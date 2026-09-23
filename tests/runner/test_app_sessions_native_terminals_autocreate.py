@@ -45,6 +45,7 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -120,9 +121,21 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("env_denylist", "expected_env_unset"),
+    [
+        (None, []),
+        (
+            " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
+            ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
+        ),
+    ],
+)
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    env_denylist: str | None,
+    expected_env_unset: list[str],
 ) -> None:
     """
     Pi-native auto-create must launch a *required* terminal.
@@ -138,12 +151,18 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param env_denylist: Optional operator-supplied credential variable names.
+    :param expected_env_unset: Variables the terminal must remove before launch.
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    if env_denylist is None:
+        monkeypatch.delenv("OMNIGENT_PI_ENV_UNSET", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", env_denylist)
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     # The lifecycle of the launch — not the binary or credentials — is under
     # test, so neither a real Pi install nor a configured provider is needed.
@@ -210,6 +229,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
     assert captured["spec"].command == "pi"
+    assert captured["spec"].env_unset == expected_env_unset
     config = json.loads(
         Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text()
     )
@@ -217,6 +237,86 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert {"list_comments", "sys_session_list"} <= tool_names
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_keeps_tmux_alive_after_pi_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pi:main terminal must keep its tmux server alive past a pi exit.
+
+    Without ``keep_alive_after_exit``, tmux's defaults (``exit-empty on`` +
+    ``remain-on-exit off``) destroy the lone-pane server the instant the
+    ``pi`` CLI exits or crashes, so the idle watcher's capture-pane probes
+    fail and it can only log the generic "tmux unavailable after N
+    consecutive probes for terminal pi:main" instead of reporting a
+    diagnosable pane-dead exit with the pane's last output. The launch spec
+    must opt in (parity with the claude terminal) so a dead pane persists
+    and the exit is reported deterministically.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    # The launch spec — not the binary or credentials — is under test.
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Records the launched terminal spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_pi_terminal(
+        "8b1f2c3d4e5f60718293a4b5c6d7e8f9",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert captured["spec"].keep_alive_after_exit is True
 
 
 @pytest.mark.asyncio
@@ -1919,8 +2019,10 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         session_id: str,
         external_session_id: str,
         workspace: Path,
+        bridge_dir: Path,
     ) -> Path:
         """Record the resume id and return a transcript path."""
+        assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
@@ -2067,7 +2169,9 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         session_id: str,
         external_session_id: str,
         workspace: Path,
+        bridge_dir: Path,
     ) -> Path:
+        assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
@@ -3277,6 +3381,120 @@ class _CodexSnapshotServerClient:
         return _Response({"id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d", "labels": labels})
 
 
+class _BlockingCodexRecoveryServerClient:
+    """Block durable inbox recovery while rejecting redundant init reads."""
+
+    def __init__(self) -> None:
+        self.recovery_started = asyncio.Event()
+        self.release_recovery = asyncio.Event()
+        self.recovery_completed = asyncio.Event()
+        self.requests: list[str] = []
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Serve recovery/history reads and fail any session metadata callback."""
+        del kwargs
+        self.requests.append(url)
+        if url.endswith("/child_sessions"):
+            self.recovery_started.set()
+            await self.release_recovery.wait()
+            self.recovery_completed.set()
+            return httpx.Response(
+                200,
+                json={"data": [], "has_more": False},
+                request=httpx.Request("GET", url),
+            )
+        if url.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={"data": [], "has_more": False},
+                request=httpx.Request("GET", url),
+            )
+        raise AssertionError(f"unexpected runner-init GET: {url}")
+
+
+class _DeletingCodexRecoveryServerClient:
+    """Pause the first recovery after one child is delivered."""
+
+    def __init__(self, parent_id: str, first_child_id: str, second_child_id: str) -> None:
+        self.parent_id = parent_id
+        self.first_child_id = first_child_id
+        self.second_child_id = second_child_id
+        self.scan_count = 0
+        self.second_child_read_started = asyncio.Event()
+        self.first_recovery_cancelled = asyncio.Event()
+
+    def _child_summary(self, child_id: str, dispatch_id: str) -> dict[str, Any]:
+        return {
+            "id": child_id,
+            "tool": "reviewer",
+            "session_name": child_id,
+            "current_task_status": "completed",
+            "labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: dispatch_id},
+        }
+
+    @staticmethod
+    def _response(payload: dict[str, Any]) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=payload,
+            request=httpx.Request("GET", "http://test-server"),
+        )
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        del kwargs
+        if url.endswith(f"/{self.parent_id}/child_sessions"):
+            self.scan_count += 1
+            return self._response(
+                {
+                    "data": [
+                        self._child_summary(self.first_child_id, "dispatch-first"),
+                        self._child_summary(self.second_child_id, "dispatch-second"),
+                    ],
+                    "has_more": False,
+                }
+            )
+        if url.endswith(f"/{self.first_child_id}/items"):
+            return self._response(
+                {
+                    "data": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "first result"}],
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+        if url.endswith(f"/{self.second_child_id}/items"):
+            if self.scan_count == 1:
+                self.second_child_read_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.first_recovery_cancelled.set()
+                    raise
+            return self._response(
+                {
+                    "data": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "second result"}],
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+        if url.endswith(f"/{self.parent_id}/items"):
+            return self._response({"data": [], "has_more": False})
+        raise AssertionError(f"unexpected runner-init GET: {url}")
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        del kwargs
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+
 _CODEX_AUTO_CREATE_SCENARIOS = [
     # Rotation target: the bridge's active session still owns the live codex
     # terminal that is about to be transferred onto the new session.
@@ -3450,6 +3668,267 @@ async def test_create_session_codex_auto_create_guard_skips_rotation_targets(
         # is the regression: it 409s the transfer, so the terminal and its tmux
         # status link stay on the superseded session.
         assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
+
+
+@pytest.mark.asyncio
+async def test_create_session_codex_envelope_avoids_reads_and_overlaps_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protocol-v2 metadata and inbox recovery stay off terminal startup's critical path."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT",
+        tmp_path / "codex-native",
+    )
+    terminal_started = asyncio.Event()
+
+    async def _recording_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **_kwargs: Any,
+    ) -> None:
+        del session_id, resource_registry, publish_event
+        terminal_started.set()
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _recording_auto_create,
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    session_id = "f1a92609dd7840ae9f2c4c29127c2a61"
+    agent_id = "7d594e9075c74249a846df420dfa7fcb"
+    server_client = _BlockingCodexRecoveryServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        request_task = asyncio.create_task(
+            client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "session_init": {
+                        "protocol_version": 2,
+                        "server_version": "0.13.0.dev5",
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "snapshot": {
+                            "created_at": 10,
+                            "updated_at": 11,
+                            "workspace": str(tmp_path),
+                            "labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id},
+                        },
+                    },
+                },
+            )
+        )
+        recovery_wait = asyncio.create_task(server_client.recovery_started.wait())
+        done, _ = await asyncio.wait(
+            {request_task, recovery_wait},
+            timeout=1.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert recovery_wait in done, (
+            f"session init finished before recovery started: "
+            f"{request_task.result().status_code} {request_task.result().text}"
+        )
+        await asyncio.wait_for(terminal_started.wait(), timeout=1.0)
+        assert not request_task.done()
+        server_client.release_recovery.set()
+        resp = await request_task
+
+    assert resp.status_code == 201, resp.text
+    assert server_client.requests == [
+        f"/v1/sessions/{session_id}/child_sessions",
+        f"/v1/sessions/{session_id}/items",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_session_keeps_recovery_alive_when_pre_launch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal pre-launch failure must not orphan concurrent inbox recovery."""
+
+    async def _raise_pre_launch_error(**_kwargs: Any) -> bool:
+        raise RuntimeError("pre-launch failed")
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._codex_native_terminal_arrives_via_transfer",
+        _raise_pre_launch_error,
+    )
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    session_id = "c46cf86fc9674eac9097e3fb260ce85f"
+    agent_id = "5b491851c683439981e6c2188929fcc0"
+    server_client = _BlockingCodexRecoveryServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        with pytest.raises(RuntimeError, match="pre-launch failed"):
+            await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "session_init": {
+                        "protocol_version": 2,
+                        "server_version": "0.13.0.dev5",
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "snapshot": {
+                            "created_at": 10,
+                            "updated_at": 11,
+                            "workspace": str(tmp_path),
+                            "labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id},
+                        },
+                    },
+                },
+            )
+        await asyncio.wait_for(server_client.recovery_started.wait(), timeout=1.0)
+        server_client.release_recovery.set()
+        await asyncio.wait_for(server_client.recovery_completed.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_delete_cancels_recovery_before_same_session_reinitializes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deletion must stop stale recovery before a same-id session is recreated."""
+    pre_launch_calls = 0
+
+    async def _fail_first_pre_launch(**_kwargs: Any) -> bool:
+        nonlocal pre_launch_calls
+        pre_launch_calls += 1
+        if pre_launch_calls == 1:
+            raise RuntimeError("pre-launch failed")
+        return False
+
+    async def _skip_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **_kwargs: Any,
+    ) -> None:
+        del session_id, resource_registry, publish_event
+
+    async def _skip_bridge_cleanup(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._codex_native_terminal_arrives_via_transfer",
+        _fail_first_pre_launch,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _skip_auto_create,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.app._delete_native_bridge_dirs",
+        _skip_bridge_cleanup,
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    session_id = "97a1ce7a249c4f64aacb9064f690e639"
+    agent_id = "fe373ed32ac948d599d50b52680d1c62"
+    first_child_id = "4f214b07944c436ea21c47eec87ecbb2"
+    second_child_id = "053550e3650144248e99f77995976377"
+    server_client = _DeletingCodexRecoveryServerClient(
+        session_id,
+        first_child_id,
+        second_child_id,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    body = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.13.0.dev5",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(tmp_path),
+                "labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id},
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        with pytest.raises(RuntimeError, match="pre-launch failed"):
+            await client.post("/v1/sessions", json=body)
+        await asyncio.wait_for(server_client.second_child_read_started.wait(), timeout=1.0)
+        first_entry = runner_app.get_subagent_work(first_child_id)
+        assert first_entry is not None and first_entry.delivered
+        assert runner_app._session_inboxes_ref[session_id].qsize() == 1
+
+        delete_resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert delete_resp.status_code == 200, delete_resp.text
+        assert server_client.first_recovery_cancelled.is_set()
+        assert runner_app.get_subagent_work(first_child_id) is None
+        assert session_id not in runner_app._session_inboxes_ref
+
+        recreate_resp = await client.post("/v1/sessions", json=body)
+        assert recreate_resp.status_code == 201, recreate_resp.text
+        recovered = []
+        inbox = runner_app._session_inboxes_ref[session_id]
+        while not inbox.empty():
+            recovered.append(inbox.get_nowait())
+        assert any(
+            payload.get("task_id") == first_child_id and payload.get("output") == "first result"
+            for payload in recovered
+        )
+        assert server_client.scan_count == 2
+
+        cleanup_resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert cleanup_resp.status_code == 200, cleanup_resp.text
 
 
 @pytest.mark.asyncio
@@ -3788,7 +4267,7 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["subscription", "gateway"])
+@pytest.mark.parametrize("endpoint", ["subscription", "gateway", "bound"])
 async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
     endpoint: str,
     tmp_path: Path,
@@ -3804,6 +4283,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     spellings, launches on its own default instead and resets the pick to Default.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inference_config import inference_config_scope
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3862,11 +4342,12 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
             )
 
     patches: list[dict[str, Any]] = []
+    selected_model = "private/model-b[large]" if endpoint == "bound" else "claude-opus-4-8"
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
-        return httpx.Response(200, json={"model_override": "claude-opus-4-8", "labels": {}})
+        return httpx.Response(200, json={"model_override": selected_model, "labels": {}})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -3886,17 +4367,34 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return config
 
     session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
-    await _auto_create_claude_terminal(
-        session_id,
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        resolve_launch_config=_resolve,
+    inference = (
+        {
+            "providers": {"gateway": {"kind": "gateway"}},
+            "inference": {
+                "harnesses": {
+                    "claude-native": {
+                        "provider": "gateway",
+                        "default_model": "private/model-a",
+                        "model_allowlist": ["private/model-a", selected_model],
+                    }
+                }
+            },
+        }
+        if endpoint == "bound"
+        else {}
     )
+    with inference_config_scope(inference):
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+        )
     args = captured["spec"].args
     pick_resets = [body for body in patches if "model_override" in body]
-    if endpoint == "subscription":
-        assert args[args.index("--model") + 1] == "claude-opus-4-8"
+    if endpoint in ("subscription", "bound"):
+        assert args[args.index("--model") + 1] == selected_model
         assert pick_resets == []
     else:
         assert args[args.index("--model") + 1] == "system.ai.claude-opus-5"

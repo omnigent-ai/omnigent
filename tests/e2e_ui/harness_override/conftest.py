@@ -1,10 +1,4 @@
-"""Shared fixture: two configured generic ACP agents for override tests.
-
-Both tests in this package drive the same precondition — two generic ACP
-agents in the global ``acp:`` block, with Gemini listed *before* Goose — so a
-slug-losing fallback (bare ``acp`` -> first configured agent) observably picks
-the wrong one.
-"""
+"""Fixtures for namespaced ACP harness overrides."""
 
 from __future__ import annotations
 
@@ -17,29 +11,15 @@ import pytest
 
 from omnigent.onboarding.provider_config import _config_path
 
-# Two configured ACP agents. Gemini is listed FIRST so a slug-losing fallback
-# (bare ``acp`` -> first configured agent) launches Gemini, which is the bug.
 GEMINI_NAME = "Fake Gemini"
 GOOSE_NAME = "Fake Goose"
-# Derived slugs (see omnigent.onboarding.acp_auth.slugify): lowercased,
-# non-alphanumeric runs collapsed to ``-``.
 GEMINI_SLUG = "fake-gemini"
 GOOSE_SLUG = "fake-goose"
-
-# The override the user picks: the SECOND (Goose) agent, by slug.
 GOOSE_OVERRIDE = f"acp:{GOOSE_SLUG}"
-
-# Distinctive reply text each fake agent streams, so the rendered chat reveals
-# which ACP agent the runner actually launched.
 GEMINI_REPLY = f"ACP agent reply from {GEMINI_NAME}"
 GOOSE_REPLY = f"ACP agent reply from {GOOSE_NAME}"
 
-# A minimal ACP agent speaking the Agent Client Protocol over stdio, mirroring
-# the hermetic fake in tests/e2e_ui/files/test_files_tab_survives_acp_reply.py
-# (initialize -> session/new -> session/prompt streams one deterministic
-# agent_message_chunk and completes the turn). It echoes its own display name
-# (argv[1]) in the reply so the transcript names the launched agent. Stdlib
-# only, so any Python interpreter on the runner host can run it.
+# Minimal stdio ACP agent that identifies itself in its reply.
 _FAKE_ACP_AGENT = r"""
 import sys, json
 
@@ -78,16 +58,7 @@ for line in sys.stdin:
 
 @pytest.fixture
 def two_acp_agents_config(tmp_path: Path) -> Iterator[None]:
-    """Configure Fake Gemini (first) + Fake Goose (second) in the global config.
-
-    Writes the hermetic fake ACP agent script to disk and adds an ``acp:``
-    block naming both agents to ``~/.omnigent/config.yaml`` (the path the
-    server and runner read via :func:`omnigent.onboarding.acp_auth.acp_agents`).
-    The original config (if any) is restored on teardown so the shared
-    session-scoped server isn't polluted for other tests.
-
-    :param tmp_path: Per-test dir for the fake agent script.
-    """
+    """Configure two agents and restore the original config after the test."""
     import yaml
 
     agent_script = tmp_path / "fake_acp_agent.py"
@@ -105,8 +76,6 @@ def two_acp_agents_config(tmp_path: Path) -> Iterator[None]:
         loaded = yaml.safe_load(original)
         if isinstance(loaded, dict):
             config = loaded
-    # Gemini FIRST, Goose SECOND — the ordering that makes a slug-losing
-    # fallback launch the wrong (Gemini) agent.
     config["acp"] = {
         "agents": [
             {"name": GEMINI_NAME, "command": _command(GEMINI_NAME)},

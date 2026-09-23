@@ -10,6 +10,7 @@ import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   ChevronLeftIcon,
+  DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
@@ -22,7 +23,9 @@ import {
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
   DialogContent,
@@ -43,6 +46,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useQueryClient } from "@tanstack/react-query";
+import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
   PINNED_LABEL_KEY,
   type Conversation,
@@ -172,6 +177,18 @@ export function HeaderConversationMenu({
     });
   };
 
+  const exportConversation = async () => {
+    try {
+      const jsonl = await exportSessionTranscript(conversation.id);
+      triggerBrowserDownload(
+        new Blob([jsonl], { type: "application/jsonl" }),
+        `${conversation.id}.jsonl`,
+      );
+    } catch {
+      toast.error("Export failed");
+    }
+  };
+
   const archiveConversation = () => {
     closeMenu();
     if (isArchived) {
@@ -191,7 +208,7 @@ export function HeaderConversationMenu({
     // and per-call mutate callbacks don't fire once their observer unmounts.
     // The Undo toast is driven by module state + the app-level Toaster, so it
     // survives this menu unmounting.
-    showArchiveUndoToast(queryClient, [conversation]);
+    showArchiveUndoToast(queryClient, [conversation], navigate);
   };
 
   const mainItems = (
@@ -236,6 +253,14 @@ export function HeaderConversationMenu({
           Fork
         </DropdownMenuItem>
       )}
+      <DropdownMenuItem
+        data-testid="header-export-conversation"
+        className={itemClass}
+        onSelect={() => void exportConversation()}
+      >
+        <DownloadIcon className="size-3.5" />
+        Export
+      </DropdownMenuItem>
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"
@@ -370,8 +395,9 @@ export function HeaderConversationMenu({
         >
           {isMobile && !projectPickerOpen && (
             <>
-              <DropdownMenuLabel className="truncate px-2.5 pb-1.5 text-foreground">
-                {label}
+              <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
+                <span className="min-w-0 flex-1 truncate">{label}</span>
+                <PresenceAvatars />
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
             </>

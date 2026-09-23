@@ -38,13 +38,15 @@ const meta = {
               conversationId: null,
               sessionHarness: "claude-native",
               llmModel: "system.ai.claude-opus-4-6",
-              selectedEffort: "high",
+              sessionReasoningEffort: "high",
               costControlModeOverride: null,
               pendingModelChange: null,
               nativeVendorOwnsModel: false,
             }}
           >
-            <div className="flex min-h-[480px] w-[620px] items-end rounded-xl border bg-card p-4">
+            {/* A column so the composer is width-constrained like its real mounts;
+                a shrink-to-fit item would collapse its labels for lack of room. */}
+            <div className="flex min-h-[480px] w-[620px] flex-col justify-end rounded-xl border bg-card p-4">
               <Story />
             </div>
           </ChatStoreSeed>
@@ -58,6 +60,63 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Open: Story = {
+  play: async ({ canvasElement }) => {
+    await userEvent.click(within(canvasElement).getByTestId("composer-config-gear"));
+  },
+};
+
+export const SmartRouting: Story = {
+  args: { costRoutingEligible: true },
+  play: async ({ canvasElement }) => {
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(within(canvasElement).getByTestId("composer-config-gear"));
+    await userEvent.click(await page.findByTestId("composer-agent-edit"));
+    await page.findByRole("menuitem", { name: "Smart Routing" });
+  },
+};
+
+export const UnknownCurrentModel: Story = {
+  decorators: [
+    (Story) => (
+      <ChatStoreSeed
+        seed={{
+          conversationId: null,
+          sessionHarness: "claude-native",
+          llmModel: "claude-future-unknown",
+          sessionReasoningEffort: "high",
+          costControlModeOverride: null,
+          pendingModelChange: null,
+          nativeVendorOwnsModel: false,
+        }}
+      >
+        <Story />
+      </ChatStoreSeed>
+    ),
+  ],
+  play: async ({ canvasElement }) => {
+    await userEvent.click(within(canvasElement).getByTestId("composer-config-gear"));
+  },
+};
+
+export const SmartRoutingSelected: Story = {
+  args: { costRoutingEligible: true },
+  decorators: [
+    (Story) => (
+      <ChatStoreSeed
+        seed={{
+          conversationId: null,
+          sessionHarness: "claude-native",
+          llmModel: null,
+          sessionReasoningEffort: null,
+          costControlModeOverride: "on",
+          pendingModelChange: null,
+          nativeVendorOwnsModel: false,
+        }}
+      >
+        <Story />
+      </ChatStoreSeed>
+    ),
+  ],
   play: async ({ canvasElement }) => {
     await userEvent.click(within(canvasElement).getByTestId("composer-config-gear"));
   },

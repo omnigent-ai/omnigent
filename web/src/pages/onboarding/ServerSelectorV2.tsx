@@ -16,8 +16,9 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { LandingFooter } from "@/pages/onboarding/LandingFooter";
 import { LandingStep } from "@/pages/onboarding/LandingStep";
-import { ModeSelectStep } from "@/pages/onboarding/ModeSelectStep";
-import { ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
+import { HarnessIconRow, LocalIntroStep } from "@/pages/onboarding/LocalIntroStep";
+import { ServerDetailStep } from "@/pages/onboarding/ServerDetailStep";
+import { ServerHeroIcons, ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
 /**
@@ -43,6 +44,13 @@ export interface ServerSelectorV2Setup {
   recentServers: string[];
   /** Organization-provided server URLs. */
   managedServers: string[];
+  /** Whether the `omnigent` CLI is already installed (returning user). Drives
+   *  the "Install" vs "Open" action label and the returning-user start step. */
+  installed?: boolean;
+  /** Mocks only: route Join / Install actions to the terminal step (which runs
+   *  the mocked local-server flow) instead of the no-op connect, so the install
+   *  screen is reachable from every path. Never set by the real shell. */
+  mockInstall?: boolean;
   /** Persist + navigate to a server URL. Resolves `{needsConfirm}` when the URL
    *  doesn't look like an Omnigent server (call again with force), or `{error}`
    *  when the connect was rejected — so the step can show it rather than
@@ -73,13 +81,14 @@ export interface ServerCheckResult {
   status: "ok" | "reachable" | "unreachable";
 }
 
-type Step = "landing" | "mode" | "server" | "terminal";
+type Step = "landing" | "local" | "detail" | "server" | "terminal";
 
 // Per-step card dimensions (px). The panel shrinks as steps gain content; the
 // card grows for the scrollable server list. Drives the CSS-transition resize.
 const CARD: Record<Step, { height: number; panelHeight: number }> = {
   landing: { height: 560, panelHeight: 308 },
-  mode: { height: 560, panelHeight: 96 },
+  local: { height: 560, panelHeight: 150 },
+  detail: { height: 600, panelHeight: 150 },
   server: { height: 600, panelHeight: 64 },
   terminal: { height: 560, panelHeight: 240 },
 };
@@ -88,14 +97,48 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // A failed connect reloads the wizard with an error (from ?error=&url=). That
   // only ever comes from the server-select flow, so open there — otherwise the
   // error banner renders on a step that isn't mounted and stays invisible.
-  // "Connect to new server…" also opens the list directly (initialStep).
+  // "Connect to new server…" also opens the list directly (initialStep). A
+  // returning user (CLI installed) skips the welcome and lands on the list too;
+  // Back still reaches the landing for the local path.
   const [step, setStep] = useState<Step>(
-    setup.error || setup.initialStep === "server" ? "server" : "landing",
+    setup.error || setup.initialStep === "server" || setup.installed ? "server" : "landing",
   );
-  const { height, panelHeight } = CARD[step];
+  // The preset server picked from the landing split button (drives the detail step).
+  const [detailUrl, setDetailUrl] = useState<string | null>(null);
+
+  // Mocks only: Join / Install routes to the terminal step (mocked install flow)
+  // instead of the no-op connect, so the install screen is reachable everywhere.
+  const connect = setup.mockInstall
+    ? async () => {
+        setStep("terminal");
+        return {};
+      }
+    : setup.onConnect;
+  // Whether the server step is showing its URL-input ("add") view vs the list —
+  // reported up so the band can show the hero icons only in the add view.
+  const [serverAddMode, setServerAddMode] = useState(false);
+  const { height, panelHeight: basePanelHeight } = CARD[step];
+  // The server step's add (URL-input) view shows the hero band, which needs the
+  // taller panel; the list view keeps the contracted band.
+  const panelHeight = step === "server" && serverAddMode ? 150 : basePanelHeight;
+
+  // Panel band: harness icons on the local intro; server hero icons on the
+  // detail step and on the server step's add (URL-input) view.
+  const bandContent =
+    step === "local" ? (
+      <HarnessIconRow />
+    ) : step === "detail" || (step === "server" && serverAddMode) ? (
+      <ServerHeroIcons />
+    ) : undefined;
 
   return (
-    <div className="grid min-h-screen place-items-center p-6">
+    <div
+      // Center the card in the space above the fixed footer: pb reserves the
+      // footer's band so the card never reaches it, and overflow-auto only
+      // kicks in when the viewport is too short for the card itself.
+      className="grid min-h-screen place-items-center overflow-auto p-6 pb-20"
+      style={{ background: "var(--onboarding-wizard-background)" }}
+    >
       {/* Top-right cog: settings for this setup surface. no-drag so it's
           clickable over the window's drag strip. */}
       <div
@@ -116,29 +159,52 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             <DropdownMenuItem onSelect={setup.onSwitchToLegacy}>
               Switch to legacy selector experience
             </DropdownMenuItem>
+            {/* Debug aid: flip the theme in place (not persisted). */}
+            <DropdownMenuItem onSelect={() => document.documentElement.classList.toggle("dark")}>
+              Toggle light/dark mode
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
 
-      <AnimatedOmnigentPanel height={height} panelHeight={panelHeight}>
+      <AnimatedOmnigentPanel
+        height={height}
+        panelHeight={panelHeight}
+        bandContent={bandContent}
+        contracted={step === "server" && !serverAddMode}
+      >
         {step === "landing" && (
           <LandingStep
-            onGetStarted={() => setStep("mode")}
+            managedServers={setup.managedServers}
+            onGetStarted={() => setStep("local")}
             onJoinServer={() => setStep("server")}
+            onJoinManaged={(url) => {
+              setDetailUrl(url);
+              setStep("detail");
+            }}
           />
         )}
-        {step === "mode" && (
-          <ModeSelectStep
+        {step === "local" && (
+          <LocalIntroStep
+            installed={setup.installed}
             onBack={() => setStep("landing")}
-            onBegin={() => setStep("terminal")}
-            onCloudSetup={setup.onCloudSetup}
+            onInstall={() => setStep("terminal")}
+          />
+        )}
+        {step === "detail" && detailUrl !== null && (
+          <ServerDetailStep
+            url={detailUrl}
+            installed={setup.installed}
+            onBack={() => setStep("landing")}
+            onConnect={connect}
+            onCopy={setup.onCopy}
           />
         )}
         {step === "terminal" && (
           <SetupTerminalStep
             onStartLocal={setup.onStartLocal}
             onSetupLog={setup.onSetupLog}
-            onBack={() => setStep("mode")}
+            onBack={() => setStep("local")}
           />
         )}
         {step === "server" && (
@@ -147,16 +213,18 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             error={setup.error}
             recentServers={setup.recentServers}
             managedServers={setup.managedServers}
+            installed={setup.installed}
             onBack={() => setStep("landing")}
-            onConnect={setup.onConnect}
+            onConnect={connect}
             onRemove={setup.onRemoveServer}
             onCopy={setup.onCopy}
             onCheckServer={setup.onCheckServer}
+            onAddModeChange={setServerAddMode}
           />
         )}
       </AnimatedOmnigentPanel>
 
-      {step === "landing" && <LandingFooter />}
+      <LandingFooter />
     </div>
   );
 }

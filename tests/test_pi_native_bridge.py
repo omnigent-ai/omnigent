@@ -369,6 +369,24 @@ def test_inject_relay_into_config_noops_when_config_absent(tmp_path: Path) -> No
     assert pi_native_bridge.inject_relay_into_config(bridge_dir, "http://x", "tok") is False
 
 
+def test_pi_native_env_unset_parses_operator_denylist() -> None:
+    """Comma-separated names parse sorted and deduplicated; blanks drop."""
+    environ = {
+        "OMNIGENT_PI_ENV_UNSET": " DEEPSEEK_API_KEY,ANTHROPIC_AUTH_TOKEN,,ANTHROPIC_AUTH_TOKEN "
+    }
+    assert pi_native_bridge.pi_native_env_unset(environ) == [
+        "ANTHROPIC_AUTH_TOKEN",
+        "DEEPSEEK_API_KEY",
+    ]
+
+
+def test_pi_native_env_unset_absent_or_empty_strips_nothing() -> None:
+    """Unset or empty denylist means no scrubbing (safe default)."""
+    assert pi_native_bridge.pi_native_env_unset({}) == []
+    assert pi_native_bridge.pi_native_env_unset({"OMNIGENT_PI_ENV_UNSET": ""}) == []
+    assert pi_native_bridge.pi_native_env_unset({"OMNIGENT_PI_ENV_UNSET": "  , ,"}) == []
+
+
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
 
 

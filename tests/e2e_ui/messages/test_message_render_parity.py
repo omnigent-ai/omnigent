@@ -38,7 +38,12 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.conftest import (
+    _CUSTOM_AGENT_MODEL,
+    configure_mock_llm,
+    reset_mock_llm,
+    set_fallback_mock_llm,
+)
 
 _COMPOSER = "Send a message…"
 _USER = '[data-testid="message-bubble"][data-role="user"]'
@@ -49,9 +54,6 @@ _TURNS = 5
 
 # A custom openai-agents turn is a single LLM call.
 _CUSTOM_TURN_TIMEOUT_MS = 90_000
-
-# Model name baked into _CUSTOM_AGENT_YAML; used to key the mock fallback.
-_ECHO_PROBE_MODEL = "gpt-4o-mini"
 
 
 def _send(page: Page, text: str) -> None:
@@ -328,7 +330,7 @@ def test_custom_agent_message_render_parity(
         session_id,
         per_turn_timeout_ms=_CUSTOM_TURN_TIMEOUT_MS,
         mock_llm_server_url=mock_llm_server_url,
-        mock_model=_ECHO_PROBE_MODEL,
+        mock_model=_CUSTOM_AGENT_MODEL,
     )
 
 

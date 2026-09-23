@@ -20,6 +20,7 @@ from pydantic import TypeAdapter
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
@@ -30,6 +31,7 @@ from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    DEVIN_NATIVE_CODING_AGENT,
     KIMI_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
@@ -43,7 +45,6 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SandboxStatus,
     ServerStreamEvent,
-    SkillSummary,
 )
 from omnigent.spec.types import (
     StateUpdate,
@@ -108,6 +109,9 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 
 
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
+
+
+_SUBAGENT_STATUS_TYPE: str = "subagent.status"
 
 
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
@@ -286,6 +290,9 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 
+_LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: str = "omnigent.last_task_error_agent_name"
+
+
 # Optional structured failure fields (present when the runner classified the
 # failure — see ``omnigent.runner.launch_failure``), persisted so a reload
 # renders the same clear failure card instead of only the raw code + message.
@@ -349,6 +356,31 @@ _ANTIGRAVITY_NATIVE_HARNESS = ANTIGRAVITY_NATIVE_CODING_AGENT.harness
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 
 
+_DEVIN_NATIVE_WRAPPER_LABEL_VALUE = DEVIN_NATIVE_CODING_AGENT.wrapper_label
+
+
+_EXTERNAL_DEVIN_SUBAGENT_START_TYPE: str = "external_devin_subagent_start"
+
+
+_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "devin-native-ui-subagent"
+
+
+# Devin's ``run_subagent`` spawns a background sub-agent whose ``agent_id`` (the
+# idempotency key for the child row) rides only free text in the tool result; a
+# child mirrors that sub-agent's transcript, reconstructed from the parent's
+# ``message_nodes`` forest.
+_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY = "omnigent.devin_native.subagent_agent_id"
+
+
+_DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY = "omnigent.devin_native.run_subagent_tool_use_id"
+
+
+_DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY = "omnigent.devin_native.subagent_title"
+
+
+_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Devin"
+
+
 _PI_NATIVE_WRAPPER_LABEL_VALUE = PI_NATIVE_CODING_AGENT.wrapper_label
 
 
@@ -385,15 +417,19 @@ _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
 _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_registry: dict[str, asyncio.Future[dict[str, Any]]] = {}  # -> parked Future
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_owners: dict[str, str] = {}  # -> issuing session_id (result POST must match)
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_claims: dict[str, str] = {}
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted action_id
 _browser_action_claim_events: dict[str, asyncio.Event] = {}
 
 
@@ -450,6 +486,20 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
 
 
+# How long an archive defers tearing down the session's runner, giving an Undo's
+# unarchive time to land first. When the teardown fires it re-reads the persisted
+# archived flag and skips if the session was unarchived, so any Undo whose
+# unarchive PERSISTS before this fires keeps the runner — across replicas, since
+# the guard is the shared row, not an in-memory timer.
+#
+# MUST stay above the client Undo pill's total lifetime, which the pill caps at
+# ARCHIVE_UNDO_MAX_LIFETIME_MS (5s) in web/src/shell/archiveUndoToast.tsx. The
+# pill merges successive archives, so without that cap it could linger past this
+# grace and offer an Undo AFTER the teardown already ran — and the re-check
+# can't un-stop a runner. The cap keeps the pill's Undo window inside this grace.
+_ARCHIVE_STOP_UNDO_GRACE_S = 8.0
+
+
 _HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
 
 
@@ -489,6 +539,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
+    _SUBAGENT_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MCP_STARTUP_TYPE,
@@ -502,6 +553,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
+    _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
 }
@@ -510,34 +562,64 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
-_session_status_cache: dict[str, str] = {}
+_session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
-_session_active_response_cache: dict[str, str] = {}
+@dataclass
+class _RunnerStatusProbeBackoff:
+    """
+    Skip window for a session's runner status probe after slow probes.
+
+    :param skip_until: Monotonic time before which the probe is skipped.
+    :param failures: Consecutive slow or failed probes; sets the next window.
+    :param runner_id: Runner the slow probes were against, e.g.
+        ``"runner_0123456789abcdef"``; a rebind to another runner discards
+        the window.
+    """
+
+    skip_until: float
+    failures: int
+    runner_id: str | None
 
 
-_session_background_task_count_cache: dict[str, int] = {}
+_runner_status_probe_backoff: WorkspaceScopedCache[str, _RunnerStatusProbeBackoff] = (
+    WorkspaceScopedCache()
+)
+
+# The one runner status probe in flight per session; concurrent snapshots await it.
+_runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None]] = (
+    WorkspaceScopedCache()
+)
+
+
+_session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+_session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 # Per-shell detail behind the tally above, kept sticky in lockstep with it (see
 # ``_publish_status``) so a reload/reconnect can restore it. Absent when the
 # count cache is absent, or when a runner reported only the count with no detail.
-_session_background_tasks_cache: dict[str, list[BackgroundTaskInfo]] = {}
+_session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
+    WorkspaceScopedCache()
+)
 
 
-_read_last_seen: dict[str, dict[str, int]] = {}
+_read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()
 
 
-_read_explicit_unread: dict[str, set[str]] = {}
+_read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCache()
 
 
-_interrupt_fenced_sessions: set[str] = set()
+_interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
-_intentional_stop_sessions: set[str] = set()
+_intentional_stop_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
 _TERMINAL_RESPONSE_EVENT_TYPES: frozenset[str] = frozenset(
@@ -570,40 +652,27 @@ _SESSION_UPDATES_MAX_WATCHED: int = 500
 _SHARED_DISCOVERY_KEY = "__all__"
 
 
-_session_todos_cache: dict[str, list[dict[str, Any]]] = {}
+_session_terminal_pending_cache: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache()
 
 
-_session_terminal_pending_cache: dict[str, bool] = {}
+_session_sandbox_status_cache: WorkspaceScopedCache[str, SandboxStatus] = WorkspaceScopedCache()
 
 
-_session_sandbox_status_cache: dict[str, SandboxStatus] = {}
+_session_mcp_startup_cache: WorkspaceScopedCache[str, dict[str, McpServerStartup]] = (
+    WorkspaceScopedCache()
+)
 
 
-_session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
+_model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
 
 
-_runner_skills_cache: dict[str, list[SkillSummary]] = {}
-
-
-# Sessions whose cached skills need a re-fetch but should keep serving until it
-# lands. A browser reload asks for one, and dropping the entry outright would
-# empty the composer's slash-command menu for the reload that requested it.
-_runner_skills_stale: set[str] = set()
-
-
-_runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
-
-
-_model_options_cache: dict[str, list[dict[str, Any]]] = {}
-
-
-_model_options_inflight: dict[str, asyncio.Task[None]] = {}
+_model_options_inflight: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
 
 
 # Sessions whose cached catalog should be re-fetched at the next snapshot
 # that has a live runner. A stale entry still SERVES in the meantime (and
 # whenever no runner is bound) so the model picker survives runner death.
-_model_options_stale: set[str] = set()
+_model_options_stale: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
 _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
@@ -611,10 +680,13 @@ _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 # Strong references to fire-and-forget catalog prefetches, so a task cannot be
 # garbage-collected mid-flight. Entries remove themselves when they finish.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _catalog_prefetch_tasks: set[asyncio.Task[None]] = set()
 
 
-_pushed_model_options_cache: dict[str, list[dict[str, Any]]] = {}
+_pushed_model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = (
+    WorkspaceScopedCache()
+)
 
 
 @dataclass
@@ -637,8 +709,11 @@ class _MirroredToolCall:
     tool_input: dict[str, Any]
 
 
-_recent_mirrored_tool_calls: cachetools.LRUCache[str, _MirroredToolCall] = cachetools.LRUCache(
-    maxsize=2048
+# Workspace-scoped: a native call_id can be derived from the conversation id
+# (e.g. Antigravity's ``agy_call_<conversation_id>_<step>``), which collides
+# across workspaces for an imported session.
+_recent_mirrored_tool_calls: WorkspaceScopedCache[str, _MirroredToolCall] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=2048)
 )
 
 
@@ -665,15 +740,21 @@ class _PendingPolicyAskWrites:
         itself, so the events handler skips write application for
         these entries to avoid double-applying non-idempotent ops
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
+    :param reviewed_arguments: Original MCP arguments shown for approval.
+    :param transformed_arguments: Policy transform stored with that approval.
     """
 
     state_updates: list[StateUpdate] | None
     set_labels: dict[str, str] | None
     from_mcp: bool = False
+    reviewed_arguments: dict[str, Any] | None = None
+    transformed_arguments: dict[str, Any] | None = None
 
 
-_pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = (
-    cachetools.LRUCache(maxsize=512)
+# Workspace-scoped: keyed by a harness elicitation id, which can be
+# deterministic and collide across workspaces for an imported session.
+_pending_policy_ask_writes: WorkspaceScopedCache[str, _PendingPolicyAskWrites] = (
+    WorkspaceScopedCache(lambda: cachetools.LRUCache(maxsize=512))
 )
 
 
@@ -692,10 +773,17 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # active relay for the session (routes_hooks), and the entry is popped at
 # every consume point, on each new turn, and when the relay task ends
 # (the relay's done-callback), so an entry can never outlive its relay.
-_llm_response_denied_turns: dict[str, str] = {}
+_llm_response_denied_turns: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_policy_evaluation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 
@@ -719,9 +807,10 @@ class _RelayHandle:
     ready: asyncio.Event
 
 
-_runner_relay_tasks: dict[str, _RelayHandle] = {}
+_runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _deferred_elicitation_clear_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -734,12 +823,14 @@ _MODEL_TOKEN_KEYS = (
 )
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _native_popup_forward_tasks: set[asyncio.Task[None]] = set()
 
 
 _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -812,6 +903,7 @@ _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
+    _DEVIN_NATIVE_WRAPPER_LABEL_VALUE: "devin-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
@@ -951,6 +1043,12 @@ __all__ = [
     "_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
     "_CURSOR_NATIVE_WRAPPER_LABEL_VALUE",
     "_DENY_SENTINEL_PREFIX",
+    "_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK",
+    "_DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
+    "_DEVIN_NATIVE_WRAPPER_LABEL_VALUE",
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
@@ -962,6 +1060,7 @@ __all__ = [
     "_EXTERNAL_COMPACTION_STATUS_TYPE",
     "_EXTERNAL_COMPACTION_STATUS_VALUES",
     "_EXTERNAL_CONVERSATION_ITEM_TYPE",
+    "_EXTERNAL_DEVIN_SUBAGENT_START_TYPE",
     "_EXTERNAL_ELICITATION_RESOLVED_TYPE",
     "_EXTERNAL_MCP_STARTUP_STATUS_VALUES",
     "_EXTERNAL_MCP_STARTUP_TYPE",
@@ -1032,6 +1131,7 @@ __all__ = [
     "_STOP_RUNNER_RESULT_TIMEOUT_S",
     "_STOP_SESSION_TYPE",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
+    "_SUBAGENT_STATUS_TYPE",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
@@ -1040,6 +1140,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
@@ -1062,9 +1163,8 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
-    "_runner_skills_cache",
-    "_runner_skills_inflight",
-    "_runner_skills_stale",
+    "_runner_status_probe_backoff",
+    "_runner_status_probe_inflight",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
@@ -1074,7 +1174,6 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
-    "_session_todos_cache",
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",

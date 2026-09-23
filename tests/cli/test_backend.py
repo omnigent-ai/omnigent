@@ -13,9 +13,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import logging
 import re
+import subprocess
 import sys
+import textwrap
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -32,7 +33,7 @@ from rich.console import Console
 # the process-wide ``subprocess.Popen``. Running that import for the first
 # time *while* Popen is patched would evaluate ``subprocess.Popen[...]``
 # generic aliases in the import chain against the stub (not subscriptable).
-import omnigent.host.connect  # noqa: F401
+import omnigent.host.connect
 from omnigent import cli
 from omnigent.cli import (
     _build_host_daemon_env,
@@ -107,6 +108,7 @@ def _patch_daemon_spawn(
                 server_url=None if mode == "local" else target,
                 log_path=spawned.log_path,
                 started_at=int(cli.time.time()),
+                host_id=cli._load_existing_host_id(),
                 config_sig=str(env[cli.DAEMON_CONFIG_SIG_ENV_VAR]),
             )
         )
@@ -211,6 +213,71 @@ def test_ensure_host_daemon_local_spawns_local_flag(
     assert (tmp_path / "host.pid").read_text().splitlines()[1] == "local"
 
 
+@pytest.mark.parametrize("server_url", [None, "https://server.example.com"])
+def test_daemon_startup_preserves_runtime_identity_and_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, server_url: str | None
+) -> None:
+    """Daemon interpreter options isolate imports without changing the workspace."""
+    from omnigent.host.identity import load_or_create_host_identity
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    for name in ("PYTHONSAFEPATH", "PYTHONPATH", "OMNIGENT_HOST_ID", "OMNIGENT_HOST_NAME"):
+        monkeypatch.delenv(name, raising=False)
+    expected_identity = load_or_create_host_identity()
+
+    captured: dict[str, object] = {}
+    with monkeypatch.context() as spawn_patch:
+        _patch_daemon_spawn(spawn_patch, tmp_path, captured)
+        _ensure_host_daemon(server_url)
+
+    args = captured["args"]
+    env = captured["env"]
+    assert isinstance(args, list)
+    assert isinstance(env, dict)
+    # Run a diagnostic with the actual daemon interpreter options, without
+    # starting a server or inheriting the developer's credentials.
+    probe_env = {
+        name: value
+        for name, value in env.items()
+        if name in {"PATH", "SYSTEMROOT", "WINDIR", "OMNIGENT_CONFIG_HOME", "OMNIGENT_DATA_DIR"}
+    }
+    probe_env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    probe = textwrap.dedent("""\
+        import json, os, sys
+
+        startup_path = list(sys.path)
+        import omnigent
+        from omnigent.host.identity import load_or_create_host_identity
+
+        print(json.dumps(dict(
+            safe_path=sys.flags.safe_path,
+            startup_path=startup_path,
+            cwd=os.getcwd(),
+            runtime=omnigent.__file__,
+            host_id=load_or_create_host_identity().host_id,
+        )))
+    """)
+    result = subprocess.run(
+        [*args[: args.index("-m")], "-c", probe],
+        env=probe_env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    observed = json.loads(result.stdout)
+    assert "" not in observed["startup_path"]
+    assert workspace.resolve() not in {Path(entry).resolve() for entry in observed["startup_path"]}
+    assert observed["safe_path"] is True
+    assert Path(observed["cwd"]) == workspace.resolve()
+    assert Path(observed["runtime"]).resolve() == Path(omnigent.__file__).resolve()
+    assert observed["host_id"] == expected_identity.host_id
+
+
 def test_ensure_host_daemon_local_inherits_data_dir_and_db_uri(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -300,6 +367,21 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert "ANTHROPIC_API_KEY" not in env
     # Databricks auth is intentionally preserved for the daemon's server auth.
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
+
+
+def test_build_host_daemon_env_remote_preserves_host_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote daemon spawns must retain the requested host identity."""
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "d6d0ccebce7b4b706d21e23696bb462a")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "isolated-host")
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "managed-token")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert env["OMNIGENT_HOST_ID"] == "d6d0ccebce7b4b706d21e23696bb462a"
+    assert env["OMNIGENT_HOST_NAME"] == "isolated-host"
+    assert env["OMNIGENT_HOST_TOKEN"] == "managed-token"
 
 
 def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
@@ -652,6 +734,7 @@ def test_concurrent_ensure_host_daemon_elects_one_daemon(
                     server_url=target,
                     log_path=str(tmp_path / "host.log"),
                     started_at=int(cli.time.time()),
+                    host_id="host_abc",
                     config_sig="sig",
                 )
             )
@@ -682,12 +765,11 @@ def test_concurrent_ensure_host_daemon_elects_one_daemon(
     assert record.pid == 4242
 
 
-def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
+def test_ensure_host_daemon_stops_spawned_daemon_that_never_claims(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A spawned daemon that never writes its record is surfaced, not silent."""
+    """A spawned daemon that never claims its record is stopped and surfaced."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
     monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
@@ -699,14 +781,56 @@ def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
     )
     # The daemon crashes before claiming: no record ever appears.
     monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: None)
+    stopped: list[int] = []
+    monkeypatch.setattr(
+        cli,
+        "_stop_spawned_host_daemon_process",
+        lambda spawned: stopped.append(spawned.pid),
+    )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.cli"):
+    with pytest.raises(click.ClickException) as excinfo:
         _ensure_host_daemon("https://server.example.com")
 
-    assert any(
-        "did not claim its registry record" in message and str(log_path) in message
-        for message in caplog.messages
+    assert "did not claim its registry record" in str(excinfo.value)
+    assert str(log_path) in str(excinfo.value)
+    assert stopped == [4242]
+
+
+def test_ensure_host_daemon_stops_spawned_daemon_on_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A daemon claiming a different host identity fails before tunnel polling."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_expected")
+    spawned = cli._SpawnedDaemonProcess(pid=4242, log_path=str(tmp_path / "host.log"))
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", lambda **_kw: spawned)
+    claimed = cli._HostDaemonRecord(
+        pid=spawned.pid,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=spawned.log_path,
+        started_at=1_000_000,
+        host_id="host_actual",
     )
+    cli._write_daemon_record(claimed)
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: claimed)
+    stopped: list[int] = []
+    monkeypatch.setattr(
+        cli,
+        "_stop_spawned_host_daemon_process",
+        lambda child: stopped.append(child.pid),
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _ensure_host_daemon("https://server.example.com")
+
+    assert "registered as 'host_actual'" in str(excinfo.value)
+    assert "requested 'host_expected'" in str(excinfo.value)
+    assert stopped == [spawned.pid]
+    assert cli._find_daemon_record("https://server.example.com") is None
 
 
 def _online_record() -> cli._HostDaemonRecord:
@@ -1136,6 +1260,32 @@ def test_host_reset_id_mints_fresh_id_when_no_daemon_runs(
     cfg = yaml.safe_load(config_path.read_text())
     assert cfg["host"]["host_id"] != "a" * 32
     assert cfg["host"]["name"] == "my-laptop"
+
+
+def test_host_reset_id_honors_config_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`host reset-id` changes the identity the isolated daemon will load."""
+    import yaml
+
+    fallback_path = tmp_path / "fallback" / "config.yaml"
+    fallback_path.parent.mkdir(parents=True)
+    fallback_path.write_text(
+        yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "fallback-host"}})
+    )
+    config_home = tmp_path / "isolated"
+    config_home.mkdir()
+    isolated_path = config_home / "config.yaml"
+    isolated_path.write_text(
+        yaml.safe_dump({"host": {"host_id": "b" * 32, "name": "isolated-host"}})
+    )
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", fallback_path)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(isolated_path.read_text())["host"]["host_id"] != "b" * 32
+    assert yaml.safe_load(fallback_path.read_text())["host"]["host_id"] == "a" * 32
 
 
 def test_host_reset_id_refuses_while_a_daemon_is_running(
@@ -1609,6 +1759,7 @@ def test_host_stop_stops_sessions_before_daemon(
             assert kwargs["params"] == {
                 "limit": 1000,
                 "include_archived": "true",
+                "visibility": "all",
             }
             return cli._HostHttpResult(
                 status_code=200,

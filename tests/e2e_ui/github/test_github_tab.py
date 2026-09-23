@@ -30,7 +30,11 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
+from tests.e2e_ui.conftest import (
+    fetch_with_retry,
+    open_right_rail,
+    workspace_bar_needs_collapse,
+)
 
 _PR_NUMBER = 4242
 
@@ -235,7 +239,14 @@ def test_composer_pr_link_opens_github_tab(
         "**/v1/hosts/composer-pr-host/worktrees?*",
         lambda route: route.fulfill(
             json={
-                "data": [{"path": workspace, "branch": branch, "is_main": True, "detached": False}]
+                "data": [
+                    {
+                        "path": workspace,
+                        "branch": branch,
+                        "is_main": False,
+                        "detached": False,
+                    }
+                ]
             }
         ),
     )
@@ -250,12 +261,16 @@ def test_composer_pr_link_opens_github_tab(
     expect(page.get_by_test_id("composer-workspace-dir")).to_have_text("demo-app")
     expect(page.get_by_test_id("composer-git-branch")).to_have_text(branch)
     context = page.get_by_test_id("composer-context-ring")
-    expect(context).to_have_text("66%")
+    expect(context).to_have_accessible_name("66% of context used")
     bar = page.get_by_test_id("composer-workspace-controls")
     expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
     expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
     bar_bounds = bar.bounding_box()
     assert bar_bounds is not None
+    # When the labels cannot all show in full, the bar collapses to icons (never
+    # ellipses); the collapse must be justified by the expanded layout not fitting.
+    collapsed = bar.get_attribute("data-labels") == "collapsed"
+    assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_count)
     font_sizes = {}
     centers = {}
     bounds = {}
@@ -267,9 +282,16 @@ def test_composer_pr_link_opens_github_tab(
     ):
         indicator = page.get_by_test_id(test_id)
         label = indicator.locator("span").last
-        expect(label).to_be_visible()
-        font_sizes[test_id] = label.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
-        for part, element in (("label", label), ("icon", indicator.locator("svg").first)):
+        parts = [("icon", indicator.locator("svg").first)]
+        # Only the directory and branch text collapse; the PR number and the
+        # context percentage stay visible in a crowded bar.
+        if collapsed and test_id in ("composer-workspace-dir", "composer-git-branch"):
+            expect(label).to_be_hidden()
+        elif test_id != "composer-context-ring":
+            expect(label).to_be_visible()
+            font_sizes[test_id] = label.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
+            parts.insert(0, ("label", label))
+        for part, element in parts:
             rect = element.bounding_box()
             assert rect is not None
             bounds[f"{test_id}.{part}"] = rect
@@ -278,17 +300,13 @@ def test_composer_pr_link_opens_github_tab(
     assert pr_bounds is not None and context_bounds is not None
     group_gap = context_bounds["x"] - pr_bounds["x"] - pr_bounds["width"]
     pair_gaps = {}
-    for test_id in ("composer-pr-link", "composer-context-ring"):
+    for test_id in ("composer-pr-link",):
         icon, label = bounds[f"{test_id}.icon"], bounds[f"{test_id}.label"]
         pair_gaps[test_id] = label["x"] - icon["x"] - icon["width"]
     painted_right_edges = {
         "composer-pr-link": pr_link.locator("path").evaluate(
             "path => path.getBoundingClientRect().right"
         ),
-        "composer-context-ring": context.locator("circle").first.evaluate("""circle => {
-            const stroke = parseFloat(getComputedStyle(circle).strokeWidth);
-            return circle.getBoundingClientRect().right + stroke * circle.getScreenCTM().a / 2;
-        }"""),
     }
     painted_gaps = {
         test_id: bounds[f"{test_id}.label"]["x"] - right
@@ -344,10 +362,20 @@ def test_composer_pr_link_opens_github_tab(
         assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
-        assert group_gap > pair_gap, (group_gap, pair_gaps)
     for name, painted_gap in painted_gaps.items():
-        assert painted_gap == pytest.approx(4, abs=0.1), (name, painted_gaps)
-    assert group_gap == pytest.approx(8, abs=0.1)
+        assert painted_gap == pytest.approx(7.5, abs=0.1), (name, painted_gaps)
+    directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
+    branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
+    assert directory_bounds is not None and branch_bounds is not None
+    selector_gaps = (
+        branch_bounds["x"] - directory_bounds["x"] - directory_bounds["width"],
+        pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"],
+    )
+    expected_selector_gap = 2 if is_mobile else 8
+    for gap in selector_gaps:
+        assert gap == pytest.approx(expected_selector_gap, abs=0.1), selector_gaps
+    assert context_bounds["x"] >= pr_bounds["x"] + pr_bounds["width"]
+    assert group_gap > 0
 
 
 def _stub_github_outdated_host(page: Page) -> None:

@@ -1,12 +1,4 @@
-"""Namespaced acp:<slug> harness overrides survive to spawn selection.
-
-A session created with harness_override="acp:goose" on a non-ACP bundle used
-to persist bare "acp" (the validator canonicalized), and the runner's spawn
-fell back to the FIRST configured agent — the wrong one. The validator now
-returns the namespaced value (validating the slug against the configured
-acp: agents), and _build_spawn_env_from_spec hands the raw namespaced
-harness to _build_acp_spawn_env for agent selection.
-"""
+"""Regression tests for namespaced ACP harness overrides."""
 
 from __future__ import annotations
 
@@ -14,9 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from omnigent.spec.types import AgentSpec, ExecutorSpec
+
 
 def _fake_agent() -> SimpleNamespace:
-    """The minimal Agent stand-in _validated_harness_override needs."""
     return SimpleNamespace(
         id="agent-1",
         name="pi-bundle",
@@ -25,10 +18,11 @@ def _fake_agent() -> SimpleNamespace:
     )
 
 
-def _fake_spec(executor_type: str = "omnigent") -> SimpleNamespace:
-    """An agent spec whose config carries NO acp harness."""
-    return SimpleNamespace(
-        executor=SimpleNamespace(type=executor_type, config={"harness": "pi"}),
+def _fake_spec(executor_type: str = "omnigent") -> AgentSpec:
+    return AgentSpec(
+        spec_version=1,
+        name="pi-bundle",
+        executor=ExecutorSpec(type=executor_type, config={"harness": "pi"}),
     )
 
 
@@ -76,12 +70,6 @@ def test_validator_rejects_unknown_slug(monkeypatch: pytest.MonkeyPatch) -> None
 def test_validator_keeps_executor_type_gate_for_namespaced_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A configured acp:<slug> on a non-omnigent executor is still rejected.
-
-    The namespaced branch must not bypass the loadable-spec / executor-type
-    gates: an override on an executor without config.harness would be a
-    silent no-op, which the validator exists to reject.
-    """
     from omnigent.errors import OmnigentError
     from omnigent.server.routes._sessions import helpers
 
@@ -98,8 +86,6 @@ def test_validator_keeps_executor_type_gate_for_namespaced_override(
 def test_spawn_env_builder_hands_slug_to_acp_builder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The spawn-env dispatch hands the raw acp:<slug> to _build_acp_spawn_env
-    so it resolves the requested agent instead of the first configured one."""
     from omnigent.runner import app as runner_app
 
     seen: dict[str, object] = {}
@@ -113,9 +99,7 @@ def test_spawn_env_builder_hands_slug_to_acp_builder(
         _fake_acp_builder,
     )
 
-    spec = SimpleNamespace(
-        executor=SimpleNamespace(type="omnigent", config={"harness": "pi"}),
-    )
+    spec = _fake_spec()
 
     env = runner_app._build_spawn_env_from_spec(
         spec,
@@ -130,8 +114,6 @@ def test_spawn_env_builder_hands_slug_to_acp_builder(
 def test_acp_builder_selects_agent_from_harness_kwarg(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_build_acp_spawn_env resolves the agent named by the harness kwarg even
-    when the spec's executor.config carries no acp harness."""
     from omnigent.runtime import workflow
 
     gemini = SimpleNamespace(
@@ -162,13 +144,7 @@ def test_acp_builder_selects_agent_from_harness_kwarg(
         lambda slug, *a, **k: {"fake-gemini": gemini, "fake-goose": goose}.get(slug),
     )
 
-    spec = SimpleNamespace(
-        executor=SimpleNamespace(type="omnigent", config={"harness": "pi"}, model=None),
-        mcp_servers=[],
-        os_env=None,
-    )
-
-    env = workflow._build_acp_spawn_env(spec, harness="acp:fake-goose")
+    env = workflow._build_acp_spawn_env(_fake_spec(), harness="acp:fake-goose")
     assert env["HARNESS_ACP_COMMAND"] == "goose-cmd", (
         "the harness kwarg must select the named agent, not the first configured one"
     )

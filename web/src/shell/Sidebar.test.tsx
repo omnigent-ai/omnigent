@@ -1,3 +1,8 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
@@ -9,7 +14,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -237,18 +241,21 @@ function renderSidebar(
   info?: ServerInfo,
   extensions: ExtensionCatalogItem[] = [],
   onClose = vi.fn(),
+  config: SidebarConfig = sidebarConfig,
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
-      <ExtensionCatalogProvider extensions={extensions}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[initialEntry]}>
-            {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
-          </MemoryRouter>
-        </TooltipProvider>
-      </ExtensionCatalogProvider>
+      <SidebarDataProvider config={config}>
+        <ExtensionCatalogProvider extensions={extensions}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
+            </MemoryRouter>
+          </TooltipProvider>
+        </ExtensionCatalogProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -347,6 +354,46 @@ const TEST_EXTENSION: ExtensionCatalogItem = {
     style_url: null,
   },
 };
+
+describe("Sidebar scroll divider", () => {
+  it("separates fixed navigation only while sessions are scrolled", () => {
+    mockConversations([conv("session-1", "A session")]);
+    renderSidebar();
+
+    const divider = screen.getByTestId("sidebar-scroll-divider");
+    const scrollContainer = screen.getByRole("navigation");
+
+    expect(divider).toHaveClass("opacity-0", "absolute", "pointer-events-none");
+    expect(divider).toHaveAttribute("aria-hidden", "true");
+    expect(scrollContainer).not.toContainElement(divider);
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 1 } });
+    expect(divider).toHaveClass("opacity-100");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 100 } });
+    expect(divider).toHaveClass("opacity-100");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 0 } });
+    expect(divider).toHaveClass("opacity-0");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: -10 } });
+    expect(divider).toHaveClass("opacity-0");
+  });
+
+  it("resets when returning from settings to a fresh session list", () => {
+    mockConversations([conv("session-1", "A session")]);
+    renderSidebar();
+
+    fireEvent.scroll(screen.getByRole("navigation"), { target: { scrollTop: 100 } });
+    expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-100");
+
+    fireEvent.click(screen.getByTestId("sidebar-settings-float"));
+    expect(screen.queryByTestId("sidebar-scroll-divider")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("link", { name: /back/i }));
+    expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-0");
+  });
+});
 
 describe("Sidebar session list", () => {
   it.each([null, 1, 2, 3, 4])(
@@ -473,14 +520,94 @@ describe("Sidebar session list", () => {
     expect(error).not.toHaveClass("text-sm");
   });
 
-  it("keeps the session list scrollable without visible scrollbar chrome", () => {
-    mockConversations(THREE_TYPE_CONVERSATIONS);
+  it.each([
+    ["shared", "loading"],
+    ["shared", "error"],
+    ["all", "loading"],
+    ["all", "error"],
+    ["archived", "loading"],
+    ["archived", "error"],
+  ] as const)("keeps pins and expanded projects mounted during %s %s", (view, state) => {
+    projectsMock.push("Work");
+    mockConversations([
+      conv("pinned-session", "Claude Code"),
+      conv("filed-session", "Claude Code", { labels: { omni_project: "Work" } }),
+    ]);
+    seedPins(["pinned-session"]);
+    const original = useConvMock.getMockImplementation()!;
+    const retry = vi.fn();
+    const mineRetry = vi.fn();
+    useConvMock.mockImplementation((...args) => {
+      const query = original(...args);
+      if (args[4] !== (view === "archived" ? "archived" : "shared")) {
+        return { ...query, refetch: mineRetry };
+      }
+      return {
+        ...query,
+        data: undefined,
+        isLoading: state === "loading",
+        isError: state === "error",
+        error: state === "error" ? new Error("unavailable") : null,
+        refetch: retry,
+      } as ReturnType<typeof useConversations>;
+    });
     renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+    const pinned = screen.getByText("pinned-session");
+    const filed = screen.getByText("filed-session");
+    const filter = screen.getByTestId("session-filter");
 
-    const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
-    expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
-    expect(scroller.className).not.toContain("scrollbar-gutter");
+    selectSessionFilter(view);
+
+    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(screen.getByText("filed-session")).toBe(filed);
+    expect(screen.getByTestId("session-filter")).toBe(filter);
+    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+    expect(within(sessions).getByRole("status")).toHaveTextContent(
+      state === "loading" ? "Loading…" : /could not be loaded|Failed to load/,
+    );
+    if (state === "error") {
+      fireEvent.click(within(sessions).getByRole("button", { name: "Retry" }));
+      expect(retry).toHaveBeenCalledOnce();
+    }
+    selectSessionFilter("mine");
+    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(screen.getByText("filed-session")).toBe(filed);
+  });
+
+  it("reveals a thin, theme-aware scrollbar only while scrolling", () => {
+    vi.useFakeTimers();
+    try {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      renderSidebar();
+
+      const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
+      expect(scroller).toHaveClass("overflow-y-auto", "md:mr-1", "[scrollbar-width:thin]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar]:w-2");
+      expect(scroller).not.toHaveClass("[scrollbar-width:none]");
+      expect(scroller.className).not.toContain("[&::-webkit-scrollbar]:hidden");
+
+      expect(scroller).toHaveClass("[scrollbar-color:transparent_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-transparent");
+      expect(scroller).not.toHaveClass("[scrollbar-color:var(--muted-foreground)_transparent]");
+      expect(scroller.className).not.toContain("[&::-webkit-scrollbar-thumb]:bg-muted-foreground");
+
+      // Scrolling reveals the thumb.
+      act(() => {
+        fireEvent.scroll(scroller, { target: { scrollTop: 40 } });
+      });
+      expect(scroller).toHaveClass("[scrollbar-color:var(--muted-foreground)_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-muted-foreground");
+
+      // It hides again once scrolling settles.
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(scroller).toHaveClass("[scrollbar-color:transparent_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-transparent");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows a draft icon only beside sessions with unfinished composer content", () => {
@@ -622,6 +749,69 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("session-filter-shared")).toHaveAttribute("aria-checked", "true");
   });
 
+  it("withholds the conversation list until identity is ready", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (identityReady: boolean) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider identityReady={identityReady}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(false));
+
+    expect(screen.queryByTestId("sidebar-conversation-list")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sessions");
+
+    rerender(tree(true));
+    expect(screen.getByTestId("sidebar-conversation-list")).toBeInTheDocument();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+  });
+
+  it("leaves Shared when runtime policy makes it unavailable", () => {
+    localStorage.setItem("omnigent:session-filter", "shared");
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+    ]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (config: SidebarConfig) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider config={config}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(sidebarConfig));
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+
+    rerender(tree({ ...sidebarConfig, sharedAvailable: false }));
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(localStorage.getItem("omnigent:session-filter")).toBe("mine");
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("session-filter-shared")).toBeNull();
+  });
+
   it("drops a persisted Shared filter on a single-user server", () => {
     // "Shared sessions" isn't in the menu on a loopback-only server, so honoring
     // a value stored against a multi-user one would scope the list to a slice
@@ -712,19 +902,17 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("conv_live")).toBeInTheDocument();
   });
 
-  it("requests the list with archived included", () => {
+  it("requests mine and shared scopes without an all-sessions scan", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
-
-    // The sidebar makes two useConversations calls: one all-sessions query
-    // (includeArchived: true, reconcileWhileConnected: true — for inbox counts
-    // and WS reconciliation) and one tab-scoped filtered query (includeArchived:
-    // false, for display). Assert the all-sessions call is present and correct.
     const calls = useConvMock.mock.calls;
-    expect(calls.length).toBeGreaterThanOrEqual(1);
-    const allSessionsCall = calls.find((call) => call[0] === "" && call[1] === true);
-    expect(allSessionsCall).toBeDefined();
-    expect(allSessionsCall?.[2]).toMatchObject({ reconcileWhileConnected: true });
+    expect(calls.some((call) => call[1] === true)).toBe(false);
+    expect(calls.find((call) => call[4] === "mine")?.[2]).toMatchObject({
+      refreshIntervalMs: 60_000,
+    });
+    expect(calls.find((call) => call[4] === "shared")?.[2]).toMatchObject({
+      refreshIntervalMs: 180_000,
+    });
   });
 
   it("opens the command palette when the Search button is clicked", () => {
@@ -768,11 +956,13 @@ describe("Sidebar session list", () => {
     expect(search).toHaveAttribute("data-size", "icon-xs");
     expect(search).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(search).not.toHaveClass("rounded-sm");
-    expect(search.querySelector("svg")).toHaveClass("ui-icon");
+    expect(search.querySelector("svg")).toHaveClass("size-4");
+    expect(search.querySelector("svg")).not.toHaveClass("ui-icon");
     expect(settings).toHaveAttribute("aria-label", "Settings");
     expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6", "rounded-[var(--radius-md)]");
-    expect(settings.querySelector("svg")).toHaveClass("ui-icon");
+    expect(settings).toHaveClass("size-6", "rounded-[8px]");
+    expect(settings.querySelector("svg")).toHaveClass("size-4");
+    expect(settings.querySelector("svg")).not.toHaveClass("ui-icon");
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
@@ -920,11 +1110,13 @@ describe("Sidebar session list", () => {
     const filterSessions = within(sessionsSection!).getByRole("button", {
       name: "Filter sessions",
     });
-    // The filter never fades; its wrapper re-enables hit-testing inside the
-    // pointer-events-gated outer box (see the overlay hit-test spec below).
-    expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
-    expect(filterSessions.parentElement).toHaveClass("pointer-events-auto", "flex");
-    expect(filterSessions.parentElement!.parentElement).toHaveClass("absolute", "right-1", "flex");
+    // The filter never fades; its persistent-action wrapper re-enables hit-testing
+    // inside the pointer-events-gated outer box (see the overlay hit-test spec below).
+    const filterTooltipTrigger = filterSessions.parentElement!;
+    const filterPersistentAction = filterTooltipTrigger.parentElement!;
+    expect(filterTooltipTrigger).not.toHaveClass("md:opacity-0");
+    expect(filterPersistentAction).toHaveClass("pointer-events-auto", "flex");
+    expect(filterPersistentAction.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
@@ -1011,11 +1203,13 @@ describe("Sidebar session list", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     fireEvent.click(screen.getByTestId("settings-button"));
@@ -1264,14 +1458,16 @@ describe("Sidebar failed session indicator", () => {
       const sidebar = <Sidebar open onClose={vi.fn()} />;
       return (
         <QueryClientProvider client={qc}>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={[initialEntry]}>
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-                <Route path="*" element={sidebar} />
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[initialEntry]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                  <Route path="*" element={sidebar} />
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
         </QueryClientProvider>
       );
     };
@@ -1848,7 +2044,7 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     observerCallback!([{ isIntersecting: false } as IntersectionObserverEntry], {} as never);
     expect(fetchNextPage).not.toHaveBeenCalled();
     observerCallback!([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
-    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+    expect(fetchNextPage).toHaveBeenCalledTimes(2);
 
     vi.unstubAllGlobals();
   });
@@ -2007,11 +2203,13 @@ describe("Sidebar project sections", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -2045,13 +2243,15 @@ describe("Sidebar project sections", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_filed"]}>
-            <Routes>
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_filed"]}>
+              <Routes>
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -2661,11 +2861,13 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const tree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={vi.fn()} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(tree());
@@ -2799,14 +3001,16 @@ describe("Sidebar active-row auto-scroll", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[initialEntry]}>
-            <Routes>
-              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              <Routes>
+                <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
   }
@@ -2876,4 +3080,33 @@ describe("Sidebar collapsed marker", () => {
     // still match [data-collapsed] and strip the glass border while open.
     expect(openAside).not.toHaveAttribute("data-collapsed");
   });
+});
+
+it("caps Shared display independently of Mine while revealing cached rows", async () => {
+  isServerLocalMock.mockReturnValue(false);
+  const owned = Array.from({ length: 40 }, (_, i) => conv(`owned-${i}`, "agent"));
+  const shared = Array.from({ length: 70 }, (_, i) =>
+    conv(`shared-${i}`, "agent", {
+      owner: "other@example.com",
+      permission_level: 1,
+      updated_at: 100 - i,
+    }),
+  );
+  mockConversations([...owned, ...shared]);
+  renderSidebar(true, "/", undefined, undefined, [], vi.fn(), {
+    ...sidebarConfig,
+    sharedDisplayPageSize: 30,
+  });
+  selectSessionFilter("mine");
+  expect(screen.getByText("owned-39", { exact: true })).toBeInTheDocument();
+  showSharedTab();
+  expect(screen.getByText("shared-29", { exact: true })).toBeInTheDocument();
+  expect(screen.queryByText("shared-30", { exact: true })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+  await waitFor(() => expect(screen.getByText("shared-59", { exact: true })).toBeInTheDocument());
+  expect(screen.queryByText("shared-60", { exact: true })).toBeNull();
+  selectSessionFilter("mine");
+  expect(screen.getByText("owned-39", { exact: true })).toBeInTheDocument();
+  showSharedTab();
+  expect(screen.queryByText("shared-30", { exact: true })).toBeNull();
 });

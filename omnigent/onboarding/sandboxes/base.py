@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import math
+import os
 import secrets
 import shlex
 from abc import ABC, abstractmethod
@@ -48,6 +51,86 @@ pins a commit). It bakes the full omnigent install plus git / tmux /
 curl and the coding-harness CLIs, so sandbox creation skips the
 in-sandbox dependency install. Providers layer their own override
 mechanisms (env var / server config) on top of this default."""
+
+_logger = logging.getLogger(__name__)
+
+MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
+"""Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
+
+# Global default keepalive cadence, used by every managed provider except
+# agent_sandbox. Providers whose keep_alive is idempotent ("configure once")
+# don't need a fast cadence, so the default stays cheap.
+_DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
+# agent_sandbox pushes an absolute shutdownTime forward and runs a SHORT window,
+# so it must refresh fast (its window floor is twice this). Scoped to the
+# provider so lowering it does not multiply every other provider's write load.
+_AGENT_SANDBOX_KEEPALIVE_INTERVAL_S: float = 60.0
+_MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
+# Ceiling so a finite-but-huge override (e.g. 1e308) cannot overflow the
+# window-floor math (ceil(2 * interval)); an hour is already far past useful.
+_MAX_MANAGED_KEEPALIVE_INTERVAL_S: float = 3600.0
+
+
+def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
+    """
+    How often the server refreshes a live managed sandbox's liveness, in seconds.
+
+    Provider-scoped default: ``agent_sandbox`` refreshes fast (60s) because it
+    pushes an absolute deadline forward under a short window; every other
+    provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
+    overrides both when set (advanced/experimental — the operator-facing knob is
+    ``keep_warm_s``), floored at a small minimum so a typo cannot spin the loop.
+    Resolved live from the env on each call (no snapshot), so the server loop
+    cadence and the ``agent_sandbox`` window floor cannot disagree.
+    """
+    default = (
+        _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S
+        if provider == "agent_sandbox"
+        else _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+    )
+    raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        _logger.warning(
+            "ignoring %s=%r (not a number); using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            default,
+        )
+        return default
+    if not math.isfinite(parsed):
+        # "nan"/"inf" parse cleanly but blow up downstream in int/ceil(2 * x);
+        # a non-finite typo must fail safe like any other bad value.
+        _logger.warning(
+            "ignoring %s=%r (not a finite number); using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            default,
+        )
+        return default
+    if parsed < _MIN_MANAGED_KEEPALIVE_INTERVAL_S:
+        _logger.warning(
+            "%s=%r is below the %ss minimum; using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
+            _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _MIN_MANAGED_KEEPALIVE_INTERVAL_S
+    if parsed > _MAX_MANAGED_KEEPALIVE_INTERVAL_S:
+        _logger.warning(
+            "%s=%r is above the %ss maximum; using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _MAX_MANAGED_KEEPALIVE_INTERVAL_S,
+            _MAX_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _MAX_MANAGED_KEEPALIVE_INTERVAL_S
+    return parsed
+
 
 # Ceiling for the in-sandbox host restart backoff, so a host that crashes on
 # every attempt settles into a slow retry instead of a hot loop.
@@ -308,6 +391,15 @@ class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
     """
 
 
+class SandboxGoneError(click.ClickException, _sandbox_types.SandboxError):
+    """Raised when a sandbox generation definitively no longer exists.
+
+    Resumable providers use this only for a definitive absence, never for a
+    timeout, connectivity failure, or unknown state. The managed-host wake path
+    catches it and provisions a fresh sandbox generation instead.
+    """
+
+
 @dataclass
 class RemoteCommandResult:
     """
@@ -483,12 +575,15 @@ class SandboxLifecycle(ABC):
         """
         raise self._capability_error("attach to an existing sandbox")
 
-    def keep_alive(self, sandbox_id: str) -> None:
+    def keep_alive(self, sandbox_id: str) -> bool | None:
         """
         Keep the sandbox from being reclaimed while it is still in use,
         so long agent runs don't lose their host. Soft-fail:
         implementations should warn rather than raise when the provider
-        rejects the setting.
+        rejects the setting. Return ``False`` when an extension was attempted
+        but could not be confirmed (a soft failure the provider already logged),
+        so the managed keepalive loop can skip its success line; ``None`` or
+        ``True`` otherwise.
 
         Called BOTH once after a CLI bootstrap provision AND periodically
         by the managed path for as long as the sandbox has a live runner
@@ -584,6 +679,8 @@ class SandboxLifecycle(ABC):
             ``"sb-a1b2c3"``.
         :raises SandboxCapabilityError: When the provider cannot resume a
             stopped sandbox (ephemeral sandboxes / no persistent volume).
+        :raises SandboxGoneError: When the sandbox generation definitively no
+            longer exists.
         :raises click.ClickException: If the resume fails.
         """
         raise self._capability_error("resume a stopped sandbox")
@@ -812,6 +909,13 @@ class SandboxHostLauncher(SandboxLifecycle):
     class directly and override :meth:`start_host` without needing any exec
     transport.
     """
+
+    def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
+        """Set request context before provider preparation, allocation, or resume.
+
+        Providers with pre-created resources can use the resolved agent name
+        to select and validate compatible infrastructure before allocation.
+        """
 
     def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
         """Bind credentials needed for background cleanup in one workspace."""
