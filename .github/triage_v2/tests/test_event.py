@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from issue_prioritization import event
+from issue_prioritization import event, github
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification
@@ -247,7 +247,7 @@ def test_event_fetches_related_issues_for_intake_and_edits(
 
         def issue_corpus(self):
             if corpus_status:
-                raise HTTPError("https://api.github.com", corpus_status, "Unavailable", {}, None)
+                return github.GitHubClient("test-token", "omnigent-ai/omnigent").issue_corpus()
             return (
                 {
                     "number": 3,
@@ -334,13 +334,19 @@ def test_event_fetches_related_issues_for_intake_and_edits(
     monkeypatch.setattr("sys.argv", argv)
 
     if corpus_status:
-        with pytest.raises(HTTPError) as raised:
+
+        def fail_request(request, *, timeout):
+            raise HTTPError(request.full_url, corpus_status, "Unavailable", {}, None)
+
+        monkeypatch.setattr(github, "urlopen", fail_request)
+        with pytest.raises(RuntimeError) as raised:
             event.main()
-        assert raised.value.code == corpus_status
+        assert isinstance(raised.value.__cause__, HTTPError)
+        assert raised.value.__cause__.code == corpus_status
         payload = json.loads((tmp_path / "event.json").read_text())
         assert payload["status"] == "failed"
         assert payload["operation"] == "fetch_related_issues"
-        assert payload["error_type"] == "HTTPError"
+        assert payload["error_type"] == "RuntimeError"
         assert payload["issue_number"] == 7
         assert payload["mode"] == mode
         assert captured == []

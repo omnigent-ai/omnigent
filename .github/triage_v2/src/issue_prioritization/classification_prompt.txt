@@ -18,7 +18,8 @@ Output only JSON with these fields:
 - duplicate_confidence: probability from 0.0 to 1.0 that duplicate_of (or the
   strongest similar issue) describes the same underlying problem
 - duplicate_reasoning: one sentence comparing the trigger, mechanism, and expected outcome
-- reasoning: one sentence explaining the affected user or CUJ, whether it is blocked, and any workaround
+- reasoning: briefly explain any type override, then separately explain the
+  affected user or CUJ, whether it is blocked, and any workaround
 
 Classify the actual request before judging bug-report completeness. Treat a
 [Bug] title or Bug label as the author's reported intent. Reclassify as Feature
