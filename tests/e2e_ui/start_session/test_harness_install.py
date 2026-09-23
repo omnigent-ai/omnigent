@@ -1,13 +1,11 @@
-"""E2E: one-click harness install from the new-session landing page.
+"""E2E: missing harnesses are disabled in the new-session picker.
 
-Covers the user journey where the selected agent's harness isn't set up on the
-chosen host: the composer shows an "Install" button (instead of the "run
-omni setup" hint), clicking it installs the harness, and the readiness
-warning clears once the host reports the harness ready.
+Covers the picker contract where a harness that is not set up on the chosen
+host cannot be selected and its row-wide tooltip gives the repair command.
 
 Uses the same route-stubbing approach as ``test_create_custom_agent.py``:
-``/v1/info``, ``/v1/hosts``, ``/v1/agents`` and the install ``POST`` are faked
-so the test drives the real UI without a live host or a real npm install.
+``/v1/info``, ``/v1/hosts``, and ``/v1/agents`` are faked so the test drives
+the real UI without a live host or a real npm install.
 """
 
 from __future__ import annotations
@@ -20,6 +18,8 @@ from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
+
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
 # The stub host reports Claude ready and Codex missing. Claude remains the
@@ -167,12 +167,8 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_harnesses_body())
 
     async def handle_agent_scan(route: Route) -> None:
-        # The picker ALSO scans GET /v1/sessions?kind=any for registered agents.
-        # The seeded_session fixture creates real sessions in the DB, so without
-        # this stub those leak in as agents and the picker auto-selects the
-        # built-in Claude Code (ready) instead of our unconfigured Codex —
-        # leaving no "Set up Codex" notice (the CI-only failure). Return none so
-        # only the stubbed /v1/agents Codex populates the picker.
+        # Exclude real agents left in the shared server so the stubbed Codex
+        # stays selected and its setup notice remains visible.
         await route.fulfill(
             status=200, content_type="application/json", body=json.dumps({"data": []})
         )
@@ -193,8 +189,11 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
 
     await page.route("**/v1/info", handle_info)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
     await page.route("**/v1/harnesses", handle_harnesses)
     await page.route(f"**/v1/hosts/*/harnesses/{_HARNESS}/install", handle_install)
 
@@ -212,12 +211,11 @@ async def _seed_workspace(page) -> None:
 # ── Tests ──────────────────────────────────────────────────────────
 
 
-def test_install_button_installs_missing_harness(
-    seeded_session: tuple[str, str],
+def test_missing_harness_is_disabled_with_repair_tooltip(
+    live_server: str,
 ) -> None:
-    """The composer offers Install for a missing harness; clicking it installs
-    and clears the readiness warning."""
-    base_url, _session_id = seeded_session
+    """A missing harness stays unselectable and explains how to repair it."""
+    base_url = live_server
     _run_in_fresh_loop(_drive_install(base_url))
 
 
@@ -234,45 +232,19 @@ async def _drive_install(base_url: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # The composer auto-selects the built-in Claude Code (ranked first),
-            # NOT our stubbed Codex agent — and Claude Code is ready on the host,
-            # so no "Set up" notice appears. Explicitly select Codex in the
-            # picker: open it, wait for the Codex row to render (it mounts only
-            # after the /v1/agents fetch resolves — can lag under CI load), then
-            # click it. Only then does the composer show the "Set up Codex"
-            # notice for its unconfigured harness. Codex is a fully supported
-            # harness, so it lists inline even while it needs setup — no "More"
-            # drill-in.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(picker).to_have_attribute("aria-label", re.compile(r"^Claude Code,"))
+            await picker.click()
             codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
             await expect(codex_option).to_be_visible(timeout=60_000)
-            await codex_option.click()
-
-            setup = page.get_by_test_id("new-chat-landing-harness-setup")
-            await expect(setup).to_be_visible(timeout=60_000)
-            await setup.click()
-
-            # The dialog's checklist offers a one-click Install for this harness.
-            install_button = page.get_by_test_id("harness-setup-install")
-            await expect(install_button).to_be_visible(timeout=5_000)
-
-            # Install → the endpoint is hit and the warning clears once the host
-            # reports the harness ready (the response's readiness map is applied
-            # to the cache, so no reconnect is needed).
-            await install_button.click()
-            await _wait_until(lambda: len(install_requests) == 1)
-            await expect(page.get_by_test_id("new-chat-landing-harness-warning")).to_be_hidden(
-                timeout=10_000
+            await expect(codex_option).to_have_attribute("aria-disabled", "true")
+            await codex_option.get_by_text("Codex", exact=True).hover()
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-tooltip-ag_codex_e2e")
+            ).to_contain_text(
+                "Codex isn't configured on e2e-host — run omni setup on that machine."
             )
+            await expect(picker).to_have_attribute("aria-label", re.compile(r"^Claude Code,"))
+            assert install_requests == []
         finally:
             await browser.close()
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")

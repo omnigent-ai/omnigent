@@ -35,24 +35,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
-from omnigent import _native_forwarder_health as native_forwarder_health
-from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
-from omnigent.codex_model_vocabulary import (
+from omnigent.errors import HarnessTransportClosedError
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.models import model_catalog
+from omnigent.models.codex_model_vocabulary import (
     EXTENDED_CATALOG_MODELS,
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
 )
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
-from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
-from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
+from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
+from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -84,6 +86,7 @@ logger = logging.getLogger(__name__)
 # Not Databricks-specific: the same fallback applies to any gateway producer
 # (Databricks AI gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
+_GATEWAY_AUTH_TIMEOUT_MS = 15_000
 
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped Codex App Server boundaries
@@ -273,6 +276,112 @@ def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[st
     if model:
         usage["model"] = model
     return usage
+
+
+def _extract_codex_thread_total_usage(params: object) -> dict[str, int] | None:
+    """Extract the raw cumulative counters from a ``thread/tokenUsage/updated``
+    payload's ``total`` breakdown.
+
+    Codex's ``tokenUsage.total`` is cumulative across the whole thread (the
+    CLI subtracts prior totals to recover per-turn deltas), unlike ``last``,
+    which covers only the latest model request. Returns the raw counters so
+    the session can diff them against the previous turn boundary.
+
+    :param params: Codex ``thread/tokenUsage/updated`` params.
+    :returns: The raw cumulative counters, or ``None`` when the payload has
+        no usable ``total`` breakdown (caller falls back to ``last``).
+    """
+    if not isinstance(params, dict):
+        return None
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    total = token_usage.get("total")
+    if not isinstance(total, dict):
+        return None
+    if not any(
+        isinstance(total.get(key), int) for key in ("inputTokens", "outputTokens", "totalTokens")
+    ):
+        return None
+    return {
+        "inputTokens": int(total.get("inputTokens") or 0),
+        "cachedInputTokens": int(total.get("cachedInputTokens") or 0),
+        "outputTokens": int(total.get("outputTokens") or 0),
+        "totalTokens": int(total.get("totalTokens") or 0),
+    }
+
+
+def _codex_turn_usage_from_totals(
+    latest: dict[str, int],
+    baseline: dict[str, int] | None,
+    model: str | None,
+) -> dict[str, object]:
+    """Map the growth of the thread's cumulative counters since the last turn
+    boundary onto the wire shape that :class:`TurnComplete` consumes.
+
+    A turn that spans several model requests (model -> tool -> model -> final)
+    emits one ``thread/tokenUsage/updated`` per request, and ``last`` covers
+    only the newest request — so the turn's usage is the delta of the
+    cumulative ``total`` counters instead. Deltas clamp at zero so a counter
+    reset can never report negative usage. Cached tokens split out of
+    ``input_tokens`` exactly as in :func:`_extract_codex_last_turn_usage`.
+
+    :param latest: Raw cumulative counters from the newest usage update.
+    :param baseline: Raw cumulative counters consumed at the previous turn
+        boundary, or ``None`` for the thread's first turn.
+    :param model: The resolved model, stamped as ``"model"`` (see
+        :func:`_extract_codex_last_turn_usage`).
+    """
+
+    def _delta(key: str) -> int:
+        prior = baseline.get(key, 0) if baseline else 0
+        return max(latest.get(key, 0) - prior, 0)
+
+    input_total = _delta("inputTokens")
+    cached = min(_delta("cachedInputTokens"), input_total)
+    usage: dict[str, object] = {
+        "input_tokens": input_total - cached,
+        "output_tokens": _delta("outputTokens"),
+        "total_tokens": _delta("totalTokens"),
+    }
+    if cached:
+        usage["cache_read_input_tokens"] = cached
+    if model:
+        usage["model"] = model
+    return usage
+
+
+def _extract_codex_context_tokens(params: object) -> int | None:
+    """Window-fill snapshot from a ``thread/tokenUsage/updated`` payload's
+    ``last`` breakdown: the size of the latest model request, the proxy for
+    how full the context window is going into the next one.
+
+    Reported as ``context_tokens`` — a per-update snapshot the occupancy
+    meter reads (server-side it pairs with the model's catalog window to
+    size the ring). It is never summed across a turn and is distinct from
+    the billing ``total_tokens``, which on the cumulative-delta path is a
+    turn total, not window fill. ``last.totalTokens`` already covers input
+    (inclusive of cached, which still occupies the window) plus output;
+    recompute from components when the provider omits it. Mirrors
+    ``pi_executor``'s last-call context split.
+
+    :param params: Codex ``thread/tokenUsage/updated`` params.
+    :returns: The window-fill token count, or ``None`` when the payload has
+        no usable ``last`` breakdown.
+    """
+    if not isinstance(params, dict):
+        return None
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    last = token_usage.get("last")
+    if not isinstance(last, dict):
+        return None
+    total = int(last.get("totalTokens") or 0)
+    if total > 0:
+        return total
+    recomputed = int(last.get("inputTokens") or 0) + int(last.get("outputTokens") or 0)
+    return recomputed or None
 
 
 def _format_codex_error_params(params: object) -> str:
@@ -497,22 +606,48 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     codex signals back out of it, so those names have to survive the filter
     (see :data:`_CODEX_OMNIGENT_LAUNCH_ENV_VARS`).
 
+    Resource attributes retain deployment metadata and identify these launches
+    with ``launch_mode=omni``. Exporter endpoints and credentials remain filtered;
+    Codex's own telemetry configuration controls whether and where it exports.
+
     :returns: Filtered environment dict.
     """
-    return clean_agent_env(
+    env = clean_agent_env(
         allow_prefixes=("OPENAI_", "REQUESTS_", "CODEX_HOME"),
         allow_exact=(
             "PYTHONUTF8",
+            "OTEL_RESOURCE_ATTRIBUTES",
             "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
             "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+            # Service-principal M2M credentials, so a Databricks-gateway
+            # ``auth.command`` can mint an OAuth token from the SP on each
+            # refresh. Only DATABRICKS_BEARER survived before, forcing a
+            # pre-minted (expiring) token or an inlined secret; these let the
+            # standard client-credentials mint work on a non-interactive host.
+            # DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN are deliberately NOT
+            # here (they stay host secrets, gated behind env_passthrough).
+            "DATABRICKS_CLIENT_ID",
+            "DATABRICKS_CLIENT_SECRET",
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
     )
+    resource_attributes = [
+        attribute
+        for attribute in env.get("OTEL_RESOURCE_ATTRIBUTES", "").split(",")
+        if attribute.strip() and attribute.partition("=")[0].strip() != "launch_mode"
+    ]
+    env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join([*resource_attributes, "launch_mode=omni"])
+    return env
 
 
-def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
+def codex_skill_sources(
+    bundle_dir: Path | None,
+    home: Path,
+    *,
+    codex_home: Path | None = None,
+) -> list[Path]:
     """
     Build the ordered Codex skill-source list: bundle skills, then host skills.
 
@@ -521,18 +656,24 @@ def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
     ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
     provider — so the linked set and the menu cannot drift on which roots
     are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    host-installed ``<home>/.codex/skills/`` (a bundled skill shadows a host
-    skill of the same name). Only existing directories are returned.
+    the host-installed skills dir (a bundled skill shadows a host skill of
+    the same name). Only existing directories are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
     :param home: The user home directory (``Path.home()``); injected so
-        tests and the menu provider can pin it.
+        tests and the menu provider can pin it. The host skills dir defaults
+        to ``<home>/.codex/skills``.
+    :param codex_home: When set, the resolved Codex home whose ``skills/`` is
+        the host source instead of ``<home>/.codex/skills``. Codex honors
+        ``$CODEX_HOME`` for its config, so the native launch passes the
+        resolved home here to keep the seeded skills and the menu in step with
+        the CLI's own ``$CODEX_HOME``.
     :returns: Existing skill-dir roots in priority order.
     """
     sources: list[Path] = []
     if bundle_dir is not None and (bundle_dir / "skills").is_dir():
         sources.append(bundle_dir / "skills")
-    host = home / ".codex" / "skills"
+    host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
         sources.append(host)
     return sources
@@ -662,6 +803,8 @@ def populate_codex_skills_from_bundle(
     codex_home: Path,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    *,
+    source_codex_home: Path | None = None,
 ) -> None:
     """
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
@@ -669,10 +812,9 @@ def populate_codex_skills_from_bundle(
     Shared by the wrapped ``codex`` executor and the ``codex-native``
     launch path so both expose the same skill surface. Builds the source
     list in priority order — the agent's own ``<bundle>/skills/`` before
-    host-installed ``~/.codex/skills/`` (so a bundled skill shadows a
-    host skill of the same name) — and delegates to
-    :func:`_populate_codex_skills`, which honours ``skills_filter``
-    (``"all"`` / ``"none"`` / list of names).
+    the host skills dir (so a bundled skill shadows a host skill of the same
+    name) — and delegates to :func:`_populate_codex_skills`, which honours
+    ``skills_filter`` (``"all"`` / ``"none"`` / list of names).
 
     :param codex_home: The CODEX_HOME whose ``skills/`` subdir Codex
         scans, e.g. a per-conversation temp dir or the per-bridge native
@@ -683,9 +825,13 @@ def populate_codex_skills_from_bundle(
         first (highest-priority) source when present.
     :param skills_filter: The spec's ``skills_filter``: ``"all"`` /
         ``"none"`` / a list of skill names.
+    :param source_codex_home: When set, the resolved host Codex home to read
+        skills from instead of ``~/.codex``. The native launch passes the
+        ``$CODEX_HOME``-resolved home so the seeded skills match what the CLI
+        loads; the wrapped executor omits it and keeps ``~/.codex``.
     :returns: None.
     """
-    skill_sources = codex_skill_sources(bundle_dir, Path.home())
+    skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
     _populate_codex_skills(codex_home / "skills", skills_filter, skill_sources)
 
 
@@ -791,6 +937,7 @@ def _populate_codex_home_config(
     minimal_config: bool | None = None,
     inject_hooks: bool = False,
     extend_model_catalog: bool = False,
+    supported_efforts: frozenset[str] = CODEX_EFFORTS,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -915,7 +1062,7 @@ def _populate_codex_home_config(
             continue
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
-            _normalize_copied_codex_effort(dest_path)
+            _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
@@ -1642,7 +1789,11 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
-def _normalize_copied_codex_effort(config_path: Path) -> None:
+def _normalize_copied_codex_effort(
+    config_path: Path,
+    *,
+    supported_efforts: frozenset[str] = CODEX_EFFORTS,
+) -> None:
     """Rewrite a deprecated top-level ``model_reasoning_effort`` in the
     session's private copy of ``config.toml``.
 
@@ -1654,15 +1805,19 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
     verbatim into every per-session ``CODEX_HOME``, that one app-written key
     fails **every** codex turn on such machines.
 
-    Values already in :data:`CODEX_EFFORTS` are left untouched, as are
-    values with no known alias (codex surfaces its own error for those) and
-    anything below the first table header. Only the session's private copy
+    Values already in *supported_efforts* (defaults to :data:`CODEX_EFFORTS`,
+    or :data:`CODEX_NATIVE_EFFORTS` for native CLI runs) are left untouched,
+    as are values with no known alias (codex surfaces its own error for those)
+    and anything below the first table header. Only the session's private copy
     is modified — never the user's real ``~/.codex/config.toml``.
 
     :param config_path: The copied ``config.toml`` inside the per-session
         ``CODEX_HOME``. Unreadable/unwritable files are skipped (best
         effort — the copy already succeeded, so this only degrades back to
         the pre-normalization behavior).
+    :param supported_efforts: Set of effort values considered supported for
+        this session runtime (e.g. :data:`CODEX_EFFORTS` or
+        :data:`CODEX_NATIVE_EFFORTS`).
     """
     try:
         text = config_path.read_text(encoding="utf-8")
@@ -1681,7 +1836,7 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
             match = _EFFORT_KEY_RE.match(content)
             if match is not None:
                 value = match.group(2)
-                if value not in CODEX_EFFORTS:
+                if value not in supported_efforts:
                     replacement = EFFORT_ALIASES.get(value)
                     if replacement is not None:
                         line_ending = line[len(content) :]
@@ -1756,7 +1911,7 @@ def _databricks_codex_config_overrides(
             f"base_url={json.dumps(base_url)},"
             'auth={command="sh",'
             f'args=["-c",{auth_command_json}],'
-            "timeout_ms=5000,"
+            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
             'wire_api="responses"}'
@@ -1817,7 +1972,7 @@ def _provider_codex_config_overrides(
         f"base_url={json.dumps(base_url)},"
         'auth={command="sh",'
         f'args=["-c",{auth_command_json}],'
-        "timeout_ms=5000,"
+        f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
         f"refresh_interval_ms={_GATEWAY_AUTH_REFRESH_MS}"
         "},"
         f'wire_api="{effective_wire_api}"}}'
@@ -2247,7 +2402,12 @@ class _CodexAppServerSession:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
-        self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
+        self._events: asyncio.Queue[CodexMessage | HarnessTransportClosedError] = asyncio.Queue()
+        self._transport_error: HarnessTransportClosedError | None = None
+        self._closing = False
+        self._native_progress_observed = False
+        self._reader_started_turn: str | None = None
+        self._reader_completed_turn: str | None = None
         self._next_id = 1
         self._started = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -2274,11 +2434,17 @@ class _CodexAppServerSession:
         self._process_cwd: Path | None = None
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
-        # Most recent ``thread/tokenUsage/updated`` payload's ``last``
-        # turn breakdown, mapped to the wire shape. Consumed (and cleared)
-        # on the next ``turn/completed`` so each TurnComplete carries the
-        # usage for the turn that just finished.
+        # In-flight turn's usage, mapped to the wire shape: billing figures
+        # are the delta of the thread's cumulative ``tokenUsage.total``
+        # counters since the last turn boundary (``last`` covers only the
+        # latest model request, so a multi-request turn would under-report),
+        # plus a ``context_tokens`` window-fill snapshot from ``last``.
+        # Consumed (and cleared) on the next ``turn/completed``.
         self._last_turn_usage: dict[str, object] | None = None
+        # Raw cumulative ``tokenUsage.total`` counters: the newest observed
+        # values, and the snapshot consumed at the last turn boundary.
+        self._thread_usage_total_raw: dict[str, int] | None = None
+        self._thread_usage_baseline_raw: dict[str, int] | None = None
         # Serialize concurrent writes to the subprocess stdin so that parallel
         # tool-call responses don't interleave bytes on the pipe.
         self._stdin_lock = asyncio.Lock()
@@ -2286,6 +2452,12 @@ class _CodexAppServerSession:
     async def start(self) -> None:
         if self._started:
             return
+        self._closing = False
+        self._transport_error = None
+        self._native_progress_observed = False
+        self._reader_started_turn = None
+        self._reader_completed_turn = None
+        self._events = asyncio.Queue()
         self._loop = asyncio.get_running_loop()
         codex_home_root = Path(tempfile.gettempdir())
         if self._cwd and self._cwd != "/":
@@ -2394,7 +2566,7 @@ class _CodexAppServerSession:
                 # App-server threads run persisted-trusted hooks only, so the
                 # routing hooks need the trust handshake to be enforced.
                 # Imported here: the app-server module imports this one.
-                from omnigent.codex_native_app_server import trust_codex_router_hooks
+                from omnigent.harnesses.codex_native.app_server import trust_codex_router_hooks
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
@@ -2409,6 +2581,7 @@ class _CodexAppServerSession:
             raise
 
     async def close(self) -> None:
+        self._closing = True
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
             if self._proc is not None and self._proc.returncode is None:
@@ -2426,6 +2599,7 @@ class _CodexAppServerSession:
             self._cleanup_process_cwd()
             return
 
+        cancellation: asyncio.CancelledError | None = None
         if self._proc is not None and self._proc.returncode is None:
             _terminate_process_tree(self._proc)
             try:
@@ -2433,6 +2607,11 @@ class _CodexAppServerSession:
             except asyncio.TimeoutError:
                 _kill_process_tree(self._proc)
                 await self._proc.wait()
+            except asyncio.CancelledError as exc:
+                # Interrupt deadlines must still reap a child that ignores SIGTERM.
+                _kill_process_tree(self._proc)
+                await self._proc.wait()
+                cancellation = exc
         stdin = self._proc.stdin if self._proc is not None else None
         if stdin is not None:
             with suppress(Exception):
@@ -2459,6 +2638,8 @@ class _CodexAppServerSession:
         self.active_turn_id = None
         self._recent_events.clear()
         self._cleanup_process_cwd()
+        if cancellation is not None:
+            raise cancellation
 
     def _cleanup_process_cwd(self) -> None:
         if self._codex_home_dir is not None:
@@ -2469,6 +2650,15 @@ class _CodexAppServerSession:
         self._recent_events.append(message)
         if len(self._recent_events) > 20:
             self._recent_events.pop(0)
+
+    def _consume_turn_usage(self) -> dict[str, object] | None:
+        """Return the finished turn's usage and advance the thread baseline
+        so the next turn's delta excludes everything reported so far."""
+        usage = self._last_turn_usage
+        self._last_turn_usage = None
+        if self._thread_usage_total_raw is not None:
+            self._thread_usage_baseline_raw = self._thread_usage_total_raw
+        return usage
 
     def _format_recent_events(self) -> list[CodexParams]:
         formatted: list[CodexParams] = []
@@ -2516,6 +2706,9 @@ class _CodexAppServerSession:
             try:
                 message = await asyncio.wait_for(self._events.get(), timeout=remaining)
             except asyncio.TimeoutError:
+                return final_response
+            if isinstance(message, HarnessTransportClosedError):
+                # A completed turn remains successful when its process exits.
                 return final_response
             self._record_event(message)
             params = message.get("params", {})
@@ -2567,6 +2760,8 @@ class _CodexAppServerSession:
         await self.start()
         assert self._proc is not None
 
+        self._native_progress_observed = self._reader_started_turn != self._reader_completed_turn
+
         # Fresh turn: forget any prior turn's gateway-error signals and clear
         # the shared watchdog slot so a resolved earlier failure can't be
         # misattributed to this turn.
@@ -2602,10 +2797,21 @@ class _CodexAppServerSession:
             # Fresh thread: forget the prior thread's applied effort so the
             # settings update below re-sends it for this thread.
             self._applied_effort = None
+            # Fresh thread: cumulative usage counters restart at zero.
+            self._thread_usage_total_raw = None
+            self._thread_usage_baseline_raw = None
+            self._last_turn_usage = None
 
         assert self.thread_id is not None
         latest_user_content = _extract_latest_user_content(messages)
         goal_objective = _goal_objective_from_content(latest_user_content)
+        if goal_objective is not None:
+            # Reject over-long objectives here so the app-server's raw
+            # JSON-RPC -32600 error never reaches the user.
+            length_error = _goal_objective_length_error(goal_objective)
+            if length_error is not None:
+                yield ExecutorError(message=length_error)
+                return
         prompt_messages = messages
         if goal_objective is not None:
             await self._request(
@@ -2677,17 +2883,29 @@ class _CodexAppServerSession:
         active_turn_id: str = raw_active_turn_id
         self.active_turn_id = active_turn_id
 
+        retained_events: list[CodexMessage | HarnessTransportClosedError] = []
+        retaining_current_turn = False
         while not self._events.empty():
             queued_message = self._events.get_nowait()
+            if isinstance(queued_message, HarnessTransportClosedError):
+                retained_events.append(queued_message)
+                continue
             queued_turn_id: str | None = None
             queued_params = queued_message.get("params")
             if isinstance(queued_params, dict):
                 raw_queued_turn_id = queued_params.get("turnId")
+                if raw_queued_turn_id is None:
+                    queued_turn = queued_params.get("turn")
+                    if isinstance(queued_turn, dict):
+                        raw_queued_turn_id = queued_turn.get("id")
                 if isinstance(raw_queued_turn_id, str):
                     queued_turn_id = raw_queued_turn_id
             if queued_turn_id is not None and queued_turn_id == active_turn_id:
-                self._events.put_nowait(queued_message)
-                break
+                retaining_current_turn = True
+            if retaining_current_turn:
+                retained_events.append(queued_message)
+        for queued_message in retained_events:
+            self._events.put_nowait(queued_message)
 
         message_buffers: dict[str, str] = {}
         last_reasoning_item_id: str | None = None
@@ -2803,6 +3021,8 @@ class _CodexAppServerSession:
                     )
                     return
                 message = event_task.result()
+                if isinstance(message, HarnessTransportClosedError):
+                    raise message
 
                 self._record_event(message)
                 raw_method = message.get("method")
@@ -2968,8 +3188,7 @@ class _CodexAppServerSession:
                                 active_turn_id,
                                 final_response[:120],
                             )
-                            turn_usage = self._last_turn_usage
-                            self._last_turn_usage = None
+                            turn_usage = self._consume_turn_usage()
                             _notify_usage_from_dict(model=model, usage=turn_usage)
                             yield TurnComplete(response=final_response, usage=turn_usage)
                             return
@@ -2982,7 +3201,24 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
-                    self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                    total_raw = _extract_codex_thread_total_usage(params)
+                    if total_raw is not None:
+                        self._thread_usage_total_raw = total_raw
+                        self._last_turn_usage = _codex_turn_usage_from_totals(
+                            total_raw, self._thread_usage_baseline_raw, model
+                        )
+                    else:
+                        # No cumulative breakdown — fall back to the newest
+                        # request's ``last`` (under-reports multi-request turns).
+                        self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                    # context_tokens is window fill: a snapshot of the latest
+                    # request from ``last``, carried alongside the billing
+                    # figures so the occupancy meter reads it rather than the
+                    # summable ``total_tokens``.
+                    if self._last_turn_usage is not None:
+                        context_tokens = _extract_codex_context_tokens(params)
+                        if context_tokens is not None:
+                            self._last_turn_usage["context_tokens"] = context_tokens
                     continue
 
                 if method == "turn/completed":
@@ -3009,8 +3245,7 @@ class _CodexAppServerSession:
                             message_buffers=message_buffers,
                             final_response=final_response,
                         )
-                    turn_usage = self._last_turn_usage
-                    self._last_turn_usage = None
+                    turn_usage = self._consume_turn_usage()
                     _notify_usage_from_dict(model=model, usage=turn_usage)
                     yield TurnComplete(response=final_response, usage=turn_usage)
                     return
@@ -3123,19 +3358,33 @@ class _CodexAppServerSession:
             return {"error": str(exc)}
 
     async def _request(self, method: str, params: CodexParams) -> CodexMessage:
+        if self._transport_error is not None:
+            raise self._transport_error
         request_id = self._next_id
         self._next_id += 1
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexMessage] = loop.create_future()
         self._pending_requests[request_id] = future
-        await self._send_message(
-            {
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-        )
-        response = await future
+        try:
+            try:
+                await self._send_message(
+                    {
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    }
+                )
+            except Exception as exc:
+                if self._transport_error is not None:
+                    raise self._transport_error from exc
+                raise
+            response = await future
+        finally:
+            self._pending_requests.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
         error = response.get("error")
         if error:
             raise RuntimeError(str(error))
@@ -3178,6 +3427,53 @@ class _CodexAppServerSession:
         if buffer:
             yield bytes(buffer)
 
+    def _note_native_activity(self, message: CodexMessage) -> None:
+        """Retain replay hazards even when an RPC reply has not arrived yet."""
+        method = message.get("method")
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            self._native_progress_observed = True
+            return
+        if method == "turn/started":
+            turn = params.get("turn", {})
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+                self._reader_started_turn = turn["id"]
+            else:
+                self._native_progress_observed = True
+            return
+        if method == "turn/completed":
+            turn = params.get("turn", {})
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+                self._reader_completed_turn = turn["id"]
+            self._native_progress_observed = True
+            return
+        if method in {
+            "thread/started",
+            "thread/status/changed",
+            "remoteControl/status/changed",
+            "mcpServer/startupStatus/updated",
+            "account/rateLimits/updated",
+        }:
+            return
+        if method in {"item/started", "item/completed"}:
+            item = params.get("item", {})
+            if isinstance(item, dict) and item.get("type") == "userMessage":
+                return
+        self._native_progress_observed = True
+
+    def _note_transport_closed(self, detail: str, *, clean_eof: bool) -> None:
+        if self._closing or self._transport_error is not None:
+            return
+        error = HarnessTransportClosedError(
+            detail, replay_safe=clean_eof and not self._native_progress_observed
+        )
+        self._transport_error = error
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.set_exception(error)
+        # Buffered terminal/output events must be consumed before EOF.
+        self._events.put_nowait(error)
+
     async def _reader_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         try:
@@ -3186,6 +3482,8 @@ class _CodexAppServerSession:
                 if not raw:
                     continue
                 message = json.loads(raw)
+                if not isinstance(message, dict):
+                    raise ValueError("Codex app-server frame is not an object")
                 if (
                     "id" in message
                     and "method" not in message
@@ -3195,11 +3493,14 @@ class _CodexAppServerSession:
                     if future is not None and not future.done():
                         future.set_result(message)
                     continue
+                self._note_native_activity(message)
                 await self._events.put(message)
+            self._note_transport_closed("Codex app-server closed stdout", clean_eof=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error  # pragma: no cover - defensive
             logger.debug("Codex App Server reader loop ended: %s", exc)
+            self._note_transport_closed(f"Codex app-server reader failed: {exc}", clean_eof=False)
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
@@ -3244,6 +3545,8 @@ class _CodexAppServerSession:
 class _CodexSessionState:
     app_session: _CodexAppServerSession | None = None
     signature: tuple[str | None, str, str, str] | None = None
+    closing: bool = False
+    close_task: asyncio.Task[None] | None = None
 
 
 class _AppSessionFactory(Protocol):
@@ -3582,26 +3885,72 @@ class CodexExecutor(Executor):
         return await state.app_session.enqueue_message(content)
 
     async def close_session(self, session_key: str) -> None:
-        state = self._session_states.pop(session_key, None)
+        state = self._session_states.get(session_key)
+        closed_session: _CodexAppServerSession | None = None
         if state is not None and state.app_session is not None:
-            await state.app_session.close()
+            closed_session = await self._close_state_app_session(state)
+        # Failed or cancelled cleanup must remain reachable for the next reap.
+        if (
+            state is not None
+            and self._session_states.get(session_key) is state
+            and state.app_session is closed_session
+        ):
+            del self._session_states[session_key]
 
     async def close(self) -> None:
         keys = list(self._session_states.keys())
         for key in keys:
             await self.close_session(key)
 
+    async def _close_state_app_session(
+        self, state: _CodexSessionState
+    ) -> _CodexAppServerSession | None:
+        app_session = state.app_session
+        if app_session is None:
+            return None
+        if state.close_task is None:
+            state.closing = True
+            state.close_task = asyncio.create_task(app_session.close())
+        close_task = state.close_task
+        try:
+            await close_task
+        except BaseException:
+            if state.close_task is close_task:
+                state.close_task = None
+            raise
+        if state.close_task is close_task:
+            state.close_task = None
+        return app_session
+
     async def _ensure_app_session(
         self,
+        session_key: str,
         state: _CodexSessionState,
         *,
         signature: tuple[str | None, str, str, str],
         effective_cwd: str,
     ) -> _CodexAppServerSession:
-        if state.signature == signature and state.app_session is not None:
-            return state.app_session
-        if state.app_session is not None:
-            await state.app_session.close()
+        while True:
+            if (
+                state.signature == signature
+                and state.app_session is not None
+                and not state.closing
+                and getattr(state.app_session, "_transport_error", None) is None
+                and not getattr(state.app_session, "_closing", False)
+            ):
+                return state.app_session
+            if state.app_session is None:
+                break
+            closed_session = await self._close_state_app_session(state)
+            if (
+                self._session_states.get(session_key) is state
+                and state.app_session is closed_session
+            ):
+                state.app_session = None
+                state.signature = None
+                state.closing = False
+            # Another waiter may have registered a replacement during cleanup.
+            state = self._session_states.setdefault(session_key, _CodexSessionState())
         app_session = self._app_session_factory(
             codex_path=self._codex_path,
             cwd=effective_cwd,
@@ -3668,6 +4017,7 @@ class CodexExecutor(Executor):
             return
 
         app_session = await self._ensure_app_session(
+            session_key,
             state,
             signature=signature,
             effective_cwd=effective_cwd,
@@ -3687,5 +4037,7 @@ class CodexExecutor(Executor):
                 reasoning_effort=reasoning_effort,
             ):
                 yield event
+        except HarnessTransportClosedError:
+            raise
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event
             yield ExecutorError(message=f"Codex executor error: {exc}")

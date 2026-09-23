@@ -607,6 +607,7 @@ _MODEL_PROVIDER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^qwen(?:\d|-)", re.IGNORECASE), "dashscope"),
     (re.compile(r"^llama-", re.IGNORECASE), "meta_llama"),
     (re.compile(r"^mistral-", re.IGNORECASE), "mistral"),
+    (re.compile(r"^kimi-", re.IGNORECASE), "moonshot"),
 )
 
 
@@ -618,6 +619,16 @@ def _inferred_catalog_provider(model: str) -> str | None:
     return None
 
 
+_BEDROCK_ANTHROPIC_PATTERN = re.compile(
+    r"^(?:[a-z0-9-]{2,8}\.)?anthropic\.(?P<model>claude-.+?)(?:-v\d+)?$",
+    re.IGNORECASE,
+)
+
+# Databricks Unity Catalog system models (``system.ai.<model>``): the same
+# model the workspace serves as its ``databricks-<model>`` endpoint.
+_DATABRICKS_SYSTEM_AI_PREFIX = "system.ai."
+
+
 def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
     """Return bounded provider/id pairs for a model catalog lookup."""
     normalized = model.split(":", 1)[0].strip()
@@ -627,6 +638,21 @@ def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
     def _add(provider: str | None, model_id: str) -> None:
         if provider is not None and (provider, model_id) not in targets:
             targets.append((provider, model_id))
+
+    bedrock = _BEDROCK_ANTHROPIC_PATTERN.match(normalized)
+    if bedrock:
+        bare = bedrock.group("model")
+        _add("anthropic", bare)
+        _add(_inferred_catalog_provider(bare), bare)
+        _add("openrouter", normalized)
+        return targets
+
+    if normalized.lower().startswith(_DATABRICKS_SYSTEM_AI_PREFIX):
+        bare = normalized[len(_DATABRICKS_SYSTEM_AI_PREFIX) :]
+        _add("databricks", f"databricks-{bare}")
+        _add(_inferred_catalog_provider(bare), bare)
+        _add("openrouter", bare)
+        return targets
 
     if "/" in normalized:
         namespace, bare = normalized.split("/", 1)

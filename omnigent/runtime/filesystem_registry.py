@@ -73,6 +73,7 @@ def _git_timeout_seconds() -> float:
 # the one-shot config write doesn't repeat.  The host fallback path builds a
 # fresh registry per fs request (unlike the runner, which caches per session),
 # so without this guard every request would re-spawn the ``git config``.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by git-root filesystem path
 _untracked_cache_enabled: set[str] = set()
 _untracked_cache_lock = threading.Lock()
 
@@ -182,20 +183,27 @@ def _net_operation(first: str, last: str) -> str | None:
 
 
 def _find_git_root(path: Path) -> Path | None:
-    """Walk up the directory tree to find the nearest ``.git`` entry.
+    """Walk up the directory tree to find the nearest valid git repository.
 
     Handles both normal clones (``.git/`` directory) and git worktrees
-    (``.git`` file, a gitlink pointing at the real git dir).
+    (``.git`` file, a gitlink pointing at the real git dir). Directories
+    named ``.git`` that are not repositories (a stray leftover holding
+    unrelated files) are skipped, mirroring git's own discovery; a broken
+    gitlink file stops the search, as it does for git.
 
     :param path: Starting directory (will be resolved to an absolute path).
-    :returns: The directory that contains ``.git``, or ``None`` if *path*
-        is not inside a git repository.
+    :returns: The directory that contains a valid ``.git``, or ``None`` if
+        *path* is not inside a git repository.
     """
     current = path.resolve()
     while True:
         git_entry = current / ".git"
-        if git_entry.is_dir() or git_entry.is_file():
-            return current
+        if git_entry.is_dir():
+            if _is_git_repo(current):
+                return current
+        elif git_entry.is_file():
+            # A broken gitlink is fatal to git, not skipped — stop here.
+            return current if _is_git_repo(current) else None
         parent = current.parent
         if parent == current:
             return None
@@ -225,6 +233,51 @@ def _git_common_dir(git_root: Path) -> Path:
     if not common_dir.is_absolute():
         common_dir = git_dir / common_dir
     return common_dir.resolve()
+
+
+def _resolve_gitfile(git_entry: Path) -> Path | None:
+    """Resolve a ``.git`` gitlink file to the git directory it points at.
+
+    :returns: The resolved git directory, or ``None`` when the file is not
+        a readable ``gitdir:`` link or its target is not a directory.
+    """
+    try:
+        marker = git_entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not marker.startswith("gitdir:"):
+        return None
+    git_dir = Path(marker.removeprefix("gitdir:").strip())
+    if not git_dir.is_absolute():
+        git_dir = git_entry.parent / git_dir
+    git_dir = git_dir.resolve()
+    return git_dir if git_dir.is_dir() else None
+
+
+def _is_git_repo(git_root: Path) -> bool:
+    """Return True when *git_root*'s ``.git`` entry forms a working repository.
+
+    A directory named ``.git`` alone is not proof of a repository — it may
+    be a stray leftover holding unrelated files — so require what git's own
+    discovery checks: a HEAD plus object and ref stores. Linked worktrees
+    keep objects and refs in the common dir, so those are looked up there.
+
+    :param git_root: Directory containing the ``.git`` entry to validate.
+    """
+    git_entry = git_root / ".git"
+    if git_entry.is_dir():
+        git_dir = git_entry
+    elif git_entry.is_file():
+        resolved = _resolve_gitfile(git_entry)
+        if resolved is None:
+            return False
+        git_dir = resolved
+    else:
+        return False
+    if not (git_dir / "HEAD").exists():
+        return False
+    common_dir = _git_common_dir(git_root)
+    return (common_dir / "objects").is_dir() and (common_dir / "refs").is_dir()
 
 
 @contextlib.contextmanager
@@ -1237,7 +1290,17 @@ def create_filesystem_registry(watch_path: Path) -> FilesystemRegistry:
     :param watch_path: The workspace root to track.
     :returns: A :class:`FilesystemRegistry` instance ready to be used.
     """
-    git_root = _find_git_root(watch_path.resolve())
+    try:
+        git_root = _find_git_root(watch_path.resolve())
+    except OSError as exc:
+        _logger.warning(
+            "Git metadata is unavailable; using ordinary file-change tracking",
+            extra={
+                "event_name": "filesystem_git_discovery_failed",
+                "attributes": {"exception_type": type(exc).__name__, "errno": exc.errno},
+            },
+        )
+        git_root = None
     if git_root is not None:
         return GitFilesystemRegistry(watch_path, git_root)
     return AgentEditFilesystemRegistry(watch_path)

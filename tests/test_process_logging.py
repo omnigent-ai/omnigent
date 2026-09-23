@@ -6,17 +6,20 @@ import contextlib
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
 
 from omnigent._platform import IS_POSIX
+from omnigent.debug_logging import record_to_row
 from omnigent.process_logging import (
     DATA_DIR_ENV_VAR,
     LOG_FORCE_COLOR_ENV_VAR,
     LOG_TO_STDERR_ENV_VAR,
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
+    RedactingLogFormatter,
     TerminalLogFormatter,
     _debug_sink_target_loggers,
     _log_once_seen,
@@ -28,6 +31,7 @@ from omnigent.process_logging import (
     log_once,
     process_log_dir_reference,
     process_log_reference,
+    redact_log_text,
     terminal_stream_handler,
     terminal_supports_color,
 )
@@ -108,11 +112,346 @@ def test_terminal_log_formatter_colors_level_name() -> None:
     assert "func_name" not in record.__dict__
 
 
+@pytest.mark.parametrize("include_whitespace_credentials", [False, True])
+def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes(
+    include_whitespace_credentials: bool,
+) -> None:
+    """Secrets are removed even when they have no provider-specific prefix."""
+    opaque = "aB3" + "xY7" * 12
+    labeled = "lowercase123" * 4
+    jwt = ".".join(("eyJ" + "HeaderA1" * 2, "PayloadB2" * 2, "SignatureC3" * 2))
+    provider_key = "sk-" + "TestKey123" * 2
+    workspace_pat = "dapi" + "Test1234567890"
+
+    samples = (
+        (f"Authorization: Bearer {labeled}", labeled),
+        (f'headers={{"token": "{labeled}"}}', labeled),
+        ("bearer abc:def", "abc:def"),
+        ("password=;supersecret", ";supersecret"),
+        ("password=p@ss,word", "p@ss,word"),
+        ('{"password":"p@ss,word"}', "p@ss,word"),
+        (f"response contained {opaque}", opaque),
+        (f"session credential {jwt}", jwt),
+        (f"provider key {provider_key}", provider_key),
+        (f"workspace PAT {workspace_pat}", workspace_pat),
+    )
+
+    for sample, secret in samples:
+        redacted = redact_log_text(
+            sample, include_whitespace_credentials=include_whitespace_credentials
+        )
+        assert "[REDACTED]" in redacted
+        assert secret not in redacted
+        assert (
+            redact_log_text(
+                redacted, include_whitespace_credentials=include_whitespace_credentials
+            )
+            == redacted
+        )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "auth token invalidation failed",
+        "password rotation failed",
+        "client secret validation pending",
+        "db-credential resolver unavailable",
+        "DATABASE_PASSWORD synthetic-value",
+    ],
+)
+def test_default_app_logs_skip_whitespace_credential_matching(message: str) -> None:
+    """Application logs keep prose while still redacting explicit secret assignments."""
+    assert redact_log_text(message) == message
+    raw = f"{message}; password=synthetic-assigned-value"
+    expected = f"{message}; password=[REDACTED]"
+    record = logging.LogRecord("omnigent.example", logging.ERROR, __file__, 1, "%s", (raw,), None)
+    record.exc_text = f"ValueError: {raw}"
+    record.attributes = {"detail": raw}
+
+    formatter = RedactingLogFormatter(fmt="%(message)s", use_colors=False)
+    assert formatter.format(record) == f"{expected}\nValueError: {expected}"
+    row = record_to_row(record, source="runner")
+    assert row["message"] == expected
+    assert row["stack_trace"] == f"ValueError: {expected}"
+    assert row["attributes"] == {"detail": expected}
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("--token=example", "--token=[REDACTED]"),
+        (".token=example", ".token=[REDACTED]"),
+        ("..access-token=example", "..access-token=[REDACTED]"),
+        ("foo.token=example", "foo.token=[REDACTED]"),
+        ("foo-token=example", "foo-token=[REDACTED]"),
+        ("_token=example", "_token=[REDACTED]"),
+        ("(--password = example )", "(--password = [REDACTED] )"),
+        ('{"access_token": "some secret"}', '{"access_token": "[REDACTED]"}'),
+        ("{'api-key': 'some secret'}", "{'api-key': '[REDACTED]'}"),
+        ("api key: some-secret status=401", "api key: [REDACTED] status=401"),
+        ("api key: Bearer short-value status=401", "api key: [REDACTED] status=401"),
+        ('"api key" = "some secret"', '"api key" = "[REDACTED]"'),
+        ('".db-credential"="example"', '".db-credential"="[REDACTED]"'),
+    ],
+)
+@pytest.mark.parametrize("include_whitespace_credentials", [False, True])
+def test_redact_log_text_preserves_named_secret_keys(
+    text: str, expected: str, include_whitespace_credentials: bool
+) -> None:
+    """Punctuation, underscores, and quotes around keys survive value redaction."""
+    redacted = redact_log_text(text, include_whitespace_credentials=include_whitespace_credentials)
+    assert redacted == expected
+    assert (
+        redact_log_text(redacted, include_whitespace_credentials=include_whitespace_credentials)
+        == redacted
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ERROR failed: password hunter2", "ERROR failed: password [REDACTED]"),
+        (
+            "ERROR authentication failed: invalid api key a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "ERROR authentication failed: invalid api key [REDACTED]",
+        ),
+        ("password supersecret status=401", "password [REDACTED] status=401"),
+        ("PASSWORD\thunter2 status=401", "PASSWORD\t[REDACTED] status=401"),
+        ('"password" "hunter2"', '"password" "[REDACTED]"'),
+        ("API\t KEY  hunter2", "API\t KEY  [REDACTED]"),
+        ('password "some secret" rejected', 'password "[REDACTED]" rejected'),
+        ("--api-key 'some secret' rejected", "--api-key '[REDACTED]' rejected"),
+        ("api_key lowercasesecret status=403", "api_key [REDACTED] status=403"),
+        ("access token synthetic-access-value", "access token [REDACTED]"),
+        ("refresh_token synthetic-refresh-value", "refresh_token [REDACTED]"),
+        ("auth-token synthetic-auth-value", "auth-token [REDACTED]"),
+        ("auth token Bearer short-value status=401", "auth token [REDACTED] status=401"),
+        ("client secret synthetic-client-value", "client secret [REDACTED]"),
+        ("passwd p@ss,word rejected", "passwd [REDACTED] rejected"),
+        ("password expired", "password [REDACTED]"),
+        ('password "is missing"', 'password "[REDACTED]"'),
+        ("password=is missing", "password=[REDACTED] missing"),
+        (
+            "password hunter2 api key abcdef012345 status=401",
+            "password [REDACTED] api key [REDACTED] status=401",
+        ),
+    ],
+)
+def test_redact_log_text_handles_whitespace_credentials(text: str, expected: str) -> None:
+    """Explicit credential labels hide even short/plain values without losing context."""
+    redacted = redact_log_text(text, include_whitespace_credentials=True)
+    assert redacted == expected
+    assert redact_log_text(redacted, include_whitespace_credentials=True) == redacted
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "DATABASE_PASSWORD",
+        "databasepassword",
+        "_password",
+        ".password",
+        "db.password",
+        "db-password",
+        "--db-password",
+        "db.PASSWD",
+        "PROVIDER_API_KEY",
+        "provider.api key",
+        "service.client secret",
+        "SESSION_TOKEN",
+        "db.secret",
+        "db-credential",
+        "token.secret",
+        ".token",
+        "_token",
+        "--credential",
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("synthetic-value", "[REDACTED]"),
+        ("'synthetic value'", "'[REDACTED]'"),
+        ("Bearer synthetic-value", "[REDACTED]"),
+    ],
+)
+def test_redact_log_text_handles_prefixed_whitespace_credentials(
+    label: str, value: str, expected: str
+) -> None:
+    """Environment, config, and CLI credential keys retain their complete prefix."""
+    text = f"ERROR failed: {label} {value} status=401"
+    redacted = redact_log_text(text, include_whitespace_credentials=True)
+    assert redacted == f"ERROR failed: {label} {expected} status=401"
+    assert redact_log_text(redacted, include_whitespace_credentials=True) == redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ERROR password authentication failed for user example",
+        "ERROR api key is missing; configure the provider",
+        "ERROR refresh token has expired; authenticate again",
+        "ERROR client secret was not configured",
+        "ERROR access token validation failed",
+        "ERROR token refresh failed",
+        "WARN token budget exceeded; token count 8192",
+        "ERROR credential resolution failed",
+        "ERROR secret provider unavailable",
+        "WARN TOKEN usage 8192; SECRET provider failed; CREDENTIAL resolution failed",
+        "ERROR DATABASE_PASSWORD is missing",
+        "ERROR PROVIDER_API_KEY was not configured",
+        "ERROR app.auth-token has expired",
+        "ERROR db.password authentication failed for user example",
+        "ERROR service.credential validation failed",
+        "WARN password_file unavailable; api_key_path not found",
+        "WARN database_password_file unavailable; provider.api_key_path not found",
+        "WARN prefix_token_count 8192",
+        "ERROR password\nconnection refused",
+        "ERROR api\nkey unavailable",
+    ],
+)
+@pytest.mark.parametrize("include_whitespace_credentials", [False, True])
+def test_redact_log_text_preserves_credential_diagnostic_prose(
+    text: str, include_whitespace_credentials: bool
+) -> None:
+    """Credential diagnostics and token accounting are not whitespace assignments."""
+    assert (
+        redact_log_text(text, include_whitespace_credentials=include_whitespace_credentials)
+        == text
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "+" * 20_000,
+        "a-" * 8_192,
+        ("ERROR " + "a-" * 9_000)[:16_384],
+        ("synthetic-token-marker" * 4_000)[:65_536],
+        ("synthetic.token.marker" * 4_000)[:65_536],
+        "api" + " " * 65_000 + "key is missing",
+        "password is missing; api key is missing\n" * 1_600,
+    ],
+    ids=[
+        "punctuation",
+        "short-hyphenated",
+        "error-short-hyphenated",
+        "hyphenated",
+        "dotted",
+        "spaced-label",
+        "diagnostic-prose",
+    ],
+)
+@pytest.mark.parametrize("include_whitespace_credentials", [False, True])
+def test_redact_log_text_handles_large_non_token_input_in_linear_time(
+    text: str, include_whitespace_credentials: bool
+) -> None:
+    """Long possible key names do not trigger quadratic regex backtracking."""
+
+    started = time.perf_counter()
+    output = redact_log_text(text, include_whitespace_credentials=include_whitespace_credentials)
+    elapsed = time.perf_counter() - started
+
+    assert output == text
+    assert elapsed < 0.5
+
+
+def test_redact_log_text_handles_large_bearer_token_in_linear_time() -> None:
+    """A maximum-size stderr line can be redacted without blocking the runner."""
+    text = "Bearer " + ("synthetic-token-marker" * 4_000)[:65_529]
+
+    started = time.perf_counter()
+    output = redact_log_text(text)
+    elapsed = time.perf_counter() - started
+
+    assert output == "Bearer [REDACTED]"
+    assert elapsed < 0.5
+
+
+@pytest.mark.parametrize(
+    "label", ["password", "api key", "access token", "DATABASE_PASSWORD", "provider.token"]
+)
+@pytest.mark.parametrize("value", ["synthetic-token-marker", "synthetic.token.marker"])
+def test_redact_log_text_handles_large_whitespace_credentials_in_linear_time(
+    label: str, value: str
+) -> None:
+    """Maximum-size credential values retain bounded redaction cost on repeated passes."""
+    text = f"ERROR failed: {label} " + (value * 4_000)[:65_000] + " status=401"
+
+    started = time.perf_counter()
+    output = redact_log_text(text, include_whitespace_credentials=True)
+    repeated = redact_log_text(output, include_whitespace_credentials=True)
+    elapsed = time.perf_counter() - started
+
+    assert output == f"ERROR failed: {label} [REDACTED] status=401"
+    assert repeated == output
+    assert elapsed < 0.5
+
+
+@pytest.mark.parametrize("prefix", ["a_", "a.", "a-"])
+@pytest.mark.parametrize("suffix", ["PASSWORD", "TOKEN"])
+def test_redact_log_text_handles_large_prefixed_keys_in_linear_time(
+    prefix: str, suffix: str
+) -> None:
+    """Key prefixes are scanned only from their start, including on repeated redaction."""
+    label = prefix * 32_000 + suffix
+    text = f"ERROR failed: {label} synthetic-value status=401"
+
+    started = time.perf_counter()
+    output = redact_log_text(text, include_whitespace_credentials=True)
+    repeated = redact_log_text(output, include_whitespace_credentials=True)
+    elapsed = time.perf_counter() - started
+
+    assert output == f"ERROR failed: {label} [REDACTED] status=401"
+    assert repeated == output
+    assert elapsed < 0.5
+
+
+def test_redact_log_text_preserves_normal_identifiers() -> None:
+    """UUIDs, session IDs, hashes, and ordinary prose remain useful in logs."""
+    values = (
+        "conv_0123456789abcdef0123456789abcdef",
+        "123e4567-e89b-12d3-a456-426614174000",
+        "0123456789abcdef0123456789abcdef01234567",
+        "claude-sonnet-4-20250514",
+    )
+
+    for value in values:
+        assert redact_log_text(value) == value
+
+
+def test_redacting_log_formatter_scrubs_interpolated_args_and_tracebacks() -> None:
+    """Redaction runs after message interpolation and exception rendering."""
+    secret = "aB3" + "xY7" * 12
+    formatter = RedactingLogFormatter(use_colors=False)
+    try:
+        raise ValueError(f"token={secret}")
+    except ValueError:
+        import sys
+
+        record = logging.LogRecord(
+            "omnigent.example",
+            logging.ERROR,
+            __file__,
+            1,
+            "request failed for %s",
+            (secret,),
+            sys.exc_info(),
+            "send",
+        )
+
+    output = formatter.format(record)
+
+    assert secret not in output
+    assert output.count("[REDACTED]") >= 2
+
+
 def test_terminal_log_formatter_abbreviates_warning_and_source() -> None:
     """Plain log files use the same aligned, compact columns without color."""
     formatter = TerminalLogFormatter(use_colors=False)
     record = logging.LogRecord(
-        "omnigent.codex_native_app_server",
+        "omnigent.harnesses.codex_native.app_server",
         logging.WARNING,
         __file__,
         1,
@@ -126,11 +465,11 @@ def test_terminal_log_formatter_abbreviates_warning_and_source() -> None:
 
     assert re.match(
         r"WARN  \d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} "
-        r"codex_native_app_server\s+native_codex\s+\| native-codex: ready",
+        r"codex_native\.app_server\s+native_codex\s+\| native-codex: ready",
         output,
     )
     assert "WARNING" not in output
-    assert "omnigent.codex_native_app_server" not in output
+    assert "omnigent.harnesses.codex_native.app_server" not in output
     assert record.levelname == "WARNING"
 
 
@@ -268,6 +607,45 @@ def test_configure_process_logging_publishes_its_log_path(
     )
     try:
         assert current_process_log_path() == log_path
+    finally:
+        logger = logging.getLogger(logger_name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+
+def test_configure_process_logging_forwards_custom_debug_log_send(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent import debug_logging
+
+    captured: list[object] = []
+
+    def send(batch: list[dict[str, object]]) -> None:
+        captured.append(batch)
+
+    def attach(
+        loggers: list[logging.Logger],
+        *,
+        source: str,
+        level: int,
+        send: debug_logging.DebugLogSend | None = None,
+    ) -> None:
+        captured.extend((loggers, source, level, send))
+
+    monkeypatch.setattr(debug_logging, "attach_debug_log_sink", attach)
+    logger_name = "omnigent.test_custom_debug_send"
+    configure_process_logging(
+        "integration",
+        log_path=tmp_path / "integration.log",
+        level=logging.WARNING,
+        logger_names=(logger_name,),
+        root=False,
+        debug_log_send=send,
+    )
+    try:
+        assert captured[1:] == ["integration", logging.WARNING, send]
     finally:
         logger = logging.getLogger(logger_name)
         for handler in list(logger.handlers):

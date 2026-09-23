@@ -1,12 +1,13 @@
 # Omnigent iOS
 
-Thin SwiftUI/WKWebView shell for Omnigent. Like the Electron app, this target
-loads the server-served web UI instead of shipping a duplicate copy of the SPA.
+Thin SwiftUI/WKWebView shell for Omnigent on iPhone and iPad. Like the Electron
+app, this target loads the server-served web UI instead of shipping a duplicate
+copy of the SPA.
 
 ## Development
 
 Open `Omnigent.xcodeproj` in Xcode 26 or newer and run the `Omnigent` scheme on
-an iOS 26 simulator.
+an iOS 26 iPhone or iPad simulator.
 
 Debug builds allow `http://` web content for local development by enabling
 `NSAllowsArbitraryLoadsInWebContent`. Release builds keep App Transport
@@ -20,6 +21,13 @@ tap routing back into the SPA. OIDC authentication is delegated to the system
 browser and the resulting session is copied into the isolated WKWebView cookie
 store, so providers such as Google that reject embedded user agents work. It
 does not implement APNs, background polling, or localhost proxy/CORS behavior.
+
+## Databricks OAuth
+
+Workspace connections use native OAuth, isolated persistent WebKit stores, bounded
+session recovery, and local sign-out. Build-configurable client ID and HTTPS callback
+setup are documented in [Databricks OAuth](docs/databricks-oauth.md). Databricks Apps
+retain inline platform sign-in; generic OIDC is unchanged.
 
 ## Managed app configuration
 

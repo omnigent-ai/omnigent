@@ -140,6 +140,8 @@ os_env:
     # Python project layouts keep working. Matching is by basename at
     # any depth. Entries must be plain names — no ``/``, no ``..``,
     # no absolute paths (validated at spec parse time).
+    # Use ["*"] only for a trusted root that must preserve arbitrary
+    # agent-created dotpaths across helper invocations.
     # cwd_allow_hidden: [".venv", ".git", ".gitignore"]
 
     # Optional: recurse into subdirectories when masking dotfiles /

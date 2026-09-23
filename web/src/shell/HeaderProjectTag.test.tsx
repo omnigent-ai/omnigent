@@ -117,4 +117,19 @@ describe("HeaderProjectTag", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /Remove from/ }));
     expect(mocks.moveToProject).toHaveBeenCalledWith({ id: "conv-1", project: "" });
   });
+
+  it("renders the project's emoji icon at full opacity when one is set", () => {
+    renderTag(<HeaderProjectTag conversationId="conv-1" projectName="Payments" projectIcon="🚀" />);
+    // The emoji glyph shows instead of the folder icon, and the trigger is not
+    // dimmed — a faded full-color emoji reads as washed-out.
+    expect(screen.getByTestId("project-icon")).toHaveTextContent("🚀");
+    expect(screen.getByTestId("header-project-tag").className).toContain("opacity-100");
+    expect(screen.getByTestId("header-project-tag").className).not.toContain("opacity-40");
+  });
+
+  it("dims the folder glyph when the filed project has no icon", () => {
+    renderTag(<HeaderProjectTag conversationId="conv-1" projectName="Payments" />);
+    expect(screen.queryByTestId("project-icon")).toBeNull();
+    expect(screen.getByTestId("header-project-tag").className).toContain("opacity-40");
+  });
 });

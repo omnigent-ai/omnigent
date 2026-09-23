@@ -25,8 +25,7 @@
 
 import { TerminalIcon, XIcon } from "lucide-react";
 import type { CSSProperties } from "react";
-import { useEffect, useRef, useState } from "react";
-import { TerminalView } from "@/components/blocks/TerminalView";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
@@ -35,6 +34,10 @@ import { cn } from "@/lib/utils";
 import { NewTerminalButton } from "./NewTerminalButton";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalSplit } from "./useTerminalSplit";
+
+const TerminalView = lazy(() =>
+  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
+);
 
 interface TerminalsPanelProps {
   open: boolean;
@@ -239,16 +242,18 @@ export function TerminalsPanel({
             // across same-shape sessions (e.g. `terminal_claude_main`), so id
             // alone reuses the xterm mount and shows stale scrollback.
             <div key={`${conversationId}:${activeTerminal.id}`} className="flex h-full flex-col">
-              <TerminalView
-                sessionId={conversationId}
-                terminalId={activeTerminal.id}
-                readOnly={readOnly}
-                directAttachUrl={activeTerminal.directAttachUrl}
-                onStateChange={(state) => {
-                  setTerminalConnectionState(activeTerminal.id, state);
-                }}
-                onActivity={() => markTerminalActive(activeTerminal.id)}
-              />
+              <Suspense fallback={null}>
+                <TerminalView
+                  sessionId={conversationId}
+                  terminalId={activeTerminal.id}
+                  readOnly={readOnly}
+                  directAttachUrl={activeTerminal.directAttachUrl}
+                  onStateChange={(state) => {
+                    setTerminalConnectionState(activeTerminal.id, state);
+                  }}
+                  onActivity={() => markTerminalActive(activeTerminal.id)}
+                />
+              </Suspense>
             </div>
           ) : (
             <div className="flex-1" />

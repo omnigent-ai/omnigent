@@ -417,4 +417,9 @@ def load_omnigent_yaml(
                 "the spec — upgrade the runner to pick up newer harnesses."
             )
         raise OmnigentError(message, code=ErrorCode.INVALID_INPUT)
+    if enforce_handler_allowlist:
+        # Apply the parsed-spec guard to both uploaded bundle formats.
+        from omnigent.spec import _reject_unregistered_spec_policy_handlers
+
+        _reject_unregistered_spec_policy_handlers(spec)
     return spec

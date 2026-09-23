@@ -27,9 +27,10 @@ const meta = {
     hostId: workspaceStoryHost,
     initialPath: workspaceStoryProjects,
     onSelect: () => undefined,
+    onClose: () => undefined,
   },
   decorators: [
-    (Story) => (
+    (Story, context) => (
       <StoryQueryRouter
         seed={(queryClient) => {
           seedFilesystem(queryClient, workspaceStoryProjects, projectEntries);
@@ -37,9 +38,47 @@ const meta = {
             storyDirectory(`${workspaceStoryHome}/projects`),
             storyDirectory(`${workspaceStoryHome}/Downloads`),
           ]);
+          queryClient.setQueryData(
+            ["host-worktrees", workspaceStoryHost, workspaceStoryProjects],
+            context.name === "Full Single Pane"
+              ? []
+              : [
+                  {
+                    path: workspaceStoryProjects,
+                    branch: "main",
+                    is_main: true,
+                    detached: false,
+                  },
+                  ...(context.name === "Main Checkout Only"
+                    ? []
+                    : [
+                        {
+                          path: `${workspaceStoryHome}/worktrees/agentic-layouts`,
+                          branch: "agentic/layouts",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_700_000_000,
+                        },
+                        {
+                          path: `${workspaceStoryHome}/worktrees/command-palette`,
+                          branch: "feature/command-palette",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_699_992_800,
+                        },
+                        {
+                          path: `${workspaceStoryHome}/worktrees/streaming-status`,
+                          branch: "feature/streaming-status",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_699_913_600,
+                        },
+                      ]),
+                ],
+          );
         }}
       >
-        <div className="w-[440px] rounded-xl border bg-card p-2">
+        <div className="flex h-[min(520px,calc(100dvh-2rem))] w-[min(800px,calc(100vw-2rem))] justify-center">
           <Story />
         </div>
       </StoryQueryRouter>
@@ -58,10 +97,39 @@ export const PopulatedWithConflict: Story = {
   },
 };
 
+export const FullTwoPane: Story = {};
+
+export const FullSinglePane: Story = {};
+
+export const MainCheckoutOnly: Story = {};
+
+export const LinkedWorktreeSelected: Story = {
+  play: async ({ canvasElement }) => {
+    await userEvent.click(
+      within(canvasElement).getByRole("radio", { name: "Use worktree command-palette" }),
+    );
+  },
+};
+
+export const CompactEmbedded: Story = {
+  args: {
+    onSelect: undefined,
+    onClose: undefined,
+    onNavigate: () => undefined,
+  },
+  decorators: [
+    (Story) => (
+      <div className="w-[min(28rem,calc(100vw-2rem))]">
+        <Story />
+      </div>
+    ),
+  ],
+};
+
 export const TypedFilter: Story = {
   play: async ({ canvasElement }) => {
-    const input = within(canvasElement).getByTestId("workspace-picker-path-input");
+    const input = within(canvasElement).getByTestId("workspace-picker-search-input");
     await userEvent.clear(input);
-    await userEvent.type(input, `${workspaceStoryProjects}/ap`);
+    await userEvent.type(input, "ap");
   },
 };

@@ -10,6 +10,13 @@ enum WebViewMode: String {
 final class WebViewModel: ObservableObject {
   @Published var currentURL: URL?
   @Published var isLoading = false
+  @Published var isAuthenticating = false
+  var cancelAuthentication: (() -> Void)?
+  var signOut: (() -> Void)?
+  #if DEBUG
+    /// Set only while a native workspace view is attached; answers with what to expect next.
+    var injectDebugFault: ((DatabricksDebugFault) async -> String)?
+  #endif
   @Published var serverSwitcherHidden = true
 
   /// Whether the native Chat/Terminal switcher should be shown. The web app owns
@@ -85,6 +92,28 @@ final class WebViewModel: ObservableObject {
     let script =
       "window.__omnigentNativeEmitInsets?.(\(jsNumber(topBar)), \(jsNumber(bottomBar)));"
     webView?.evaluateJavaScript(script)
+  }
+
+  /// Push the server-picker payload (current origin plus the selectable
+  /// managed/recent servers) to the SPA, which surfaces server selection in
+  /// its sidebar instead of the floating pill. The JS bridge caches the value
+  /// so a later-mounting subscriber still receives it.
+  func emitServerPicker(currentOrigin: String?, managedServers: [String], recentServers: [String]) {
+    guard let currentOrigin else { return }
+    struct Payload: Encodable {
+      let currentOrigin: String
+      let managedServers: [String]
+      let recentServers: [String]
+    }
+    let payload = Payload(
+      currentOrigin: currentOrigin,
+      managedServers: managedServers,
+      recentServers: recentServers
+    )
+    guard let data = try? JSONEncoder().encode(payload),
+      let json = String(data: data, encoding: .utf8)
+    else { return }
+    webView?.evaluateJavaScript("window.__omnigentNativeEmitServerPicker?.(\(json));")
   }
 
   /// Tell the web app the user tapped a segment in the native switcher.

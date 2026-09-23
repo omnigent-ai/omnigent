@@ -16,7 +16,7 @@ import type {
   ToolResultBlock,
   UserMessageBlock,
 } from "./blocks";
-import type { ConversationItem } from "./conversationItems";
+import type { ConversationItem, ErrorItem } from "./conversationItems";
 import { itemsToBlocks } from "./itemsToBlocks";
 
 function userMessage(responseId: string, text: string, id = "msg_user"): ConversationItem {
@@ -105,7 +105,7 @@ describe("itemsToBlocks — flat shape", () => {
     ]);
   });
 
-  it("hides legacy Claude task notifications that predate is_meta", () => {
+  it("re-labels a Claude task notification as a system marker between real messages", () => {
     const items: ConversationItem[] = [
       userMessage("resp_before", "visible before", "msg_before"),
       userMessage(
@@ -129,10 +129,53 @@ describe("itemsToBlocks — flat shape", () => {
 
     const userBlocks = blocks.filter((b): b is UserMessageBlock => b.type === "user_message");
     const texts = userBlocks.map((b) => b.content.map((c) => ("text" in c ? c.text : "")).join(""));
-    expect(texts).toEqual(["visible before", "visible after"]);
+    // The wake keeps its place as a `[System: …]` marker: it is a turn
+    // boundary, so the answer before it cannot fold into the work after it.
+    expect(texts).toEqual([
+      "visible before",
+      '[System: background task a815d170defd74675 completed]\nAgent "Explore spec" finished',
+      "visible after",
+    ]);
+    expect(userBlocks[1]!.ctx.itemId).toBe("msg_legacy_task_notification");
   });
 
-  it("hides legacy Claude Monitor task notifications with optional fields omitted", () => {
+  it("re-labels an is_meta task notification (bridge-marked) as a system marker", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg_wake",
+        response_id: "resp_wake",
+        type: "message",
+        status: "completed",
+        role: "user",
+        is_meta: true,
+        content: [
+          {
+            type: "input_text",
+            text: [
+              "<task-notification>",
+              "<task-id>b3f9a2c1d</task-id>",
+              "<status>failed</status>",
+              "<summary>Background command exited 1</summary>",
+              "</task-notification>",
+            ].join("\n"),
+          },
+        ],
+      },
+    ];
+
+    const blocks = itemsToBlocks(items);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.type).toBe("user_message");
+    expect((blocks[0] as UserMessageBlock).content).toEqual([
+      {
+        type: "input_text",
+        text: "[System: background task b3f9a2c1d failed]\nBackground command exited 1",
+      },
+    ]);
+  });
+
+  it("re-labels a Claude Monitor task notification with optional fields omitted", () => {
     const items: ConversationItem[] = [
       userMessage(
         "resp_task",
@@ -147,7 +190,17 @@ describe("itemsToBlocks — flat shape", () => {
       ),
     ];
 
-    expect(itemsToBlocks(items)).toEqual([]);
+    const blocks = itemsToBlocks(items);
+
+    expect(blocks).toHaveLength(1);
+    expect((blocks[0] as UserMessageBlock).content).toEqual([
+      {
+        type: "input_text",
+        text:
+          "[System: background task b1mhekpmy finished]\n" +
+          'Monitor event: "PR 2086 E2E UI + npm test CI results"',
+      },
+    ]);
   });
 
   it("user + assistant items produce [UserMessageBlock, TextDone] in order", () => {
@@ -222,6 +275,24 @@ describe("itemsToBlocks — flat shape", () => {
     expect(td?.interrupted).toBe(true);
   });
 
+  it("error items carry an info level through to the block only when set", () => {
+    const base = {
+      response_id: "resp_notice",
+      type: "error" as const,
+      status: "completed" as const,
+      source: "harness",
+      code: "codex_thread_reset",
+      message: "Codex started a fresh thread.",
+    };
+    const items: ConversationItem[] = [
+      { ...base, id: "err_info", level: "info" },
+      { ...base, id: "err_plain" },
+    ];
+    const [info, plain] = itemsToBlocks(items) as ErrorBlock[];
+    expect(info?.level).toBe("info");
+    expect(plain).not.toHaveProperty("level");
+  });
+
   it("error items produce ErrorBlock banners on reload", () => {
     const items: ConversationItem[] = [
       {
@@ -270,6 +341,110 @@ describe("itemsToBlocks — flat shape", () => {
       { type: "input_text", text: "carefully." },
       { type: "input_file", file_id: "file_abc" },
     ]);
+  });
+});
+
+describe("itemsToBlocks — historical error attribution", () => {
+  function errorItem(responseId: string, code = "RuntimeError"): ErrorItem {
+    return {
+      id: `err_${responseId}`,
+      response_id: responseId,
+      type: "error",
+      status: "completed",
+      source: "execution",
+      code,
+      message: "The turn did not complete.",
+    };
+  }
+
+  it.each(["message", "function_call", "reasoning"] as const)(
+    "attributes errors to the same response's %s agent after an agent switch",
+    (type) => {
+      function agentItem(responseId: string, model: string): ConversationItem {
+        if (type === "message") {
+          return assistantMessage(responseId, "Working on it.", `msg_${responseId}`, model);
+        }
+        if (type === "function_call") {
+          return functionCall(responseId, responseId, "read_file", {}, `fc_${responseId}`, model);
+        }
+        return {
+          id: `reasoning_${responseId}`,
+          response_id: responseId,
+          type: "reasoning",
+          status: "completed",
+          model,
+          summary: [],
+        };
+      }
+
+      const items = [
+        agentItem("resp_polly", "polly"),
+        errorItem("resp_polly"),
+        agentItem("resp_claude", "claude-native-ui (switch ag_claude)"),
+        errorItem("resp_claude", "native_turn_error"),
+        errorItem("resp_no_output"),
+      ];
+      const errors = itemsToBlocks(items).filter((b): b is ErrorBlock => b.type === "error");
+
+      expect(errors.map((error) => error.title)).toEqual([
+        "Polly ran into an error during this turn.",
+        "Claude Code ran into an error during this turn.",
+        undefined,
+      ]);
+      expect(errors.map((error) => error.ctx.agent)).toEqual([null, null, null]);
+      expect(errors.map((error) => error.ctx.responseId)).toEqual([
+        "resp_polly",
+        "resp_claude",
+        "resp_no_output",
+      ]);
+    },
+  );
+
+  it.each([
+    { ...userMessage("resp_failed", "Try again."), model: "polly" },
+    {
+      id: "routing",
+      response_id: "resp_failed",
+      type: "routing_decision",
+      status: "completed",
+      model: "provider-model",
+      applied: true,
+      rationale: "Selected for this task.",
+    },
+    {
+      id: "compaction",
+      response_id: "resp_failed",
+      type: "compaction",
+      status: "completed",
+      model: "provider-model",
+      summary: "Older context summarized.",
+    },
+  ] satisfies ConversationItem[])("does not infer an error's agent from $type", (item) => {
+    const blocks = itemsToBlocks([
+      assistantMessage("resp_earlier", "Earlier response", "msg_earlier", "claude-native-ui"),
+      item,
+      errorItem("resp_failed"),
+    ]);
+    expect(blocks.find((b): b is ErrorBlock => b.type === "error")?.title).toBeUndefined();
+  });
+
+  it("does not guess which of multiple response agents caused an error", () => {
+    const blocks = itemsToBlocks([
+      assistantMessage("resp_shared", "Parent response", "msg_parent", "polly"),
+      assistantMessage("resp_shared", "Child response", "msg_child", "polly.worker"),
+      errorItem("resp_shared"),
+    ]);
+    expect(blocks.find((b): b is ErrorBlock => b.type === "error")?.title).toBeUndefined();
+  });
+
+  it("preserves classified titles and informational notices with a known agent", () => {
+    const blocks = itemsToBlocks([
+      assistantMessage("resp_polly", "Working on it.", "msg_polly", "polly"),
+      { ...errorItem("resp_polly"), id: "err_classified", title: "Specific diagnosis" },
+      { ...errorItem("resp_polly"), id: "err_info", level: "info" },
+    ]);
+    const errors = blocks.filter((b): b is ErrorBlock => b.type === "error");
+    expect(errors.map((error) => error.title)).toEqual(["Specific diagnosis", undefined]);
   });
 });
 

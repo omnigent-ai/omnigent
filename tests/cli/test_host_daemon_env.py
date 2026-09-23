@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Final
+from unittest.mock import patch
 
+import keyring.errors
 import pytest
 
 from omnigent.cli import _build_host_daemon_env
@@ -11,6 +15,7 @@ from omnigent.host.connect import (
     RUNNER_ENV_PASSTHROUGH_ENV_VAR,
     _build_runner_env,
 )
+from omnigent.onboarding.provider_config import resolve_secret
 
 _REMOTE_SERVER_URL: Final = "https://example.databricksapps.com"
 _PROXY_ENV: Final = {
@@ -23,6 +28,78 @@ _PROXY_ENV: Final = {
     "all_proxy": "socks5://lower-proxy.example.com:1080",
     "no_proxy": "localhost,127.0.0.2",
 }
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_pi_env_denylist_reaches_runner_through_host_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Pi's denylist crosses both hops without forwarding the named secrets."""
+    denylist = "ANTHROPIC_AUTH_TOKEN, UNRELATED_SECRET"
+    monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", denylist)
+    monkeypatch.setenv("UNRELATED_SECRET", "synthetic-unrelated-secret")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_pi_env",
+        binding_token="binding-pi-env",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    for env in (daemon_env, runner_env):
+        assert env["OMNIGENT_PI_ENV_UNSET"] == denylist
+        assert "UNRELATED_SECRET" not in env
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_runner_can_read_keyring_from_cli_desktop_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    server_url: str | None,
+) -> None:
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING", raising=False)
+    for name, value in session_env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-forward")
+    monkeypatch.setenv("DBUS_UNRELATED_SECRET", "must-not-forward")
+    monkeypatch.setenv("XDG_UNRELATED_SECRET", "must-not-forward")
+
+    def get_password(service: str, username: str) -> str:
+        assert (service, username) == ("omnigent", "openrouter")
+        if any(os.environ.get(name) != value for name, value in session_env.items()):
+            raise keyring.errors.KeyringError("desktop session unavailable")
+        return "test-openrouter-key"
+
+    monkeypatch.setattr(keyring, "get_password", get_password)
+    assert resolve_secret("keychain:openrouter") == "test-openrouter-key"
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_keyring",
+        binding_token="binding-keyring",
+        workspace=str(tmp_path),
+        parent_pid=12345,
+    )
+
+    for env in (daemon_env, runner_env):
+        assert {name: env.get(name) for name in session_env} == session_env
+        assert {"UNRELATED_SECRET", "DBUS_UNRELATED_SECRET", "XDG_UNRELATED_SECRET"}.isdisjoint(
+            env
+        )
+    with patch.dict(os.environ, runner_env, clear=True):
+        assert resolve_secret("keychain:openrouter") == "test-openrouter-key"
 
 
 @pytest.mark.parametrize(
@@ -96,6 +173,30 @@ def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
     assert (set(_PROXY_ENV) - explicit_names).isdisjoint(env)
 
 
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_host_slice_key_gate_reaches_daemon_and_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+    enabled: str,
+) -> None:
+    """The host and its spawned runner make the same slice-key decision."""
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", enabled)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_slice_key",
+        binding_token="binding-slice-key",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    assert daemon_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
+    assert runner_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
+
+
 _CLAUDE_TOOL_SEARCH_ENV: Final = {
     "CLAUDE_CODE_USE_GATEWAY": "1",
     "ENABLE_TOOL_SEARCH": "true",
@@ -136,3 +237,150 @@ def test_runner_env_preserves_claude_tool_search_flags() -> None:
 
     # Then
     assert {name: env.get(name) for name in _CLAUDE_TOOL_SEARCH_ENV} == _CLAUDE_TOOL_SEARCH_ENV
+
+
+# The gcloud ADC auth selectors the Antigravity CLI (agy) reads. Non-secret
+# selectors/paths (the ADC file *contains* the credential; the vars just point
+# at it), so they ride the allowlists like KUBECONFIG rather than the
+# credential passthrough. The CLOUDSDK_ entries are exact names on purpose:
+# gcloud's CLOUDSDK_AUTH_* vars carry live tokens and must stay stripped.
+_GCLOUD_ADC_ENV: Final = {
+    "AGY_ADC_AUTH": "true",
+    "GOOGLE_APPLICATION_CREDENTIALS": "/home/alice/.config/gcloud/adc.json",
+    "GOOGLE_CLOUD_PROJECT": "acme-dev",
+    "GOOGLE_CLOUD_QUOTA_PROJECT": "acme-quota",
+    "CLOUDSDK_CONFIG": "/home/alice/.config/gcloud",
+    "CLOUDSDK_ACTIVE_CONFIG_NAME": "alt",
+}
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_gcloud_adc_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """The gcloud ADC selectors survive the CLI→daemon strip in both modes.
+
+    Without them the detached daemon loses the user's gcloud login, so every
+    antigravity-native pane it (transitively) spawns blocks at agy's
+    interactive "Select login method" menu.
+    """
+    # Given
+    for name, value in _GCLOUD_ADC_ENV.items():
+        monkeypatch.setenv(name, value)
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then
+    assert {name: env.get(name) for name in _GCLOUD_ADC_ENV} == _GCLOUD_ADC_ENV
+
+
+def test_runner_env_preserves_gcloud_adc_selectors() -> None:
+    """The gcloud ADC selectors survive the daemon→runner strip.
+
+    The runner env is what the antigravity-native pane ultimately inherits,
+    so this hop is where a drop turns into agy's login menu.
+    """
+    # Given
+    base_env = {"PATH": "/usr/bin", **_GCLOUD_ADC_ENV}
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_adc",
+        binding_token="binding-adc",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert {name: env.get(name) for name in _GCLOUD_ADC_ENV} == _GCLOUD_ADC_ENV
+
+
+# gcloud vars that hold live credentials, not selectors. They must NOT ride
+# the allowlists: a CLOUDSDK_ prefix entry would hand usable GCP tokens to the
+# runner (and transitively the agent-controlled harness).
+_GCLOUD_TOKEN_ENV: Final = {
+    "CLOUDSDK_AUTH_ACCESS_TOKEN": "ya29.fake-access-token",
+    "CLOUDSDK_AUTH_REFRESH_TOKEN": "1//fake-refresh-token",
+}
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_strips_gcloud_auth_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """gcloud CLOUDSDK_AUTH_* bearer/refresh tokens do NOT reach the daemon."""
+    # Given
+    for name, value in _GCLOUD_TOKEN_ENV.items():
+        monkeypatch.setenv(name, value)
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then
+    assert not set(_GCLOUD_TOKEN_ENV) & set(env)
+
+
+def test_runner_env_strips_gcloud_auth_tokens() -> None:
+    """gcloud CLOUDSDK_AUTH_* bearer/refresh tokens do NOT reach the runner."""
+    # Given
+    base_env = {"PATH": "/usr/bin", **_GCLOUD_TOKEN_ENV}
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_adc_tokens",
+        binding_token="binding-adc-tokens",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert not set(_GCLOUD_TOKEN_ENV) & set(env)
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_claude_telemetry_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """CLAUDE_CODE_ENABLE_TELEMETRY survives the CLI→daemon strip in both modes."""
+    # Given
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_TELEMETRY", "1")
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "otlp")
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then: the opt-in flag travels with the OTEL exporter config it belongs to.
+    assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
+    assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
+    """CLAUDE_CODE_ENABLE_TELEMETRY survives the daemon→runner strip."""
+    # Given
+    base_env = {
+        "PATH": "/usr/bin",
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "OTEL_METRICS_EXPORTER": "otlp",
+    }
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_telemetry",
+        binding_token="binding-telemetry",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
+    assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"

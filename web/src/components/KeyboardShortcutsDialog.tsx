@@ -15,9 +15,12 @@ import {
   ALT_KEY,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
+  composerSteerAllShortcutKeys,
+  CTRL_KEY,
   ENTER_KEY,
   Kbd,
   MOD_KEY,
+  SHIFT_KEY,
 } from "@/components/KeyboardShortcut";
 import {
   Dialog,
@@ -29,6 +32,7 @@ import {
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { isNativeShell } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -44,6 +48,8 @@ export function openKeyboardShortcuts(): void {
 // Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
 const UP = "↑";
 const DOWN = "↓";
+const BRACKET_LEFT = "[";
+const BRACKET_RIGHT = "]";
 
 interface Shortcut {
   label: string;
@@ -67,6 +73,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Start a new session", keys: [MOD_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
+      { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
@@ -76,6 +83,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
+      { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],
@@ -83,8 +91,8 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "Navigation",
     items: [
-      { label: "Previous session", keys: [MOD_KEY, UP] },
-      { label: "Next session", keys: [MOD_KEY, DOWN] },
+      { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
+      { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
     ],
   },
   {
@@ -92,6 +100,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
       { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
     ],
   },
   {
@@ -128,6 +137,10 @@ function shortcutGroupsFor(
         ...group,
         items: [
           { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
+          {
+            label: "Send now, with all queued messages",
+            keys: composerSteerAllShortcutKeys(submitWithModEnter),
+          },
           {
             label: "New line in message",
             keys: composerNewLineShortcutKeys(submitWithModEnter),
@@ -195,8 +208,9 @@ export function KeyboardShortcutsDialog() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
-      // trigger, so require the modifier and no Shift/Alt to avoid clashing.
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "/") {
+      // trigger, so require the platform command modifier and no Shift/Alt to
+      // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
+      if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

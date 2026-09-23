@@ -49,6 +49,8 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         "reasoning": {"effort": "low"},
         "max_output_tokens": background_title_max_output_tokens(context.additional_instructions),
     }
+    if context.title_model is not None:
+        event_body["model_override"] = context.title_model
     try:
         client = await context.process_manager.get_client(
             process_key,

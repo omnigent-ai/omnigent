@@ -77,7 +77,7 @@ def test_landing_composer_matches_skill_and_tab_completes(
     ``code-review`` skill (the landing menu lists the selected agent's
     skills only, and suppresses entirely for native-terminal agents). The
     session list is stubbed empty so no agent discovered by the
-    ``kind=any`` scan sorts ahead and steals auto-selection.
+    ``visibility=mine`` scan sorts ahead and steals auto-selection.
 
     ``/review`` is a substring of ``code-review`` but a prefix of no
     command — it surfaces the row only under substring matching. Tab then
@@ -103,13 +103,24 @@ def test_landing_composer_matches_skill_and_tab_completes(
             }
         ]
     }
+    hosts_body = {
+        "hosts": [
+            {
+                "host_id": "host_helper_e2e",
+                "name": "e2e-host",
+                "owner": "e2e",
+                "status": "online",
+            }
+        ]
+    }
     empty_list = {"object": "list", "data": [], "has_more": False}
 
     def _fulfill(route: Route, body: dict[str, object]) -> None:
         route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
 
     page.route("**/v1/agents", lambda r: _fulfill(r, agents_body))
-    # Neutralize the sidebar list + kind=any agent-discovery scan so only
+    page.route("**/v1/hosts", lambda r: _fulfill(r, hosts_body))
+    # Neutralize the sidebar list + visibility=mine agent-discovery scan so only
     # the stubbed agent feeds the picker (and auto-selects).
     page.route("**/v1/sessions", lambda r: _fulfill(r, empty_list))
 

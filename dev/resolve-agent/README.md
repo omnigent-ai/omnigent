@@ -7,13 +7,18 @@ reproduction verdict, the per-facet breakdown, the journey, and the authored e2e
 test), then does one of two things:
 
 - **If an open PR already fixes the bug**, it **reviews that PR** — checks out the
-  PR, runs the repro test against it, and reviews the diff — instead of writing a
-  competing fix.
+  PR, runs the repro test against it, and reviews the full diff for quality and
+  scope — instead of writing a competing fix. One concrete failure or requested
+  outcome may require changes across layers; independent fixes or features must
+  be removed or split out. Polly reports clearly unrelated work as blocking
+  and uncertain scope as non-blocking clarification questions in its ordinary
+  review. A missing issue link alone is not a scope finding. Resolve addresses
+  those findings against the reported bug before approving the existing PR.
 - **If no fix exists yet**, it **authors the fix** in a fresh worktree, adds
-  targeted tests at the layer it changed, proves the set goes fail→pass, opens a
-  ready-for-review PR, and then **drives that PR to a landable state** — a live
-  preview deploy (on every PR, so the fix can be validated directly), green CI, a
-  clean automated review, and the issue's maintainer tagged to review.
+  targeted tests at the layer it changed, and proves the set goes fail→pass.
+  Publication then follows the selected mode: the agent either opens and drives
+  the PR itself, prepares a reviewer-facing body for a workflow-owned publisher,
+  or stops after a local commit when `skip_push` is enabled.
 
 ## Prerequisites
 
@@ -21,7 +26,8 @@ test), then does one of two things:
   Claude subscription, an OpenAI-compatible gateway, or a Databricks workspace).
   The agent's brain runs on the Claude Agent SDK.
 - `gh` authenticated (`gh auth login`) — the agent finds/reviews an existing fix
-  PR, opens its own PR, and (for the CI path) reads the run's artifacts with it.
+  PR, directly published runs open their own PR, and CI recovery reads the run's
+  artifacts with it.
 - Run it **from the root of your `omnigent-ai/omnigent` checkout** so the agent's
   working directory is this repo.
 
@@ -75,19 +81,37 @@ python dev/resolve.py <session> --skip-push                  # author mode: comm
 
 `--skip-push` applies to the author path only: the agent commits the fix in its
 local worktree but does **not** push the branch or open a PR, leaving the commit
-for you to inspect, push, and PR yourself. It has no effect in review mode (which
-pushes nothing either way).
+for you to inspect, push, and PR yourself. It has no effect in review mode, which
+follows the existing PR's remediation and publication rules.
 
-Because the agent may **push, open a PR, or comment on an existing PR**,
+### Publication modes
+
+- **Direct publication** is the default when no external publisher contract is
+  present. The agent pushes, opens a ready-for-review PR, and drives its preview,
+  CI, Polly review, live-validation prompt, and maintainer handoff.
+- **Workflow-owned publication** is selected by an explicit CI publisher
+  contract with `skip_push` false. The agent commits the fix and prepares and
+  validates `.omnigent/pr-body.md` plus the deferred validation prompt, but makes
+  no GitHub writes. The workflow preserves the body and handoff in the resolve
+  artifact, restores them into the publication worktree, and owns publication
+  and recovery.
+- **Local-only** is selected by `skip_push` true. It takes precedence over a
+  generic publisher overlay: the agent commits locally, prepares no PR body, and
+  the workflow suppresses publication.
+
+Because direct publication may **push and open a PR**, and review mode may comment
+on an existing PR,
 `dev/resolve.py` asks you to confirm before it launches the agent (skip with
-`--yes`). The agent itself runs unattended once launched — the mid-run push is not
-gated, so the CI path works with nobody at a terminal; the ready-for-review PR is
-the review gate after the fact.
+`--yes`). The agent itself runs unattended once launched — a direct-mode push is
+not gated mid-run, so it works with nobody at a terminal; the ready-for-review PR
+is the review gate after the fact.
 
 ## What it does
 
 1. Recovers the repro handoff (verdict, facets, journey, `bug_url`) and the e2e
-   test's content from the `session` or `ci_link`.
+   test's content from the `session` or `ci_link`. CI recovery reads the compact
+   artifact checkpoint and preserved test files first, using multi-megabyte job
+   logs only as a compatibility fallback for older bundles.
 2. **Looks for an open PR already fixing the bug.** This decides the path:
    - **Existing fix PR** → checks it out, runs the repro test against it (pass =
      it fixes the bug; fail = it doesn't — the key review finding), reviews the
@@ -112,15 +136,14 @@ the review gate after the fact.
    it performs, and carries the before clips' captions through — so the captioned
    before/after pair lands in the PR's Demo section and, for Linear bugs with a
    key available, on the ticket.
-6. *(author path)* **Gets an independent cross-vendor review before opening the
-   PR** — spawns a different-model reviewer child (a `codex-native` bundle) on its
-   own diff, the same review polly runs after the fact but here *before* publish,
-   and feeds it a growing **recurring-pitfalls checklist**
-   (`review-checklist.md`) so known repo mistakes are caught by name. Acts on any
-   blocking finding, then commits, pushes, and opens a **ready-for-review PR** (so
-   the repo's automated review runs too). Reuses the same server + runner; if no
-   second vendor is configured it skips and says so.
-7. *(author path)* **Drives the open PR to a landable state** — a bounded loop:
+6. *(author path)* Commits the focused, locally validated fix, then follows the
+   selected publication mode. Direct runs push and open a **ready-for-review
+   PR**. Workflow-owned runs prepare the validated PR body and handoff without
+   GitHub writes. Local-only runs stop at the commit. Full repository validation
+   and independent review happen after publication.
+7. *(direct author path and review path)* **Drives the open PR to a landable
+   state** — a bounded loop. Workflow-owned author runs leave this post-publication
+   work to the publisher:
    - Labels **every** PR **`ui-preview`** (not just frontend fixes) to request a
      live app deploy — but only **after** CI is green and the Polly review is
      clean for the current commit, never up front, since the label triggers a
@@ -133,17 +156,19 @@ the review gate after the fact.
    - Watches CI (`gh pr checks --watch`); when a check fails it reads the log,
      fixes its own regressions, and pushes — while leaving pre-existing/flaky/infra
      failures alone (and saying so).
-   - Reads the latest **Polly AI Review** comment; fixes any blocking/security
-     finding at the root, pushes, and re-triggers the review with a `/review`
-     comment, looping until no critical findings remain.
+   - Reads the latest **Polly AI Review** comment; fixes every actionable finding
+     at the root, pushes, and re-triggers `polly-review.yml` for the PR, looping
+     until the newest review is clean or the review-round cap is reached.
    - Writes a **paste-to-an-agent live-validation prompt** into the PR body so a
      human can reproduce and confirm the fix, then **tags the issue's assignee**
      (the maintainer) to review once CI is green and the review is clean.
 8. Emits a single fenced ```json handoff block: `mode`
    (`reviewed_existing_pr` / `authored_fix`), `outcome` (`fixed` /
    `partially_fixed` / `not_fixed` / `nothing_to_fix` / `needs_more_info`), the
-   per-facet fail→pass proof, the `cross_review` result, the PR URL (opened or
-   reviewed), and the Step 4 landing state (`ci_status`, `polly_review`,
-   `ui_preview`, `validation_prompt`, `maintainer_review`).
+   plain-English `problem_summary` and `solution_summary` used for the Linear
+   update, the per-facet fail→pass proof, the PR URL (opened or reviewed, or empty
+   until the workflow-owned publisher opens it), and the publication state
+   (`ci_status`, `polly_review`, `ui_preview`, `validation_prompt`,
+   `maintainer_review`).
 
 It does **not** merge. See `AGENTS.md` for the full operating procedure.

@@ -23,9 +23,10 @@ from typing import Any
 
 import cachetools
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
@@ -81,25 +82,29 @@ _ASK_ON_ADD_POLICY_SPEC = FunctionPolicySpec(
 # per-tool-call engine build. Only non-``None`` owners are cached (a
 # session is granted its owner atomically at creation, so ``None`` is a
 # transient single-user/pre-grant state, not worth caching).
-_SESSION_OWNER_CACHE: cachetools.LRUCache[str, str] = cachetools.LRUCache(maxsize=4096)
+_SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096)
+)
 
 # TTL cache of ``workspace_id -> list[PolicySpec]`` for DB-stored default
 # policies. Default policies are admin-managed and change infrequently, so
 # a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
 # evaluation while still propagating changes within half a minute.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed solely by workspace_id
 _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachetools.TTLCache(
     maxsize=256, ttl=30
 )
 
-# Invalidation-based LRU cache of ``(workspace_id, conversation_id) -> list[PolicySpec]``
-# for session-scoped policies. Unlike defaults, session policies can be added
-# mid-session (via sys_add_policy), so a TTL would delay enforcement. Instead,
-# the cache is explicitly invalidated whenever a session policy is mutated via
-# the CRUD routes. Keyed by workspace to prevent cross-tenant leakage.
-# Bounded (LRU, 4096 entries) to match _SESSION_OWNER_CACHE and prevent unbounded
-# growth — LRU eviction handles sessions that end without any policy mutation.
-_SESSION_POLICY_SPECS_CACHE: cachetools.LRUCache[tuple[int, str], list[PolicySpec]] = (
-    cachetools.LRUCache(maxsize=4096)
+# TTL+LRU cache of ``conversation_id -> list[PolicySpec]`` for session-scoped
+# policies, workspace-namespaced by the wrapper. Mutations call
+# invalidate_session_policy_specs_cache for immediate local eviction
+# (single-instance or lucky same-replica routing). The TTL (30 s) is the safety
+# ceiling for horizontally-scaled deployments where a DELETE/PATCH on one replica
+# cannot evict another replica's in-process cache — without it, a deleted session
+# policy would remain enforced on other replicas indefinitely (no natural expiry).
+# TTLCache subsumes LRU eviction, bounding memory the same way.
+_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=30)
 )
 
 
@@ -221,11 +226,12 @@ def any_policies_apply(
     policy_store: PolicyStore | None,
     phase: Phase | None = None,
     tool_name: str | None = None,
+    conversation: Conversation | None = None,
 ) -> bool:
-    """Return ``True`` when at least one policy would run for this evaluation.
+    """Return ``True`` when this evaluation may need to run policies.
 
-    Cheaper than building a full :class:`PolicyEngine`: only checks whether
-    the combined policy list is non-empty. Used as a fast-path guard in
+    Cheaper than building a full :class:`PolicyEngine`: checks whether
+    policies may apply. Used as a fast-path guard in
     ``POST /policies/evaluate`` to skip the engine build (and the associated
     conversation-store reads for labels/state/usage) when nothing would fire.
 
@@ -239,6 +245,12 @@ def any_policies_apply(
         policies are configured.
     :param phase: The evaluation phase, if known.
     :param tool_name: The tool being called (for ``PHASE_TOOL_CALL`` events).
+    :param conversation: The conversation row when the caller holds one. For
+        sub-agent conversations this lets the check see the CHILD spec's own
+        guardrails (which :func:`build_policy_engine` enforces), so a bundle
+        whose only policies live on a sub-agent is not fast-path skipped.
+        Children with a policy store must build the engine to resolve
+        inherited session policies against their verified root.
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
@@ -249,6 +261,9 @@ def any_policies_apply(
         return True
     if spec.guardrails and spec.guardrails.policies:
         return True
+    child_spec = _resolve_sub_agent_spec(spec, conversation)
+    if child_spec is not None and child_spec.guardrails and child_spec.guardrails.policies:
+        return True
     if default_policies:
         return True
     if _load_default_policy_specs(policy_store):
@@ -257,7 +272,50 @@ def any_policies_apply(
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
         return True
+    # The engine verifies ancestry before inheriting root session policies.
+    # A child's local policy list cannot rule out an inherited policy.
+    if (
+        policy_store is not None
+        and conversation is not None
+        and conversation.parent_conversation_id is not None
+    ):
+        return True
     return False
+
+
+def _resolve_sub_agent_spec(
+    spec: AgentSpec,
+    conversation: Conversation | None,
+) -> AgentSpec | None:
+    """
+    Resolve a sub-agent conversation's own child :class:`AgentSpec`.
+
+    Engine-build sites resolve a session's agent binding to the ROOT
+    bundle spec, so a sub-agent conversation's engine would otherwise
+    hold only the parent's guardrails and silently drop the child's
+    (e.g. a stricter ``max_tool_calls_per_session`` on the child).
+    This looks up ``conversation.sub_agent_name`` in the root spec's
+    ``sub_agents`` tree.
+
+    :param spec: The spec the caller resolved for this session —
+        the root bundle spec for sub-agent conversations.
+    :param conversation: The conversation row, or ``None`` when the
+        caller could not load one.
+    :returns: The child :class:`AgentSpec`, or ``None`` when the
+        conversation is not a sub-agent or the name does not resolve
+        in the tree (native-harness children store a display label
+        here).
+    """
+    if conversation is None or not conversation.sub_agent_name:
+        return None
+    # Lazy import: workflow imports the policies package at runtime, so a
+    # module-level import here would be circular.
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    child_spec = _find_spec_by_name(spec, conversation.sub_agent_name)
+    if child_spec is None or child_spec is spec:
+        return None
+    return child_spec
 
 
 def build_policy_engine(
@@ -299,8 +357,10 @@ def build_policy_engine(
     before any child-specific session policies. This ensures
     guardrails set on the parent session (e.g. via
     ``sys_add_policy``) also govern spawned sub-agents.
-    Policies with the same ``name`` on both root and child
-    are deduplicated (child wins).
+    Structurally identical root and child policies evaluate once
+    at the root policy's original position. Same-named policies
+    with different handlers or parameters both run, root first,
+    so a child cannot shadow or reorder an inherited guardrail.
 
     :param spec: The parsed agent spec.
     :param conversation_id: The conversation this workflow is
@@ -399,7 +459,7 @@ def build_policy_engine(
     # is no longer reachable since all_policy_specs is never empty).
     all_policy_specs.append(_ASK_ON_ADD_POLICY_SPEC)
 
-    label_defs = (guardrails.labels or {}) if guardrails else {}
+    label_defs = dict((guardrails.labels or {}) if guardrails else {})
     # One conversation read (``conv``, resolved above for policy
     # inheritance) and ONE spawn-tree load feed everything below: labels,
     # session state (own + inherited root keys), both usage seeds, and the
@@ -474,6 +534,34 @@ def build_policy_engine(
                 code=ErrorCode.CONFLICT,
             )
         conv = confirmed
+    # A sub-agent conversation runs the CHILD agent's spec, but every
+    # engine-build site resolves the session's agent binding to the ROOT
+    # bundle spec. Resolve ``conv.sub_agent_name`` to the child spec so the
+    # child's own guardrails are enforced too. Resolved from the REFRESHED
+    # row (after the tree/identity checks above), per the freshness contract
+    # — a delete/recreate race must not enforce a stale child's policies.
+    # The child's policies are APPENDED after the parent's and same-name
+    # collisions are NOT deduplicated: both instances run, and DENY
+    # short-circuit makes the stricter limit the effective one, so a child
+    # redeclaring a parent policy name with a looser configuration cannot
+    # weaken the parent's fence. Native-harness children whose
+    # ``sub_agent_name`` is a display label resolve to no spec and are
+    # unaffected.
+    child_spec = _resolve_sub_agent_spec(spec, conv)
+    child_guardrails = child_spec.guardrails if child_spec is not None else None
+    if child_guardrails is not None and child_guardrails.policies:
+        agent_policy_specs = agent_policy_specs + list(child_guardrails.policies)
+        all_policy_specs = (
+            session_policy_specs
+            + agent_policy_specs
+            + admin_policy_specs
+            + [_ASK_ON_ADD_POLICY_SPEC]
+        )
+        if child_guardrails.labels:
+            # Child label schemas ADD keys; the parent's schema wins on a
+            # collision so a child cannot loosen a parent-declared label
+            # constraint.
+            label_defs = {**child_guardrails.labels, **label_defs}
     # Session policies are per-conversation, but sub-agents inherit the root
     # conversation's policies so guardrails set on the top-level session (e.g.
     # via sys_add_policy) also govern spawned children. Loaded from the
@@ -481,11 +569,10 @@ def build_policy_engine(
     # suggested root inherited another tree's guardrails.
     if root_conversation_id != conversation_id:
         root_policy_specs = _load_session_policy_specs(root_conversation_id, policy_store)
-        # Deduplicate: skip root policies already present on the child
-        # (keyed by policy name) to avoid double-evaluation.
-        child_names = {p.name for p in session_policy_specs}
-        root_policy_specs = [p for p in root_policy_specs if p.name not in child_names]
-        session_policy_specs = root_policy_specs + session_policy_specs
+        # Keep the root copy of an exact duplicate so attaching the same
+        # policy to a child cannot reorder the authoritative root pipeline.
+        child_policy_specs = [p for p in session_policy_specs if p not in root_policy_specs]
+        session_policy_specs = root_policy_specs + child_policy_specs
         all_policy_specs = (
             session_policy_specs
             + agent_policy_specs
@@ -554,11 +641,15 @@ def build_policy_engine(
     # Session model: the conversation's model_override (set when a user
     # picks a model mid-session) wins over the spec's llm.model; None when
     # neither is available and cost policies treat it as undeterminable.
-    initial_model = (
-        conv.model_override
-        if conv is not None and conv.model_override
+    # A sub-agent session runs the CHILD spec's model, so its declaration
+    # (falling back to the root's when the child declares none) is the
+    # spec-level default here.
+    spec_model = (
+        child_spec.llm.model
+        if child_spec is not None and child_spec.llm and child_spec.llm.model
         else (spec.llm.model if spec.llm else None)
     )
+    initial_model = conv.model_override if conv is not None and conv.model_override else spec_model
     # Pass the full ModelPricing so the engine can price cache-read and
     # cache-write tokens at their own rates via compute_llm_cost(). Check
     # provider config first for custom pricing (self-hosted models), then
@@ -571,11 +662,15 @@ def build_policy_engine(
 
         provider_config = load_config()
         # Match the harness running this session; an override wins over the
-        # agent's configured executor harness.
-        harness = (
-            conv.harness_override
-            if conv is not None and conv.harness_override
+        # agent's configured executor harness. A sub-agent session runs the
+        # CHILD spec's executor.
+        spec_harness = (
+            child_spec.executor.harness_kind
+            if child_spec is not None
             else spec.executor.harness_kind
+        )
+        harness = (
+            conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
         token_pricing = fetch_model_pricing_with_provider(
             initial_model, provider_config=provider_config, harness=harness
@@ -600,7 +695,13 @@ def build_policy_engine(
             for s in all_policy_specs
         ],
         label_defs=label_defs,
-        ask_timeout=guardrails.ask_timeout if guardrails else DEFAULT_ASK_TIMEOUT,
+        # A sub-agent's ASKs resolve under its own declared timeout; fall
+        # back to the root's, then the default.
+        ask_timeout=(
+            child_guardrails.ask_timeout
+            if child_guardrails is not None
+            else (guardrails.ask_timeout if guardrails else DEFAULT_ASK_TIMEOUT)
+        ),
         conversation_id=conversation_id,
         initial_labels=initial_labels,
         initial_session_state=initial_session_state,
@@ -1017,6 +1118,34 @@ def load_session_usage(
     return _sum_subtree_usage(tree, conversation_id)
 
 
+def load_session_usage_and_tree(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    *,
+    root_conversation_id: str | None = None,
+) -> tuple[dict[str, Any], list[Conversation]]:
+    """
+    Load a conversation's subtree usage together with the tree it came from.
+
+    :func:`load_session_usage` discards the tree it summed, so a caller that
+    needs both — the sums *and* the rows, e.g. to roll up which harnesses ran
+    in the tree — would otherwise load it twice. Returning both keeps that to
+    one read, and keeps the sums and the rows from the same snapshot rather
+    than two.
+
+    :param conversation_id: The conversation to sum, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read from.
+    :param root_conversation_id: The conversation's tree root, when the
+        caller already holds the row — validated as in
+        :func:`load_session_usage`.
+    :returns: ``(usage, tree)`` — the subtree usage dict
+        :func:`load_session_usage` would return, and every conversation in
+        the tree it was summed from.
+    """
+    tree = load_session_tree(conversation_id, conversation_store, root_conversation_id)
+    return _sum_subtree_usage(tree, conversation_id), tree
+
+
 def load_session_tree(
     conversation_id: str,
     conversation_store: ConversationStore,
@@ -1208,10 +1337,18 @@ def _policy_usage_seed(
     conv = conversation_store.get_conversation(conversation_id)
     if conv is None:
         return {}
-    usage = load_session_usage(conv.root_conversation_id, conversation_store)
+    # A top-level row's ``root_conversation_id`` is its own id, so the root we
+    # are about to sum names itself as its root — pass it and the loader skips
+    # re-reading that row (it still verifies the hint, so a stale one heals).
+    usage = load_session_usage(
+        conv.root_conversation_id,
+        conversation_store,
+        root_conversation_id=conv.root_conversation_id,
+    )
     return _normalize_usage_for_engine(usage)
 
 
+@restart_on_stale_cursor
 def _load_tree_conversations(
     root_conversation_id: str,
     conversation_store: ConversationStore,
@@ -1222,7 +1359,11 @@ def _load_tree_conversations(
     Returns all conversations sharing ``root_conversation_id`` (the
     root plus every sub-agent, any ``kind``), paginating so a large
     tree is not silently truncated. The ``root_conversation_id`` column
-    is indexed, so this is a bounded indexed scan per page.
+    is indexed, so this is a bounded indexed scan per page. A delete
+    landing on the page cursor mid-walk restarts the walk (via
+    :func:`restart_on_stale_cursor`) instead of silently dropping the
+    remaining rows — a truncated tree under-counts spend and can move a
+    budget gate.
 
     :param root_conversation_id: The tree's root conversation id (every
         conversation in a spawn tree shares it), e.g. ``"conv_abc123"``.
@@ -1254,12 +1395,18 @@ def _load_tree_conversations(
     return convs
 
 
+@restart_on_stale_cursor
 def _load_tree_pages(
     root_conversation_id: str,
     conversation_store: ConversationStore,
 ) -> tuple[list[Conversation], bool]:
     """
     Page through a spawn tree, reporting whether more than one page was read.
+
+    A delete landing on the page cursor mid-walk restarts the walk (via
+    :func:`restart_on_stale_cursor`) instead of silently dropping the
+    remaining rows — a truncated tree under-counts spend and can move a
+    budget gate.
 
     :param root_conversation_id: The tree's root conversation id.
     :param conversation_store: Store to read from.
@@ -1449,9 +1596,7 @@ def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
     :param conversation_id: The session whose cache entry to evict,
         e.g. ``"conv_abc123"``.
     """
-    from omnigent.db.db_models import current_workspace_id
-
-    _SESSION_POLICY_SPECS_CACHE.pop((current_workspace_id(), conversation_id), None)
+    _SESSION_POLICY_SPECS_CACHE.pop(conversation_id, None)
 
 
 def _load_session_policy_specs(
@@ -1462,11 +1607,15 @@ def _load_session_policy_specs(
     Load enabled session policies from the store and convert
     them to :class:`FunctionPolicySpec` instances.
 
-    Results are cached per ``(workspace_id, conversation_id)`` and
-    invalidated on any mutation via :func:`invalidate_session_policy_specs_cache`.
-    There is no TTL — the cache entry is permanent until explicitly evicted,
-    so session policy changes (including ``sys_add_policy``) take effect
-    immediately on the next engine build.
+    Results are cached per ``(workspace_id, conversation_id)`` with a
+    30 s TTL (see :data:`_SESSION_POLICY_SPECS_CACHE`). Mutations call
+    :func:`invalidate_session_policy_specs_cache` for immediate local
+    eviction on the replica that handled the change; the TTL is the
+    safety net for replicas in a horizontally-scaled deployment that
+    never received the invalidation signal. Same-replica mutations
+    (including ``sys_add_policy``) still take effect on the next engine
+    build via the explicit invalidation; cross-replica propagation is
+    bounded to ≤ 30 s.
 
     Only ``type="python"`` policies are instantiable today. An
     enabled policy of an unsupported type (e.g. ``type="url"``)
@@ -1484,10 +1633,7 @@ def _load_session_policy_specs(
     """
     if policy_store is None:
         return []
-    from omnigent.db.db_models import current_workspace_id
-
-    key = (current_workspace_id(), conversation_id)
-    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(key)
+    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
     if cached is not None:
         return cached
     stored = policy_store.list_for_session(conversation_id)
@@ -1496,7 +1642,7 @@ def _load_session_policy_specs(
         if not policy.enabled:
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _SESSION_POLICY_SPECS_CACHE[key] = specs
+    _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
     return specs
 
 
@@ -1527,6 +1673,9 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
             # Session policies self-select: on=None means the
             # engine skips phase filtering and always dispatches.
             on=None,
+            # Carry the row's owning workspace so a denial can be
+            # attributed to it in logs.
+            workspace_id=policy.workspace_id,
             function=FunctionRef(
                 path=policy.handler,
                 arguments=policy.factory_params,

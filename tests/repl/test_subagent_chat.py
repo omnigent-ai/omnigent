@@ -35,7 +35,7 @@ from omnigent.repl._repl import (
     _should_discover_subagents,
 )
 from omnigent.server.schemas import SessionStatusEvent
-from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 # ── Host-level: chattability + closed status (B / F2 / F5) ─────────────────
 

@@ -20,6 +20,7 @@
 
 import type {
   AnyBlock,
+  ErrorBlock,
   MessageContentBlock,
   RoutingDecisionBlock,
   ToolExecution,
@@ -33,7 +34,7 @@ import {
   routingExtras,
 } from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
-import type { RememberScope } from "./types";
+import type { CodexPersistMode, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -51,6 +52,20 @@ export type ToolState =
   | "no-output"; // turn finished (completed/incomplete) but no result was ever recorded
 
 /** A single rendered item inside an assistant bubble. */
+export interface RenderErrorDetails {
+  message: string;
+  source: string;
+  code: string;
+  level?: "error" | "info";
+  title?: string;
+  cause?: string;
+  remediation?: string;
+}
+
+export interface RelatedRenderError extends RenderErrorDetails {
+  itemId: string | null;
+}
+
 export type RenderItem =
   | { kind: "text"; itemId: string | null; text: string; final: boolean }
   | {
@@ -93,16 +108,11 @@ export type RenderItem =
       stderr: string | null;
     }
   | { kind: "policy_denied"; itemId: string | null; reason: string; phase: string }
-  | {
+  | ({
       kind: "error";
       itemId: string | null;
-      message: string;
-      source: string;
-      code: string;
-      title?: string;
-      cause?: string;
-      remediation?: string;
-    }
+      relatedErrors?: RelatedRenderError[];
+    } & RenderErrorDetails)
   | {
       kind: "retry";
       itemId: string | null;
@@ -126,6 +136,7 @@ export type RenderItem =
       response: {
         action: "accept" | "decline" | "cancel" | "auto_resolved";
         content?: Record<string, unknown>;
+        _meta?: Record<string, unknown>;
       } | null;
       askUserQuestion?: Record<string, unknown> | null;
       exitPlanMode?: Record<string, unknown> | null;
@@ -136,7 +147,9 @@ export type RenderItem =
         execPolicyAmendment: string[] | null;
       } | null;
       allowAllEdits?: boolean;
+      allowAutoMode?: boolean;
       rememberScope?: RememberScope | null;
+      codexPersistModes?: CodexPersistMode[];
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -144,6 +157,8 @@ export type Bubble =
   | {
       kind: "user";
       itemId: string;
+      /** Queued input that does not yet have a persisted transcript item. */
+      pending?: boolean;
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
@@ -189,12 +204,19 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
+      /**
+       * The user spoke while this response was already producing assistant
+       * items. Start the continuation's fold expanded: it can contain a direct
+       * answer to that interjection followed by resumed background work, and
+       * the ordinary trailing-text heuristic cannot distinguish the two.
+       */
+      defaultExpanded?: boolean;
       /** Freshest epoch stamp in the group (latest activity) —
        *  server-stamped from history, client-stamped while live.
        *  Display-only. */
       createdAtS?: number;
     }
-  | { kind: "compaction_loading"; itemId: string }
+  | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
   | {
       kind: "routing_decision";
@@ -528,6 +550,29 @@ function isAnonymousRid(rid: string): boolean {
   return rid === "" || rid.startsWith(LIVE_ITEM_PREFIX);
 }
 
+function errorDetails(block: ErrorBlock): RelatedRenderError {
+  return {
+    itemId: block.ctx.itemId,
+    message: block.message,
+    source: block.source,
+    code: block.code,
+    ...(block.level ? { level: block.level } : {}),
+    ...(block.title ? { title: block.title } : {}),
+    ...(block.cause ? { cause: block.cause } : {}),
+    ...(block.remediation ? { remediation: block.remediation } : {}),
+  };
+}
+
+/** Errors are related only when the transcript gives them the same causal identity. */
+function errorsShareCausalBoundary(first: ErrorBlock, next: ErrorBlock): boolean {
+  return (
+    !isAnonymousRid(first.ctx.responseId) &&
+    first.ctx.responseId === next.ctx.responseId &&
+    first.ctx.turn === next.ctx.turn &&
+    first.ctx.agent === next.ctx.agent
+  );
+}
+
 /**
  * Blocks stamped a distinct response id ON PURPOSE so they render as
  * their own bubble: deny/failure sentinels aren't part of any turn's
@@ -762,6 +807,7 @@ function walkBubbles(
   let lastBubbleStart = bubbles.length > 0 ? 0 : -1;
   let lastBubbleCount = 1;
   let i = startIndex;
+  let expandNextAssistantResponseId: string | null = null;
 
   while (i < blocks.length) {
     const b = blocks[i]!;
@@ -769,11 +815,20 @@ function walkBubbles(
     // Lifecycle markers don't render — they exist for the streaming
     // reducer and the eager URL update, not the renderer.
     if (isNonRenderingBlock(b)) {
+      // A new lifecycle edge means the next assistant group is a distinct
+      // response, even if a harness happens to reuse the same response id.
+      expandNextAssistantResponseId = null;
       i += 1;
       continue;
     }
 
     if (b.type === "user_message") {
+      // A native harness can accept a steering message without ending the
+      // response already in progress. In persisted history that user message
+      // has the same response id as assistant work immediately before it.
+      // The answer and the resumed work then share one assistant bubble; do
+      // not hide the answer merely because more work followed it.
+      expandNextAssistantResponseId = midResponseUserMessageId(blocks, i);
       const chipIndexes = deferred.byMessage.get(i);
       const firstChip = chipIndexes?.[0];
       // The pair's region starts at whichever block came first, so an
@@ -809,25 +864,47 @@ function walkBubbles(
     }
 
     if (b.type === "compaction_loading") {
+      // One compaction → one spinner. A long compaction re-announces
+      // in_progress on every status poll, so a spinner for this compaction
+      // may already be on screen; refresh it in place — preferring the
+      // server-reported start as the elapsed anchor — instead of stacking
+      // another spinner that completion would then orphan.
+      let existing = -1;
+      for (let j = bubbles.length - 1; j >= 0; j--) {
+        if (bubbles[j]?.kind === "compaction_loading") {
+          existing = j;
+          break;
+        }
+      }
+      if (existing !== -1) {
+        const prev = bubbles[existing] as Extract<Bubble, { kind: "compaction_loading" }>;
+        bubbles[existing] = { ...prev, createdAtS: b.startedAtS ?? prev.createdAtS };
+        lastBubbleStart = i;
+        lastBubbleCount = 0;
+        i += 1;
+        continue;
+      }
       lastBubbleStart = i;
       lastBubbleCount = 1;
       bubbles.push({
         kind: "compaction_loading",
         itemId: b.ctx.itemId ?? `compaction_loading_${i}`,
+        createdAtS: b.startedAtS ?? b.ctx.clientCreatedAtS,
       });
       i += 1;
       continue;
     }
 
     if (b.type === "compaction") {
-      // Remove the loading spinner for this compaction so the user sees
-      // a single transition from spinner → checkmark.  The spinner may
-      // not be the immediately preceding bubble when assistant blocks
-      // (text, tool calls) were streamed during compaction.
+      // Remove EVERY loading spinner for this compaction so the user sees
+      // a single transition from spinner → checkmark. The spinner may not
+      // be the immediately preceding bubble when assistant blocks (text,
+      // tool calls) were streamed during compaction, and a long compaction
+      // that re-announced progress may have left more than one — an
+      // unremoved spinner would keep counting beside the marker forever.
       for (let j = bubbles.length - 1; j >= 0; j--) {
         if (bubbles[j]?.kind === "compaction_loading") {
           bubbles.splice(j, 1);
-          break;
         }
       }
       lastBubbleStart = i;
@@ -1004,7 +1081,12 @@ function walkBubbles(
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
       ...(groupCreatedAtS !== undefined ? { createdAtS: groupCreatedAtS } : {}),
+      ...(expandNextAssistantResponseId !== null &&
+      groupBlocks.some((block) => block.ctx.responseId === expandNextAssistantResponseId)
+        ? { defaultExpanded: true }
+        : {}),
     });
+    expandNextAssistantResponseId = null;
   }
 
   return { bubbles, lastBubbleStart, lastBubbleCount };
@@ -1327,6 +1409,36 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
   );
 }
 
+/**
+ * Whether a user message interrupted assistant work in the same response.
+ *
+ * Native harnesses persist a steered message with the active response id. A
+ * normal next-turn message has a new response id, so comparing it with the
+ * preceding assistant work distinguishes the two without inspecting message
+ * wording. Runtime system messages may record an interruption in between and are
+ * skipped; lifecycle markers remain hard boundaries. Empty ids are provisional
+ * live-stream values, not durable turn identity, and are deliberately ignored.
+ */
+function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | null {
+  const user = blocks[index];
+  if (
+    user?.type !== "user_message" ||
+    isAnonymousRid(user.ctx.responseId) ||
+    isSystemUserContent(user.content)
+  ) {
+    return null;
+  }
+  for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
+    const previous = blocks[previousIndex]!;
+    if (isNonRenderingBlock(previous)) return null;
+    if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
+    return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
+      ? user.ctx.responseId
+      : null;
+  }
+  return null;
+}
+
 /** Return true when persisted text marks the assistant turn interrupted. */
 function groupHasInterruptedText(blocks: AnyBlock[]): boolean {
   return blocks.some((b) => b.type === "text_done" && b.interrupted === true);
@@ -1476,17 +1588,19 @@ function buildAssistantItems(
     }
 
     if (b.type === "error") {
+      const relatedErrors: RelatedRenderError[] = [];
+      i += 1;
+      while (i < blocks.length) {
+        const next = blocks[i]!;
+        if (next.type !== "error" || !errorsShareCausalBoundary(b, next)) break;
+        relatedErrors.push(errorDetails(next));
+        i += 1;
+      }
       items.push({
         kind: "error",
-        itemId: b.ctx.itemId,
-        message: b.message,
-        source: b.source,
-        code: b.code,
-        ...(b.title ? { title: b.title } : {}),
-        ...(b.cause ? { cause: b.cause } : {}),
-        ...(b.remediation ? { remediation: b.remediation } : {}),
+        ...errorDetails(b),
+        ...(relatedErrors.length > 0 ? { relatedErrors } : {}),
       });
-      i += 1;
       continue;
     }
 
@@ -1521,7 +1635,9 @@ function buildAssistantItems(
         exitPlanMode: b.exitPlanMode,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
+        allowAutoMode: b.allowAutoMode,
         rememberScope: b.rememberScope,
+        codexPersistModes: b.codexPersistModes,
       });
       i += 1;
       continue;
@@ -1687,7 +1803,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       // the user branch's `createdAtS` comparison below.
       a.createdAtS !== b.createdAtS ||
       // Flips when a later bubble continues this turn — the fold depends on it.
-      Boolean(a.continued) !== Boolean(b.continued)
+      Boolean(a.continued) !== Boolean(b.continued) ||
+      // Opens an interjected response's process fold on first render.
+      Boolean(a.defaultExpanded) !== Boolean(b.defaultExpanded)
     ) {
       return false;
     }
@@ -1702,6 +1820,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "user" && b.kind === "user") {
     if (
       a.itemId !== b.itemId ||
+      Boolean(a.pending) !== Boolean(b.pending) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||

@@ -1,9 +1,12 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
@@ -11,13 +14,21 @@ import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
   isMobile: false,
-  projects: [{ id: "project-1", name: "Sprint 42" }],
+  projects: [{ id: "project-1", name: "Sprint 42" }] as {
+    id: string | null;
+    name: string;
+    icon?: string | null;
+  }[],
   togglePinned: vi.fn(),
   rename: vi.fn(),
   moveToProject: vi.fn(),
   archive: vi.fn(),
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
+  fork: vi.fn(),
+  exportTranscript: vi.fn(),
+  triggerDownload: vi.fn(),
+  toastError: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -45,6 +56,20 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
   return { ...actual, markConversationUnread: mocks.markUnread };
 });
 
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApiModule>();
+  return { ...actual, exportSessionTranscript: mocks.exportTranscript };
+});
+
+vi.mock("@/hooks/useFileContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseFileContentModule>();
+  return { ...actual, triggerBrowserDownload: mocks.triggerDownload };
+});
+
+vi.mock("sonner", () => ({
+  toast: { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() },
+}));
+
 const CONVERSATION: Conversation = {
   id: "conv-1",
   object: "conversation",
@@ -65,16 +90,23 @@ const SECOND_CONVERSATION: Conversation = {
 };
 
 function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
+  // A QueryClientProvider is required: the menu reads useQueryClient() to hand
+  // the post-archive Undo toast a client for unarchiving.
+  const queryClient = new QueryClient();
   return (
-    <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
-      <HeaderConversationMenu
-        conversation={CONVERSATION}
-        currentProject={null}
-        canShare
-        onShare={() => {}}
-        {...overrides}
-      />
-    </MemoryRouter>
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
+        <HeaderConversationMenu
+          conversation={CONVERSATION}
+          currentProject={null}
+          canShare
+          canFork
+          onShare={() => {}}
+          onFork={mocks.fork}
+          {...overrides}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
   );
 }
 
@@ -114,6 +146,8 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -145,6 +179,42 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
   });
 
+  it("downloads the transcript as <session-id>.jsonl from Export", async () => {
+    const jsonl = '{"record_type":"session_meta","id":"conv-1"}\n';
+    mocks.exportTranscript.mockResolvedValueOnce(jsonl);
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.triggerDownload).toHaveBeenCalledTimes(1));
+    expect(mocks.exportTranscript).toHaveBeenCalledWith("conv-1");
+    const [blob, filename] = mocks.triggerDownload.mock.calls[0]! as [Blob, string];
+    expect(filename).toBe("conv-1.jsonl");
+    expect(await blob.text()).toBe(jsonl);
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an export failure as a toast and downloads nothing", async () => {
+    mocks.exportTranscript.mockRejectedValueOnce(new Error("boom"));
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Export failed"));
+    expect(mocks.triggerDownload).not.toHaveBeenCalled();
+  });
+
+  it("opens a full-history fork from the session menu", () => {
+    renderMenu();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(mocks.fork).toHaveBeenCalledOnce();
+  });
+
   it("renames from the mobile Rename dialog", () => {
     // Rename is mobile-only in this menu now — desktop renames by clicking the
     // breadcrumb title (HeaderTitle).
@@ -165,9 +235,9 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // Just the flag: the optimistic overlay lives in the hook, and the
-    // "view archived" toast fires synchronously (navigating away unmounts this
-    // menu, so a mutate onSuccess callback wouldn't fire).
+    // Just the flag: the optimistic overlay lives in the hook, and the Undo
+    // toast fires synchronously (navigating away unmounts this menu, so a
+    // mutate onSuccess callback wouldn't fire).
     expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
 
     view.unmount();
@@ -180,6 +250,22 @@ describe("HeaderConversationMenu", () => {
       id: "conv-1",
       deleteBranch: true,
     });
+  });
+
+  it("offers Unarchive on an archived session and unarchives in place", () => {
+    // An archived session reopened by URL must not be re-offered the action
+    // that was already taken; the item flips like the sidebar row's menu.
+    renderMenu({ conversation: { ...CONVERSATION, archived: true } });
+
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+    const item = screen.getByRole("menuitem", { name: "Unarchive" });
+    expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
+
+    fireEvent.click(item);
+    // Just the flag flip: unarchiving keeps the user on the session, so no
+    // redirect home and no Undo toast.
+    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: false });
   });
 
   it("labels project actions for filed and unfiled sessions", () => {
@@ -229,6 +315,68 @@ describe("HeaderConversationMenu", () => {
     ).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("menuitem", { name: "Sprint 42" }));
     expect(mocks.moveToProject).toHaveBeenCalledWith({ id: "conv-1", project: "Sprint 42" });
+  });
+
+  it("orders decorative project icons and a folder fallback before their names", () => {
+    mocks.isMobile = true;
+    mocks.projects = [
+      { id: "project-1", name: "Sprint 42", icon: "🚀" },
+      { id: null, name: "Legacy project" },
+    ];
+    renderMenu({ currentProject: "Sprint 42" });
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-move-to-project"));
+
+    const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    const emoji = iconRow.firstElementChild;
+    expect(emoji).toHaveAttribute("data-testid", "project-icon");
+    expect(emoji).toHaveAttribute("aria-hidden", "true");
+    expect(emoji).toHaveTextContent("🚀");
+    expect(emoji?.nextElementSibling).toHaveTextContent("Sprint 42");
+
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).firstElementChild;
+    expect(fallback?.tagName.toLowerCase()).toBe("svg");
+    expect(fallback).toHaveAttribute("aria-hidden", "true");
+    expect(fallback?.nextElementSibling).toHaveTextContent("Legacy project");
+
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    expect(removeItem.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(removeItem.firstElementChild).toHaveTextContent("🚀");
+  });
+
+  it("uses project names and the Remove label for the mobile picker typeahead", async () => {
+    mocks.isMobile = true;
+    mocks.projects = [
+      { id: null, name: "Alpha" },
+      { id: "project-1", name: "Sprint 42", icon: "🚀" },
+    ];
+    const view = renderMenu({ currentProject: "Sprint 42" });
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-move-to-project"));
+
+    const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    expect(alphaRow.firstElementChild?.tagName.toLowerCase()).toBe("svg");
+    expect(alphaRow.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
+    expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
+    alphaRow.focus();
+    fireEvent.keyDown(alphaRow, { key: "s" });
+    await waitFor(() => expect(sprintRow).toHaveFocus());
+
+    // A fresh mount resets the typeahead buffer so "r" matches the Remove row
+    // instead of extending the previous "s" search.
+    view.unmount();
+    renderMenu({ currentProject: "Sprint 42" });
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-move-to-project"));
+
+    const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    freshAlphaRow.focus();
+    fireEvent.keyDown(freshAlphaRow, { key: "r" });
+    await waitFor(() => expect(removeItem).toHaveFocus());
   });
 
   it("closes and resets Rename when the conversation id changes", async () => {
@@ -287,7 +435,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
     openMenu();
     const label = screen.getByText("Quarterly planning");
-    expect(label).toHaveAttribute("data-slot", "dropdown-menu-label");
+    expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();
@@ -311,7 +459,9 @@ describe("HeaderConversationMenu", () => {
     mocks.isMobile = true;
     renderMenu();
     const mobileTrigger = screen.getByRole("button", { name: "Conversation actions" });
-    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-4");
+    // 44px tap-target floor on phones, matching the sibling header controls.
+    expect(mobileTrigger).toHaveClass("max-md:size-11");
+    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-5");
     openMenu();
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
   });
@@ -326,6 +476,8 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -346,6 +498,8 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -367,6 +521,27 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     // The entries bring exactly one separator of their own.
     expect(screen.getAllByRole("separator")).toHaveLength(baseSeparators + 1);
+  });
+
+  it("keeps the page touchable while the mobile menu is open (non-modal)", () => {
+    // Modal mode sets pointer-events:none on <body>, leaving the menu as the
+    // only touch target; browser touch-target adjustment then snaps outside
+    // taps onto the menu, so on a phone it can never be dismissed. Mobile must
+    // run non-modal so an outside tap lands on real content and closes it.
+    mocks.isMobile = true;
+    renderMenu();
+    openMenu();
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).not.toBe("none");
+  });
+
+  it("stays modal on desktop, where outside clicks are precise", () => {
+    renderMenu();
+    openMenu();
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).toBe("none");
   });
 
   it("wears the mobile glass surface and a round trigger", () => {

@@ -19,9 +19,11 @@ import {
   loadWebglRenderer,
   openTerminalLink,
   parseTerminalClipboardMessage,
+  resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
+  touchScrollPayload,
   type ConnectionState,
   wheelReportPayload,
   type WheelMouseState,
@@ -75,6 +77,23 @@ describe("openTerminalLink", () => {
     expect(pushSpy).not.toHaveBeenCalled();
   });
 
+  it("rebases session links under the configured base path", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    window.history.replaceState(null, "", "/proxy/6767/");
+    try {
+      const pushSpy = vi.spyOn(window.history, "pushState");
+      const event = new MouseEvent("click");
+      // Unprefixed terminal link is rebased under the basename.
+      openTerminalLink(event, `${window.location.origin}/c/conv_x`);
+      expect(pushSpy).toHaveBeenCalledWith(null, "", "/proxy/6767/c/conv_x");
+      // Already-prefixed link is pushed unchanged (idempotent, no doubling).
+      openTerminalLink(event, `${window.location.origin}/proxy/6767/c/conv_y`);
+      expect(pushSpy).toHaveBeenCalledWith(null, "", "/proxy/6767/c/conv_y");
+    } finally {
+      delete window.__OMNIGENT_BASE_PATH__;
+    }
+  });
+
   it("prevents the addon's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");
@@ -87,6 +106,70 @@ describe("openTerminalLink", () => {
     // (and kill the WebSocket-attached terminal) before window.open's
     // tab is usable. A failure here means that suppression was dropped.
     expect(preventSpy).toHaveBeenCalledOnce();
+  });
+
+  it("lets the app consume an OSC 8 file link instead of opening the browser", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const onFileLink = vi.fn(() => true);
+    const event = new MouseEvent("click");
+
+    openTerminalLink(event, "file:///home/u/ws/src/app.ts#L42", onFileLink);
+
+    expect(onFileLink).toHaveBeenCalledWith("file:///home/u/ws/src/app.ts#L42");
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps the normal external-link path when the app declines a link", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    openTerminalLink(new MouseEvent("click"), "https://example.com/foo", () => false);
+
+    expect(openSpy).toHaveBeenCalledWith(
+      "https://example.com/foo",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+
+  it.each([
+    "file:///etc/hosts#L1",
+    "javascript:alert(document.domain)",
+    "data:text/html,<script>alert(1)</script>",
+    "mailto:user@example.com",
+  ])("does not browser-open a declined non-HTTP OSC 8 link: %s", (uri) => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    openTerminalLink(new MouseEvent("click"), uri, () => false);
+
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveTerminalWorkspaceFileLink", () => {
+  const ROOT = "/home/u/ws";
+  const HOME = "/home/u";
+
+  it.each([
+    ["file:///home/u/ws/src/app.ts", "src/app.ts", null],
+    ["file:///home/u/ws/src/app.ts:42", "src/app.ts", 42],
+    ["file:///home/u/ws/src/app.ts:42:7", "src/app.ts", 42],
+    ["file:///home/u/ws/src/app.ts#L43", "src/app.ts", 43],
+    ["file:///home/u/ws/src/app.ts#L44C3", "src/app.ts", 44],
+    ["file:///home/u/ws/src/app.ts#L45-L50", "src/app.ts", 45],
+    ["file:///home/u/ws/Design%20Notes.md#L46", "Design Notes.md", 46],
+  ])("resolves %s", (uri, path, line) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toEqual({ path, line });
+  });
+
+  it.each([
+    "https://example.com/src/app.ts#L42",
+    "file:///etc/hosts#L1",
+    "file:///home/u/ws/src/app.ts#heading",
+    "file:///home/u/ws/src/app.ts?line=42",
+    "file://fileserver/home/u/ws/src/app.ts#L42",
+    "file:///home/u/ws/%E0%A4%A.md#L42",
+  ])("rejects a non-workspace or unsafe target: %s", (uri) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toBeNull();
   });
 });
 
@@ -220,8 +303,60 @@ describe("terminalKeyEventPayload", () => {
     expect(payload).toBe("\x1b[13;2u");
   });
 
+  it("maps macOS Cmd line shortcuts to their readline control bytes", () => {
+    // WHY: Option+key works because xterm encodes Alt as ESC-prefixes, but
+    // Cmd (metaKey) combos reach neither xterm nor the PTY — native-terminal
+    // line editing (delete to start / home / end) silently did nothing.
+    expect(terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true }))).toBe("\x15");
+    expect(terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true }))).toBe("\x01");
+    expect(terminalKeyEventPayload(keyEvent({ key: "ArrowRight", metaKey: true }))).toBe("\x05");
+  });
+
+  it("keeps browser-owned Cmd combos off the mapping", () => {
+    // Cmd+C/V/K/R (copy/paste/clear/reload) and every Cmd combo with another
+    // modifier must keep their browser meaning — only the bare three
+    // line-editing combos are synthesized.
+    expect(terminalKeyEventPayload(keyEvent({ key: "c", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "v", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "k", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "r", metaKey: true }))).toBeNull();
+    // Meta combined with another modifier (e.g. Cmd+Shift+Backspace, or a
+    // Windows-flag AltGr-adjacent event) stays on the default path.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true, shiftKey: true })),
+    ).toBeNull();
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true, altKey: true })),
+    ).toBeNull();
+    // Plain, unmodified keys never hit the mapping either.
+    expect(terminalKeyEventPayload(keyEvent({ key: "Backspace" }))).toBeNull();
+  });
+
   it("leaves plain Enter on xterm's default path", () => {
     expect(terminalKeyEventPayload(keyEvent({ key: "Enter" }))).toBeNull();
+  });
+
+  it("releases Shift+Enter to xterm during an IME composition", () => {
+    // xterm consults the custom handler BEFORE its CompositionHelper; claiming
+    // the key mid-conversion skips the helper's finalize path and the composed
+    // text is dropped. The payload must be null so xterm runs composition
+    // handling instead of us sending CSI-u bytes to the PTY.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, isComposing: true })),
+    ).toBeNull();
+    // The 229 keyCode path (Safari/legacy) cannot be set through the
+    // constructor init dict, so exercise it with a stub.
+    expect(
+      terminalKeyEventPayload({
+        key: "Enter",
+        shiftKey: true,
+        keyCode: 229,
+      } as unknown as KeyboardEvent),
+    ).toBeNull();
+    // Without either composition signal the CSI-u payload still applies.
+    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true }))).toBe(
+      SHIFT_ENTER_CSI_U,
+    );
   });
 
   it("does not override other modified Enter combinations", () => {
@@ -415,6 +550,82 @@ describe("wheelReportPayload", () => {
   });
 });
 
+describe("touchScrollPayload", () => {
+  const noTracking: WheelMouseState = { mouseTrackingMode: "none", sgrEncoding: false };
+  const sgrModes: WheelMouseState = { mouseTrackingMode: "vt200", sgrEncoding: true };
+  const screen: WheelScreenMetrics = {
+    left: 0,
+    top: 0,
+    cellWidth: 8,
+    cellHeight: 16,
+    cols: 80,
+    rows: 24,
+  };
+
+  function drag(previousY: number, currentY: number, clientX = 100) {
+    return { previousY, currentY, clientX };
+  }
+
+  it("leaves the gesture to the browser when layout is unmeasurable, keeping the carry", () => {
+    // WHY: pre-mount (or jsdom) there is no grid to convert pixels to lines;
+    // consuming the event would swallow the gesture with no effect at all.
+    expect(touchScrollPayload(drag(100, 50), noTracking, null, 0.4)).toEqual({
+      consume: false,
+      lines: 0,
+      data: "",
+      partial: 0.4,
+    });
+  });
+
+  it("scrolls xterm's scrollback when no app is tracking the mouse", () => {
+    // WHY: this is the reported bug's exact shape — a plain shell on a phone.
+    // Dragging the finger DOWN 64px over 16px cells reveals 4 older lines:
+    // negative lines (scrollLines scrolls up for negative amounts), no reports.
+    const result = touchScrollPayload(drag(100, 164), noTracking, screen, 0);
+    expect(result).toEqual({ consume: true, lines: -4, data: "", partial: 0 });
+  });
+
+  it("accumulates small drag steps across moves into whole lines", () => {
+    // WHY: touchmove fires with tiny deltas; without a carry a slow drag
+    // would floor every step to zero lines and never move at all.
+    let partial = 0;
+    let lines = 0;
+    for (let i = 0; i < 10; i++) {
+      const result = touchScrollPayload(
+        drag(100 + i * 4, 100 + (i + 1) * 4),
+        noTracking,
+        screen,
+        partial,
+      );
+      expect(result.consume).toBe(true);
+      partial = result.partial;
+      lines += result.lines;
+    }
+    // 40px total / 16px cells = 2.5 lines: 2 whole lines back, 0.5 carried.
+    expect(lines).toBe(-2);
+    expect(partial).toBeCloseTo(-0.5);
+  });
+
+  it("synthesizes SGR wheel reports at the touched cell when the app tracks the mouse", () => {
+    // WHY: a mouse-tracking TUI (e.g. Claude Code) owns scrolling; the drag
+    // must reach it as wheel reports, exactly like the wheel path. A downward
+    // 32px drag is 2 lines of "older" — wheel-up, button 64 — placed at the
+    // finger's cell (x 100/8 = col 13, y 164/16 = row 11, 1-based).
+    const result = touchScrollPayload(drag(132, 164), sgrModes, screen, 0);
+    expect(result.lines).toBe(0);
+    expect(result.data).toBe("\x1b[<64;13;11M".repeat(2));
+    expect(result.partial).toBe(0);
+  });
+
+  it("caps per-step reports and discards the excess on the tracking path", () => {
+    // WHY: same flood guard as the wheel path — a giant drag step must not
+    // bank hundreds of lines that keep scrolling after the finger stops.
+    const result = touchScrollPayload(drag(16 * 1000, 0), sgrModes, screen, 0);
+    expect(result.data.split("\x1b[<65").length - 1).toBe(WHEEL_REPORTS_MAX_PER_EVENT);
+    expect(result.partial).toBe(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // TerminalSession class — wired up against a fake WebSocket + ResizeObserver.
 // The real xterm Terminal runs (it already does in jsdom for loadWebglRenderer
@@ -496,6 +707,8 @@ describe("TerminalSession", () => {
     onInput?: () => void,
     clipboardEnabled = true,
     onClipboardRequest?: (text: string) => void,
+    focusOnConnect = true,
+    adaptCodexPalette = false,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -509,6 +722,8 @@ describe("TerminalSession", () => {
       onInput,
       clipboardEnabled,
       onClipboardRequest,
+      focusOnConnect,
+      adaptCodexPalette,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
@@ -526,6 +741,175 @@ describe("TerminalSession", () => {
       (m) => typeof m === "string" && m.includes('"type":"resize"'),
     );
     expect(resizeFrame).toBeDefined();
+    session.dispose();
+  });
+
+  it("enables OSC 8 file links while keeping activation in the app handler", () => {
+    const { session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+
+    expect(term.options.linkHandler?.allowNonHttpProtocols).toBe(true);
+    expect(term.options.linkHandler?.activate).toBeTypeOf("function");
+    session.dispose();
+  });
+
+  it("grabs keyboard focus on open when focusOnConnect is set", () => {
+    // WHY: a foreground surface should claim the keyboard as it comes up.
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const focusSpy = vi.spyOn(term, "focus");
+
+    socket.open();
+
+    expect(focusSpy).toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it.each([false, true])(
+    "updates cached Codex input and scrollback in both theme directions (starts dark: %s)",
+    async (startsDark) => {
+      const { socket, session } = makeSession(undefined, undefined, true, undefined, true, true);
+      const term = (session as unknown as { term: Terminal }).term;
+      session.setTheme(startsDark);
+      socket.open();
+      const bytes = new TextEncoder().encode(
+        "\x1b[48;2;244;244;244mhistory\x1b[0m\r\n" +
+          "output\r\n".repeat(30) +
+          "\x1b[48;2;30;30;30munsent input\x1b[0m",
+      );
+      const data = new ArrayBuffer(bytes.length);
+      new Uint8Array(data).set(bytes);
+      socket.emit("message", { data });
+      await new Promise<void>((resolve) => {
+        term.write("", resolve);
+      });
+      const writes = vi.spyOn(term, "write");
+      const frames = [...socket.sent];
+      for (const isDark of [!startsDark, startsDark, !startsDark]) {
+        session.setTheme(isDark);
+        expect(term.options.theme?.extendedAnsi?.[239]).toBe(isDark ? "#2f3132" : "#f4f4f4");
+        expect(term.buffer.active.getLine(0)?.getCell(0)?.isBgPalette()).toBe(true);
+        expect(term.buffer.active.getLine(0)?.getCell(0)?.getBgColor()).toBe(255);
+        expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe("history");
+        const input = term.buffer.active.getLine(
+          term.buffer.active.baseY + term.buffer.active.cursorY,
+        );
+        expect(input?.translateToString(true)).toBe("unsent input");
+        expect(input?.getCell(0)?.getBgColor()).toBe(255);
+        expect(socket.sent).toEqual(frames);
+        expect(socket.closed).toBe(false);
+      }
+      expect(writes).not.toHaveBeenCalled();
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      session.dispose();
+    },
+  );
+
+  it.each([
+    {
+      name: "light truecolor",
+      startsDark: false,
+      stripe: "48;2;244;244;244",
+      selected: "48;2;224;224;224",
+      stripeIndex: 255,
+      selectedIndex: 254,
+    },
+    {
+      name: "light 256-color",
+      startsDark: false,
+      stripe: "48;5;255",
+      selected: "48;5;254",
+      stripeIndex: 255,
+      selectedIndex: 254,
+    },
+    {
+      name: "dark truecolor",
+      startsDark: true,
+      stripe: "48;2;31;33;35",
+      selected: "48;2;47;49;50",
+      stripeIndex: 253,
+      selectedIndex: 255,
+    },
+    {
+      name: "dark 256-color",
+      startsDark: true,
+      stripe: "48;5;234",
+      selected: "48;5;236",
+      stripeIndex: 253,
+      selectedIndex: 255,
+    },
+  ])("recolors cached $name picker rows without merging their shades", async (fixture) => {
+    const { socket, session } = makeSession(undefined, undefined, true, undefined, true, true);
+    const term = (session as unknown as { term: Terminal }).term;
+    session.setTheme(fixture.startsDark);
+    socket.open();
+    const bytes = new TextEncoder().encode(
+      `\x1b[${fixture.stripe}mother session\x1b[0m\r\n` +
+        `\x1b[${fixture.selected}mselected session\x1b[0m`,
+    );
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+    const writes = vi.spyOn(term, "write");
+    const frames = [...socket.sent];
+    const expectedColors: Record<number, { light: string; dark: string }> = {
+      253: { light: "#fafafa", dark: "#1f2123" },
+      254: { light: "#e0e0e0", dark: "#464849" },
+      255: { light: "#f4f4f4", dark: "#2f3132" },
+    };
+    for (const isDark of [fixture.startsDark, !fixture.startsDark, fixture.startsDark]) {
+      session.setTheme(isDark);
+      const stripe = term.buffer.active.getLine(0);
+      const selected = term.buffer.active.getLine(1);
+      expect(stripe?.translateToString(true)).toBe("other session");
+      expect(selected?.translateToString(true)).toBe("selected session");
+      expect(stripe?.getCell(0)?.isBgPalette()).toBe(true);
+      expect(selected?.getCell(0)?.isBgPalette()).toBe(true);
+      expect(stripe?.getCell(0)?.getBgColor()).toBe(fixture.stripeIndex);
+      expect(selected?.getCell(0)?.getBgColor()).toBe(fixture.selectedIndex);
+      const stripeColor = term.options.theme?.extendedAnsi?.[fixture.stripeIndex - 16];
+      const selectedColor = term.options.theme?.extendedAnsi?.[fixture.selectedIndex - 16];
+      expect(stripeColor).toBe(expectedColors[fixture.stripeIndex][isDark ? "dark" : "light"]);
+      expect(selectedColor).toBe(expectedColors[fixture.selectedIndex][isDark ? "dark" : "light"]);
+      expect(stripeColor).not.toBe(selectedColor);
+    }
+    expect(writes).not.toHaveBeenCalled();
+    expect(socket.sent).toEqual(frames);
+    expect(socket.closed).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    session.dispose();
+  });
+
+  it("leaves non-Codex terminal colors unchanged", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const bytes = new TextEncoder().encode("\x1b[48;2;244;244;244mtext");
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+    session.setTheme(true);
+    expect(term.buffer.active.getLine(0)?.getCell(0)?.isBgRGB()).toBe(true);
+    expect(term.buffer.active.getLine(0)?.getCell(0)?.getBgColor()).toBe(0xf4f4f4);
+    expect(term.options.theme?.extendedAnsi).toBeUndefined();
+    session.dispose();
+  });
+
+  it("does not grab focus on open when focusOnConnect is false", () => {
+    // WHY: the workspace-rail shell connects in the background on a session
+    // switch — it must not yank focus off the chat composer.
+    const { socket, session } = makeSession(undefined, undefined, true, undefined, false);
+    const term = (session as unknown as { term: Terminal }).term;
+    const focusSpy = vi.spyOn(term, "focus");
+
+    socket.open();
+
+    expect(focusSpy).not.toHaveBeenCalled();
     session.dispose();
   });
 
@@ -560,6 +944,65 @@ describe("TerminalSession", () => {
 
     socket.emit("error", {});
     expect(states.at(-1)).toEqual({ kind: "error" });
+    session.dispose();
+  });
+
+  it("scrolls the scrollback when a finger drags down over the terminal", () => {
+    // WHY: xterm has no touch handling of its own, so on a phone the
+    // scrollback used to be unreachable by touch — the view stayed pinned to
+    // the live bottom. The session must translate a one-finger downward drag
+    // into scrollLines and claim the gesture from the browser.
+    const { session, container } = makeSession();
+    // jsdom has no layout, so feed the grid geometry the handler measures.
+    (session as unknown as { screenMetrics: () => WheelScreenMetrics }).screenMetrics = () => ({
+      left: 0,
+      top: 0,
+      cellWidth: 8,
+      cellHeight: 16,
+      cols: 80,
+      rows: 24,
+    });
+    const term = (session as unknown as { term: Terminal }).term;
+    const scrollSpy = vi.spyOn(term, "scrollLines");
+
+    const touchEvent = (type: string, points: { clientX: number; clientY: number }[]) => {
+      // jsdom lacks a TouchEvent constructor; a plain Event with a touches
+      // list exercises the same listener path.
+      const ev = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "touches", { value: points });
+      container.dispatchEvent(ev);
+      return ev;
+    };
+
+    touchEvent("touchstart", [{ clientX: 100, clientY: 100 }]);
+    // Finger moves down 64px (past the slop gate) over 16px cells = 4 lines
+    // of older content, including the pre-slop travel.
+    const move = touchEvent("touchmove", [{ clientX: 100, clientY: 164 }]);
+
+    expect(scrollSpy).toHaveBeenCalledWith(-4);
+    expect(move.defaultPrevented).toBe(true);
+
+    // Lifting the finger resets the drag: a later move without a start is
+    // ignored rather than jumping the view.
+    touchEvent("touchend", []);
+    scrollSpy.mockClear();
+    touchEvent("touchmove", [{ clientX: 100, clientY: 300 }]);
+    expect(scrollSpy).not.toHaveBeenCalled();
+
+    // Sub-slop jitter (a tap or the start of a long-press) stays with the
+    // browser: nothing scrolls and the default isn't prevented.
+    touchEvent("touchstart", [{ clientX: 100, clientY: 100 }]);
+    const jitter = touchEvent("touchmove", [{ clientX: 102, clientY: 103 }]);
+    expect(scrollSpy).not.toHaveBeenCalled();
+    expect(jitter.defaultPrevented).toBe(false);
+    touchEvent("touchend", []);
+
+    // A dominantly horizontal drag is abandoned to the browser — even when
+    // the finger later moves vertically in the same gesture.
+    touchEvent("touchstart", [{ clientX: 100, clientY: 100 }]);
+    touchEvent("touchmove", [{ clientX: 160, clientY: 110 }]);
+    touchEvent("touchmove", [{ clientX: 160, clientY: 200 }]);
+    expect(scrollSpy).not.toHaveBeenCalled();
     session.dispose();
   });
 
@@ -599,6 +1042,62 @@ describe("TerminalSession", () => {
       term.write(`\x1b]52;;${btoa("pane output")}\x07`, resolve);
     });
 
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it.each([true, false])(
+    "routes browser selections through consent without a recent-input requirement (bridge enabled: %s)",
+    (clipboardEnabled) => {
+      const onClipboardRequest = vi.fn();
+      const { container, session } = makeSession(
+        undefined,
+        undefined,
+        clipboardEnabled,
+        onClipboardRequest,
+      );
+      const term = (session as unknown as { term: Terminal }).term;
+      vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+      const setData = vi.fn();
+      const copy = new Event("copy", { bubbles: true, cancelable: true });
+      Object.defineProperty(copy, "clipboardData", { value: { setData } });
+      const textarea = container.querySelector("textarea")!;
+      const bypassConsent = vi.fn();
+      textarea.addEventListener("copy", bypassConsent);
+
+      textarea.dispatchEvent(copy);
+
+      expect(copy.defaultPrevented).toBe(true);
+      expect(bypassConsent).not.toHaveBeenCalled();
+      expect(setData).not.toHaveBeenCalled();
+      expect(onClipboardRequest).toHaveBeenCalledWith("selected text", copy);
+      session.dispose();
+    },
+  );
+
+  it("does not copy a browser selection without a consent handler", () => {
+    const { container, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+    const setData = vi.fn();
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(copy, "clipboardData", { value: { setData } });
+
+    container.querySelector("textarea")!.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(true);
+    expect(setData).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("leaves copying outside a terminal selection alone", () => {
+    const onClipboardRequest = vi.fn();
+    const { container, session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+
+    container.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(false);
     expect(onClipboardRequest).not.toHaveBeenCalled();
     session.dispose();
   });

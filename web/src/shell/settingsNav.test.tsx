@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
+  customizeEnabled: true,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -29,6 +30,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    features: { customize: mocks.customizeEnabled },
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -62,6 +64,7 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.singleUser = false;
   mocks.isAdmin = false;
+  mocks.customizeEnabled = true;
 });
 afterEach(cleanup);
 
@@ -136,6 +139,17 @@ describe("settingsNavGroups", () => {
       (g) => g.title === "Admin",
     );
     expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies"]);
+  });
+
+  it("includes the Sandbox Integrations item only when a connection is enabled", () => {
+    // 5th arg is integrationsEnabled (enabled_connections non-empty). Absent when
+    // the server has no GitHub App configured, so the nav item must not appear.
+    const item = (integrationsEnabled: boolean) =>
+      settingsNavGroups(false, false, false, false, integrationsEnabled)
+        .flatMap((g) => g.items)
+        .find((i) => i.id === "integrations");
+    expect(item(false)).toBeUndefined();
+    expect(item(true)).toMatchObject({ id: "integrations", label: "Sandbox Integrations" });
   });
 });
 
@@ -382,6 +396,41 @@ describe("useSettingsRoute", () => {
     });
     // A non-settings route is out of settings.
     expect(routeHook("/inbox").inSettings).toBe(false);
+  });
+
+  it("parses the customize sub-section and defaults a bare/unknown one to the first", () => {
+    expect(routeHook("/settings/customize/harnesses")).toEqual({
+      inSettings: true,
+      section: "customize",
+      subSection: "harnesses",
+    });
+    expect(routeHook("/settings/customize/skills")).toEqual({
+      inSettings: true,
+      section: "customize",
+      subSection: "skills",
+    });
+    // Bare or unknown sub-section falls back to the first sub-section.
+    expect(routeHook("/settings/customize")).toEqual({
+      inSettings: true,
+      section: "customize",
+      subSection: "harnesses",
+    });
+    expect(routeHook("/settings/customize/nope")).toEqual({
+      inSettings: true,
+      section: "customize",
+      subSection: "harnesses",
+    });
+  });
+
+  it("falls back to General for a customize deep link when the feature is disabled", () => {
+    mocks.customizeEnabled = false;
+    // Disabled (the default deploy) → the section resolves to General instead
+    // of an empty customize page, and no subSection is set.
+    expect(routeHook("/settings/customize")).toEqual({ inSettings: true, section: "general" });
+    expect(routeHook("/settings/customize/skills")).toEqual({
+      inSettings: true,
+      section: "general",
+    });
   });
 
   it("keeps General as the bare settings default when a login session exists", () => {

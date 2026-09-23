@@ -1,24 +1,47 @@
-// The landing screen's mobile chrome. Two rules, both about arriving at "/"
-// on a phone:
-//   1. The composer is not focused, so landing here — including on the way
-//      back out of Settings — never throws up the keyboard unasked.
-//   2. The iOS shell's native Chat/Terminal bar is pushed hidden: there is no
-//      session here, so there is nothing to switch between.
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({ data: undefined, isLoading: false }),
+}));
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
+// The landing screen's mobile chrome. One rule, about arriving at "/" on a
+// phone: the composer is not focused, so landing here — including on the way
+// back out of Settings — never throws up the keyboard unasked. (The iOS
+// shell's legacy bottom Chat/Terminal bar is kept hidden app-wide at boot by
+// hideNativeChatTerminalBar in main.tsx, not per-screen here.)
 
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
-import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { isIOSShell, setNativeViewMode } from "@/lib/nativeBridge";
 import { NewChatLandingScreen } from "./NewChatDialog";
 
 vi.mock("@/lib/routing", () => ({
@@ -27,7 +50,11 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
@@ -39,8 +66,13 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
-vi.mock("@/hooks/useHostWorktrees", () => ({
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
   useHostWorktrees: () => ({ data: [], isError: false }),
+  hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
+    queryKey: ["host-worktrees", hostId, repoPath],
+    queryFn: async () => [],
+  }),
 }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: () => ({ data: [] }) }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -56,14 +88,6 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   useBrainHarnessLabels: () => ({}),
   useHarnessSetupSteps: () => ({}),
 }));
-// Only the two native entry points under test are stubbed; the rest of the
-// bridge keeps its real (no-op outside a shell) behaviour.
-vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
-  ...(await importOriginal<typeof NativeBridgeModule>()),
-  isIOSShell: vi.fn(() => false),
-  setNativeViewMode: vi.fn(),
-}));
-
 /** Point `matchMedia` at a phone-width (or desktop-width) viewport. */
 function setViewport(mobile: boolean): void {
   Object.defineProperty(window, "matchMedia", {
@@ -106,8 +130,6 @@ beforeEach(() => {
       } as AvailableAgent,
     ],
   } as ReturnType<typeof useAvailableAgents>);
-  vi.mocked(isIOSShell).mockReturnValue(false);
-  vi.mocked(setNativeViewMode).mockClear();
   setViewport(false);
 });
 
@@ -128,25 +150,5 @@ describe("NewChatLandingScreen keyboard behaviour", () => {
     renderLanding();
 
     expect(document.activeElement).not.toBe(screen.getByTestId("new-chat-landing-input"));
-  });
-});
-
-describe("NewChatLandingScreen native Chat/Terminal bar", () => {
-  it("pushes the bar hidden in the iOS shell — there is no session to switch", () => {
-    vi.mocked(isIOSShell).mockReturnValue(true);
-    renderLanding();
-
-    expect(vi.mocked(setNativeViewMode)).toHaveBeenCalledWith({
-      mode: "chat",
-      terminalEnabled: false,
-      terminalStartingUp: false,
-      visible: false,
-    });
-  });
-
-  it("leaves the native bridge alone outside the iOS shell", () => {
-    renderLanding();
-
-    expect(vi.mocked(setNativeViewMode)).not.toHaveBeenCalled();
   });
 });

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -30,12 +31,15 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.routes.skills import create_skills_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -113,6 +117,8 @@ def fs_app(
         prefix="/v1",
     )
 
+    app.include_router(create_skills_router(registry, host_store, conv_store), prefix="/v1")
+
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
         request: Request,
@@ -164,7 +170,6 @@ async def fs_setup(
     conn = registry.get(_HOST_ID)
     assert conn is not None
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
         """Drain outbound WS frames from the communicator and reply.
@@ -177,20 +182,33 @@ async def fs_setup(
         ``websocket.receive`` event — which the route's receive
         loop turns into a resolved future.
 
-        :returns: None when ``stop_drain`` is set or no events
-            arrive within the per-iteration timeout.
+        Runs until fixture teardown cancels the task.
         """
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
             if not isinstance(text, str):
                 continue
             frame = decode_host_frame(text)
+            if isinstance(frame, HostSkillsFrame):
+                reply = replies[f"skills:{frame.harness}:{frame.path}"]
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostSkillsResultFrame(
+                                request_id=frame.request_id,
+                                status=reply.get("status", "ok"),
+                                skills=reply.get("skills", []),
+                                error=reply.get("error"),
+                                error_code=reply.get("error_code"),
+                            )
+                        ),
+                    }
+                )
+                continue
             if isinstance(frame, HostModelOptionsFrame):
                 reply = replies.get(f"model:{frame.harness}", {})
                 await comm.send_input(
@@ -238,14 +256,126 @@ async def fs_setup(
     try:
         yield app, registry, comm, replies, drain_task
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
+
+
+async def test_list_filesystem_survives_idle_mock_host(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An idle mock host stays connected until fixture teardown."""
+    app, registry, comm, replies, _drain = fs_setup
+    replies["~"] = {"entries": []}
+    await asyncio.sleep(0.75)
+    assert not comm.future.done()
+    assert registry.get(_HOST_ID) is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem")
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    "reply,status,expected",
+    [
+        (
+            {"skills": [{"name": "toolkit:review", "description": "Review changes"}]},
+            200,
+            {"skills": [{"name": "toolkit:review", "description": "Review changes"}]},
+        ),
+        ({"skills": []}, 200, {"skills": []}),
+        (
+            {"status": "failed", "error_code": "not_directory", "error": "directory missing"},
+            404,
+            {"detail": "directory missing"},
+        ),
+        (
+            {"status": "failed", "error_code": "invalid_path", "error": "invalid directory"},
+            400,
+            {"detail": "invalid directory"},
+        ),
+        (
+            {"status": "failed", "error_code": "discovery_failed", "error": "discovery failed"},
+            502,
+            {"detail": "discovery failed"},
+        ),
+    ],
+)
+async def test_host_skills_round_trip_without_session(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+    reply: dict[str, Any],
+    status: int,
+    expected: dict[str, Any],
+) -> None:
+    app, registry, _comm, replies, _drain = fs_setup
+    replies["skills:claude-sdk:~/project with spaces"] = reply
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/skills",
+            params={"host_id": _HOST_ID, "harness": "claude", "path": "~/project with spaces"},
+        )
+    assert response.status_code == status, response.text
+    assert response.json() == expected
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    assert conn.pending_skills == {}
+
+
+@pytest.mark.parametrize("params", [{}, {"path": ""}])
+async def test_host_skills_requires_directory(
+    fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    params: dict[str, str],
+) -> None:
+    app, _registry, _host_store, _conv_store = fs_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/skills",
+            params={"host_id": _HOST_ID, "harness": "claude-native", **params},
+        )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "host_state,status", [("missing", 404), ("offline", 409), ("other_replica", 400)]
+)
+async def test_host_skills_requires_connected_host(
+    fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    host_state: str,
+    status: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.server.routes._host_launch._deployment_is_sharded", lambda: True)
+    app, registry, host_store, _conv_store = fs_app
+    if host_state != "missing":
+        host_store.upsert_on_connect(_HOST_ID, "test-host", "local")
+        if host_state == "offline":
+            host_store.set_offline(_HOST_ID)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/skills",
+            params={"host_id": _HOST_ID, "harness": "claude-native", "path": "~"},
+        )
+    assert response.status_code == status, response.text
+    assert registry.get(_HOST_ID) is None
 
 
 async def test_host_model_options_returns_prelaunch_catalog(
@@ -287,6 +417,71 @@ async def test_host_model_options_returns_prelaunch_catalog(
         # The frame's routable set reaches the web client instead of being
         # dropped at the route boundary.
         "routable_models": ["system.ai.claude-sonnet-4-6[1m]"],
+        # A healthy catalog has no reason to report.
+        "error": None,
+    }
+
+
+async def test_host_model_options_probe_failure_returns_bad_gateway(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """A failed host probe is a structured non-OK HTTP response."""
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex-native"] = {
+        "status": "failed",
+        "error": "the codex model probe failed — see the host log",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+        )
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "the codex model probe failed — see the host log"}
+
+
+async def test_host_model_options_reports_probe_error_without_500(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An empty catalog carries the host's reason instead of failing the request.
+
+    The host answers ``status="ok"`` with no models and an ``error`` string
+    explaining why (a failed probe is not a transport failure, so it is not a
+    502). The reason has to survive response serialization — a response model
+    that does not declare ``error`` drops the explanation, and a route
+    annotated ``dict[str, list[Any]]`` rejected the string outright as a 500.
+    """
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex-native"] = {
+        "status": "ok",
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed — see the host log",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed — see the host log",
     }
 
 
@@ -700,3 +895,40 @@ async def test_list_filesystem_limit_above_max_rejected(
         )
     # FastAPI returns 422 for failed Query validation.
     assert resp.status_code == 422
+
+
+async def test_list_filesystem_windows_drive_path_is_not_posixified(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """Windows drive paths must reach the host without a leading slash.
+
+    FastAPI strips the URL leading slash; the handler used to always
+    prepend ``/``, turning ``C:/Users/me/work`` into ``/C:/Users/me/work``
+    which does not exist. The picker then fell through to the drive root.
+    """
+    from omnigent.host.frames import HostListDirEntry
+
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["C:/Users/alice/work"] = {
+        "entries": [
+            HostListDirEntry(
+                name="src",
+                path=r"C:\Users\alice\work\src",
+                type="directory",
+                bytes=None,
+                modified_at=1779980000,
+            ),
+        ],
+        "has_more": False,
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/C:/Users/alice/work")
+    assert resp.status_code == 200, resp.text
+    names = [entry["name"] for entry in resp.json()["data"]]
+    assert names == ["src"]

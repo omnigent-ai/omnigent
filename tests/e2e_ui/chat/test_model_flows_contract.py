@@ -78,7 +78,7 @@ def _open_gear_model_dropdown(page: Page) -> None:
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
 
 def test_row12_gear_rows_render_without_any_click_time_fetch(
@@ -109,7 +109,7 @@ def test_row12_gear_rows_render_without_any_click_time_fetch(
     page.route("**/v1/**", _abort_api)
 
     _open_gear_model_dropdown(page)
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_MODEL_OPTIONS))
 
 
@@ -136,16 +136,16 @@ def test_row13_off_catalog_reported_model_appends_and_highlights_exactly(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    chip = page.get_by_test_id("composer-model-effort-label")
+    chip = page.get_by_test_id("composer-agent-config-value")
     expect(chip).to_contain_text(reported, timeout=15_000)
 
     _open_gear_model_dropdown(page)
-    appended = page.locator(f'[role="option"][data-model-id="{reported}"]')
+    appended = page.locator(f'[role="menuitemcheckbox"][data-model-id="{reported}"]')
     expect(appended).to_have_count(1)
-    expect(appended).to_have_attribute("data-active", "true")
+    expect(appended).to_have_attribute("aria-checked", "true")
     # The same-family catalog row (Opus 4.10) must NOT claim the highlight.
-    expect(page.locator('[role="option"][data-model-id="opus"]')).not_to_have_attribute(
-        "data-active", "true"
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="opus"]')).not_to_have_attribute(
+        "aria-checked", "true"
     )
 
 
@@ -163,8 +163,8 @@ def test_row13_exact_match_highlights_the_catalog_row(
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_gear_model_dropdown(page)
-    expect(page.locator('[role="option"][data-model-id="sonnet"]')).to_have_attribute(
-        "data-active", "true"
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')).to_have_attribute(
+        "aria-checked", "true"
     )
 
 
@@ -188,12 +188,11 @@ def test_row14_pick_stays_pending_until_the_harness_confirms(
     )
 
     page.goto(f"{base_url}/c/{session_id}")
-    chip = page.get_by_test_id("composer-model-effort-label")
+    chip = page.get_by_test_id("composer-agent-config-value")
     expect(chip).to_contain_text("Sonnet 5", timeout=15_000)
 
     _open_gear_model_dropdown(page)
-    page.locator('[role="option"][data-model-id="opus"]').click()
-    page.get_by_test_id("composer-config-save").click()
+    page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
     # Unconfirmed: the chip keeps the reported model and a pending indicator
     # shows. (The PATCH round-trip completes; confirmation has not arrived.)
@@ -232,12 +231,13 @@ def test_row15_failed_switch_surfaces_error_and_keeps_the_reported_model(
     )
 
     page.goto(f"{base_url}/c/{session_id}")
-    chip = page.get_by_test_id("composer-model-effort-label")
+    chip = page.get_by_test_id("composer-agent-config-value")
     expect(chip).to_contain_text("Sonnet 5", timeout=15_000)
 
     _open_gear_model_dropdown(page)
-    page.locator('[role="option"][data-model-id="haiku"]').click()
-    page.get_by_test_id("composer-config-save").click()
+    page.locator('[role="menuitemcheckbox"][data-model-id="haiku"]').click()
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
 
     _push_sse(
         page,

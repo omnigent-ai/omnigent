@@ -1,4 +1,11 @@
-import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -34,7 +41,7 @@ interface HostsResponse {
   hosts: Host[];
 }
 
-async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
+export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
@@ -92,31 +99,76 @@ async function fetchHostModelOptions(
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
   );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // Non-JSON error body — keep the status-line detail.
+    }
+    throw new Error(detail);
+  }
   const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
   const models = body.models ?? [];
-  // An honest empty answer names its reason (the host's probe failed);
-  // surface it as the query error so the picker can say WHY it is empty.
+  // Backward compatibility with servers that encoded probe failure in a 200.
   if (models.length === 0 && body.error) throw new Error(body.error);
   return models;
 }
 
+// A shared request may start from an inactive observer while another needs retries.
+const modelCatalogPollers = new WeakMap<QueryClient, Map<string, number>>();
+
 /** Model choices available before launch, resolved on the selected host. */
-export function useHostModelOptions(hostId: string | null, harness: string, enabled = true) {
-  return useQuery({
+export function useHostModelOptions(
+  hostId: string | null,
+  harness: string,
+  enabled = true,
+  { poll = true }: { poll?: boolean } = {},
+) {
+  const queryClient = useQueryClient();
+  const canRefresh = enabled && hostId !== null && poll;
+  const pollerKey = JSON.stringify([hostId, harness]);
+  // Only committed selections participate; suspended renders leave retries alone.
+  useLayoutEffect(() => {
+    if (!canRefresh) return;
+    let pollers = modelCatalogPollers.get(queryClient);
+    if (!pollers) {
+      pollers = new Map();
+      modelCatalogPollers.set(queryClient, pollers);
+    }
+    pollers.set(pollerKey, (pollers.get(pollerKey) ?? 0) + 1);
+    return () => {
+      const remaining = (pollers.get(pollerKey) ?? 1) - 1;
+      if (remaining > 0) pollers.set(pollerKey, remaining);
+      else pollers.delete(pollerKey);
+      if (pollers.size === 0) modelCatalogPollers.delete(queryClient);
+    };
+  }, [queryClient, pollerKey, canRefresh]);
+  const query = useQuery({
     queryKey: ["host-model-options", hostId, harness],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
     enabled: enabled && hostId !== null,
-    staleTime: 30_000,
-    // A request racing the host's boot probe gets an honest empty answer
-    // with an error string; the probe itself completes shortly after
-    // (single-flight in the host's catalog store). Retry with backoff so a
-    // picker opened during that warm-up window fills in instead of pinning
-    // the transient error until reopen. A genuinely failing probe still
-    // surfaces its error once the retries exhaust (~45 s).
-    retry: 6,
+    // Poll the active picker for provider changes; inactive harnesses can
+    // fetch eagerly without periodic refreshes or background retries.
+    staleTime: 15_000,
+    refetchInterval: canRefresh ? 15_000 : false,
+    ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
+    // Retry boot-probe races while any picker uses this catalog. Persistent
+    // failures surface after bounded backoff (~22 s).
+    retry: (failureCount) =>
+      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
+  const previouslyRefreshing = useRef(canRefresh);
+  const { isError, isFetching, refetch } = query;
+  useEffect(() => {
+    const becameSelected = canRefresh && !previouslyRefreshing.current;
+    previouslyRefreshing.current = canRefresh;
+    // Retry failed prefetches on selection without restarting exhausted retries.
+    if (becameSelected && isError && !isFetching) void refetch();
+  }, [canRefresh, isError, isFetching, refetch]);
+  return query;
 }
 
 interface InstallHarnessResult {

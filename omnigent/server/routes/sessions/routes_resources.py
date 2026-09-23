@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import mimetypes
 import ntpath
 import urllib.parse
-from collections.abc import Awaitable, Callable
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -21,7 +23,8 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from omnigent.entities import (
     Conversation,
@@ -29,7 +32,8 @@ from omnigent.entities import (
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
+    native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
 from omnigent.runner.routing import RunnerRouter
@@ -64,12 +68,15 @@ from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
     get_server_runner_router,
+    host_interactive_shells_for_request,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
     FILE_CONTENT_CACHE_CONTROL,
     _ancestor_session_ids,
     _attachment_disposition,
+    _await_settled_managed_launch,
+    _enforce_filesystem_attachment_policy,
     _file_content_etag,
     _get_runner_client_for_resource_access,
     _if_none_match_matches,
@@ -77,8 +84,12 @@ from omnigent.server.routes._sessions.helpers import (
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
+    _raise_if_runner_session_agent_missing,
+    _raise_if_session_agent_missing_payload,
     _read_upload_capped,
+    _require_filesystem_attachment_harness,
     _stored_file_to_resource,
+    require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
@@ -96,6 +107,63 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 
 
+class _RunnerStreamResponse(StreamingResponse):
+    """Stream a runner response body and close it however the send ends.
+
+    A generator ``finally`` only runs once the body is first pulled, so a
+    send that fails before that, or a client that disconnects (where
+    Starlette skips background tasks), would leak the tunnel request.
+    Closing in ``__call__`` covers every exit.
+
+    :param upstream: The runner's streamed response.
+    :param headers: Response headers to forward.
+    """
+
+    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
+        super().__init__(upstream.aiter_raw(), headers=headers)
+        self._upstream = upstream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._upstream.aclose()
+
+
+# Admission gate bounding how many image uploads hold their raw bytes in memory
+# and decode/re-encode at once. Created lazily on first use so it binds to the
+# running server loop (not import time) and picks up the configured size. The
+# raw upload is already spooled to disk by the multipart parser before the
+# handler runs, so waiting here serializes only the in-memory materialize +
+# decode — the memory-heavy work — never the network transfer.
+_image_compression_gate: asyncio.Semaphore | None = None
+
+
+def _get_image_compression_gate() -> asyncio.Semaphore:
+    """Return the process-wide image-compression admission semaphore."""
+    global _image_compression_gate
+    if _image_compression_gate is None:
+        from omnigent.server.server_config import image_compression_concurrency
+
+        _image_compression_gate = asyncio.Semaphore(image_compression_concurrency())
+    return _image_compression_gate
+
+
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_attachment_upload_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
+    """Return the lock serializing one session's attachment quota check and store."""
+    lock = _attachment_upload_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _attachment_upload_locks[session_id] = lock
+    return lock
+
+
 def register_resources_routes(
     router: APIRouter,
     *,
@@ -109,6 +177,50 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
 ) -> None:
     """Register the resources routes on router."""
+
+    async def _require_filesystem_attachment_support(
+        request: Request, conv: Conversation, filename: str
+    ) -> None:
+        await _require_filesystem_attachment_harness(conv, filename)
+        tracker = getattr(request.app.state, "managed_launches", None)
+        launch = tracker.get(conv.id) if tracker is not None else None
+        if launch is not None and conv.host_id is None and conv.runner_id is None:
+            await _await_settled_managed_launch(launch)
+            refreshed = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+            if refreshed is None:
+                raise _session_not_found()
+            conv = refreshed
+        tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+        if (
+            conv.host_id is not None
+            and host_registry is not None
+            and host_registry.get(conv.host_id) is None
+            and (
+                conv.runner_id is None
+                or tunnel_registry is None
+                or tunnel_registry.get(conv.runner_id) is None
+            )
+            and not (
+                runner_router is not None
+                and await asyncio.to_thread(runner_router.host_is_on_another_replica, conv.host_id)
+            )
+        ):
+            # Upload can be the first action after a managed sandbox sleeps.
+            _, conv = await ensure_runner_connected(
+                session_id=conv.id,
+                conv=conv,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+            )
+        await asyncio.to_thread(
+            require_filesystem_attachment_runtime,
+            host_id=conv.host_id,
+            runner_id=conv.runner_id,
+            host_registry=host_registry,
+            tunnel_registry=tunnel_registry,
+            runner_router=runner_router,
+        )
 
     @router.get(
         "/sessions/{session_id}/resources",
@@ -246,6 +358,93 @@ def register_resources_routes(
             raise _session_not_found()
         return conv
 
+    # Per-chunk read budget for a direct HTTP runner client; no total timeout,
+    # since a large file legitimately outlives any. The WebSocket tunnel
+    # transport ignores httpx timeouts: there, a runner that drops aborts the
+    # body iterator once the tunnel closes.
+    _download_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
+
+    async def _stream_download_from_runner(
+        request: Request,
+        session_id: str,
+        conversation: Conversation,
+        runner_path: str,
+    ) -> Response:
+        """Stream a file download from the runner without buffering it.
+
+        The runner serves the bytes straight from disk; forwarding them
+        chunk by chunk keeps the server's memory flat however large the
+        file is. There is no host fallback: the host tunnel's filesystem
+        op answers in a single message, so it cannot stream a file.
+
+        :param request: The incoming request, for the gzip opt-out.
+        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
+        :param runner_path: Runner-relative URL carrying ``download=true``.
+        :returns: The attachment, streamed as the runner sends it, or the
+            runner's own error body and status for a missing file, a
+            directory, or an out-of-grant path.
+        :raises OmnigentError: ``runner_unavailable`` when the runner
+            predates downloads.
+        :raises HTTPException: 502 when no runner can be reached.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.send(
+                runner_client.build_request("GET", runner_path, timeout=_download_timeout),
+                stream=True,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner download endpoint unavailable",
+            ) from exc
+        if resp.status_code == 200 and "content-disposition" in resp.headers:
+            skip_gzip(request)
+            forwarded = {
+                name: resp.headers[name]
+                for name in (
+                    "content-type",
+                    "content-length",
+                    "content-encoding",
+                    "content-disposition",
+                    "cache-control",
+                    "x-content-type-options",
+                )
+                if name in resp.headers
+            }
+            return _RunnerStreamResponse(resp, headers=forwarded)
+        try:
+            await resp.aread()
+        finally:
+            await resp.aclose()
+        if resp.status_code == 200:
+            # A runner that predates ``download=true`` ignores it and answers
+            # the capped JSON envelope; serving that would truncate silently.
+            raise OmnigentError(
+                "Session runner does not support file downloads; restart the session",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+            raise HTTPException(status_code=502, detail="runner download failed")
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) with its client-safe message instead of forwarding the
+        # runner's raw resolver text verbatim.
+        _raise_if_session_agent_missing_payload(payload)
+        return JSONResponse(status_code=resp.status_code, content=payload)
+
     async def _proxy_get_to_runner(
         session_id: str,
         path: str,
@@ -260,7 +459,9 @@ def register_resources_routes(
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :returns: Parsed JSON response body.
-        :raises HTTPException: 502 on runner failure.
+        :raises OmnigentError: Typed ``not_found`` (404) or
+            ``session_agent_missing`` (410) re-derived from the runner body.
+        :raises HTTPException: 502 on any other runner failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -295,6 +496,9 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
@@ -330,7 +534,8 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
-            / ``"diff"`` / ``"search"``.
+            / ``"diff"`` / ``"search"`` / ``"github_info"`` /
+            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"``.
         :param host_params: Op-specific args for the host reader.
         :param runner_path: Runner-relative URL for the live path.
         :param runner_params: Optional query params for the runner path.
@@ -411,6 +616,21 @@ def register_resources_routes(
             conversation.workspace,
         )
 
+    def _runner_path_segment(relative_path: str, *, absolute: bool) -> str:
+        """Encode a browse path for the runner's ``{relative_path:path}`` segment.
+
+        Only the leading slash is encoded, since a literal "//" is what proxies
+        collapse; interior slashes travel fine and keep logs readable. Every
+        other character is quoted, so a literal "%" in a name is not decoded a
+        second time by the runner into a path the gate here never saw.
+
+        :param relative_path: Decoded path, with a leading slash iff *absolute*.
+        :param absolute: Whether the path is host-absolute.
+        :returns: The encoded segment.
+        """
+        quoted = urllib.parse.quote(relative_path.lstrip("/"))
+        return "%2F" + quoted if absolute else quoted
+
     def _mutating_runner_path(
         session_id: str,
         environment_id: str,
@@ -429,12 +649,7 @@ def register_resources_routes(
         :param relative_path: Client-supplied path.
         :returns: The runner-relative URL.
         """
-        absolute = relative_path.startswith("/")
-        # Encode only the leading slash: a literal "//" is what proxies
-        # collapse, while interior slashes travel fine.
-        encoded = (
-            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
-        )
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         return (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/filesystem/{encoded}"
@@ -477,6 +692,70 @@ def register_resources_routes(
         :returns: The required permission level.
         """
         return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
+
+    async def _authorize_browse_read(
+        session_id: str,
+        request: Request | None,
+        client_path: str = "",
+    ) -> Conversation:
+        """Authorize a workspace *content* read and return the conversation.
+
+        The read surfaces (file read/list, directory listing, changed files,
+        diffs, search, and the GitHub diff views) all serve the workspace's
+        own bytes or paths. An ABSOLUTE ``client_path`` is the owner's own
+        machine — owner-only, exactly as :func:`_browse_level` decides for a
+        mutation. A workspace-relative read needs ``LEVEL_EDIT`` *unless* the
+        session owner opted into ``share_workspace_files``, which lowers the
+        bar to ``LEVEL_READ``.
+
+        Fail-closed by default: a plain read grant shares the *conversation*,
+        not the raw filesystem — workspace files routinely hold secrets
+        (``.env`` / key files), so a read-only viewer sees nothing there until
+        the owner turns sharing on. The opt-in never widens absolute-path
+        browsing; that stays owner-only.
+
+        One :func:`require_access_and_level` round-trip resolves both the
+        caller's level and (via the conversation it returns) the session flag,
+        so the hot file-panel path pays no extra query in the common case.
+
+        :param session_id: Session/conversation identifier.
+        :param request: Incoming request; ``None`` for internal (no-auth)
+            calls, which are admitted at read level like ``_validate_session``.
+        :param client_path: Client-supplied path (``""`` for the whole-
+            workspace surfaces such as ``/changes``). A leading ``/`` — on any
+            platform — marks it absolute and forces the owner gate.
+        :returns: The authorized conversation.
+        :raises OmnigentError: 401/403/404 on auth failure.
+        """
+        if ntpath.isabs(client_path):
+            return await _validate_session(session_id, request, LEVEL_OWNER)
+        if request is None:
+            return await _validate_session(session_id, request, LEVEL_READ)
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        )
+        conv = access.conversation
+        if conv is None:
+            # Admin caller or permissions disabled: no conversation was fetched
+            # during authorization, so read it here (matching _validate_session).
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        # ``level is None`` means permissions are disabled (single-user); admins
+        # resolve to owner. Edit collaborators keep the workspace unconditionally;
+        # a view-only grant reaches it only once the owner shares its files.
+        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+            return conv
+        raise OmnigentError(
+            f"{user_id!r} needs edit access to browse the workspace of session "
+            f"{session_id!r}, or the owner must enable file sharing",
+            code=ErrorCode.FORBIDDEN,
+        )
 
     def _resolve_browse_path(request: Request, client_path: str) -> tuple[bool, str]:
         """Resolve a filesystem request path against its declared base.
@@ -588,6 +867,53 @@ def register_resources_routes(
                 raise HTTPException(status_code=400, detail=exc.message) from exc
             # Any other host FS failure (e.g. git_status_failed 500) mirrors the
             # runner proxy, which wraps non-200/404 responses as a 502.
+            raise HTTPException(status_code=502, detail=exc.message) from exc
+
+    async def _write_workspace_via_host(
+        session_id: str,
+        conversation: Conversation,
+        op: str,
+        host_params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Serve a workspace-mutating op over the session's host tunnel.
+
+        The write counterpart of :func:`_read_workspace_via_host`, for when the
+        runner is offline but the host holding the workspace is connected.
+
+        :param op: Host-side write op — currently ``"github_set_preference"``.
+        :param host_params: Op-specific args for the host writer.
+        :returns: The refreshed payload, or ``None`` when no host is bound /
+            connected / reachable (caller re-raises the runner-offline error).
+        :raises HTTPException: On host-reported failures, reproducing the runner's
+            status.
+        """
+        from omnigent.server.routes._host_filesystem import (
+            HostFsError,
+            HostFsUnavailableError,
+            write_workspace_from_host,
+        )
+
+        if host_registry is None:
+            return None
+        if not conversation.host_id or not conversation.workspace:
+            return None
+        host_conn = host_registry.get(conversation.host_id)
+        if host_conn is None:
+            return None
+        try:
+            return await write_workspace_from_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                op=op,
+                workspace=conversation.workspace,
+                session_id=session_id,
+                params=host_params,
+            )
+        except HostFsUnavailableError:
+            return None
+        except HostFsError as exc:
+            if exc.status == 400:
+                raise HTTPException(status_code=400, detail=exc.message) from exc
             raise HTTPException(status_code=502, detail=exc.message) from exc
 
     async def _proxy_post_to_runner(
@@ -998,6 +1324,19 @@ def register_resources_routes(
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
             declared = list(spec.terminals or {}) if spec is not None else []
+            if (
+                spec is not None
+                and conv.host_id is not None
+                and host_registry is not None
+                and native_coding_agent_for_agent_name(spec.name) is not None
+            ):
+                reported = host_interactive_shells_for_request(
+                    conv.host_id,
+                    host_registry=host_registry,
+                    runner_router=runner_router or get_server_runner_router(),
+                )
+                if reported:
+                    declared = reported
             if body.get("terminal") not in declared:
                 raise OmnigentError(
                     (
@@ -1087,7 +1426,9 @@ def register_resources_routes(
 
         Used by native Claude ``/clear`` rotation: ownership changes
         from the previous conversation to the fresh one while the tmux
-        pane keeps running.
+        pane keeps running. A successful transfer also carries the
+        source host, workspace, and git branch to the target because the
+        live terminal remains on that same placement.
 
         :param request: The incoming FastAPI request (for auth) with
             JSON body ``{"target_session_id": "conv_new"}``.
@@ -1132,6 +1473,15 @@ def register_resources_routes(
             raise OmnigentError(
                 error.get("message", "Terminal transfer failed"),
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+
+        if conv.host_id is not None:
+            await asyncio.to_thread(
+                conversation_store.set_host_id,
+                target_session_id,
+                conv.host_id,
+                conv.workspace,
+                conv.git_branch,
             )
 
         _publish_and_persist_resource_event(
@@ -1270,7 +1620,7 @@ def register_resources_routes(
         :param file: The uploaded file (multipart form data).
         :returns: The session file resource object.
         """
-        await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
                 status_code=501,
@@ -1281,52 +1631,133 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
+        from omnigent.inner.native_attachments import requires_filesystem
         from omnigent.runtime.content_resolver import (
+            _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
+            ImageCompressionError,
             _resolve_content_type,
             attachment_text_type_for_extension,
             attachment_upload_limit,
+            compress_image_attachment,
+            image_filename_for_content_type,
+            image_needs_compression,
         )
 
-        # Resolve the type from the declared MIME + filename BEFORE reading
-        # the body, so an unsupported or oversized upload is rejected without
-        # buffering it. Attachments are inlined into the model context as
-        # base64 (see content_resolver.resolve_content_references); only
-        # images, PDF, and text/code files are usable — others (pptx, docx,
-        # zip, …) would be garbled or blow the request size, so reject them.
+        # Validate the type and limits before buffering the file.
         content_type = _resolve_content_type(
             file.content_type,
             file.filename,
         )
-        type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
-            # The browser/OS can mislabel a text/code file as binary (e.g. a
-            # .csv reported as application/vnd.ms-excel on Windows). Fall back
-            # to the extension — matching the web client's allowlist — and
-            # normalize the type so the resolver inlines it as text.
-            ext_type = attachment_text_type_for_extension(file.filename)
-            if ext_type is not None:
-                content_type = ext_type
+        # Check the filename first so a misleading MIME cannot skip the
+        # harness requirement or the quotas for files that need local tools.
+        filesystem_required = requires_filesystem(file.filename)
+        if filesystem_required:
+            # Drop the declared type so the file is never stored as text.
+            content_type = _resolve_content_type("application/octet-stream", file.filename)
+            await _require_filesystem_attachment_support(request, conv, file.filename)
+        # Hold the quota check through the store below, so parallel uploads can't
+        # all spend the same remaining allowance.
+        attachment_lock = (
+            _attachment_upload_lock(session_id)
+            if filesystem_required
+            else contextlib.nullcontext()
+        )
+        async with attachment_lock:
+            if filesystem_required:
+                read_limit = _enforce_filesystem_attachment_policy(
+                    [file.filename],
+                    session_id=session_id,
+                    file_store=file_store,
+                )
+            else:
                 type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
-            raise HTTPException(
-                status_code=415,
-                detail=(
-                    f"Unsupported attachment type '{content_type}'. Only images, "
-                    "PDF, and text/code files can be attached."
+                if type_limit is None:
+                    # The browser/OS can mislabel a text/code file as binary (e.g. a
+                    # .csv reported as application/vnd.ms-excel on Windows). Fall back
+                    # to the extension — matching the web client's allowlist — and
+                    # normalize the type so the resolver inlines it as text.
+                    ext_type = attachment_text_type_for_extension(file.filename)
+                    if ext_type is not None:
+                        content_type = ext_type
+                        type_limit = attachment_upload_limit(content_type)
+                if type_limit is None:
+                    raise HTTPException(
+                        status_code=415,
+                        detail=(
+                            f"Unsupported attachment type '{content_type}'. Attach images, PDF, "
+                            "or text/code files, or use Claude Code or Codex for archives, "
+                            "Office documents, and databases."
+                        ),
+                    )
+                read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+            filename = file.filename
+            # Persist original dimensions only after a downscale.
+            source_dims: tuple[int, int] | None = None
+            if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+                # Compressible images carry the large cap and the decode, so they are
+                # the server's peak upload memory. The body is already spooled to
+                # disk by the multipart parser, so gate the in-memory read + the
+                # decode/re-encode behind the admission semaphore: a burst of
+                # concurrent uploads waits (each holding only a disk-backed temp
+                # file), instead of every one buffering the full image in RAM and
+                # decoding at once. This bounds peak memory to the gate size × the
+                # per-upload cost, without serializing the network transfer.
+                async with _get_image_compression_gate():
+                    content = await _read_upload_capped(file, read_limit)
+                    if image_needs_compression(len(content), content_type):
+                        try:
+                            compressed, resolved_type, source_dims = await asyncio.to_thread(
+                                compress_image_attachment, content, content_type
+                            )
+                        except ImageCompressionError as exc:
+                            raise HTTPException(status_code=413, detail=str(exc)) from exc
+                        # A re-encode (e.g. PNG → JPEG) changes the type; realign the
+                        # filename extension so name, bytes, and MIME stay consistent.
+                        if resolved_type != content_type:
+                            filename = image_filename_for_content_type(
+                                file.filename, resolved_type
+                            )
+                        content, content_type = compressed, resolved_type
+            else:
+                # PDF/text/SVG and other non-compressed types use their smaller
+                # per-type caps and aren't decoded, so they read outside the gate.
+                content = await _read_upload_capped(file, read_limit)
+            stored = file_store.create(
+                session_id=session_id,
+                filename=filename,
+                bytes=len(content),
+                content_type=content_type,
+                source_metadata=(
+                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
                 ),
             )
-        content = await _read_upload_capped(
-            file,
-            min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES),
-        )
-        stored = file_store.create(
-            session_id=session_id,
-            filename=file.filename,
-            bytes=len(content),
-            content_type=content_type,
-        )
-        artifact_store.put(stored.id, content)
+            try:
+                artifact_store.put(stored.id, content)
+            except Exception as exc:
+                # Release quota before another upload can acquire the session lock.
+                try:
+                    file_store.delete(stored.id, session_id=session_id)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete uploaded file row during rollback: session=%s file_id=%s",
+                        session_id,
+                        stored.id,
+                        exc_info=True,
+                    )
+                try:
+                    artifact_store.delete(stored.id)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete uploaded file blob during rollback: session=%s file_id=%s",
+                        session_id,
+                        stored.id,
+                        exc_info=True,
+                    )
+                raise OmnigentError(
+                    "Failed to upload file. Please try again.",
+                    code=ErrorCode.INTERNAL_ERROR,
+                ) from exc
         resource = _stored_file_to_resource(session_id, stored)
         _publish_and_persist_resource_event(
             session_id,
@@ -1400,10 +1831,15 @@ def register_resources_routes(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        # Content is immutable per file id, so a still-valid cached copy can be
-        # answered before ever touching the artifact store. Transcripts re-render
-        # the same attachments on every load, and the originals run to megabytes.
-        etag = _file_content_etag(stored.id)
+        # The bytes live under blob_key (== id for own uploads; the source's
+        # blob for a fork copy that shares it). Content is immutable per blob,
+        # so a still-valid cached copy can be answered before ever touching the
+        # artifact store — and keying the ETag on the blob lets a fork and its
+        # source share the browser cache for the same bytes. Transcripts
+        # re-render the same attachments on every load, and originals run to
+        # megabytes.
+        blob_key = stored.blob_key or stored.id
+        etag = _file_content_etag(blob_key)
         if _if_none_match_matches(request.headers.get("if-none-match"), etag):
             return Response(
                 status_code=304,
@@ -1412,7 +1848,7 @@ def register_resources_routes(
                     "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
                 },
             )
-        content = await asyncio.to_thread(artifact_store.get, stored.id)
+        content = await asyncio.to_thread(artifact_store.get, blob_key)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
         # The filename and bytes are fully user-controlled. Serving the
         # content inline lets a browser navigating directly to this URL
@@ -1455,12 +1891,26 @@ def register_resources_routes(
                 status_code=501,
                 detail="file store not configured",
             )
-        if not file_store.delete(file_id, session_id=session_id):
+        # Learn the blob this row points at BEFORE deleting the row — a fork
+        # copy shares the source's blob (blob_key != id), so we can't assume
+        # the blob lives under file_id.
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
+        if stored is None:
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        artifact_store.delete(file_id)
+        blob_key = stored.blob_key or stored.id
+        if not await asyncio.to_thread(file_store.delete, file_id, session_id=session_id):
+            raise OmnigentError(
+                "File not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        # Delete the bytes only once no surviving row (e.g. a fork sharing this
+        # blob) still references them — otherwise the fork's attachment would
+        # 404 after the source deletes its copy.
+        if await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key):
+            await asyncio.to_thread(artifact_store.delete, blob_key)
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.deleted",
@@ -1513,7 +1963,7 @@ def register_resources_routes(
             copy_total_bytes_limit,
         )
 
-        await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
                 status_code=501,
@@ -1557,7 +2007,9 @@ def register_resources_routes(
         total_bytes = 0
         for file_id in body.file_ids:
             stored = file_store.get(file_id, session_id=body.source_session_id)
-            if stored is None or not artifact_store.exists(stored.id):
+            # The source row may itself share a blob (blob_key != id), so probe
+            # existence under the effective blob key, not the row id.
+            if stored is None or not artifact_store.exists(stored.blob_key or stored.id):
                 raise OmnigentError(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,
@@ -1570,55 +2022,81 @@ def register_resources_routes(
                 )
             sources.append(stored)
 
-        # Commit the copies one file at a time (read → create → put) so peak
-        # memory is a single blob, not the whole batch. If any step fails
-        # mid-batch, roll back the rows/blobs already created.
-        mapping: dict[str, CopiedFile] = {}
-        created: list[str] = []
-        copied: list[StoredFile] = []
-        try:
-            for stored in sources:
-                content = artifact_store.get(stored.id)
-                new = file_store.create(
+        # Files requiring filesystem tools entering a session pass the same checks as an upload,
+        # held under the same lock, so a copy can't skip the harness or quotas.
+        from omnigent.inner.native_attachments import requires_filesystem
+
+        filesystem_sources = [
+            stored
+            for stored in sources
+            if stored.filename and requires_filesystem(stored.filename)
+        ]
+        if filesystem_sources:
+            await _require_filesystem_attachment_support(
+                request, conv, filesystem_sources[0].filename or ""
+            )
+        attachment_lock = (
+            _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()
+        )
+        async with attachment_lock:
+            if filesystem_sources:
+                _enforce_filesystem_attachment_policy(
+                    [stored.filename or "" for stored in filesystem_sources],
                     session_id=session_id,
-                    filename=stored.filename,
-                    bytes=stored.bytes,
-                    content_type=stored.content_type,
+                    file_store=file_store,
+                    sizes=[stored.bytes for stored in filesystem_sources],
                 )
-                created.append(new.id)
-                artifact_store.put(new.id, content)
-                # Carry the preserved filename + content_type back so the
-                # caller can attach the copy without a follow-up metadata GET.
-                mapping[stored.id] = CopiedFile(
-                    new_id=new.id,
-                    filename=new.filename,
-                    content_type=new.content_type,
-                )
-                copied.append(new)
-        except Exception as exc:
-            for new_id in created:
-                try:
-                    file_store.delete(new_id, session_id=session_id)
-                except Exception:
-                    _logger.warning(
-                        "Failed to delete copied file row during rollback: session=%s file_id=%s",
-                        session_id,
-                        new_id,
-                        exc_info=True,
+            # Commit the copies one file at a time (read → create → put) so peak
+            # memory is a single blob, not the whole batch. If any step fails
+            # mid-batch, roll back the rows/blobs already created.
+            mapping: dict[str, CopiedFile] = {}
+            created: list[str] = []
+            copied: list[StoredFile] = []
+            try:
+                for stored in sources:
+                    content = artifact_store.get(stored.blob_key or stored.id)
+                    new = file_store.create(
+                        session_id=session_id,
+                        filename=stored.filename,
+                        bytes=stored.bytes,
+                        content_type=stored.content_type,
+                        # Preserve transform metadata on copies.
+                        source_metadata=stored.source_metadata,
                     )
-                try:
-                    artifact_store.delete(new_id)
-                except Exception:
-                    _logger.warning(
-                        "Failed to delete copied file blob during rollback: session=%s file_id=%s",
-                        session_id,
-                        new_id,
-                        exc_info=True,
+                    created.append(new.id)
+                    artifact_store.put(new.id, content)
+                    # Carry the preserved filename + content_type back so the
+                    # caller can attach the copy without a follow-up metadata GET.
+                    mapping[stored.id] = CopiedFile(
+                        new_id=new.id,
+                        filename=new.filename,
+                        content_type=new.content_type,
                     )
-            raise OmnigentError(
-                "Failed to copy files into destination session",
-                code=ErrorCode.INTERNAL_ERROR,
-            ) from exc
+                    copied.append(new)
+            except Exception as exc:
+                for new_id in created:
+                    try:
+                        file_store.delete(new_id, session_id=session_id)
+                    except Exception:
+                        _logger.warning(
+                            "Failed to delete copied file row during rollback: session=%s file_id=%s",
+                            session_id,
+                            new_id,
+                            exc_info=True,
+                        )
+                    try:
+                        artifact_store.delete(new_id)
+                    except Exception:
+                        _logger.warning(
+                            "Failed to delete copied file blob during rollback: session=%s file_id=%s",
+                            session_id,
+                            new_id,
+                            exc_info=True,
+                        )
+                raise OmnigentError(
+                    "Failed to copy files into destination session",
+                    code=ErrorCode.INTERNAL_ERROR,
+                ) from exc
 
         # Resource events fire only after every write lands. Publishing them
         # inside the copy loop would emit (and persist as transcript items)
@@ -1678,6 +2156,18 @@ def register_resources_routes(
         if method == "GET":
             return await _proxy_get_to_runner(session_id, path, conv)
         if method == "PUT":
+            # Reads can use the host tunnel, but saving needs a runner to
+            # enforce the environment's write policy. Reconnect before saving
+            # and use the refreshed binding if recovery launched a new runner.
+            if request is not None:
+                _, conv = await ensure_runner_connected(
+                    session_id=session_id,
+                    conv=conv,
+                    app_state=request.app.state,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router or get_server_runner_router(),
+                    raise_host_refusal=True,
+                )
             status, payload = await _proxy_put_to_runner(
                 session_id,
                 path,
@@ -1708,6 +2198,10 @@ def register_resources_routes(
             raise HTTPException(status_code=405)
 
         if status >= 400:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) with its client-safe message instead of forwarding
+            # the runner's raw resolver text verbatim.
+            _raise_if_session_agent_missing_payload(payload)
             error = payload.get("error", {})
             message = error.get("message", "filesystem operation failed")
             if status == 404:
@@ -1795,7 +2289,7 @@ def register_resources_routes(
             params["before"] = before
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return _skip_gzip_for_binary(
             request,
             await _fs_get_with_host_fallback(
@@ -1920,9 +2414,7 @@ def register_resources_routes(
             params["exclude"] = exclude
 
         absolute, path = _resolve_browse_path(request, path)
-        conv = await _validate_session(
-            session_id, request, _browse_level(path, within_workspace=LEVEL_READ)
-        )
+        conv = await _authorize_browse_read(session_id, request, path)
 
         qs = urllib.parse.urlencode(params)
         suffix = ""
@@ -1970,7 +2462,7 @@ def register_resources_routes(
         :returns: Flat list of changed filesystem entries with ``status``.
         """
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2008,7 +2500,7 @@ def register_resources_routes(
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/diff/{relative_path}"
         )
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request, relative_path)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2018,9 +2510,103 @@ def register_resources_routes(
         )
 
     @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_pr_diff(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+    ) -> Any:
+        """
+        Return the whole PR as one unified diff patch.
+
+        ``gh pr diff`` covering every changed file, gzipped on the way out
+        (patches are large). The web view parses it client-side into per-file
+        diffs. Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_pr_diff",
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_file_diff(
+        request: Request,
+        session_id: str,
+        relative_path: str,
+        base: str | None = Query(default=None),
+        pr_url: str | None = None,
+        previous_path: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
+    ) -> Any:
+        """
+        Return before/after content for a file in the selected PR.
+
+        Tracked PRs read GitHub revisions; legacy requests use the workspace.
+        Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param relative_path: Repo-root-relative path from the changes list.
+        :param base: Base branch name; the default is derived when omitted.
+        :returns: JSON with ``before`` and ``after`` content strings.
+        """
+        conv = await _authorize_browse_read(session_id, request, relative_path)
+        params = {
+            key: value
+            for key, value in {
+                "base": base,
+                "pr_url": pr_url,
+                "previous_path": previous_path,
+                "head_sha": head_sha,
+                "base_sha": base_sha,
+            }.items()
+            if value is not None
+        }
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_diff",
+            host_params={"base": base, "path": relative_path, **params},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{relative_path}",
+            runner_params=params or None,
+        )
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}",
         response_model=None,
+        responses={
+            200: {
+                "description": (
+                    "File content or directory listing as JSON; the raw file "
+                    "as an attachment when `download=true`."
+                ),
+                "content": {
+                    "application/octet-stream": {
+                        "schema": {"type": "string", "format": "binary"},
+                    },
+                },
+            },
+        },
     )
     async def read_or_list_environment_path(
         request: Request,
@@ -2031,6 +2617,9 @@ def register_resources_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        # A plain default, not ``Query(...)``: the root listing calls this
+        # function directly, and a ``Query`` object is truthy.
+        download: bool = False,
     ) -> Any:
         """
         Read a file or list a directory in an environment.
@@ -2044,7 +2633,10 @@ def register_resources_routes(
         :param after: Cursor entry id for forward pagination.
         :param before: Cursor entry id for backward pagination.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
-        :returns: File content or directory listing.
+        :param download: When ``True``, stream the complete file as an
+            attachment with no size cap instead of the capped JSON
+            envelope. A directory rejects it with 400.
+        :returns: File content or directory listing, or the raw file.
         """
         params: dict[str, str] = {"limit": str(limit), "order": order}
         if after is not None:
@@ -2058,16 +2650,18 @@ def register_resources_routes(
         # `_mutating_level` for why anything weaker would make this route a
         # way around the owner-scoped host filesystem endpoint.
         absolute, relative_path = _resolve_browse_path(request, relative_path)
-        conv = await _validate_session(
-            session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
-        )
+        conv = await _authorize_browse_read(session_id, request, relative_path)
 
         qs = urllib.parse.urlencode(params)
-        # Encode only the leading slash: a literal "//" is what proxies
-        # collapse, while interior slashes travel fine and keep logs readable.
-        runner_rel = (
-            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
-        )
+        runner_rel = _runner_path_segment(relative_path, absolute=absolute)
+        if download:
+            return await _stream_download_from_runner(
+                request,
+                session_id,
+                conv,
+                f"/v1/sessions/{session_id}/resources/environments"
+                f"/{environment_id}/filesystem/{runner_rel}?download=true",
+            )
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/filesystem/{runner_rel}?{qs}"
@@ -2215,6 +2809,12 @@ def register_resources_routes(
         """
         Execute a shell command in an environment.
 
+        Owner-only. A command has no path to inspect, so unlike the
+        filesystem proxy there is no workspace-relative form that could
+        be opened to collaborators: any command reaches the owner's own
+        machine, the same boundary ``_browse_level`` closes for absolute
+        paths, and it passes no policy or approval gate on the way.
+
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
         :param request: JSON body with ``command`` and optional
@@ -2229,9 +2829,156 @@ def register_resources_routes(
             path,
             body,
             request=request,
+            required_level=LEVEL_OWNER,
             environment_id=environment_id,
             publish_invalidation=False,
         )
+
+    # ── GitHub integration (read-only) ───────────────────────────
+    # Registered BEFORE the generic ``/{resource_id}`` lookup so
+    # ``/resources/github`` is not captured as a resource id. The diff route
+    # lives on ``file_read_router`` (gzip) above.
+
+    @router.get(
+        "/sessions/{session_id}/resources/github",
+        response_model=None,
+    )
+    async def get_session_github(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Return GitHub context (repo, branch, base ref, PR) for a session.
+
+        Proxies to the runner, which shells out to ``gh``/``git`` in the
+        workspace. Returns an ``available: false`` payload (200) when ``gh`` is
+        missing or the workspace is not a git repo.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_info",
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/changes",
+        response_model=None,
+    )
+    async def list_session_github_changes(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        List the PR's changed files (empty when the branch has no PR).
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: Flat list of changed files with ``status`` and line counts.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_changes",
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
+        )
+
+    @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
+    async def update_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        params = {
+            "url": body["url"],
+            "action": body.get("action", "attach"),
+            "session_id": session_id,
+        }
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/prs",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_prs_update", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(
+                status_code=status, detail=result.get("detail", "Cannot update pull requests")
+            )
+        return result
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/preferences",
+        response_model=None,
+    )
+    async def set_session_github_preference(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Apply the GitHub panel's account (and optional base) selection.
+
+        Persists the choice — a per-workspace account preference in the user
+        config, and ``gh repo set-default`` when a base is given — then returns the
+        refreshed ``session.github.info``. Served by the runner when it's online,
+        else by the host over its tunnel (both run the same
+        :func:`github_resource.set_github_preference` against the local config +
+        workspace), so a preference change works with the runner asleep.
+
+        :param request: The incoming FastAPI request (JSON body + auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The refreshed ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        params = {"account": body.get("account"), "remote": body.get("remote")}
+        if body.get("pr_url"):
+            params.update(pr_url=body["pr_url"], session_id=session_id)
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/preferences",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            # Runner asleep — serve the write from the host if it's connected.
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_set_preference", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            error = result.get("error", {})
+            raise OmnigentError(
+                error.get("message", f"GitHub preference update failed (HTTP {status})"),
+                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        return result
 
     # Generic single-resource lookup — registered AFTER typed
     # collections so "environments", "terminals", "files" are not

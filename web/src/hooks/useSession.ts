@@ -11,8 +11,10 @@
 // Reading it from the single-fetch snapshot instead means the rail
 // gets the user's actual level for any conversation they navigate to.
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
+import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
+import { isTempConvId } from "@/lib/tempConversationId";
 import type { Session } from "@/lib/types";
 
 /**
@@ -48,10 +50,15 @@ interface UseSessionResult {
  * for the refresh to thrash those caches.
  */
 export function useSession(conversationId: string | null | undefined): UseSessionResult {
+  // A `temp:*` id is a client-only routing token with no server session behind
+  // it (navigate-first new-chat window). Disable the fetch by construction so no
+  // caller can leak a `GET /v1/sessions/temp:*` — cheaper than gating every
+  // call site.
+  const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
   const { data, isLoading, error } = useQuery({
-    queryKey: conversationId ? ["session", conversationId] : ["session", null],
-    queryFn: () => getSessionSlim(conversationId as string, { refreshState: true }),
-    enabled: Boolean(conversationId),
+    queryKey: serverId ? ["session", serverId] : ["session", null],
+    queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
+    enabled: serverId !== null,
     staleTime: Infinity,
     retry: false,
   });
@@ -140,4 +147,50 @@ export function useActiveRootSessionId(
   const id = activeConversationId ?? null;
   const { session } = useSession(id);
   return useRootSessionId(id, session?.parentSessionId);
+}
+
+/**
+ * Resolve the host a session's traffic keys by, loading ancestors as needed.
+ *
+ * The slice-key router pins a session's requests to the replica holding its
+ * host's runner tunnel. A sub-agent child has no host of its own: it runs on
+ * its parent's runner, so its key is the nearest host-bound ancestor's. A warm
+ * page already knows that ancestor (its snapshot or the child-sessions list
+ * seeded the map), but a cold ``/c/<child>`` open does not — the child's own
+ * snapshot names only its parent. This walks the parent chain through the
+ * shared ``["session", id]`` snapshot cache until `getSessionHost` resolves,
+ * so the first host-scoped request keys correctly instead of landing on the
+ * default replica.
+ *
+ * Registered as identity's session-host resolver at the app entry
+ * (``setSessionHostResolver``); the chat store's stream bind goes through the
+ * same resolver. Best-effort: a hostless top-level session, an unknown id, or
+ * a cycle ends the walk with whatever is known.
+ *
+ * @param queryClient - The app QueryClient holding the snapshot cache.
+ * @param sessionId - Session whose routing host to resolve, e.g. ``"conv_child"``.
+ */
+export async function prefetchSessionHostChain(
+  queryClient: QueryClient,
+  sessionId: string,
+): Promise<void> {
+  const visited = new Set<string>();
+  let id: string | null = sessionId;
+  while (id !== null && !visited.has(id) && getSessionHost(sessionId) === null) {
+    visited.add(id);
+    const hopId: string = id;
+    // Each hop's id comes from the previous snapshot, so the chain is serial.
+    // oxlint-disable-next-line no-await-in-loop
+    const session: Session = await queryClient.fetchQuery({
+      queryKey: ["session", hopId],
+      queryFn: () => getSessionSlim(hopId),
+      staleTime: Infinity,
+      retry: false,
+    });
+    // `sessionFromWire` records these on a live fetch; re-record so a cached
+    // snapshot seeds the map the same way.
+    setSessionHost(session.id, session.hostId);
+    setSessionParent(session.id, session.parentSessionId);
+    id = session.parentSessionId;
+  }
 }

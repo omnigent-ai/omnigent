@@ -9,6 +9,8 @@ const vm = require("node:vm");
 
 function loadMainHarness({
   settings = {},
+  serverUrl = "https://server.example/app",
+  sessionCookies = [],
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
   serverShutdown = () => Promise.resolve(),
@@ -32,16 +34,26 @@ function loadMainHarness({
     sent: [],
     showMessageBox: [],
     setApplicationMenu: [],
+    aboutOpens: [],
+    expiredAccess: [],
+    removedRefresh: [],
+    authRequests: [],
+    cookieReads: [],
+    cookieRemovals: [],
+    reloads: 0,
   };
 
   const sender = {
-    getURL: () => "https://server.example/app",
+    getURL: () => serverUrl,
   };
   const win = {
     isDestroyed: () => false,
     webContents: {
-      getURL: () => "https://server.example/app",
+      getURL: () => serverUrl,
       send: (channel, payload) => calls.sent.push({ channel, payload }),
+      reload: () => {
+        calls.reloads++;
+      },
     },
     isMinimized: () => false,
     restore: () => {},
@@ -121,7 +133,19 @@ function loadMainHarness({
     },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
     screen: {},
-    session: { defaultSession: {} },
+    session: {
+      defaultSession: {
+        cookies: {
+          get: async (filter) => {
+            calls.cookieReads.push(filter);
+            return sessionCookies;
+          },
+          remove: async (url, name) => {
+            calls.cookieRemovals.push([url, name]);
+          },
+        },
+      },
+    },
     shell: {},
     systemPreferences: {
       getUserDefault: (key, type) =>
@@ -130,6 +154,12 @@ function loadMainHarness({
   };
 
   const localRequires = {
+    "./about_window": {
+      createAboutWindow: () => ({
+        open: (parent) => calls.aboutOpens.push(parent),
+        registerIpc: () => {},
+      }),
+    },
     "./localhost_cors": { registerLocalhostCors: () => {} },
     "./url": {
       normalizeUrl: (url) => url,
@@ -137,6 +167,24 @@ function loadMainHarness({
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
     "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
+    // databricks-session (transitively) requires electron's `net`, unresolvable
+    // under the sandbox's real require; behavior is covered in databricks-*.test.js.
+    "./databricks-session": {
+      ensureDatabricksSession: async (_ses, origin) => {
+        calls.authRequests.push(origin);
+        return origin;
+      },
+    },
+    "./databricks-oauth": {
+      expireStoredAccessToken: (origin) => {
+        calls.expiredAccess.push(origin);
+        return true;
+      },
+      removeStoredRefreshToken: (origin) => {
+        calls.removedRefresh.push(origin);
+        return true;
+      },
+    },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
@@ -204,8 +252,8 @@ function loadMainHarness({
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   module.exports.testApi.windows.set(win, {
-    origin: "https://server.example",
-    serverUrl: "https://server.example/app",
+    origin: new URL(serverUrl).origin,
+    serverUrl,
     badgeCount: 0,
   });
 
@@ -216,7 +264,7 @@ function loadMainHarness({
     calls,
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
     events: {
-      pinned: { sender, senderFrame: { url: "https://server.example/app" } },
+      pinned: { sender, senderFrame: { url: serverUrl } },
       unpinned: { sender, senderFrame: { url: "https://evil.example/app" } },
     },
     ipcHandlers,
@@ -241,8 +289,8 @@ function plain(value) {
 
 function findMenuItem(menu, id) {
   for (const item of menu.template) {
-    const submenu = item.submenu ?? [];
-    const found = submenu.find((entry) => entry.id === id);
+    if (item.id === id) return item;
+    const found = findMenuItem({ template: item.submenu ?? [] }, id);
     if (found) return found;
   }
   return null;
@@ -279,14 +327,104 @@ describe("in-app navigation menu actions", () => {
   });
 });
 
+describe("About menu wiring", () => {
+  it("opens the shell-owned About window from About and Check for Updates", async (t) => {
+    const harness = loadMainHarness({
+      platform: "darwin",
+      settings: { update_mode: "manual" },
+    });
+    t.after(harness.cleanup);
+    harness.api.updater.init();
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const aboutItem = findMenuItem(menu, "open_about");
+    const checkItem = findMenuItem(menu, "check_for_updates");
+    aboutItem.click();
+
+    assert.equal(aboutItem.label, "About Omnigent");
+    assert.equal(harness.calls.aboutOpens.length, 1);
+
+    checkItem.click();
+    await flushPromises();
+    assert.equal(harness.calls.aboutOpens.length, 2);
+    assert.equal(harness.calls.checkForUpdates, 1);
+  });
+
+  it("exposes About under Help on Windows and Linux", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const aboutItem = findMenuItem(menu, "open_about");
+    aboutItem.click();
+
+    assert.equal(aboutItem.label, "About Omnigent");
+    assert.equal(harness.calls.aboutOpens.length, 1);
+  });
+});
+
 describe("developer-mode menu wiring", () => {
-  it("keeps the Debug menu in development builds", (t) => {
+  it("places expiry simulations under Debug, not Server, in development builds", (t) => {
     const harness = loadMainHarness({ isPackaged: false, platform: "linux" });
     t.after(harness.cleanup);
 
     harness.api.buildMenu();
 
-    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const debug = menu.template.find((item) => item.label === "Debug");
+    const server = menu.template.find((item) => item.label === "Server");
+    const authentication = debug.submenu.find((item) => item.id === "debug_authentication");
+    assert.equal(authentication.label, "Authentication");
+    for (const id of [
+      "simulate_session_expiry",
+      "simulate_oauth_token_expiry",
+      "invalidate_oauth_refresh_token",
+    ]) {
+      assert.equal(typeof authentication.submenu.find((item) => item.id === id)?.click, "function");
+      assert.equal(findMenuItem({ template: [server] }, id), null);
+    }
+  });
+
+  it("clears the focused workspace cookie without forcing a reload or renewal", async (t) => {
+    const origin = "https://workspace.cloud.databricks.com";
+    const harness = loadMainHarness({
+      isPackaged: false,
+      platform: "linux",
+      serverUrl: `${origin}/omnigent`,
+      sessionCookies: [
+        { name: "DBAUTH", domain: ".workspace.cloud.databricks.com", path: "/", secure: true },
+      ],
+    });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "simulate_session_expiry").click();
+    await flushPromises();
+    assert.deepEqual(plain(harness.calls.cookieReads), [{ url: origin, name: "DBAUTH" }]);
+    assert.deepEqual(harness.calls.cookieRemovals, [[`${origin}/`, "DBAUTH"]]);
+    assert.equal(harness.calls.reloads, 0);
+    assert.deepEqual(harness.calls.authRequests, []);
+  });
+
+  it("changes cached tokens without starting a refresh or reload", async (t) => {
+    const origin = "https://workspace.cloud.databricks.com";
+    const harness = loadMainHarness({
+      isPackaged: false,
+      platform: "linux",
+      serverUrl: `${origin}/omnigent`,
+    });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    findMenuItem(menu, "simulate_oauth_token_expiry").click();
+    findMenuItem(menu, "invalidate_oauth_refresh_token").click();
+    await flushPromises();
+    assert.deepEqual(harness.calls.expiredAccess, [origin]);
+    assert.deepEqual(harness.calls.removedRefresh, [origin]);
+    assert.deepEqual(harness.calls.authRequests, []);
+    assert.equal(harness.calls.reloads, 0);
+    assert.deepEqual(harness.calls.showMessageBox, []);
   });
 
   it("hides the Debug menu in packaged builds by default", (t) => {
@@ -302,7 +440,7 @@ describe("developer-mode menu wiring", () => {
     assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), false);
   });
 
-  it("shows the Debug menu when a packaged macOS build opts in", (t) => {
+  it("shows authentication debugging when a packaged macOS build opts in", (t) => {
     const harness = loadMainHarness({
       isPackaged: true,
       platform: "darwin",
@@ -312,7 +450,17 @@ describe("developer-mode menu wiring", () => {
 
     harness.api.buildMenu();
 
-    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    assert.equal(hasDebugMenu(menu), true);
+    const authentication = findMenuItem(menu, "debug_authentication");
+    assert.equal(authentication.label, "Authentication");
+    for (const id of [
+      "simulate_session_expiry",
+      "simulate_oauth_token_expiry",
+      "invalidate_oauth_refresh_token",
+    ]) {
+      assert.equal(typeof findMenuItem(menu, id)?.click, "function");
+    }
   });
 });
 
@@ -648,9 +796,10 @@ describe("auto-update main-process wiring", () => {
     restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
     assert.equal(restartItem.visible, true);
 
+    // A late/redundant check result must not discard an already-downloaded artifact.
     harness.autoUpdater.emit("update-not-available");
     restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
-    assert.equal(restartItem.visible, false);
+    assert.equal(restartItem.visible, true);
   });
 
   it("does not start the install path when no update is downloaded", async (t) => {
@@ -736,7 +885,7 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.api.updater.installPending, false);
   });
 
-  it("allows only development builds to override the effective desktop version", async (t) => {
+  it("allows only development builds to override the effective desktop version", (t) => {
     const development = loadMainHarness({
       settings: { update_mode: "manual" },
       desktopVersionOverride: " 0.2.0 ",
@@ -750,13 +899,6 @@ describe("auto-update main-process wiring", () => {
     assert.equal(development.api.updater.getStatus().currentVersion, "0.2.0");
 
     development.autoUpdater.emit("update-not-available");
-    development.api.buildMenu();
-    await findMenuItem(development.calls.setApplicationMenu.at(-1), "check_for_updates").click();
-    assert.equal(development.calls.showMessageBox.at(-1).options.title, "Omnigent Desktop");
-    assert.equal(
-      development.calls.showMessageBox.at(-1).options.detail,
-      "Omnigent Desktop 0.2.0 is the latest version.",
-    );
 
     const packaged = loadMainHarness({
       isPackaged: true,

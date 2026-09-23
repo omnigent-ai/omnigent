@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ImageIcon } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
+import { withBasePath } from "@/lib/basePath";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { ZoomableImage } from "@/components/ImageLightbox";
@@ -16,31 +17,40 @@ export interface SessionImageProps {
   className?: string;
 }
 
-/**
- * Fixed-height box every inline preview renders into, reserved before the bytes
- * arrive and unchanged once they land. The chat scroller runs with
- * `overflow-anchor: none` (history prepends own the anchoring) and its
- * resize-compensating observer is iOS-only, so an image that grew on decode
- * would shove the transcript down under the reader with nothing to absorb it.
- */
-const PREVIEW_BOX = "flex h-64 max-w-full shrink-0 items-center justify-center";
+// Size the box to the image so short screenshots don't leave empty rows.
+const PREVIEW_BOX = "flex max-w-full shrink-0 items-start justify-center";
 
-/**
- * Cap on the image itself, in the same absolute unit as the box's height so the
- * two can't drift apart. It has to be absolute rather than `max-h-full`: the
- * lightbox wraps the image in an auto-height button, and a percentage height
- * resolves against that wrapper, leaving a tall image free to overflow the box.
- */
+// An absolute cap also constrains images inside the auto-height zoom button.
 const PREVIEW_IMAGE = "max-h-64 max-w-full";
 
 /** Placeholder width, so the box holds a slot on the row before its image lands. */
 const PREVIEW_PLACEHOLDER_BOX = "flex h-64 w-40 shrink-0 items-center justify-center";
 
 /**
+ * Fallback for an image that can't be shown: a compact labelled chip, so an
+ * unusable attachment costs a line rather than a tall box of broken glyph.
+ */
+function UnavailableImage({ alt, className }: { alt: string; className?: string }) {
+  return (
+    <div
+      role="img"
+      aria-label={alt}
+      className={cn(
+        "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-muted-foreground",
+        className,
+      )}
+    >
+      <ImageIcon className="size-3.5 shrink-0" />
+      <span className="truncate">{alt}</span>
+    </div>
+  );
+}
+
+/**
  * Inline preview for an uploaded image stored as a session file resource.
  *
- * Standalone the file path is same-origin, so a plain `<img src>` works and we
- * keep it as-is (native streaming + HTTP caching). Embedded, the host proxies
+ * Standalone the file path is same-origin, so a plain `<img src>` works (native
+ * streaming + HTTP caching) and {@link InlineImage} renders it. Embedded, the host proxies
  * the API behind a path prefix and cookie+CSRF auth that a browser `<img>` GET
  * can't satisfy (no way to send the prefix or the CSRF header), so we pull the
  * bytes through the host fetcher — which handles both — and render an object
@@ -50,21 +60,57 @@ export function SessionImage({ path, alt, className }: SessionImageProps) {
   // Host config is installed once at embed startup and never changes, so it's
   // safe to branch on it before any hooks. Hooks live in the embedded child.
   if (!getOmnigentHostConfig().fetcher) {
-    return (
-      <div className={PREVIEW_BOX}>
-        <ZoomableImage
-          src={path}
-          alt={alt}
-          className={cn(PREVIEW_IMAGE, className)}
-          // Offscreen history images cost nothing until scrolled to, and
-          // decoding off the main thread keeps the swap from blocking paint.
-          loading="lazy"
-          decoding="async"
-        />
-      </div>
-    );
+    // Share sizing and error handling with transcript-carried images.
+    return <InlineImage src={path ? withBasePath(path) : path} alt={alt} className={className} />;
   }
   return <EmbeddedSessionImage path={path} alt={alt} className={className} />;
+}
+
+/**
+ * Preview for an image the browser can load straight from `src`: a `data:` URI
+ * the transcript carries, or a same-origin session file path.
+ *
+ * Shares sizing and failure handling with same-origin session images.
+ * Only corrupt data URIs collapse to a chip; fetched paths can fail transiently.
+ */
+export function InlineImage({
+  src,
+  alt,
+  className,
+}: {
+  src?: string;
+  alt: string;
+  className?: string;
+}) {
+  // Tracked by source rather than as a bare flag, so a later block swapping in a
+  // different `src` on the same slot retries instead of staying stuck failed.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+
+  // A truncated or corrupt `data:` URI decodes to nothing; showing the chip
+  // keeps it off the lightbox.
+  if (src !== undefined && failedSrc === src) {
+    return <UnavailableImage alt={alt} className={className} />;
+  }
+
+  return (
+    <div className={PREVIEW_BOX}>
+      <ZoomableImage
+        src={src}
+        alt={alt}
+        className={cn(PREVIEW_IMAGE, className)}
+        // Offscreen history images cost nothing until scrolled to, and decoding
+        // off the main thread keeps the swap from blocking paint.
+        loading="lazy"
+        decoding="async"
+        // An absent src never resolved, so nothing has failed yet — latching
+        // here would strand the slot on a chip once the path arrives. A
+        // non-data src remains available for retry on error.
+        onError={() => {
+          if (src !== undefined && src.startsWith("data:")) setFailedSrc(src);
+        }}
+      />
+    </div>
+  );
 }
 
 type LoadState = "loading" | "loaded" | "error";
@@ -163,19 +209,7 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
   }, [path]);
 
   if (state === "error") {
-    return (
-      <div
-        role="img"
-        aria-label={alt}
-        className={cn(
-          "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-muted-foreground",
-          className,
-        )}
-      >
-        <ImageIcon className="size-3.5 shrink-0" />
-        <span className="truncate">{alt}</span>
-      </div>
-    );
+    return <UnavailableImage alt={alt} className={className} />;
   }
 
   if (state === "loading" || !blobUrl) {

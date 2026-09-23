@@ -39,6 +39,56 @@ const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 // every rule-extraction below so the block grammar lives in one place.
 const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
+describe("composer picker single highlight", () => {
+  const rules = cssBlocks
+    .map(([block]) => block)
+    .filter((block) => block.includes(".composer-agent-menu"));
+  const highlightRule = rules.find((block) => block.includes("background-color: var(--muted)"))!;
+
+  it("uses shared input and submenu state instead of stale native focus-visible", () => {
+    expect(highlightRule).toBeDefined();
+    const selectors = selectorOf(highlightRule).replace(/\s+/g, " ");
+    expect(selectors).toContain('.composer-agent-menu[data-initial-selection="true"]');
+    expect(selectors).toContain(
+      '.composer-agent-menu[data-input-method="pointer"]:not([data-initial-selection="true"])',
+    );
+    expect(selectors).toContain(
+      '.composer-agent-menu[data-input-method="keyboard"] .composer-agent-row:focus-within',
+    );
+    expect(selectors).toContain(
+      '.composer-agent-menu .composer-agent-row:has(> [aria-haspopup="menu"][data-state="open"])',
+    );
+    const interactionSelectors = selectors.slice(
+      selectors.indexOf(", .composer-agent-menu[data-input-method"),
+    );
+    expect(selectors).toContain('[data-active="true"]');
+    expect(interactionSelectors).not.toContain('[data-active="true"]');
+    expect(rules.join("\n")).not.toContain(":focus-visible");
+    expect(
+      rules.find((block) => selectorOf(block) === '.composer-agent-menu [role^="menuitem"]'),
+    ).toContain("background-color: transparent");
+  });
+
+  it("uses pointer cursors only on enabled picker items", () => {
+    const cursorRule = rules.find((block) => block.includes("cursor: pointer"))!;
+    const { getByTestId } = render(
+      createElement(
+        "div",
+        { className: "composer-agent-menu" },
+        createElement("div", { role: "menuitem", "data-testid": "enabled" }),
+        createElement("div", {
+          role: "menuitemcheckbox",
+          "data-testid": "disabled",
+          "data-disabled": "",
+        }),
+      ),
+    );
+    expect(getByTestId("enabled").matches(selectorOf(cursorRule))).toBe(true);
+    expect(getByTestId("disabled").matches(selectorOf(cursorRule))).toBe(false);
+    cleanup();
+  });
+});
+
 /* Regression test for the "transparent dropdown in prod" bug.
  *
  * Dark mode renders popovers/cards with a semi-transparent background that
@@ -172,6 +222,29 @@ describe("index.css app-shell viewport lock", () => {
     expect(rule).toContain("html:has(.app-shell)");
     expect(rule).toContain("body:has(.app-shell)");
   });
+});
+
+const allWidthNativeLayoutRules = [
+  ["iOS keyboard viewport", "[data-ios-native].app-shell", "--omnigent-viewport-height"],
+  ["native chat header", ".chat-header", "--omnigent-safe-top"],
+  ["native Plan tracker", ".chat-plan-accordion", "--omnigent-safe-top"],
+] as const;
+
+describe("index.css native tablet layout", () => {
+  it.each(allWidthNativeLayoutRules)(
+    "keeps the %s rule outside width media queries",
+    (_, selector, value) => {
+      const matches = cssBlocks.filter(
+        ([block]) => block.includes(selector) && block.includes(value),
+      );
+      expect(matches, `missing the all-width ${selector} rule`).toHaveLength(1);
+
+      const before = cssSource.slice(0, matches[0].index!);
+      const opens = (before.match(/\{/g) ?? []).length;
+      const closes = (before.match(/\}/g) ?? []).length;
+      expect(opens - closes, `${selector} must not sit inside an at-rule`).toBe(0);
+    },
+  );
 });
 
 /* The unified native-panel rule: one ungated :is() list covering the
@@ -441,6 +514,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           rightRailTab: "files",
           onRightRailTabChange: () => {},
           showFilesPanel: true,
+          showGithubTab: false,
           showBrowserTab: false,
           changedCount: 0,
           subagentsWorking: 0,
@@ -696,7 +770,7 @@ describe("index.css desktop typography ramp", () => {
 describe("index.css body text tokens", () => {
   const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
   const mobileMap = cssSource.match(
-    /@media \(width < 48rem\) \{\s*\/\*[^*]*\*\/\s*:root \{[^}]*\}/,
+    /@media \(width < 48rem\) \{\s*(?:\/\*[\s\S]*?\*\/\s*)?:root \{[^}]*\}/,
   )?.[0];
   const CAPTION_RATIO = 0.9;
   const LINE_HEIGHT_RATIO = 1.6;
@@ -712,6 +786,41 @@ describe("index.css body text tokens", () => {
     expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
     expect(mobileMap).toContain(`--text-sm: calc(var(--mobile-ui-font-size) * ${CAPTION_RATIO})`);
     expect(mobileMap).toContain("--text-ui: var(--mobile-ui-font-size)");
+  });
+
+  /* Contract: the Appearance font-size setting applies on mobile.
+   *
+   * The mobile base used to be a hard-coded 14px with zero references to
+   * --desktop-ui-font-size, so the Settings stepper's value was persisted and
+   * set on <html> but never consumed below 48rem — saved but not applied. The
+   * mobile base must scale off the preference. */
+  describe("mobile branch consumes the font-size preference", () => {
+    const MOBILE_BASE_RATIO = 14 / 13;
+
+    it("derives the mobile base from the preference, not a hard-coded px", () => {
+      expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
+      // A literal `--mobile-ui-font-size: 14px` is the saved-but-not-applied
+      // bug: the preference would be a dead store below 48rem.
+      expect(mobileMap).not.toMatch(/--mobile-ui-font-size:\s*\d/);
+      expect(mobileMap).toContain(
+        "--mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13))",
+      );
+    });
+
+    it("keeps the historical 14px mobile base at the default preference", () => {
+      // The ratio must map the shipped default onto the long-standing mobile
+      // base exactly, so users who never touch the setting see no change.
+      expect(UI_FONT_SIZE_DEFAULT * MOBILE_BASE_RATIO).toBe(14);
+    });
+
+    it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX])(
+      "moves the rendered mobile base when the preference is %ipx",
+      (px) => {
+        // The applied size must actually change with the setting — the
+        // user-visible half of the fix.
+        expect(px * MOBILE_BASE_RATIO).not.toBe(UI_FONT_SIZE_DEFAULT * MOBILE_BASE_RATIO);
+      },
+    );
   });
 
   it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX])(
@@ -839,9 +948,10 @@ describe("index.css mobile sidebar glass chip opacity", () => {
 describe("index.css text selection colors", () => {
   const selectionRule = cssSource.match(/::selection\s*\{([^}]*)\}/)?.[1];
 
-  it("matches the active sidebar item in every color mode", () => {
-    expect(selectionRule).toContain("background: var(--sidebar-active)");
-    expect(selectionRule).toContain("color: var(--sidebar-active-foreground)");
+  it("uses dedicated selection tokens instead of subtle sidebar shading", () => {
+    expect(selectionRule).toContain("background: var(--selection-background)");
+    expect(selectionRule).toContain("color: var(--selection-foreground)");
+    expect(selectionRule).not.toContain("--sidebar-active");
     expect(selectionRule).not.toContain("--brand-accent");
     expect(cssSource).not.toContain(".dark ::selection");
   });

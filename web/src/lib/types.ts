@@ -32,6 +32,9 @@ export interface RememberScope {
   host?: string;
 }
 
+/** Persistence scopes advertised by Codex for MCP tool approvals. */
+export type CodexPersistMode = "session" | "always";
+
 /**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at
@@ -69,6 +72,8 @@ export interface Usage {
 export interface ErrorInfo {
   code: string;
   message: string;
+  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
+  level?: "error" | "info";
   /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */
   title?: string;
   /** One/two-sentence explanation of why it failed. Paired with `title`. */
@@ -117,11 +122,10 @@ export interface Response {
 // ── Content blocks ───────────────────────────────────────
 
 /**
- * A typed content block for user messages.
- *
- * Used when sending messages via `POST /v1/sessions/{id}/events`.
- * Mirrors the `content` array that `content_resolver.py` and the
- * sessions schema accept on the server side.
+ * The content blocks the composer sends via
+ * `POST /v1/sessions/{id}/events` — a send-path subset, not the full
+ * server schema. Blocks read back from a session are wider (e.g.
+ * `input_image` without `file_id`); parse those with `blocks.ts`.
  */
 export type ContentBlock =
   | { type: "input_text"; text: string }
@@ -284,6 +288,12 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /**
+   * Whether the session is archived. Carried on the snapshot because it is
+   * the only carrier for a session opened directly by URL — the default
+   * sidebar list excludes archived rows. `false`/absent for active sessions.
+   */
+  archived?: boolean;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -363,6 +373,15 @@ export interface Session {
    * `"on"` at create, so `null` means Default rather than "inherit".
    */
   subagentRoutingOverride?: "on" | "off" | null;
+  /**
+   * Whether the owner opted into letting people with *view* (read-only)
+   * access browse this session's workspace files (the Files/Changes/GitHub
+   * surfaces and the file contents behind them). `false` by default — a
+   * read grant shares the conversation, not the raw filesystem. Owner-set
+   * from the share dialog; the rail reads it to decide whether to mount the
+   * file surfaces for a view-only viewer.
+   */
+  shareWorkspaceFiles?: boolean;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
   /**
@@ -371,11 +390,12 @@ export interface Session {
    * render immediately on conversation resume.
    */
   lastTotalTokens?: number | null;
+  /** False when subtree usage was skipped and must be fetched separately. */
+  usageIncluded?: boolean;
   /**
    * Cumulative session spend in USD, server-computed (the cost-budget
-   * total). ``null``/absent when the session is **unpriced** (no turn
-   * priced yet), so the UI renders "—" rather than ``$0.00``. Lets the
-   * cost indicator render immediately on conversation resume.
+   * total). ``null``/absent when usage was skipped or the session is
+   * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
   /**
@@ -395,6 +415,7 @@ export interface Session {
   lastTaskError?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;
@@ -451,26 +472,20 @@ export interface Session {
    */
   kind: "default" | "sub_agent";
   /**
-   * Current Claude Code todo list for `omnigent claude` sessions.
-   * Sourced from the server's `_session_todos_cache` at snapshot
-   * build time so the panel survives page refresh. Empty array for
-   * non-claude-native sessions or before the first turn creates todos.
+   * Current native Plan/TODO list reported by a harness. Restored from
+   * persisted session metadata at snapshot build time so the panel survives
+   * page refresh. Empty before the first Plan update.
    */
   todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent has access to (bundled + host-discovered,
-   * subject to the spec's ``skills_filter``). Populated by the
-   * server from the agent cache; ``undefined`` on older snapshots.
-   * The web composer surfaces these in its slash-command menu so
-   * users can fire ``/skill-name``.
-   */
-  skills?: SkillSummary[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** A saved sandbox inference policy owns the model catalog. */
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced
@@ -530,13 +545,7 @@ export interface SandboxStatus {
   error?: string | null;
 }
 
-/**
- * One entry in ``Session.skills`` — mirrors
- * ``omnigent.server.schemas.SkillSummary``. Just the name +
- * one-line description so the composer's suggestion menu can list
- * them; the full skill body is loaded server-side at invocation
- * time.
- */
+/** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */
 export interface SkillSummary {
   /** Lowercase kebab-case identifier, e.g. ``"triage-issues"``. */
   name: string;
@@ -544,12 +553,62 @@ export interface SkillSummary {
   description: string;
 }
 
+export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";
+
 /** Reasoning-effort metadata advertised for a native model. */
 export interface NativeReasoningEffortOption {
   /** Effort id, e.g. ``"xhigh"``. */
   reasoningEffort: string;
   /** User-facing description, when present. */
   description?: string;
+}
+
+/** Non-secret provenance for the configuration serving a model. */
+export interface ModelConfigurationSource {
+  /** Stable provider category, e.g. `subscription`, `databricks`, or `gateway`. */
+  kind: string;
+  /** Compact composer label, e.g. `Subscription` or `Workspace`. */
+  label: string;
+  /** Specific configured source, e.g. a provider name or Databricks profile. */
+  name?: string;
+  /** Non-secret endpoint host, when the provider has one. */
+  host?: string;
+}
+
+/**
+ * One resolved Devin Fusion pairing. Both halves are real catalog models:
+ * a `lead` (with an `effort` rung and an optional `fast` serving modifier) and
+ * a `sidekick` (with an optional `priority` modifier). `modelUid` is the exact
+ * `--model` id to launch.
+ */
+export interface FusionCombo {
+  /** Full Devin variant id, e.g. `fusion-claude-fable-5-1-medium-sidekick-swe-2-medium`. */
+  modelUid: string;
+  /** Lead family key (a standalone model id), e.g. `claude-fable-5.1`. */
+  lead: string;
+  /** Lead family label, e.g. `Claude Fable 5.1`. */
+  leadLabel: string;
+  /** Lead reasoning effort rung, e.g. `medium`. */
+  effort: string;
+  /** Whether this pairing uses the lead's `-fast` serving variant. */
+  fast: boolean;
+  /** Sidekick key with any `-priority` modifier stripped, e.g. `swe-2-medium`. */
+  sidekick: string;
+  /** Sidekick label, e.g. `SWE-2 Medium`. */
+  sidekickLabel: string;
+  /** Whether this pairing uses the sidekick's `-priority` variant. */
+  priority: boolean;
+}
+
+/**
+ * Structured Fusion picker payload: the full set of real lead/sidekick combos
+ * plus the default. The web builds dependent Lead / Effort / Sidekick selectors
+ * from `combos` and only offers combinations that exist.
+ */
+export interface FusionDescriptor {
+  combos: FusionCombo[];
+  /** `modelUid` of the default combo. */
+  default: string;
 }
 
 /** One runner-owned native model-picker row. */
@@ -566,4 +625,8 @@ export interface NativeModelOption {
   supportedReasoningEfforts?: NativeReasoningEffortOption[];
   /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
+  /** Configuration that supplies this model; never includes credentials. */
+  source?: ModelConfigurationSource;
+  /** Present only on Devin's Fusion option: its lead/sidekick combo table. */
+  fusion?: FusionDescriptor;
 }

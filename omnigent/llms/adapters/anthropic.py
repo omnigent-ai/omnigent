@@ -26,8 +26,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.adapters._content import parse_data_uri
 from omnigent.llms.adapters.base import BaseAdapter
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
-from omnigent.model_metadata import ModelMetadata, ModelReasoningMode
-from omnigent.reasoning_effort import ANTHROPIC_EFFORTS, validate_effort_or_llm_error
+from omnigent.models.model_metadata import ModelMetadata, ModelReasoningMode
+from omnigent.util.reasoning_effort import ANTHROPIC_EFFORTS, validate_effort_or_llm_error
 
 _logger = logging.getLogger(__name__)
 

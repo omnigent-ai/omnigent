@@ -8,7 +8,7 @@
  * (API key, gateway) add step kinds server-side and appear here for free.
  */
 
-import type { SetupStepWire } from "@/lib/agentLabels";
+import { isAutoHarness, type SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 
@@ -34,6 +34,105 @@ export interface ResolvedSetupStep {
   status: SetupStepStatus;
   /** The harness id to POST for a one-click install (``action === "install"``). */
   harness: string;
+}
+
+export type HarnessReadinessState = "available" | "unavailable" | "broken" | "setup-required";
+
+export type HarnessReadinessReason =
+  | "ready"
+  | "readiness-unknown"
+  | "harness-unavailable"
+  | "host-unavailable"
+  | "binary-missing"
+  | "needs-auth"
+  | "unconfigured"
+  | "version-too-low"
+  | "readiness-error";
+
+export interface HarnessReadinessExplanation {
+  label: string;
+  description: string;
+}
+
+export interface HarnessReadiness {
+  state: HarnessReadinessState;
+  reason: HarnessReadinessReason;
+  selectable: boolean;
+  /** A different harness on the same host may recover this condition. */
+  fallbackRelevant: boolean;
+  explanation: HarnessReadinessExplanation | null;
+}
+
+function harnessReadinessResult(
+  state: HarnessReadinessState,
+  reason: HarnessReadinessReason,
+  fallbackRelevant: boolean,
+  explanation: HarnessReadinessExplanation | null,
+): HarnessReadiness {
+  return {
+    state,
+    reason,
+    selectable: state === "available",
+    fallbackRelevant,
+    explanation,
+  };
+}
+
+/** Resolve selection and fallback behavior from one host readiness value. */
+export function harnessReadinessOnHost(
+  harness: string | null | undefined,
+  host: Host | undefined | null,
+): HarnessReadiness {
+  if (!harness) {
+    return harnessReadinessResult("unavailable", "harness-unavailable", true, {
+      label: "Harness unavailable",
+      description: "This agent does not resolve to a runnable harness.",
+    });
+  }
+  if (!host || host.status !== "online") {
+    return harnessReadinessResult("unavailable", "host-unavailable", false, {
+      label: "Host unavailable",
+      description: "Connect an online host before starting a session.",
+    });
+  }
+
+  const configured = host.configured_harnesses;
+  if (!configured || !(harness in configured)) {
+    return harnessReadinessResult("available", "readiness-unknown", false, null);
+  }
+
+  const availability = configured[harness];
+  if (availability === true) {
+    return harnessReadinessResult("available", "ready", false, null);
+  }
+  if (availability === "version-too-low") {
+    return harnessReadinessResult("broken", "version-too-low", true, {
+      label: "Harness is outdated",
+      description: "Update this harness before starting a session with it.",
+    });
+  }
+  if (availability === "binary-missing") {
+    return harnessReadinessResult("setup-required", "binary-missing", true, {
+      label: "Harness is not installed",
+      description: "Install this harness on the selected host before using it.",
+    });
+  }
+  if (availability === "needs-auth") {
+    return harnessReadinessResult("setup-required", "needs-auth", true, {
+      label: "Authentication required",
+      description: "Sign in or add credentials on the selected host before using this harness.",
+    });
+  }
+  if (availability === false) {
+    return harnessReadinessResult("setup-required", "unconfigured", true, {
+      label: "Setup required",
+      description: "Set up this harness on the selected host before using it.",
+    });
+  }
+  return harnessReadinessResult("broken", "readiness-error", true, {
+    label: "Harness is not working",
+    description: "The selected host reported a harness readiness error.",
+  });
 }
 
 /** Whether *harness* is a Codex spelling (bare or native). Codex is the only
@@ -76,6 +175,22 @@ export function harnessUnavailableReasonOnHost(
   // Any other string from a newer/older server still means "not ready";
   // show a generic warning rather than silently treating it as available.
   if (typeof availability === "string") {
+    return "unconfigured";
+  }
+  // Missing key on a host that DOES report readiness (a non-empty map): the host
+  // can't launch this harness — its runner has no catalog row for it, e.g. a host
+  // predating a newly-added harness (jcode on a pre-jcode host, which reports
+  // devin/grok but omits jcode). Treat it as unconfigured so "hide unconfigured"
+  // hides it, instead of failing open and offering a harness the host can't run.
+  // Excludes the client-only Smart Routing "auto" sentinels: the daemon never
+  // reports a readiness key for those, so they must stay selectable and unbadged.
+  // An absent/empty map still fails open (the guard above, plus the size check),
+  // so a host that reports no readiness at all is never emptied out.
+  if (
+    availability === undefined &&
+    !isAutoHarness(harness) &&
+    Object.keys(host.configured_harnesses).length > 0
+  ) {
     return "unconfigured";
   }
   return null;

@@ -3,14 +3,19 @@
 // more than one such PR, the oldest PR is kept and the newer ones are closed,
 // labeled `duplicate`, and commented on. Maintainer PRs are included in
 // detection (so a maintainer's PR can be the kept "keeper") but are never
-// auto-closed: a maintainer duplicate instead gets a softer heads-up comment
-// and the `duplicate` label (no close). Originally ported from mlflow/mlflow's
-// .github/workflows/duplicate-prs.js, with the maintainer skip narrowed from
-// detection to closing only.
+// auto-closed. Trusted resolve-agent replacement PRs are excluded entirely;
+// their contributor PR remains open until a post-merge workflow closes it.
+// Originally ported from mlflow/mlflow's .github/workflows/duplicate-prs.js,
+// with the maintainer skip narrowed from detection to closing only.
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const DAYS_TO_CONSIDER = 14;
 const DUPLICATE_LABEL = "duplicate";
+const TRUSTED_REPLACEMENT_AUTHORS = new Set([
+  "app/omni-resolve-agent",
+  "omni-resolve-agent",
+  "omni-resolve-agent[bot]",
+]);
 
 const duplicateMessage = (author, issueNumber, keeperPR) =>
   `@${author} This PR appears to reference the same issue (#${issueNumber}) as #${keeperPR} (opened earlier). Closing as a duplicate. ` +
@@ -54,13 +59,15 @@ const MAINTAINER_ASSOCIATIONS = ["MEMBER", "OWNER", "COLLABORATOR"];
 // Maintainer PRs participate in detection (so they can be the kept "keeper"
 // that makes a community duplicate closeable) but are never themselves closed.
 const isMaintainerPR = (pr) => MAINTAINER_ASSOCIATIONS.includes(pr.authorAssociation);
+const isTrustedReplacementPR = (pr) =>
+  TRUSTED_REPLACEMENT_AUTHORS.has(pr.author?.login ?? "");
 
 // Whether a PR should be considered at all when grouping by issue. Already
 // labeled-duplicate PRs are skipped (already handled); everything else --
 // community and maintainer alike -- is considered.
 const shouldConsiderPR = (pr) => {
   const labels = pr.labels?.nodes?.map((l) => l.name) ?? [];
-  return !labels.includes(DUPLICATE_LABEL);
+  return !labels.includes(DUPLICATE_LABEL) && !isTrustedReplacementPR(pr);
 };
 
 // Whether a duplicate PR is eligible to be auto-closed: only community PRs.

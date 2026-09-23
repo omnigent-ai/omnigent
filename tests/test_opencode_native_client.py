@@ -8,7 +8,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from omnigent.opencode_native_client import (
+from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeClientError,
     OpenCodeEvent,

@@ -68,6 +68,7 @@ def test_plugin_state_loads_builtins() -> None:
     assert isinstance(state, SandboxProviderPluginState)
     assert "modal" in state
     assert "blaxel" in state
+    assert "gensee" in state
     assert "kubernetes" in state
 
 
@@ -94,6 +95,7 @@ def test_available_providers_returns_builtins() -> None:
     names = available_providers()
     assert "modal" in names
     assert "blaxel" in names
+    assert "gensee" in names
     assert "kubernetes" in names
 
 
@@ -124,6 +126,21 @@ def test_instantiate_loads_blaxel_without_optional_sdk() -> None:
     reset_plugin_state_for_tests()
     launcher = instantiate("blaxel")
     assert launcher.provider == "blaxel"
+
+
+def test_instantiate_loads_microsandbox_without_optional_sdk() -> None:
+    """The lazy microsandbox module imports before the optional SDK is installed."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("microsandbox")
+    assert launcher.provider == "microsandbox"
+
+
+def test_instantiate_loads_gensee_from_core() -> None:
+    """Gensee resolves to the built-in launcher without a plugin package."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("gensee")
+    assert launcher.provider == "gensee"
+    assert launcher.__class__.__module__ == "omnigent.onboarding.sandboxes.gensee"
 
 
 def test_instantiate_unknown_raises() -> None:
@@ -277,6 +294,16 @@ def test_get_launcher_uses_registry() -> None:
     reset_plugin_state_for_tests()
     launcher = get_launcher("modal")
     assert launcher.provider == "modal"
+
+
+def test_get_launcher_passes_server_url_to_microsandbox() -> None:
+    """CLI server context reaches the microsandbox network configuration."""
+    reset_plugin_state_for_tests()
+    launcher = get_launcher(
+        "microsandbox",
+        server_url="http://host.microsandbox.internal:8799",
+    )
+    assert launcher._host_ports == (8799,)
 
 
 def test_get_launcher_unknown_raises_click_exception() -> None:

@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionCodexApprovalModeEvent,
   SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
@@ -25,7 +26,6 @@ import type {
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSandboxStatusEvent,
-  SessionSkillsEvent,
   SessionStatusEvent,
   SessionTerminalActivityEvent,
   SessionTerminalPendingEvent,
@@ -756,6 +756,24 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(ev.targetSessionId).toBe("conv_child_123");
   });
 
+  it.each([true, false, undefined, "true", 1])(
+    "requires an explicit boolean auto-mode capability, received %s",
+    (hint) => {
+      const out = parse("response.elicitation_request", {
+        type: "response.elicitation_request",
+        elicitation_id: "elicit_auto",
+        params: {
+          mode: "form",
+          message: "Claude wants to call **Bash**",
+          requestedSchema: {},
+          allow_auto_mode: hint,
+        },
+      });
+      expect(out).toHaveLength(1);
+      expect((out[0] as ElicitationRequest).allowAutoMode).toBe(hint === true);
+    },
+  );
+
   it("lifts the allow_all_edits hint for claude-native edit-tool prompts", () => {
     // The server stamps ``allow_all_edits`` on edit-tool
     // PermissionRequests so the card can offer "Accept & allow all
@@ -874,6 +892,29 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(out).toHaveLength(1);
     const ev = out[0] as ElicitationRequest;
     expect(ev.rememberScope).toBeNull();
+  });
+
+  it("lifts Codex MCP persistence modes from approval metadata", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_mcp",
+      params: {
+        mode: "form",
+        message: 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+        phase: "codex_mcp_elicitation",
+        policy_name: "codex_native_mcp_elicitation",
+        content_preview: "{}",
+        requestedSchema: {},
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          persist: ["session", "always", "unsupported", "session"],
+        },
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.codexPersistModes).toEqual(["session", "always"]);
   });
 });
 
@@ -1453,6 +1494,28 @@ describe("session.permission_mode (FLAT envelope)", () => {
   });
 });
 
+describe("session.codex_approval_mode (FLAT envelope)", () => {
+  it("lifts conversation_id and approval_mode string", () => {
+    const events = parse("session.codex_approval_mode", {
+      conversation_id: "conv_abc",
+      approval_mode: "approve-for-me",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionCodexApprovalModeEvent;
+    expect(ev.type).toBe("session_codex_approval_mode");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.approvalMode).toBe("approve-for-me");
+  });
+
+  it("rejects missing approval_mode", () => {
+    expect(parse("session.codex_approval_mode", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.codex_approval_mode", { approval_mode: "approve-for-me" })).toEqual([]);
+  });
+});
+
 describe("session.agent_changed (FLAT envelope)", () => {
   it("lifts conversation_id, agent_id, and agent_name", () => {
     const events = parse("session.agent_changed", {
@@ -1647,36 +1710,6 @@ describe("session.terminal.activity (FLAT envelope)", () => {
         session_id: "conv_abc",
       }),
     ).toEqual([]);
-  });
-});
-
-describe("session.skills (FLAT envelope)", () => {
-  it("lifts conversation_id into the bare nudge", () => {
-    const out = parse("session.skills", {
-      type: "session.skills",
-      conversation_id: "conv_abc",
-    });
-    expect(out).toHaveLength(1);
-    const ev = out[0] as SessionSkillsEvent;
-    expect(ev.type).toBe("session_skills");
-    expect(ev.conversationId).toBe("conv_abc");
-  });
-
-  it("rejects missing conversation_id", () => {
-    // Without a conversation id the store handler can't target a
-    // refetch, so the frame must be dropped rather than lifted.
-    const out = parse("session.skills", {
-      type: "session.skills",
-    });
-    expect(out).toEqual([]);
-  });
-
-  it("rejects an empty conversation_id", () => {
-    const out = parse("session.skills", {
-      type: "session.skills",
-      conversation_id: "",
-    });
-    expect(out).toEqual([]);
   });
 });
 

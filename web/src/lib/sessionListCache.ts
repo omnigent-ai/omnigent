@@ -38,6 +38,16 @@ export const PROJECT_LABEL_KEY = "omni_project";
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
 
+/**
+ * The reserved `conversation_labels` key holding the epoch-SECONDS time a
+ * session was archived. Written by the server on the archive transition and
+ * deleted on unarchive, so its absence is normal for sessions archived before
+ * this shipped (readers fall back to `updated_at`). Seconds, not the pin key's
+ * epoch-ms, to match that fallback's unit. Mirrors the server's
+ * `ARCHIVED_AT_LABEL_KEY`.
+ */
+export const ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at";
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;
@@ -49,6 +59,12 @@ export interface ConversationListFilters {
    * "all projects".
    */
   project?: string;
+  /**
+   * Ownership/archive scope for the sidebar tabs. ``"mine"`` holds only owned
+   * sessions; ``"shared"`` holds accessible-but-not-owned; ``"archived"`` holds
+   * only archived sessions. ``undefined`` is the default all-sessions list.
+   */
+  visibility?: "mine" | "shared" | "archived";
 }
 
 /**
@@ -115,34 +131,47 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
 /**
  * Decode the filter dimensions from a conversations query key.
  *
- * The base key is `["conversations", searchQuery, includeArchived]`. The
- * project-filtered variant appends a fourth element:
- * `["conversations", searchQuery, includeArchived, project]` (the Archived
- * settings picker is the only producer today). Both lengths are accepted so
- * the rename overlay and push-delta merge — which iterate *every* cached
- * `["conversations", ...]` query — never throw on the project variant. Query
- * membership decisions depend on these dimensions, so malformed keys fail
- * loudly instead of being guessed.
+ * The base key is `["conversations", searchQuery, includeArchived]`. Variants:
+ * - 4 elements: `[..., project]` — the Archived settings picker's project filter.
+ * - 5 elements: `[..., project|null, visibility]` — the sidebar's mine/shared
+ *   tab-scoped query (project is `null` here since it's always unset for those
+ *   tabs). All lengths are accepted so the rename overlay and push-delta merge
+ *   — which iterate *every* cached `["conversations", ...]` query — never throw
+ *   on unknown variants. Query membership decisions depend on these dimensions,
+ *   so malformed keys fail loudly instead of being guessed.
  *
  * @param key - TanStack Query key for a conversations query.
  * @returns Parsed list filters.
  * @throws Error if the key is not a conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
+  if (key.length < 3 || key.length > 5 || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
   const [, searchQuery, includeArchived, project] = key;
   if (typeof searchQuery !== "string" || typeof includeArchived !== "boolean") {
     throw new Error("Invalid conversations query key");
   }
-  if (project !== undefined && typeof project !== "string") {
+  // project is undefined (3-element), a string (4-element project-scoped), or
+  // null (5-element visibility-scoped where project is always unset).
+  if (project !== undefined && project !== null && typeof project !== "string") {
+    throw new Error("Invalid conversations query key");
+  }
+  const visibility = key[4];
+  if (
+    visibility !== undefined &&
+    visibility !== "mine" &&
+    visibility !== "shared" &&
+    visibility !== "archived"
+  ) {
     throw new Error("Invalid conversations query key");
   }
   return {
     searchQuery,
     includeArchived,
-    project,
+    // Treat null (visibility-scoped key) the same as undefined (no project filter).
+    project: project ?? undefined,
+    visibility: visibility as ConversationListFilters["visibility"],
   };
 }
 
@@ -163,6 +192,17 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  * @returns `true` when the row should be removed immediately.
  */
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
+  // Visibility-scoped caches have strict membership rules beyond archive/project:
+  if (filters.visibility === "archived") {
+    // The archived cache holds only archived rows. A non-archived row (or one
+    // that just got un-archived) does not belong; evict it so the overlay paths
+    // don't leave stale active sessions in this cache.
+    return conv.archived !== true;
+  }
+  if (filters.visibility === "mine" || filters.visibility === "shared") {
+    // Mine/shared caches hold only active (non-archived) sessions. Evict if archived.
+    if (conv.archived === true) return true;
+  }
   if (!filters.includeArchived && conv.archived === true) return true;
   if (filters.project && conv.labels?.[PROJECT_LABEL_KEY] !== filters.project) return true;
   return false;
@@ -272,6 +312,42 @@ export function mergeItemsIntoPages(
   return { data: { ...data, pages }, found, needsRefetch };
 }
 
+// ── Recently-created keep-alive ───────────────────────────────────────
+//
+// The push stream inserts a just-created session into the sidebar instantly
+// (SessionUpdatesProvider → insertNewRowsIntoPages), but the create path also
+// fires a `["conversations"]` refetch, and on the search-indexed deployment
+// that fetch lags the write — so it comes back WITHOUT the new session and
+// replaces the cache, dropping the row until the index catches up (it flashes
+// in, then out). We keep the row in the first-page fetch until the index
+// reflects it — the additive mirror of the delete tombstone. Lives in this
+// leaf module so both `useConversations` (the reader) and the chat store (the
+// optimistic-create writer) can reach it without an import cycle.
+export const recentlyCreatedSessions = new Map<string, Conversation>();
+
+/** Grace window for the server's async create reindex. */
+const CREATED_KEEPALIVE_MS = 60_000;
+
+/** Keep a just-created session in the first-page list fetch until it's indexed. */
+export function markRecentlyCreated(conv: Conversation): void {
+  recentlyCreatedSessions.set(conv.id, conv);
+  setTimeout(() => recentlyCreatedSessions.delete(conv.id), CREATED_KEEPALIVE_MS);
+}
+
+/** Clear the keep-alive map — exported for test cleanup (mirrors `unmarkSessionsDeleting`). */
+export function clearRecentlyCreated(): void {
+  recentlyCreatedSessions.clear();
+}
+
+/**
+ * Drop one row from the keep-alive map — e.g. an optimistic unarchive whose
+ * PATCH failed, so the row must stop being re-injected and fall back to
+ * archived. Safe to call for an id that isn't tracked.
+ */
+export function unmarkRecentlyCreated(id: string): void {
+  recentlyCreatedSessions.delete(id);
+}
+
 /**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
@@ -286,9 +362,11 @@ export function insertNewRowsIntoPages(
   candidates: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
   skip?: (id: string) => boolean,
-): { data: ConversationsInfiniteData | undefined; inserted: Set<string> } {
-  const inserted = new Set<string>();
-  if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted };
+  viewerId?: string | null,
+): { data: ConversationsInfiniteData | undefined; inserted: Conversation[] } {
+  // Archived caches hold only archived rows; new sessions are never archived.
+  if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
+  if (filters.visibility === "archived") return { data, inserted: [] };
   const present = new Set<string>();
   for (const page of data.pages) for (const c of page.data) present.add(c.id);
   const rows: Conversation[] = [];
@@ -305,29 +383,32 @@ export function insertNewRowsIntoPages(
       id,
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
+    // Ownership-aware insertion for scoped caches. `conv.owner` is null/absent
+    // when the row is owned by the viewer (single-user / legacy shape) or
+    // explicitly set to another user's id when the session was shared.
+    const ownedByViewer = conv.owner == null || conv.owner === viewerId;
+    if (filters.visibility === "mine" && !ownedByViewer) continue;
+    if (filters.visibility === "shared" && ownedByViewer) continue;
     rows.push(conv);
-    inserted.add(id);
   }
-  if (rows.length === 0) return { data, inserted };
+  if (rows.length === 0) return { data, inserted: [] };
   const [first, ...rest] = data.pages;
   const nextFirst = { ...first, data: [...rows, ...first.data], first_id: rows[0].id };
-  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted };
+  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted: rows };
 }
 
-/**
- * Drop rows with the given ids from one infinite query's cached pages.
- *
- * Page cursors are recomputed from the surviving rows: `last_id` of the
- * final page is the `after=` anchor `fetchNextPage` sends, and a deleted
- * anchor id makes the server's keyset lookup miss (the next page comes
- * back empty). An emptied page gets null cursors — infinite scroll then
- * pauses until the next reconcile refetch rebuilds the pages, which
- * beats paginating from a dead anchor.
- *
- * @param data - The cached infinite data, or `undefined`.
- * @param ids - Conversation ids to remove.
- * @returns The (possibly identical) data and whether anything was removed.
- */
+// Only known legacy row-ID cursors can be repaired after removing their anchor.
+// All other continuation tokens must round-trip unchanged, even on empty pages.
+export function lastIdAfterFiltering(
+  original: ConversationsPage,
+  rows: Conversation[],
+  emptyCursor: string | null = null,
+): string | null {
+  if (!original.data.some((row) => row.id === original.last_id)) return original.last_id;
+  return rows.at(-1)?.id ?? emptyCursor;
+}
+
+/** Drop matching rows while preserving opaque continuation metadata. */
 export function removeIdsFromPages(
   data: ConversationsInfiniteData | undefined,
   ids: Set<string>,
@@ -342,7 +423,7 @@ export function removeIdsFromPages(
       ...page,
       data: nextData,
       first_id: nextData[0]?.id ?? null,
-      last_id: nextData[nextData.length - 1]?.id ?? null,
+      last_id: lastIdAfterFiltering(page, nextData),
     };
   });
   if (!changed) return { data, removed: false };

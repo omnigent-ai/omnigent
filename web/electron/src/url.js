@@ -233,6 +233,47 @@
   }
 
   /**
+   * True when a server URL is hosted by Databricks — a workspace domain
+   * (workspace-mounted Omnigent) or a Databricks App. Https-only: a local or
+   * self-hosted server is never "Databricks-managed", whatever its hostname
+   * claims. Used to scope Databricks-internal desktop features (e.g. the Arca
+   * host option) to Databricks-managed servers.
+   *
+   * @param {string | null | undefined} rawUrl
+   * @returns {boolean}
+   */
+  function isDatabricksManagedServerUrl(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return false;
+    }
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    if (host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`)) {
+      return true;
+    }
+    return isDatabricksWorkspaceHost(host);
+  }
+
+  /** Browser OAuth/session bridging is workspace/account-only, not Databricks Apps. */
+  function isDatabricksOAuthServerUrl(rawUrl) {
+    try {
+      const url = new URL(rawUrl);
+      return (
+        url.protocol === "https:" &&
+        !url.username &&
+        !url.password &&
+        !url.port &&
+        WORKSPACE_DOMAINS.some((domain) => url.hostname.endsWith(`.${domain}`))
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Probe timeout for Databricks workspace detection. Deliberately short: a
    * slow or unreachable host must not stall the connect flow — on timeout we
    * fall back to loading the URL exactly as entered.
@@ -254,10 +295,12 @@
    * loads the web UI, so it appends the SPA mount instead.
    *
    * @param {string} normalized A normalized http(s) URL from normalizeUrl().
+   * @param {{ signal?: AbortSignal }} [options] Optional connection cancellation.
    * @returns {Promise<string>} The workspace UI URL when expansion applies,
    *   else the input unchanged.
    */
-  async function expandDatabricksWorkspaceUrl(normalized) {
+  async function expandDatabricksWorkspaceUrl(normalized, { signal } = {}) {
+    signal?.throwIfAborted();
     let url;
     try {
       url = new URL(normalized);
@@ -281,11 +324,13 @@
       probe = await fetch(`${url.origin}/`, {
         method: "HEAD",
         redirect: "manual",
-        signal: AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS)])
+          : AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
       });
     } catch {
-      // Unreachable / DNS / TLS / timeout: connect to the URL as given and let
-      // the did-fail-load fallback surface any real failure.
+      // Explicit cancellation must not become an ordinary failed probe.
+      signal?.throwIfAborted();
       return normalized;
     }
     if ((probe.headers.get("server") ?? "").toLowerCase() !== "databricks") {
@@ -325,7 +370,7 @@
    * Read a server's version manifest, so the shell can adapt to the server it
    * actually reached instead of assuming its own release's behavior.
    *
-   * TOTAL: this never throws and never blocks a connection. Anything short of a
+   * Unless explicitly cancelled, this never throws or blocks a connection. Anything short of a
    * well-formed manifest — 404 (older server), unreachable host, HTML from an
    * SPA catch-all, malformed JSON, wrong types — yields
    * {@link PRE_MANIFEST_BASELINE}. "I could not learn anything" and "this
@@ -337,10 +382,12 @@
    * bumps the envelope stays usable by a shell that predates the bump.
    *
    * @param {string} serverUrl A normalized absolute http(s) server URL.
+   * @param {{ signal?: AbortSignal }} [options] Optional connection cancellation.
    * @returns {Promise<{manifestVersion: number, serverVersion: string | null,
    *   minDesktopVersion: string | null, ui: Record<string, unknown>}>}
    */
-  async function fetchServerManifest(serverUrl) {
+  async function fetchServerManifest(serverUrl, { signal } = {}) {
+    signal?.throwIfAborted();
     let origin;
     try {
       origin = new URL(serverUrl).origin;
@@ -352,9 +399,12 @@
       response = await fetch(`${origin}${WELL_KNOWN_MANIFEST_PATH}`, {
         // A redirect to a login page is not a manifest; don't follow it.
         redirect: "manual",
-        signal: AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS)])
+          : AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS),
       });
     } catch {
+      signal?.throwIfAborted();
       return PRE_MANIFEST_BASELINE;
     }
     if (!response.ok) return PRE_MANIFEST_BASELINE;
@@ -369,6 +419,7 @@
     try {
       body = await response.json();
     } catch {
+      signal?.throwIfAborted();
       return PRE_MANIFEST_BASELINE;
     }
     if (body === null || typeof body !== "object") return PRE_MANIFEST_BASELINE;
@@ -400,6 +451,8 @@
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,
     expandDatabricksWorkspaceUrl,
+    isDatabricksManagedServerUrl,
+    isDatabricksOAuthServerUrl,
     WELL_KNOWN_MANIFEST_PATH,
     MANIFEST_FETCH_TIMEOUT_MS,
     PRE_MANIFEST_BASELINE,

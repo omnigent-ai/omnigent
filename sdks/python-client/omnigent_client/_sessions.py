@@ -26,7 +26,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import TypeAdapter
@@ -34,7 +34,7 @@ from pydantic import TypeAdapter
 from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
-from ._errors import raise_for_status, require_json_object, response_body
+from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _SSE_TIMEOUT
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
@@ -179,8 +179,9 @@ class Session:
         conversations.
     :param archived: Whether the session is archived. Archived
         sessions are hidden from the default ``list`` listing and
-        returned only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        returned with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
     """
 
     id: str
@@ -258,6 +259,11 @@ class SessionListItem:
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
+    :param host_id: Host that launched the runner for this session,
+        or ``None`` for sessions without a host binding (e.g. a
+        caller-managed runner). Native resume pickers rely on it to
+        drop rows bound to other hosts, whose runtime state is not
+        reachable from the invoking machine.
     :param reasoning_effort: Per-session reasoning-effort hint.
     :param owner: User ID of the session owner.
     :param external_session_id: Runtime-native session id this
@@ -270,8 +276,9 @@ class SessionListItem:
         running can tell which ones are blocked on them. ``0`` when
         the session has no outstanding prompts.
     :param archived: Whether the session is archived. Returned by
-        ``list`` only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        ``list`` with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
     """
 
     id: str
@@ -282,6 +289,7 @@ class SessionListItem:
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
+    host_id: str | None = None
     reasoning_effort: str | None = None
     owner: str | None = None
     external_session_id: str | None = None
@@ -307,6 +315,7 @@ class SessionListItem:
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
+            host_id=raw.get("host_id"),
             reasoning_effort=raw.get("reasoning_effort"),
             owner=raw.get("owner"),
             external_session_id=raw.get("external_session_id"),
@@ -600,6 +609,7 @@ class SessionsNamespace:
         order: str = "desc",
         sort_by: str = "created_at",
         include_archived: bool = False,
+        visibility: Literal["all", "mine", "shared", "archived"] = "all",
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -619,13 +629,28 @@ class SessionsNamespace:
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
-        :param include_archived: When ``False`` (default), archived
-            sessions are omitted. When ``True``, archived sessions are
-            returned alongside active ones.
+        :param include_archived: With ``visibility="all"``, include
+            archived sessions alongside active ones when ``True``.
+            Defaults to ``False``. Other visibility modes determine
+            archive filtering themselves.
+        :param visibility: ``"all"`` (default) returns all accessible
+            sessions. ``"mine"`` returns owned active sessions, and
+            ``"shared"`` returns accessible active sessions not owned
+            by the caller. ``"archived"`` returns only archived sessions.
+            Without server authentication, ``"mine"`` and ``"shared"``
+            behave like ``"all"``. Always sent explicitly to the server.
         :returns: List of :class:`SessionListItem`.
+        :raises StaleCursorError: If ``after``/``before`` names a session
+            that has since been deleted. The walk cannot continue from
+            that cursor — restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status.
         """
-        params: dict[str, str | int] = {"limit": limit, "order": order, "sort_by": sort_by}
+        params: dict[str, str | int] = {
+            "limit": limit,
+            "order": order,
+            "sort_by": sort_by,
+            "visibility": visibility,
+        }
         if after is not None:
             params["after"] = after
         if before is not None:
@@ -786,9 +811,10 @@ class SessionsNamespace:
 
         Calls ``PATCH /v1/sessions/{session_id}`` with
         ``{"archived": ...}``. Archived sessions are hidden from the
-        default :meth:`list` listing and surfaced only with
-        ``include_archived=True``. Owner-only (the web UI stops the
-        session on archive, an owner-gated lifecycle action, so archive
+        default :meth:`list` listing and surfaced with
+        ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. Owner-only (the web
+        UI stops the session on archive, an owner-gated lifecycle action, so archive
         is held to the same gate); note this method only flips the
         archived flag — it does not stop the session.
 
@@ -865,6 +891,9 @@ class SessionsNamespace:
         :param order: Sort order, ``"asc"`` (chronological) or
             ``"desc"``.
         :returns: List of conversation item dicts.
+        :raises StaleCursorError: If ``after`` names an item that has since
+            been deleted. The walk cannot continue from that cursor —
+            restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """
@@ -1226,6 +1255,10 @@ async def _stream_session_events(
         to subscribe to, e.g. ``"conv_abc123"``.
     :yields: :class:`ServerStreamEvent` envelopes parsed from the SSE
         ``data:`` payload.
+    :raises OmnigentError: If the stream open fails with a non-2xx
+        status, including a redirect that was not followed.
+    :raises httpx.TooManyRedirects: If on-origin redirects loop past
+        httpx's limit.
     """
     async with http.stream(
         "GET",
@@ -1235,6 +1268,17 @@ async def _stream_session_events(
         if resp.status_code >= 400:
             await resp.aread()
             raise_for_status(resp.status_code, response_body(resp))
+        elif 300 <= resp.status_code < 400:
+            # OmnigentClient follows redirects, so a 3xx here was not
+            # followable (no Location header, a 304, or a caller-supplied
+            # client with redirects disabled). Parsing its non-SSE body
+            # would yield a silent, error-free, empty stream — fail loud
+            # instead.
+            raise OmnigentError(
+                f"stream open returned a 3xx response (status {resp.status_code}) "
+                "instead of an event stream",
+                resp.status_code,
+            )
 
         async for event in _parse_sse_lines(resp.aiter_lines()):
             yield event

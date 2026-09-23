@@ -1,9 +1,13 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
 // the archive PATCH (`archived: true`) — no client stop. The row leaves the
 // sidebar optimistically (useArchiveConversation flips the cached `archived`
 // flag in onMutate; the list filters archived rows out client-side), so there
 // is no "Archiving…" status row — the row simply unmounts, like delete's. The
-// only mutate-level callback is the success toast pointing at Settings.
+// only synchronous side effect is the Undo pill (which also links to Settings).
 // The runner stop is the server's job once the flag commits — a client stop
 // would race the server's against the same runner, and put the runner's stop
 // timeouts in front of the flag flip. The kebab's user-facing "Stop session"
@@ -16,9 +20,8 @@
 // file exercises the archive path from a row's kebab.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Controllable archive + stop mutations, declared via vi.hoisted so the
@@ -112,12 +115,14 @@ function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-          <Toaster />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open={true} onClose={vi.fn()} />
+            <Toaster />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -167,22 +172,44 @@ describe("archive flow", () => {
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
   });
 
-  it("toasts a pointer to Settings on archive", async () => {
+  it("shows an Undo toast (with a View archived action) on archive", async () => {
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
     // The toast fires synchronously on click (the row is about to unmount, so
     // it can't wait for a mutate callback) — no need to drive onSuccess.
-    const toast = await screen.findByTestId("toast");
-    expect(within(toast).getByText(/View archived sessions in/)).toBeInTheDocument();
-    expect(within(toast).getByRole("link", { name: "Settings" })).toHaveAttribute(
-      "href",
-      "/settings/archived",
-    );
+    // Singular copy for one session — never "session(s)".
+    expect(await screen.findByText("Archived 1 session")).toBeInTheDocument();
+    expect(screen.queryByText(/session\(s\)/)).not.toBeInTheDocument();
+    // Undo and the View archived pointer are the toast's two actions.
+    expect(screen.getByRole("button", { name: "Undo" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View archived" })).toBeInTheDocument();
   });
 
-  // Unarchive moved out of the sidebar: archived sessions no longer render
-  // here (they're on the Settings page), so the "Unarchive" affordance is
-  // covered by SettingsPage.test.tsx instead.
+  it("archives from the row's quick-archive hover button", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByTestId("quick-archive-conversation"));
+
+    // Same single-PATCH contract as the kebab item, just a different affordance.
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.stop.mutate).not.toHaveBeenCalled();
+  });
+
+  it("unarchives from the quick button on an archived row", () => {
+    // Archived rows render under the "Archived sessions" filter; the quick
+    // button flips to its unarchive affordance there.
+    mockConversations([{ ...CONV, archived: true }]);
+    renderSidebar();
+    // Radix menu opens on pointerdown; pick the Archived filter.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0 });
+    fireEvent.click(screen.getByTestId("session-filter-archived"));
+
+    fireEvent.click(screen.getByTestId("quick-archive-conversation"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: false });
+  });
 });

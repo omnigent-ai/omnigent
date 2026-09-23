@@ -39,10 +39,12 @@ import {
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
+  modelPickerKindForConv,
   unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 
 // The Composer's read-only and disabled states are derived from
 // permissionLevel. These tests pin the derivation logic so a
@@ -106,6 +108,38 @@ describe("Composer structural read-only reasons", () => {
         labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
       }),
     ).toBe("Claude Code sub-agents are read-only");
+  });
+
+  it("gives a sealed codex /side child its own reason, not the generic one", () => {
+    // Server seals a dead side chat with omnigent.closed; the "Side chat"
+    // nickname distinguishes it from an ordinary closed codex sub-agent.
+    expect(
+      readOnlyReasonForSessionLabels(
+        {
+          labels: {
+            "omnigent.closed": "true",
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+          },
+        },
+        null,
+      ),
+    ).toBe("This side chat has ended and can't receive new messages");
+  });
+
+  it("keeps the generic closed reason for a non-side-chat codex sub-agent", () => {
+    expect(
+      readOnlyReasonForSessionLabels(
+        {
+          labels: {
+            "omnigent.closed": "true",
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "reviewer",
+          },
+        },
+        null,
+      ),
+    ).toBe("This sub-agent session is closed");
   });
 
   it("returns null for editable sessions without structural labels", () => {
@@ -925,11 +959,9 @@ describe("computeShowsWorking", () => {
     ).toBe(true);
   });
 
-  it("a spin-up in flight yields the slot to the Starting-up cue", () => {
-    // ChatPage passes `localSendInFlight: status === "streaming" && !spinUpInFlight`.
-    // `RunnerStartingIndicator` renders only when the shimmer is absent, and its
-    // copy ("Starting up…" / "Cloning repository…") is strictly more informative
-    // than a generic shimmer — so during a boot the optimistic path stands down.
+  it("a managed-sandbox spin-up yields the slot to its stage cue", () => {
+    // ChatPage suppresses the optimistic Working indicator only while a
+    // managed sandbox is reporting a more specific launch stage.
     expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
   });
 
@@ -1028,7 +1060,15 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
     // Being blocked on the user is the one state that needs an action, and the
     // dialog may exist only in the terminal tab — so it must not be buried
     // under a rotating "Cooking…".
-    expect(workingIndicatorLabel(2, "dialog open")).toBe("Blocked on: dialog open");
+    const label = workingIndicatorLabel(2, "dialog open");
+    expect(WORKING_MESSAGES).not.toContain(label);
+  });
+
+  it("points the user at the terminal for a dialog open", () => {
+    // "dialog open" means the agent is waiting on a dialog that lives only in
+    // the terminal tab. A bare "Blocked on: dialog open" leaves the user with
+    // no idea where to respond, so the label must guide them to the terminal.
+    expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
   });
 
   it("falls back to the normal label when not parked", () => {
@@ -1121,6 +1161,23 @@ describe("subAgentComposerLabel", () => {
     expect(subAgentComposerLabel(mkSession({ title: "researcher:auth:v2" }))).toBe("auth:v2");
   });
 
+  it("shows the Codex nickname label instead of the thread-UUID title suffix", () => {
+    // A Codex /side child titles as "codex-native-ui-subagent:<uuid>"; the tray
+    // must show the friendly nickname, never the raw thread UUID.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "codex-native-ui-subagent:01a0a211-5fa2-7922-8b5b-503d8c3dc1a1",
+          subAgentName: "Codex",
+          labels: {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+          },
+        }),
+      ),
+    ).toBe("Side chat");
+  });
+
   it("strips the user-added 'ui:' sentinel before taking the suffix", () => {
     expect(subAgentComposerLabel(mkSession({ title: "ui:claude_code:my-task" }))).toBe("my-task");
   });
@@ -1140,6 +1197,37 @@ describe("subAgentComposerLabel", () => {
   it("falls back to a generic label when every name field is null", () => {
     // Degenerate snapshot — the tray still needs something to render.
     expect(subAgentComposerLabel(mkSession())).toBe("sub-agent");
+  });
+
+  it("prefers the Task description for a Claude Code sub-agent", () => {
+    // Its title's suffix is an opaque hex id, so the title-split rule
+    // would put "a09d1dd1d8dbc0151" in the tray.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "general-purpose:a09d1dd1d8dbc0151",
+          subAgentName: "general-purpose",
+          labels: {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.description": "wave-worker-696",
+          },
+        }),
+      ),
+    ).toBe("wave-worker-696");
+  });
+
+  it("uses the bare agent name for a description-less namespaced Claude sub-agent", () => {
+    // "rpw-published:debug-lead" carries its own colon, so splitting the
+    // title on the first one left the id half showing.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "rpw-published:debug-lead:a361e6a6aa05689cb",
+          subAgentName: "rpw-published:debug-lead",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ),
+    ).toBe("debug-lead");
   });
 });
 
@@ -1257,9 +1345,33 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    expect(Object.keys(map)).toEqual(Object.keys(BUILTIN_SLASH_COMMANDS));
+    // /btw (claude-native) and /side (codex-native) are gated off by default,
+    // so both are excluded here.
+    expect(Object.keys(map)).toEqual(
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+    );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /side only when showSide is true (codex-native)", () => {
+    // Off by default and when explicitly false — /side is a codex-native
+    // built-in, so it must not leak into other harnesses' menus.
+    expect(buildSlashCommandMap([], true, true)["/side"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false)["/side"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, true)["/side"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/side"],
+    );
+  });
+
+  it("includes /btw only when showBtw is true (claude-native)", () => {
+    // Off by default and when explicitly false.
+    expect(buildSlashCommandMap([], true, true)["/btw"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false)["/btw"]).toBeUndefined();
+    // On when the session is claude-native.
+    expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/btw"],
+    );
   });
 
   it("omits /effort when effort controls are hidden", () => {
@@ -1309,9 +1421,9 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills.
+    // surfaces built-ins above user skills. /btw and /side are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
       "/triage-issues",
       "/mlflow-bug",
     ]);
@@ -1433,6 +1545,24 @@ describe("dispatchInitialPrompt", () => {
     // an empty array here means first-message attachments silently vanish.
     expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file]);
   });
+
+  it("dispatches an image-only draft (blank text) through the plain path with its files", () => {
+    // The server-first create path queues { text: "", files: [image] }.
+    // Dispatch must hand the blank text plus the real File objects to
+    // send() — send() omits the input_text block for blank text, so the
+    // first message goes out as input_image blocks alone.
+    const send = vi.fn().mockResolvedValue(undefined);
+    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+    const file = new File(["x"], "screenshot.png", { type: "image/png" });
+    dispatchInitialPrompt(
+      { text: "", skill: null, files: [file] },
+      "ag_abc123",
+      send,
+      sendSlashCommand,
+    );
+    expect(send).toHaveBeenCalledWith("", "ag_abc123", [file]);
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
 });
 
 describe("shouldSendInitialPrompt", () => {
@@ -1442,6 +1572,7 @@ describe("shouldSendInitialPrompt", () => {
   // dropped in the effect, the matching case flips.
   const ready = {
     initialPrompt: "read the README",
+    initialPromptFileCount: 0,
     promptConversationId: "conv_abc",
     sentForConversationId: null,
     conversationId: "conv_abc",
@@ -1465,9 +1596,24 @@ describe("shouldSendInitialPrompt", () => {
     ["empty string", ""],
   ] as const)("does not send when there is no carried prompt (%s)", (_label, initialPrompt) => {
     // null = user left the field blank (common case); "" = a
-    // manipulated router state. Both are falsy and must never
-    // auto-send — a failure would post an empty/garbage message.
+    // manipulated router state. Both are falsy and — with no files —
+    // must never auto-send: a failure would post an empty/garbage
+    // message.
     expect(shouldSendInitialPrompt({ ...ready, initialPrompt })).toBe(false);
+  });
+
+  it.each([
+    ["null", null],
+    ["empty string", ""],
+  ] as const)("sends an image-only prompt (%s text, files attached)", (_label, initialPrompt) => {
+    // The landing composer's submit gate counts attachments as content,
+    // so the auto-send gate must too: an image-only first message queued
+    // by the server-first create path carries blank text plus files. A
+    // failure here means the session is created but the attached image
+    // is silently dropped — the exact bug the composer fix exposed.
+    expect(shouldSendInitialPrompt({ ...ready, initialPrompt, initialPromptFileCount: 1 })).toBe(
+      true,
+    );
   });
 
   it("does not send twice for the same conversation (once-guard)", () => {
@@ -1683,6 +1829,7 @@ describe("routing eligibility gates", () => {
       databricks_features: false,
       managed_sandboxes_enabled: false,
       sandbox_provider: null,
+      enabled_connections: [],
       sharing_mode: "on",
       public_sharing_enabled: true,
       server_version: null,
@@ -1750,6 +1897,48 @@ describe("routing eligibility gates", () => {
       false,
     );
     expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
+  });
+
+  it("evaluates an optimistic (temp) seeded session by the same rules, harness-only", () => {
+    // The in-session temp composer builds this shape from the create seed:
+    // a bound-agent name + the create harness, with NO wrapper labels. Native
+    // detection falls back to the harness, so it is eligible under the judge.
+    const seededNative = {
+      agentName: "coder",
+      parentSessionId: null,
+      harness: "claude-native",
+    } as unknown as Session;
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), seededNative)).toBe(
+      true,
+    );
+    // A seed with no bound agent is NOT eligible — the guard is never bypassed
+    // just because the conversation is a fresh temp id.
+    const seededNoAgent = { ...seededNative, agentName: null } as unknown as Session;
+    expect(isCostRoutingEligible(info(true), seededNoAgent)).toBe(false);
+  });
+
+  it("derives the temp-session native model-picker kind from the seeded native harness (#7039 P1)", () => {
+    // The temp capabilitySource has no server session and no sidebar wrapper
+    // identity, so it derives the wrapper label from the SEEDED native harness
+    // (the create identity). Without this the native model/effort/permission
+    // controls fail closed on the optimistic route. Mirrors the ChatPage
+    // derivation: nativeCodingAgentForHarness(seededHarness).wrapperLabel →
+    // modelPickerKindForConv.
+    for (const [harness, kind] of [
+      ["codex-native", "codex"],
+      ["claude-native", "claude"],
+    ] as const) {
+      const native = nativeCodingAgentForHarness(harness);
+      expect(native).toBeDefined();
+      const capabilitySource = {
+        labels: { [WRAPPER_LABEL_KEY]: native!.wrapperLabel },
+        harness,
+      };
+      expect(modelPickerKindForConv(capabilitySource)).toBe(kind);
+    }
+    // A bundle/SDK harness has no native picker — controls correctly stay hidden
+    // (the seed's pickedHarness fallback for a non-native agent).
+    expect(modelPickerKindForConv({ labels: {}, harness: "claude-sdk" })).toBeNull();
   });
 
   it("a non-native SDK session is subagent-routing eligible whatever its harness", () => {

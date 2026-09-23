@@ -6,12 +6,13 @@ extra logging handler that also forwards each record, as JSON, to a Databricks
 Delta table through the ZeroBus REST ingest endpoint, so a whole session's logs
 can be queried in one place (see the Omnigent Debuggability Plan, OMNI-4198).
 
-The sink is enabled only when the ``OMNIGENT_DEBUG_LOG_*`` environment variables
-are present -- the internal ``omni`` config CLI sets them for internal users, so
-the feature is off by default for OSS users and customers. Uploading is
-best-effort and fully non-blocking: records are queued and flushed by a daemon
-thread, and any failure (auth, network, overflow) drops rows rather than
-disrupting the process.
+By default, the sink is enabled only when the ``OMNIGENT_DEBUG_LOG_*``
+environment variables are present -- the internal ``omni`` config CLI sets them
+for internal users, so the feature is off by default for OSS users and
+customers. Integrations can instead provide their own batch-send function.
+Delivery is best-effort and fully non-blocking: records are queued and flushed
+by a daemon thread, and any failure drops rows rather than disrupting the
+process.
 """
 
 from __future__ import annotations
@@ -28,12 +29,18 @@ import time
 import traceback
 import urllib.parse
 import uuid
-from collections.abc import Iterator
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
+from omnigent.errors import ErrorPhase, OmnigentError, classify_exception
+from omnigent.process_logging import redact_log_text
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 from omnigent.version import VERSION
 
 # ── environment contract ────────────────────────────────────────────────────
@@ -56,6 +63,30 @@ PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 # because a ContextVar set at startup is invisible to run_in_executor threads).
 USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
 _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
+
+# Session attribution for HTTP handlers and scoped lifecycle work on every
+# process. Explicit record fields win; runner environment IDs are fallbacks.
+_session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id", default=None)
+
+_runner_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_runner_id", default=None)
+_request_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_request_id", default=None)
+
+
+# Ambient lifecycle phase for the code currently executing. Set with
+# ``phase_scope`` around each region (runner launch, harness setup/startup, turn)
+# so any error logged inside inherits where it failed. Propagates into awaited
+# coroutines and is copied into asyncio tasks at creation, so wrap the entry of a
+# background task, not the scheduler. Unset outside a scoped region.
+_phase_var: ContextVar[ErrorPhase | None] = ContextVar("omnigent_error_phase", default=None)
+
+# Request-scoped bag of extra audit attributes a handler can attach so they ride
+# the request's audit envelope end-event (e.g. POST /events' event type, a newly
+# created session id) rather than emitting a separate row. Reset per request by
+# the middleware; mutated in place so a handler running in a child context is
+# still visible to the middleware. Unset outside a request.
+_audit_attrs_var: ContextVar[dict[str, str] | None] = ContextVar(
+    "omnigent_audit_attrs", default=None
+)
 
 # Origin deployment identity for the workspace_id/app_name columns. The
 # multi-tenant managed service stamps a per-request ``record.workspace_id`` (via
@@ -233,6 +264,114 @@ def current_user_id() -> str | None:
     return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
 
 
+def set_current_request_id(request_id: str | None) -> None:
+    """Bind the server HTTP request id; host-frame request ids are separate."""
+    _request_id_var.set(request_id or None)
+
+
+def set_current_runner_id(runner_id: str | None) -> None:
+    """Bind a known runner without looking up a session on every log record."""
+    _runner_id_var.set(runner_id or None)
+
+
+@contextlib.contextmanager
+def runner_log_scope(session_id: str | None, runner_id: str | None) -> Iterator[None]:
+    """Attribute a launch, callback, or relay and restore the caller's context."""
+    session_token = _session_id_var.set(session_id or None)
+    runner_token = _runner_id_var.set(runner_id or None)
+    try:
+        yield
+    finally:
+        _runner_id_var.reset(runner_token)
+        _session_id_var.reset(session_token)
+
+
+def set_current_session_id(session_id: str | None) -> None:
+    """Bind a known session in the current request or lifecycle task."""
+    _session_id_var.set(session_id or None)
+
+
+@contextlib.contextmanager
+def current_session_id_scope(session_id: str | None) -> Iterator[None]:
+    """Bind ``session_id`` for the duration of the block, restoring the prior value on exit."""
+    token = _session_id_var.set(session_id or None)
+    try:
+        yield
+    finally:
+        _session_id_var.reset(token)
+
+
+def current_session_id() -> str | None:
+    """Return the session bound to the current request or lifecycle scope."""
+    return _session_id_var.get() or None
+
+
+@contextlib.contextmanager
+def phase_scope(phase: ErrorPhase) -> Iterator[None]:
+    """Mark *phase* as active for the block, restoring the prior value on exit.
+
+    Wrap each lifecycle region (runner launch, harness setup/startup, turn) so an
+    error logged inside is located even when it carries no error code. For a
+    background task, wrap the task body, not the scheduler (the context is copied
+    at task creation).
+    """
+    token = _phase_var.set(phase)
+    try:
+        yield
+    finally:
+        _phase_var.reset(token)
+
+
+def current_phase() -> ErrorPhase | None:
+    """The ambient lifecycle phase, or ``None`` outside any ``phase_scope``."""
+    return _phase_var.get()
+
+
+def reset_request_audit_attrs() -> None:
+    """Start a fresh per-request audit-attribute bag (server middleware).
+
+    Called at the top of the request so a handler can attach attributes that
+    ride the request's audit envelope ``ok``/``error`` row instead of emitting
+    a separate row (see :func:`add_audit_attrs`).
+    """
+    _audit_attrs_var.set({})
+
+
+def add_audit_attrs(**attrs: object) -> None:
+    """Merge attributes onto the current request's audit envelope end-event.
+
+    A no-op outside a request (bag unset -> e.g. on the runner). Mutates the
+    bag in place so the value is visible to the middleware even though it runs
+    the downstream app in a child context. Values are coerced to ``str`` and
+    ``None`` dropped, matching the ``MAP<STRING,STRING>`` attributes column.
+    """
+    bag = _audit_attrs_var.get()
+    if bag is None:
+        return
+    for key, value in attrs.items():
+        if value is not None:
+            bag[str(key)] = str(value)
+
+
+def current_request_audit_attrs() -> dict[str, str]:
+    """Return a copy of the current request's accumulated audit attributes."""
+    return dict(_audit_attrs_var.get() or {})
+
+
+def mark_request_audit_suppressed() -> None:
+    """Suppress this request's audit envelope end-event (high-frequency echoes).
+
+    For endpoints hit per streamed chunk (``POST /events`` with a transient
+    ``external_*_delta`` / usage type) whose per-call row is pure noise — the
+    content is already on the SSE-event logger. Recorded in the shared attribute
+    bag (a reserved key the middleware reads), so it survives the middleware's
+    child-context boundary like any other bag entry.
+    """
+    bag = _audit_attrs_var.get()
+    if bag is not None:
+        bag["_suppress"] = "1"
+
+
 def _clean(value: object) -> str | None:
     """Coerce a missing/blank record attribute to ``None`` so a fallback engages.
 
@@ -301,15 +440,11 @@ def debug_event(
             "tool_call_dispatched", session_id=session_id,
             tool_call_id=tc.id, model=model))
 
-    ``turn_id`` is populated only from what the callsite passes. ``session_id``
-    is likewise callsite-driven, but the sink additionally falls back to the
-    runner's primary (parent) conversation id when a record carries none (see
-    :func:`record_to_row`); that fallback is runner-only, so on the server an
-    unthreaded ``session_id`` stays null. ``user_id`` has its own ambient
-    fallback (a request-scoped ContextVar on the server, the ``OMNIGENT_USER_ID``
-    env on the runner/host). Freeform ``_logger.debug("…")`` calls need no
-    ``extra``; they ship with null correlation columns and an empty attributes
-    map.
+    Explicit fields win over ambient lifecycle context. The sink enriches
+    ordinary logs too: session/request/runner scopes on the server and host,
+    primary-session and runner environment defaults on runner/harness rows.
+    ``turn_id`` remains callsite-driven. ``user_id`` uses its existing request
+    scope or process-owner environment fallback.
     """
     extra: dict[str, object] = {"event_name": event_name, "attributes": dict(attributes)}
     if session_id is not None:
@@ -327,12 +462,77 @@ def _stack_trace(record: logging.LogRecord) -> str | None:
     return record.exc_text or None
 
 
-def _attributes(record: logging.LogRecord) -> dict[str, str]:
+def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
-    if not isinstance(raw, dict):
-        return {}
-    # The target column is MAP<STRING,STRING>; coerce values and drop nulls.
-    return {str(k): str(v) for k, v in raw.items() if v is not None}
+    attrs: dict[str, str] = {}
+    if isinstance(raw, dict):
+        # The target column is MAP<STRING,STRING>; coerce values, redact them,
+        # and drop nulls. Event attributes share the same privacy boundary as
+        # messages.
+        attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+    for key, value in (
+        ("request_id", getattr(record, "request_id", None) or _request_id_var.get()),
+        (
+            "runner_id",
+            getattr(record, "runner_id", None)
+            or _runner_id_var.get()
+            or (os.environ.get(RUNNER_ID_ENV_VAR) if source in {"runner", "harness"} else None),
+        ),
+    ):
+        if value:
+            attrs.setdefault(key, redact_log_text(str(value)))
+    _stamp_error_dimensions(attrs, record)
+    return attrs
+
+
+def _stamp_error_dimensions(attrs: dict[str, str], record: logging.LogRecord) -> None:
+    """Auto-attribute a logged exception the callsite did not classify itself.
+
+    Any record carrying ``exc_info`` gains ``error_category`` / ``error_impact``
+    derived from the exception (see :func:`omnigent.errors.classify_exception`),
+    so every ``_logger.exception`` / ``exc_info=…`` site across the codebase is
+    covered without per-site edits. Exception and explicit cause types make
+    generic wrapper errors groupable without their messages. Explicit callsite
+    values always win.
+    """
+    exc = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+    if isinstance(exc, BaseException):
+        attrs.setdefault("exception_type", type(exc).__name__)
+        if exc.__cause__ is not None:
+            attrs.setdefault("exception_cause_type", type(exc.__cause__).__name__)
+    if isinstance(exc, BaseException) and not (
+        "error_category" in attrs and "error_impact" in attrs
+    ):
+        category, impact = classify_exception(exc)
+        attrs.setdefault("error_category", category.value)
+        attrs.setdefault("error_impact", impact.value)
+    # Locate only rows that are actually errors: an exception to place, or a row
+    # already declaring itself an error via category/impact. Otherwise a benign
+    # INFO/DEBUG line emitted inside a phase_scope (the whole turn loop is one)
+    # would inherit a spurious error_phase from the ambient scope.
+    is_error_row = exc is not None or "error_category" in attrs or "error_impact" in attrs
+    if is_error_row and "error_phase" not in attrs:
+        phase = _resolve_error_phase(exc)
+        if phase is not None:
+            attrs["error_phase"] = phase.value
+
+
+def _resolve_error_phase(exc: BaseException | None) -> ErrorPhase | None:
+    """Locate a logged error's lifecycle phase.
+
+    Precedence: a coded ``OmnigentError``'s own (concrete) phase, then the ambient
+    ``phase_scope`` for the region that was executing (covers uncoded exceptions
+    and non-exception error logs), then a coded error's UNKNOWN fallback. Returns
+    ``None`` when there is nothing to attribute (no code, no active scope), so the
+    column stays empty rather than guessing.
+    """
+    coded = exc.phase if isinstance(exc, OmnigentError) else None
+    if coded is not None and coded is not ErrorPhase.UNKNOWN:
+        return coded
+    ambient = current_phase()
+    if ambient is not None:
+        return ambient
+    return coded
 
 
 def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
@@ -342,14 +542,12 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
 
-    ``session_id`` is taken from what the callsite threaded via ``extra`` and,
-    failing that, falls back to the runner's primary (parent) conversation id
-    (:func:`runner_primary_session_id`). That fallback reads a runner-only env
-    that is absent on the multi-tenant server, so a server record with no
-    explicit id stays null rather than risk cross-request mis-attribution --
-    this is deliberate; do NOT add an ambient request-scoped fallback here. On a
-    runner, a co-located subagent turn whose log is not threaded can be
-    attributed to the parent conversation, an accepted trade-off.
+    Session attribution prefers an explicit record field, then the active
+    request/lifecycle scope, then the primary-session environment on runner
+    and harness rows only. Runner child-session requests bind their own ID;
+    process-wide runner logs can still fall back to the primary session.
+    Request and runner IDs follow the same explicit-before-ambient rule in
+    ``attributes``. Server and host rows never use runner environment defaults.
 
     ``workspace_id``/``app_name`` describe the record's origin deployment: the
     managed service stamps ``record.workspace_id`` per request (so it wins),
@@ -358,20 +556,25 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     null on the managed service.
     """
     workspace_id, app_name = _process_identity()
+    stack_trace = _stack_trace(record)
     return {
-        "session_id": getattr(record, "session_id", None) or runner_primary_session_id(),
+        "session_id": (
+            getattr(record, "session_id", None)
+            or current_session_id()
+            or (runner_primary_session_id() if source in {"runner", "harness"} else None)
+        ),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
         "event_name": getattr(record, "event_name", None),
         "level": record.levelname,
-        "message": record.getMessage(),
+        "message": redact_log_text(record.getMessage()),
         "client_time": int(record.created * 1_000_000),
         "hostname": _HOSTNAME,
         "logger_name": record.name,
         "func_name": record.funcName,
         "app_version": VERSION,
-        "stack_trace": _stack_trace(record),
-        "attributes": _attributes(record),
+        "stack_trace": redact_log_text(stack_trace) if stack_trace is not None else None,
+        "attributes": _attributes(record, source),
         "log_id": uuid.uuid4().hex,
         "user_id": getattr(record, "user_id", None) or current_user_id(),
         "workspace_id": _clean(getattr(record, "workspace_id", None)) or workspace_id,
@@ -481,30 +684,36 @@ class _TokenSource:
         return token, time.time() + expires_in
 
 
-class ZerobusLogHandler(logging.Handler):
-    """Non-blocking logging handler that batches records to a ZeroBus table."""
+DebugLogRow = dict[str, object]
+DebugLogSend = Callable[[list[DebugLogRow]], None]
 
-    def __init__(self, config: DebugLogConfig, source: str) -> None:
+
+class DebugLogHandler(logging.Handler):
+    """Non-blocking handler that queues rows and sends them in batches.
+
+    ``send`` runs on the handler's daemon thread and receives a prepared batch
+    of debug-log row objects. It owns only delivery; this handler retains record
+    serialization, queue overflow, batching, flush timing, and shutdown drains.
+    """
+
+    def __init__(self, source: str, send: DebugLogSend) -> None:
         super().__init__()
-        self._config = config
         self._source = source
+        self._send = send
         self._closed = False
-        self._delivered_any = False
         self._start_worker()
         atexit.register(self.close)
 
     def _start_worker(self) -> None:
-        """Create the queue/client and launch the uploader thread.
+        """Create the queue and launch the sender thread.
 
         Re-invoked by :meth:`emit` when the thread has stopped — after a
         ``logging.config.dictConfig()`` (uvicorn) or an ``os.fork()`` (the
         runner ``_zygote``), which leave the handler attached but kill the
-        thread. Fresh queue/client/thread let delivery resume; the inherited
-        ones (whose locks are in an indeterminate post-fork state) are dropped.
+        thread. A fresh queue/thread lets delivery resume; the inherited ones
+        (whose locks are in an indeterminate post-fork state) are dropped.
         """
-        self._queue: queue.Queue[dict[str, object]] = queue.Queue(maxsize=_QUEUE_MAX_RECORDS)
-        self._client = httpx.Client(timeout=_HTTP_TIMEOUT_S)
-        self._tokens = _TokenSource(self._config, self._client)
+        self._queue: queue.Queue[DebugLogRow] = queue.Queue(maxsize=_QUEUE_MAX_RECORDS)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="omnigent-debug-log", daemon=True)
         self._thread.start()
@@ -525,10 +734,9 @@ class ZerobusLogHandler(logging.Handler):
         # logging.shutdown() on every handler — which close()s this one and stops
         # its uploader thread while leaving it attached to root; os.fork() (the
         # runner _zygote) likewise kills the thread. Receiving a record means the
-        # handler is still live, so revive the worker (fresh queue/client/thread)
-        # and delivery resumes on the next line. A real shutdown emits nothing
-        # afterward, so this never fights atexit. emit() is serialized by the
-        # Handler lock, so the restart happens once.
+        # handler is still live, so revive it with fresh worker state. A real
+        # shutdown emits nothing afterward, so this never fights atexit. emit()
+        # is serialized by the Handler lock, so the restart happens once.
         if self._closed or not self._thread.is_alive():
             try:
                 self._closed = False
@@ -553,37 +761,28 @@ class ZerobusLogHandler(logging.Handler):
                 pass
 
     def _run(self) -> None:
-        # This worker owns the client captured at start and closes it on exit,
-        # so close() never shuts the client down from another thread while a
-        # post/token-mint is in flight (which raises inside httpx and would
-        # otherwise kill this thread with an uncaught exception).
-        client = self._client
         try:
             while not self._stop.is_set():
                 try:
                     batch = self._collect_batch(self._FLUSH_WAIT)
                     if batch:
-                        self._post(batch)
+                        self._send(batch)
                 except Exception:  # noqa: BLE001 — the uploader thread must never die
-                    # A transient error (or a closed client during a shutdown
-                    # race) must not kill the worker: emit()'s self-heal only
-                    # revives a *stopped* thread, so a crash would silently end
-                    # delivery for the process. Drop and keep going.
+                    # A sender failure must not kill the worker: emit()'s
+                    # self-heal only revives a *stopped* thread, so a crash would
+                    # silently end delivery for the process. Drop and continue.
                     time.sleep(0.1)
             # Best-effort drain of whatever is left on shutdown.
             remaining = self._collect_batch(0.0)
             if remaining:
-                self._post(remaining)
+                self._send(remaining)
         except Exception:  # noqa: BLE001 — shutdown drain is best-effort
             pass
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
 
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
 
-    def _collect_batch(self, wait: float) -> list[dict[str, object]]:
-        batch: list[dict[str, object]] = []
+    def _collect_batch(self, wait: float) -> list[DebugLogRow]:
+        batch: list[DebugLogRow] = []
         try:
             batch.append(self._queue.get(timeout=wait) if wait else self._queue.get_nowait())
         except queue.Empty:
@@ -595,7 +794,44 @@ class ZerobusLogHandler(logging.Handler):
                 break
         return batch
 
-    def _post(self, batch: list[dict[str, object]]) -> None:
+    def close(self) -> None:
+        if self._closed:
+            return
+        # Capture the worker being stopped: a concurrent emit() can revive the
+        # handler during the join and replace self._stop/self._thread.
+        stop, thread = self._stop, self._thread
+        self._closed = True
+        stop.set()
+        thread.join(timeout=5.0)
+        super().close()
+
+
+class ZerobusLogHandler(DebugLogHandler):
+    """Default batched debug-log handler that delivers through ZeroBus."""
+
+    def __init__(self, config: DebugLogConfig, source: str) -> None:
+        self._config = config
+        self._delivered_any = False
+        super().__init__(source, self._post)
+
+    def _start_worker(self) -> None:
+        # Recreate the transport on every worker start. After a fork, inherited
+        # httpx/token locks may be indeterminate and must not be reused.
+        self._client = httpx.Client(timeout=_HTTP_TIMEOUT_S)
+        self._tokens = _TokenSource(self._config, self._client)
+        super()._start_worker()
+
+    def _run(self) -> None:
+        # The worker owns the client captured at start, so close() never shuts
+        # it down while a post or token mint is in flight.
+        client = self._client
+        try:
+            super()._run()
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    def _post(self, batch: list[DebugLogRow]) -> None:
         payload = json.dumps(batch)
         for attempt in range(3):
             token = self._tokens.token()
@@ -647,15 +883,257 @@ class ZerobusLogHandler(logging.Handler):
             time.sleep(min(0.5 * 2**attempt, 3.0))
         _diag("post_dropped", "dropped %d row(s) after 3 failed insert attempts", len(batch))
 
+
+@dataclass(frozen=True, slots=True)
+class _SseFileItem:
+    """One queued SSE row: the safe fields pulled off the record in emit()."""
+
+    session_id: str
+    created: float
+    level: str
+    event: str | None
+    attrs: dict[str, object]
+
+
+class SseFileHandler(logging.Handler):
+    """Append SSE-event records to per-session JSONL files (opt-in; non-blocking).
+
+    :meth:`emit` never touches the filesystem: it pulls the safe fields off the
+    record and enqueues them, and a daemon writer thread batches, groups by
+    session, and appends to ``<log_dir>/<session_id>-sse.jsonl``. A single server
+    fans out hundreds of concurrent sessions and SSE events (text deltas,
+    terminal activity) are very frequent, so a synchronous write per event would
+    block the workflow thread — this keeps all file I/O off the publish path.
+
+    The writer groups a drained batch by session, so each pass issues one
+    ``os.write`` per session touched (``O_APPEND`` keeps whole-line writes atomic
+    even if a file is shared across a forked child). Open descriptors are bounded
+    by an LRU cache so a many-session server never exhausts fds — an evicted
+    session reopens (and keeps appending) on its next event. The queue is bounded
+    and sheds the oldest record under sustained overload, so publish is never
+    backpressured — best-effort debug data. Content is never written: only the
+    event name and whitelisted ids/dimensions, the same safe subset the ZeroBus
+    table gets.
+
+    Retention is the operator's responsibility: files are appended without
+    rotation and old per-session files are never reaped, so ``<log_dir>`` grows
+    without bound until cleaned up externally. This is a debugging aid, not a
+    managed log stream.
+    """
+
+    # Concurrently open per-session fds; the least-recently-used is closed when
+    # exceeded (reopening in O_APPEND resumes the same file).
+    _MAX_OPEN_FILES = 128
+    # Queue bound before shedding the oldest record, records drained per write
+    # pass, and the writer's idle wakeup interval.
+    _QUEUE_MAX_RECORDS = 20_000
+    _BATCH_MAX_RECORDS = 1_000
+    _FLUSH_INTERVAL_S = 1.0
+
+    def __init__(self, log_dir: Path, source: str) -> None:
+        super().__init__()
+        self._log_dir = log_dir
+        self._source = source
+        self._closed = False
+        self._start_worker()
+        atexit.register(self.close)
+
+    def _start_worker(self) -> None:
+        """Create a fresh queue / fd-cache / thread and launch the writer.
+
+        Re-invoked by :meth:`emit` when the thread has stopped — after a
+        ``logging.config.dictConfig()`` (uvicorn) or ``os.fork()`` (the runner
+        ``_zygote``), which leave the handler attached but kill the thread. The
+        fresh fd cache drops any inherited descriptors (whose files belong to the
+        parent) rather than writing to them.
+
+        The queue / fd-cache / stop-event are also passed to the worker as
+        arguments, so it operates solely on the state it was started with: a
+        concurrent revive that reassigns these attributes cannot make a still-
+        running old worker and the new one share one (non-thread-safe) fd cache.
+        """
+        self._queue: queue.Queue[_SseFileItem | threading.Event] = queue.Queue(
+            maxsize=self._QUEUE_MAX_RECORDS
+        )
+        # session_id -> fd, LRU-ordered; owned by the writer thread (also bound
+        # here for introspection/tests).
+        self._fds: OrderedDict[str, int] = OrderedDict()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(self._queue, self._fds, self._stop),
+            name="omnigent-sse-file-log",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _safe_session_id(session_id: str) -> str:
+        """Sanitize a session id into a filesystem-safe basename."""
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id) or "unknown"
+
+    def _extract(self, record: logging.LogRecord) -> _SseFileItem | None:
+        """Pull the safe fields off a record on the caller thread (cheap)."""
+        session_id = getattr(record, "session_id", None)
+        if not session_id:
+            return None  # SSE records always carry one; nothing to key a file on.
+        attrs = getattr(record, "attributes", None)
+        return _SseFileItem(
+            session_id=str(session_id),
+            created=record.created,
+            level=record.levelname,
+            event=getattr(record, "event_name", None),
+            attrs=attrs if isinstance(attrs, dict) else {},
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Revive a worker stopped by dictConfig()/fork (see _start_worker).
+        if self._closed or not self._thread.is_alive():
+            try:
+                self._closed = False
+                self._start_worker()
+            except Exception:  # noqa: BLE001 — never break logging over the sink
+                return
+        try:
+            item = self._extract(record)
+        except Exception:  # noqa: BLE001 — a logging handler must never raise into the app
+            return
+        if item is None:
+            return
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            # Shed the oldest to keep the newest; best-effort, never block publish.
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(item)
+            except queue.Empty:
+                # The writer drained the queue between our full put and this get,
+                # so there is room now and this one record is dropped — acceptable
+                # for a best-effort sink shedding under overload.
+                pass
+
+    def _run(
+        self,
+        work: queue.Queue[_SseFileItem | threading.Event],
+        fds: OrderedDict[str, int],
+        stop: threading.Event,
+    ) -> None:
+        # Operate only on the state this worker was started with (see
+        # _start_worker): never read self._queue/_fds/_stop, so a concurrent
+        # revive cannot repoint us at another worker's cache mid-run.
+        try:
+            while not stop.is_set():
+                batch = self._collect_batch(work, self._FLUSH_INTERVAL_S)
+                if batch:
+                    self._write_batch(fds, batch)
+            # Best-effort drain of whatever is left on shutdown.
+            remaining = self._collect_batch(work, 0.0)
+            if remaining:
+                self._write_batch(fds, remaining)
+        finally:
+            for fd in fds.values():
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            fds.clear()
+
+    def _collect_batch(
+        self, work: queue.Queue[_SseFileItem | threading.Event], wait: float
+    ) -> list[_SseFileItem | threading.Event]:
+        batch: list[_SseFileItem | threading.Event] = []
+        try:
+            batch.append(work.get(timeout=wait) if wait else work.get_nowait())
+        except queue.Empty:
+            return batch
+        while len(batch) < self._BATCH_MAX_RECORDS:
+            try:
+                batch.append(work.get_nowait())
+            except queue.Empty:
+                break
+        return batch
+
+    def _fd_for(self, fds: OrderedDict[str, int], session_id: str) -> int | None:
+        """Return an open append fd for *session_id* (writer thread only).
+
+        Touches the LRU on reuse; on a miss, opens the session's file and evicts
+        the least-recently-used fd when over the cap.
+        """
+        fd = fds.get(session_id)
+        if fd is not None:
+            fds.move_to_end(session_id)
+            return fd
+        path = self._log_dir / f"{self._safe_session_id(session_id)}-sse.jsonl"
+        try:
+            self._log_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        except OSError as exc:
+            # Throttled: an unwritable log dir fails identically for every session
+            # on every batch, which would otherwise flood the process logs.
+            _diag("sse_file_open", "SSE file sink cannot open %s: %s", path, exc)
+            return None
+        fds[session_id] = fd
+        if len(fds) > self._MAX_OPEN_FILES:
+            _evicted_id, evicted_fd = fds.popitem(last=False)
+            with contextlib.suppress(OSError):
+                os.close(evicted_fd)
+        return fd
+
+    def _write_batch(
+        self, fds: OrderedDict[str, int], batch: list[_SseFileItem | threading.Event]
+    ) -> None:
+        """Group a drained batch by session and issue one write per session.
+
+        A ``threading.Event`` in the batch is a :meth:`flush` barrier: pending
+        buffers are written before it is set, so its waiter is guaranteed the
+        records queued before it are on disk.
+        """
+        buffers: dict[str, bytearray] = {}
+
+        def flush_buffers() -> None:
+            for session_id, buf in buffers.items():
+                fd = self._fd_for(fds, session_id)
+                if fd is None:
+                    continue
+                with contextlib.suppress(OSError):
+                    os.write(fd, bytes(buf))
+            buffers.clear()
+
+        for item in batch:
+            if isinstance(item, threading.Event):
+                flush_buffers()
+                item.set()
+                continue
+            buffers.setdefault(item.session_id, bytearray()).extend(self._format_line(item))
+        flush_buffers()
+
+    def _format_line(self, item: _SseFileItem) -> bytes:
+        row = {
+            "ts": datetime.fromtimestamp(item.created, tz=timezone.utc).isoformat(),
+            "source": self._source,
+            "level": item.level,
+            "conversation_id": item.session_id,
+            "event": item.event,
+            "attrs": item.attrs,
+        }
+        return (json.dumps(row, default=str) + "\n").encode("utf-8")
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Block until records queued so far are written (for shutdown / tests)."""
+        if self._closed or not self._thread.is_alive():
+            return
+        barrier = threading.Event()
+        try:
+            self._queue.put_nowait(barrier)
+        except queue.Full:
+            return  # best-effort; cannot guarantee a flush under overload
+        barrier.wait(timeout)
+
     def close(self) -> None:
         if self._closed:
             return
-        # Signal the worker and let it finish and close its own client. Capture
-        # the worker we are tearing down first: a concurrent emit() (under the
-        # handler lock) can revive the sink during the join below, reassigning
-        # self._stop/_thread to fresh ones. Do NOT close the client here — the
-        # worker's shutdown drain may still be minting a token / posting, and
-        # closing it underneath raises inside httpx and kills the thread.
+        # Capture the worker we are tearing down: a concurrent emit() can revive
+        # the handler during the join below, swapping in a fresh stop/thread. The
+        # captured worker closes its own fds in _run's finally.
         stop, thread = self._stop, self._thread
         self._closed = True
         stop.set()
@@ -665,14 +1143,34 @@ class ZerobusLogHandler(logging.Handler):
 
 # Process-wide sink; recreated only if a prior instance was closed (e.g. a
 # logging reconfigure closed the root handlers out from under us).
-_active_sink: ZerobusLogHandler | None = None
+_active_sink: DebugLogHandler | None = None
 _sink_lock = threading.Lock()
 
-# Dedicated logger for the server's outgoing SSE-event stream. It gets the sink
-# as its sole handler with ``propagate=False`` (wired in attach_debug_log_sink),
-# so its high-volume, table-only records — one per emitted event, names + safe
-# ids, never content — never reach the on-disk/stderr logs.
+# Dedicated logger for the server's outgoing SSE-event stream. It carries
+# ``propagate=False`` (wired in attach_debug_log_sink / attach_sse_file_sink) so
+# its high-volume records — one per emitted event, names + safe ids, never
+# content — reach only the opt-in sinks below and never the on-disk/stderr logs.
+# Two independent sinks may attach: the ZeroBus table (attach_debug_log_sink)
+# and a local JSONL file (attach_sse_file_sink); either, both, or neither.
 SSE_LOGGER_NAME = "omnigent.sse_events"
+
+# Dedicated logger for server request audit events (the per-method
+# start/ok/error envelope, WS lifecycle, and in-handler checkpoints). Like the
+# SSE logger it gets the sink as its sole handler with ``propagate=False``, so
+# audit rows populate the table without flooding the on-disk/stderr logs, and
+# they disappear entirely when the sink is off (no env vars -> no handler).
+AUDIT_LOGGER_NAME = "omnigent.audit_events"
+
+# Opt-in local file sink for the SSE-event stream, independent of the ZeroBus
+# table. Set OMNIGENT_SSE_LOG_TO_FILE truthy (1/true/yes/on) to also append each
+# emitted event (safe subset — the same ids/dimensions the table gets, never
+# content) as JSONL, split per session into
+# ``<data-dir>/logs/<source>/<session_id>-sse.jsonl`` (e.g.
+# ``~/.omnigent/logs/server/<session_id>-sse.jsonl``); useful for offline
+# debugging when the table is unavailable. Files are not rotated or reaped —
+# operators must clean up the directory themselves. See attach_sse_file_sink.
+SSE_LOG_TO_FILE_ENV_VAR = "OMNIGENT_SSE_LOG_TO_FILE"
+_sse_file_handler: SseFileHandler | None = None
 
 
 def debug_sink_enabled() -> bool:
@@ -698,40 +1196,128 @@ def sse_event_logger() -> logging.Logger:
     return logging.getLogger(SSE_LOGGER_NAME)
 
 
-def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: int) -> None:
+def audit_event_logger() -> logging.Logger:
+    """Return the table-only logger for server request audit events.
+
+    Records go only to the debug sink (attached with ``propagate=False`` in
+    :func:`attach_debug_log_sink`); when the sink is disabled the logger has no
+    handlers and records are dropped -- so gate on :func:`debug_sink_enabled`.
+    """
+    return logging.getLogger(AUDIT_LOGGER_NAME)
+
+
+def attach_debug_log_sink(
+    loggers: list[logging.Logger],
+    *,
+    source: str,
+    level: int,
+    send: DebugLogSend | None = None,
+) -> None:
     """Attach the shared debug-log sink to *loggers* when configured.
 
-    A no-op unless the ``OMNIGENT_DEBUG_LOG_*`` variables are set. Reuses one
-    handler per process; ``Logger.addHandler`` is idempotent for a given
-    instance, so repeated calls do not double-ship.
+    ``send`` is an optional integration hook receiving each prepared batch on a
+    daemon thread. When omitted, the sink uses ZeroBus and is a no-op unless the
+    ``OMNIGENT_DEBUG_LOG_*`` variables are set. Reuses one handler per process;
+    ``Logger.addHandler`` is idempotent for a given instance, so repeated calls
+    do not double-ship.
     """
     global _active_sink
-    config = config_from_env()
-    if config is None:
-        return
+    config: DebugLogConfig | None = None
+    if send is None:
+        config = config_from_env()
+        if config is None:
+            return
     with _sink_lock:
         if _active_sink is None or _active_sink.closed:
             try:
-                _active_sink = ZerobusLogHandler(config, source)
+                if send is not None:
+                    _active_sink = DebugLogHandler(source, send)
+                elif config is not None:
+                    _active_sink = ZerobusLogHandler(config, source)
+                else:
+                    return
             except Exception:  # noqa: BLE001 — the sink must never break logging setup
-                # Honor the module's best-effort contract: handler construction
-                # (httpx client, uploader thread, probe timer) failing must not
-                # take down configure_process_logging() and thus process startup.
+                # Handler construction must not take down process logging setup.
                 _logger.warning("debug-log sink disabled: handler init failed", exc_info=True)
                 return
-            _logger.info(
-                "debug-log sink enabled: source=%s table=%s endpoint=%s",
-                source,
-                config.table,
-                config.insert_url,
-            )
+            if config is None:
+                _logger.info("debug-log sink enabled: source=%s custom sender", source)
+            else:
+                _logger.info(
+                    "debug-log sink enabled: source=%s table=%s endpoint=%s",
+                    source,
+                    config.table,
+                    config.insert_url,
+                )
         _active_sink.setLevel(level)
         for target in loggers:
             target.addHandler(_active_sink)
-        # Table-only SSE-event logger: the sink is its sole handler and it does
-        # not propagate to root, so per-token delta events populate the table
-        # without flooding the on-disk/stderr logs.
+        # SSE-event logger: attach the table sink here and keep the logger from
+        # propagating to root, so per-token delta events populate the table
+        # without flooding the on-disk/stderr logs. The file sink (if enabled)
+        # attaches independently in attach_sse_file_sink.
         sse_logger = logging.getLogger(SSE_LOGGER_NAME)
         sse_logger.setLevel(level)
         sse_logger.propagate = False
         sse_logger.addHandler(_active_sink)
+        # Table-only server audit-event logger (same rationale as the SSE
+        # logger): sink-only, non-propagating, so request audit rows reach the
+        # table but never the on-disk/stderr logs.
+        audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
+        audit_logger.setLevel(level)
+        audit_logger.propagate = False
+        audit_logger.addHandler(_active_sink)
+
+
+def sse_file_sink_enabled() -> bool:
+    """Whether the opt-in SSE-event file sink is active in this process.
+
+    Lock-free by design (a single global-object read is atomic under the GIL);
+    a stale read only mis-times one record around enable, never corrupts state.
+    """
+    return _sse_file_handler is not None
+
+
+def sse_logging_enabled() -> bool:
+    """Whether any SSE-event sink (ZeroBus table or local file) is active.
+
+    The gate for :func:`omnigent.runtime.session_stream._log_sse_event`: it
+    builds a record only when at least one sink will consume it, so the feature
+    stays free for anyone who enabled neither.
+    """
+    return debug_sink_enabled() or sse_file_sink_enabled()
+
+
+def attach_sse_file_sink(*, source: str, level: int) -> None:
+    """Attach the opt-in SSE-event file sink when ``OMNIGENT_SSE_LOG_TO_FILE`` is truthy.
+
+    A no-op unless the boolean env var is set (1/true/yes/on). Writes one JSONL
+    file per session under ``<data-dir>/logs/<source>/`` (e.g.
+    ``~/.omnigent/logs/server/<session_id>-sse.jsonl``). Independent of the
+    ZeroBus table sink: it configures the SSE logger's level and
+    ``propagate=False`` itself, so enabling only the file sink still keeps the
+    high-volume SSE records off the on-disk/stderr process logs. Idempotent per
+    process.
+    """
+    global _sse_file_handler
+    # Local imports to avoid an import cycle: process_logging imports this module.
+    from omnigent.process_logging import env_truthy, process_log_dir
+
+    if not env_truthy(os.environ.get(SSE_LOG_TO_FILE_ENV_VAR)):
+        return
+    with _sink_lock:
+        if _sse_file_handler is not None:
+            return
+        log_dir = process_log_dir(source)
+        try:
+            handler = SseFileHandler(log_dir, source)
+        except Exception:  # noqa: BLE001 — the sink must never break logging setup
+            _logger.warning("SSE file sink disabled: handler init failed", exc_info=True)
+            return
+        handler.setLevel(level)
+        _sse_file_handler = handler
+        sse_logger = logging.getLogger(SSE_LOGGER_NAME)
+        sse_logger.setLevel(level)
+        sse_logger.propagate = False
+        sse_logger.addHandler(handler)
+        _logger.info("SSE file sink enabled: source=%s dir=%s", source, log_dir)

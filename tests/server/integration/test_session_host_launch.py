@@ -30,6 +30,8 @@ from fastapi import FastAPI
 
 from omnigent.entities import Conversation
 from omnigent.host.frames import (
+    HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -45,6 +47,7 @@ from omnigent.host.frames import (
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.host_registry import HostConnection
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -53,6 +56,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests.budgets import Deadline, budget
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -153,7 +157,7 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
     path = f"/v1/hosts/{_HOST_ID}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
@@ -218,9 +222,14 @@ async def _serve_one_launch(
         callers can assert on its fields (e.g. ``harness``).
     """
     # Bounded so a routing bug can't hang the test: stat + launch are
-    # 2 frames, the rest of the budget absorbs interleaved pings.
+    # 2 frames, the rest of the budget absorbs interleaved pings. One deadline
+    # for the whole exchange — a per-receive budget would multiply by 40.
+    deadline = Deadline(30.0)
     for _ in range(40):
-        output = await comm.receive_output(timeout=3.0)
+        # Allow server work between stat and launch under CI load: a
+        # receive_output timeout cancels the mock host tunnel and makes
+        # a slow session create fail with a spurious "host is offline" 409.
+        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -274,8 +283,9 @@ async def _serve_one_stop(comm: ApplicationCommunicator) -> str:
         runner (the regression this guards against).
     """
     # Bounded so a missing stop frame fails fast instead of hanging.
+    deadline = Deadline(20.0)
     for _ in range(40):
-        output = await comm.receive_output(timeout=3.0)
+        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -581,6 +591,63 @@ async def test_inline_launch_failure_still_returns_bound_session(
     assert conv.host_id == _HOST_ID
 
 
+@pytest.mark.parametrize("disconnect", [False, True], ids=["replaced", "disconnected"])
+async def test_inline_launch_connection_loss_still_returns_bound_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    disconnect: bool,
+) -> None:
+    """Replace the transport after workspace validation, before launch enqueueing."""
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    registry = app.state.host_registry
+    original_send = registry.send_text
+    old_connection = registry.get(_HOST_ID)
+    assert old_connection is not None
+    pending_launches: list[asyncio.Future[dict[str, str | None]]] = []
+
+    def send_with_connection_loss(conn: HostConnection, data: str) -> None:
+        frame = decode_host_frame(data)
+        if isinstance(frame, HostStatFrame):
+            conn.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+            return
+        if isinstance(frame, HostLaunchRunnerFrame):
+            pending_launches.append(conn.pending_launches[frame.request_id])
+            if disconnect:
+                registry.deregister(conn.host_id, workspace_id=conn.workspace_id, conn=conn)
+            else:
+                registry.register(
+                    conn.host_id,
+                    _NoopRunnerWS(),
+                    conn.hello,
+                    conn.owner,
+                    workspace_id=conn.workspace_id,
+                )
+        original_send(conn, data)
+
+    monkeypatch.setattr(registry, "send_text", send_with_connection_loss)
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["host_id"] == _HOST_ID
+    assert body["runner_id"].startswith("runner_token_")
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conversation is not None
+    assert conversation.runner_id == body["runner_id"]
+    assert old_connection.pending_launches == {}
+    assert len(pending_launches) == 1
+    assert pending_launches[0].done()
+    comm.stop()
+
+
 _HARNESS_REFUSAL = (
     "harness 'codex' is not configured on host 'laptop' — run `omnigent setup` on that machine"
 )
@@ -646,33 +713,95 @@ async def test_inline_create_harness_not_configured_stays_lenient(
     )
 
 
-async def test_message_relaunch_harness_not_configured_persists_error_turn(
+@pytest.mark.parametrize(
+    (
+        "launch_error_code",
+        "expected_error_code",
+        "launch_error",
+        "expected_fragments",
+        "wrapper_command",
+    ),
+    [
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            _HARNESS_REFUSAL,
+            ("omnigent setup", "harness 'codex' is not configured"),
+            None,
+        ),
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "",
+            ("isaac omni setup",),
+            "isaac omni",
+        ),
+        (
+            WORKSPACE_MISSING_ERROR_CODE,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "runner log tail: SECRET_TOKEN\nforged workspace failure",
+            ("workspace path does not exist", "/work/repo"),
+            None,
+        ),
+        (
+            None,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "workspace path does not exist: /work/repo",
+            ("workspace path does not exist", "/work/repo"),
+            None,
+        ),
+        (
+            "runner_crashed",
+            None,
+            "runner log tail: private output",
+            (),
+            None,
+        ),
+    ],
+)
+async def test_message_relaunch_deterministic_failure_persists_error_turn(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    launch_error_code: str | None,
+    expected_error_code: str | None,
+    launch_error: str,
+    expected_fragments: tuple[str, ...],
+    wrapper_command: str | None,
 ) -> None:
-    """A message whose host relaunch is refused persists user msg + error.
+    """A deterministic host relaunch refusal persists user msg + error.
 
     The first message is the real runner-start attempt. When the host
-    refuses the relaunch with ``harness_not_configured``, the server
-    consumes the user message AND records a sibling ``type="error"`` item
-    carrying the host's `omnigent setup` message (the web renders it as
-    an error banner) — instead of timing out into a generic
+    refuses the relaunch with a definite failure, the server
+    consumes the user message and records a sibling ``type="error"`` item
+    carrying the host's actionable message (the web renders it as an
+    error banner) instead of timing out into a generic
     ``RUNNER_UNAVAILABLE``. The binding is left intact so a later message
-    relaunches once the user has run setup.
+    can relaunch after the underlying host problem is fixed.
 
-    Mutation check: drop the ``harness_not_configured`` branch in
+    Mutation check: drop the deterministic-failure branch in
     post_event's relaunch and the message instead 503s with
     ``runner_unavailable`` and no error item is written — both assertions
     below fail.
     """
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events as routes_events_module
+
+    if wrapper_command is not None:
+        monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", wrapper_command)
 
     # Grace=0 so the message takes the relaunch branch immediately instead
     # of waiting for the (never-connecting) create-bound runner.
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # A mutation that drops the deterministic-failure branch must fail fast
+    # instead of waiting through the production runner-connect timeout.
+    monkeypatch.setattr(
+        routes_events_module,
+        "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
+        0.0,
+    )
 
     comm = await _connect_host(app)
     agent = await create_test_agent(
@@ -689,6 +818,7 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
     await create_responder
     assert create_resp.status_code == 201, create_resp.text
     session_id = create_resp.json()["id"]
+    initial_runner_id = create_resp.json()["runner_id"]
 
     # Runner offline (none ever connected) → the message relaunches; serve
     # that relaunch as a harness refusal.
@@ -697,8 +827,8 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
         _serve_one_launch(
             comm,
             launch_status="failed",
-            launch_error=_HARNESS_REFUSAL,
-            launch_error_code="harness_not_configured",
+            launch_error=launch_error,
+            launch_error_code=launch_error_code,
         )
     )
     try:
@@ -713,8 +843,22 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
         await relaunch_responder
         set_runner_client(None)
 
-    # The message is accepted (not a 503 RUNNER_UNAVAILABLE): the server
-    # consumed it and recorded the failure turn.
+    if expected_error_code is None:
+        # Unknown host categories may contain arbitrary runner output and
+        # must not be persisted into the transcript.
+        assert msg_resp.status_code == 503
+        items = await client.get(f"/v1/sessions/{session_id}/items")
+        assert items.status_code == 200, items.text
+        assert items.json()["data"] == []
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert conv is not None
+        assert conv.host_id == _HOST_ID
+        assert conv.runner_id is not None
+        assert conv.runner_id != initial_runner_id
+        return
+
+    # A safe categorical failure is accepted (not a 503): the server
+    # consumed the message and recorded the failure turn.
     assert msg_resp.status_code == 202, (
         f"expected 202, got {msg_resp.status_code}: {msg_resp.text}"
     )
@@ -730,20 +874,25 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
         for part in item.get("content", [])
     ]
     assert "hi" in user_texts, f"user message should be persisted, got {user_texts!r}"
-    # A type="error" item carries the host's refusal (rendered as a banner),
-    # including the remediation command.
+    # A type="error" item carries the safe host refusal (rendered as a banner).
     error_items = [item for item in data if item.get("type") == "error"]
     assert len(error_items) == 1, (
         f"expected exactly one error item for the refused relaunch, got {error_items!r}"
     )
-    assert error_items[0]["code"] == "harness_not_configured"
-    assert "omnigent setup" in error_items[0]["message"]
-    assert "harness 'codex' is not configured" in error_items[0]["message"]
+    assert error_items[0]["code"] == expected_error_code
+    for fragment in expected_fragments:
+        assert fragment in error_items[0]["message"]
+    if expected_error_code == WORKSPACE_MISSING_ERROR_CODE:
+        assert error_items[0]["message"] == "workspace path does not exist: /work/repo"
+        assert "SECRET_TOKEN" not in error_items[0]["message"]
+        assert "\n" not in error_items[0]["message"]
 
-    # Binding kept so a post-setup message can relaunch.
+    # Binding kept so a later message can relaunch after remediation.
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.host_id == _HOST_ID
+    assert conv.runner_id is not None
+    assert conv.runner_id != initial_runner_id
 
 
 @pytest.mark.parametrize(
@@ -968,7 +1117,7 @@ async def test_stopped_host_session_message_relaunches_runner(
         )
     )
     try:
-        launch_frame = await _wait_for_launch(comm, budget_s=5.0)
+        launch_frame = await _wait_for_launch(comm, budget_s=budget(5.0))
     finally:
         # No runner ever connects, so cancel before the ~30s wait loop —
         # the relaunch frame + runner_id rotation already happened.
@@ -1027,7 +1176,9 @@ async def test_host_reports_runner_unknown_skips_connect_grace(
     from omnigent.server.routes import sessions as sessions_module
 
     # Long grace: a blind wait would take this long; the verdict must beat it.
-    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 5.0)
+    # Scaled with the budget below so the 2:5 margin that detects a blind wait
+    # survives on a slow runner — scaling only the budget would erase it.
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", budget(5.0))
 
     comm = await _connect_host(app)
     session = await _inline_launch_session(client, comm)
@@ -1047,7 +1198,7 @@ async def test_host_reports_runner_unknown_skips_connect_grace(
     )
     try:
         launch_frame = await _answer_runner_status_then_wait_for_launch(
-            comm, status="unknown", budget_s=2.0
+            comm, status="unknown", budget_s=budget(2.0)
         )
     finally:
         # No runner ever connects, so the post would otherwise ride the
@@ -1121,7 +1272,7 @@ async def test_host_session_message_relaunches_offline_runner(
         # The launch frame is sent (and the runner_id rotated) before the
         # route's 30s wait-for-runner loop, so a small budget suffices;
         # None means no relaunch fired.
-        launch_frame = await _wait_for_launch(comm, budget_s=5.0)
+        launch_frame = await _wait_for_launch(comm, budget_s=budget(5.0))
     finally:
         # We never connect a runner, so the route would otherwise block
         # ~30s in its wait loop. Cancel now that we've observed (or missed)
@@ -1253,7 +1404,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     finally:
         await fake_runner.aclose()
 
-    saw_launch = await _expect_no_launch(comm, budget_s=0.2)
+    saw_launch = await _expect_no_launch(comm, budget_s=budget(0.2))
 
     assert resp.status_code < 300, resp.text
     assert not saw_launch, (
@@ -1712,8 +1863,9 @@ async def _serve_fs_requests(
     from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
     reader = WorkspaceReader(Path(workspace_root))
+    deadline = Deadline(30.0)
     for _ in range(max_frames):
-        output = await comm.receive_output(timeout=3.0)
+        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -1909,7 +2061,7 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     worktree was pruned), the host returns ``workspace_missing`` and the
     runner will never appear. The server must:
     - NOT wait out the full connect timeout (which would hang every message);
-    - Persist the user message together with a ``runner_failed_to_start``
+    - Persist the user message together with a ``workspace_missing``
       error item carrying the host's actionable "workspace does not exist"
       message instead of the generic fallback.
 
@@ -1975,7 +2127,7 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     assert len(error_items) == 1, (
         f"expected exactly one error item for the workspace-missing refusal, got {error_items!r}"
     )
-    assert error_items[0]["code"] == "workspace_missing"
+    assert error_items[0]["code"] == WORKSPACE_MISSING_ERROR_CODE
     assert "does not exist" in error_items[0]["message"], (
         f"error message should mention workspace does not exist, got {error_items[0]['message']!r}"
     )
@@ -2089,7 +2241,7 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
         "recovery": "runner_relaunched",
     }
     assert [response.json() for response in responses] == [expected, expected]
-    assert not await _expect_no_launch(comm, budget_s=0.2)
+    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.runner_id != original_runner_id
@@ -2247,10 +2399,11 @@ async def test_relaunch_stops_the_superseded_runner(
     try:
         # The stop is a detached task, so the stop and launch frames can
         # arrive in either order; collect until both are seen.
+        deadline = Deadline(20.0)
         for _ in range(40):
             if launch_frame is not None and stop_frame is not None:
                 break
-            output = await comm.receive_output(timeout=3.0)
+            output = await comm.receive_output(timeout=deadline.next_wait(3.0))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -2311,6 +2464,21 @@ async def test_concurrent_relaunches_are_single_flight(
 
     set_runner_client(None)
 
+    launch_runner = sessions_module._launch_runner_on_host
+    both_callers_ready = asyncio.Event()
+    observed_bindings: list[str | None] = []
+
+    async def _race_launch(*args: Any, **kwargs: Any) -> Any:
+        observed_bindings.append(args[0].runner_id)
+        if len(observed_bindings) == 2:
+            both_callers_ready.set()
+        await both_callers_ready.wait()
+        return await launch_runner(*args, **kwargs)
+
+    # Both requests must snapshot the offline binding before either rotates it.
+    # With startup grace disabled, a later snapshot would request another launch.
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
+
     def _post() -> Any:
         return client.post(
             f"/v1/sessions/{session_id}/events",
@@ -2326,12 +2494,15 @@ async def test_concurrent_relaunches_are_single_flight(
     tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
     launches: list[HostLaunchRunnerFrame] = []
     try:
+        await asyncio.wait_for(both_callers_ready.wait(), timeout=10.0)
+        assert observed_bindings == [session["runner_id"], session["runner_id"]]
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.
+        drain = Deadline(20.0)
         with contextlib.suppress(asyncio.TimeoutError):
             for _ in range(40):
-                output = await comm.receive_output(timeout=2.0)
+                output = await comm.receive_output(timeout=drain.next_wait(2.0))
                 if output["type"] != "websocket.send":
                     continue
                 frame = decode_host_frame(output["text"])
@@ -2416,9 +2587,10 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
     async def _serve_refusals() -> int:
         """Answer every launch with a refusal (and ack stops) for a while."""
         served = 0
+        drain = Deadline(20.0)
         with contextlib.suppress(asyncio.TimeoutError):
             for _ in range(40):
-                output = await comm.receive_output(timeout=2.0)
+                output = await comm.receive_output(timeout=drain.next_wait(2.0))
                 if output["type"] != "websocket.send":
                     continue
                 frame = decode_host_frame(output["text"])
@@ -2463,7 +2635,9 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
         )
 
     # Both must complete promptly (the rider must not dead-end in a 30s
-    # connect wait after losing the refusal).
+    # connect wait after losing the refusal). Deliberately unscaled: the bound
+    # only means something below _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S (30s),
+    # which this test does not patch, so scaling it would admit the regression.
     first, second = await asyncio.wait_for(asyncio.gather(_post(), _post()), timeout=15.0)
     responder.cancel()
     with contextlib.suppress(asyncio.CancelledError):

@@ -61,7 +61,8 @@ Default view inside the sandbox:
   ``~/.ssh/id_rsa``, ``~/.gnupg``, etc. all return EPERM.
 - Top-level dotfiles / dotdirs anywhere under cwd are denied unless
   their basename is in :data:`_DEFAULT_CWD_ALLOW_HIDDEN` or the
-  spec's ``cwd_allow_hidden``. ``.venv`` is allowed by default.
+  spec's ``cwd_allow_hidden``. ``.venv`` is allowed by default; the
+  explicit ``"*"`` entry allows every dotpath in trusted roots.
 - The default network policy depends on egress and ``allow_network``:
 
   - egress active → ``network*`` denied except loopback to the
@@ -1129,6 +1130,11 @@ def _build_profile(
             lines.append(
                 f"(deny network-outbound (remote unix-socket (path-literal {_quote(canonical)})))"
             )
+
+    for source_path in policy.credential_source_paths or []:
+        quoted = _quote(str(source_path.resolve()))
+        lines.append(f"(deny file-read* file-write* (literal {quoted}))")
+        lines.append(f"(deny network-outbound (remote unix-socket (path-literal {quoted})))")
 
     return "\n".join(lines) + "\n"
 
