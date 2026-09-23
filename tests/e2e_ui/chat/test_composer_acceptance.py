@@ -254,9 +254,9 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     ordered_icons = [
         (test_id, icon)
         for test_id in (
-            "composer-pr-link",
             "composer-workspace-dir",
             "composer-git-branch",
+            "composer-pr-link",
             "background-task-pill",
             "subagent-task-pill",
             "composer-context-ring",
