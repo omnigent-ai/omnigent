@@ -3169,6 +3169,12 @@ def _spawn_host_daemon_process(
 
     log_path, log_fh = open_process_log_file("host")
     env = {**env, PROCESS_LOG_FILE_ENV_VAR: str(log_path)}
+    if sys.platform == "win32":
+        env = {
+            **env,
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+        }
     try:
         with child_logging_popen_kwargs(env) as logging_kwargs:
             proc = subprocess.Popen(

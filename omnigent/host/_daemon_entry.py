@@ -50,6 +50,16 @@ def main() -> None:
 
     log_path = configure_process_logging("host", force=True)
 
+    import contextlib
+    import sys
+
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                with contextlib.suppress(ValueError, OSError):
+                    reconfigure(encoding="utf-8", errors="replace")
+
     if args.local == bool(args.server):
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
