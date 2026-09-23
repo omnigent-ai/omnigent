@@ -278,15 +278,12 @@ describe("AssistantBubble error retry", () => {
 });
 
 describe("UserBubble long-prompt collapse", () => {
-  // A unique tail that appears only after the 8 000-code-point boundary.
+  const COLLAPSE_THRESHOLD = 12000;
   const TAIL = "UNIQUE_TAIL";
 
-  // 8 000 ASCII characters followed by the tail
-  const LONG_TEXT = "a".repeat(8000) + TAIL;
-
-  // An emoji placed at exactly the 8 000th code-point position.
-  const EMOJI_AT_BOUNDARY = "a".repeat(7999) + "🔥" + "b".repeat(100);
-
+  // Overflowing ASCII characters followed by the tail
+  const LONG_TEXT = "a".repeat(COLLAPSE_THRESHOLD) + TAIL;
+  const EMOJI_AT_BOUNDARY = "a".repeat(COLLAPSE_THRESHOLD - 1) + "🔥" + "b".repeat(100);
   const SHORT_TEXT = "Hello, world!";
 
   function userBubble(text: string): Extract<Bubble, { kind: "user" }> {
@@ -344,12 +341,15 @@ describe("UserBubble long-prompt collapse", () => {
     expect(writtenTexts[0]).toContain(TAIL);
   });
 
-  it("does not corrupt an emoji at the 8000-code-point slice boundary", () => {
+  it("does not corrupt an emoji at slice boundary", () => {
     render(<BubbleView bubble={userBubble(EMOJI_AT_BOUNDARY)} isLastAssistant={false} />);
 
     const bubble = screen.getByTestId("message-bubble");
 
     expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
-    expect(bubble).toHaveTextContent("🔥");
+
+    expect(bubble).not.toHaveTextContent("🔥");
+    expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
+    expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
   });
 });
