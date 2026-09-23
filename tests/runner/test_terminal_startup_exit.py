@@ -45,7 +45,11 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
     instance = make_test_terminal_instance("native", "main", tmp_path)
     instance.launch = AsyncMock()  # type: ignore[method-assign]
     secret = "private-startup-token-" * 500
-    output = f"Authorization: Bearer {secret}\nerror: unexpected argument '--invalid' found"
+    output = (
+        f"Authorization: Bearer {secret}\nerror: unexpected argument '--invalid' found"
+        + "\n" * 80
+        + "Pane is dead (status 2, Wed Sep 23 00:00:00 2026)"
+    )
     probes = 0
 
     async def alive() -> bool:
@@ -61,7 +65,7 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
 
     async def close() -> None:
         assert instance.last_exit_status() == 2
-        assert instance.last_exit_text() == output
+        assert instance._last_exit_snapshot == output
 
     monkeypatch.setattr(instance, "is_alive", alive)
     close_mock = AsyncMock(side_effect=close)

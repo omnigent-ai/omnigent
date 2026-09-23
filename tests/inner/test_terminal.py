@@ -229,6 +229,63 @@ def test_missing_exit_history_does_not_use_partial_visible_record(tmp_path: Path
     assert instance.last_pane_text() == "unsafe visible credential continuation"
 
 
+@pytest.mark.parametrize(
+    "banner",
+    [
+        "Pane is dead (status 2, Wed Sep 23 12:00:00 2026)",
+        "Pane is dead (signal term, Wed Sep 23 12:00:00 2026)",
+        "Pane is dead (status",
+        "Pane is dead (signal",
+    ],
+)
+@pytest.mark.parametrize("padding", ["", "\n" * 80, " \t\n" * 80], ids=["none", "blank", "space"])
+def test_exit_text_removes_only_padding_before_dead_pane_banner(
+    tmp_path: Path, banner: str, padding: str
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    raw = (
+        "\x1b[31merror: synthetic startup failure\x1b[0m\n\n"
+        "usage: preserve this spacing\n" + padding + f"\x1b[7m{banner}\x1b[0m\n\n"
+    )
+    instance._remember_exit_snapshot("0 10000\n" + raw)
+    instance._remember_pane_snapshot(raw)
+    visible_before = instance.last_pane_text()
+
+    assert instance.last_exit_text() == (
+        "error: synthetic startup failure\n\nusage: preserve this spacing\n" + banner
+    )
+    assert instance._last_exit_snapshot == raw
+    assert instance._last_pane_snapshot == raw
+    assert instance.last_pane_text() == visible_before
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "startup error\n\n\napplication footer",
+        "startup error\n\n\nlog: Pane is dead (status 2)",
+        "startup error\n\n\nPane is dead (status 2)\n\napplication footer",
+        "startup error\n\n\nPane is",
+    ],
+)
+def test_exit_text_preserves_non_banner_padding(tmp_path: Path, text: str) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_snapshot("0 10000\n" + text)
+
+    assert instance.last_exit_text() == text
+    assert instance._last_exit_snapshot == text
+
+
 @pytest.mark.parametrize("capture", ["async", "sync"])
 async def test_failed_exit_history_capture_does_not_fall_back_to_partial_visible_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str
@@ -1785,6 +1842,52 @@ async def test_server_survives_inner_process_exit_real_tmux(
             "exit-empty/remain-on-exit were not applied: "
             f"{probe.stderr.decode().strip()!r}"
         )
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("height", [24, 40, 41, 45, 60])
+@pytest.mark.parametrize("width", [20, 80])
+async def test_exit_history_preserves_error_in_tall_pane_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, height: int, width: int
+) -> None:
+    """Screen padding must not push a short startup error outside the exported tail."""
+    error = "error: synthetic startup argument is invalid"
+    script = f"import sys\nprint({error!r}, flush=True)\nsys.exit(2)\n"
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-u", "-c", script],
+        keep_alive_after_exit=True,
+        tmux_start_on_attach=True,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        await instance._tmux("resize-window", "-t", "main", "-x", str(width), "-y", str(height))
+        # Release the existing launch gate only after the final geometry is applied.
+        await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        async with asyncio.timeout(5):
+            while await instance.is_alive():
+                await asyncio.sleep(0.01)
+
+        raw = instance._last_exit_snapshot
+        visible_before = instance.last_pane_text()
+        assert raw is not None and "\n\n\n\n" in raw
+        assert instance.last_exit_status() == 2
+        history = instance.last_exit_text()
+        assert history is not None and error in history
+        assert "Pane is dead (" in history
+        exported = trim_terminal_output(sanitize_diagnostic_text(history))
+        assert exported is not None and error in exported
+        assert "Pane is dead (" in exported
+        assert len(exported.splitlines()) <= 40
+        assert len(exported) <= 4000
+        assert instance._last_exit_snapshot == raw
+        assert instance.last_pane_text() == visible_before
     finally:
         await instance.close()
 

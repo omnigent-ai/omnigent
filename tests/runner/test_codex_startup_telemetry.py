@@ -257,6 +257,8 @@ def _exited_terminal(tmp_path: Path) -> TerminalInstance:
         + "\n"
         + "startup details\n" * 100
         + "\x1b[31merror: unexpected argument '--invalid' found\x1b[0m\n"
+        + "\n" * 80
+        + "Pane is dead (status 2, Wed Sep 23 00:00:00 2026)"
     )
     instance._remember_pane_snapshot("visible usage hint; initial error scrolled away")
     return instance

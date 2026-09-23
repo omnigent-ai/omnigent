@@ -180,10 +180,13 @@ The new startup diagnostics read this history only with the flag enabled. A
 possibly incomplete first joined record is discarded when history could have
 lost its prefix; unknown capture metadata suppresses the new tail. Export
 sanitizes the captured text before trimming to the last 40 lines and 4,000
-characters, plus an omission notice. Existing registered Codex
-`terminal_exit_observed` records retain their screen-only excerpt independently
-of this flag; the flag is not a master content switch for ordinary lifecycle
-logs. Other terminals still export no pane text in these event attributes.
+characters, plus an omission notice. Blank screen padding immediately before
+tmux's final `Pane is dead (` footer is removed from this new excerpt so it does
+not crowd out the error on tall terminals. The footer and raw snapshot are
+preserved. Existing registered Codex `terminal_exit_observed` records retain
+their screen-only excerpt independently of this flag; the flag is not a master
+content switch for ordinary lifecycle logs. Other terminals still export no
+pane text in these event attributes.
 
 ## Codex startup failure snapshot
 

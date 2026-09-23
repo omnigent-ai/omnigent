@@ -1121,7 +1121,16 @@ class TerminalInstance:
         """Return bounded recent exit history without changing the visible-screen cache."""
         if self._last_exit_snapshot is None:
             return None
-        return _strip_ansi(self._last_exit_snapshot).strip() or None
+        text = _strip_ansi(self._last_exit_snapshot).strip()
+        lines = text.splitlines()
+        if lines and lines[-1].startswith("Pane is dead ("):
+            # Tmux draws its footer below blank padding at the bottom of the pane.
+            footer = lines.pop()
+            while lines and not lines[-1].strip():
+                lines.pop()
+            lines.append(footer)
+            text = "\n".join(lines)
+        return text or None
 
     def _exit_capture_args(self) -> tuple[str, ...]:
         """Read stable exit-history bounds and capture joined recent records."""
