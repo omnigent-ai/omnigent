@@ -103,12 +103,13 @@ def _install_fake_cli(brew: Path, version: str) -> Path:
     cli = bin_dir / "databricks"
     pad = "# " + "x" * 1022 + "\n"
     script = (
-        "#!/usr/bin/env bash\n"
-        f'exp="$(date -d "+{_TOKEN_TTL_S} seconds" \'+%Y-%m-%dT%H:%M:%S\')"\n'
-        'printf \'{"access_token":"fake-cli-token-'
-        + version
-        + '","token_type":"Bearer","expiry":"%s"}\\n\' "$exp"\n'
-        "exit 0\n" + pad * 1100
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "from datetime import datetime, timedelta\n"
+        f"expiry = datetime.now() + timedelta(seconds={_TOKEN_TTL_S})\n"
+        "expiry_text = expiry.strftime('%Y-%m-%dT%H:%M:%S')\n"
+        f'print(json.dumps({{"access_token": "fake-cli-token-{version}", '
+        '"token_type": "Bearer", "expiry": expiry_text}))\n' + pad * 1100
     )
     cli.write_text(script)
     cli.chmod(0o755)
@@ -201,18 +202,6 @@ def _run_prompt_submit_hook(bridge_dir: Path, prompt: str) -> subprocess.Complet
     )
 
 
-def _decision(hook_stdout: bytes) -> dict[str, object]:
-    """Parse the hook's JSON stdout ("" = no opinion / allow)."""
-    text = hook_stdout.decode().strip()
-    if not text:
-        return {}
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return {"_raw": text}
-    return parsed if isinstance(parsed, dict) else {"_raw": text}
-
-
 def test_prompt_survives_databricks_cli_upgrade_mid_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -298,11 +287,11 @@ def test_prompt_survives_databricks_cli_upgrade_mid_session(
 
         # Verify the full policy path before changing the CLI.
         control = _run_prompt_submit_hook(bridge_dir, "hello before the upgrade")
-        control_decision = _decision(control.stdout)
-        assert control_decision.get("decision") != "block", (
+        assert control.returncode == 0 and not control.stdout.strip(), (
             "Control leg (before the CLI upgrade) unexpectedly blocked the prompt -- the "
             "server/relay/auth chain is unhealthy, so the post-upgrade leg would prove "
-            f"nothing. hook stdout={control.stdout.decode()!r} "
+            f"nothing. hook returncode={control.returncode} "
+            f"stdout={control.stdout.decode()!r} "
             f"stderr={control.stderr.decode()!r}"
         )
 
@@ -317,8 +306,6 @@ def test_prompt_survives_databricks_cli_upgrade_mid_session(
         time.sleep(_EXPIRY_WAIT_S)
 
         after = _run_prompt_submit_hook(bridge_dir, "hello after the upgrade")
-        after_decision = _decision(after.stdout)
-
         # Confirm a fresh factory resolves the upgraded executable.
         fresh_factory = _make_auth_token_factory(base_url)
         fresh_token = fresh_factory() if fresh_factory is not None else None
@@ -326,13 +313,13 @@ def test_prompt_survives_databricks_cli_upgrade_mid_session(
             f"a fresh runner should mint a token from the upgraded 1.16.1 CLI; got {fresh_token!r}"
         )
 
-        assert after_decision.get("decision") != "block", (
+        assert after.returncode == 0 and not after.stdout.strip(), (
             "Bug reproduced: after a `brew upgrade databricks` under a live runner, the "
             "Databricks SDK re-ran the versioned CLI realpath it baked at construction -- "
             "now deleted by the upgrade -- so every token refresh 404s and the "
             f"claude-native UserPromptSubmit hook latches fail-closed ({_TOKEN_REFRESH_FAILURE}). "
             "A fresh runner resolves the current binary fine, so only the baked path broke. "
-            f"hook decision={after_decision!r}\n"
+            f"hook returncode={after.returncode} stdout={after.stdout.decode()!r}\n"
             f"hook stderr={after.stderr.decode().strip()!r}"
         )
     finally:
