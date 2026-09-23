@@ -6,7 +6,6 @@
 import { type ComponentType, type ReactNode, useEffect, useState } from "react";
 import {
   ArrowLeft,
-  Building,
   ChevronDown,
   Cloudy,
   Copy,
@@ -16,10 +15,8 @@ import {
   Play,
   Plus,
   Server,
-  ShieldUser,
   SquareArrowOutUpRight,
   TabletSmartphone,
-  Timer,
   Trash2,
   Users,
 } from "lucide-react";
@@ -347,7 +344,7 @@ export function ServerSelectStep({
           )}
         </div>
 
-        {isExpanded && <ServerDetails url={url} local={isLocal(url)} onCopy={onCopy} />}
+        {isExpanded && <ServerDetails url={url} onCopy={onCopy} />}
       </div>
     );
   };
@@ -505,34 +502,10 @@ function DetailRow({
 
 /** Inline server-detail body (icon-labeled rows). Shared by the list accordion
  *  and the single-server detail step. Mock org/admin fields for remote servers. */
-export function ServerDetails({
-  url,
-  local,
-  onCopy,
-}: {
-  url: string;
-  local: boolean;
-  onCopy: (text: string) => void;
-}) {
+export function ServerDetails({ url, onCopy }: { url: string; onCopy: (text: string) => void }) {
   const name = displayName(url);
   return (
     <div className="mt-2.5 flex flex-col border-t border-border pt-2.5 text-base">
-      {!local && (
-        <>
-          <DetailRow icon={Building} label="Organization">
-            <span className="truncate text-right text-foreground">Databricks</span>
-          </DetailRow>
-          <DetailRow icon={ShieldUser} label="Admin">
-            <span className="truncate text-right text-foreground">Ajay Alfred</span>
-          </DetailRow>
-          <DetailRow icon={Timer} label="Last used">
-            <span className="text-foreground">2m</span>
-          </DetailRow>
-          <DetailRow icon={Users} label="Participants">
-            <span className="text-foreground">42</span>
-          </DetailRow>
-        </>
-      )}
       <DetailRow icon={Server} label="Server URL">
         <span className="flex min-w-0 items-center gap-1">
           <span className="truncate text-right text-foreground">{name}</span>

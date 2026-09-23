@@ -63,7 +63,7 @@ export function ServerDetailStep({
           </button>
         </div>
 
-        {expanded && <ServerDetails url={url} local={false} onCopy={onCopy} />}
+        {expanded && <ServerDetails url={url} onCopy={onCopy} />}
       </div>
 
       <div className="mt-4 flex flex-1 flex-col gap-2">
