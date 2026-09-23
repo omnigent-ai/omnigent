@@ -175,8 +175,22 @@ function callDndListener(
   name: string,
   event: SyntheticEvent,
 ) {
+  // Portaled dialogs and menus bubble React events through the row but must
+  // not start a drag (or its selection clearing).
+  const target = event.target;
+  if (target instanceof Node && !(event.currentTarget as Node).contains(target)) return;
   const listener = listeners?.[name] as ((event: SyntheticEvent) => void) | undefined;
   listener?.(event);
+}
+
+function guardDndListeners(listeners: DraggableSyntheticListeners) {
+  if (!listeners) return listeners;
+  return Object.fromEntries(
+    Object.keys(listeners).map((name) => [
+      name,
+      (event: SyntheticEvent) => callDndListener(listeners, name, event),
+    ]),
+  );
 }
 
 export function useRowGesture({
@@ -639,7 +653,7 @@ export function useRowGesture({
 
   const bindListeners = useCallback(
     (dragListeners: DraggableSyntheticListeners) => ({
-      ...dragListeners,
+      ...guardDndListeners(dragListeners),
       onPointerDown,
       onPointerMove: (event: ReactPointerEvent) => {
         onPointerMove(event);
