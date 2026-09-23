@@ -61,7 +61,7 @@ def test_sidebar_session_organization_round_trip(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Pin, rename, archive, undo, and unpin through the real server."""
+    """Pin, rename, archive, and undo through the real server."""
     base_url, session_a, session_b = seeded_session_pair
     initial_title = f"e2e-lifecycle-{uuid.uuid4().hex[:8]}"
     renamed_title = f"{initial_title}-renamed"
@@ -107,6 +107,8 @@ def test_sidebar_session_organization_round_trip(
     expect(toast).to_contain_text("Archived 2 sessions")
     _wait_for_archived(base_url, session_a, True)
     _wait_for_archived(base_url, session_b, True)
+    # A client stop would serialize runner timeouts ahead of archive or race
+    # the server teardown, which can orphan a host-spawned runner.
     assert stop_events == [], f"archive must not send stop_session, sent {stop_events}"
 
     toast.get_by_role("button", name="Undo").click()
@@ -117,4 +119,9 @@ def test_sidebar_session_organization_round_trip(
 
     restored = _section(page, "Sessions").locator(f'a[href="/c/{session_a}"]')
     expect(restored).to_contain_text(renamed_title)
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_have_count(0)
+
+    page.reload()
+    restored = _section(page, "Sessions").locator(f'a[href="/c/{session_a}"]')
+    expect(restored).to_contain_text(renamed_title, timeout=15_000)
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_have_count(0)
