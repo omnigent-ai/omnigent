@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from contextlib import suppress
 from pathlib import Path
 
 import httpx
@@ -251,9 +252,7 @@ def unpinned_codex_astra_session(
             else:
                 try:
                     if httpx.get(f"{base_url}/health", timeout=2).status_code == 200:
-                        status = httpx.get(
-                            f"{base_url}/v1/runners/{runner_id}/status", timeout=2
-                        )
+                        status = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
                         if status.status_code == 200 and status.json()["online"] is True:
                             break
                         last_error = f"runner status {status.status_code}: {status.text[:200]}"
@@ -265,10 +264,8 @@ def unpinned_codex_astra_session(
         yield base_url, session_id, tmp_dir
     finally:
         if session_id is not None:
-            try:
+            with suppress(httpx.HTTPError):
                 httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-            except httpx.HTTPError:
-                pass
         for child in (runner_proc, proc):
             if child is not None and child.poll() is None:
                 child.send_signal(signal.SIGTERM)
