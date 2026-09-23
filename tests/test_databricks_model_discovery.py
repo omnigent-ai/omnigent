@@ -363,6 +363,31 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
     )
 
 
+def test_discover_codex_models_ranks_uncurated_major_only_tier_by_generation() -> None:
+    """A major-only tiered id outside the curated table ranks with its generation.
+
+    Codex's id grammar makes the minor version optional (``gpt-6-terra``), so
+    such an id belongs in the versioned tier — newest generation first, an
+    untiered id ahead of a same-generation tier — not in the unranked name
+    tail below every older versioned GPT (and below kimi by name).
+    """
+    servable = _discover_codex(
+        [
+            {"name": "model-services/system.ai.gpt-5-4-mini"},
+            {"name": "model-services/system.ai.gpt-6-terra"},
+            {"name": "model-services/system.ai.gpt-6"},
+            {"name": "model-services/system.ai.kimi-k2"},
+        ]
+    )
+
+    assert servable == (
+        "system.ai.gpt-6",
+        "system.ai.gpt-6-terra",
+        "system.ai.gpt-5-4-mini",
+        "system.ai.kimi-k2",
+    )
+
+
 def test_discover_codex_models_empty_listing_is_authoritative() -> None:
     """A listing that serves no codex model returns an empty tuple, not an error."""
     assert _discover_codex([{"name": "model-services/system.ai.claude-opus-5"}]) == ()
