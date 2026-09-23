@@ -168,7 +168,7 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         discovery_gap="a gateway listing advertises these without pi's request-shape limits",
     ),
     "codex_catalog_clone_source": StaticModelFallback(
-        model_ids=("gpt-6-luna",),
+        model_ids=("gpt-6-luna", "gpt-5.6-luna"),
         owner="Codex extended catalog (omnigent.inner.codex_executor)",
         provenance="Codex 0.156.0 live catalog's current economical concrete slug",
         discovery_gap="codex's bundled catalog carries no entry for a gateway-only arm to clone",
@@ -204,6 +204,10 @@ SMART_ROUTING_PI_EXCLUDED = _SMART_ROUTING_FALLBACKS["pi_excluded"].model_ids
 CODEX_CATALOG_CLONE_SOURCE_SLUG = _SMART_ROUTING_FALLBACKS["codex_catalog_clone_source"].model_ids[
     0
 ]
+#: Older Codex CLIs may not contain the current clone source; try these catalog slugs in order.
+CODEX_CATALOG_CLONE_SOURCE_FALLBACK_SLUGS = _SMART_ROUTING_FALLBACKS[
+    "codex_catalog_clone_source"
+].model_ids[1:]
 
 #: Cheapest current arm per CLI family for background session titles. Title
 #: calls are tiny (<=64 output tokens, no tools, low effort), so they always
