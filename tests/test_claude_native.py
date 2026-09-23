@@ -4198,6 +4198,39 @@ async def test_attach_with_reconnect_recovery_failure_is_non_fatal(
 
 
 @pytest.mark.asyncio
+async def test_attach_with_reconnect_propagates_recovery_failure_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller can make a terminal recovery failure end reconnect."""
+    monkeypatch.setattr(claude_native, "_sleep", _noop_sleep)
+    recover_calls = 0
+
+    async def _permanent_recover_failure() -> None:
+        nonlocal recover_calls
+        recover_calls += 1
+        raise click.ClickException("Session access was revoked.")
+
+    attach = _ScriptedAttach(
+        script=[
+            _make_connection_closed(1011),
+            True,
+        ],
+    )
+
+    with pytest.raises(click.ClickException, match="Session access was revoked"):
+        await claude_native._attach_with_reconnect(
+            attach=attach,
+            attach_url="wss://example.com/attach",
+            headers={"Authorization": "Bearer tok"},
+            recover=_permanent_recover_failure,
+            propagate_recover_errors=True,
+        )
+
+    assert len(attach.calls) == 1
+    assert recover_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_attach_with_reconnect_recover_none_does_not_retry_on_clean_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

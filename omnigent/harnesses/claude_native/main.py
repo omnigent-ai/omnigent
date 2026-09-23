@@ -4036,6 +4036,7 @@ async def _attach_with_reconnect(
     bridge_dir: Path | None = None,
     active_session_id_reader: Callable[[], str | None] | None = None,
     close_attach_on_terminal_gone: bool = False,
+    propagate_recover_errors: bool = False,
 ) -> _AttachOutcome:
     """
     Attach to the terminal WebSocket, reconnecting on transient failures.
@@ -4058,8 +4059,8 @@ async def _attach_with_reconnect(
         do not rebind.
     :param recover: Optional async callback invoked between attempts
         (not before the first). ``None`` disables reconnect; the
-        loop returns after one ``attach`` call. Callback exceptions
-        are logged and the loop still retries.
+        loop returns after one ``attach`` call. By default, callback
+        exceptions are logged and the loop still retries.
     :param session_name: User-facing native session name used in reconnect
         messages, e.g. ``"Claude"`` or ``"Codex"``.
     :param base_url: Omnigent server URL for the post-close terminal probe;
@@ -4079,6 +4080,9 @@ async def _attach_with_reconnect(
         WebSocket as soon as the terminal resource reports stopped, so
         CLI exit does not wait for delayed server-side close
         propagation.
+    :param propagate_recover_errors: Re-raise recovery callback errors
+        instead of retrying the attach. Callers enabling this must handle
+        transient recovery failures inside the callback.
     :returns: :attr:`_AttachOutcome.DETACHED` when the user detached
         from tmux (the runner should be kept alive); otherwise
         :attr:`_AttachOutcome.EXITED`.
@@ -4097,7 +4101,9 @@ async def _attach_with_reconnect(
         if not first_attempt and recover is not None:
             try:
                 await recover()
-            except Exception:  # noqa: BLE001
+            except Exception:
+                if propagate_recover_errors:
+                    raise
                 _logger.warning(
                     "%s-native reconnect recovery callback raised; retrying attach anyway",
                     session_name.lower(),
