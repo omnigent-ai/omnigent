@@ -1,20 +1,11 @@
 """Browser e2e: sidebar touch input on touch-capable wide viewports.
 
-The two wide-viewport facets of the touch-input problem:
+The sidebar's resize divider must not be mouse-only: the right-edge handle's
+drag lifecycle (``useResizableSidebar``) used to listen to ``mousedown`` +
+window ``mousemove``/``mouseup`` only, so a finger or stylus drag produced
+pointer/touch events the handle never saw and the sidebar never resized.
 
-- **The sidebar's resize divider is effectively mouse-only.** The right-edge
-  handle's drag lifecycle (``useResizableSidebar``) listens to ``mousedown`` +
-  window ``mousemove``/``mouseup`` only, so a finger or stylus drag produces
-  pointer/touch events the handle never sees and the sidebar never resizes.
-- **Capability checks drift between the sidebar header and its rows.** On a
-  hover-incapable touch tablet (md-and-up width, ``hover: none``), the
-  header's controls are persistently visible because they gate their
-  hover-reveal on ``(hover:hover) and (pointer:fine)`` -- but the session
-  row's actions kebab uses a bare ``md:opacity-0 md:group-hover:opacity-100``,
-  and hover never happens on a touch-only surface, so the kebab stays
-  invisible and the row's actions are unreachable/undiscoverable.
-
-Both journeys drive trusted touch input through CDP
+The journey drives trusted touch input through CDP
 ``Input.dispatchTouchEvent`` so the browser produces the same
 pointer/touch event stream a real touchscreen does (and mouse-only
 handlers correctly receive nothing).
@@ -31,9 +22,6 @@ from playwright.sync_api import Browser, CDPSession, expect
 # (Playwright's has_touch flips `(pointer: coarse)` / `(hover: none)`).
 _TOUCH_DESKTOP = {"width": 1280, "height": 800}
 
-# Hover-incapable touch tablet: md+ width so the desktop sidebar (header
-# controls and row kebabs) renders, but no hover to reveal anything with.
-_TOUCH_TABLET = {"width": 1024, "height": 768}
 
 # The finger travels this far right across the divider; far past any
 # reasonable drag slop and big enough that a working resize is unmissable.
@@ -122,66 +110,6 @@ def test_sidebar_divider_touch_drag_resizes(
             f"the sidebar by only {growth:.0f}px (from {before['width']:.0f}px "
             f"to {after['width']:.0f}px); the divider is mouse-only, so touch "
             "users cannot resize the pane"
-        )
-    finally:
-        context.close()
-
-
-def test_touch_tablet_row_kebab_visible_like_header_actions(
-    browser: Browser,
-    seeded_session: tuple[str, str],
-) -> None:
-    """On a hover-incapable touch tablet the row kebab must be visible.
-
-    Journey: open the app on a touch tablet (1024px, ``hover: none``) -> the
-    sidebar header's controls are visible without hovering -> the session
-    row's actions kebab must be equally visible, since hover-reveal can never
-    fire on this surface.
-
-    Failure mode this catches: capability checks drift per
-    component -- the header controls gate their hover-reveal on
-    ``(hover:hover) and (pointer:fine)`` and so show up on touch, while the
-    row kebab uses a bare ``md:opacity-0 md:group-hover:opacity-100`` and
-    stays at opacity 0 forever, leaving row actions undiscoverable by touch.
-
-    :param browser: Playwright browser to open the touch-tablet context on.
-    :param seeded_session: ``(base_url, session_id)`` for a pre-created
-        runner-bound session.
-    """
-    base_url, session_id = seeded_session
-    context = browser.new_context(**_context_kwargs(_TOUCH_TABLET))
-    try:
-        page = context.new_page()
-        page.goto(f"{base_url}/c/{session_id}")
-
-        # Sanity: this context is the reported surface -- touch, no hover.
-        assert page.evaluate("matchMedia('(hover: none)').matches"), (
-            "expected a hover-incapable touch context"
-        )
-
-        row = page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
-        expect(row).to_be_visible(timeout=30_000)
-
-        # The header's controls are visible at rest on this surface (their
-        # hover-reveal only applies under `(hover:hover) and (pointer:fine)`).
-        header_filter = page.get_by_test_id("session-filter")
-        expect(header_filter).to_be_visible()
-        header_opacity = float(header_filter.evaluate("el => getComputedStyle(el).opacity"))
-        assert header_opacity >= 0.99, (
-            f"sidebar header actions unexpectedly hidden on touch tablet "
-            f"(opacity {header_opacity}); cannot judge row/header drift"
-        )
-
-        # The row's actions kebab must match: with no hover on this surface,
-        # opacity-0-until-hover means permanently invisible.
-        kebab = row.get_by_test_id("conversation-actions")
-        expect(kebab).to_have_count(1)
-        kebab_opacity = float(kebab.evaluate("el => getComputedStyle(el).opacity"))
-        assert kebab_opacity >= 0.99, (
-            f"on a hover-incapable touch tablet the sidebar header's actions "
-            f"are visible (opacity {header_opacity:g}) but the session row's "
-            f"actions kebab sits at opacity {kebab_opacity:g} -- hover-revealed "
-            "only, so touch users can never see or reach the row's actions"
         )
     finally:
         context.close()

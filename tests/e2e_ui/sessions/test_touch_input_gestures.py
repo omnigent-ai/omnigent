@@ -4,8 +4,9 @@ Five journeys, each driven with real (CDP-synthesized) touch input against the
 live SPA so Chromium's gesture recognizer arbitrates them as a finger would:
 a touch drag on a pane divider resizes it, a horizontal swipe on a session row
 tracks the finger, a leftward swipe opens the default delete confirmation,
-a long-press with realistic finger wobble opens the row menu, and a
-hover-incapable md+ tablet keeps the row's controls visible without hover.
+a long-press with realistic finger wobble opens the row menu, and an unfolded
+foldable (touch at md+ width) drops the row's hover controls in favor of the
+long-press menu.
 """
 
 from __future__ import annotations
@@ -14,13 +15,15 @@ import time
 from typing import Literal
 
 import pytest
-from playwright.sync_api import Browser, Page, expect
+from playwright.sync_api import Browser, CDPSession, Page, expect
 
 from tests.e2e_ui._touch import new_touch_context, touch, touch_drag
 from tests.e2e_ui.conftest import set_session_title
 
 _DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
 _PHONE_VIEWPORT = {"width": 390, "height": 844}
+# An unfolded foldable: wide enough for the md+ sidebar, but touch-only.
+_FOLDABLE_VIEWPORT = {"width": 884, "height": 1104}
 
 
 def _sidebar_width(page: Page) -> float:
@@ -281,6 +284,22 @@ def test_session_row_swipe_reversal_keeps_action_colors(
         context.close()
 
 
+def _long_press(cdp: CDPSession, x: float, y: float) -> None:
+    """Hold a finger on ``(x, y)`` long enough to open the row menu.
+
+    Holds past the row recognizer's 400ms hold (``ROW_GESTURE_HOLD_MS``) and
+    the browser's ~500ms long-press threshold, wobbling ±3px like a real
+    fingertip. 3px is well inside the recognizer's 20px hold tolerance, so a
+    correct gesture owner must still treat this as a long-press.
+    """
+    touch(cdp, "touchStart", x, y)
+    for i in range(6):
+        time.sleep(0.12)
+        touch(cdp, "touchMove", x + (3 if i % 2 == 0 else -3), y)
+    time.sleep(0.3)
+    touch(cdp, "touchEnd")
+
+
 def test_session_row_long_press_opens_actions_menu(
     browser: Browser,
     seeded_session: tuple[str, str],
@@ -299,17 +318,7 @@ def test_session_row_long_press_opens_actions_menu(
         x = box["x"] + box["width"] / 2
         y = box["y"] + box["height"] / 2
 
-        cdp = context.new_cdp_session(page)
-        # Hold past dnd-kit's 250ms drag delay and the browser's ~500ms
-        # long-press threshold, wobbling ±3px like a real fingertip. 3px is
-        # well inside the 8px tolerance dnd-kit itself declares for the hold,
-        # so a correct gesture owner must still treat this as a long-press.
-        touch(cdp, "touchStart", x, y)
-        for i in range(6):
-            time.sleep(0.12)
-            touch(cdp, "touchMove", x + (3 if i % 2 == 0 else -3), y)
-        time.sleep(0.3)
-        touch(cdp, "touchEnd")
+        _long_press(context.new_cdp_session(page), x, y)
 
         # The session actions menu (context menu body) must be on screen.
         expect(
@@ -321,36 +330,50 @@ def test_session_row_long_press_opens_actions_menu(
         context.close()
 
 
-def test_row_actions_reachable_on_touch_tablet(
+def test_row_actions_use_long_press_on_unfolded_foldable(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """On a hover-incapable md+ tablet the row's kebab is visible without hover."""
+    """An unfolded foldable hides the row's hover controls; long-press has them."""
     base_url, session_id = seeded_session
-    context = new_touch_context(browser, viewport={"width": 1024, "height": 768})
+    context = new_touch_context(browser, viewport=_FOLDABLE_VIEWPORT)
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}")
 
-        # This context reports itself as hover-incapable, exactly like a
-        # real touch tablet.
+        # This context reports itself as touch-only, exactly like a real
+        # unfolded foldable, while still getting the md+ desktop sidebar.
         assert page.evaluate("matchMedia('(hover: none)').matches")
 
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
+        row = row_link.locator("xpath=ancestor::li[1]")
 
-        # The fixed call site: header-level actions are visible without hover.
-        expect(page.get_by_test_id("new-project")).to_be_visible()
+        # Rows are driven by swipes and long-press here, so the pin, archive
+        # and kebab controls must not be painted at all.
+        for test_id in (
+            "quick-pin-conversation",
+            "quick-archive-conversation",
+            "conversation-actions",
+        ):
+            expect(
+                row.get_by_test_id(test_id),
+                f"{test_id} is shown on a touch-only md+ device; row controls "
+                "belong to fine-hover desktops",
+            ).to_be_hidden()
 
-        # The drifted call site: the row's own actions kebab must be equally
-        # reachable — visible (opacity 1) without a hover the device can
-        # never produce.
-        kebab = row_link.locator("xpath=ancestor::li[1]").get_by_test_id("conversation-actions")
-        expect(kebab).to_be_attached()
-        expect(
-            kebab,
-            "session-row actions kebab is hover-revealed on a device with no hover: "
-            "touch-capability handling drifted between the sidebar header and the row",
-        ).to_have_css("opacity", "1")
+        box = row_link.bounding_box()
+        assert box is not None
+        _long_press(
+            context.new_cdp_session(page),
+            box["x"] + box["width"] / 2,
+            box["y"] + box["height"] / 2,
+        )
+
+        # The long-press menu carries the actions the hidden controls held,
+        # including Pin (which fine-hover desktops get from the quick button).
+        expect(page.get_by_test_id("rename-conversation")).to_be_visible(timeout=2_000)
+        expect(page.get_by_test_id("pin-conversation")).to_be_visible()
+        expect(page.get_by_test_id("archive-conversation")).to_be_visible()
     finally:
         context.close()

@@ -693,23 +693,24 @@ describe("quick pin/unpin hover button", () => {
 
   it("splits the two pin affordances by viewport via Tailwind responsive classes", () => {
     // jsdom doesn't evaluate CSS media queries, so both affordances live in the
-    // DOM regardless of viewport — the mobile/desktop split is purely the
-    // responsive classes. Assert those classes directly: the kebab Pin item is
-    // hidden from `md` up (desktop), and the quick button is hidden below `md`
-    // (mobile) but shown from `md` up. Together they guarantee exactly one pin
-    // affordance is visible at any breakpoint.
+    // DOM regardless of viewport — the split is purely the responsive and
+    // input-capability classes. Assert those classes directly: the menu Pin
+    // item is hidden on fine-hover `md`+ (desktop), and the quick button is
+    // shown only there. Together they guarantee exactly one pin affordance on
+    // every device, including touch devices at desktop widths.
     renderSidebar();
 
-    // Desktop quick button: hidden on mobile, revealed from `md` up. The reveal
-    // uses `md:inline-flex` (not `md:block`) so the button stays a flex
-    // container — see the centering regression test below.
+    // Desktop quick button: revealed only on fine-hover `md`+. The reveal uses
+    // `inline-flex` (not `block`) so the button stays a flex container — see
+    // the centering regression test below.
     const quickButton = screen.getByTestId("quick-pin-conversation");
-    expect(quickButton).toHaveClass("hidden", "md:inline-flex");
+    expect(quickButton).toHaveClass("hidden", "fine-hover:md:inline-flex");
 
-    // Kebab Pin item: present in the menu but hidden from `md` up, so it only
-    // surfaces on mobile.
+    // Menu Pin item: present in the menu but hidden on fine-hover `md`+, so it
+    // surfaces on phones and touch devices at any width.
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
-    expect(screen.getByTestId("pin-conversation")).toHaveClass("md:hidden");
+    expect(screen.getByTestId("pin-conversation")).toHaveClass("fine-hover:md:hidden");
+    expect(screen.getByTestId("pin-conversation")).not.toHaveClass("md:hidden");
   });
 
   it("reveals the quick-pin button without breaking icon centering", () => {
@@ -726,21 +727,21 @@ describe("quick pin/unpin hover button", () => {
     expect(quickButton).toHaveClass("items-center", "justify-center");
     // ...and the desktop reveal makes the button a flex container (so those
     // classes actually take effect), rather than a block (which would not).
-    expect(quickButton).toHaveClass("md:inline-flex");
+    expect(quickButton).toHaveClass("fine-hover:md:inline-flex");
     expect(quickButton).not.toHaveClass("md:block");
   });
 
-  it("drops the row kebab on mobile, revealing it only from md up", () => {
-    // The per-row "..." menu is desktop-only: on mobile the chat page's own
-    // header menu covers these per-session actions, so the row kebab is hidden
-    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
-    // like the quick-pin button — flex, not block — so its glyph stays
-    // centered.
+  it("drops the row kebab without fine hover, revealing it only on fine-hover md+", () => {
+    // The per-row "..." menu is fine-hover-desktop-only: touch devices of any
+    // width (phones, unfolded foldables, tablets) reach these actions through
+    // the long-press menu, so the kebab is hidden (`hidden`) and only surfaces
+    // on a fine-hover display from `md` up. It reveals like the quick-pin
+    // button — flex, not block — so its glyph stays centered.
     renderSidebar();
 
     const kebab = screen.getByTestId("conversation-actions");
-    expect(kebab).toHaveClass("hidden", "md:inline-flex");
-    expect(kebab).not.toHaveClass("md:block");
+    expect(kebab).toHaveClass("hidden", "fine-hover:md:inline-flex");
+    expect(kebab).not.toHaveClass("md:inline-flex", "md:block");
   });
 });
 
