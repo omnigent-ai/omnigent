@@ -338,6 +338,8 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 _TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
 _TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
 _TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
+# Sign-in may stay open indefinitely; limit its liveness subprocess rate.
+_CODEX_LOGIN_EXIT_POLL_INTERVAL_S = 1.0
 
 # Background Codex app-server instances for host-spawned codex-native
 # runners, kept referenced so they aren't garbage-collected mid-run.
@@ -5338,13 +5340,16 @@ class _CodexTerminalExited(RuntimeError):
 
 
 async def _wait_for_codex_thread_or_terminal_exit(
-    thread_started: Awaitable[str], instance: TerminalInstance
+    thread_started: Awaitable[str],
+    instance: TerminalInstance,
+    *,
+    poll_interval_s: float = _TERMINAL_INTERACTIVE_POLL_INTERVAL_S,
 ) -> str:
     """Stop startup discovery promptly without following a replacement terminal."""
 
     async def wait_for_exit() -> None:
         while await instance.is_alive():
-            await asyncio.sleep(_TERMINAL_INTERACTIVE_POLL_INTERVAL_S)
+            await asyncio.sleep(poll_interval_s)
 
     thread_task = asyncio.ensure_future(thread_started)
     exit_task = asyncio.create_task(wait_for_exit())
@@ -5353,6 +5358,7 @@ async def _wait_for_codex_thread_or_terminal_exit(
         # A created thread remains usable through the app-server after TUI exit.
         if thread_task in done:
             return await thread_task
+        # Propagate probe failures instead of reporting a normal terminal exit.
         await exit_task
         raise _CodexTerminalExited(instance)
     finally:
@@ -5483,7 +5489,13 @@ async def _codex_discover_thread_and_forward(
                 await thread_started
                 if terminal_instance is None
                 else await _wait_for_codex_thread_or_terminal_exit(
-                    thread_started, terminal_instance
+                    thread_started,
+                    terminal_instance,
+                    poll_interval_s=(
+                        _CODEX_LOGIN_EXIT_POLL_INTERVAL_S
+                        if login_required
+                        else _TERMINAL_INTERACTIVE_POLL_INTERVAL_S
+                    ),
                 )
             )
         except (TimeoutError, RuntimeError) as exc:

@@ -210,7 +210,7 @@ def test_exit_history_omits_potentially_incomplete_leading_records(
 
     instance._remember_exit_snapshot(captured)
 
-    assert instance._last_exit_snapshot is not None
+    assert (instance._last_exit_snapshot is None) == (expected is None)
     assert instance.last_exit_text() == expected
     assert instance.last_pane_text() == "unsafe visible credential continuation"
 
@@ -251,9 +251,99 @@ async def test_failed_exit_history_capture_does_not_fall_back_to_partial_visible
     else:
         instance._capture_exit_snapshot_sync()
 
-    assert instance._last_exit_snapshot == ""
+    assert instance._last_exit_snapshot is None
     assert instance.last_exit_text() is None
     assert instance.last_pane_text() == "unsafe visible credential continuation"
+
+
+@pytest.mark.parametrize("duplicate_path", ["async", "sync"])
+@pytest.mark.parametrize(
+    "duplicate_result",
+    [
+        None,
+        "0 10000\n",
+        "0 10000\n \n\t\n",
+        "0 10000\n\x1b[31m\x1b[0m\n",
+        "unknown bounds\nunsafe partial credential",
+        "101 10000\nunsafe partial credential",
+    ],
+    ids=["failure", "empty", "whitespace", "ansi_only", "malformed", "clipped_record"],
+)
+async def test_duplicate_exit_capture_preserves_good_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    duplicate_path: str,
+    duplicate_result: str | None,
+) -> None:
+    """A competing capture cannot erase a safe snapshot while its producer returns."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_status("1 2")
+    instance._remember_pane_snapshot("unsafe visible credential continuation")
+    diagnostic = "error: unexpected argument '--invalid' found"
+    good_capture = f"0 10000\n{diagnostic}\n"
+    published = threading.Event()
+    finish_primary = threading.Event()
+    duplicate_started = threading.Event()
+    finish_duplicate = threading.Event()
+    original_remember = instance._remember_exit_snapshot
+
+    def remember(captured: str) -> None:
+        original_remember(captured)
+        if captured == good_capture:
+            published.set()
+            assert finish_primary.wait(5)
+
+    def duplicate_output() -> str:
+        if duplicate_result is None:
+            raise RuntimeError("tmux removed during cleanup")
+        return duplicate_result
+
+    sync_calls = 0
+
+    def output_sync(*_args: str) -> str:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            return good_capture
+        duplicate_started.set()
+        assert finish_duplicate.wait(5)
+        return duplicate_output()
+
+    async def output_async(*_args: str) -> str:
+        duplicate_started.set()
+        assert await asyncio.to_thread(finish_duplicate.wait, 5)
+        return duplicate_output()
+
+    monkeypatch.setattr(instance, "_remember_exit_snapshot", remember)
+    monkeypatch.setattr(instance, "_tmux_output_sync", output_sync)
+    monkeypatch.setattr(instance, "_tmux_output", output_async)
+    primary = asyncio.create_task(asyncio.to_thread(instance._capture_exit_snapshot_sync))
+    duplicate: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.to_thread(published.wait, 5)
+        assert instance.last_exit_text() == diagnostic
+        assert not primary.done()
+        duplicate = asyncio.create_task(
+            instance._capture_exit_snapshot()
+            if duplicate_path == "async"
+            else asyncio.to_thread(instance._capture_exit_snapshot_sync)
+        )
+        assert await asyncio.to_thread(duplicate_started.wait, 5)
+        assert instance.last_exit_text() == diagnostic
+        finish_primary.set()
+        await primary
+        finish_duplicate.set()
+        await duplicate
+        assert instance.last_exit_text() == diagnostic
+    finally:
+        finish_primary.set()
+        finish_duplicate.set()
+        await asyncio.gather(primary, *([duplicate] if duplicate is not None else []))
 
 
 def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> None:
@@ -1136,6 +1226,158 @@ async def test_is_alive_false_when_pane_dead(
     assert instance.last_pane_text() == "error: invalid startup argument"
 
 
+@pytest.mark.parametrize("detection", ["is_alive", "async_watcher", "threaded_watcher"])
+@pytest.mark.parametrize(
+    ("final_fields", "expected_status"),
+    [
+        ("1|2|", 2),
+        ("1|0|", 0),
+        ("1||TERM", None),
+        ("1||15", None),
+        ("1||", None),
+        ("malformed", None),
+        (None, None),
+    ],
+)
+async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    detection: str,
+    final_fields: str | None,
+    expected_status: int | None,
+) -> None:
+    """PTY EOF may arrive before tmux has reaped the child and stored its status."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+        keep_alive_after_exit=True,
+    )
+    refresh_calls = 0
+
+    def output(*args: str) -> str:
+        nonlocal refresh_calls
+        if args[0] == "list-panes":
+            if args[-1] != terminal_mod._PANE_EXIT_STATUS_FORMAT:
+                return "1\n"
+            refresh_calls += 1
+            if refresh_calls == 1:
+                return "1||\n"
+            if final_fields is None:
+                raise RuntimeError("tmux target gone")
+            return final_fields
+        if args[0] == "display-message":
+            return "0 10000\nsafe exit diagnostic\n"
+        if args[0] == "capture-pane":
+            return "visible final frame\n"
+        assert args[0] == "detach-client"
+        return ""
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=output))
+    monkeypatch.setattr(instance, "_tmux_output_sync", output)
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            **{
+                **vars(asyncio),
+                "create_subprocess_exec": AsyncMock(
+                    return_value=_ProcessWithStdout(stdout=b"1\n", returncode=0)
+                ),
+            }
+        ),
+    )
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(terminal_mod, "_EXIT_STATUS_POLL_SECONDS", 0.001)
+    # An expired budget must still report an unknown-status exit immediately.
+    monkeypatch.setattr(
+        terminal_mod, "_EXIT_STATUS_REFRESH_SECONDS", 0 if final_fields == "1||" else 5
+    )
+    try:
+        if detection == "threaded_watcher":
+            exited = threading.Event()
+            instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.001)
+            assert await asyncio.to_thread(exited.wait, 1)
+        elif detection == "async_watcher":
+            exited_async = asyncio.Event()
+            instance.start_idle_watcher(lambda: None, on_exit=exited_async.set)
+            await asyncio.wait_for(exited_async.wait(), timeout=1)
+        else:
+            assert await asyncio.wait_for(instance.is_alive(), timeout=1) is False
+
+        assert instance.running is False
+        assert instance.last_exit_status() == expected_status
+        assert instance.last_exit_text() == "safe exit diagnostic"
+        assert refresh_calls == (1 if final_fields == "1||" else 2)
+    finally:
+        await instance._stop_idle_watcher()
+        instance._stop_idle_watcher_thread()
+
+
+async def test_exit_status_refresh_propagates_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    probing = asyncio.Event()
+
+    async def waiting_probe(*_args: str) -> str:
+        probing.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(instance, "_tmux_output", waiting_probe)
+    task = asyncio.create_task(instance._refresh_exit_status())
+    await asyncio.wait_for(probing.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        # Await the task to verify cancellation escapes the diagnostic refresh.
+        await task
+
+
+@pytest.mark.parametrize("capture", ["async", "sync"])
+async def test_exit_status_refresh_stops_at_its_grace_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    clock = iter([10.0, 10.04, 10.09, 10.1])
+    sleep_intervals: list[float] = []
+    monkeypatch.setattr(
+        terminal_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock), sleep=sleep_intervals.append),
+    )
+    probes = 0
+
+    def pending(*_args: str) -> str:
+        nonlocal probes
+        probes += 1
+        return "1||"
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=pending))
+    monkeypatch.setattr(instance, "_tmux_output_sync", pending)
+    if capture == "async":
+        await instance._refresh_exit_status()
+    else:
+        instance._refresh_exit_status_sync()
+        assert sleep_intervals == pytest.approx([0.01, 0.01])
+
+    assert probes == 3
+    assert instance.last_exit_status() is None
+    assert list(clock) == []
+
+
 @pytest.mark.parametrize("watcher", ["async", "threaded"])
 async def test_liveness_probe_before_first_watcher_tick_still_reports_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, watcher: str
@@ -1573,7 +1815,7 @@ async def test_exit_history_omits_wrapped_credential_without_its_prefix_real_tmu
         assert canary in visible
         instance._remember_pane_snapshot(visible)
         assert instance.last_exit_status() == 2
-        assert instance._last_exit_snapshot == ""
+        assert instance._last_exit_snapshot is None
         assert instance.last_exit_text() is None
         exported = trim_terminal_output(sanitize_diagnostic_text(instance.last_exit_text() or ""))
         assert canary not in (exported or "")

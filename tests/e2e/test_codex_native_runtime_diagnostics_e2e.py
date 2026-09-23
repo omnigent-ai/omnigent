@@ -191,6 +191,7 @@ async def _stop_runner(proc: asyncio.subprocess.Process) -> None:
     try:
         await asyncio.wait_for(proc.communicate(), 5)
     except TimeoutError:
+        # A slow graceful exit is followed by force-kill cleanup below.
         pass
     finally:
         with contextlib.suppress(ProcessLookupError):

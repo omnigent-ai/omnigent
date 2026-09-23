@@ -354,6 +354,92 @@ async def test_thread_creation_wins_simultaneous_terminal_exit(tmp_path: Path) -
     )
 
 
+@pytest.mark.parametrize(("login_required", "expected_interval"), [(False, 0.15), (True, 1.0)])
+async def test_login_wait_uses_slower_terminal_exit_polling(
+    monkeypatch: pytest.MonkeyPatch,
+    startup: _Startup,
+    login_required: bool,
+    expected_interval: float,
+) -> None:
+    terminal = _exited_terminal(startup.bridge_dir)
+    thread_waiter = asyncio.Future[str]()
+    race = AsyncMock(wraps=orchestration._wait_for_codex_thread_or_terminal_exit)
+    monkeypatch.setattr(orchestration, "_wait_for_codex_thread_or_terminal_exit", race)
+    monkeypatch.setattr(
+        forwarder, "wait_for_thread_started", lambda *_args, **_kwargs: thread_waiter
+    )
+
+    await _discover(startup, terminal_instance=terminal, login_required=login_required)
+
+    race.assert_awaited_once_with(thread_waiter, terminal, poll_interval_s=expected_interval)
+    assert thread_waiter.cancelled()
+
+
+@pytest.mark.parametrize("poll_interval", [0.15, 1.0])
+async def test_terminal_exit_polling_sleep_is_cancellable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poll_interval: float
+) -> None:
+    terminal = _exited_terminal(tmp_path)
+    thread_waiter = asyncio.Future[str]()
+    sleep_started = asyncio.Event()
+    sleep_cancelled = asyncio.Event()
+    intervals: list[float] = []
+
+    async def waiting_sleep(interval: float) -> None:
+        intervals.append(interval)
+        sleep_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            sleep_cancelled.set()
+
+    monkeypatch.setattr(terminal, "is_alive", AsyncMock(return_value=True))
+    asyncio_facade = SimpleNamespace(**vars(asyncio))
+    asyncio_facade.sleep = waiting_sleep
+    monkeypatch.setattr(orchestration, "asyncio", asyncio_facade)
+    task = asyncio.create_task(
+        orchestration._wait_for_codex_thread_or_terminal_exit(
+            thread_waiter, terminal, poll_interval_s=poll_interval
+        )
+    )
+    await asyncio.wait_for(sleep_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert intervals == [poll_interval]
+    assert thread_waiter.cancelled()
+    assert sleep_cancelled.is_set()
+
+
+async def test_startup_race_propagates_probe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    terminal = _exited_terminal(tmp_path)
+    thread_started = asyncio.Event()
+    thread_cancelled = asyncio.Event()
+
+    async def waiting_thread() -> str:
+        thread_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            thread_cancelled.set()
+        raise AssertionError("unreachable")
+
+    async def failing_probe() -> bool:
+        await thread_started.wait()
+        raise ValueError("liveness probe failed")
+
+    monkeypatch.setattr(terminal, "is_alive", failing_probe)
+    with pytest.raises(ValueError, match="liveness probe failed"):
+        await asyncio.wait_for(
+            orchestration._wait_for_codex_thread_or_terminal_exit(waiting_thread(), terminal),
+            timeout=1,
+        )
+    assert thread_cancelled.is_set()
+
+
 async def test_startup_race_cancellation_cancels_both_waiters(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -386,6 +472,7 @@ async def test_startup_race_cancellation_cancels_both_waiters(
     await asyncio.wait_for(asyncio.gather(thread_started.wait(), probe_started.wait()), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
+        # Await cancellation so both waiter finalizers have completed.
         await task
     assert thread_cancelled.is_set()
     assert probe_cancelled.is_set()

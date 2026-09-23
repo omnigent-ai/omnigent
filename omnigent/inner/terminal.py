@@ -310,6 +310,9 @@ _IDLE_POLL_INTERVAL_SECONDS = 1.0
 _IDLE_EXIT_FAILURE_THRESHOLD = 3
 _PROBE_ERROR_MAX_CHARS = 1024
 _EXIT_DIAGNOSTIC_SCROLLBACK_LINES = 100
+_EXIT_STATUS_REFRESH_SECONDS = 0.1
+_EXIT_STATUS_POLL_SECONDS = 0.01
+_PANE_EXIT_STATUS_FORMAT = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}"
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
 
@@ -1141,7 +1144,6 @@ class TerminalInstance:
 
     def _remember_exit_snapshot(self, captured: str) -> None:
         """Omit a leading record that may have lost its credential prefix."""
-        self._last_exit_snapshot = ""
         bounds, separator, snapshot = captured.partition("\n")
         if not separator:
             return
@@ -1159,17 +1161,19 @@ class TerminalInstance:
             or retained_capacity <= _EXIT_DIAGNOSTIC_SCROLLBACK_LINES
         ):
             snapshot = snapshot.partition("\n")[2]
-        self._last_exit_snapshot = snapshot
+        # A competing failed or empty capture must not erase an earlier exit cause.
+        if _strip_ansi(snapshot).strip():
+            self._last_exit_snapshot = snapshot
 
     async def _capture_exit_snapshot(self) -> None:
         """Retain recent output after confirmed exit, before cleanup removes tmux."""
-        self._last_exit_snapshot = ""
+        await self._refresh_exit_status()
         with contextlib.suppress(RuntimeError, OSError):
             self._remember_exit_snapshot(await self._tmux_output(*self._exit_capture_args()))
 
     def _capture_exit_snapshot_sync(self) -> None:
         """Synchronous exit capture for the threaded lifecycle watcher."""
-        self._last_exit_snapshot = ""
+        self._refresh_exit_status_sync()
         with contextlib.suppress(RuntimeError, OSError):
             self._remember_exit_snapshot(self._tmux_output_sync(*self._exit_capture_args()))
 
@@ -1344,6 +1348,54 @@ class TerminalInstance:
         if len(parts) >= 2 and parts[0] == "1":
             with contextlib.suppress(ValueError):
                 self._last_exit_status = int(parts[1])
+
+    def _exit_status_is_pending(self, fields: str) -> bool:
+        """Refresh the code and distinguish unreaped children from signal-only exits."""
+        parts = fields.strip().split("|")
+        if len(parts) != 3:
+            return False
+        dead, status, signal = parts
+        self._remember_exit_status(f"{dead} {status}")
+        return dead == "1" and not status and not signal
+
+    async def _refresh_exit_status(self) -> None:
+        """Allow a short grace period for tmux to reap a confirmed-dead pane."""
+        if self._last_exit_status is not None:
+            return
+        # PTY EOF can mark a pane dead before SIGCHLD supplies its wait status.
+        deadline = time.monotonic() + _EXIT_STATUS_REFRESH_SECONDS
+        while True:
+            try:
+                fields = await self._tmux_output(
+                    "list-panes", "-t", self.tmux_target, "-F", _PANE_EXIT_STATUS_FORMAT
+                )
+            except (RuntimeError, OSError):
+                return
+            if not self._exit_status_is_pending(fields):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(_EXIT_STATUS_POLL_SECONDS, remaining))
+
+    def _refresh_exit_status_sync(self) -> None:
+        """Synchronous wait-status refresh for the threaded exit watcher."""
+        if self._last_exit_status is not None:
+            return
+        deadline = time.monotonic() + _EXIT_STATUS_REFRESH_SECONDS
+        while True:
+            try:
+                fields = self._tmux_output_sync(
+                    "list-panes", "-t", self.tmux_target, "-F", _PANE_EXIT_STATUS_FORMAT
+                )
+            except (RuntimeError, OSError):
+                return
+            if not self._exit_status_is_pending(fields):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(_EXIT_STATUS_POLL_SECONDS, remaining))
 
     def _tmux_base_cmd(self) -> list[str]:
         """
