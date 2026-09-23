@@ -12,7 +12,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -37,6 +37,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
     read_pane_signals,
+    read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
@@ -3442,42 +3443,23 @@ async def _create_fork_replacement_session(
 def _is_subagent_hook_record(
     record: ClaudeHookRecord,
     *,
-    parent_claude_session_id: str | None = None,
+    parent_claude_session_ids: Collection[str] | None = None,
 ) -> bool:
     """
     Return whether a hook record originated from a Claude subagent.
 
-    Primary check: a record whose ``session_id`` differs from the
-    parent's pinned Claude session id is from a subagent process.
-    This catches background (``run_in_background=True``) subagents
-    whose transcripts may not live under a ``subagents/``
-    subdirectory. Requires the caller to supply
-    ``parent_claude_session_id`` (read from bridge state).
-
-    Fallback path check: synchronous (in-process) subagents always
-    have transcripts under
-    ``~/.claude/projects/<encoded>/<session>/subagents/agent-<id>.jsonl``.
-    When the session id comparison is unavailable, the presence of
-    ``subagents`` as a path component distinguishes them.
-
-    :param record: Claude hook record read from ``hooks.jsonl``.
-    :param parent_claude_session_id: The parent Claude session id
-        pinned in bridge state, e.g.
-        ``"a1b2c3d4-1234-5678-9abc-def012345678"``.  ``None`` falls
-        back to the path-only check.
-    :returns: ``True`` when the record belongs to a subagent,
-        ``False`` otherwise (including when neither signal is
-        available — conservative default so parent events are never
-        accidentally dropped).
+    Primary: a session id absent from the set of ids ever pinned to
+    this bridge belongs to a background subagent process. Fallback:
+    the ``subagents/`` path component for synchronous subagents.
     """
-    # Primary: session id mismatch → record is from a subagent process.
+    # Primary: id not in any id the parent has ever held → subagent.
     if (
-        parent_claude_session_id
+        parent_claude_session_ids
         and record.claude_session_id
-        and record.claude_session_id != parent_claude_session_id
+        and record.claude_session_id not in parent_claude_session_ids
     ):
         return True
-    # Fallback: subagent directory structure check.
+    # Fallback: subagent directory structure.
     if record.transcript_path is None:
         return False
     return "subagents" in record.transcript_path.parts
@@ -3749,10 +3731,10 @@ async def _forward_available_status_events(
         retried and the failing event is retried later.
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
-    # Read once before the loop; the pinned parent session id is stable
-    # across all records in this batch (SessionStart updates would have
-    # been processed in an earlier poll).
-    parent_claude_session_id = read_claude_session_id(bridge_dir)
+    # Read all session ids ever pinned to this bridge so a rotation race
+    # (batch spans the old id's StopFailure and the new SessionStart)
+    # does not drop the parent's own failure as a subagent event.
+    parent_claude_session_ids = read_seen_claude_session_ids(bridge_dir)
     if not result.records:
         if result.event_cursor == state.event_cursor and result.byte_offset == (
             state.byte_offset or 0
@@ -3785,7 +3767,7 @@ async def _forward_available_status_events(
         # parent turn is still running while it awaits the Agent tool
         # result.
         if status is not None and _is_subagent_hook_record(
-            record, parent_claude_session_id=parent_claude_session_id
+            record, parent_claude_session_ids=parent_claude_session_ids
         ):
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
