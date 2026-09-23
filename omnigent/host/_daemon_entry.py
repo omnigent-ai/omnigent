@@ -46,19 +46,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from omnigent.process_logging import configure_process_logging
+    from omnigent.process_logging import (
+        configure_process_logging,
+        ensure_stdio_survives_unencodable_output,
+    )
 
     log_path = configure_process_logging("host", force=True)
 
-    import contextlib
-    import sys
-
-    if sys.platform == "win32":
-        for stream in (sys.stdout, sys.stderr):
-            reconfigure = getattr(stream, "reconfigure", None)
-            if reconfigure is not None:
-                with contextlib.suppress(ValueError, OSError):
-                    reconfigure(encoding="utf-8", errors="replace")
+    # The daemon's stdio is redirected to its log file, which on a legacy
+    # encoding (Windows ANSI code page, C locale) can't encode the status
+    # glyphs (✓/⚠) — harden it before the connect loop prints anything.
+    ensure_stdio_survives_unencodable_output()
 
     if args.local == bool(args.server):
         # Both or neither — the CLI always passes exactly one; fail loud.
