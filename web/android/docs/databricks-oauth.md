@@ -201,3 +201,16 @@ Other workspace profiles are not touched.
 
 This is local app sign-out. It does not revoke the provider grant globally or
 clear system-browser/IdP SSO, so a later explicit sign-in may reuse browser SSO.
+
+## Debug authentication faults
+
+Debug builds add **Debug Authentication** to the native workspace menu. It can:
+
+- clear only the `DBAUTH` session cookie, exercising foreground/navigation recovery;
+- expire the saved access token, exercising silent refresh;
+- install an unexpired access token the workspace will reject, exercising one 401 refresh/retry;
+- clear the saved OAuth grant, exercising the explicit Sign In prompt.
+
+Faults are scoped to the selected workspace profile and credential record. The
+menu labels and fault implementation live only in the Debug source set; Release
+builds compile a no-op surface and contain none of those menu strings.
