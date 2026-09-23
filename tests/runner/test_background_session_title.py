@@ -998,8 +998,8 @@ def _title_context(harness: str, **overrides: Any) -> BackgroundTitleContext:
 def test_background_title_model_registers_economy_tier_per_harness() -> None:
     assert background_title_model("claude-sdk") == "haiku"
     assert background_title_model("claude-native") == "haiku"
-    assert background_title_model("codex") == "gpt-5.6-luna"
-    assert background_title_model("codex-native") == "gpt-5.6-luna"
+    assert background_title_model("codex") == "gpt-6-luna"
+    assert background_title_model("codex-native") == "gpt-6-luna"
     assert background_title_model("pi") is None
     assert background_title_model("community-example") is None
 
@@ -1022,7 +1022,7 @@ async def test_background_title_dispatch_pins_economy_model_for_mapped_harness(
 
     assert title == "Debug authentication timeout"
     [context] = contexts
-    assert context.title_model == "gpt-5.6-luna"
+    assert context.title_model == "gpt-6-luna"
     assert context.model_override == "gpt-5.4-mini"
 
 
@@ -1219,7 +1219,7 @@ async def test_background_title_surfaces_harness_failure_and_releases_process(
     for process_key in process_manager.released:
         assert uuid.UUID(process_key).hex == process_key
     [(_, first_body), (_, second_body)] = harness_client.requests
-    assert first_body["model_override"] == "gpt-5.6-luna"
+    assert first_body["model_override"] == "gpt-6-luna"
     assert "model_override" not in second_body
 
 

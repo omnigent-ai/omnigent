@@ -58,10 +58,10 @@ from typing import Any
 _MODEL_ROUTE_PREFIX = "system.ai."
 _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", _MODEL_ROUTE_PREFIX)
 
-#: A bare gpt id, split into family, version digits, and optional tier —
-#: ``gpt-5-6-luna`` → ``("gpt", "5", "6", "luna")``. Codex spells the
-#: version with a dot and keeps the tier hyphenated.
-_GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)-(\d+)(?:-([a-z0-9]+))?$")
+#: A bare gpt id, split into family, major, optional minor, and optional tier —
+#: ``gpt-5-6-luna`` → ``("gpt", "5", "6", "luna")``;
+#: ``gpt-6-luna`` → ``("gpt", "6", None, "luna")``.
+_GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)(?:-(\d+))?(?:-([a-z0-9]+))?$")
 
 #: Models the gateway serves that codex's bundled catalog does not carry, so
 #: omnigent adds them to the session's own catalog (``model_catalog_json``)
@@ -128,7 +128,7 @@ def codex_spawn_model(model: str) -> str | None:
     if match is None:
         return None
     family, major, minor, tier = match.groups()
-    slug = f"{family}-{major}.{minor}"
+    slug = f"{family}-{major}.{minor}" if minor else f"{family}-{major}"
     return f"{slug}-{tier}" if tier else slug
 
 

@@ -983,13 +983,12 @@ def test_static_model_fallbacks_document_ownership(table_key: str) -> None:
 
 
 def test_codex_default_model_names_a_concrete_variant() -> None:
-    """The codex launch default is codex's own spelling of a tiered model.
+    """The codex launch default is the current economical Codex model.
 
-    The bundled OpenAI catalog's newest row is ``gpt-5.6``, which codex
-    rejects as a family name, and codex's backend 400s the hyphenated
-    Databricks serving spelling — the default must be a dotted concrete
-    variant codex serves.
+    A family alias is not safe for launch code that pins a concrete model.
+    The dotted slug is the spelling advertised by the installed Codex catalog.
     """
+    assert CODEX_DEFAULT_MODEL == "gpt-6-luna"
     assert not CODEX_DEFAULT_MODEL.startswith("databricks-")
     assert codex_spawn_model(CODEX_DEFAULT_MODEL) == CODEX_DEFAULT_MODEL
     # A bare family alias has no tier segment after the dotted version.
