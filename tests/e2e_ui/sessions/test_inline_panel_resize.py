@@ -143,11 +143,15 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
 
     transcript_box = page.get_by_role("log").bounding_box()
     assert transcript_box is not None
-    # The 8px hit test catches a widened gutter without dragging the scrollbar
-    # thumb; the 16px gesture separately proves transcript scrolling stays owned.
+    # The 8px hit test catches a widened gutter; the 16px gesture separately
+    # proves transcript scrolling stays owned. The transcript's own scrollbar
+    # thumb shares that 8px column wherever it happens to sit and is
+    # deliberately touch-none (it's draggable), so look past it.
     hit = page.evaluate(
         """([x, y]) => {
-          const target = document.elementFromPoint(x, y);
+          const target = document
+            .elementsFromPoint(x, y)
+            .find((element) => !element.closest('[data-transcript-scrollbar]'));
           return {
             isGutter: target?.closest('[data-workspace-panel-resize-gutter]') !== null,
             touchAction: target ? getComputedStyle(target).touchAction : null,
