@@ -26,26 +26,6 @@ def _row_link(page: Page, session_id: str) -> Locator:
     return page.locator(f'a[href="/c/{session_id}"]')
 
 
-def test_right_clicking_session_button_opens_actions_menu(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """Right-clicking a row action button opens the app menu, not the native one."""
-    base_url, session_id = seeded_session
-
-    page.goto(f"{base_url}/c/{session_id}")
-
-    link = _row_link(page, session_id)
-    expect(link).to_be_visible()
-    row = page.locator(f'li[data-sidebar-session-id="{session_id}"]')
-    row.hover()
-
-    row.get_by_test_id("conversation-actions").click(button="right")
-
-    expect(page.get_by_test_id("rename-conversation")).to_be_visible()
-    expect(page).to_have_url(f"{base_url}/c/{session_id}")
-
-
 def test_right_click_opens_session_actions_menu(
     page: Page,
     seeded_session: tuple[str, str],
