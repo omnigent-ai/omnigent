@@ -132,6 +132,28 @@ def _right_inset(card: FloatRect, box: FloatRect) -> float:
     return card["x"] + card["width"] - (box["x"] + box["width"])
 
 
+def _assert_row_grid(boxes: list[FloatRect], tol: float = _TOL) -> None:
+    """Fail unless sibling list rows share x, width, and height within ``tol``
+    and stack evenly (the ``| icon | label (flex) | metadata | trailing |``
+    grid's shared columns and single-line row height)."""
+    first = boxes[0]
+    for box in boxes[1:]:
+        assert abs(box["x"] - first["x"]) <= tol, (
+            f"row x diverges: {first['x']:.2f} vs {box['x']:.2f}"
+        )
+        assert abs(box["width"] - first["width"]) <= tol, (
+            f"row width diverges: {first['width']:.2f} vs {box['width']:.2f}"
+        )
+        assert abs(box["height"] - first["height"]) <= tol, (
+            f"row height diverges: {first['height']:.2f} vs {box['height']:.2f}"
+        )
+    for a, b in pairwise(boxes):
+        pitch = b["y"] - a["y"]
+        assert abs(pitch - a["height"]) <= tol + 1.0, (
+            f"rows are not stacked evenly: pitch {pitch:.2f}px vs height {a['height']:.2f}px"
+        )
+
+
 def _attach_files(page: Page | AsyncPage, files: list[tuple[str, str, bytes]]) -> None:
     """Attach files through the composer's hidden file input.
 
@@ -795,3 +817,212 @@ async def _landing_shared_width(base_url: str, session_id: str, live_width: floa
         finally:
             await context.close()
             await browser.close()
+
+
+def _three_agent_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: three agents so the landing picker
+    has sibling rows to measure."""
+    agents = [
+        ("ag_claude_e2e", "claude-native-ui", "Claude Code", "claude-native"),
+        ("ag_codex_e2e", "codex-native-ui", "Codex", "codex-native"),
+        ("ag_gemini_e2e", "gemini-cli", "Gemini CLI", "gemini-cli"),
+    ]
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": agent_id,
+                    "name": name,
+                    "display_name": display,
+                    "description": f"{display} agent",
+                    "harness": harness,
+                    "skills": [],
+                }
+                for agent_id, name, display, harness in agents
+            ]
+        }
+    )
+
+
+def _row_boxes(page: Page | AsyncPage, locator) -> list[FloatRect]:
+    """Bounding boxes of the first three visible rows in a menu locator."""
+    count = locator.count()
+    assert count >= 2, f"expected several rows, found {count}"
+    return [_box(locator.nth(i)) for i in range(min(count, 3))]
+
+
+@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
+def test_landing_picker_rows_follow_the_row_grid(seeded_session: tuple[str, str]) -> None:
+    """Landing agent-picker rows share the row grid (icon x, label x, trailing
+    x, height, pitch) at desktop and phone widths."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_landing_picker_grid(base_url, session_id))
+
+
+async def _landing_picker_grid(base_url: str, session_id: str) -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(viewport=_DESKTOP)
+        page = await context.new_page()
+        try:
+            await _open_landing(page, base_url, session_id, agents_body=_three_agent_agents_body())
+            for viewport in [_DESKTOP, _PHONE]:
+                await page.set_viewport_size(viewport)
+                trigger = page.get_by_test_id("new-chat-landing-agent-select")
+                await trigger.click()
+                rows = page.locator(".composer-agent-menu .composer-agent-row")
+                await async_expect(rows.first).to_be_visible()
+                boxes = []
+                count = await rows.count()
+                assert count >= 2, f"expected several picker rows, found {count}"
+                for i in range(min(count, 3)):
+                    box = await rows.nth(i).bounding_box()
+                    assert box is not None
+                    boxes.append(box)
+                _assert_row_grid(boxes)
+                icons = [await rows.nth(i).locator("svg").first.bounding_box() for i in range(2)]
+                assert icons[0] is not None and icons[1] is not None
+                assert abs(icons[0]["x"] - icons[1]["x"]) <= _TOL, (
+                    f"row icons do not share x: {icons[0]['x']:.2f} vs {icons[1]['x']:.2f}"
+                )
+                await page.keyboard.press("Escape")
+        finally:
+            await context.close()
+            await browser.close()
+
+
+@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
+def test_live_picker_rows_follow_the_row_grid(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Live model/effort config rows share the row grid (label x, value
+    trailing x, height, pitch) at desktop and phone widths."""
+    base_url, session_id = seeded_session
+    _patch_session_as_databricks_claude_native(page, session_id)
+    try:
+        _open_live(page, base_url, session_id, _DESKTOP)
+        for viewport in [_DESKTOP, _PHONE]:
+            # A fresh load at each width: resizing desktop→phone leaves the
+            # sidebar drawer open over the composer and it eats the click.
+            _open_live(page, base_url, session_id, viewport)
+            gear = page.get_by_test_id("composer-config-gear")
+            gear.click()
+            rows = page.locator(".composer-agent-menu [role=menuitem]")
+            expect(rows.first).to_be_visible()
+            boxes = _row_boxes(page, rows)
+            _assert_row_grid(boxes)
+            page.keyboard.press("Escape")
+    finally:
+        page.unroute_all(behavior="ignoreErrors")
+
+
+@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
+def test_landing_workspace_bar_aligns_with_the_card(seeded_session: tuple[str, str]) -> None:
+    """The landing workspace bar's content inset line matches the composer
+    card's inset line, and the bar shares the card's outer edges."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_landing_workspace_bar(base_url, session_id))
+
+
+async def _landing_workspace_bar(base_url: str, session_id: str) -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(viewport=_DESKTOP)
+        page = await context.new_page()
+        try:
+            await _open_landing(page, base_url, session_id)
+            bar = await page.get_by_test_id("new-chat-landing-workspace-controls").bounding_box()
+            card = await page.locator("[data-composer-card]").bounding_box()
+            chip = await page.get_by_test_id("new-chat-landing-workspace-chip").bounding_box()
+            input_box = await page.get_by_test_id("new-chat-landing-input").bounding_box()
+            assert (
+                bar is not None and card is not None and chip is not None and input_box is not None
+            )
+            assert abs(bar["x"] - card["x"]) <= _TOL, (
+                f"bar and card left edges diverge: {bar['x']:.2f} vs {card['x']:.2f}"
+            )
+            assert abs(_right_inset(card, bar)) <= _TOL, (
+                f"bar and card right edges diverge by {_right_inset(card, bar):.2f}px"
+            )
+            chip_inset = chip["x"] - bar["x"]
+            input_inset = input_box["x"] - card["x"]
+            assert abs(chip_inset - input_inset) <= _TOL, (
+                f"bar content inset {chip_inset:.2f}px diverges from the card's "
+                f"{input_inset:.2f}px"
+            )
+        finally:
+            await context.close()
+            await browser.close()
+
+
+@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
+def test_live_workspace_bar_aligns_with_the_card(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The live workspace bar's content inset line matches the composer
+    card's inset line, and the bar shares the card's outer edges."""
+    base_url, session_id = seeded_session
+    _open_live(page, base_url, session_id, _DESKTOP)
+    bar = _box(page.get_by_test_id("composer-workspace-controls"))
+    card = _box(page.locator("[data-composer-card]"))
+    chip = _box(page.get_by_test_id("composer-workspace-dir"))
+    input_box = _box(page.get_by_label("Message the agent"))
+    assert abs(bar["x"] - card["x"]) <= _TOL, (
+        f"bar and card left edges diverge: {bar['x']:.2f} vs {card['x']:.2f}"
+    )
+    assert abs(_right_inset(card, bar)) <= _TOL, (
+        f"bar and card right edges diverge by {_right_inset(card, bar):.2f}px"
+    )
+    chip_inset = chip["x"] - bar["x"]
+    input_inset = input_box["x"] - card["x"]
+    assert abs(chip_inset - input_inset) <= _TOL, (
+        f"bar content inset {chip_inset:.2f}px diverges from the card's {input_inset:.2f}px"
+    )
+
+
+@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
+def test_live_workspace_bar_nested_variant_keeps_the_inset_line(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """With queued messages docked above it, the live workspace bar drops its
+    top border (the nesting variant) without shifting its content inset line
+    or the card's edges."""
+    base_url, session_id = seeded_session
+    sentinel = "geometry-contract workspace bar hold"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "done", "block": True}] * 4,
+        key="geometry-workspace-bar-gate",
+        match=sentinel,
+    )
+    try:
+        _open_live(page, base_url, session_id, _DESKTOP)
+        input_loc = page.get_by_label("Message the agent")
+        input_loc.fill(sentinel)
+        page.get_by_role("button", name="Send", exact=True).click()
+        expect(page.get_by_role("button", name="Interrupt")).to_be_visible(timeout=60_000)
+        input_loc.fill("queued while running")
+        page.get_by_role("button", name="Send", exact=True).click()
+        strip = page.get_by_test_id("composer-queued-strip")
+        expect(strip).to_be_visible()
+
+        bar = page.get_by_test_id("composer-workspace-controls")
+        border_top = bar.evaluate("(el) => getComputedStyle(el).borderTopWidth")
+        assert border_top == "0px", f"nesting variant keeps a top border: {border_top}"
+        bar_box = _box(bar)
+        card_box = _box(page.locator("[data-composer-card]"))
+        assert abs(bar_box["x"] - card_box["x"]) <= _TOL
+        assert abs(_right_inset(card_box, bar_box)) <= _TOL
+        strip_box = _box(strip)
+        assert abs(strip_box["x"] - bar_box["x"]) <= _TOL, (
+            f"queued strip and bar left edges diverge: {strip_box['x']:.2f} vs {bar_box['x']:.2f}"
+        )
+        _screenshot(page, "live-workspace-bar-nested-variant")
+    finally:
+        page.unroute_all(behavior="ignoreErrors")
+        _release_gates(mock_llm_server_url)
+        reset_mock_llm(mock_llm_server_url)
