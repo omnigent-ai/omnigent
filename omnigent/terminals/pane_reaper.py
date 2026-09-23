@@ -12,6 +12,7 @@ This reaps a single native pane only when it is genuinely unused. "Busy" is the
 disjunction of these signals (any one spares the pane):
 
   * an in-flight runner turn (``has_active_turn``), OR
+  * messages still queued for the pane (for one idle window), OR
   * live work or a human wait: a running tool call, a pending runner approval,
     an open prompt park younger than
     :envvar:`OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S`, claude's approval marker, or
@@ -29,9 +30,12 @@ tmux client probe is a blocking ``subprocess`` call, so it runs off the event
 loop via ``asyncio.to_thread``.
 
 Teardown is **pane-scoped** (``reap`` closes only the one native terminal, not
-the conversation's other terminals), leaving the session's primary OSEnv +
-server-side transcript intact — the next message re-creates the pane and the
-vendor CLI resumes via its own ``--resume``.
+the conversation's other terminals). It closes the pane and releases its
+sidecars (forwarder or bridge task, comment relay, vendor server) under the
+harness's per-session ensure lock, after re-testing attached clients and live
+work with no await in between. The session's primary OSEnv + server-side
+transcript stay intact — the next message re-creates the pane and its sidecars,
+and the vendor CLI resumes via its own ``--resume``.
 """
 
 from __future__ import annotations
@@ -100,6 +104,8 @@ class SpareReason(StrEnum):
     """Why a pane is not reaped this scan."""
 
     RUNNER_TURN = "runner_turn"
+    # Messages buffered for the pane, still waiting to be delivered.
+    QUEUED_INPUT = "queued_input"
     TOOL_CALL = "tool_call"
     AWAITING_HUMAN = "awaiting_human"
     CHILDREN = "children"
@@ -181,7 +187,9 @@ class NativePaneReaper:
         turn, is reporting ``running``, or has an attached tmux client. Async so
         the (blocking) tmux probe runs off the event loop.
     :param reap: ``async`` pane-scoped teardown — closes only this one native
-        terminal, leaving the session resumable.
+        terminal and releases its sidecars, leaving the session resumable. May
+        return ``False`` to report that it spared the pane after all (it
+        re-checked under a lock).
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
         knob; ``<= 0`` disables reaping.
     :param reaper_interval_s: Seconds between scans.
@@ -192,7 +200,7 @@ class NativePaneReaper:
         *,
         list_native_panes: Callable[[], list[PaneRef]],
         is_busy: Callable[[PaneRef], Awaitable[bool]],
-        reap: Callable[[PaneRef], Awaitable[None]],
+        reap: Callable[[PaneRef], Awaitable[bool | None]],
         idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
     ) -> None:
@@ -284,18 +292,26 @@ class NativePaneReaper:
             if await self._is_busy(pane):
                 self._last_busy_at[pane.conversation_id] = time.monotonic()
                 continue
-            _logger.info(
-                "reaping idle native pane for conversation %s (%s; idle > %.0fs)",
-                pane.conversation_id,
-                pane.terminal_name,
-                self._idle_timeout_s,
-            )
             # Drop the clock entry up front: a reap failure then re-arms the grace
             # window next scan instead of permanently skipping the conversation.
             self._last_busy_at.pop(pane.conversation_id, None)
             try:
-                await self._reap(pane)
+                reaped = await self._reap(pane)
             except Exception:
                 _logger.exception(
                     "native pane reaper: reap failed for conversation %s", pane.conversation_id
                 )
+                continue
+            if reaped is False:
+                self._last_busy_at[pane.conversation_id] = time.monotonic()
+                _logger.info(
+                    "native pane teardown for %s did not close it; re-arming",
+                    pane.conversation_id,
+                )
+                continue
+            _logger.info(
+                "reaped idle native pane for conversation %s (%s; idle > %.0fs)",
+                pane.conversation_id,
+                pane.terminal_name,
+                self._idle_timeout_s,
+            )

@@ -62,12 +62,18 @@ _READERS = frozenset(
         "last_control_idle_at",
         "session_ids",
         "status_view",
+        "edge_mark",
     }
 )
 # writer -> the (module, function) pairs allowed to call it.
 _WRITER_CALLERS: dict[str, frozenset[tuple[Path, str]]] = {
     "record": frozenset(),  # audited by name in _RECORDERS
-    "reset": frozenset({(_REGISTRY_MODULE, "reset_session_status")}),
+    "reset": frozenset(
+        {
+            (_REGISTRY_MODULE, "reset_session_status"),
+            (_REGISTRY_MODULE, "_finalize_terminal_exit"),
+        }
+    ),
     "forget": frozenset({(_REGISTRY_MODULE, "cleanup_session"), (_APP_MODULE, "delete_session")}),
     "transfer": frozenset({(_REGISTRY_MODULE, "transfer_terminal")}),
 }
@@ -114,6 +120,8 @@ _RETIRED_STATUS_NAMES = frozenset({"_native_pane_status", "_published_session_st
 _STATUS_READING_PATHS: dict[str, frozenset[str]] = {
     "_native_session_hold_reasons": frozenset({"blocked"}),
     "_native_pane_is_busy": frozenset({"claim"}),
+    "_native_pane_close_snapshot": frozenset({"claim"}),
+    "_native_sidecars_still_needed": frozenset(),
     "_handle_claude_native_model_change": frozenset({"current"}),
     "_native_turn_in_flight": frozenset({"blocked", "current", "last_dispatch_at", "age_s"}),
 }

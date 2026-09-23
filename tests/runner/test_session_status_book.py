@@ -166,6 +166,27 @@ def test_dispatch_and_control_stamps() -> None:
     assert book.last_control_idle_at("conv") == 1001.0
 
 
+def test_a_marked_reset_spares_an_edge_recorded_after_the_mark() -> None:
+    book, _ = _book()
+    book.record("conv", "running", source=StatusSource.PTY)
+    mark = book.edge_mark("conv")
+    # Any edge moves the mark, a duplicate from another channel included.
+    book.record("conv", "running", source=StatusSource.RELAY)
+    assert book.edge_mark("conv") is not mark
+
+    book.reset("conv", "native_terminal_exited", mark=mark)
+    record = book.current("conv")
+    assert record is not None and record.status == "running"
+
+    book.reset("conv", "native_terminal_exited", mark=book.edge_mark("conv"))
+    assert book.current("conv") is None
+    # An edge that opens a record after an empty mark is spared too.
+    mark = book.edge_mark("conv")
+    book.record("conv", "running", source=StatusSource.RUNNER)
+    book.reset("conv", "native_terminal_exited", mark=mark)
+    assert book.current("conv") is not None
+
+
 def test_concurrent_writers_keep_seq_monotonic() -> None:
     book = SessionStatusBook()
     seen: list[int] = []

@@ -155,6 +155,7 @@ from omnigent.runner.native import (
 )
 from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
+from omnigent.runner.native.pane_probe_types import NativeProbeContext, TurnProbe, TurnState
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     _STATUS_EMITTING_TERMINAL_ROLES,
@@ -198,6 +199,7 @@ from omnigent.terminals.pane_reaper import (
     SpareReason,
     resolve_approval_max_s,
     resolve_max_turn_s,
+    resolve_native_pane_idle_timeout_s,
 )
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.tools.builtins.load_skill import (
@@ -338,6 +340,9 @@ for _builder_name in (
 _FORWARDER_OWNED_IDLE_HARNESSES: frozenset[str] = frozenset(
     {CODEX_NATIVE_TERMINAL_ROLE, ANTIGRAVITY_NATIVE_TERMINAL_ROLE}
 )
+
+# Bound on awaiting a cancelled runner-side sidecar task during pane teardown.
+_NATIVE_SIDECAR_CANCEL_TIMEOUT_S = 5.0
 
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
@@ -1180,6 +1185,21 @@ class _CommentRelayBinding:
     relay: ClaudeNativeToolRelay
     spec_entry: _SpecEntry | None
     bridge_dir: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class _TurnBoundSidecars:
+    """The per-turn sidecars a native teardown decided on, read before it awaits.
+
+    A message that arrives while the pane closes starts its own relay and
+    prompt waiter; the release leaves those alone.
+
+    :param relay: The session's tool/comment relay, or ``None``.
+    :param prompt_waiter: The claude prompt waiter task, or ``None``.
+    """
+
+    relay: ClaudeNativeToolRelay | None
+    prompt_waiter: asyncio.Task[None] | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3081,6 +3101,32 @@ def create_runner_app(
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    # Per-session ensure locks by native agent key. Launch, ensure and pane
+    # teardown all serialize on the same per-session lock.
+    _native_terminal_ensure_locks_by_key = _require_full_native_lock_coverage(
+        {
+            "claude": _claude_terminal_ensure_locks,
+            "codex": _codex_terminal_ensure_locks,
+            "pi": _pi_terminal_ensure_locks,
+            "cursor": _cursor_terminal_ensure_locks,
+            "kiro": _kiro_terminal_ensure_locks,
+            "antigravity": _antigravity_terminal_ensure_locks,
+            "opencode": _opencode_terminal_ensure_locks,
+            "goose": _goose_terminal_ensure_locks,
+            "hermes": _hermes_terminal_ensure_locks,
+            "qwen": _qwen_terminal_ensure_locks,
+            "kimi": _kimi_terminal_ensure_locks,
+            "devin": _devin_terminal_ensure_locks,
+        }
+    )
+    app.state.native_terminal_ensure_locks = _native_terminal_ensure_locks_by_key
+
+    def _pop_terminal_ensure_locks(session_id: str) -> None:
+        """Drop every per-harness ensure lock held for *session_id*."""
+        for locks in _native_terminal_ensure_locks_by_key.values():
+            locks.pop(session_id, None)
+        _repl_terminal_ensure_locks.pop(session_id, None)
+
     # custom-lint: disable-next=session-status-single-source -- this runner's own turn tasks
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
@@ -4478,22 +4524,7 @@ def create_runner_app(
             # (claude/codex/antigravity) add a pre_launch check and, for
             # claude/codex, a build_context enrichment. All wire the comment
             # relay (pi/opencode route their policy hook through it).
-            _launch_locks = _require_full_native_lock_coverage(
-                {
-                    "claude": _claude_terminal_ensure_locks,
-                    "codex": _codex_terminal_ensure_locks,
-                    "pi": _pi_terminal_ensure_locks,
-                    "cursor": _cursor_terminal_ensure_locks,
-                    "kiro": _kiro_terminal_ensure_locks,
-                    "antigravity": _antigravity_terminal_ensure_locks,
-                    "opencode": _opencode_terminal_ensure_locks,
-                    "goose": _goose_terminal_ensure_locks,
-                    "hermes": _hermes_terminal_ensure_locks,
-                    "qwen": _qwen_terminal_ensure_locks,
-                    "kimi": _kimi_terminal_ensure_locks,
-                    "devin": _devin_terminal_ensure_locks,
-                }
-            )[_native_agent.key]
+            _launch_locks = _native_terminal_ensure_locks_by_key[_native_agent.key]
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
@@ -5132,17 +5163,7 @@ def create_runner_app(
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
-        _codex_terminal_ensure_locks.pop(session_id, None)
-        _claude_terminal_ensure_locks.pop(session_id, None)
-        _pi_terminal_ensure_locks.pop(session_id, None)
-        _cursor_terminal_ensure_locks.pop(session_id, None)
-        _kiro_terminal_ensure_locks.pop(session_id, None)
-        _antigravity_terminal_ensure_locks.pop(session_id, None)
-        _goose_terminal_ensure_locks.pop(session_id, None)
-        _qwen_terminal_ensure_locks.pop(session_id, None)
-        _kimi_terminal_ensure_locks.pop(session_id, None)
-        _hermes_terminal_ensure_locks.pop(session_id, None)
-        _repl_terminal_ensure_locks.pop(session_id, None)
+        _pop_terminal_ensure_locks(session_id)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
@@ -8425,6 +8446,58 @@ def create_runner_app(
         del _session_comment_relays[session_id]
         relay.close()
 
+    app.state.session_comment_relays = _session_comment_relays
+
+    # ── Native pane teardown ────────────────────────────────────────────
+    # A native pane runs beside per-session sidecars: a forwarder or bridge
+    # task, the tool/comment relay, and for codex / opencode a vendor server.
+    # The idle reaper and a user's terminal DELETE release them here, under
+    # the harness's per-session ensure lock.
+
+    def _native_ensure_lock(conv_id: str, terminal_name: str) -> asyncio.Lock:
+        """The per-session lock the launch and ensure paths hold for this harness."""
+        agent = native_coding_agent_for_terminal_name(terminal_name)
+        locks = _native_terminal_ensure_locks_by_key.get(agent.key) if agent is not None else None
+        if locks is None:
+            return asyncio.Lock()
+        return locks.setdefault(conv_id, asyncio.Lock())
+
+    # Monotonic time each session's message buffer was first seen non-empty,
+    # and the sessions already warned about as stranded.
+    _queued_input_since: dict[str, float] = {}
+    _queued_input_warned: set[str] = set()
+
+    def _queued_input_holds(conv_id: str, facts: dict[str, object]) -> bool:
+        """Whether messages buffered for *conv_id* still hold its pane.
+
+        A buffer drains within seconds of the pane going idle; one still full
+        after an idle window is stranded, and holding the pane for it would
+        leak the pane for the rest of the session. The messages stay buffered
+        for the next turn either way.
+        """
+        queued = _session_message_buffers.get(conv_id)
+        if not queued:
+            _queued_input_since.pop(conv_id, None)
+            _queued_input_warned.discard(conv_id)
+            return False
+        now = time.monotonic()
+        age = now - _queued_input_since.setdefault(conv_id, now)
+        facts["queued_input"], facts["queued_input_age_s"] = len(queued), age
+        max_s = resolve_native_pane_idle_timeout_s() or 3600.0
+        if age < max_s:
+            return True
+        if conv_id not in _queued_input_warned:
+            _queued_input_warned.add(conv_id)
+            _logger.warning(
+                "native pane %s: %d queued message(s) not delivered for %.0fs; "
+                "no longer holding the pane for them",
+                conv_id,
+                len(queued),
+                age,
+                extra={"session_id": conv_id},
+            )
+        return False
+
     def _native_session_hold_reasons(
         conv_id: str,
         facts: dict[str, object],
@@ -8433,7 +8506,9 @@ def create_runner_app(
     ) -> set[SpareReason]:
         """Live work or a human wait holding *conv_id*'s native pane.
 
-        Synchronous and free of tmux I/O.
+        The one reading of these signals, shared by the reaper's busy check and
+        the teardown re-test. Synchronous and free of tmux I/O, so a teardown
+        re-tests it with no await before acting.
 
         :param facts: Diagnostics the checks add to, e.g. ``park_age_s``.
         :param approval_max_s: Oldest human-wait signal still honored.
@@ -8446,6 +8521,8 @@ def create_runner_app(
             process_manager is not None and process_manager.has_active_turn(conv_id)
         ):
             reasons.add(SpareReason.RUNNER_TURN)
+        if _queued_input_holds(conv_id, facts):
+            reasons.add(SpareReason.QUEUED_INPUT)
         if mcp_execution_registry.has_live_operation(conv_id):
             reasons.add(SpareReason.TOOL_CALL)
         # A pane parked on a prompt emits nothing and reports no turn, so
@@ -8469,6 +8546,358 @@ def create_runner_app(
         if _has_live_children(conv_id):
             reasons.add(SpareReason.CHILDREN)
         return reasons
+
+    def _native_session_live_work(conv_id: str) -> str | None:
+        """Why *conv_id* still has work in flight or a human waiting, else ``None``."""
+        reasons = _native_session_hold_reasons(
+            conv_id, {}, approval_max_s=resolve_approval_max_s()
+        )
+        return ",".join(sorted(reason.value for reason in reasons)) or None
+
+    async def _run_native_turn_probe(
+        conv_id: str, harness_key: str | None, *, cheap_only: bool
+    ) -> TurnProbe | None:
+        """Ask the harness's own state for its turn; ``None`` if it has no probe."""
+        from omnigent.native.native_dispatch import resolve_hook_for_key
+
+        if harness_key is None:
+            return None
+        probe = resolve_hook_for_key(harness_key, "pane_turn_probe")
+        if probe is None:
+            return None
+        forwarder = _native_runtime._AUTO_FORWARDER_TASKS.get(conv_id)
+
+        async def _labels() -> Mapping[str, str]:
+            return await _session_labels_for_runner_spawn(
+                server_client=server_client, session_id=conv_id
+            )
+
+        ctx = NativeProbeContext(
+            session_id=conv_id,
+            harness_key=harness_key,
+            resource_registry=resource_registry,
+            status_book=_status_book,
+            session_labels=_labels,
+            forwarder_alive=forwarder is not None and not forwarder.done(),
+            cheap_only=cheap_only,
+        )
+        try:
+            return await asyncio.wait_for(probe(ctx), timeout=2 * ctx.timeout_s)
+        except Exception as exc:  # noqa: BLE001 - a failed probe answers UNKNOWN.
+            _logger.warning(
+                "native pane probe failed for %s (%s): %r",
+                conv_id,
+                harness_key,
+                exc,
+                extra={"session_id": conv_id},
+            )
+            return TurnProbe(TurnState.UNKNOWN, "inferred", detail=type(exc).__name__)
+
+    async def _native_pane_close_snapshot(
+        conv_id: str, harness_key: str | None
+    ) -> tuple[bool, TurnProbe | None]:
+        """What must be read before a pane closes, since the close may reset it.
+
+        :returns: Whether a running claim (relayed ones too) is recorded, and
+            the harness's cheap probe answer (``None`` when it has none).
+        """
+        claimed = _status_book.claim(conv_id, include_relay=True) is not None
+        cheap = await _run_native_turn_probe(conv_id, harness_key, cheap_only=True)
+        return claimed, cheap
+
+    async def _native_sidecars_still_needed(
+        conv_id: str, harness_key: str | None, before_close: tuple[bool, TurnProbe | None]
+    ) -> str | None:
+        """Why a session whose pane was deleted must keep its sidecars, else ``None``.
+
+        Stricter than the reaper's idle test, because no idle window has been
+        observed: live work, a running claim recorded before the close, or a
+        probe answer other than INACTIVE keeps them. A codex thread or an
+        opencode turn keeps running after its TUI is gone.
+        """
+        why = _native_session_live_work(conv_id)
+        if why is not None:
+            return why
+        claimed, probe = before_close
+        if claimed:
+            return "status_claim"
+        if probe is None:
+            probe = await _run_native_turn_probe(conv_id, harness_key, cheap_only=False)
+        if probe is not None and probe.state is not TurnState.INACTIVE:
+            return f"probe {probe.state.value}"
+        return None
+
+    def _native_sidecar_sessions(conv_id: str, terminal_name: str) -> tuple[str, ...]:
+        """Sessions whose sidecars serve *conv_id*'s native pane.
+
+        Sidecars stay keyed by the session that launched the pane, so a pane
+        that arrived by a ``/clear``-style transfer is also served by that
+        session's — unless it has a pane of its own again.
+        """
+        home = resource_registry.sidecar_home(conv_id)
+        registry = resource_registry.terminal_registry
+        if home == conv_id or (
+            registry is not None and registry.get(home, terminal_name, "main") is not None
+        ):
+            return (conv_id,)
+        return (conv_id, home)
+
+    def _turn_bound_sidecars(conv_id: str) -> _TurnBoundSidecars:
+        binding = _session_comment_relays.get(conv_id)
+        return _TurnBoundSidecars(
+            relay=binding.relay if binding is not None else None,
+            prompt_waiter=_claude_prompt_waiters.get(conv_id),
+        )
+
+    async def _release_native_session_sidecars(
+        conv_id: str,
+        harness_key: str | None,
+        *,
+        reason: str,
+        reset_status: bool = True,
+        decided: _TurnBoundSidecars | None = None,
+    ) -> tuple[str, ...]:
+        """Release a native session's sidecars and per-pane state (idempotent).
+
+        Queued user input is left buffered for the next turn to drain. Sessions
+        that kept their status for this session's vendor server (a TUI a
+        ``/clear`` rotation moved to them was lost mid-turn) are reset too.
+
+        :param reset_status: Drop the session's recorded status first, with no
+            await before it, so a turn that starts during the release keeps
+            its own edges. ``False`` when a pane close already reset it.
+        :param decided: The relay and prompt waiter the caller's re-test saw;
+            newer ones belong to a turn that started since and are kept.
+            ``None`` releases whatever is registered.
+        """
+        from omnigent.native import prompt_parks
+
+        resource_registry.reset_statuses_kept_for(conv_id, reason)
+        if reset_status:
+            resource_registry.reset_session_status(conv_id, reason)
+        released = list(
+            await _native_runtime.teardown_native_pane_sidecars(conv_id, harness_key=harness_key)
+        )
+        binding = _session_comment_relays.get(conv_id)
+        if binding is not None and (decided is None or binding.relay is decided.relay):
+            _discard_comment_relay(conv_id, binding.relay)
+            released.append("comment_relay")
+        waiter = _claude_prompt_waiters.get(conv_id)
+        if waiter is not None and (decided is None or waiter is decided.prompt_waiter):
+            del _claude_prompt_waiters[conv_id]
+            waiter.cancel()
+            await asyncio.wait({waiter}, timeout=_NATIVE_SIDECAR_CANCEL_TIMEOUT_S)
+            released.append("claude_prompt_waiter")
+        prompt_parks.clear_session(conv_id)
+        return tuple(released)
+
+    def _log_native_teardown_spared(conv_id: str, terminal_name: str, why: str) -> None:
+        _logger.info(
+            "native pane %s (%s) spared at teardown: %s",
+            conv_id,
+            terminal_name,
+            why,
+            extra=debug_event(
+                "native_pane_spared",
+                session_id=conv_id,
+                terminal_name=terminal_name,
+                reasons=why,
+                stage="teardown",
+            ),
+        )
+
+    def _log_native_teardown(
+        conv_id: str,
+        terminal_name: str,
+        *,
+        kind: str,
+        reason: str,
+        closed: bool,
+        released: Sequence[str],
+        kept: str | None,
+    ) -> None:
+        _logger.info(
+            "native %s teardown for %s (%s, %s): closed=%s released=[%s]%s",
+            kind,
+            conv_id,
+            terminal_name,
+            reason,
+            closed,
+            ",".join(released),
+            f" kept sidecars: {kept}" if kept else "",
+            extra=debug_event(
+                "native_pane_teardown",
+                session_id=conv_id,
+                terminal_name=terminal_name,
+                kind=kind,
+                reason=reason,
+                closed=closed,
+                sidecars=",".join(released),
+                kept=kept,
+            ),
+        )
+
+    async def _teardown_native_pane(
+        conv_id: str,
+        terminal_name: str,
+        *,
+        reason: str,
+        socket_path: Path | None = None,
+    ) -> bool:
+        """Close an idle native pane and release its sidecars, under its ensure lock.
+
+        The pane is spared when a client is attached or
+        :func:`_native_session_live_work` holds, re-tested with no await before
+        the close: a message that bound its turn first aborts the teardown, and
+        one that arrives later waits on the lock and re-creates the pane.
+
+        :param conv_id: Owning conversation id, e.g. ``"conv_abc"``.
+        :param terminal_name: Native terminal name, e.g. ``"opencode"``.
+        :param reason: For logs and the status reset, e.g. ``"idle_reap"``.
+        :param socket_path: tmux socket for the attached-client re-check.
+        :returns: ``True`` when the pane was closed.
+        """
+        from omnigent.native.native_cost_popup import _list_tmux_clients
+        from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+
+        agent = native_coding_agent_for_terminal_name(terminal_name)
+        harness_key = agent.key if agent is not None else None
+        terminal_id = terminal_resource_id(terminal_name, "main")
+        registry = resource_registry.terminal_registry
+        lock = _native_ensure_lock(conv_id, terminal_name)
+        if lock.locked():
+            # A launch or ensure is replacing the pane right now; never wait
+            # for it and then close the pane it just created.
+            _log_native_teardown_spared(conv_id, terminal_name, "launch_in_progress")
+            return False
+        async with lock:
+            why: str | None = None
+            if socket_path is not None and await asyncio.to_thread(
+                _list_tmux_clients, str(socket_path), "main"
+            ):
+                why = "client_attached"
+            else:
+                why = _native_session_live_work(conv_id)
+            if why is not None:
+                _log_native_teardown_spared(conv_id, terminal_name, why)
+                return False
+            # No await between the re-test above and the close: the registry
+            # drops the pane, its role and its status before close_terminal
+            # first yields.
+            sidecar_sessions = _native_sidecar_sessions(conv_id, terminal_name)
+            decided = {session: _turn_bound_sidecars(session) for session in sidecar_sessions}
+            was_registered = (
+                registry is not None and registry.get(conv_id, terminal_name, "main") is not None
+            )
+            closed = False
+            released: list[str] = []
+            try:
+                closed = await resource_registry.close_terminal(conv_id, terminal_id)
+            finally:
+                for session in sidecar_sessions:
+                    released.extend(
+                        await _release_native_session_sidecars(
+                            session,
+                            harness_key,
+                            reason=reason,
+                            reset_status=session != conv_id or not closed,
+                            decided=decided[session],
+                        )
+                    )
+                if closed or (
+                    was_registered
+                    and registry is not None
+                    and registry.get(conv_id, terminal_name, "main") is None
+                ):
+                    _publish_terminal_deleted_event(
+                        conversation_id=conv_id,
+                        terminal_name=terminal_name,
+                        session_key="main",
+                        publish_event=_publish_event,
+                    )
+                _log_native_teardown(
+                    conv_id,
+                    terminal_name,
+                    kind="pane",
+                    reason=reason,
+                    closed=closed,
+                    released=released,
+                    kept=None,
+                )
+            return closed
+
+    # Strong references to post-DELETE sidecar releases (see below).
+    _native_sidecar_release_tasks: set[asyncio.Task[None]] = set()
+    app.state.native_sidecar_release_tasks = _native_sidecar_release_tasks
+
+    async def _release_sidecars_after_pane_delete(
+        conv_id: str,
+        terminal_name: str,
+        sidecar_sessions: tuple[str, ...],
+        before_close: tuple[bool, TurnProbe | None],
+        *,
+        reason: str,
+    ) -> None:
+        """Release a deleted pane's sidecars unless something still needs them.
+
+        Runs off the DELETE request, under the harness's ensure lock. Releasing
+        them resets the session's status too, which the close keeps while a
+        codex or opencode vendor server still runs the turn.
+        """
+        agent = native_coding_agent_for_terminal_name(terminal_name)
+        harness_key = agent.key if agent is not None else None
+        registry = resource_registry.terminal_registry
+        async with _native_ensure_lock(conv_id, terminal_name):
+            if registry is not None and registry.get(conv_id, terminal_name, "main") is not None:
+                return  # a launch re-created the pane; the sidecars are its own
+            kept = await _native_sidecars_still_needed(conv_id, harness_key, before_close)
+            released: list[str] = []
+            if kept is None:
+                decided = {session: _turn_bound_sidecars(session) for session in sidecar_sessions}
+                for session in sidecar_sessions:
+                    released.extend(
+                        await _release_native_session_sidecars(
+                            session,
+                            harness_key,
+                            reason=reason,
+                            decided=decided[session],
+                        )
+                    )
+            _log_native_teardown(
+                conv_id,
+                terminal_name,
+                kind="pane",
+                reason=reason,
+                closed=True,
+                released=released,
+                kept=kept,
+            )
+
+    def _schedule_sidecar_release_after_pane_delete(
+        conv_id: str,
+        terminal_name: str,
+        sidecar_sessions: tuple[str, ...],
+        before_close: tuple[bool, TurnProbe | None],
+    ) -> None:
+        task = asyncio.create_task(
+            _release_sidecars_after_pane_delete(
+                conv_id, terminal_name, sidecar_sessions, before_close, reason="terminal_deleted"
+            ),
+            name=f"native-sidecar-release-{conv_id}",
+        )
+        _native_sidecar_release_tasks.add(task)
+
+        def _done(done: asyncio.Task[None]) -> None:
+            _native_sidecar_release_tasks.discard(done)
+            if not done.cancelled() and (exc := done.exception()) is not None:
+                _logger.warning(
+                    "Releasing native sidecars after terminal delete failed; session=%s",
+                    conv_id,
+                    exc_info=exc,
+                    extra={"session_id": conv_id},
+                )
+
+        task.add_done_callback(_done)
 
     async def _ensure_comment_relay_started(
         session_id: str,
@@ -10822,22 +11251,7 @@ def create_runner_app(
             # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
             # via build_context; codex/antigravity add an ownership check (and
             # codex a one-shot policy-notice response wrap).
-            _ensure_locks = _require_full_native_lock_coverage(
-                {
-                    "claude": _claude_terminal_ensure_locks,
-                    "codex": _codex_terminal_ensure_locks,
-                    "pi": _pi_terminal_ensure_locks,
-                    "cursor": _cursor_terminal_ensure_locks,
-                    "kiro": _kiro_terminal_ensure_locks,
-                    "antigravity": _antigravity_terminal_ensure_locks,
-                    "opencode": _opencode_terminal_ensure_locks,
-                    "goose": _goose_terminal_ensure_locks,
-                    "hermes": _hermes_terminal_ensure_locks,
-                    "qwen": _qwen_terminal_ensure_locks,
-                    "kimi": _kimi_terminal_ensure_locks,
-                    "devin": _devin_terminal_ensure_locks,
-                }
-            )[_ensure_agent.key]
+            _ensure_locks = _native_terminal_ensure_locks_by_key[_ensure_agent.key]
             persist_resource_event = body.get("persist_resource_event") is not False
 
             def _publish_ensure_event(event_session_id: str, event: _JsonObject) -> None:
@@ -11114,6 +11528,18 @@ def create_runner_app(
         terminal_registry = resource_registry.terminal_registry if resource_registry else None
         if terminal_registry is None:
             return
+        # A pane teardown (or launch) in flight holds the ensure lock: let it
+        # settle first, then heal whatever it removed.
+        _lock_agent = native_coding_agent_for_terminal_name(terminal_name)
+        _locks = (
+            _native_terminal_ensure_locks_by_key.get(_lock_agent.key)
+            if _lock_agent is not None
+            else None
+        )
+        _in_flight = _locks.get(conv_id) if _locks is not None else None
+        if _in_flight is not None and _in_flight.locked():
+            async with _in_flight:
+                pass
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None:
             if await instance.is_alive():
@@ -11263,10 +11689,30 @@ def create_runner_app(
         session_id: str,
         terminal_id: str,
     ) -> JSONResponse:
+        # A runner-owned native pane runs beside sidecars; note them before the
+        # close forgets which session launched the pane.
+        role = resource_registry.terminal_resource_role(session_id, terminal_id)
+        native_agent = native_coding_agent_for_harness(role) if role else None
+        if native_agent is not None and terminal_id != terminal_resource_id(
+            native_agent.terminal_name, "main"
+        ):
+            native_agent = None
+        sidecar_sessions: tuple[str, ...] = ()
+        before_close: tuple[bool, TurnProbe | None] = (False, None)
+        if native_agent is not None:
+            sidecar_sessions = _native_sidecar_sessions(session_id, native_agent.terminal_name)
+            before_close = await _native_pane_close_snapshot(session_id, native_agent.key)
+        # A codex or opencode turn outlives its TUI in the vendor server, so
+        # its status stays until the sidecar release below resets it.
         closed = await resource_registry.close_terminal(
             session_id,
             terminal_id,
+            keep_vendor_turn=True,
         )
+        if closed and native_agent is not None:
+            _schedule_sidecar_release_after_pane_delete(
+                session_id, native_agent.terminal_name, sidecar_sessions, before_close
+            )
         if not closed:
             return JSONResponse(
                 status_code=404,
@@ -12696,17 +13142,7 @@ def create_runner_app(
         session_id: str,
     ) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
-        _codex_terminal_ensure_locks.pop(session_id, None)
-        _claude_terminal_ensure_locks.pop(session_id, None)
-        _pi_terminal_ensure_locks.pop(session_id, None)
-        _cursor_terminal_ensure_locks.pop(session_id, None)
-        _kiro_terminal_ensure_locks.pop(session_id, None)
-        _antigravity_terminal_ensure_locks.pop(session_id, None)
-        _goose_terminal_ensure_locks.pop(session_id, None)
-        _qwen_terminal_ensure_locks.pop(session_id, None)
-        _kimi_terminal_ensure_locks.pop(session_id, None)
-        _hermes_terminal_ensure_locks.pop(session_id, None)
-        _repl_terminal_ensure_locks.pop(session_id, None)
+        _pop_terminal_ensure_locks(session_id)
         await resource_registry.cleanup_session(session_id)
         await _delete_native_bridge_dirs(
             server_client=server_client,
@@ -12724,17 +13160,7 @@ def create_runner_app(
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
-        _codex_terminal_ensure_locks.pop(session_id, None)
-        _claude_terminal_ensure_locks.pop(session_id, None)
-        _pi_terminal_ensure_locks.pop(session_id, None)
-        _cursor_terminal_ensure_locks.pop(session_id, None)
-        _kiro_terminal_ensure_locks.pop(session_id, None)
-        _antigravity_terminal_ensure_locks.pop(session_id, None)
-        _goose_terminal_ensure_locks.pop(session_id, None)
-        _qwen_terminal_ensure_locks.pop(session_id, None)
-        _kimi_terminal_ensure_locks.pop(session_id, None)
-        _hermes_terminal_ensure_locks.pop(session_id, None)
-        _repl_terminal_ensure_locks.pop(session_id, None)
+        _pop_terminal_ensure_locks(session_id)
         await _teardown_session_terminals(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))
@@ -13358,7 +13784,6 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
-        from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
@@ -13397,22 +13822,13 @@ def create_runner_app(
                 activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
             )
 
-        async def _reap_native_pane(pane: PaneRef) -> None:
-            try:
-                await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
-            finally:
-                # Closing the codex TUI pane leaves its per-session app-server
-                # (and forwarder) running — no-op for other harnesses. Tear it
-                # down in ``finally`` so an idle-reaped codex session can't orphan
-                # a ``codex app-server`` for the runner's lifetime even when the
-                # pane close above partially fails (the very leak this guards).
-                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
-                _publish_terminal_deleted_event(
-                    conversation_id=pane.conversation_id,
-                    terminal_name=pane.terminal_name,
-                    session_key="main",
-                    publish_event=_publish_event,
-                )
+        async def _reap_native_pane(pane: PaneRef) -> bool:
+            return await _teardown_native_pane(
+                pane.conversation_id,
+                pane.terminal_name,
+                reason="idle_reap",
+                socket_path=pane.socket_path,
+            )
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,

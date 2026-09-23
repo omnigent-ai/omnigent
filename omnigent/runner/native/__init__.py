@@ -132,6 +132,7 @@ from omnigent.runner.native.orchestration import (
     teardown_all_codex_native_app_servers,
     teardown_all_opencode_native_servers,
     teardown_codex_native_app_server,
+    teardown_native_pane_sidecars,
     teardown_opencode_native_server,
 )
 
@@ -267,5 +268,6 @@ __all__ = [
     "teardown_all_codex_native_app_servers",
     "teardown_all_opencode_native_servers",
     "teardown_codex_native_app_server",
+    "teardown_native_pane_sidecars",
     "teardown_opencode_native_server",
 ]

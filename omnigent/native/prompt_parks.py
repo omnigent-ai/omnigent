@@ -111,7 +111,7 @@ class _Released:
         if exc_type is not None and issubclass(exc_type, Exception):
             # The mirror crashed, but its prompts may still be on screen and
             # nothing else will report them: keep them as holds, which expire
-            # at the approval ceiling.
+            # at the approval ceiling or when the pane is torn down.
             kept = [key for key in open_keys(self._session_id) if key.startswith(self._prefix)]
             if kept:
                 _logger.warning(

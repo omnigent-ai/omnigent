@@ -284,6 +284,24 @@ def test_seconds_knobs_fall_back_to_their_defaults_on_bad_input(
     assert resolve() == 42.5
 
 
+async def test_reap_returning_false_rearms_the_clock() -> None:
+    f = _Fakes()
+    f.panes = [_pane("conv_a")]
+
+    async def _spared(pane: PaneRef) -> bool:
+        return False
+
+    r = NativePaneReaper(
+        list_native_panes=lambda: list(f.panes),
+        is_busy=f.is_busy,
+        reap=_spared,
+        idle_timeout_s=10.0,
+    )
+    r._last_busy_at["conv_a"] = time.monotonic() - 1000
+    await r._scan_once()
+    assert time.monotonic() - r._last_busy_at["conv_a"] < 5
+
+
 # ── Human-wait and live-work signals in the runner's busy check ─────────────
 
 

@@ -324,6 +324,11 @@ class SessionStatusPoller:
         self._last_status: SessionStatus | None = None
 
     @property
+    def path(self) -> Path | None:
+        """The resolved status file, or ``None`` while resolving or never resolved."""
+        return self._path
+
+    @property
     def active(self) -> bool:
         """Whether a resolved file is still being read.
 

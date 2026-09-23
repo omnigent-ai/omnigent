@@ -70,6 +70,7 @@ BOOK_READERS = frozenset(
         "last_control_idle_at",
         "session_ids",
         "status_view",
+        "edge_mark",
     }
 )
 

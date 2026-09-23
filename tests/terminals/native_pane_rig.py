@@ -286,3 +286,157 @@ async def build_pane_rig(
         callbacks=callbacks,
         closed=closed,
     )
+
+
+class _FakeServerProcess:
+    """A codex app-server / opencode serve stand-in that records its close."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeRelay:
+    """A tool/comment relay stand-in that records its close."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _TrackedRelay:
+    """Records the close of a real relay the runner started for a turn."""
+
+    def __init__(self, relay: Any) -> None:
+        self.relay = relay
+        self.closed = False
+        real_close = relay.close
+
+        def _close() -> None:
+            self.closed = True
+            real_close()
+
+        relay.close = _close
+
+    def close(self) -> None:
+        self.relay.close()
+
+
+@dataclass
+class PlantedSidecars:
+    """The per-session sidecars a harness's native pane runs beside, faked.
+
+    Only the vendor server the harness really runs is planted (a codex
+    app-server for codex, ``opencode serve`` for opencode): each vendor server's
+    teardown also cancels the forwarder, so planting one for every harness
+    would hide a teardown that forgets the forwarder itself.
+    """
+
+    session_id: str
+    forwarder: asyncio.Task[object]
+    codex_app_server: _FakeServerProcess | None
+    opencode_server: _FakeServerProcess | None
+    relay: _FakeRelay | _TrackedRelay
+    prompt_waiter: asyncio.Task[None]
+    relays: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def planted(self) -> list[str]:
+        """Names of what was planted, in :meth:`leftovers` order."""
+        names = ["forwarder"]
+        if self.codex_app_server is not None:
+            names.append("codex_app_server")
+        if self.opencode_server is not None:
+            names.append("opencode_server")
+        return [*names, "comment_relay", "claude_prompt_waiter"]
+
+    def leftovers(self, app: Any) -> list[str]:
+        """Names of the sidecars still registered or running."""
+        from omnigent.runner.native import orchestration
+
+        sid = self.session_id
+        codex, opencode = self.codex_app_server, self.opencode_server
+        left = []
+        if sid in orchestration._AUTO_FORWARDER_TASKS or not self.forwarder.done():
+            left.append("forwarder")
+        if sid in orchestration._AUTO_CODEX_APP_SERVERS or (codex and not codex.closed):
+            left.append("codex_app_server")
+        if sid in orchestration._AUTO_OPENCODE_SERVERS or (opencode and not opencode.closed):
+            left.append("opencode_server")
+        if sid in app.state.session_comment_relays or not self.relay.closed:
+            left.append("comment_relay")
+        if sid in app.state.claude_prompt_waiters or not self.prompt_waiter.done():
+            left.append("claude_prompt_waiter")
+        return left
+
+    def intact(self, app: Any) -> bool:
+        return self.leftovers(app) == self.planted
+
+    def discard(self) -> None:
+        """Drop whatever the test left registered (test hygiene)."""
+        from omnigent.runner.native import orchestration
+
+        orchestration._AUTO_FORWARDER_TASKS.pop(self.session_id, None)
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(self.session_id, None)
+        orchestration._AUTO_OPENCODE_SERVERS.pop(self.session_id, None)
+        self.forwarder.cancel()
+        self.prompt_waiter.cancel()
+        binding = self.relays.get(self.session_id)
+        if binding is not None and getattr(binding, "relay", None) is self._relay_object():
+            del self.relays[self.session_id]
+        if not self.relay.closed:
+            self.relay.close()
+
+    def _relay_object(self) -> object:
+        return self.relay.relay if isinstance(self.relay, _TrackedRelay) else self.relay
+
+
+def plant_sidecars(
+    app: Any, session_id: str, bridge_dir: Path, *, harness_key: str
+) -> PlantedSidecars:
+    """Register the sidecars *harness_key*'s native pane runs for *session_id*.
+
+    Every harness gets a forwarder task, a tool/comment relay and a claude
+    prompt waiter; only codex gets a codex app-server and only opencode an
+    ``opencode serve``. A relay the runner already started for the session
+    (the per-turn ensure does for claude, codex and antigravity) is kept and
+    tracked instead of replaced.
+    """
+    from omnigent.runner.app import _CommentRelayBinding
+    from omnigent.runner.native import orchestration
+
+    forwarder: asyncio.Task[object] = asyncio.create_task(asyncio.sleep(3600))
+    orchestration._register_auto_forwarder_task(session_id, forwarder)
+    codex_app_server = _FakeServerProcess() if harness_key == "codex" else None
+    opencode_server = _FakeServerProcess() if harness_key == "opencode" else None
+    if codex_app_server is not None:
+        orchestration._AUTO_CODEX_APP_SERVERS[session_id] = codex_app_server  # type: ignore[assignment]
+    if opencode_server is not None:
+        orchestration._AUTO_OPENCODE_SERVERS[session_id] = opencode_server  # type: ignore[assignment]
+    relays = app.state.session_comment_relays
+    existing = relays.get(session_id)
+    relay: _FakeRelay | _TrackedRelay
+    if existing is not None:
+        relay = _TrackedRelay(existing.relay)
+    else:
+        relay = _FakeRelay()
+        relays[session_id] = _CommentRelayBinding(
+            relay=relay,  # type: ignore[arg-type]
+            spec_entry=None,
+            bridge_dir=bridge_dir,
+        )
+    prompt_waiter: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(3600))
+    app.state.claude_prompt_waiters[session_id] = prompt_waiter
+    return PlantedSidecars(
+        session_id=session_id,
+        forwarder=forwarder,
+        codex_app_server=codex_app_server,
+        opencode_server=opencode_server,
+        relay=relay,
+        prompt_waiter=prompt_waiter,
+        relays=relays,
+    )

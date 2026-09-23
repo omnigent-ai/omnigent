@@ -61,7 +61,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.native.native_dispatch import resolve_hook
+from omnigent.native.native_dispatch import resolve_hook, resolve_hook_for_key
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -274,6 +274,86 @@ async def teardown_all_opencode_native_servers() -> None:
     for session_id in list(_AUTO_OPENCODE_SERVERS):
         with contextlib.suppress(Exception):
             await teardown_opencode_native_server(session_id)
+
+
+async def teardown_native_pane_sidecars(
+    session_id: str, *, harness_key: str | None = None
+) -> tuple[str, ...]:
+    """
+    Release the per-session processes and tasks a native pane runs beside.
+
+    Driven by registry membership, not by harness name, so every harness is
+    covered: the codex app-server, the ``opencode serve`` process (and its MCP
+    children), and the forwarder / bridge / reader task each harness registers
+    in :data:`_AUTO_FORWARDER_TASKS`. The harness provider's optional
+    ``pane_teardown`` hook runs last. Each step is best-effort, so one failure
+    does not leak the rest. The next native-terminal ensure re-creates them.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param harness_key: Native agent key, e.g. ``"opencode"``, selecting the
+        provider hook; ``None`` skips it.
+    :returns: Names of what was released, e.g. ``("forwarder", "opencode_server")``.
+    """
+    released: list[str] = []
+    had_forwarder = session_id in _AUTO_FORWARDER_TASKS
+    steps: list[tuple[str, Callable[[str], Awaitable[None]]]] = []
+    if session_id in _AUTO_CODEX_APP_SERVERS:
+        steps.append(("codex_app_server", teardown_codex_native_app_server))
+    if session_id in _AUTO_OPENCODE_SERVERS:
+        steps.append(("opencode_server", teardown_opencode_native_server))
+    steps.append(("forwarder", _cancel_auto_forwarder_task))
+    for name, step in steps:
+        try:
+            await step(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one failed release must not leak the rest
+            _logger.warning(
+                "Releasing native pane %s failed; session=%s",
+                name,
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            continue
+        if name != "forwarder":
+            released.append(name)
+    if had_forwarder and session_id not in _AUTO_FORWARDER_TASKS:
+        released.append("forwarder")
+    hook = resolve_hook_for_key(harness_key, "pane_teardown") if harness_key else None
+    if hook is not None:
+        try:
+            await hook(session_id)
+            released.append("provider_hook")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a provider hook failure is logged, not raised
+            _logger.warning(
+                "Native pane teardown hook for %s failed; session=%s",
+                harness_key,
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+    return tuple(released)
+
+
+def native_vendor_server_registered(session_id: str, role: str) -> bool:
+    """Whether the vendor server behind a *role* TUI still serves *session_id*.
+
+    Codex runs each turn in its app-server and opencode in ``opencode serve``;
+    their TUI only shows it, so a turn outlives a lost TUI while the server is
+    registered. Other native roles have no vendor server.
+
+    :param session_id: Session whose sidecars to check, e.g. ``"conv_abc123"``.
+    :param role: Native terminal role, e.g. ``"codex-native"``.
+    :returns: ``True`` while that harness's server is registered for the session.
+    """
+    if role == CODEX_NATIVE_TERMINAL_ROLE:
+        return session_id in _AUTO_CODEX_APP_SERVERS
+    if role == OPENCODE_NATIVE_TERMINAL_ROLE:
+        return session_id in _AUTO_OPENCODE_SERVERS
+    return False
 
 
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:

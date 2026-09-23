@@ -107,6 +107,15 @@ class NativeHarnessProvider:
     stop_handler: str | None = None
     materialize_agent_spec: str | None = None  # built-in agent seeding
     bridge_dir: str | None = None  # cost-popup bridge-dir lookup
+    # Native pane teardown: ``async (NativeProbeContext) -> TurnProbe | None``
+    # asking the harness's own state whether its agent is still working (see
+    # ``omnigent.runner.native.pane_probe_types``). ``None`` when the harness's
+    # running/idle is pane-derived and needs no probe.
+    pane_turn_probe: str | None = None
+    # Optional ``async (session_id: str) -> None`` releasing per-session pane
+    # sidecars the runner's shared registries do not track. Called last when a
+    # pane is reaped or deleted.
+    pane_teardown: str | None = None
 
 
 @dataclass(frozen=True)

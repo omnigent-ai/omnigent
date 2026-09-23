@@ -29,6 +29,9 @@ from omnigent.debug_logging import debug_event
 
 _logger = logging.getLogger(__name__)
 
+# ``reset`` without a mark: drop the session's status unconditionally.
+_UNMARKED = object()
+
 
 class StatusSource(StrEnum):
     """The channel a status edge arrived on."""
@@ -279,7 +282,7 @@ class SessionStatusBook:
         if source == StatusSource.CONTROL and status == "idle":
             self._control_idle_at[session_id] = now
 
-    def reset(self, session_id: str, reason: str) -> None:
+    def reset(self, session_id: str, reason: str, *, mark: object = _UNMARKED) -> None:
         """Drop a session's status after its pane was torn down.
 
         Keeps the dispatch and interrupt stamps: they order evidence that
@@ -288,10 +291,26 @@ class SessionStatusBook:
 
         :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
         :param reason: Why, for the log, e.g. ``"native_terminal_closed"``.
+        :param mark: From :meth:`edge_mark`, taken before the teardown awaited
+            anything. When given, nothing is dropped if an edge was recorded
+            since: it belongs to whatever started meanwhile (a new turn while
+            the old pane closed), not to the torn-down pane.
         """
+        dropped: StatusRecord | None = None
         with self._lock:
-            dropped = self._records.pop(session_id, None)
-        if dropped is not None:
+            spared = mark is not _UNMARKED and self._records.get(session_id) is not mark
+            if not spared:
+                dropped = self._records.pop(session_id, None)
+        if spared:
+            _logger.debug(
+                "session status reset skipped: session=%s reason=%s (an edge landed since)",
+                session_id,
+                reason,
+                extra=debug_event(
+                    "session_status_reset_skipped", session_id=session_id, reason=reason
+                ),
+            )
+        elif dropped is not None:
             _logger.debug(
                 "session status reset: session=%s reason=%s status=%s",
                 session_id,
@@ -331,6 +350,17 @@ class SessionStatusBook:
                     stamps[target_id] = stamp
 
     # ── readers ──────────────────────────────────────────────────────────
+
+    def edge_mark(self, session_id: str) -> object:
+        """An opaque mark that moves whenever any channel records an edge.
+
+        Duplicates move it too. It says nothing about the status; compare it
+        only by identity, through :meth:`reset`'s *mark*.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        """
+        with self._lock:
+            return self._records.get(session_id)
 
     def current(self, session_id: str) -> StatusRecord | None:
         """Return the last recorded edge from any channel, or ``None``.

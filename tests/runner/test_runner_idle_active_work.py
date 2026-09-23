@@ -26,6 +26,7 @@ from omnigent.runner.app import (
     register_timer,
     unregister_timer,
 )
+from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import NullServerClient
 
 
@@ -341,12 +342,14 @@ async def _native_app_with_session(
     harness: str = "pi-native",
     *,
     status_clock: Callable[[], float] | None = None,
+    terminal_registry: TerminalRegistry | None = None,
 ) -> FastAPI:
     """Build a runner app whose spec resolves to *harness* for *conv_id*.
 
     :param conv_id: Session id the caller will create, e.g. ``"conv_native"``.
     :param harness: Executor harness the spec declares, e.g. ``"pi-native"``.
     :param status_clock: Monotonic clock for the status book, e.g. a fake.
+    :param terminal_registry: Terminal registry the resource registry observes.
     :returns: Fresh FastAPI runner app.
     """
     from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -368,7 +371,9 @@ async def _native_app_with_session(
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
         spec_resolver=await _spec_resolver_returning(spec),
         server_client=NullServerClient(),  # type: ignore[arg-type]
-        resource_registry=SessionResourceRegistry(status_clock=status_clock),
+        resource_registry=SessionResourceRegistry(
+            terminal_registry=terminal_registry, status_clock=status_clock
+        ),
     )
 
 
@@ -478,30 +483,69 @@ async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin(
 
 
 @pytest.mark.asyncio
-async def test_required_native_terminal_exit_releases_idle_pin() -> None:
-    """A required terminal that dies after delivery cannot leave the runner pinned."""
-    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+@pytest.mark.parametrize(
+    ("harness", "role"),
+    [("pi-native", "pi-native"), ("pi-native", None), ("codex-native", "codex-native")],
+    ids=["native_pane", "role_less_pane", "codex_pane_with_app_server"],
+)
+async def test_required_native_terminal_exit_releases_idle_pin(
+    tmp_path: Path, harness: str, role: str | None
+) -> None:
+    """A required terminal that dies after delivery cannot leave the runner pinned.
+
+    The exit arrives as the pane watcher reports it, through the registry.
+    The registry resets a native pane's session, and the runner's exit
+    publisher resets any required terminal's. A codex app-server does not
+    keep the turn: a required terminal's death ends the session.
+    """
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import TerminalLifecycle
     from tests.runner.conftest import _runner_client
+    from tests.runner.helpers import make_test_terminal_instance
+    from tests.terminals.native_pane_rig import _FakeServerProcess
 
     conv_id = "conv_native_exit"
-    app = await _native_app_with_session(conv_id)
+    name = harness.removesuffix("-native")
+    terminals = TerminalRegistry()
+    app = await _native_app_with_session(conv_id, harness=harness, terminal_registry=terminals)
     registry = app.state.session_resource_registry
-    async with _runner_client(app) as client:
-        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
-        assert created.status_code == 201, created.text
-        await _post_status(client, conv_id, "running")
-        assert app.state.has_active_work() is True
-        registry._terminal_exit_publisher(
-            TerminalExitEvent(
+    instance = make_test_terminal_instance(name, "main", tmp_path)
+
+    async def _close() -> None:
+        instance.running = False
+
+    async def _no_link(_link: str) -> None:
+        return None
+
+    instance.close = _close  # type: ignore[method-assign]
+    instance.set_conversation_link = _no_link  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread = lambda *_a, **_k: None  # type: ignore[method-assign]
+    terminals._by_conversation.setdefault(conv_id, {})[(name, "main")] = instance
+    if harness == "codex-native":
+        orchestration._AUTO_CODEX_APP_SERVERS[conv_id] = _FakeServerProcess()  # type: ignore[assignment]
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"}
+            )
+            assert created.status_code == 201, created.text
+            await registry.observe_required_terminal(
+                conv_id, name, "main", instance, resource_role=role
+            )
+            await _post_status(client, conv_id, "running")
+            assert app.state.has_active_work() is True
+            # The pane last reported its prompt back, so this is a clean exit.
+            registry._set_session_status_memo(conv_id, "idle")
+            await registry._handle_terminal_exit(
                 session_id=conv_id,
-                terminal_id="terminal:pi:main",
-                terminal_name="pi",
+                terminal_name=name,
                 session_key="main",
                 lifecycle=TerminalLifecycle.REQUIRED,
-                session_was_idle=True,
+                instance=instance,
             )
-        )
-        assert app.state.has_active_work() is False
+            assert app.state.has_active_work() is False
+    finally:
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(conv_id, None)
 
 
 @pytest.mark.asyncio
@@ -788,45 +832,67 @@ async def test_a_six_hour_native_turn_holds_the_runner_until_its_idle(
 async def test_a_claude_exit_banner_frees_the_runner_and_records_idle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A Claude ``/exit`` during a claimed turn frees the runner and leaves ``idle``.
+    """A Claude ``/exit`` just after its turn frees the runner and leaves ``idle``.
 
-    Printing the resume banner can flip the pane's exit memo back to
-    ``running``, so the exit arrives as not idle. The exit publisher resets
-    the session's status and records the clean stop's ``idle`` as a runner
-    edge: no stale ``running`` holds the runner and no ``failed`` is left.
+    The edges and the exit come from the real pane watcher closure, through
+    the registry. Printing the resume banner after the turn's ``idle`` is pane
+    activity, so the pane reads ``running`` again and the exit is not idle.
+    The registry resets the claude pane's session, then the exit publisher
+    records the clean stop's ``idle`` as a runner edge: no stale ``running``
+    holds the runner and no ``failed`` is left.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
     from omnigent.runner.session_status import StatusSource
-    from tests.runner.conftest import _runner_client, _spec_resolver_returning
-    from tests.terminals.native_pane_rig import build_pane_rig
+    from tests.runner.conftest import _runner_client
+    from tests.runner.helpers import make_test_terminal_instance
 
-    rig = await build_pane_rig(
-        tmp_path,
-        monkeypatch,
-        key="claude",
-        spec_resolver=await _spec_resolver_returning(_native_spec("claude-native")),
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    conv_id = "conv_claude_exit_banner"
+    terminals = TerminalRegistry()
+    app = await _native_app_with_session(
+        conv_id, harness="claude-native", terminal_registry=terminals
     )
-    app, conv_id = rig.app, rig.conv_id
+    registry = app.state.session_resource_registry
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    callbacks: dict[str, Callable[[], None]] = {}
+
+    def _capture_watcher(on_idle: Callable[[], None] | None = None, **kwargs: Any) -> None:
+        for name, callback in (("on_idle", on_idle), *kwargs.items()):
+            if callable(callback):
+                callbacks[name] = callback
+
+    async def _close() -> None:
+        instance.running = False
+
+    async def _fire(name: str) -> None:
+        await asyncio.to_thread(callbacks[name])
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    instance.close = _close  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    instance.pane_pid_sync = lambda: 4178604  # type: ignore[method-assign]
+    terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
     try:
         async with _runner_client(app) as client:
             await _create_session(client, conv_id)
-            await _post_status(client, conv_id, "running")
-            assert app.state.has_active_work() is True
-            rig.drain()
-            rig.resources._terminal_exit_publisher(
-                TerminalExitEvent(
-                    session_id=conv_id,
-                    terminal_id="terminal:claude:main",
-                    terminal_name="claude",
-                    session_key="main",
-                    lifecycle=TerminalLifecycle.REQUIRED,
-                    exit_status=0,
-                    session_was_idle=False,
-                    last_output="Resume this session with:\nclaude --resume 0d5c8f3e",
-                )
+            await registry.observe_required_terminal(
+                conv_id, "claude", "main", instance, resource_role="claude-native"
             )
-            record = rig.book.current(conv_id)
+            await _fire("on_activity")
+            await _fire("on_idle")
+            assert app.state.has_active_work() is False
+            # Printing the banner flips the pane back to running just before it dies.
+            await _fire("on_activity")
+            assert app.state.has_active_work() is True
+            instance.last_pane_text = lambda: (  # type: ignore[method-assign]
+                "Resume this session with:\nclaude --resume 0d5c8f3e"
+            )
+            instance.last_exit_status = lambda: 0  # type: ignore[method-assign]
+            _session_event_queues_ref.pop(conv_id, None)
+            await _fire("on_exit")
+            await registry.wait_for_terminal_exit_cleanup()
+            record = app.state.session_status_book.current(conv_id)
             assert record is not None
             assert (record.status, record.origin) == ("idle", StatusSource.RUNNER)
             assert app.state.has_active_work() is False
@@ -839,7 +905,7 @@ async def test_a_claude_exit_banner_frees_the_runner_and_records_idle(
             ]
             assert published == ["idle"]
     finally:
-        rig.drain()
+        _session_event_queues_ref.pop(conv_id, None)
 
 
 @pytest.mark.asyncio
@@ -1082,3 +1148,432 @@ async def test_a_small_max_turn_knob_cannot_switch_the_runner_hold_off(
         assert app.state.has_active_work() is True
         clock.now += 1.0
         assert app.state.has_active_work() is False
+
+
+# ── losing or tearing down the pane ──
+
+
+async def _plant_pane_sidecars(app: FastAPI, conv_id: str, bridge_dir: Path, key: str) -> Any:
+    """Plant *key*'s pane sidecars, minus claude's prompt waiter.
+
+    A live prompt waiter holds the runner by itself, which would hide the
+    status hold these tests pin.
+
+    :returns: The rig's ``PlantedSidecars``.
+    """
+    from tests.terminals.native_pane_rig import plant_sidecars
+
+    sidecars = plant_sidecars(app, conv_id, bridge_dir, harness_key=key)
+    waiter = app.state.claude_prompt_waiters.pop(conv_id)
+    waiter.cancel()
+    await asyncio.wait({waiter})
+    return sidecars
+
+
+def _kept(sidecars: Any) -> list[str]:
+    """What a kept set of the planted sidecars holds."""
+    return [name for name in sidecars.planted if name != "claude_prompt_waiter"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ends_by", ["relayed_idle", "ceiling", "launching_session_deleted"])
+@pytest.mark.parametrize("rotated", [False, True], ids=["own", "rotated"])
+@pytest.mark.parametrize("how", ["deleted", "exited"])
+@pytest.mark.parametrize("key", ["codex", "opencode"])
+async def test_a_turn_that_outlives_its_tui_holds_the_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    how: str,
+    rotated: bool,
+    ends_by: str,
+) -> None:
+    """Codex and opencode run a turn in their vendor server, not in the TUI.
+
+    Losing the TUI mid-turn, to a user's DELETE or a crash, keeps the turn's
+    relayed ``running`` while the server lives, so the runner stays up for
+    it. The same holds for a TUI that a ``/clear`` rotation moved to another
+    session: its turn still runs in the launching session's server. The
+    turn's relayed ``idle`` ends the hold, so does deleting the launching
+    session (which releases its server), and with no evidence of work the
+    ceiling bounds it like any silent claim.
+
+    :param key: Native harness key, e.g. ``"codex"``.
+    :param how: How the TUI went away.
+    :param rotated: Whether a rotation moved the TUI before it was lost.
+    :param ends_by: What ends the runner's hold.
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    monkeypatch.setenv(_MAX_TURN_ENV, str(_CEILING_S))
+    clock = _Clock()
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key=key,
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec(f"{key}-native")),
+    )
+    app, launching = rig.app, rig.conv_id
+    session = f"{launching}_rotated" if rotated else launching
+    name = rig.agent.terminal_name
+    terminal_id = terminal_resource_id(name, "main")
+    sidecars = await _plant_pane_sidecars(app, launching, tmp_path, key)
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, launching)
+            if rotated:
+                await _create_session(client, session)
+                resp = await client.post(
+                    f"/v1/sessions/{launching}/resources/terminals/{terminal_id}/transfer",
+                    json={"target_session_id": session},
+                )
+                assert resp.status_code == 200, resp.text
+                assert rig.resources.sidecar_home(session) == launching
+            await _post_status(client, session, "running")
+            if how == "deleted":
+                resp = await client.delete(
+                    f"/v1/sessions/{session}/resources/terminals/{terminal_id}"
+                )
+                assert resp.status_code == 200, resp.text
+                releases = set(app.state.native_sidecar_release_tasks)
+                assert releases
+                await asyncio.wait(releases, timeout=10)
+            else:
+                await rig.fire("on_exit")
+                await rig.resources.wait_for_terminal_exit_cleanup()
+            assert rig.terminal_registry.get(session, name, "main") is None
+            assert sidecars.leftovers(app) == _kept(sidecars)
+            assert app.state.has_active_work() is True
+            clock.now += _CEILING_S - 1.0
+            assert app.state.has_active_work() is True
+
+            async def _turn_ends() -> None:
+                if ends_by == "relayed_idle":
+                    await _post_status(client, session, "idle")
+                elif ends_by == "launching_session_deleted":
+                    resp = await client.delete(f"/v1/sessions/{launching}")
+                    assert resp.status_code == 200, resp.text
+                    assert rig.book.current(session) is None
+                else:
+                    clock.now += 1.0
+
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work,
+                release=_turn_ends,
+            )
+    finally:
+        sidecars.discard()
+        rig.drain()
+        _session_event_queues_ref.pop(session, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launching_server", ["gone", "alive"])
+@pytest.mark.parametrize("how", ["deleted", "exited"])
+async def test_a_tui_moved_into_a_session_with_its_own_vendor_server_follows_the_launching_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str, launching_server: str
+) -> None:
+    """The rotated session's own vendor server never keeps a moved TUI's turn.
+
+    Here the rotated session already has a codex app-server of its own when a
+    ``/clear`` rotation moves the launching session's TUI to it, but the moved
+    TUI's turn runs in the launching session's server. With that server gone,
+    losing the TUI resets the rotated session at once. With it alive, the
+    status is kept until the launching session's server is released (here by
+    deleting that session), while the rotated session's own server lives on.
+
+    :param how: How the TUI went away.
+    :param launching_server: Whether the launching session's app-server is
+        still registered when the TUI is lost.
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.native import orchestration
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    monkeypatch.setenv(_MAX_TURN_ENV, str(_CEILING_S))
+    clock = _Clock()
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="codex",
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec("codex-native")),
+    )
+    app, launching = rig.app, rig.conv_id
+    rotated = f"{launching}_rotated"
+    (tmp_path / "rotated").mkdir()
+    sidecars = await _plant_pane_sidecars(app, launching, tmp_path, "codex")
+    own = await _plant_pane_sidecars(app, rotated, tmp_path / "rotated", "codex")
+    terminal_id = terminal_resource_id("codex", "main")
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, launching)
+            await _create_session(client, rotated)
+            resp = await client.post(
+                f"/v1/sessions/{launching}/resources/terminals/{terminal_id}/transfer",
+                json={"target_session_id": rotated},
+            )
+            assert resp.status_code == 200, resp.text
+            assert rig.resources.sidecar_home(rotated) == launching
+            await _post_status(client, rotated, "running")
+            if launching_server == "gone":
+                await orchestration.teardown_codex_native_app_server(launching)
+                assert launching not in orchestration._AUTO_CODEX_APP_SERVERS
+            if how == "deleted":
+                resp = await client.delete(
+                    f"/v1/sessions/{rotated}/resources/terminals/{terminal_id}"
+                )
+                assert resp.status_code == 200, resp.text
+                releases = set(app.state.native_sidecar_release_tasks)
+                if releases:
+                    await asyncio.wait(releases, timeout=10)
+            else:
+                await rig.fire("on_exit")
+                await rig.resources.wait_for_terminal_exit_cleanup()
+            assert rig.terminal_registry.get(rotated, "codex", "main") is None
+            assert rotated in orchestration._AUTO_CODEX_APP_SERVERS
+            if launching_server == "alive":
+                record = rig.book.current(rotated)
+                assert record is not None and record.status == "running"
+                assert app.state.has_active_work() is True
+                resp = await client.delete(f"/v1/sessions/{launching}")
+                assert resp.status_code == 200, resp.text
+                assert rotated in orchestration._AUTO_CODEX_APP_SERVERS
+            assert rig.book.current(rotated) is None
+            assert app.state.has_active_work() is False
+    finally:
+        sidecars.discard()
+        own.discard()
+        rig.drain()
+        _session_event_queues_ref.pop(rotated, None)
+
+
+@pytest.mark.asyncio
+async def test_reaping_the_launching_sessions_own_new_pane_resets_the_status_kept_for_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launching session's pane reap releases its server, so it ends a kept status.
+
+    A ``/clear`` rotation moved the launching session's codex TUI away and that
+    TUI was lost mid-turn, so the rotated session keeps its ``running`` for the
+    launching session's app-server. The launching session then gets a pane of
+    its own again. Reaping that pane closes it (which resets the launching
+    session's own status) and releases its sidecars, app-server included, so
+    the rotated session's kept status is reset too and the runner is freed.
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.native import orchestration
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    monkeypatch.setenv(_MAX_TURN_ENV, str(_CEILING_S))
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="codex",
+        spec_resolver=await _spec_resolver_returning(_native_spec("codex-native")),
+    )
+    app, launching = rig.app, rig.conv_id
+    rotated = f"{launching}_rotated"
+    terminal_id = terminal_resource_id("codex", "main")
+    sidecars = await _plant_pane_sidecars(app, launching, tmp_path, "codex")
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, launching)
+            await _create_session(client, rotated)
+            resp = await client.post(
+                f"/v1/sessions/{launching}/resources/terminals/{terminal_id}/transfer",
+                json={"target_session_id": rotated},
+            )
+            assert resp.status_code == 200, resp.text
+            await _post_status(client, rotated, "running")
+            await rig.fire("on_exit")
+            await rig.resources.wait_for_terminal_exit_cleanup()
+            assert rig.resources._vendor_turn_homes == {rotated: launching}
+            assert app.state.has_active_work() is True
+
+            relaunched = make_test_terminal_instance("codex", "main", tmp_path / "relaunch")
+
+            async def _close() -> None:
+                relaunched.running = False
+
+            relaunched.close = _close  # type: ignore[method-assign]
+            relaunched.start_idle_watcher_thread = lambda **_kwargs: None  # type: ignore[method-assign]
+            panes = rig.terminal_registry._by_conversation.setdefault(launching, {})
+            panes[("codex", "main")] = relaunched
+            await rig.resources.observe_auxiliary_terminal(
+                launching, "codex", "main", relaunched, resource_role="codex-native"
+            )
+            await _post_status(client, launching, "idle")
+
+            assert await rig.reaper._reap(rig.pane) is True
+            assert launching not in orchestration._AUTO_CODEX_APP_SERVERS
+            assert rig.book.current(rotated) is None
+            assert rig.resources._vendor_turn_homes == {}
+            assert app.state.has_active_work() is False
+    finally:
+        sidecars.discard()
+        rig.drain()
+        _session_event_queues_ref.pop(rotated, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["exit", "close"])
+@pytest.mark.parametrize("key", ["codex", "opencode"])
+async def test_an_edge_recorded_while_the_old_pane_closes_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str, path: str
+) -> None:
+    """A new turn's edge that lands while the old TUI is being closed survives it.
+
+    Codex and opencode observe their TUI as auxiliary; with no vendor server
+    registered, losing it resets the session's status. The registry frees the
+    pane's key before the old tmux is killed, so a new turn can start and
+    record its first edge meanwhile. The dead pane's reset spares a record
+    that changed during the close, on the exit path as on a close, and the
+    runner keeps holding for the new turn. The mark protects auxiliary TUIs
+    only: after a REQUIRED pane's exit, the exit publisher decides the
+    session's status (a required exit ends the session).
+
+    :param key: Native harness key, e.g. ``"codex"``.
+    :param path: ``exit`` (the pane died) or ``close`` (it was closed).
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.runner.native import orchestration
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key=key,
+        spec_resolver=await _spec_resolver_returning(_native_spec(f"{key}-native")),
+    )
+    app, conv_id = rig.app, rig.conv_id
+    name = rig.agent.terminal_name
+    assert not orchestration.native_vendor_server_registered(conv_id, f"{key}-native")
+    instance = rig.terminal_registry.get(conv_id, name, "main")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_close() -> None:
+        entered.set()
+        await release.wait()
+        instance.running = False
+
+    instance.close = _slow_close  # type: ignore[method-assign]
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            await _post_status(client, conv_id, "running")
+            if path == "exit":
+                await rig.fire("on_exit")
+                closer = asyncio.ensure_future(rig.resources.wait_for_terminal_exit_cleanup())
+            else:
+                closer = asyncio.ensure_future(
+                    rig.resources.close_terminal(conv_id, terminal_resource_id(name, "main"))
+                )
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert not rig.alive()  # the key is already free for a successor
+            await _post_status(client, conv_id, "running")
+            release.set()
+            await asyncio.wait_for(closer, timeout=5)
+            record = rig.book.current(conv_id)
+            assert record is not None and record.status == "running"
+            assert app.state.has_active_work() is True
+    finally:
+        release.set()
+        rig.drain()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["codex", "opencode", "pi"])
+async def test_deleting_an_idle_tui_releases_its_sidecars_and_the_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """A DELETE whose sidecars nothing needs releases them and the runner's hold.
+
+    The session's ``waiting`` (sub-agents still working when the turn ended)
+    is no claim on the pane, so the sidecars are released, codex's and
+    opencode's vendor servers included, and the release resets the status
+    the close kept for them.
+
+    :param key: Native harness key, e.g. ``"codex"``.
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key=key,
+        spec_resolver=await _spec_resolver_returning(_native_spec(f"{key}-native")),
+    )
+    app, conv_id = rig.app, rig.conv_id
+    sidecars = await _plant_pane_sidecars(app, conv_id, tmp_path, key)
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            await _post_status(client, conv_id, "waiting")
+            assert app.state.has_active_work() is True
+            terminal_id = terminal_resource_id(rig.agent.terminal_name, "main")
+            resp = await client.delete(f"/v1/sessions/{conv_id}/resources/terminals/{terminal_id}")
+            assert resp.status_code == 200, resp.text
+            await asyncio.wait(set(app.state.native_sidecar_release_tasks), timeout=10)
+            assert sidecars.leftovers(app) == []
+            assert app.state.session_status_book.current(conv_id) is None
+            assert app.state.has_active_work() is False
+    finally:
+        sidecars.discard()
+        rig.drain()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["codex", "pi"])
+async def test_a_reap_ends_the_runner_hold_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """A lost closing edge holds the runner only until the reaper tears the pane down.
+
+    The reap closes the pane and releases its sidecars, a codex app-server
+    included, and resets the session's status, so nothing is left to hold
+    the runner.
+
+    :param key: Native harness key, e.g. ``"codex"``.
+    """
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key=key,
+        spec_resolver=await _spec_resolver_returning(_native_spec(f"{key}-native")),
+    )
+    app, conv_id = rig.app, rig.conv_id
+    sidecars = await _plant_pane_sidecars(app, conv_id, tmp_path, key)
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            await _post_status(client, conv_id, "running")
+            assert app.state.has_active_work() is True
+
+            async def _reap() -> None:
+                assert await rig.reaper._reap(rig.pane) is True
+
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work,
+                release=_reap,
+            )
+            assert sidecars.leftovers(app) == []
+    finally:
+        sidecars.discard()
+        rig.drain()
