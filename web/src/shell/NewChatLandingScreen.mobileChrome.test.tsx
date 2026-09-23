@@ -1,3 +1,29 @@
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({ data: undefined, isLoading: false }),
+}));
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 // The landing screen's mobile chrome. One rule, about arriving at "/" on a
 // phone: the composer is not focused, so landing here — including on the way
 // back out of Settings — never throws up the keyboard unasked. (The iOS
@@ -5,12 +31,12 @@
 // hideNativeChatTerminalBar in main.tsx, not per-screen here.)
 
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
@@ -40,8 +66,13 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
-vi.mock("@/hooks/useHostWorktrees", () => ({
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
   useHostWorktrees: () => ({ data: [], isError: false }),
+  hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
+    queryKey: ["host-worktrees", hostId, repoPath],
+    queryFn: async () => [],
+  }),
 }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: () => ({ data: [] }) }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({

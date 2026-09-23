@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from alembic import command
 from sqlalchemy import Engine, inspect, text
 
 from omnigent.db.cockroachdb import (
@@ -13,6 +14,7 @@ from omnigent.db.cockroachdb import (
     _prepare_crdb_schema_transaction,
 )
 from omnigent.db.utils import (
+    _build_alembic_config,
     _get_current_db_revision,
     _get_head_db_revision,
     _initialize_or_verify_schema,
@@ -60,11 +62,14 @@ def test_cockroachdb_upgrades_from_supported_baseline(db_uri: str) -> None:
     if head == CRDB_BASELINE_REVISION:
         pytest.skip("requires a migration after the CRDB baseline")
 
-    with engine.begin() as connection:
-        connection.execute(
-            text("UPDATE alembic_version SET version_num = :revision"),
-            {"revision": CRDB_BASELINE_REVISION},
-        )
+    config = _build_alembic_config(db_uri)
+    with engine.connect() as connection:
+        _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        command.downgrade(config, CRDB_BASELINE_REVISION)
+        connection.commit()
+
+    assert _get_current_db_revision(engine) == CRDB_BASELINE_REVISION
 
     _initialize_or_verify_schema(engine, db_uri)
 
@@ -108,3 +113,108 @@ def test_cockroachdb_resumes_empty_revision_and_repairs_indexes(db_uri: str) -> 
     assert _get_current_db_revision(engine) == head
     assert _CRDB_BOOTSTRAP_MARKER_TABLE not in inspect(engine).get_table_names()
     assert index_name in found
+
+
+def test_account_generation_backfill_resumes_after_schema_commit(db_uri) -> None:
+    from sqlalchemy import event
+
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.server.device_grant_store import DeviceGrantStore
+
+    engine = _crdb_engine(db_uri)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("migration-user", "existing-password-hash")
+    grants = DeviceGrantStore(db_uri)
+    grants.create_redeemed_grant(
+        "migration-grant",
+        user_id="migration-user",
+        client_id="cli",
+        refresh_token_hash="existing-refresh-hash",
+        created_at=100,
+    )
+    config = _build_alembic_config(db_uri)
+    with engine.connect() as connection:
+        _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        command.downgrade(config, "hh1b2c3d4e5f")
+        connection.commit()
+
+    def interrupt_backfill(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE users SET account_generation"):
+            raise RuntimeError("injected backfill interruption")
+
+    event.listen(engine, "before_cursor_execute", interrupt_backfill)
+    try:
+        with pytest.raises(RuntimeError, match="schema migration failed"):
+            _initialize_or_verify_schema(engine, db_uri)
+    finally:
+        event.remove(engine, "before_cursor_execute", interrupt_backfill)
+    assert _get_current_db_revision(engine) == "hh1b2c3d4e5f"
+    assert "account_generation" in {c["name"] for c in inspect(engine).get_columns("users")}
+
+    _initialize_or_verify_schema(engine, db_uri)
+    account = accounts.get_user("migration-user")
+    assert account is not None and len(account.account_generation) == 32
+    assert accounts.get_password_hash("migration-user") == "existing-password-hash"
+    grant = grants.authorize_access("migration-grant")
+    assert grant is not None and grant.account_generation == account.account_generation
+    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+
+
+@pytest.mark.parametrize("failed_attempts", [2, 3])
+def test_project_preferences_copy_retries_serialization_failures(
+    db_uri: str, failed_attempts: int, capfd: pytest.CaptureFixture[str]
+) -> None:
+    from sqlalchemy import event
+
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    engine = _crdb_engine(db_uri)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("ordering-user", "existing-password-hash")
+    config = _build_alembic_config(db_uri)
+    with engine.connect() as connection:
+        _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        command.downgrade(config, "ii1a2b3c4d5e")
+        connection.commit()
+
+    payload = b"legacy project order bytes"
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE users SET project_order = :value WHERE id = 'ordering-user'"),
+            {"value": payload},
+        )
+
+    attempts = 0
+
+    def fail_copy(conn, cursor, statement, parameters, context, executemany):
+        nonlocal attempts
+        if statement.startswith("INSERT INTO preferences"):
+            attempts += 1
+            if attempts <= failed_attempts:
+                # Observed results prevent transparent server retries of a fresh transaction.
+                cursor.execute("SELECT id FROM users WHERE id = 'ordering-user'")
+                cursor.fetchone()
+                return "SELECT crdb_internal.force_retry('10s')", ()
+        return statement, parameters
+
+    event.listen(engine, "before_cursor_execute", fail_copy, retval=True)
+    try:
+        _initialize_or_verify_schema(engine, db_uri)
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_copy)
+
+    assert attempts == 3
+    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+    assert "project_order" not in {c["name"] for c in inspect(engine).get_columns("users")}
+    with engine.connect() as connection:
+        saved = connection.execute(
+            text(
+                "SELECT value FROM preferences "
+                "WHERE user_id = 'ordering-user' AND key = 'project_order'"
+            )
+        ).scalar_one_or_none()
+    assert saved == (payload if failed_attempts == 2 else None)
+    warning = "Could not migrate project order preferences after 3 attempts"
+    assert (warning in capfd.readouterr().err) == (failed_attempts == 3)

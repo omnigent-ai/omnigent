@@ -53,6 +53,24 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("CommandPalette — sessions", () => {
+  it.each([false, true])(
+    "requests active sessions and keeps owned and shared results (sessionsOnly=%s)",
+    (sessionsOnly) => {
+      const sessions = [
+        { ...conv("owned", "Owned session"), owner: "current-user", permission_level: 4 },
+        { ...conv("shared", "Shared session"), owner: "other-user", permission_level: 2 },
+        { ...conv("archived", "Archived session"), archived: true },
+      ];
+      setSessions(sessions);
+      renderPalette({ sessionsOnly });
+
+      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(screen.getByText("Owned session")).toBeTruthy();
+      expect(screen.getByText("Shared session")).toBeTruthy();
+      expect(screen.queryByText("Archived session")).toBeNull();
+    },
+  );
+
   it("fuzzy-matches session names without showing unrelated actions", () => {
     setSessions([
       conv("parser", "Fix the parser"),
@@ -198,22 +216,19 @@ describe("CommandPalette — sessions", () => {
       setSessions([conv("c1", "Fix the parser")]);
       renderPalette();
 
-      // Empty query on mount → shares AppShell's `["conversations","",true]` entry.
-      expect(useConversations).toHaveBeenCalledWith("", true, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
       });
       // Before the debounce elapses the query has NOT yet reached the hook.
-      expect(useConversations).not.toHaveBeenCalledWith("deploy", true, { enabled: true });
+      expect(useConversations).not.toHaveBeenCalledWith("deploy", false, { enabled: true });
 
       act(() => {
         vi.advanceTimersByTime(300);
       });
-      // After the 300ms debounce, the typed query drives a server search with
-      // archived rows included (filtered client-side) — proving the palette
-      // searches the server, not a page.
-      expect(useConversations).toHaveBeenCalledWith("deploy", true, { enabled: true });
+      // The debounced query searches active sessions on the server.
+      expect(useConversations).toHaveBeenCalledWith("deploy", false, { enabled: true });
     } finally {
       vi.useRealTimers();
     }
@@ -402,7 +417,7 @@ describe("CommandPalette — mobile full-screen sheet", () => {
       act(() => {
         vi.advanceTimersByTime(300);
       });
-      expect(useConversations).toHaveBeenCalledWith("deploy", true, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("deploy", false, { enabled: true });
     } finally {
       vi.useRealTimers();
     }

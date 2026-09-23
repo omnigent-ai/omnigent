@@ -18,10 +18,6 @@ import {
   TabletSmartphone,
   Terminal,
   Users,
-  CloudIcon,
-  TabletSmartphoneIcon,
-  UsersIcon,
-  PlayIcon,
   ExternalLinkIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -35,28 +31,35 @@ interface Detail {
 }
 
 const LOCAL_ICONS: { key: string; node: ReactNode; accent?: boolean }[] = [
-  { key: "local", node: <Laptop className="size-8" />, accent: true },
-  { key: "claude", node: <ClaudeCodeColor size={32} /> },
-  { key: "codex", node: <CodexColor size={32} /> },
-  { key: "cursor", node: <CursorMono size={32} /> },
+  { key: "local", node: <Laptop className="size-6" />, accent: true },
+  { key: "claude", node: <ClaudeCodeColor size={24} /> },
+  { key: "codex", node: <CodexColor size={24} /> },
+  { key: "cursor", node: <CursorMono size={24} /> },
 ];
 
-const CLOUD_ICONS: { key: string; node: ReactNode; accent?: boolean }[] = [
-  { key: "cloud", node: <CloudIcon className="size-8" />, accent: true },
-  { key: "tablet", node: <TabletSmartphoneIcon className="size-8" />, accent: true },
-  { key: "users", node: <UsersIcon className="size-8" />, accent: true },
-  { key: "play", node: <PlayIcon className="size-8" />, accent: true },
-];
+/** Overlapping harness-icon row shown in the panel band (collapsed flavor). */
+export function HarnessIconRow() {
+  return (
+    <div className="flex -space-x-2">
+      {LOCAL_ICONS.map(({ key, node, accent }) => (
+        <span
+          key={key}
+          className={cn(
+            "flex size-12 items-center justify-center rounded-xl border bg-background",
+            accent ? "border-brand-accent/25 text-brand-accent" : "border-border",
+          )}
+        >
+          {node}
+        </span>
+      ))}
+    </div>
+  );
+}
 
 const MODES: {
   id: Mode;
   title: string;
   details: Detail[];
-  iconSet?: {
-    key: string;
-    node: ReactNode;
-    accent?: boolean;
-  }[];
 }[] = [
   {
     id: "local",
@@ -72,7 +75,6 @@ const MODES: {
       },
       { label: "Import existing chats from harnesses.", icon: Import },
     ],
-    iconSet: LOCAL_ICONS,
   },
   {
     id: "cloud",
@@ -82,7 +84,6 @@ const MODES: {
       { label: "Access agents from any device", icon: TabletSmartphone },
       { label: "Co-drive live sessions with teammates", icon: Users },
     ],
-    iconSet: CLOUD_ICONS,
   },
 ];
 
@@ -133,25 +134,6 @@ export function ModeSelectStep({
                   selected ? "" : "hover:bg-muted",
                 )}
               >
-                <div
-                  className={cn(
-                    "flex justify-center gap-1.5 transition-all duration-300",
-                    selected ? "max-h-32 mb-4" : "max-h-0 overflow-hidden mb-0",
-                  )}
-                  aria-hidden="true"
-                >
-                  {m.iconSet?.map(({ key, node, accent }) => (
-                    <span
-                      key={key}
-                      className={cn(
-                        "-mr-4 flex size-14 items-center justify-center rounded-2xl border bg-background",
-                        accent ? "border-brand-accent/25 text-brand-accent" : "border-border",
-                      )}
-                    >
-                      {node}
-                    </span>
-                  ))}
-                </div>
                 <span className="flex items-center gap-2">
                   <span
                     aria-hidden

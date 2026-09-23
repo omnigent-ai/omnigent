@@ -390,11 +390,12 @@ export interface Session {
    * render immediately on conversation resume.
    */
   lastTotalTokens?: number | null;
+  /** False when subtree usage was skipped and must be fetched separately. */
+  usageIncluded?: boolean;
   /**
    * Cumulative session spend in USD, server-computed (the cost-budget
-   * total). ``null``/absent when the session is **unpriced** (no turn
-   * priced yet), so the UI renders "—" rather than ``$0.00``. Lets the
-   * cost indicator render immediately on conversation resume.
+   * total). ``null``/absent when usage was skipped or the session is
+   * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
   /**
@@ -414,6 +415,7 @@ export interface Session {
   lastTaskError?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;
@@ -479,18 +481,11 @@ export interface Session {
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent has access to (bundled + host-discovered,
-   * subject to the spec's ``skills_filter``). Populated by the
-   * server from the agent cache; ``undefined`` on older snapshots.
-   * The web composer surfaces these in its slash-command menu so
-   * users can fire ``/skill-name``.
-   */
-  skills?: SkillSummary[];
-  /** Discovery state; absent on older servers. */
-  skillsStatus?: SkillsStatus;
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** A saved sandbox inference policy owns the model catalog. */
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced
@@ -550,13 +545,7 @@ export interface SandboxStatus {
   error?: string | null;
 }
 
-/**
- * One entry in ``Session.skills`` — mirrors
- * ``omnigent.server.schemas.SkillSummary``. Just the name +
- * one-line description so the composer's suggestion menu can list
- * them; the full skill body is loaded server-side at invocation
- * time.
- */
+/** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */
 export interface SkillSummary {
   /** Lowercase kebab-case identifier, e.g. ``"triage-issues"``. */
   name: string;
@@ -586,6 +575,42 @@ export interface ModelConfigurationSource {
   host?: string;
 }
 
+/**
+ * One resolved Devin Fusion pairing. Both halves are real catalog models:
+ * a `lead` (with an `effort` rung and an optional `fast` serving modifier) and
+ * a `sidekick` (with an optional `priority` modifier). `modelUid` is the exact
+ * `--model` id to launch.
+ */
+export interface FusionCombo {
+  /** Full Devin variant id, e.g. `fusion-claude-fable-5-1-medium-sidekick-swe-2-medium`. */
+  modelUid: string;
+  /** Lead family key (a standalone model id), e.g. `claude-fable-5.1`. */
+  lead: string;
+  /** Lead family label, e.g. `Claude Fable 5.1`. */
+  leadLabel: string;
+  /** Lead reasoning effort rung, e.g. `medium`. */
+  effort: string;
+  /** Whether this pairing uses the lead's `-fast` serving variant. */
+  fast: boolean;
+  /** Sidekick key with any `-priority` modifier stripped, e.g. `swe-2-medium`. */
+  sidekick: string;
+  /** Sidekick label, e.g. `SWE-2 Medium`. */
+  sidekickLabel: string;
+  /** Whether this pairing uses the sidekick's `-priority` variant. */
+  priority: boolean;
+}
+
+/**
+ * Structured Fusion picker payload: the full set of real lead/sidekick combos
+ * plus the default. The web builds dependent Lead / Effort / Sidekick selectors
+ * from `combos` and only offers combinations that exist.
+ */
+export interface FusionDescriptor {
+  combos: FusionCombo[];
+  /** `modelUid` of the default combo. */
+  default: string;
+}
+
 /** One runner-owned native model-picker row. */
 export interface NativeModelOption {
   /** Native picker id (a Claude alias or Codex model id). */
@@ -602,4 +627,6 @@ export interface NativeModelOption {
   isDefault?: boolean;
   /** Configuration that supplies this model; never includes credentials. */
   source?: ModelConfigurationSource;
+  /** Present only on Devin's Fusion option: its lead/sidekick combo table. */
+  fusion?: FusionDescriptor;
 }

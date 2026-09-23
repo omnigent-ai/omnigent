@@ -80,4 +80,17 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(icon).toHaveAttribute("aria-hidden", "true");
     expect(icon).not.toHaveClass("animate-spin", "animate-pulse", "text-brand-accent");
   });
+
+  it("renders a host disconnect as a neutral outline dot", () => {
+    const { container } = renderBadge({ kind: "disconnected" });
+    const badge = screen.getByRole("img", { name: "Host disconnected" });
+    expect(badge).toHaveAttribute("data-state", "disconnected");
+    expect(container.querySelector("svg")).toBeNull();
+    expect(badge.firstElementChild).toHaveClass(
+      "size-2",
+      "rounded-full",
+      "border",
+      "border-muted-foreground",
+    );
+  });
 });

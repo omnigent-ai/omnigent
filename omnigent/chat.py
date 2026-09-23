@@ -756,11 +756,7 @@ def _remote_headers(
     return headers
 
 
-# Cache the resolved token source per server URL so that repeated calls
-# to _remote_headers for the same URL reuse the same SDK Config instance.
-# The SDK's Config.authenticate() caches the OAuth token in memory and
-# only re-runs the CLI shell-out when it nears expiry, so reusing the
-# object is both fast and correct for long-running callers.
+# Reuse the SDK's in-memory token cache for each server.
 _databricks_auth_cache: dict[str, _ReusedDatabricksTokenSource] = {}
 
 
@@ -772,12 +768,6 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     via the Databricks CLI's host-keyed OAuth cache. One-shot — callers
     that issue many requests should use :class:`_DatabricksTokenAuth`,
     which reuses the SDK config across requests.
-
-    The resolved token source is cached per ``server_url`` so repeated
-    calls reuse the same SDK ``Config`` instance. The SDK serves the
-    cached OAuth token from memory and only re-runs the Databricks CLI
-    when the token nears expiry, so this is both fast on repeat calls
-    and safe for long-running callers.
 
     :param server_url: The remote server URL, e.g.
         ``"https://myapp-123.aws.databricksapps.com"``.
@@ -1416,7 +1406,7 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
         resp = _server_get(
             f"{base_url}/v1/sessions",
             headers=_remote_headers(server_url=base_url, host_id=None),
-            params={"limit": 100},
+            params={"limit": 100, "visibility": "all"},
             timeout=10.0,
         )
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.InvalidURL) as exc:
@@ -2592,6 +2582,13 @@ async def _query_sessions_once(
 
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
+    # An auto-woken turn can finish between live-stream subscriptions.
+    # Recheck its durable output once the session has stopped running.
+    if chat.status not in ("running", "launching"):
+        reconciled = await _persisted_turn_text(client, bound.id)
+        if reconciled is not None:
+            logger.info("Recovered headless output from completed session %s", bound.id)
+            return reconciled
     # No assistant text at all. If the runner persisted a terminal
     # ``error`` item (e.g. a harness start failure like the cursor SDK's
     # invalid-model rejection), surface it instead of returning ``None`` —
@@ -2993,6 +2990,7 @@ async def _resolve_latest_conversation_id_async(
         limit=1,
         order="desc",
         sort_by="updated_at",
+        visibility="mine",
     )
     if not sessions:
         return None
@@ -3048,13 +3046,13 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
                 raise click.ClickException(f"{source}: directory has no config.yaml to override.")
             target = config
 
-        raw = yaml.safe_load(target.read_text())
+        raw = yaml.safe_load(target.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise click.ClickException(
                 f"{source}: expected YAML mapping at top level, got {type(raw).__name__}"
             )
         _apply_overrides_to_raw(raw, overrides)
-        target.write_text(yaml.safe_dump(raw, default_flow_style=False))
+        target.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
         materialized = target if source.is_file() else target.parent
         _MATERIALIZED_OVERRIDE_DIRS[materialized.resolve()] = tmpdir
         return materialized
@@ -3101,7 +3099,7 @@ def _load_yaml_for_override_peek(source: Path) -> _YamlMapping | None:
         config = source / "config.yaml"
         if not config.is_file():
             return None
-        parsed = yaml.safe_load(config.read_text())
+        parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
         return parsed if isinstance(parsed, dict) else None
     return _load_yaml_if_single_file(source)
 
@@ -3121,7 +3119,7 @@ def _load_yaml_if_single_file(source: Path) -> _YamlMapping | None:
     """
     if not source.is_file():
         return None
-    parsed = yaml.safe_load(source.read_text())
+    parsed = yaml.safe_load(source.read_text(encoding="utf-8"))
     return parsed if isinstance(parsed, dict) else None
 
 
@@ -3333,20 +3331,24 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     if overrides.model is not None:
         executor_block["model"] = overrides.model
     if overrides.harness is not None:
+        prior_harness = _spec_declared_harness(raw, executor_block)
         _apply_harness_override_to_executor(raw, executor_block, overrides.harness)
-        # A harness-only override drops any prior model pin so the new
-        # harness resolves its provider default — e.g. ``omnigent run
-        # examples/polly --harness pi`` must not keep Polly's Claude-only
-        # a Claude-only ``executor.model``. An explicit ``--model``
-        # (applied above) wins and is left alone.
+        overrides_a_different_harness = prior_harness != (
+            canonicalize_harness(overrides.harness) or overrides.harness
+        )
+        # A real harness switch invalidates spec models. Otherwise, preserve
+        # them and use the environment only when no model remains.
         if overrides.model is None:
-            executor_block.pop("model", None)
             llm_block = raw.get("llm")
-            if isinstance(llm_block, dict):
-                llm_block.pop("model", None)
-            env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
-            if env_model is not None:
-                executor_block["model"] = env_model
+            if overrides_a_different_harness:
+                executor_block.pop("model", None)
+                if isinstance(llm_block, dict):
+                    llm_block.pop("model", None)
+            llm_model = llm_block.get("model") if isinstance(llm_block, dict) else None
+            if not (executor_block.get("model") or llm_model):
+                env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
+                if env_model is not None:
+                    executor_block["model"] = env_model
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)
@@ -3402,6 +3404,18 @@ def _apply_harness_override_to_executor(
         config = {}
         executor_block["config"] = config
     config["harness"] = canonical
+
+
+def _spec_declared_harness(raw: _YamlMapping, executor_block: _YamlMapping) -> str | None:
+    """Read the canonical harness from the spec's flat or bundle executor."""
+    if "spec_version" not in raw:
+        harness = executor_block.get("harness")
+    else:
+        config = executor_block.get("config")
+        harness = config.get("harness") if isinstance(config, dict) else None
+    if not isinstance(harness, str) or not harness.strip():
+        return None
+    return canonicalize_harness(harness.strip()) or harness.strip()
 
 
 def _validate_agent_spec(agent_path: Path) -> None:

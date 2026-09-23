@@ -125,7 +125,10 @@ vi.mock("./MarkdownEditorToolbar", () => ({
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
@@ -375,8 +378,9 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
   });
 
   it("flushes accumulated edits when the runner reconnects", async () => {
-    // Offline → auto-save suppressed.
+    // Runner down, no host to serve the workspace → auto-save suppressed.
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
+    vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(null);
     const { rerender } = render(makeViewer());
     fakeEditor!.setMarkdown(EDITED);
     await act(async () => {

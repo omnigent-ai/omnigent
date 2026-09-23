@@ -11,7 +11,22 @@ New code should prefer OmnigentError for consistency.
 
 from __future__ import annotations
 
+import functools
+import inspect
+from collections.abc import Callable
 from enum import Enum
+from typing import Any, ParamSpec, TypeVar, cast
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+class HarnessTransportClosedError(RuntimeError):
+    """A native harness channel ended; replay requires explicit safety evidence."""
+
+    def __init__(self, message: str, *, replay_safe: bool = False) -> None:
+        super().__init__(message)
+        self.replay_safe = replay_safe
 
 
 class ErrorCategory(str, Enum):
@@ -202,6 +217,13 @@ class ErrorCode:
         family the gRPC CANCELLED status conventionally maps to): a 4xx
         keeps this expected, retryable condition out of 5xx fault-rate
         signals, the same reasoning as ``WRONG_REPLICA``.
+    :cvar STALE_CURSOR: A pagination cursor (``after``/``before``)
+        references a row that no longer exists — typically deleted
+        between two page fetches (HTTP 400). Without a distinct signal
+        the next page reads as empty with ``has_more=false``,
+        indistinguishable from a completed enumeration, so the caller
+        silently loses the remaining rows. The caller's remedy is to
+        restart the enumeration without the cursor.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -221,6 +243,7 @@ class ErrorCode:
     WORKSPACE_MISSING = "workspace_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
+    STALE_CURSOR = "stale_cursor"
 
 
 # Single source of truth for error code → HTTP status.
@@ -257,6 +280,10 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # 499, not 5xx: the peer cancelling an in-flight backing call is expected
     # and retryable, so it must not read as a server fault (see the cvar).
     ErrorCode.UPSTREAM_CANCELLED: 499,
+    # 400: the referenced cursor row is gone, so this exact request can never
+    # succeed — the fix is to restart the enumeration without the cursor. The
+    # distinct code is what a paging client keys that restart off.
+    ErrorCode.STALE_CURSOR: 400,
 }
 
 
@@ -291,6 +318,9 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.SESSION_AGENT_MISSING: ErrorCategory.USER,
     # A dependency tore down the in-flight call; the fix (if any) is upstream.
     ErrorCode.UPSTREAM_CANCELLED: ErrorCategory.UPSTREAM,
+    # A stale reference: the cursor row was deleted (often by the same user
+    # in another client) between two page fetches.
+    ErrorCode.STALE_CURSOR: ErrorCategory.USER,
 }
 
 
@@ -332,6 +362,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.INVALID_INPUT: ErrorImpact.BENIGN,
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
+    ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
 }
 
 
@@ -368,6 +399,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
     # Context-driven: a backing call can be cancelled while serving any stage.
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
+    ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
 }
 
 
@@ -455,6 +487,77 @@ class OmnigentError(Exception):
         """Lifecycle phase: the constructor override if given, else the code's
         mapping."""
         return self._phase_override or phase_for_code(self.code)
+
+
+class StaleCursorError(OmnigentError):
+    """A pagination cursor row no longer exists.
+
+    Cursor pagination resolves the ``after``/``before`` id to that row's sort
+    position at read time. When the row was deleted between two page fetches
+    the position is unknowable, and an empty page would be indistinguishable
+    from a completed enumeration — silent truncation. Raising instead makes
+    the outcome distinguishable: HTTP clients get a 400 with the
+    ``stale_cursor`` code and restart their enumeration; in-process
+    enumeration loops restart via :func:`restart_on_stale_cursor`.
+
+    :param cursor_id: The id the cursor referenced, e.g. ``"conv_abc123"``.
+    """
+
+    def __init__(self, cursor_id: str) -> None:
+        super().__init__(
+            f"pagination cursor {cursor_id!r} no longer exists; "
+            "restart the enumeration without it",
+            code=ErrorCode.STALE_CURSOR,
+        )
+        self.cursor_id = cursor_id
+
+
+# Full-enumeration attempts before a persistently stale cursor propagates.
+_STALE_CURSOR_ATTEMPTS = 3
+
+
+def restart_on_stale_cursor(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+    """Restart a full cursor enumeration when its cursor row vanishes.
+
+    For in-process loops that page a store to completion (``while has_more:
+    after = last_id``), a concurrent delete of the cursor row makes the walk
+    fail loudly (:class:`StaleCursorError`) rather than end early on a
+    silently truncated result. Decorating the whole enumeration restarts it
+    from the first page, so local accumulators are rebuilt against a
+    surviving row set instead of double-counting a partial walk. Re-raises
+    after :data:`_STALE_CURSOR_ATTEMPTS` attempts (rows are being deleted
+    faster than the walk can finish).
+
+    Works on coroutine functions too: an ``async def`` walk is awaited
+    inside the retry loop, so decorating one restarts it rather than
+    handing back a coroutine the loop never gets to see fail.
+
+    :param fn: A function that runs one complete enumeration per call.
+    :returns: The wrapped function.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Any:
+            for _ in range(_STALE_CURSOR_ATTEMPTS - 1):
+                try:
+                    return await fn(*args, **kwargs)
+                except StaleCursorError:
+                    continue
+            return await fn(*args, **kwargs)
+
+        return cast(Callable[_P, _T], async_wrapper)
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        for _ in range(_STALE_CURSOR_ATTEMPTS - 1):
+            try:
+                return fn(*args, **kwargs)
+            except StaleCursorError:
+                continue
+        return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class ElicitationDeclinedError(Exception):

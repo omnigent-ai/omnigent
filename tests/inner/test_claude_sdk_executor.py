@@ -765,6 +765,111 @@ class TestConstructor(unittest.TestCase):
 
         _run(_t())
 
+    def test_databricks_profile_model_resolution_cached_across_turns(self):
+        """The unpinned-session catalog resolution runs once per executor."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        async def _t():
+            with patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+
+            captured: list[str | None] = []
+            resolve_calls: list[str | None] = []
+
+            def fake_resolver(profile):
+                resolve_calls.append(profile)
+                return "system.ai.claude-opus-5"
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured.append(model)
+                raise RuntimeError("stop after model resolution")
+
+            with (
+                patch(
+                    "omnigent.inner.claude_sdk_executor._resolve_databricks_claude_model",
+                    side_effect=fake_resolver,
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                for _ in range(2):
+                    with self.assertRaises(RuntimeError):
+                        async for _ in executor.run_turn(
+                            [{"role": "user", "content": "hi"}], [], ""
+                        ):
+                            pass
+
+            self.assertEqual(captured, ["system.ai.claude-opus-5"] * 2)
+            self.assertEqual(len(resolve_calls), 1)
+
+        _run(_t())
+
+    def test_databricks_profile_model_substitution_warns(self):
+        """An unpinned session's silent model pick must emit a WARNING."""
+        from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+        with (
+            patch(
+                "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                return_value=SimpleNamespace(
+                    host="https://example.cloud.databricks.com", token="dapi_test_token"
+                ),
+            ),
+            patch(
+                "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+                return_value=SimpleNamespace(
+                    families={
+                        "sonnet": "system.ai.claude-sonnet-5",
+                        "opus": "system.ai.claude-opus-5",
+                    }
+                ),
+            ),
+            self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+        ):
+            resolved = _resolve_databricks_claude_model("repro")
+
+        self.assertEqual(resolved, "system.ai.claude-opus-5")
+        self.assertTrue(
+            any("system.ai.claude-opus-5" in message for message in logs.output),
+            f"no WARNING names the substituted model: {logs.output}",
+        )
+
+    def test_databricks_catalog_fallback_substitution_warns(self):
+        """The bundled-catalog fallback is also a substitution; it must warn."""
+        from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+        with (
+            patch(
+                "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+                side_effect=RuntimeError("live listing unavailable"),
+            ),
+            patch(
+                "omnigent.models.model_catalog.resolve_catalog_model",
+                return_value=SimpleNamespace(model_id="databricks-claude-default"),
+            ),
+            self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+        ):
+            resolved = _resolve_databricks_claude_model("repro")
+
+        self.assertEqual(resolved, "databricks-claude-default")
+        self.assertTrue(
+            any(
+                "databricks-claude-default" in message and "bundled catalog" in message
+                for message in logs.output
+            ),
+            f"no WARNING names the catalog-fallback model: {logs.output}",
+        )
+
     def test_neutral_gateway_no_model_does_not_inject_databricks_default(self):
         """Neutral gateway (base URL supplied directly) + no model → ``None``.
 
@@ -1010,16 +1115,28 @@ class TestConstructor(unittest.TestCase):
                 captured["model"] = model
                 raise RuntimeError("stop after model resolution")
 
-            with patch.object(
-                executor,
-                "_get_or_create_client",
-                side_effect=fake_get_or_create_client,
+            with (
+                patch(
+                    "omnigent.models.model_catalog.subprocess.run",
+                    side_effect=AssertionError("unexpected authentication subprocess"),
+                ) as auth_subprocess,
+                patch(
+                    "omnigent.models.model_catalog.httpx.Client",
+                    side_effect=AssertionError("unexpected model-listing HTTP client"),
+                ) as http_client,
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
             ):
                 with self.assertRaises(RuntimeError):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
             self.assertEqual(captured["model"], "databricks-claude-sonnet-4-6")
+            auth_subprocess.assert_not_called()
+            http_client.assert_not_called()
 
         _run(_t())
 
@@ -1509,9 +1626,45 @@ class TestResolveGatewayEnv(unittest.TestCase):
         with (
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.databricks_executor._read_databrickscfg", return_value=None),
+            # Host derivation no longer needs a static token, so "no creds"
+            # must also mean no host is resolvable from ~/.databrickscfg.
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg_host",
+                return_value=None,
+            ),
         ):
             env = _resolve_gateway_env()
             self.assertEqual(env, {})
+
+    def test_oauth_profile_without_token_resolves_from_host(self):
+        """An OAuth U2M profile (host, no static token) must resolve.
+
+        The SDK resolver returns ``None`` when it cannot mint a bearer
+        (e.g. no Databricks CLI OAuth state on this machine), but the
+        profile's ``host`` is always present — and the generated auth
+        command mints the bearer at request time — so the gateway env
+        must still resolve instead of failing with "requires gateway
+        credentials".
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("omnigent.inner.databricks_executor._read_databrickscfg", return_value=None),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg_host",
+                return_value="https://adb-12345.azuredatabricks.net",
+            ),
+        ):
+            env = _resolve_gateway_env("my-oauth-profile")
+        self.assertEqual(
+            env["ANTHROPIC_BASE_URL"],
+            "https://adb-12345.azuredatabricks.net/ai-gateway/anthropic",
+        )
+        self.assertIn(
+            'databricks auth token --profile "my-oauth-profile"',
+            env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
+        )
 
     def test_host_override_skips_profile_lookup(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env

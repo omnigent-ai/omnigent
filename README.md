@@ -143,13 +143,18 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   installed by `omnigent run`) and **`pnpm`** (for the web UI). You can get
   both from a single Node install; pnpm is available via
   `corepack enable` or `npm install -g pnpm`.
+- **Devin CLI** (optional), for `omnigent devin`: install with
+  `curl -fsSL https://cli.devin.ai/install.sh | bash`, then sign in with
+  `devin auth login`. Devin tool approvals appear as Chat approval cards
+  (its `PermissionRequest` hook is mirrored to the web UI) and stay
+  answerable in the embedded Terminal. See `docs/devin-native.md`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
   one-time approvals also appear as Chat cards. See
   `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`)
+  (`claude`, `codex`, `cursor`, `devin`, `hermes`, `kiro`, `pi`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
@@ -366,6 +371,11 @@ omnigent start   # starts the local server and registers this machine as a host
 Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
+
+To suppress the automatic browser tab, use `omni host --no-open` or set
+`OMNIGENT_HOST_NO_OPEN=1` in your shell. Both also apply to `omni host
+--background` and `omni start`. Sign-in may still open a browser; use
+`--non-interactive` in scripts to fail if sign-in is required.
 
 <details>
 <summary>Customize automatic session titles</summary>

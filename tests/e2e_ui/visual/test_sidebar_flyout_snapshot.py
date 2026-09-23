@@ -177,6 +177,10 @@ def test_pinned_project_flyout_matches_baseline(
     expect(landing).to_be_visible(timeout=30_000)
     # Capture settled controls, not the composer's transient metadata spinners.
     expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+        "aria-label", "Claude Code, unavailable", timeout=30_000
+    )
+    expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_be_visible()
     expect(page.get_by_test_id("new-chat-landing-workspace-loading")).to_be_hidden(timeout=30_000)
     # The pinned row must be painted before we can hover it.
     row = page.get_by_role("link", name=_PINNED_TITLE)

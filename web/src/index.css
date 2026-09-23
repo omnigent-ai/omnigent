@@ -150,6 +150,11 @@
   --icon-container-default: 16px;
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 60 40 10;
+  /* Onboarding wizard page surface — a hair off the white card so it reads as a
+     distinct backdrop (the card stays var(--card)). */
+  --onboarding-wizard-background: #fcfbfb;
+  --onboarding-modal-border: #0000001a;
+  --onboarding-modal-shadow: 0 24px 80px 8px #00000012;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 12%);
   --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
 
@@ -258,6 +263,9 @@
 .dark {
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 0 0 0;
+  --onboarding-wizard-background: #131315;
+  --onboarding-modal-border: #ffffff14;
+  --onboarding-modal-shadow: 0 24px 80px 8px #00000038;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 80%);
   --composer-shadow-focus: 0 0 14px -8px rgb(0 0 0 / 90%);
   --destructive: #e65b77;
@@ -417,7 +425,9 @@
   background-color: var(--muted);
 }
 
-.composer-agent-menu .composer-agent-row > [role="menuitem"] {
+/* Disabled rows wrap the item in a tooltip span, so match through one wrapper. */
+.composer-agent-menu .composer-agent-row > [role="menuitem"],
+.composer-agent-menu .composer-agent-row > span > [role="menuitem"] {
   gap: 0;
   padding: 0;
 }
@@ -454,6 +464,53 @@
   border-width: 0.5px;
   border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
   background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* --background is the opaque palette canvas; flatten tints over it to mask the stack. */
+.composer-workspace-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--muted) 70%, transparent),
+      color-mix(in oklch, var(--muted) 70%, transparent)
+    ),
+    var(--background);
+}
+
+/* Preserve the translucent dark tray while matching the mock's single warm
+   surface across queued rows and workspace metadata in light themes. */
+.composer-queued-surface {
+  background-color: color-mix(in oklab, var(--tray) 40%, transparent);
+}
+
+:root:not(.dark) .composer-workspace-surface,
+:root:not(.dark) .composer-queued-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--muted) 85%, transparent),
+      color-mix(in oklch, var(--muted) 85%, transparent)
+    ),
+    var(--background);
+}
+
+.composer-subagent-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--brand-accent) 10%, transparent),
+      color-mix(in oklch, var(--brand-accent) 10%, transparent)
+    ),
+    var(--background);
+}
+
+/* Soft brand-accent wash behind the whole side-chat pane: a single diffuse
+   glow from the top-right that fades to nothing, matching the design. One
+   gradient (no seam) over the full pane height (no hard edge above the
+   composer), kept very subtle so it reads fine behind message bubbles too. */
+.side-chat-backdrop {
+  background: radial-gradient(
+    150% 110% at 100% 0%,
+    color-mix(in oklch, var(--brand-accent) 8%, transparent),
+    transparent 70%
+  );
 }
 
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
@@ -627,6 +684,11 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
  * opaque background so the chat underneath doesn't bleed through. */
 aside[aria-label="Workspace"][data-maximized] {
   background: var(--card-solid) !important;
+}
+
+/* Label-only tooltips must not block controls beneath their portal wrapper. */
+[data-radix-popper-content-wrapper]:has([data-noninteractive-tooltip]) {
+  pointer-events: none !important;
 }
 
 /* Popovers/menus — same glass treatment */
@@ -890,12 +952,6 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-ios-native] .main-terminal-view,
   [data-android-native] .main-terminal-view {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
-  }
-
-  /* With the bottom pill retired the terminal card is the lowest content in
-     the terminal view — keep it clear of the home indicator. */
-  [data-ios-native] .main-terminal-view {
-    padding-bottom: calc(0.375rem + var(--omnigent-safe-bottom));
   }
 
   [data-ios-native] .chat-scroll-fade {
@@ -1319,7 +1375,25 @@ aside[aria-label="Workspace"][data-maximized] {
   vertical-align: -0.075em;
 }
 
-/* Flash highlight on nav jump. Duration must match FLASH_DURATION_MS in chatStore.ts. */
+/* Message highlights must match FLASH_DURATION_MS in chatStore.ts.
+   Omit the final keyframe to fade back to the bubble's own background. */
+@keyframes message-highlight {
+  0%,
+  40% {
+    background-color: var(--message-highlight);
+  }
+}
+
+.animate-message-highlight {
+  --message-highlight: color-mix(in oklch, var(--warning) 16%, transparent);
+  animation: message-highlight 1500ms ease-out;
+}
+
+.dark .animate-message-highlight {
+  --message-highlight: color-mix(in oklch, var(--warning) 24%, transparent);
+}
+
+/* Workspace navigation keeps its compact outline highlight. */
 @keyframes user-msg-flash {
   0% {
     box-shadow: 0 0 0 0 var(--ring);
@@ -1337,8 +1411,14 @@ aside[aria-label="Workspace"][data-maximized] {
   border-radius: var(--radius-2xl);
 }
 
-/* Reduced-motion: static outline still signals the target. */
+/* Reduced-motion: static highlights still signal the target. */
 @media (prefers-reduced-motion: reduce) {
+  .animate-message-highlight {
+    animation: none;
+    /* Override inline contributor tints while the static highlight is active. */
+    background-color: var(--message-highlight) !important;
+  }
+
   .animate-user-msg-flash {
     animation: none;
     box-shadow: 0 0 0 2px var(--ring);

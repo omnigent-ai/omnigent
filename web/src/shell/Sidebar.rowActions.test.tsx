@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar conversation-row quick actions:
 //   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
 //      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
@@ -9,8 +13,8 @@
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
@@ -242,17 +246,19 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
     const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
     const tree = (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-            {activeId ? (
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-              </Routes>
-            ) : (
-              sidebar
-            )}
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+              {activeId ? (
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                </Routes>
+              ) : (
+                sidebar
+              )}
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     // No explicit info → CapabilitiesContext default ("loading"), matching
@@ -435,6 +441,17 @@ describe("quick pin/unpin hover button", () => {
     // Clicking again unpins: the Pinned section disappears.
     fireEvent.click(screen.getByTestId("quick-pin-conversation"));
     expect(screen.queryByText("Pinned")).toBeNull();
+  });
+
+  it.each([
+    ["quick-pin-conversation", "Pin"],
+    ["quick-archive-conversation", "Archive"],
+  ])("shows the %s action in a styled tooltip on hover", async (testId, label) => {
+    const user = userEvent.setup();
+    renderSidebar();
+
+    await user.hover(screen.getByTestId(testId));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
   });
 
   it("also offers Pin in the kebab menu (mobile affordance) and toggles the same pin state", () => {
@@ -1151,6 +1168,17 @@ describe("right-click context menu", () => {
     );
   });
 
+  it.each(["quick-pin-conversation", "quick-archive-conversation", "conversation-actions"])(
+    "opens the session menu when right-clicking the %s button",
+    (testId) => {
+      renderSidebar();
+
+      expect(fireEvent.contextMenu(screen.getByTestId(testId))).toBe(false);
+
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    },
+  );
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
@@ -1356,11 +1384,13 @@ describe("peek mode row menu", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <Sidebar open={false} peek onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open={false} peek onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     return { onClose };

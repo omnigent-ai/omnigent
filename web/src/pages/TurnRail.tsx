@@ -133,10 +133,18 @@ export function TurnRail({
     const onWheel = (e: WheelEvent) => {
       if (e.deltaY < 0) fetchOlder();
     };
-    rail.addEventListener("scroll", fetchOlder, { passive: true });
+    let previousTop = rail.scrollTop;
+    const onScroll = () => {
+      const scrollingUp = rail.scrollTop < previousTop;
+      previousTop = rail.scrollTop;
+      // Active-tick tracking scrolls the rail without a reader gesture.
+      const readerInRail = interactingRef.current || rail.contains(document.activeElement);
+      if (scrollingUp && readerInRail) fetchOlder();
+    };
+    rail.addEventListener("scroll", onScroll, { passive: true });
     rail.addEventListener("wheel", onWheel, { passive: true });
     return () => {
-      rail.removeEventListener("scroll", fetchOlder);
+      rail.removeEventListener("scroll", onScroll);
       rail.removeEventListener("wheel", onWheel);
     };
   }, [hasMoreHistory, loadingMoreHistory]);
@@ -265,7 +273,7 @@ export function TurnRail({
         style={{ "--turn-rail-fade": `${FADE}px` } as CSSProperties}
         // max-h-72 (not a fixed height): the box shrinks to its ticks when a
         // session is short — so no confusing empty scroll track — and caps at
-        // 288px once the ticks (~10px pitch) exceed ~29, at which point it
+        // 288px once the ticks (~8px pitch) exceed ~36, at which point it
         // overflows and scrolls. Top+bottom fades (mask) show the ticks scroll
         // past both ends. items-start (not center) so a hover-widened tick
         // extends rightward from a fixed left edge instead of re-centering the
@@ -291,12 +299,12 @@ export function TurnRail({
               onBlur={() => setHoveredId((cur) => (cur === turn.itemId ? null : cur))}
               onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage, ensureItemVisible)}
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
-              // Full-pitch hit area (h-2.5, no gap between ticks) so clicking
+              // Full-pitch hit area (h-2, no gap between ticks) so clicking
               // anywhere in a tick's band — not just the 2px dash — registers.
               // Matches the hover zone, so any spot that shows the preview also
               // navigates on click. Dash anchored left (justify-start) so the
               // hover-widen grows rightward without nudging the button box.
-              className="group flex h-2.5 w-5 shrink-0 cursor-pointer items-center justify-start"
+              className="group flex h-2 w-5 shrink-0 cursor-pointer items-center justify-start"
             >
               {/* Dash: subtle by default; black for on-screen turns (or the
                   hovered one); wider only on hover. Transitions keep the color

@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import threading
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -42,7 +44,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
 
@@ -145,8 +147,10 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("harness", [None, "claude-native"])
 async def test_permission_request_hook_allow_round_trip(
     client: httpx.AsyncClient,
+    harness: str | None,
 ) -> None:
     """
     UI approves Claude's permission request → endpoint returns
@@ -158,7 +162,11 @@ async def test_permission_request_hook_allow_round_trip(
     doesn't park the future (verdict comes in but the endpoint never
     wakes); the verdict→decision mapping returns the wrong literal.
     """
-    agent = await create_test_agent(client, "test-permission-allow")
+    agent = await create_test_agent(
+        client,
+        "test-permission-allow",
+        executor={"type": "omnigent", "config": {"harness": harness}} if harness else None,
+    )
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload()
 
@@ -178,6 +186,8 @@ async def test_permission_request_hook_allow_round_trip(
     )
 
     event = await drain_task
+    assert event["params"]["message"] == "Claude wants to call **Bash**"
+    assert event["params"]["policy_name"] == "claude_native_permission"
     verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
     assert verdict.status_code == 202, verdict.text
 
@@ -192,23 +202,35 @@ async def test_permission_request_hook_allow_round_trip(
     }
 
 
-async def test_permission_request_hook_accepts_kimi_namespaced_elicitation_id(
+@pytest.mark.parametrize("tool_name", ["Bash", "Write", "AskUserQuestion", "ExitPlanMode"])
+@pytest.mark.parametrize("action", ["accept", "decline"])
+@pytest.mark.parametrize(
+    ("vendor", "supplies_id"), [("kimi", True), ("devin", True), ("devin", False)]
+)
+async def test_permission_request_hook_preserves_native_verdict(
     client: httpx.AsyncClient,
+    tool_name: str,
+    action: str,
+    vendor: str,
+    supplies_id: bool,
 ) -> None:
-    """
-    A kimi-native hook supplies ``_omnigent_elicitation_id = elicit_kimi_…`` on
-    every POST (stable re-attach id). The shared endpoint must accept any
-    ``elicit_<harness>_`` namespace — not just ``elicit_claude_`` — or it 400s
-    and the approval card is NEVER published.
-
-    Regression: the id regex was hard-coded to ``^elicit_claude_…$``, so every
-    kimi approval POST was rejected and no card surfaced in the web UI.
-    """
-    agent = await create_test_agent(client, "test-permission-kimi-id")
+    """Kimi and Devin keep their cards and supported verdicts, including older Devin hooks."""
+    agent = await create_test_agent(
+        client,
+        "test-permission-native-id",
+        executor={"type": "omnigent", "config": {"harness": f"{vendor}-native"}},
+    )
     session_id = await _create_session(client, agent["id"])
-    elicitation_id = "elicit_kimi_" + "0" * 32
-    payload = await _claude_permission_payload()
-    payload["_omnigent_elicitation_id"] = elicitation_id
+    elicitation_id = f"elicit_{vendor}_" + "0" * 32
+    payload = await _claude_permission_payload(tool_name)
+    if supplies_id:
+        payload["_omnigent_elicitation_id"] = elicitation_id
+    if tool_name == "AskUserQuestion":
+        payload["tool_input"] = {
+            "questions": [{"question": "Continue?", "header": "Next", "options": []}]
+        }
+    elif tool_name == "ExitPlanMode":
+        payload["tool_input"] = {"plan": "Run the tests."}
 
     drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
     await asyncio.sleep(0.05)
@@ -222,12 +244,140 @@ async def test_permission_request_hook_accepts_kimi_namespaced_elicitation_id(
     event = await drain_task
     # The published card uses the client-supplied id verbatim (not 400, not a
     # server-minted replacement).
-    assert event["elicitation_id"] == elicitation_id
-    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    if supplies_id:
+        assert event["elicitation_id"] == elicitation_id
+    else:
+        elicitation_id = event["elicitation_id"]
+    params = event["params"]
+    assert params["message"] == f"{vendor.capitalize()} wants to call **{tool_name}**"
+    assert params["policy_name"] == f"{vendor}_native_permission"
+    for extra in (
+        "allow_auto_mode",
+        "allow_all_edits",
+        "remember_scope",
+        "ask_user_question",
+        "exit_plan_mode",
+    ):
+        assert extra not in params
+    verdict = await _post_approval(
+        client,
+        session_id,
+        elicitation_id,
+        action,
+        {"allow_auto_mode": True, "allow_all_edits": True, "remember": True, "feedback": "Wait"},
+    )
     assert verdict.status_code == 202, verdict.text
     resp = await hook_task
     assert resp.status_code == 200, resp.text
-    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    assert resp.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow" if action == "accept" else "deny",
+        **({"message": "Wait"} if action == "decline" else {}),
+    }
+
+
+@pytest.mark.parametrize(
+    ("harness", "labels", "override", "hook_vendor"),
+    [
+        ("codex-native", {}, None, "claude"),
+        ("codex-native", {}, None, None),
+        (None, {"omnigent.wrapper": "codex-native-ui"}, None, "claude"),
+        ("claude-native", {"omnigent.wrapper": "claude-code-native-ui"}, "codex-native", "claude"),
+        ("pi-native", {}, None, "claude"),
+        ("claude-native", {}, None, "kimi"),
+        ("kimi-native", {}, None, "claude"),
+        ("devin-native", {}, None, "claude"),
+        ("devin-native", {}, None, "kimi"),
+        ("claude-native", {}, None, "devin"),
+        ("codex-native", {}, None, "devin"),
+    ],
+)
+async def test_permission_request_hook_rejects_mismatched_native_harness(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+    labels: dict[str, str],
+    override: str | None,
+    hook_vendor: str | None,
+) -> None:
+    """A stale callback must not publish an approval into another native harness's session."""
+    monkeypatch.setattr(sessions_route, "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.01)
+    agent = await create_test_agent(
+        client,
+        "test-permission-mismatch",
+        executor={"type": "omnigent", "config": {"harness": harness}} if harness else None,
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": labels, "harness_override": override},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    payload = await _claude_permission_payload()
+    if hook_vendor is not None:
+        payload["_omnigent_elicitation_id"] = f"elicit_{hook_vendor}_" + "0" * 32
+    collector = await start_session_stream_collector(session_id)
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+        )
+        assert response.status_code == 409, response.text
+        assert "permission hook does not match" in response.text
+        await collector.assert_no_event(within=0.01)
+    finally:
+        await collector.stop()
+
+
+async def test_permission_hook_concurrent_sessions_cannot_claim_same_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent metadata reads must not let two sessions claim the same approval id."""
+    from omnigent.server.routes.sessions import routes_hooks
+
+    agent = await create_test_agent(client, "test-permission-concurrent-owner")
+    session_ids = [await _create_session(client, agent["id"]) for _ in range(2)]
+    collectors = [await start_session_stream_collector(sid) for sid in session_ids]
+    barrier = threading.Barrier(2)
+    original = routes_hooks._resolve_harness
+
+    def resolve_together(*args: Any, **kwargs: Any) -> str | None:
+        harness = original(*args, **kwargs)
+        barrier.wait(timeout=5)
+        return harness
+
+    monkeypatch.setattr(routes_hooks, "_resolve_harness", resolve_together)
+    monkeypatch.setattr(sessions_route, "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 1.0)
+    elicitation_id = "elicit_claude_" + "1" * 32
+    payload = {**(await _claude_permission_payload()), "_omnigent_elicitation_id": elicitation_id}
+    tasks = [
+        asyncio.create_task(
+            client.post(f"/v1/sessions/{sid}/hooks/permission-request", json=payload)
+        )
+        for sid in session_ids
+    ]
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        assert len(done) == len(pending) == 1
+        rejected = done.pop()
+        assert rejected.result().status_code == 400, rejected.result().text
+        rejected_index = tasks.index(rejected)
+        await collectors[rejected_index].assert_no_event(within=0.01)
+        accepted = pending.pop()
+        accepted_index = tasks.index(accepted)
+        event = await collectors[accepted_index].next_event()
+        assert event["elicitation_id"] == elicitation_id
+        verdict = await _post_approval(
+            client, session_ids[accepted_index], elicitation_id, "accept"
+        )
+        assert verdict.status_code == 202, verdict.text
+        response = await accepted
+        assert response.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for collector in collectors:
+            await collector.stop()
 
 
 async def test_cursor_permission_request_hook_allow_round_trip(
@@ -2648,7 +2798,11 @@ async def test_codex_command_approval_hook_accept_round_trip(
     approvals and accepted web verdicts return Codex's command
     approval response shape.
     """
-    agent = await create_test_agent(client, "test-codex-command-approval")
+    agent = await create_test_agent(
+        client,
+        "test-codex-command-approval",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
     session_id = await _create_session(client, agent["id"])
     payload = {
         "id": 13,
@@ -3879,65 +4033,76 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
     later — the click dropped, the codex sub-agent still blocked.
     """
     from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes._sessions import orchestration
+
+    grace_started = asyncio.Event()
+    release_grace = asyncio.Event()
+
+    async def _wait_for_grace(delay: float) -> None:
+        if delay == sessions_route._HARNESS_ELICITATION_REPARK_GRACE_S:
+            grace_started.set()
+            await release_grace.wait()
+        else:
+            await asyncio.sleep(delay)
 
     async def _disconnect_immediately(_request: Any) -> None:
-        """
-        Sever every hook long-poll straight away.
-
-        :param _request: Ignored FastAPI request.
-        :returns: None.
-        """
-        await asyncio.sleep(0.01)
+        """Sever each hook poll without a timing dependency."""
+        return
 
     monkeypatch.setattr(
         sessions_route,
         "_poll_request_disconnect",
         _disconnect_immediately,
     )
+    # Hold the real deferred cleanup until the gap verdict has been consumed.
+    # Replace only this module's asyncio binding, leaving other sleeps intact.
     monkeypatch.setattr(
-        sessions_route,
-        "_HARNESS_ELICITATION_REPARK_GRACE_S",
-        0.25,
+        orchestration,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "sleep": _wait_for_grace}),
     )
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-codex-gap-verdict")
     session_id = await _create_session(client, agent["id"])
 
-    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
-    await asyncio.sleep(0.05)
-    first = await client.post(
-        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-        json=_CODEX_REPARK_PAYLOAD,
-    )
-    assert first.status_code == 200, first.text
-    assert first.content == b""
-    event = await drain_task
+    collector = await start_session_stream_collector(session_id)
+    try:
+        first = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+        assert first.status_code == 200, first.text
+        assert first.content == b""
+        event = await collector.next_event()
+        assert event["type"] == "response.elicitation_request"
+        await asyncio.wait_for(grace_started.wait(), timeout=5.0)
+        assert pending_elicitations.count_for(session_id) == 1
+        assert event["elicitation_id"] not in sessions_route._harness_elicitation_registry
 
-    # Verdict arrives while NO poll is parked (the gap).
-    verdict = await _post_approval(
-        client,
-        session_id,
-        event["elicitation_id"],
-        "accept",
-        content={"ok": "go"},
-    )
-    assert verdict.status_code == 202, verdict.text
-    assert pending_elicitations.count_for(session_id) == 0
+        # Verdict arrives while no poll is parked and cleanup is still waiting.
+        verdict = await _post_approval(
+            client,
+            session_id,
+            event["elicitation_id"],
+            "accept",
+            content={"ok": "go"},
+        )
+        assert verdict.status_code == 202, verdict.text
+        assert pending_elicitations.count_for(session_id) == 0
 
-    # The retry consumes the tombstone and returns the verdict in the
-    # codex result shape without re-publishing the prompt; an empty
-    # body here means the tombstone was dropped and the click lost.
-    second = await client.post(
-        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-        json=_CODEX_REPARK_PAYLOAD,
-    )
-    assert second.status_code == 200, second.text
-    assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
-    # Drain the severed poll's deferred clear so it doesn't outlive the
-    # test's event loop (it no-ops the index either way).
-    for task in set(sessions_route._deferred_elicitation_clear_tasks):
-        await asyncio.wait_for(task, timeout=5.0)
-    pending_elicitations.reset_for_tests()
+        # The retry must consume the saved verdict instead of publishing again.
+        second = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+        assert second.status_code == 200, second.text
+        assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
+    finally:
+        release_grace.set()
+        for task in set(sessions_route._deferred_elicitation_clear_tasks):
+            await asyncio.wait_for(task, timeout=5.0)
+        await collector.stop()
+        pending_elicitations.reset_for_tests()
 
 
 # ── Antigravity elicitation hook tests ──────────────────────────────────────

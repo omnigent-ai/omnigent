@@ -167,21 +167,24 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import posixpath
 import re
 import secrets
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
-from typing import TYPE_CHECKING, cast
+from functools import partial
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
+from omnigent.onboarding.sandboxes.base import SandboxGoneError
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -613,7 +616,10 @@ class ManagedSandboxConfig:
         :func:`omnigent.onboarding.sandboxes.base.render_host_config_write_command`.
         Non-secret by design: credentials stay behind
         ``api_key_ref: env:VAR`` indirection, resolved inside the
-        sandbox against its own environment.
+        sandbox against its own environment. Saved session inference settings
+        replace the current template's providers and bindings on restore.
+    :param model_discovery: Server-only catalog endpoints and credential references,
+        keyed by inference provider name. Never installed in the sandbox.
     """
 
     server_url: str
@@ -622,6 +628,7 @@ class ManagedSandboxConfig:
     managed_launch_supported: bool = True
     provider: str | None = None
     host_config: dict[str, object] | None = None
+    model_discovery: dict[str, object] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -783,14 +790,17 @@ class ManagedSandboxDeployment:
         ponytail: builds launchers on each call; memoize on the deployment only
         if /v1/info shows up hot (provider count is tiny, __init__ does no I/O).
 
-        :returns: ``{provider: {"multi_repo": bool}}`` for each launchable
-            provider, in configured order.
+        :returns: Capability flags for each launchable provider, in configured order.
         """
         caps: dict[str, dict[str, bool]] = {}
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                from omnigent.inference_config import parse_inference_config
+
+                if parse_inference_config(config.host_config or {}):
+                    caps[config.provider]["inference_models"] = True
         return caps
 
 
@@ -1106,6 +1116,81 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxHostLaun
     return _reject
 
 
+_MAX_KEEP_WARM_S = 30 * 24 * 3600  # 30 days; a finite, sane ceiling on runner.idle_timeout_s
+
+
+def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
+    """Parse the top-level ``sandbox.keep_warm_s`` knob (positive seconds), or None.
+
+    The single agent-sandbox timing knob: how long an idle sandbox stays warm
+    (its runner alive) after the last turn before it suspends.
+    """
+    value = raw.get("keep_warm_s")
+    if value is None:
+        return None
+    # It becomes runner.idle_timeout_s, where the runner does float(value): a
+    # value rounding to 0 DISABLES the idle watchdog (never suspends), and an
+    # oversized one (e.g. 10**400) overflows float() and stops the runner
+    # starting. Require a whole number in [1, _MAX_KEEP_WARM_S] (30 days, far more
+    # than any real keep-warm and safely finite). bool is an int subclass (reject
+    # first); a float must be finite and integral (2.9 would silently truncate);
+    # the range check runs on the int/float directly so a huge int never reaches
+    # a float conversion here.
+    _bad = "sandbox.keep_warm_s must be a whole number of seconds, 1 to 2592000 (30 days)"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(_bad)
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        raise ValueError(_bad)
+    if not 1 <= value <= _MAX_KEEP_WARM_S:
+        raise ValueError(_bad)
+    return int(value)
+
+
+def _apply_keep_warm(
+    host_config: dict[str, object] | None, keep_warm_s: int | None
+) -> dict[str, object] | None:
+    """Map the ``keep_warm_s`` knob onto the in-sandbox ``runner.idle_timeout_s``.
+
+    ``keep_warm_s`` is the single agent-sandbox timing knob and is authoritative:
+    it wins over an explicit ``host_config.runner.idle_timeout_s`` (logging when it
+    overrides one) so there is one source of truth. A no-op when unset.
+    """
+    if keep_warm_s is None:
+        return host_config
+    merged = dict(host_config or {})
+    existing = merged.get("runner")
+    runner = dict(existing) if isinstance(existing, dict) else {}
+    if runner.get("idle_timeout_s") not in (None, keep_warm_s):
+        _logger.info(
+            "sandbox.keep_warm_s=%s overrides host_config.runner.idle_timeout_s=%s",
+            keep_warm_s,
+            runner.get("idle_timeout_s"),
+        )
+    runner["idle_timeout_s"] = keep_warm_s
+    merged["runner"] = runner
+    return merged
+
+
+def deployment_with_inference_snapshot(
+    deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
+) -> ManagedSandboxDeployment:
+    """Restore saved inference settings while retaining current sandbox lifecycle settings."""
+    from omnigent.inference_config import snapshot_runtime_config
+
+    runtime = snapshot_runtime_config(snapshot)
+    if runtime is None:
+        if not any((entry.host_config or {}).get("inference") for entry in deployment.configs):
+            return deployment
+        runtime = {"inference": {}}
+    return replace(
+        deployment,
+        configs=tuple(
+            replace(entry, host_config={**(entry.host_config or {}), **(runtime or {})})
+            for entry in deployment.configs
+        ),
+    )
+
+
 def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the top-level ``sandbox.host_config`` block.
@@ -1140,6 +1225,10 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     # validation here yet still ride to the sandbox, where the merge writes
     # `providers: null` over any existing block — the silent degradation this
     # parse exists to prevent.
+    from omnigent.inference_config import parse_inference_config, validate_inference_credentials
+
+    if parse_inference_config(host_config):
+        validate_inference_credentials(host_config)
     if "providers" in host_config:
         providers = host_config["providers"]
         # load_providers silently ignores a non-mapping providers value, so
@@ -1351,6 +1440,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         raise ValueError(
             f"server config 'sandbox.provider' must be one of: {supported} (got {provider!r})"
         )
+    warm_pool = _parse_agent_sandbox_warm_pool(raw)
     server_url = raw.get("server_url")
     if not isinstance(server_url, str) or not server_url.strip():
         raise ValueError(
@@ -1360,6 +1450,26 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    model_discovery = raw.get("model_discovery", {})
+    if not isinstance(model_discovery, dict):
+        raise ValueError("sandbox.model_discovery must be a mapping")
+    for name, discovery in model_discovery.items():
+        if not isinstance(discovery, dict) or set(discovery) - {
+            "base_url",
+            "api_key_ref",
+            "auth_command",
+            "family",
+        }:
+            raise ValueError(f"Invalid sandbox.model_discovery entry {name!r}")
+        if not isinstance(discovery.get("base_url"), str):
+            raise ValueError(f"sandbox.model_discovery.{name} requires base_url")
+        if not (discovery.get("api_key_ref") or discovery.get("auth_command")):
+            raise ValueError(f"sandbox.model_discovery.{name} requires a credential reference")
+    from omnigent.inference_config import validate_inference_credentials
+
+    validate_inference_credentials({}, model_discovery)
+    if provider == "agent_sandbox":
+        host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -1513,6 +1623,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         _reject_overlapping_kubernetes_mounts(pvc_mounts, secret_mounts)
         launcher_factory = _kubernetes_launcher_factory(
             agent_sandbox=provider == "agent_sandbox",
+            warm_pool=warm_pool,
             image=_parse_provider_image(raw, "kubernetes"),
             env=_parse_provider_env(raw, "kubernetes"),
             namespace=_parse_provider_string(raw, "kubernetes", "namespace"),
@@ -1580,6 +1691,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         ),
         provider=provider,
         host_config=host_config,
+        model_discovery=model_discovery,
     )
 
 
@@ -2679,13 +2791,15 @@ def _validate_dns1123_label(value: str | None, field: str) -> None:
         )
 
 
-def _validate_dns1123_subdomain(value: str | None, field: str) -> None:
-    """Reject a ``sandbox.kubernetes.<field>`` that is not a DNS-1123 subdomain."""
+def _validate_dns1123_subdomain(
+    value: str | None, field: str, *, provider: str = "kubernetes"
+) -> None:
+    """Reject a provider resource name that is not a DNS-1123 subdomain."""
     if value is None:
         return
     if len(value) > 253 or not _DNS1123_SUBDOMAIN_RE.fullmatch(value):
         raise ValueError(
-            f"server config 'sandbox.kubernetes.{field}' is not a valid "
+            f"server config 'sandbox.{provider}.{field}' is not a valid "
             f"Kubernetes name (RFC 1123 DNS subdomain): {value!r}"
         )
 
@@ -3169,9 +3283,23 @@ def _reject_overlapping_kubernetes_mounts(
                 )
 
 
+def _parse_agent_sandbox_warm_pool(raw: dict[str, object]) -> str | None:
+    """Validate the optional native warm-pool selection for agent-sandbox."""
+    if "agent_sandbox" in raw and raw.get("provider") != "agent_sandbox":
+        raise ValueError("server config 'sandbox.agent_sandbox' requires provider: agent_sandbox")
+    section = _parse_provider_section(raw, "agent_sandbox")
+    if section is None:
+        return None
+    _reject_unknown_keys(section, {"warm_pool"}, "sandbox.agent_sandbox")
+    name = _parse_provider_string(raw, "agent_sandbox", "warm_pool")
+    _validate_dns1123_subdomain(name, "warm_pool", provider="agent_sandbox")
+    return name
+
+
 def _kubernetes_launcher_factory(
     *,
     agent_sandbox: bool = False,
+    warm_pool: str | None = None,
     image: str | None,
     env: list[str] | None,
     namespace: str | None,
@@ -3194,6 +3322,8 @@ def _kubernetes_launcher_factory(
     :param agent_sandbox: Launch each Pod inside an agent-sandbox ``Sandbox``
         custom resource (``provider: agent_sandbox``) rather than a ``Job``,
         which makes the sandbox reclaim itself once no runner keeps it alive.
+    :param warm_pool: Operator-owned ``SandboxWarmPool`` name for new
+        agent-sandbox allocations, or ``None`` for direct Sandbox creation.
     :param image: Registry image with omnigent pre-installed, or ``None`` for
         the official prebaked host image (env-overridable).
     :param env: Names of server-process environment variables injected into
@@ -3237,11 +3367,13 @@ def _kubernetes_launcher_factory(
         """Construct the Kubernetes launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
 
-        launcher_cls: type[KubernetesSandboxLauncher] = KubernetesSandboxLauncher
+        launcher_cls: Callable[..., SandboxHostLauncher] = KubernetesSandboxLauncher
         if agent_sandbox:
-            from omnigent.onboarding.sandboxes.agent_sandbox import AgentSandboxLauncher
+            from omnigent.onboarding.sandboxes.agent_sandbox_warm_pool import (
+                AgentSandboxWarmPoolLauncher,
+            )
 
-            launcher_cls = AgentSandboxLauncher
+            launcher_cls = partial(AgentSandboxWarmPoolLauncher, warm_pool=warm_pool)
         return launcher_cls(
             image=image,
             env=env,
@@ -3353,6 +3485,7 @@ async def launch_managed_host(
     # across a user's managed sandboxes.
     host_name = f"managed-{host_id[:8]}"
     try:
+        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
     except click.ClickException as exc:
@@ -3443,6 +3576,7 @@ async def relaunch_managed_host(
             provider=host.sandbox_provider,
         )
     try:
+        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
     except click.ClickException as exc:
@@ -3607,36 +3741,31 @@ async def _register_and_start_host(
         registration fails.
     """
     token = secrets.token_urlsafe(32)
-    if keep_host_on_failure:
-        record = await asyncio.to_thread(
-            host_store.replace_managed_host_sandbox,
-            host_id=host_id,
-            user_id=owner,
-            token=token,
-            provider=launcher.provider,
-            sandbox_id=sandbox_id,
-            token_expires_at=now_epoch() + config.token_ttl_s,
-        )
-        if record is None:
-            await _terminate_sandbox_best_effort(
-                launcher,
-                sandbox_id,
-                host_id=host_id,
-                provider=launcher.provider,
-            )
-            raise ValueError(f"managed host {host_id!r} no longer exists")
-    else:
-        record = await asyncio.to_thread(
-            host_store.register_managed_host,
-            host_id=host_id,
-            name=host_name,
-            user_id=owner,
-            token=token,
-            provider=launcher.provider,
-            sandbox_id=sandbox_id,
-            token_expires_at=now_epoch() + config.token_ttl_s,
-        )
+    record = None
     try:
+        if keep_host_on_failure:
+            record = await asyncio.to_thread(
+                host_store.replace_managed_host_sandbox,
+                host_id=host_id,
+                user_id=owner,
+                token=token,
+                provider=launcher.provider,
+                sandbox_id=sandbox_id,
+                token_expires_at=now_epoch() + config.token_ttl_s,
+            )
+            if record is None:
+                raise ValueError(f"managed host {host_id!r} no longer exists")
+        else:
+            record = await asyncio.to_thread(
+                host_store.register_managed_host,
+                host_id=host_id,
+                name=host_name,
+                user_id=owner,
+                token=token,
+                provider=launcher.provider,
+                sandbox_id=sandbox_id,
+                token_expires_at=now_epoch() + config.token_ttl_s,
+            )
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
         # a token that already resolves. The exec-model default execs in; the
@@ -3655,14 +3784,30 @@ async def _register_and_start_host(
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
-        # Broad on purpose: any post-provision failure — launcher CLI
-        # errors, provider SDK exceptions (e.g. Modal's
-        # SandboxTerminated), raw network errors from the in-sandbox
-        # exec — must tear down the sandbox and revoke the armed token,
-        # or the sandbox leaks running until the provider's lifetime
-        # cap. Cleanup-then-reraise at a system boundary, not a
-        # swallow: every path below re-raises as an HTTPException.
-        if keep_host_on_failure:
+        # The provider allocated the sandbox before registration or startup
+        # could fail, so both failures must attempt cleanup.
+        if record is None:
+            current = None
+            try:
+                current = await asyncio.to_thread(host_store.get_host, host_id)
+            except Exception:
+                _logger.exception("Could not inspect failed host registration")
+            # A provider can reuse an ID already retained for active work or cleanup.
+            if (
+                current is None
+                or current.sandbox_provider != launcher.provider
+                or sandbox_id
+                not in (
+                    current.sandbox_id,
+                    current.terminating_sandbox_id,
+                )
+            ):
+                await _terminate_sandbox_best_effort(
+                    launcher, sandbox_id, host_id=host_id, provider=launcher.provider
+                )
+            if isinstance(exc, ValueError):
+                raise
+        elif keep_host_on_failure:
             await _terminate_sandbox_best_effort(
                 launcher,
                 sandbox_id,
@@ -3809,6 +3954,7 @@ async def resume_managed_host(
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
     *,
+    repos: Sequence[RepoWorkspace] = (),
     force: bool = False,
     on_stage: Callable[[str], None] | None = None,
     agent_name: str | None = None,
@@ -3818,7 +3964,7 @@ async def resume_managed_host(
 
     The send-message relaunch path calls this when a host-bound session has no
     live runner. If the host is a *resumable* managed host — a provider whose
-    sandbox idle-stops but retains its persistent volume
+    sandbox idle-stops but retains its identity
     (:attr:`SandboxLauncher.can_resume`) — and is currently offline, this
     resumes the sandbox under the SAME sandbox id, re-arms its launch token,
     re-execs ``omnigent host``, and waits for it to re-register. The caller's
@@ -3839,6 +3985,8 @@ async def resume_managed_host(
     :param host_store: Persistent host registrations (cross-replica liveness).
     :param config: The deployment's managed-sandbox config, or ``None`` when
         the ``sandbox:`` section has been removed since launch.
+    :param repos: Recorded repositories to restore when an agent-sandbox wake
+        recreates its Pod with ephemeral HOME. Existing clones are kept.
     :param force: Skip the DB-liveness no-op gate when the caller has local
         evidence that the tunnel is gone.
     :param on_stage: Progress observer forwarded to the launcher's
@@ -3851,7 +3999,9 @@ async def resume_managed_host(
         runner, or ``None`` to leave it unstamped. A wake rebuilds the runner
         from scratch, so the classifier is not carried over by the resume: the
         caller re-derives it through the same built-in gate a launch uses.
-    :raises HTTPException: 502 when the resume or host restart fails.
+    :raises SandboxGoneError: When the sandbox generation definitively no
+        longer exists, allowing the caller to create a fresh one.
+    :raises HTTPException: 502 when the resume or host restart otherwise fails.
     """
     if config is None:
         return
@@ -3870,11 +4020,13 @@ async def resume_managed_host(
         if host is None:
             return
         # Provider-matched launcher (None if config dropped / provider changed).
-        # Resume needs a reattachable volume; others (e.g. Modal) fall through
-        # to the caller's fresh relaunch path.
+        # Non-resumable providers (e.g. Modal) fall through to a fresh relaunch.
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
             return
+        # Agent-sandbox recreates its Pod and may lose HOME. Other resumable
+        # providers retain their filesystem and do not need workspace prep.
+        workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
         sandbox_id = host.sandbox_id
         _logger.info(
@@ -3884,6 +4036,7 @@ async def resume_managed_host(
             launcher.provider,
         )
         try:
+            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
             await asyncio.to_thread(launcher.resume, sandbox_id)
             token = secrets.token_urlsafe(32)
             armed = await asyncio.to_thread(
@@ -3925,12 +4078,14 @@ async def resume_managed_host(
                 host_id=host.host_id,
                 host_name=host.name,
                 server_url=entry.server_url,
-                repos=(),  # the persistent volume already holds the workspace
+                repos=workspace_repos,
                 host_config=entry.host_config,
                 on_stage=on_stage,
                 agent_name=agent_name,
             )
             await _wait_for_host_online(host_store, host.host_id)
+        except SandboxGoneError:
+            raise
         except Exception as exc:
             # An ordinary failed wake must NOT tear the sandbox down (the volume
             # is the user's); just surface it. Full teardown is handled above.

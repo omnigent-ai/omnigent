@@ -2028,6 +2028,82 @@ def test_apply_overrides_harness_only_clears_pinned_model() -> None:
     assert executor.get("model") is None
 
 
+def test_apply_overrides_same_harness_keeps_pinned_model() -> None:
+    """Repeating the spec's harness preserves its pinned model."""
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "my-agent",
+        "prompt": "repro",
+        "executor": {
+            "type": "omnigent",
+            "model": "my-model-id",
+            "config": {"harness": "pi"},
+        },
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="pi"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["config"]["harness"] == "pi"
+    assert executor["model"] == "my-model-id"
+
+
+def test_apply_overrides_flat_same_harness_keeps_pinned_model() -> None:
+    """A canonical harness alias preserves the single-file spec's model."""
+    raw: dict[str, object] = {
+        "name": "single_file",
+        "prompt": "hi",
+        "executor": {"harness": "claude-sdk", "model": "sonnet"},
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="claude"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["model"] == "sonnet"
+
+
+@pytest.mark.parametrize("bundled", [False, True], ids=["flat", "bundle"])
+@pytest.mark.parametrize(
+    ("model_location", "cli_model", "expected_model"),
+    [
+        (None, None, "from-env"),
+        ("executor", None, "from-spec"),
+        ("llm", None, "from-spec"),
+        (None, "from-cli", "from-cli"),
+        ("executor", "from-cli", "from-cli"),
+        ("llm", "from-cli", "from-cli"),
+    ],
+)
+def test_apply_overrides_same_harness_model_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    bundled: bool,
+    model_location: str | None,
+    cli_model: str | None,
+    expected_model: str,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
+    executor: dict[str, object] = (
+        {"type": "omnigent", "config": {"harness": "claude-sdk"}}
+        if bundled
+        else {"harness": "claude-sdk"}
+    )
+    raw: dict[str, object] = {"name": "model-precedence", "prompt": "hi", "executor": executor}
+    if bundled:
+        raw["spec_version"] = 1
+    if model_location == "executor":
+        executor["model"] = "from-spec"
+    elif model_location == "llm":
+        raw["llm"] = {"model": "from-spec"}
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="claude", model=cli_model))
+
+    llm = raw.get("llm")
+    llm_model = llm.get("model") if isinstance(llm, dict) else None
+    assert (executor.get("model") or llm_model) == expected_model
+
+
 def test_apply_overrides_rejects_harness_for_non_omnigent_executor_type() -> None:
     """
     A spec_version bundle with a non-omnigent ``executor.type`` fails
@@ -3106,6 +3182,7 @@ async def test_resolve_latest_conversation_id_async_scopes_by_agent_name() -> No
         "limit": 1,
         "order": "desc",
         "sort_by": "updated_at",
+        "visibility": "mine",
     }
 
 
@@ -3125,6 +3202,7 @@ async def test_resolve_latest_conversation_id_async_returns_none_for_unknown_nam
         "limit": 1,
         "order": "desc",
         "sort_by": "updated_at",
+        "visibility": "mine",
     }
 
 
@@ -3234,22 +3312,10 @@ def test_databricks_token_auth_resolves_sdk_once(
 def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A mint failure on the reused SDK auth re-resolves instead of latching.
-
-    The long-lived client holds one SDK auth, and the SDK bakes the resolved
-    Databricks CLI binary path into it. When that path vanishes (e.g. a
-    Homebrew upgrade removes the versioned Cellar directory), every request
-    would go out bare for the rest of the process; the auth must resolve a
-    fresh SDK auth — which finds the current binary — and keep minting.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
+    """The client replaces stale SDK auth before retrying a mint."""
     import omnigent.inner.databricks_executor as dbx
 
     class _Cfg:
-        """Config double that can go stale like a deleted CLI binary."""
-
         def __init__(self, token: str) -> None:
             self.token = token
             self.stale = False
@@ -3276,7 +3342,6 @@ def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
 
     assert _first_auth_header(auth, "https://ex.databricks.com/v1/x") == "Bearer tok-1"
 
-    # The upgrade deletes the binary path the first Config baked in.
     cfgs[0].stale = True
 
     assert _first_auth_header(auth, "https://ex.databricks.com/v1/x") == "Bearer tok-2", (

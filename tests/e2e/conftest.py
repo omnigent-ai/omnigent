@@ -1582,7 +1582,9 @@ def lookup_agent_id(client: httpx.Client, agent_name: str) -> str:
     :returns: The matching ``"ag_..."`` durable id.
     :raises AssertionError: If no session with that agent name exists.
     """
-    resp = client.get("/v1/sessions", params={"agent_name": agent_name, "limit": 1})
+    resp = client.get(
+        "/v1/sessions", params={"visibility": "all", "agent_name": agent_name, "limit": 1}
+    )
     resp.raise_for_status()
     sessions = resp.json()["data"]
     if sessions:

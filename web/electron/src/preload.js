@@ -435,9 +435,18 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * Resolves `{needsConfirm:true, url}` when a remote URL doesn't look like an
    * Omnigent server; re-call with `{force:true}` to proceed anyway.
    * @param {string} url
-   * @param {{force?: boolean}} [opts]
+   * @param {{force?: boolean, requestId?: string}} [opts]
    */
   setServerUrl: (url, opts) => ipcRenderer.invoke("omnigent:set-server-url", url, opts),
+  /** Cancel only this setup window's matching connection attempt. */
+  cancelServerConnection: (requestId) =>
+    ipcRenderer.invoke("omnigent:cancel-server-connection", requestId),
+  /** Subscribe to connecting/authenticating phases for a request ID. */
+  onConnectionProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("omnigent:connection-progress", listener);
+    return () => ipcRenderer.removeListener("omnigent:connection-progress", listener);
+  },
   /** Organization-provided server URLs from macOS Managed Preferences. */
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
   /** Recently-connected server URLs, most recent first. */

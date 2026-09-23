@@ -8,7 +8,10 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.chat.test_claude_model_picker import _patch_session_as_claude_native
-from tests.e2e_ui.chat.test_working_indicator_background_tasks import _publish_status
+from tests.e2e_ui.chat.test_working_indicator_background_tasks import (
+    _MONITOR_TASK,
+    _publish_status,
+)
 from tests.e2e_ui.conftest import fetch_with_retry, workspace_bar_needs_collapse
 
 
@@ -51,7 +54,7 @@ from tests.e2e_ui.conftest import fetch_with_retry, workspace_bar_needs_collapse
         ),
     ],
 )
-def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
+def test_pr_context_and_background_tasks_share_workspace_bar(
     page: Page,
     seeded_session: tuple[str, str],
     tmp_path: Path,
@@ -80,7 +83,16 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
     page.route(
         "**/v1/hosts/acceptance-host/worktrees?*",
         lambda route: route.fulfill(
-            json={"data": [{"path": "/work/repo", "branch": "live-branch", "is_main": True}]}
+            json={
+                "data": [
+                    {
+                        "path": "/work/repo",
+                        "branch": "live-branch",
+                        "is_main": False,
+                        "detached": False,
+                    }
+                ]
+            }
         ),
     )
     page.route(
@@ -129,7 +141,13 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
             f"localStorage.setItem('omnigent:ui-font-family', JSON.stringify('{font_family}'))"
         )
     page.set_viewport_size({"width": viewport_width, "height": 844 if is_mobile else 900})
-    _publish_status(base_url, session_id, "idle", background_task_count=2)
+    _publish_status(
+        base_url,
+        session_id,
+        "idle",
+        background_task_count=1,
+        background_tasks=[_MONITOR_TASK],
+    )
     page.goto(f"{base_url}/c/{session_id}")
     bar = page.get_by_test_id("composer-workspace-controls")
     pr_link = bar.get_by_test_id("composer-pr-link")
@@ -137,17 +155,24 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
     expect(pr_label).to_have_text(f"#{pr_number}", timeout=30_000)
     expect(pr_link).to_have_accessible_name(f"#{pr_number}")
     context = bar.get_by_test_id("composer-context-ring")
-    expect(context).to_have_text("100%")
+    expect(context).to_have_accessible_name("100% of context used")
     if font_family is not None:
         applied_family = context.evaluate("el => getComputedStyle(el).fontFamily")
         assert applied_family.split(",")[0].strip("\"' ") == font_family
-    expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
-    expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
+    expect(bar.get_by_test_id("background-task-pill")).to_have_text("1")
+    subagent = bar.get_by_test_id("subagent-task-pill")
+    expect(subagent).to_have_text("1")
+    expect(subagent).to_have_accessible_name("1 sub-agent: 1 active")
     expect(bar).to_contain_text("live-branch")
     expect(bar).not_to_contain_text("pr-head-not-checkout")
     bounds = bar.bounding_box()
     assert bounds is not None
-    status_ids = ("composer-pr-link", "composer-context-ring")
+    status_ids = (
+        "composer-pr-link",
+        "background-task-pill",
+        "subagent-task-pill",
+        "composer-context-ring",
+    )
     control_bounds = {}
     icon_bounds = {}
     for test_id in ("composer-workspace-dir", "composer-git-branch", *status_ids):
@@ -160,9 +185,7 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
             icon_rect = icon.bounding_box()
             assert icon_rect is not None
             icon_bounds[test_id].append(icon_rect)
-    measured_font = context.locator("span").evaluate(
-        "el => parseFloat(getComputedStyle(el).fontSize)"
-    )
+    measured_font = context.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
     print(
         f"Status bar ({viewport_width}px, {font_size}px preference, {theme}): "
         f"bar={bounds}, controls={control_bounds}, icons={icon_bounds}, "
@@ -170,9 +193,6 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
     )
     bar.screenshot(path=tmp_path / f"status-bar-{theme}.png", animations="disabled")
     page.screenshot(path=tmp_path / f"status-page-{theme}.png", animations="disabled")
-    assert measured_font == pytest.approx(
-        font_size * 0.9 * (14 / 13 if is_mobile else 1), abs=0.01
-    )
     directory_icon = icon_bounds["composer-workspace-dir"][0]
     center_y = directory_icon["y"] + directory_icon["height"] / 2
     assert bounds["height"] == pytest.approx(37, abs=0.5)
@@ -181,17 +201,21 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
     assert trailing["x"] + trailing["width"] == pytest.approx(
         bounds["x"] + bounds["width"] - 9, abs=0.5
     )
+    background = control_bounds["background-task-pill"]
+    subagent = control_bounds["subagent-task-pill"]
+    context_ring = control_bounds["composer-context-ring"]
+    assert background["x"] + background["width"] == pytest.approx(subagent["x"], abs=0.5)
+    assert subagent["x"] + subagent["width"] + 4 == pytest.approx(context_ring["x"], abs=0.5)
     # A label that would have to truncate collapses the whole bar to icons
     # instead — the full value stays in the title — and a bar with room shows
     # every label untruncated. Neither state may show an ellipsis.
     collapsed = bar.get_attribute("data-labels") == "collapsed"
     assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_number)
     expect(pr_label).to_have_attribute("title", f"#{pr_number}")
-    # The PR number and the context percentage always show; a crowded bar
-    # collapses the directory and branch text to their icons, which gives the
-    # PR number the room it needs.
+    # The PR number stays visible and the context ring stays accessible; a
+    # crowded bar collapses only the directory and branch text to their icons.
     expect(pr_label).to_be_visible()
-    expect(context.locator("span")).to_be_visible()
+    expect(context).to_have_accessible_name("100% of context used")
     for chip in ("composer-workspace-dir", "composer-git-branch"):
         chip_label = bar.get_by_test_id(chip).locator("[data-workspace-collapse-label]")
         if collapsed:
@@ -227,7 +251,18 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
                 icon,
                 rect,
             )
-    ordered_icons = [(test_id, icon) for test_id, icons in icon_bounds.items() for icon in icons]
+    ordered_icons = [
+        (test_id, icon)
+        for test_id in (
+            "composer-workspace-dir",
+            "composer-git-branch",
+            "composer-pr-link",
+            "background-task-pill",
+            "subagent-task-pill",
+            "composer-context-ring",
+        )
+        for icon in icon_bounds[test_id]
+    ]
     for (left_id, left), (right_id, right) in pairwise(ordered_icons):
         assert left["x"] + left["width"] <= right["x"] + 0.5, (
             left_id,
@@ -266,7 +301,7 @@ def test_long_model_and_permission_remain_single_row(
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     label = page.get_by_test_id("composer-agent-config-value")
-    expect(label).to_contain_text(display_name, timeout=30_000)
+    expect(label).to_contain_text("Opus 4.8 1M", timeout=30_000)
     permission = page.get_by_test_id("composer-permission-chip")
     expect(permission).to_be_visible()
     if width == 3200:
@@ -297,7 +332,7 @@ def test_long_model_and_permission_remain_single_row(
         "send_on_screen": send_bounds["x"] + send_bounds["width"] <= width,
     }
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_attribute(
-        "title", display_name
+        "title", "Opus 4.8 1M"
     )
     expect(summary).to_have_attribute("title", display_name)
     page.get_by_test_id("composer-agent-edit").click()

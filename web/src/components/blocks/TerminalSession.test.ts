@@ -19,6 +19,7 @@ import {
   loadWebglRenderer,
   openTerminalLink,
   parseTerminalClipboardMessage,
+  resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
@@ -76,6 +77,23 @@ describe("openTerminalLink", () => {
     expect(pushSpy).not.toHaveBeenCalled();
   });
 
+  it("rebases session links under the configured base path", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    window.history.replaceState(null, "", "/proxy/6767/");
+    try {
+      const pushSpy = vi.spyOn(window.history, "pushState");
+      const event = new MouseEvent("click");
+      // Unprefixed terminal link is rebased under the basename.
+      openTerminalLink(event, `${window.location.origin}/c/conv_x`);
+      expect(pushSpy).toHaveBeenCalledWith(null, "", "/proxy/6767/c/conv_x");
+      // Already-prefixed link is pushed unchanged (idempotent, no doubling).
+      openTerminalLink(event, `${window.location.origin}/proxy/6767/c/conv_y`);
+      expect(pushSpy).toHaveBeenCalledWith(null, "", "/proxy/6767/c/conv_y");
+    } finally {
+      delete window.__OMNIGENT_BASE_PATH__;
+    }
+  });
+
   it("prevents the addon's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");
@@ -88,6 +106,70 @@ describe("openTerminalLink", () => {
     // (and kill the WebSocket-attached terminal) before window.open's
     // tab is usable. A failure here means that suppression was dropped.
     expect(preventSpy).toHaveBeenCalledOnce();
+  });
+
+  it("lets the app consume an OSC 8 file link instead of opening the browser", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const onFileLink = vi.fn(() => true);
+    const event = new MouseEvent("click");
+
+    openTerminalLink(event, "file:///home/u/ws/src/app.ts#L42", onFileLink);
+
+    expect(onFileLink).toHaveBeenCalledWith("file:///home/u/ws/src/app.ts#L42");
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps the normal external-link path when the app declines a link", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    openTerminalLink(new MouseEvent("click"), "https://example.com/foo", () => false);
+
+    expect(openSpy).toHaveBeenCalledWith(
+      "https://example.com/foo",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+
+  it.each([
+    "file:///etc/hosts#L1",
+    "javascript:alert(document.domain)",
+    "data:text/html,<script>alert(1)</script>",
+    "mailto:user@example.com",
+  ])("does not browser-open a declined non-HTTP OSC 8 link: %s", (uri) => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    openTerminalLink(new MouseEvent("click"), uri, () => false);
+
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveTerminalWorkspaceFileLink", () => {
+  const ROOT = "/home/u/ws";
+  const HOME = "/home/u";
+
+  it.each([
+    ["file:///home/u/ws/src/app.ts", "src/app.ts", null],
+    ["file:///home/u/ws/src/app.ts:42", "src/app.ts", 42],
+    ["file:///home/u/ws/src/app.ts:42:7", "src/app.ts", 42],
+    ["file:///home/u/ws/src/app.ts#L43", "src/app.ts", 43],
+    ["file:///home/u/ws/src/app.ts#L44C3", "src/app.ts", 44],
+    ["file:///home/u/ws/src/app.ts#L45-L50", "src/app.ts", 45],
+    ["file:///home/u/ws/Design%20Notes.md#L46", "Design Notes.md", 46],
+  ])("resolves %s", (uri, path, line) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toEqual({ path, line });
+  });
+
+  it.each([
+    "https://example.com/src/app.ts#L42",
+    "file:///etc/hosts#L1",
+    "file:///home/u/ws/src/app.ts#heading",
+    "file:///home/u/ws/src/app.ts?line=42",
+    "file://fileserver/home/u/ws/src/app.ts#L42",
+    "file:///home/u/ws/%E0%A4%A.md#L42",
+  ])("rejects a non-workspace or unsafe target: %s", (uri) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toBeNull();
   });
 });
 
@@ -662,6 +744,15 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("enables OSC 8 file links while keeping activation in the app handler", () => {
+    const { session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+
+    expect(term.options.linkHandler?.allowNonHttpProtocols).toBe(true);
+    expect(term.options.linkHandler?.activate).toBeTypeOf("function");
+    session.dispose();
+  });
+
   it("grabs keyboard focus on open when focusOnConnect is set", () => {
     // WHY: a foreground surface should claim the keyboard as it comes up.
     const { socket, session } = makeSession();
@@ -951,6 +1042,62 @@ describe("TerminalSession", () => {
       term.write(`\x1b]52;;${btoa("pane output")}\x07`, resolve);
     });
 
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it.each([true, false])(
+    "routes browser selections through consent without a recent-input requirement (bridge enabled: %s)",
+    (clipboardEnabled) => {
+      const onClipboardRequest = vi.fn();
+      const { container, session } = makeSession(
+        undefined,
+        undefined,
+        clipboardEnabled,
+        onClipboardRequest,
+      );
+      const term = (session as unknown as { term: Terminal }).term;
+      vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+      const setData = vi.fn();
+      const copy = new Event("copy", { bubbles: true, cancelable: true });
+      Object.defineProperty(copy, "clipboardData", { value: { setData } });
+      const textarea = container.querySelector("textarea")!;
+      const bypassConsent = vi.fn();
+      textarea.addEventListener("copy", bypassConsent);
+
+      textarea.dispatchEvent(copy);
+
+      expect(copy.defaultPrevented).toBe(true);
+      expect(bypassConsent).not.toHaveBeenCalled();
+      expect(setData).not.toHaveBeenCalled();
+      expect(onClipboardRequest).toHaveBeenCalledWith("selected text", copy);
+      session.dispose();
+    },
+  );
+
+  it("does not copy a browser selection without a consent handler", () => {
+    const { container, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+    const setData = vi.fn();
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(copy, "clipboardData", { value: { setData } });
+
+    container.querySelector("textarea")!.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(true);
+    expect(setData).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("leaves copying outside a terminal selection alone", () => {
+    const onClipboardRequest = vi.fn();
+    const { container, session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+
+    container.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(false);
     expect(onClipboardRequest).not.toHaveBeenCalled();
     session.dispose();
   });

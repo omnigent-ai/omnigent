@@ -15,6 +15,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 # Stubbed host the composer auto-selects (the tunneled runner registers no
 # host). Keyed identically in the recent-workspaces localStorage seed.
 _HOST_ID = "host_e2e"
@@ -142,8 +144,11 @@ async def _register_routes(page) -> None:
         )
 
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
 
 
 async def _open_picker(page) -> None:
@@ -152,11 +157,10 @@ async def _open_picker(page) -> None:
 
 
 def test_recent_harness_remains_in_other_group(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Recent launches do not change the prototype's primary harness order."""
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive_recent(base_url))
 
 
@@ -196,11 +200,10 @@ async def _drive_recent(base_url: str) -> None:
 
 
 def test_picker_leads_with_primary_harnesses(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Primary harnesses lead; the selected secondary harness joins them on reopen."""
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive(base_url))
 
 

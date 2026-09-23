@@ -31,6 +31,7 @@ from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    DEVIN_NATIVE_CODING_AGENT,
     KIMI_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
@@ -44,7 +45,6 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SandboxStatus,
     ServerStreamEvent,
-    SkillSummary,
 )
 from omnigent.spec.types import (
     StateUpdate,
@@ -109,6 +109,9 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 
 
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
+
+
+_SUBAGENT_STATUS_TYPE: str = "subagent.status"
 
 
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
@@ -287,6 +290,9 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 
+_LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: str = "omnigent.last_task_error_agent_name"
+
+
 # Optional structured failure fields (present when the runner classified the
 # failure — see ``omnigent.runner.launch_failure``), persisted so a reload
 # renders the same clear failure card instead of only the raw code + message.
@@ -348,6 +354,31 @@ _ANTIGRAVITY_NATIVE_HARNESS = ANTIGRAVITY_NATIVE_CODING_AGENT.harness
 
 
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
+
+
+_DEVIN_NATIVE_WRAPPER_LABEL_VALUE = DEVIN_NATIVE_CODING_AGENT.wrapper_label
+
+
+_EXTERNAL_DEVIN_SUBAGENT_START_TYPE: str = "external_devin_subagent_start"
+
+
+_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "devin-native-ui-subagent"
+
+
+# Devin's ``run_subagent`` spawns a background sub-agent whose ``agent_id`` (the
+# idempotency key for the child row) rides only free text in the tool result; a
+# child mirrors that sub-agent's transcript, reconstructed from the parent's
+# ``message_nodes`` forest.
+_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY = "omnigent.devin_native.subagent_agent_id"
+
+
+_DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY = "omnigent.devin_native.run_subagent_tool_use_id"
+
+
+_DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY = "omnigent.devin_native.subagent_title"
+
+
+_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Devin"
 
 
 _PI_NATIVE_WRAPPER_LABEL_VALUE = PI_NATIVE_CODING_AGENT.wrapper_label
@@ -455,6 +486,20 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
 
 
+# How long an archive defers tearing down the session's runner, giving an Undo's
+# unarchive time to land first. When the teardown fires it re-reads the persisted
+# archived flag and skips if the session was unarchived, so any Undo whose
+# unarchive PERSISTS before this fires keeps the runner — across replicas, since
+# the guard is the shared row, not an in-memory timer.
+#
+# MUST stay above the client Undo pill's total lifetime, which the pill caps at
+# ARCHIVE_UNDO_MAX_LIFETIME_MS (5s) in web/src/shell/archiveUndoToast.tsx. The
+# pill merges successive archives, so without that cap it could linger past this
+# grace and offer an Undo AFTER the teardown already ran — and the re-check
+# can't un-stop a runner. The cap keeps the pill's Undo window inside this grace.
+_ARCHIVE_STOP_UNDO_GRACE_S = 8.0
+
+
 _HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
 
 
@@ -494,6 +539,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
+    _SUBAGENT_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MCP_STARTUP_TYPE,
@@ -507,6 +553,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
+    _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
 }
@@ -520,6 +567,33 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+@dataclass
+class _RunnerStatusProbeBackoff:
+    """
+    Skip window for a session's runner status probe after slow probes.
+
+    :param skip_until: Monotonic time before which the probe is skipped.
+    :param failures: Consecutive slow or failed probes; sets the next window.
+    :param runner_id: Runner the slow probes were against, e.g.
+        ``"runner_0123456789abcdef"``; a rebind to another runner discards
+        the window.
+    """
+
+    skip_until: float
+    failures: int
+    runner_id: str | None
+
+
+_runner_status_probe_backoff: WorkspaceScopedCache[str, _RunnerStatusProbeBackoff] = (
+    WorkspaceScopedCache()
+)
+
+# The one runner status probe in flight per session; concurrent snapshots await it.
+_runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None]] = (
+    WorkspaceScopedCache()
+)
 
 
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
@@ -587,21 +661,6 @@ _session_sandbox_status_cache: WorkspaceScopedCache[str, SandboxStatus] = Worksp
 _session_mcp_startup_cache: WorkspaceScopedCache[str, dict[str, McpServerStartup]] = (
     WorkspaceScopedCache()
 )
-
-
-_runner_skills_cache: WorkspaceScopedCache[str, list[SkillSummary]] = WorkspaceScopedCache()
-
-
-_runner_skills_failed: WorkspaceScopedSet[str] = WorkspaceScopedSet()
-
-
-# Sessions whose cached skills need a re-fetch but should keep serving until it
-# lands. A browser reload asks for one, and dropping the entry outright would
-# empty the composer's slash-command menu for the reload that requested it.
-_runner_skills_stale: WorkspaceScopedSet[str] = WorkspaceScopedSet()
-
-
-_runner_skills_inflight: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
 
 
 _model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
@@ -844,6 +903,7 @@ _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
+    _DEVIN_NATIVE_WRAPPER_LABEL_VALUE: "devin-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
@@ -983,6 +1043,12 @@ __all__ = [
     "_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
     "_CURSOR_NATIVE_WRAPPER_LABEL_VALUE",
     "_DENY_SENTINEL_PREFIX",
+    "_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK",
+    "_DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY",
+    "_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
+    "_DEVIN_NATIVE_WRAPPER_LABEL_VALUE",
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
@@ -994,6 +1060,7 @@ __all__ = [
     "_EXTERNAL_COMPACTION_STATUS_TYPE",
     "_EXTERNAL_COMPACTION_STATUS_VALUES",
     "_EXTERNAL_CONVERSATION_ITEM_TYPE",
+    "_EXTERNAL_DEVIN_SUBAGENT_START_TYPE",
     "_EXTERNAL_ELICITATION_RESOLVED_TYPE",
     "_EXTERNAL_MCP_STARTUP_STATUS_VALUES",
     "_EXTERNAL_MCP_STARTUP_TYPE",
@@ -1064,6 +1131,7 @@ __all__ = [
     "_STOP_RUNNER_RESULT_TIMEOUT_S",
     "_STOP_SESSION_TYPE",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
+    "_SUBAGENT_STATUS_TYPE",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
@@ -1072,6 +1140,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
@@ -1094,9 +1163,8 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
-    "_runner_skills_cache",
-    "_runner_skills_inflight",
-    "_runner_skills_stale",
+    "_runner_status_probe_backoff",
+    "_runner_status_probe_inflight",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

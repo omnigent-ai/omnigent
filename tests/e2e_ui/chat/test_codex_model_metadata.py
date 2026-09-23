@@ -313,16 +313,24 @@ _HOST_PROBE_ROWS = [
 ]
 
 
-def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None:
+def _patch_precatalog_codex_session_on_host(
+    page: Page,
+    session_id: str,
+    *,
+    reported_model: str = "gpt-5.6-luna",
+    runner_online: bool = True,
+) -> None:
     """Shape ``session_id`` as a host-bound codex session with no catalog yet.
 
     The snapshot's ``model_options`` stay empty for the whole test — the
     state a fresh session is in while codex app-server boots — while the
-    host's pre-launch probe route serves cached rows. Liveness is pinned
-    online so the gear stays enabled despite the fake host id.
+    host's pre-launch probe route serves cached rows. The host stays online
+    so the gear remains enabled even when the runner is asleep.
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch.
+    :param reported_model: Model id reported by the session.
+    :param runner_online: Whether the session runner is connected.
     """
 
     def _patch_snapshot(route: Route) -> None:
@@ -337,9 +345,11 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
             "omnigent.wrapper": "codex-native-ui",
         }
         payload["harness"] = "codex"
-        payload["llm_model"] = "gpt-5.6-luna"
+        payload["llm_model"] = reported_model
         payload["model_options"] = []
         payload["host_id"] = _PRE_CATALOG_HOST_ID
+        payload["runner_online"] = runner_online
+        payload["host_online"] = True
         route.fulfill(
             status=200,
             headers={**response.headers, "content-type": "application/json"},
@@ -360,7 +370,7 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
             return
         response = fetch_with_retry(route)
         payload = response.json()
-        online = {"runner_online": True, "host_online": True}
+        online = {"runner_online": runner_online, "host_online": True}
         if isinstance(payload.get("sessions"), dict):
             payload["sessions"][session_id] = online
         if isinstance(payload.get("session"), dict):
@@ -377,6 +387,31 @@ def _patch_precatalog_codex_session_on_host(page: Page, session_id: str) -> None
         _serve_host_probe,
     )
     page.route(re.compile(r"/health(\?|$)"), _force_online_health)
+
+
+def test_offline_codex_model_label_matches_gateway_id_to_host_catalog(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """An asleep runner's Gateway model gets its display name from the host."""
+    base_url, session_id = seeded_session
+    _patch_precatalog_codex_session_on_host(
+        page,
+        session_id,
+        reported_model="system.ai.gpt-5-6-luna",
+        runner_online=False,
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_contain_text("GPT-5.6-Luna", timeout=15_000)
+    expect(page.get_by_role("status", name="Loading model")).to_have_count(0)
+    gear.click()
+    expect(page.get_by_test_id("composer-agent-model-summary")).to_have_text("GPT-5.6-Luna")
+    page.get_by_test_id("composer-agent-edit").click()
+    row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]')
+    expect(row).to_have_attribute("aria-checked", "true")
+    expect(row).to_contain_text("GPT-5.6-Luna")
 
 
 def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(

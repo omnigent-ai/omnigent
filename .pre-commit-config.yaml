@@ -55,9 +55,11 @@ repos:
       - id: custom-lint
         name: custom project lint rules
         language: system
-        entry: .venv/bin/python -m dev.lint.custom_lint
+        entry: >-
+          bash -c '.venv/bin/python -m dev.lint.custom_lint &&
+          node --test dev/lint/session_list_visibility.test.mjs'
         pass_filenames: false
-        files: ^(omnigent/(server|runtime)|dev/lint)/.*\.py$
+        files: \.(py|[cm]?[jt]sx?|sh)$|^(\.pre-commit-config\.yaml|\.github/workflows/lint\.yml)$
 
       - id: web-prettier
         name: web prettier

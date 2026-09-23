@@ -26,7 +26,7 @@ import cachetools
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
@@ -228,10 +228,10 @@ def any_policies_apply(
     tool_name: str | None = None,
     conversation: Conversation | None = None,
 ) -> bool:
-    """Return ``True`` when at least one policy would run for this evaluation.
+    """Return ``True`` when this evaluation may need to run policies.
 
-    Cheaper than building a full :class:`PolicyEngine`: only checks whether
-    the combined policy list is non-empty. Used as a fast-path guard in
+    Cheaper than building a full :class:`PolicyEngine`: checks whether
+    policies may apply. Used as a fast-path guard in
     ``POST /policies/evaluate`` to skip the engine build (and the associated
     conversation-store reads for labels/state/usage) when nothing would fire.
 
@@ -249,7 +249,8 @@ def any_policies_apply(
         sub-agent conversations this lets the check see the CHILD spec's own
         guardrails (which :func:`build_policy_engine` enforces), so a bundle
         whose only policies live on a sub-agent is not fast-path skipped.
-        ``None`` checks the passed *spec* alone.
+        Children with a policy store must build the engine to resolve
+        inherited session policies against their verified root.
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
@@ -270,6 +271,14 @@ def any_policies_apply(
     # Session policies are LRU-cached per (workspace_id, conversation_id) —
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
+        return True
+    # The engine verifies ancestry before inheriting root session policies.
+    # A child's local policy list cannot rule out an inherited policy.
+    if (
+        policy_store is not None
+        and conversation is not None
+        and conversation.parent_conversation_id is not None
+    ):
         return True
     return False
 
@@ -1109,6 +1118,34 @@ def load_session_usage(
     return _sum_subtree_usage(tree, conversation_id)
 
 
+def load_session_usage_and_tree(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    *,
+    root_conversation_id: str | None = None,
+) -> tuple[dict[str, Any], list[Conversation]]:
+    """
+    Load a conversation's subtree usage together with the tree it came from.
+
+    :func:`load_session_usage` discards the tree it summed, so a caller that
+    needs both — the sums *and* the rows, e.g. to roll up which harnesses ran
+    in the tree — would otherwise load it twice. Returning both keeps that to
+    one read, and keeps the sums and the rows from the same snapshot rather
+    than two.
+
+    :param conversation_id: The conversation to sum, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read from.
+    :param root_conversation_id: The conversation's tree root, when the
+        caller already holds the row — validated as in
+        :func:`load_session_usage`.
+    :returns: ``(usage, tree)`` — the subtree usage dict
+        :func:`load_session_usage` would return, and every conversation in
+        the tree it was summed from.
+    """
+    tree = load_session_tree(conversation_id, conversation_store, root_conversation_id)
+    return _sum_subtree_usage(tree, conversation_id), tree
+
+
 def load_session_tree(
     conversation_id: str,
     conversation_store: ConversationStore,
@@ -1300,10 +1337,18 @@ def _policy_usage_seed(
     conv = conversation_store.get_conversation(conversation_id)
     if conv is None:
         return {}
-    usage = load_session_usage(conv.root_conversation_id, conversation_store)
+    # A top-level row's ``root_conversation_id`` is its own id, so the root we
+    # are about to sum names itself as its root — pass it and the loader skips
+    # re-reading that row (it still verifies the hint, so a stale one heals).
+    usage = load_session_usage(
+        conv.root_conversation_id,
+        conversation_store,
+        root_conversation_id=conv.root_conversation_id,
+    )
     return _normalize_usage_for_engine(usage)
 
 
+@restart_on_stale_cursor
 def _load_tree_conversations(
     root_conversation_id: str,
     conversation_store: ConversationStore,
@@ -1314,7 +1359,11 @@ def _load_tree_conversations(
     Returns all conversations sharing ``root_conversation_id`` (the
     root plus every sub-agent, any ``kind``), paginating so a large
     tree is not silently truncated. The ``root_conversation_id`` column
-    is indexed, so this is a bounded indexed scan per page.
+    is indexed, so this is a bounded indexed scan per page. A delete
+    landing on the page cursor mid-walk restarts the walk (via
+    :func:`restart_on_stale_cursor`) instead of silently dropping the
+    remaining rows — a truncated tree under-counts spend and can move a
+    budget gate.
 
     :param root_conversation_id: The tree's root conversation id (every
         conversation in a spawn tree shares it), e.g. ``"conv_abc123"``.
@@ -1346,12 +1395,18 @@ def _load_tree_conversations(
     return convs
 
 
+@restart_on_stale_cursor
 def _load_tree_pages(
     root_conversation_id: str,
     conversation_store: ConversationStore,
 ) -> tuple[list[Conversation], bool]:
     """
     Page through a spawn tree, reporting whether more than one page was read.
+
+    A delete landing on the page cursor mid-walk restarts the walk (via
+    :func:`restart_on_stale_cursor`) instead of silently dropping the
+    remaining rows — a truncated tree under-counts spend and can move a
+    budget gate.
 
     :param root_conversation_id: The tree's root conversation id.
     :param conversation_store: Store to read from.

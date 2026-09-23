@@ -6,7 +6,10 @@
 // the harness config controls, and the store can all depend on one source of
 // truth without a circular import.
 
+import { fusionModelLabel, isFusionModelUid } from "@/lib/devinFusion";
 import type { NativeModelOption } from "@/lib/types";
+
+const DISPLAY_ONLY_CATALOG_PREFIXES = ["databricks-", "system.ai."] as const;
 
 /** The native-catalog fields a model label is built from. A superset like
  *  {@link NativeModelOption} is assignable to this. */
@@ -18,7 +21,17 @@ export interface NativeModelLabelFields {
 }
 
 export function nativeModelLabel(option: NativeModelLabelFields): string {
-  return option.displayName ?? option.model ?? option.id;
+  const label = option.displayName ?? option.model ?? option.id;
+  // Some provider catalogs repeat the transport id as their display name.
+  // Hide its mechanical namespace while preserving real advertised labels.
+  const isTransportLabel = [option.id, option.model].some(
+    (id) => id != null && (label === id || label === id.slice(id.indexOf("/") + 1)),
+  );
+  if (option.displayName != null && !isTransportLabel) return label;
+  for (const prefix of DISPLAY_ONLY_CATALOG_PREFIXES) {
+    if (label.startsWith(prefix)) return label.slice(prefix.length);
+  }
+  return label;
 }
 
 export function defaultModelLabel(options: readonly NativeModelLabelFields[]): string {
@@ -27,7 +40,8 @@ export function defaultModelLabel(options: readonly NativeModelLabelFields[]): s
 }
 
 export function compactModelTriggerLabel(value: string): string {
-  return /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
+  const withoutDefault = /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
+  return withoutDefault.replace(/\s*\((\d+(?:\.\d+)?[KMG]) context\)/gi, " $1");
 }
 
 export function formatStatusModelLabel(
@@ -36,6 +50,10 @@ export function formatStatusModelLabel(
 ): string | null {
   const raw = model?.trim();
   if (!raw) return null;
+  if (isFusionModelUid(raw)) {
+    const descriptor = codexModelOptions.find((candidate) => candidate.fusion)?.fusion;
+    if (descriptor) return fusionModelLabel(descriptor, raw);
+  }
   const option =
     codexModelOptions.find((candidate) => candidate.id === raw) ??
     codexModelOptions.find((candidate) => candidate.model === raw);

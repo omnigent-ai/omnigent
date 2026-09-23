@@ -679,6 +679,70 @@ def test_load_claude_session_trims_at_real_two_mb_threshold(tmp_path: Path) -> N
     assert any("question after compaction marker" in text for text in texts)
 
 
+def test_load_claude_session_titles_from_user_message_not_compaction_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trimmed-to-compaction import titles from a real user turn, not the summary.
+
+    The continuation summary leads the trimmed items, so without flagging it meta
+    the title would be "summary of the conversation so far", an instruction-like
+    title. It is durable context (is_meta), so the title falls through to the
+    first real user message.
+    """
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    _write_claude_transcript_with_compaction(tmp_path, session_id)
+    monkeypatch.setattr(local_import, "_IMPORT_COMPACT_TRIM_BYTES", 0)
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert imported.title == "follow-up after compaction"
+    # The summary still imports (durable context) but is flagged meta so it is
+    # hidden from the user-facing transcript and skipped for the title.
+    summary = imported.items[0].data.model_dump()
+    assert summary["content"][0]["text"] == "summary of the conversation so far"
+    assert summary["is_meta"] is True
+
+
+def test_list_recent_codex_sessions_excludes_non_interactive_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recent-import lists only interactive Codex sessions, like Codex's own picker.
+
+    ``exec`` runs and sub-agent threads are automation the user never opened
+    interactively (their first message is an injected instruction), so they are
+    excluded; a rollout predating the ``source`` field defaults to interactive.
+    """
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    sessions = tmp_path / "sessions" / "2026" / "07" / "16"
+    sessions.mkdir(parents=True)
+    cases = {
+        "019f7777-0001-7000-8000-00000000000c": ("cli", 4),
+        "019f7777-0001-7000-8000-00000000000e": ("exec", 3),
+        "019f7777-0001-7000-8000-00000000000a": ({"subagent": {"review": {}}}, 2),
+        "019f7777-0001-7000-8000-00000000000f": (None, 1),  # no source field
+    }
+    for session_id, (source, modified_at) in cases.items():
+        rollout = sessions / f"rollout-2026-07-16T00-00-0{modified_at}-{session_id}.jsonl"
+        payload: dict[str, object] = {"id": session_id, "cwd": "/repo"}
+        if source is not None:
+            payload["source"] = source
+        rollout.write_text(
+            json.dumps({"type": "session_meta", "payload": payload}) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(rollout, (modified_at, modified_at))
+
+    recent = list_recent_local_session_ids("codex", limit=10)
+
+    # cli (newest) and the source-less legacy rollout only; exec + subagent dropped.
+    assert recent == (
+        "019f7777-0001-7000-8000-00000000000c",
+        "019f7777-0001-7000-8000-00000000000f",
+    )
+
+
 def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

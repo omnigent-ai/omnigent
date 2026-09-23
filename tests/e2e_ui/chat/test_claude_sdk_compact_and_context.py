@@ -104,7 +104,7 @@ def test_context_ring_renders_for_claude_sdk_with_usage(
     # ContextRing carries aria-label "<pct>% of context used" (23% here).
     ring = page.get_by_label(re.compile(r"\d+% of context used"))
     expect(ring).to_be_visible(timeout=15_000)
-    expect(ring).to_contain_text("23%")
+    expect(ring).to_have_accessible_name("23% of context used")
 
     # Persists across reload — the snapshot patch still applies, proving the
     # ring hydrates from the persisted snapshot, not just a transient event.

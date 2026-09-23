@@ -17,7 +17,7 @@ from tests.e2e_ui.mobile.test_ios_ipad_safe_layout import _IOS_SHELL_INIT_SCRIPT
 from tests.e2e_ui.sessions.test_reply_quotes_session_switch import _reply_to
 
 _TOUCH = pytest.mark.browser_context_args(has_touch=True)
-_AGENT_SCAN = re.compile(r"/v1/sessions\?.*kind=any")
+_AGENT_SCAN = re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine")
 
 
 def _metrics(element: Locator) -> dict[str, Any]:

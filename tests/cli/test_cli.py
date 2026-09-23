@@ -1099,14 +1099,16 @@ def test_help_groups_harnesses_and_other_commands() -> None:
     assert commands_at < result.output.index("server")
 
 
-def test_help_hides_deprecated_update_spelling_but_keeps_it_runnable() -> None:
-    """``update`` is omitted from --help but stays registered and runnable."""
+def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
+    """The ``update`` alias is omitted from --help but stays registered."""
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "upgrade" in result.output
+    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
     assert "\n  update " not in result.output
-    assert cli.commands["update"].hidden is True
+    # ...but it's still a real, invokable command.
+    assert cli.commands["update"] is cli.commands["upgrade"]
 
 
 def test_help_hides_extras_gated_harness_when_sdk_missing(
@@ -3377,6 +3379,91 @@ def test_preregister_agent_accepts_directory(tmp_path: Path) -> None:
     put_location, put_bytes = artifact_store.puts[0]
     assert put_location == created["bundle_location"]
     assert len(put_bytes) > 0
+
+
+def test_preregister_agent_accepts_resolvable_policy_function(tmp_path: Path) -> None:
+    """
+    A guardrail function policy whose path IS importable from
+    sys.path registers normally — the fail-loud validation must not
+    reject valid paths.
+    """
+    agent_dir = tmp_path / "guarded-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "guarded-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        # A real, importable builtin — resolves from sys.path.
+                        "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
+                    },
+                },
+            },
+        },
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    agent_id = _preregister_agent(agent_dir, agent_store, artifact_store, agent_cache)
+
+    assert agent_id is not None
+    assert len(agent_store.created) == 1
+
+
+def test_preregister_agent_rejects_unresolvable_policy_function(
+    tmp_path: Path,
+) -> None:
+    """
+    A guardrail function policy whose path can't be resolved from
+    sys.path fails REGISTRATION loudly, naming the agent, policy, and
+    path — instead of registering an agent whose every turn would be
+    fail-closed denied with a generic policy-evaluation error.
+    """
+    agent_dir = tmp_path / "broken-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "broken-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "pack_guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        # Pack-local module the server can't import.
+                        "function": "agents.mypack.policies.missing_module.check",
+                    },
+                },
+            },
+        },
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    with pytest.raises(ClickException, match=r"cannot be resolved from sys\.path") as exc:
+        _preregister_agent(agent_dir, agent_store, artifact_store, agent_cache)
+
+    # Actionable message: names the agent, the policy, and the path.
+    message = str(exc.value)
+    assert "broken-agent" in message
+    assert "pack_guard" in message
+    assert "missing_module" in message
+
+    # Nothing half-registered.
+    assert agent_store.created == []
+    assert artifact_store.puts == []
 
 
 def test_preregister_agent_accepts_omnigent_yaml_file(tmp_path: Path) -> None:

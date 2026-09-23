@@ -7,9 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 
 from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.budgets import budget
 
 A = "https://github.com/example/one/pull/42"
 B = "https://github.com/example/two/pull/42"
@@ -479,7 +481,152 @@ def test_removal_survives_replay_and_inference(tmp_path: Path) -> None:
     assert [entry.url for entry in store.list()] == [A]
 
 
-def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "cached_title",
+    [{}, {"title": "Last known title", "title_checked_at": 20}],
+)
+def test_title_cache_is_backward_compatible(
+    tmp_path: Path, cached_title: dict[str, object]
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "prs": [
+                    {
+                        **PullRequestRef.from_url(A).model_dump(),
+                        "relationship": "created",
+                        "source": "test",
+                        "first_seen_at": 10,
+                        "last_seen_at": 10,
+                        **cached_title,
+                    }
+                ],
+            }
+        )
+    )
+    entry = store.list()[0]
+    assert entry.title == cached_title.get("title")
+    assert entry.title_checked_at == cached_title.get("title_checked_at", 0)
+    assert entry.title_lookup_timed_out is False
+
+
+def test_title_cache_preserves_order_and_survives_new_observations(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
+    store.update_titles({A: "First", B: "Second"}, timestamp=30)
+    assert [entry.url for entry in store.list()] == [B, A]
+    assert [entry.last_seen_at for entry in store.list()] == [20, 10]
+    store.record(
+        [PullRequestRef.from_url(A)], relationship="worked_on", source="test", timestamp=40
+    )
+    entry = store.list()[0]
+    assert entry.url == A
+    assert entry.title == "First"
+    assert entry.title_checked_at == 30
+    assert entry.first_seen_at == 10
+    assert entry.relationship == "created"
+
+
+def test_title_cache_preserves_newer_updates_and_removed_prs(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record(
+        [PullRequestRef.from_url(A), PullRequestRef.from_url(B)],
+        relationship="created",
+        source="test",
+    )
+    store.update_titles({A: "New title", B: "Second"}, timestamp=30)
+    store.remove(B)
+    store.update_titles({A: "Old title", B: "Removed title"}, timestamp=20)
+    assert [(entry.url, entry.title) for entry in store.list()] == [(A, "New title")]
+    store.update_titles({A: None, B: "Removed title"}, timestamp=40)
+    assert [(entry.url, entry.title) for entry in store.list()] == [(A, "New title")]
+    assert store.list()[0].title_checked_at == 40
+    store.record([PullRequestRef.from_url(B)], relationship="inferred", source="branch")
+    assert [entry.url for entry in store.list()] == [A]
+
+
+def test_title_timeout_preserves_cached_title_and_survives_observations(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    reference = PullRequestRef.from_url(A)
+    store.record([reference], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: None}, timestamp=30, timed_out_urls={A})
+
+    restored = SessionPrRegistry("conv_a", root=tmp_path)
+    entry = restored.list()[0]
+    assert entry.title == "Last known title"
+    assert entry.title_checked_at == 30
+    assert entry.title_lookup_timed_out is True
+
+    restored.record([reference], relationship="worked_on", source="test", timestamp=40)
+    entry = restored.list()[0]
+    assert entry.title == "Last known title"
+    assert entry.title_checked_at == 30
+    assert entry.title_lookup_timed_out is True
+    assert entry.last_seen_at == 40
+
+
+@pytest.mark.parametrize(
+    "title,timed_out_urls,expected_title",
+    [
+        ("Fetched title", (), "Fetched title"),
+        (None, (), "Last known title"),
+        ("Fetched title", (A,), "Fetched title"),
+    ],
+)
+def test_completed_title_lookup_clears_timeout_marker(
+    tmp_path: Path, title: str | None, timed_out_urls: tuple[str, ...], expected_title: str
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: None}, timestamp=30, timed_out_urls={A})
+
+    store.update_titles({A: title}, timestamp=40, timed_out_urls=timed_out_urls)
+
+    entry = store.list()[0]
+    assert entry.title == expected_title
+    assert entry.title_checked_at == 40
+    assert entry.title_lookup_timed_out is False
+
+
+@pytest.mark.parametrize(
+    "newer_title,newer_timeouts,older_title,older_timeouts",
+    [
+        ("Newest title", (), None, (A,)),
+        (None, (A,), "Older title", ()),
+    ],
+)
+def test_title_cache_preserves_newer_timeout_marker(
+    tmp_path: Path,
+    newer_title: str | None,
+    newer_timeouts: tuple[str, ...],
+    older_title: str | None,
+    older_timeouts: tuple[str, ...],
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: newer_title}, timestamp=40, timed_out_urls=newer_timeouts)
+    latest = store.list()
+
+    store.update_titles({A: older_title}, timestamp=30, timed_out_urls=older_timeouts)
+
+    assert store.list() == latest
+
+
+def test_concurrent_writers_preserve_all_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Allow serialized durable writes to finish even on a busy CI filesystem.
+    monkeypatch.setattr(
+        "omnigent.runner.session_prs.FileLock",
+        lambda path, **_kwargs: FileLock(path, timeout=budget(10)),
+    )
+
     def write(number: int) -> None:
         store = SessionPrRegistry("conv_a", root=tmp_path)
         store.record(
@@ -490,7 +637,11 @@ def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(write, range(1, 17)))
-    assert len(SessionPrRegistry("conv_a", root=tmp_path).list()) == 16
+    prs = SessionPrRegistry("conv_a", root=tmp_path).list()
+    assert len(prs) == 16
+    assert {pr.url for pr in prs} == {
+        f"https://github.com/example/one/pull/{number}" for number in range(1, 17)
+    }
 
 
 def test_corruption_is_not_overwritten(tmp_path: Path) -> None:
