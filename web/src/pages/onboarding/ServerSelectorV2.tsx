@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { LandingFooter } from "@/pages/onboarding/LandingFooter";
 import { LandingStep } from "@/pages/onboarding/LandingStep";
-import { ModeSelectStep } from "@/pages/onboarding/ModeSelectStep";
+import { HarnessIconRow, ModeSelectStep } from "@/pages/onboarding/ModeSelectStep";
 import { ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
@@ -79,7 +79,7 @@ type Step = "landing" | "mode" | "server" | "terminal";
 // card grows for the scrollable server list. Drives the CSS-transition resize.
 const CARD: Record<Step, { height: number; panelHeight: number }> = {
   landing: { height: 560, panelHeight: 308 },
-  mode: { height: 560, panelHeight: 96 },
+  mode: { height: 560, panelHeight: 150 },
   server: { height: 600, panelHeight: 64 },
   terminal: { height: 560, panelHeight: 240 },
 };
@@ -95,7 +95,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const { height, panelHeight } = CARD[step];
 
   return (
-    <div className="grid min-h-screen place-items-center p-6">
+    <div
+      className="grid min-h-screen place-items-center p-6"
+      style={{ background: "var(--onboarding-wizard-background)" }}
+    >
       {/* Top-right cog: settings for this setup surface. no-drag so it's
           clickable over the window's drag strip. */}
       <div
@@ -116,11 +119,21 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             <DropdownMenuItem onSelect={setup.onSwitchToLegacy}>
               Switch to legacy selector experience
             </DropdownMenuItem>
+            {/* Debug aid: flip the theme in place (not persisted). */}
+            <DropdownMenuItem
+              onSelect={() => document.documentElement.classList.toggle("dark")}
+            >
+              Toggle light/dark mode
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
 
-      <AnimatedOmnigentPanel height={height} panelHeight={panelHeight}>
+      <AnimatedOmnigentPanel
+        height={height}
+        panelHeight={panelHeight}
+        bandContent={step === "mode" ? <HarnessIconRow /> : undefined}
+      >
         {step === "landing" && (
           <LandingStep
             onGetStarted={() => setStep("mode")}

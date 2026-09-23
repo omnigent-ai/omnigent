@@ -150,6 +150,11 @@
   --icon-container-default: 16px;
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 60 40 10;
+  /* Onboarding wizard page surface — a hair off the white card so it reads as a
+     distinct backdrop (the card stays var(--card)). */
+  --onboarding-wizard-background: #fcfbfb;
+  --onboarding-modal-border: #0000001a;
+  --onboarding-modal-shadow: 0 24px 80px 8px #00000012;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 12%);
   --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
 
@@ -258,6 +263,9 @@
 .dark {
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 0 0 0;
+  --onboarding-wizard-background: #131315;
+  --onboarding-modal-border: #ffffff14;
+  --onboarding-modal-shadow: 0 24px 80px 8px #00000038;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 80%);
   --composer-shadow-focus: 0 0 14px -8px rgb(0 0 0 / 90%);
   --destructive: #e65b77;
