@@ -82,9 +82,9 @@ provision time, so secrets never live in config files. The server's
 managed-host config (``sandbox.daytona.env``) takes precedence when
 set."""
 
-# Resources for the sandbox. Matches the Modal launcher's sizing: 2
-# vCPU / 4 GiB is enough for a host running one interactive session
-# (Daytona's Resources units are vCPUs and GiB).
+# Default sandbox size when `sandbox.daytona.cpu` / `.memory` are unset.
+# Matches the Modal launcher: enough for one interactive session, but a
+# workload that builds or tests in-sandbox needs more (units: vCPU, GiB).
 _SANDBOX_CPU: int = 2
 _SANDBOX_MEMORY_GIB: int = 4
 
@@ -202,7 +202,16 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             foreground_exec=True,
         )
 
-    def __init__(self, *, image: str | None = None, env: Sequence[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        image: str | None = None,
+        env: Sequence[str] | None = None,
+        cpu: int | None = None,
+        memory: int | None = None,
+        disk: int | None = None,
+        auto_delete_interval: int | None = None,
+    ) -> None:
         """
         Initialize the launcher.
 
@@ -218,9 +227,28 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             managed-host ``sandbox.daytona.env`` config. ``None``
             resolves :data:`SANDBOX_ENV_PASSTHROUGH_ENV_VAR`
             (comma-separated) and falls back to no injected env.
+        :param cpu: Optional vCPU count — the server's
+            ``sandbox.daytona.cpu`` config. ``None`` uses
+            :data:`_SANDBOX_CPU`.
+        :param memory: Optional memory in GiB —
+            ``sandbox.daytona.memory``. ``None`` uses
+            :data:`_SANDBOX_MEMORY_GIB`.
+        :param disk: Optional disk in GiB — ``sandbox.daytona.disk``.
+            ``None`` leaves Daytona's default (the account's per-sandbox
+            cap applies either way).
+        :param auto_delete_interval: Optional minutes a STOPPED sandbox
+            lingers before Daytona deletes it server-side —
+            ``sandbox.daytona.auto_delete_interval``. ``None`` leaves
+            Daytona's default (auto-delete disabled); ``0`` deletes on
+            stop. Lets a deployment whose API key has no delete
+            permission shed stopped sandboxes instead of leaking them.
         """
         self._image_ref = image
         self._env_names = tuple(env) if env is not None else None
+        self._cpu = cpu if cpu is not None else _SANDBOX_CPU
+        self._memory = memory if memory is not None else _SANDBOX_MEMORY_GIB
+        self._disk = disk
+        self._auto_delete_interval = auto_delete_interval
         self._client: daytona_sdk.Daytona | None = None
         self._sandboxes: dict[str, DaytonaSandbox] = {}
 
@@ -352,7 +380,12 @@ class DaytonaSandboxLauncher(SandboxLauncher):
                     # would kill the host between turns); the managed-
                     # session machinery owns sandbox termination.
                     auto_stop_interval=_AUTO_STOP_DISABLED,
-                    resources=daytona.Resources(cpu=_SANDBOX_CPU, memory=_SANDBOX_MEMORY_GIB),
+                    # None keeps Daytona's default (auto-delete disabled);
+                    # a configured value reaps stopped sandboxes server-side.
+                    auto_delete_interval=self._auto_delete_interval,
+                    resources=daytona.Resources(
+                        cpu=self._cpu, memory=self._memory, disk=self._disk
+                    ),
                 ),
                 timeout=_CREATE_TIMEOUT_S,
                 # First-use image pulls stream build logs; echo them so a
