@@ -464,6 +464,41 @@ async def test_undo_within_grace_cancels_archive_stop(
         _sessions_common._session_status_cache.pop(session_id, None)
 
 
+async def test_archive_stop_skips_when_row_unarchived_during_grace(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    The deferred stop re-checks the store and skips a re-archived session.
+
+    In-memory cancellation only reaches the replica that archived; an Undo
+    served by a different replica leaves the pending timer running. The
+    authoritative guard is the persisted ``archived`` flag: firing
+    ``_archive_stop`` against a row that is no longer archived must tear
+    down nothing.
+    """
+    session = await create_test_session(client, name="archive-stop-restale")
+    session_id = session["id"]
+
+    # Archive, then unarchive out-of-band (as another replica's PATCH would),
+    # leaving no in-memory pending timer to cancel — only the row flipped back.
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            # Simulate the deferred task firing after the grace elapsed.
+            await _sessions_orchestration._archive_stop(
+                session_id, conv_store, runner_router=None, host_registry=None
+            )
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
 # ── Agent contents download ──────────────────────────────
 
 

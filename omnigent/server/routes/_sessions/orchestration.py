@@ -738,6 +738,12 @@ async def _archive_stop(
     Every step is best-effort: a wedged, offline, or already-stopped
     runner must not leave the session un-archived.
 
+    The persisted ``archived`` flag is the authoritative undo guard.
+    :func:`_cancel_pending_archive_stop` only reaches this replica's
+    timer, so an Undo served by a different replica (scaled deployment)
+    never cancels it; re-reading the row after the grace and skipping the
+    teardown when the session is no longer archived catches that case.
+
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
     :param runner_router: The ``RunnerRouter`` for runner-client
@@ -748,18 +754,23 @@ async def _archive_stop(
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
 
-    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     except Exception:  # noqa: BLE001
         _logger.debug(
-            "Archive host-runner teardown lookup failed for %s",
+            "Archive teardown lookup failed for %s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
         return
-    if conv is None or not conv.host_id or not conv.runner_id:
+    # Unarchived during the grace (e.g. an Undo on another replica) — the
+    # session is live again, so leave its runner alone.
+    if conv is None or not conv.archived:
+        return
+
+    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    if not conv.host_id or not conv.runner_id:
         return
     # Mark the tunnel drop intentional BEFORE tearing it down so the relay
     # renders a quiet stopped state rather than "runner_disconnected".
