@@ -59,7 +59,9 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
                 "el => getComputedStyle(el).backgroundColor"
             )
             assert hovered_background != "rgba(0, 0, 0, 0)"
-            other = page.get_by_role("menu").get_by_role("menuitem", name="Custom agents...", exact=True)
+            other = page.get_by_role("menu").get_by_role(
+                "menuitem", name="Custom agents...", exact=True
+            )
             await other.hover()
             await expect(harness_row).to_have_css("background-color", "rgba(0, 0, 0, 0)")
             await expect(other).to_have_css("background-color", hovered_background)
