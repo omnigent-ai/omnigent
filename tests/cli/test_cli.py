@@ -6054,6 +6054,47 @@ def test_bare_omnigent_non_tty_shows_help(
     assert "Commands:" in stdout
 
 
+def test_cli_shorthand_help() -> None:
+    """``-h`` displays help on the root CLI and subcommands."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["-h"])
+    assert result.exit_code == 0
+    assert "Usage:" in result.output
+
+    # Subcommands also inherit -h support
+    config_result = runner.invoke(cli, ["config", "-h"])
+    assert config_result.exit_code == 0
+    assert "Usage:" in config_result.output
+
+
+def test_cli_shorthand_version() -> None:
+    """``-v`` displays the version line and exits 0."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["-v"])
+    assert result.exit_code == 0
+    assert "omnigent " in result.output
+
+
+def test_main_dispatches_shorthand_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``main(['-v'])`` and ``main(['-h'])`` dispatch cleanly without 'run' rewriting."""
+    from omnigent.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["omnigent", "-v"])
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 0
+    assert "omnigent " in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["omnigent", "-h"])
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 0
+    assert "Usage:" in capsys.readouterr().out
+
+
 def test_bare_omnigent_tty_dispatches_to_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
