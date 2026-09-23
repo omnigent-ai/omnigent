@@ -24,6 +24,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
 # enough to embed, used to prove image blocks are materialized to disk
@@ -461,6 +462,85 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
     )
 
 
+def test_resize_notice_is_encoded_in_model_visible_image_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex receives resize metadata without adding user-visible text."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        async for _ in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                        {
+                            "type": "_omnigent_framework_notice",
+                            "source_metadata": {"width": 4600, "height": 3400},
+                        },
+                        {"type": "input_text", "text": "inspect this"},
+                    ],
+                },
+            ],
+            [],
+            "",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    start = next(
+        params for method, params in _FakeCodexNativeClient.requests if method == "turn/start"
+    )
+    image = start["input"][0]
+    assert image["type"] == "localImage"
+    assert "downscaled-from-4600x3400" in image["path"]
+    assert start["input"][1] == {"type": "text", "text": "inspect this"}
+    assert len(start["input"]) == 2
+
+
+def test_resize_paths_preserve_multiple_images_and_cached_originals(tmp_path: Path) -> None:
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    content = []
+    for image_bytes, dimensions in [
+        (b"first image", {"width": 6000, "height": 4000}),
+        (b"second image", {"width": 6000, "height": 4000}),
+        (b"third image", {"width": 8000, "height": 5000}),
+    ]:
+        content.extend(
+            [
+                {
+                    "type": "input_image",
+                    "filename": "same.png",
+                    "image_url": "data:image/png;base64," + base64.b64encode(image_bytes).decode(),
+                },
+                framework_notice_block(dimensions),
+            ]
+        )
+    items = _content_to_input_items(content, tmp_path)
+    paths = [Path(item["path"]) for item in items]
+    assert len(set(paths)) == 3
+    assert [path.read_bytes() for path in paths] == [
+        b"first image",
+        b"second image",
+        b"third image",
+    ]
+    assert "downscaled-from-8000x5000" in paths[2].name
+    assert (attachment_cache_dir(tmp_path) / "same.png").read_bytes() == b"first image"
+    assert _content_to_input_items(content, tmp_path) == items
+
+
 def test_input_file_text_is_inlined_as_a_text_item(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -513,7 +593,7 @@ def test_input_file_text_is_inlined_as_a_text_item(
     assert items == [{"type": "text", "text": file_text}]
     # No image channel item for a file, and no uploads dir written.
     assert all(item["type"] != "localImage" for item in items)
-    assert not (tmp_path / "uploads").exists()
+    assert not (attachment_cache_dir(tmp_path)).exists()
 
 
 def test_input_file_binary_is_materialized_and_referenced_by_path(
@@ -575,8 +655,121 @@ def test_input_file_binary_is_materialized_and_referenced_by_path(
     assert base64.b64encode(pdf_bytes).decode() not in text
     referenced = Path(text[len("[Attached file: ") : -len("]")])
     # The referenced file exists under uploads/ and holds the decoded bytes.
-    assert referenced.parent == tmp_path / "uploads"
+    assert referenced.parent == attachment_cache_dir(tmp_path)
     assert referenced.read_bytes() == pdf_bytes
+
+
+def test_input_file_zip_is_materialized_outside_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ZIP reaches Codex by absolute cache path without changing the checkout."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+            cwd=str(workspace),
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    zip_bytes = b"PK\x03\x04 fake zip bytes"
+    data_uri = "data:application/zip;base64," + base64.b64encode(zip_bytes).decode()
+    block = {"type": "input_file", "file_data": data_uri, "filename": "bundle.zip"}
+
+    async def run() -> None:
+        """Drive one turn carrying a single zip ``input_file`` block."""
+        async for _event in executor.run_turn([{"role": "user", "content": [block]}], [], ""):
+            pass
+
+    asyncio.run(run())
+
+    _method, params = _FakeCodexNativeClient.requests[-1]
+    text = params["input"][0]["text"]
+    referenced = Path(text[len("[Attached: ") : -len("]")])
+    assert referenced.parent == attachment_cache_dir(tmp_path)
+    assert referenced.read_bytes() == zip_bytes
+    assert list(workspace.iterdir()) == []
+
+
+def test_zip_submitted_as_an_image_block_still_uses_a_file_reference(
+    tmp_path: Path,
+) -> None:
+    """
+    Delivery follows the stored filename, not the block type.
+
+    A zip uploaded under an image MIME comes back as an ``input_image``
+    block carrying the authoritative filename. Taking the image branch would
+    stage it in the bridge dir and hand codex a localImage it cannot open.
+    """
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    zip_bytes = b"PK\x03\x04 fake zip bytes"
+    block = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(zip_bytes).decode(),
+        "filename": "bundle.zip",
+    }
+
+    items = _content_to_input_items([block], tmp_path)
+
+    expected = attachment_cache_dir(tmp_path) / "bundle.zip"
+    assert items == [{"type": "text", "text": f"[Attached: {expected}]"}]
+    assert expected.read_bytes() == zip_bytes
+    assert list(workspace.iterdir()) == []
+
+
+def test_input_file_zip_is_materialized_without_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Attachment delivery does not depend on cwd being recorded in bridge state."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    data_uri = "data:application/zip;base64," + base64.b64encode(b"PK\x03\x04").decode()
+    block = {"type": "input_file", "file_data": data_uri, "filename": "bundle.zip"}
+
+    async def run() -> None:
+        """Drive one turn carrying a zip with no workspace recorded."""
+        async for _event in executor.run_turn([{"role": "user", "content": [block]}], [], ""):
+            pass
+
+    asyncio.run(run())
+
+    _method, params = _FakeCodexNativeClient.requests[-1]
+    assert params["input"] == [
+        {"type": "text", "text": f"[Attached: {attachment_cache_dir(tmp_path) / 'bundle.zip'}]"}
+    ]
 
 
 async def test_executor_reaches_app_server_over_ws_transport(

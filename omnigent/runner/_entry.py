@@ -1130,6 +1130,13 @@ def _runner_parent_pid_from_env() -> int | None:
     return parent_pid
 
 
+def _runner_host_owns_global_cleanup_from_env() -> bool:
+    """Return whether the host daemon owns machine-global cleanup."""
+    from omnigent.runner.identity import RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR
+
+    return os.environ.get(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR) == "1"
+
+
 def _parent_process_is_alive(parent_pid: int) -> bool:
     """Return whether an OS process id is still alive.
 
@@ -1496,41 +1503,33 @@ def create_app(
             session_id=session_id,
         )
 
+    host_owns_global_cleanup = _runner_host_owns_global_cleanup_from_env()
+
     # Out-of-process runner owns its own TerminalRegistry.
     from omnigent.inner.terminal import reap_orphaned_terminals
     from omnigent.terminals import TerminalRegistry
 
     _terminal_registry = TerminalRegistry(conversation_link_base_url=server_url)
-    # Reap terminal tmux servers leaked by a previous runner that died
-    # without graceful shutdown (SIGKILL / harness teardown). Detached
-    # tmux outlives its supervisor, and runner-bound SDK sessions now
-    # auto-create the embedded REPL terminal — without this sweep every
-    # ungraceful exit leaks one tmux server per session (enough to
-    # starve CI hosts running many short-lived runners).
-    _reaped_terminals = reap_orphaned_terminals()
-    if _reaped_terminals:
-        _logger.info(
-            "Reaped %d orphaned terminal tmux server(s) from prior runs",
-            _reaped_terminals,
-            extra={"session_id": runner_primary_session_id()},
-        )
-
-    # Reap per-session native-harness bridge dirs (bridge.json token, MCP/
-    # policy config, permission_hook.json) leaked by a prior runner that died
-    # without running the explicit delete path. Dynamic across all native
-    # harnesses — see native_bridge_common.reap_orphaned_native_bridge_dirs.
-    # Best-effort: a sweep failure must never crash runner startup.
-    try:
-        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
-
-        _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
-        if _reaped_bridge_dirs:
+    if not host_owns_global_cleanup:
+        _reaped_terminals = reap_orphaned_terminals()
+        if _reaped_terminals:
             _logger.info(
-                "Reaped %d orphaned native bridge dir(s) from prior runs",
-                _reaped_bridge_dirs,
+                "Reaped %d orphaned terminal tmux server(s) from prior runs",
+                _reaped_terminals,
+                extra={"session_id": runner_primary_session_id()},
             )
-    except Exception:  # noqa: BLE001 — housekeeping must never block startup
-        _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
+
+        try:
+            from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+            _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
+            if _reaped_bridge_dirs:
+                _logger.info(
+                    "Reaped %d orphaned native bridge dir(s) from prior runs",
+                    _reaped_bridge_dirs,
+                )
+        except Exception:  # noqa: BLE001 — housekeeping must never block startup
+            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
@@ -1551,7 +1550,7 @@ def create_app(
 
     async def _start_pm() -> None:
         """Start harness process manager; register MCP prewarm metadata if requested."""
-        await pm.start()
+        await pm.start(sweep_orphans=not host_owns_global_cleanup)
         prewarm_path = os.environ.get(_RUNNER_PREWARM_SPEC_PATH_ENV_VAR)
         if prewarm_path and mcp_manager is not None:
             try:
@@ -1579,18 +1578,13 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.start()
-        # Backstop for a hard host/runner death (SIGKILL / OOM / crash) that
-        # ran no graceful teardown: a codex app-server spawned in its own
-        # session outlives its runner. Reconciling the crash-safe registry at
-        # boot reaps any such orphan whose owner lock is no longer held (its
-        # runner is gone), so a fresh runner on the host cleans up what a dead
-        # predecessor left. Held owner locks (live sibling runners) are skipped.
-        from omnigent.harnesses.codex_native.process_registry import (
-            reconcile_codex_native_process_registry,
-        )
+        if not host_owns_global_cleanup:
+            from omnigent.harnesses.codex_native.process_registry import (
+                reconcile_codex_native_process_registry,
+            )
 
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(reconcile_codex_native_process_registry)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(reconcile_codex_native_process_registry)
         # Liveness backstop for sub-agent dispatches wedged in ``launching``:
         # a child that never emits any edge would otherwise hold the parent's
         # work handle open forever with no error surfaced. The app's
@@ -1601,6 +1595,7 @@ def create_app(
         app.state.subagent_launch_reaper = asyncio.create_task(
             run_subagent_launch_reaper(
                 mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                reconcile_pending=app.state.reconcile_pending_subagent_results,
             ),
             name="runner-subagent-launch-reaper",
         )

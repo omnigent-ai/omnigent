@@ -10,6 +10,8 @@
 //   Existing comments highlight the lines they span. Clicking inside a
 //   highlighted range navigates to that comment in CommentsPanel.
 
+import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import { createPortal } from "react-dom";
 import {
   isValidElement,
@@ -394,6 +396,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 // ---------------------------------------------------------------------------
 
 export interface CodeViewerProps {
+  position?: FilePosition;
   conversationId: string;
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
@@ -437,6 +440,7 @@ export interface CodeViewerProps {
 }
 
 export function CodeViewer({
+  position,
   conversationId,
   path,
   fileQuery,
@@ -509,6 +513,24 @@ export function CodeViewer({
   const showMonaco = lang !== "markdown" && viewMode !== "preview";
   // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
   const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
+
+  const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
+  useEffect(() => {
+    if (
+      !position ||
+      !isFilePositionPending(position) ||
+      showMonaco ||
+      viewMode !== "source" ||
+      !fileQuery.isSuccess
+    )
+      return;
+    if (revealedPositionRef.current === position) return;
+    const index = Math.min(Math.max(1, position.line), rawLines.length) - 1;
+    const line = matchLineRefs.current.get(index);
+    if (!line) return;
+    line.scrollIntoView({ block: "center" });
+    revealedPositionRef.current = position;
+  }, [position, showMonaco, viewMode, fileQuery.isSuccess, rawLines]);
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
   // composer reads — only the native coding-agent harnesses act on it, so
@@ -862,6 +884,7 @@ export function CodeViewer({
         }
       >
         <MonacoCodeEditor
+          position={position}
           content={content}
           conversationId={conversationId}
           path={path}
@@ -1019,7 +1042,12 @@ export function CodeViewer({
                 if (el) matchLineRefs.current.set(idx, el);
                 else matchLineRefs.current.delete(idx);
               }}
-              className={cn(isCurrentMatch && "bg-yellow-200/40 dark:bg-yellow-700/30")}
+              className={cn(
+                (isCurrentMatch ||
+                  (position &&
+                    lineNum === Math.min(Math.max(1, position.line), rawLines.length))) &&
+                  "bg-yellow-200/40 dark:bg-yellow-700/30",
+              )}
             >
               <div className="flex items-stretch">
                 {/* Gutter — line number; MessageCircleIcon when a comment starts here */}

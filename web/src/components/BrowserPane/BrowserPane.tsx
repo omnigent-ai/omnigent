@@ -503,8 +503,14 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
         /* Measuring region — the native WebContentsView paints over this.
            flex-1 min-h-0 so it fills everything BELOW the toolbar; its rect
            is what syncBounds() pushes. Mounted only while viewActive so the
-           effects never measure an empty div. */
-        <div ref={containerRef} className="min-h-0 min-w-0 flex-1" />
+           effects never measure an empty div.
+           ml-1 (4px, matching the WorkspacePanel resize handle's w-1) shifts
+           this box right so the native view's rect.left clears the handle at
+           the panel's left edge; a native compositor layer ignores z-index and
+           would otherwise paint over the handle, making it impossible to grab.
+           Margin, not padding: getBoundingClientRect() excludes margin but
+           includes padding, so only a margin moves rect.left. */
+        <div ref={containerRef} className="ml-1 min-h-0 min-w-0 flex-1" />
       ) : (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-ui">
           Enter a URL above to get started

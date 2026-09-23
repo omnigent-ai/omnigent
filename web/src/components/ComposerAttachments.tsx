@@ -16,7 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentFilename, attachmentKey } from "@/lib/attachments";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { cn } from "@/lib/utils";
 
@@ -135,8 +135,7 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
   // An image whose blob can't decode falls back to the file card (spec rule 4).
   const [thumbFailed, setThumbFailed] = useState(false);
   const showThumb = file.type.startsWith("image/") && !thumbFailed;
-  // Pasted screenshots have no filename; the composer sends them as image.png.
-  const name = file.name || "image.png";
+  const name = attachmentFilename(file);
   const url = useObjectUrl(showThumb ? file : null);
 
   if (showThumb) {

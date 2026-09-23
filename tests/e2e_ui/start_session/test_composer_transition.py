@@ -41,7 +41,7 @@ async def _drive(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
             await page.route(
-                re.compile(r"/v1/sessions\?.*kind=any"),
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
                 lambda route: route.fulfill(json={"data": []}),
             )
             await page.route(
@@ -99,7 +99,11 @@ async def _drive(
             await _close_entry_models(page)
             await page.evaluate("""() => {
               window.composerSamples = [];
+              window.sawConversationLoading = false;
               const capture = () => {
+                if (document.body.textContent.includes('Loading conversation…')) {
+                  window.sawConversationLoading = true;
+                }
                 const selector = '[data-testid="composer-agent-config-value"]';
                 const label = document.querySelector(selector);
                 if (label) window.composerSamples.push({
@@ -134,12 +138,14 @@ async def _drive(
             await expect(label).not_to_contain_text(selected)
             await expect(label).to_contain_text("High")
             snapshot_ready.set()
-            await expect(label).to_contain_text(selected_label)
+            compact_selected_label = selected_label.replace(" (1M context)", " 1M")
+            await expect(label).to_contain_text(compact_selected_label)
             await expect(loading).to_have_count(0)
             await page.locator("[data-composer-card]").screenshot(
                 path=output / "bound-model.png", animations="disabled"
             )
             samples = await page.evaluate("window.composerSamples")
+            assert not await page.evaluate("window.sawConversationLoading")
             assert any("/c/temp" in sample["path"] and sample["loading"] for sample in samples), (
                 samples
             )
@@ -148,7 +154,7 @@ async def _drive(
                 for sample in samples
             ), samples
             assert all(
-                sample["loading"] or selected_label in sample["text"] for sample in samples
+                sample["loading"] or compact_selected_label in sample["text"] for sample in samples
             ), samples
         finally:
             release.set()
@@ -177,7 +183,7 @@ async def _drive_failed_create(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
             await page.route(
-                re.compile(r"/v1/sessions\?.*kind=any"),
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
                 lambda route: route.fulfill(json={"data": []}),
             )
 

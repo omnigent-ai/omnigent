@@ -18,6 +18,7 @@ from omnigent_slack.models import SessionRecord, ThreadKey, UserConfig
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("thread_sessions", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
     ("user_configs", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
+    ("thread_sessions", "turn_inflight", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -51,6 +52,7 @@ class SQLiteStore:
                     host_id TEXT,
                     workspace TEXT,
                     host_type TEXT NOT NULL DEFAULT 'external',
+                    turn_inflight INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (team_id, channel_id, thread_ts)
@@ -106,7 +108,8 @@ class SQLiteStore:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
                 """
-                SELECT omnigent_session_id, owner_user_id, host_id, workspace, host_type
+                SELECT omnigent_session_id, owner_user_id, host_id, workspace, host_type,
+                       turn_inflight
                 FROM thread_sessions
                 WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
                 """,
@@ -122,6 +125,7 @@ class SQLiteStore:
             host_id=str(row[2]) if row[2] is not None else None,
             workspace=str(row[3]) if row[3] is not None else None,
             host_type=_host_type(row[4]),
+            turn_inflight=bool(row[5]),
         )
 
     async def upsert_session(
@@ -166,6 +170,29 @@ class SQLiteStore:
                     host_type,
                     now,
                     now,
+                ),
+            )
+            await db.commit()
+
+    async def set_turn_inflight(self, key: ThreadKey, inflight: bool) -> None:
+        """Persist whether a bot process has a live turn stream for this thread.
+
+        Set when a turn reaches the server and cleared when it ends cleanly, so
+        a marker that survives into a fresh process means a restart or crash
+        abandoned the turn mid-stream. No-op for an unmapped thread.
+        """
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                UPDATE thread_sessions SET turn_inflight = ?, updated_at = ?
+                WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
+                """,
+                (
+                    1 if inflight else 0,
+                    int(time.time()),
+                    key.team_id,
+                    key.channel_id,
+                    key.thread_ts,
                 ),
             )
             await db.commit()

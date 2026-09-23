@@ -435,7 +435,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
     openMenu();
     const label = screen.getByText("Quarterly planning");
-    expect(label).toHaveAttribute("data-slot", "dropdown-menu-label");
+    expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();

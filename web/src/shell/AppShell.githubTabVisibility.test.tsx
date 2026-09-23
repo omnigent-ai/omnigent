@@ -1,3 +1,4 @@
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // The workspace rail's GitHub tab is shown whenever the workspace/Files gate is
 // open. Non-git workspaces (not_a_git_repo) show an empty state inside the panel
 // rather than hiding the tab entirely.
@@ -146,15 +147,17 @@ function renderShell() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/c/conv_ws"]}>
-          <Routes>
-            <Route element={<AppShell />}>
-              <Route path="c/:conversationId" element={<GithubLinkProbe />} />
-            </Route>
-          </Routes>
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_ws"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<GithubLinkProbe />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

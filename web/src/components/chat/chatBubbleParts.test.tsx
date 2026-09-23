@@ -56,6 +56,59 @@ afterEach(() => {
   useChatStore.setState(initialStoreState);
 });
 
+describe("message navigation highlight", () => {
+  const text = "Highlight only this message content";
+  const messageId = "highlight_target";
+  const createdAtS = 1_700_000_000;
+  const bubbles: Bubble[] = [
+    {
+      kind: "user",
+      itemId: messageId,
+      content: [{ type: "input_text", text }],
+      createdAtS,
+    },
+    {
+      kind: "assistant",
+      responseId: messageId,
+      stableId: "highlight_assistant",
+      lifecycle: "completed",
+      error: null,
+      items: [{ kind: "text", itemId: "highlight_text", text, final: true }],
+      createdAtS,
+    },
+  ];
+
+  it.each(bubbles)("keeps the $kind highlight inside the content bubble", (bubble) => {
+    useChatStore.setState({ flashItemId: null });
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={bubble} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+    const highlightSelector = ".animate-message-highlight";
+    expect(container.querySelector(highlightSelector)).toBeNull();
+
+    act(() => useChatStore.setState({ flashItemId: messageId }));
+
+    const highlight = screen.getByText(text).closest(highlightSelector);
+    expect(highlight).not.toBeNull();
+    expect(container.querySelectorAll(highlightSelector)).toHaveLength(1);
+    expect(screen.getByTestId("message-bubble")).not.toHaveClass("animate-message-highlight");
+    expect(screen.getByTestId("message-timestamp").closest(highlightSelector)).toBeNull();
+    for (const button of screen.getAllByRole("button")) {
+      expect(button.closest(highlightSelector)).toBeNull();
+    }
+
+    act(() => useChatStore.setState({ flashItemId: "another_message" }));
+    expect(container.querySelector(highlightSelector)).toBeNull();
+
+    act(() => useChatStore.setState({ flashItemId: messageId }));
+    expect(screen.getByText(text).closest(highlightSelector)).not.toBeNull();
+    act(() => useChatStore.setState({ flashItemId: null }));
+    expect(container.querySelector(highlightSelector)).toBeNull();
+  });
+});
+
 describe("UserBubble literal text", () => {
   it.each([
     [
@@ -267,7 +320,7 @@ describe("AssistantBubble error retry", () => {
     );
     render(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
 
     await waitFor(() => expect(screen.queryByTestId("error-pill")).toBeNull());
     expect(fetchMock).toHaveBeenCalledOnce();

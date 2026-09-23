@@ -1,12 +1,8 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
-import {
-  PROJECT_LABEL_KEY,
-  type Conversation,
-  useConversations,
-  useProjects,
-} from "@/hooks/useConversations";
+import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
@@ -95,14 +91,19 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
-import { FileViewerContext } from "./FileViewerContext";
+import {
+  FileViewerContext,
+  type FilePosition,
+  type OpenFileOptions,
+  type FileNavigationGuard,
+} from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { GithubPanel } from "./GithubPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
-import { useSettingsRoute } from "./settingsNav";
+import { HEADERLESS_SECTIONS, useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -268,7 +269,11 @@ export function AppShell() {
   // reintroduce the trap: by then the title-bar toggle is back and the Back row
   // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
   // stashes and restores the same state around the maximize flow.
-  const { inSettings } = useSettingsRoute();
+  const { inSettings, section } = useSettingsRoute();
+  // Only hide the header while the sidebar is open — it carries the
+  // sidebar-reopen control, so hiding it with the sidebar closed strands the
+  // user with no way back. Mirrors extensionOwnsHeader above.
+  const hideHeader = inSettings && HEADERLESS_SECTIONS.includes(section) && sidebarOpen;
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (inSettings) {
@@ -330,6 +335,32 @@ export function AppShell() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
+  // Explicit opens override the URL, including opens without a cited position.
+  const [fileNavigation, setFileNavigation] = useState<{
+    conversationId: string | undefined;
+    path: string;
+    position: FilePosition | undefined;
+  }>();
+  const citationPath = searchParams.get("file");
+  const citationLine = searchParams.get("line");
+  const citationColumn = searchParams.get("column");
+  // Keep URL requests stable across viewer remounts, just like citation clicks.
+  const urlNavigation = useMemo(() => {
+    const line = Number(citationLine);
+    const column = Number(citationColumn);
+    if (!citationPath || !Number.isSafeInteger(line) || line < 1) return undefined;
+    return {
+      conversationId,
+      path: citationPath,
+      position: { line, ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}) },
+    };
+  }, [conversationId, citationPath, citationLine, citationColumn]);
+  const filePosition =
+    fileNavigation?.conversationId === conversationId && fileNavigation?.path === selectedFilePath
+      ? fileNavigation.position
+      : urlNavigation?.path === selectedFilePath
+        ? urlNavigation.position
+        : undefined;
   // Ordered list of open file tabs. ``selectedFilePath`` is the active tab
   // (null = a scope view, Changed/All, is active). Tabs persist when the user
   // switches to a scope view or another rail tab; only ``closeFile`` removes
@@ -430,12 +461,8 @@ export function AppShell() {
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
-  // Restrict the observer to the fields AppShell actually reads: the 30s
-  // refetchInterval otherwise re-renders this whole shell on every background
-  // `isFetching`/`dataUpdatedAt` flap even when the list is unchanged.
-  const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true, {
-    notifyOnChangeProps: ["data", "isLoading"],
-  });
+  // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
+  const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
@@ -551,7 +578,7 @@ export function AppShell() {
     (isTempConvId(conversationId)
       ? (optimisticConversationTitle ?? UNTITLED_CONVERSATION_LABEL)
       : null) ||
-    (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
+    (isChildSession || activeSession?.id === conversationId ? UNTITLED_CONVERSATION_LABEL : null);
   const headerProjectSummary =
     breadcrumbConv?.project_id != null
       ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)
@@ -1005,6 +1032,7 @@ export function AppShell() {
     // terminal absent from the new session's list.
     pendingShellCreateRef.current = null;
     setTerminalPendingClose(null);
+    setFileNavigation(undefined);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
@@ -1124,6 +1152,9 @@ export function AppShell() {
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
     setRightRailTab((tab) => {
+      // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
+      // gated nav tab — always valid, and never a fallback target.
+      if (tab === "sidechat") return tab;
       if (railTabsAvailable[tab]) return tab;
       return (
         (["files", "changes", "github", "subagents", "browser"] as const).find(
@@ -1159,9 +1190,11 @@ export function AppShell() {
     writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
 
-  const openFileViewer = useCallback(
-    (path: string) => {
+  const commitFileNavigation = useCallback(
+    (path: string, options?: OpenFileOptions) => {
+      const position = options?.line ? { line: options.line, column: options.column } : undefined;
       setSelectedFilePath(path);
+      setFileNavigation({ conversationId, path, position });
       // A file and a shell tab can't both own the rail's content slot —
       // opening a file deselects any active shell tab (its tab stays in the
       // strip).
@@ -1201,12 +1234,39 @@ export function AppShell() {
           const next = new URLSearchParams(prev);
           next.set("file", path);
           next.delete("comment"); // stale comment belongs to the previous file
+          // A citation's cited line rides along so the viewer can land on it;
+          // a plain open clears any previous citation's line.
+          if (position?.line != null) next.set("line", String(position.line));
+          else next.delete("line");
+          if (position?.column != null) next.set("column", String(position.column));
+          else next.delete("column");
           return next;
         },
         { replace: true },
       );
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
+  );
+
+  // Desktop and mobile viewers can both be mounted; each may own a draft.
+  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
+  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
+    fileNavigationGuardsRef.current.add(guard);
+    return () => {
+      fileNavigationGuardsRef.current.delete(guard);
+    };
+  }, []);
+  const openFileViewer = useCallback(
+    (path: string, options?: OpenFileOptions) => {
+      const guards = [...fileNavigationGuardsRef.current];
+      const navigate = (index: number) => {
+        const guard = guards[index];
+        if (guard) guard(path, options, () => navigate(index + 1));
+        else commitFileNavigation(path, options);
+      };
+      navigate(0);
+    },
+    [commitFileNavigation],
   );
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
@@ -1220,6 +1280,8 @@ export function AppShell() {
         next.delete("file");
         next.delete("diff");
         next.delete("comment");
+        next.delete("line");
+        next.delete("column");
         return next;
       },
       { replace: true },
@@ -1501,6 +1563,8 @@ export function AppShell() {
               const params = new URLSearchParams(sp);
               params.set("file", neighbor);
               params.delete("comment");
+              params.delete("line"); // stale citation belongs to the closed file
+              params.delete("column");
               return params;
             },
             { replace: true },
@@ -1536,20 +1600,15 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // A `/side` fork the user just opened: reveal it in the Agents rail on the
-  // SIDE CHAT itself, and leave the main chat's rail untouched. `ChatPage`
-  // navigates off `redirectToConversationId`; the rail tab is per-conversation,
-  // so we wait until the router has actually landed on the child
-  // (`conversationId === sideChatRailRequest`) before switching the tab —
-  // otherwise the tab would persist onto the main chat we're leaving.
-  const sideChatRailRequest = useChatStore((s) => s.sideChatRailRequest);
-  const clearSideChatRailRequest = useChatStore((s) => s.clearSideChatRailRequest);
+  // A side chat the user just opened must be visible: reveal the Workspace rail
+  // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
+  // clearing the one-shot `sideChatToOpen` signal (it holds the side-chat tab
+  // state, like the browser tabs); AppShell only ensures the rail is open.
+  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   useEffect(() => {
-    if (sideChatRailRequest === null) return;
-    if (conversationId !== sideChatRailRequest) return;
-    handleRightRailTabChange("subagents");
-    clearSideChatRailRequest();
-  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange, conversationId]);
+    if (sideChatToOpen === null) return;
+    setRightPanelOpen(true);
+  }, [sideChatToOpen]);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1771,13 +1830,22 @@ export function AppShell() {
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
+      registerNavigationGuard,
       openGithubTab,
       isChangedPath,
       conversationId,
       workspaceRoot,
       workspaceHome,
     }),
-    [openFileViewer, openGithubTab, isChangedPath, conversationId, workspaceRoot, workspaceHome],
+    [
+      openFileViewer,
+      registerNavigationGuard,
+      openGithubTab,
+      isChangedPath,
+      conversationId,
+      workspaceRoot,
+      workspaceHome,
+    ],
   );
 
   // Context for descendants — ChatPage's ConnectionIndicator reads
@@ -2065,7 +2133,7 @@ export function AppShell() {
                   } as CSSProperties
                 }
               >
-                {!extensionOwnsHeader && (
+                {!extensionOwnsHeader && !hideHeader && (
                   <ChatHeader
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
@@ -2188,6 +2256,7 @@ export function AppShell() {
                     agentCount={agentCount}
                     rootSessionId={rootSessionId}
                     selectedFilePath={selectedFilePath}
+                    filePosition={filePosition}
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
@@ -2297,9 +2366,11 @@ export function AppShell() {
               {serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
+                    viewport="mobile"
                     open
                     conversationId={serverConversationId}
                     path={selectedFilePath}
+                    position={filePosition}
                     onClose={closeFileViewer}
                     onNavigateTo={openFileViewer}
                     permissionLevel={permissionLevel}
@@ -2383,7 +2454,7 @@ export function AppShell() {
           {/* Match the previous toast system's effectively unbounded stack so
               security prompts cannot be hidden behind ordinary notifications. */}
           <Toaster
-            position="bottom-right"
+            position="top-center"
             visibleToasts={100}
             offset={{
               right: "1rem",

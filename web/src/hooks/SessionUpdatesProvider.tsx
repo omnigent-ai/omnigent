@@ -1,3 +1,5 @@
+import { SidebarDataContext } from "./useSidebarData";
+import { PINNED_CONVERSATIONS_KEY, type PinnedConversationsResult } from "./useConversations";
 // App-level wiring for the `WS /v1/sessions/updates` push stream.
 //
 // Mounted once near the app root. It:
@@ -15,7 +17,7 @@
 // HTTP reconciliation so new sessions from other tabs / CLIs are still
 // discovered while the socket handles watched-row freshness.
 
-import { type ReactNode, useCallback, useEffect, useRef } from "react";
+import { type ReactNode, useCallback, useContext, useEffect, useRef } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
@@ -73,9 +75,7 @@ function applyItemsToCache(
   const itemsById = new Map<string, SessionListWireItem>();
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
-    // An optimistic archive/unarchive in flight owns the row's archived flag:
-    // coerce a stale frame to match so a lagging server signal can't flip the
-    // row out from under the pending mutation (either direction flashes).
+    // The pending archive operation owns the flag while server signals lag.
     let coerced = item;
     if (isSessionArchiving(item.id)) coerced = { ...item, archived: true };
     else if (isSessionUnarchiving(item.id)) coerced = { ...item, archived: false };
@@ -87,6 +87,7 @@ function applyItemsToCache(
     queryKey: ["conversations"],
   });
   for (const [key, data] of entries) {
+    if (key[4] === "archived") continue;
     const filters = filtersFromConversationQueryKey(key);
     const {
       data: merged,
@@ -136,6 +137,28 @@ function applyItemsToCache(
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);
   }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (previous) => {
+    if (!previous) return previous;
+    let changed = false;
+    const conversations = previous.conversations
+      .map((row) => {
+        const item = itemsById.get(row.id);
+        if (!item) return row;
+        foundAnywhere.add(row.id);
+        changed = true;
+        // Pin membership and pin timestamps reconcile through the pinned query.
+        return {
+          ...row,
+          ...item,
+          labels: {
+            ...(item.labels ?? row.labels),
+            ["omnigent.pinned"]: row.labels["omnigent.pinned"],
+          },
+        };
+      })
+      .filter((row) => !row.archived);
+    return changed ? { ...previous, conversations } : previous;
+  });
   return {
     missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
     needsRefetch,
@@ -174,6 +197,11 @@ function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
  */
 export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
+  const sidebarData = useContext(SidebarDataContext);
+  const identityReady = sidebarData?.identityReady ?? true;
+  const sidebarIds = sidebarData?.watchedIds;
+  const sidebarIdsRef = useRef(sidebarIds);
+  sidebarIdsRef.current = sidebarIds;
 
   // Last comments fingerprint (`count:updated_at`) seen per session id.
   // A frame whose fingerprint differs from the recorded one means a comment
@@ -210,7 +238,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     const projectEntries = queryClient.getQueriesData<ConversationsInfiniteData>({
       queryKey: ["project-sessions"],
     });
-    const ids = collectConversationIds([...entries, ...projectEntries].map(([, data]) => data));
+    const ids = sidebarIdsRef.current
+      ? [...sidebarIdsRef.current]
+      : collectConversationIds([...entries, ...projectEntries].map(([, data]) => data));
     // Union in the open session. A directly-opened child / sub-agent
     // session is filtered out of the sidebar list, so it's absent from
     // every cached conversations page and wouldn't otherwise be watched —
@@ -243,7 +273,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // watch-set (and an already-watched id no-ops via setWatched).
   useEffect(() => {
     pushWatched();
-  }, [pushWatched, activeId]);
+  }, [pushWatched, activeId, sidebarIds]);
 
   // Freeze the fallback slice key (the modal host over all seen sessions) once
   // the session list first loads, then start the updates socket — which keys
@@ -264,6 +294,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // anyway). The session list itself is NOT gated on the modal (it populates the
   // map the modal reads; gating it on the modal would deadlock).
   useEffect(() => {
+    if (!identityReady) return;
     let cacheUnsub: (() => void) | null = null;
     const tryResolveAndStart = (): boolean => {
       const succeeded = queryClient
@@ -293,7 +324,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       if (invalidateTimer !== null) return;
       invalidateTimer = setTimeout(() => {
         invalidateTimer = null;
-        void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        void queryClient.invalidateQueries({
+          queryKey: ["conversations"],
+          predicate: (query) => query.meta?.snapshot !== true,
+        });
         // Converge each project folder's own list too (new/archived/relabeled
         // members the local field-patch can't place).
         void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
@@ -347,6 +381,18 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
+          queryClient.setQueryData<PinnedConversationsResult>(
+            PINNED_CONVERSATIONS_KEY,
+            (previous) =>
+              previous
+                ? {
+                    ...previous,
+                    conversations: previous.conversations.filter(
+                      (row) => !frame.ids.includes(row.id),
+                    ),
+                  }
+                : previous,
+          );
           if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
           return;
         case "snapshot":
@@ -433,7 +479,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       if (watchTimer !== null) clearTimeout(watchTimer);
       sessionUpdatesSocket.stop();
     };
-  }, [queryClient, pushWatched]);
+  }, [identityReady, queryClient, pushWatched]);
 
   return children;
 }

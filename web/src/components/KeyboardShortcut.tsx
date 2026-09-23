@@ -18,6 +18,10 @@ export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] 
   return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];
 }
 
+export function composerSteerAllShortcutKeys(submitWithModEnter: boolean): string[] {
+  return submitWithModEnter ? [MOD_KEY, SHIFT_KEY, ENTER_KEY] : [MOD_KEY, ENTER_KEY];
+}
+
 export function composerNewLineShortcutKeys(submitWithModEnter: boolean): string[] {
   return submitWithModEnter ? [ENTER_KEY] : [SHIFT_KEY, ENTER_KEY];
 }

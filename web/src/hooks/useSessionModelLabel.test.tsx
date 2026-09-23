@@ -190,6 +190,45 @@ describe("useSessionModelLabel", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it.each([
+    ["codex-native", "system.ai.gpt-6-astra", "system.ai.gpt-6-astra"],
+    ["pi-native", "omnigent-openai/system.ai.gpt-6-astra", "system.ai.gpt-6-astra"],
+    ["claude-native", "opus", "system.ai.claude-opus-5"],
+  ])("keeps %s labels formatted across catalog loss and reload", (harness, id, wireModel) => {
+    const props = { ...defaults, scope: { ...scope, harness }, model: id };
+    const expected = wireModel.slice("system.ai.".length);
+    const first = renderLabel({
+      ...props,
+      options: [{ id, model: harness === "pi-native" ? id : wireModel, displayName: wireModel }],
+    });
+    expect(first.result.current.label).toBe(expected);
+    first.rerender(props);
+    expect(first.result.current).toEqual({ label: expected, loading: false, unavailable: false });
+    first.unmount();
+    expect(renderLabel(props).result.current.label).toBe(expected);
+  });
+
+  it.each(["system.ai.gpt-6-astra", "omnigent-openai/system.ai.gpt-6-astra"])(
+    "formats an existing raw cached label for %s before metadata arrives",
+    (reported) => {
+      const key = getSessionModelLabelCacheKey(scope, reported);
+      writeSessionModelLabelCache(key, "system.ai.gpt-6-astra");
+      const { result } = renderLabel({ model: reported });
+      expect(result.current).toEqual({
+        label: "gpt-6-astra",
+        loading: false,
+        unavailable: false,
+      });
+    },
+  );
+
+  it("preserves deliberate cached display names with catalog prefixes", () => {
+    const reported = "omnigent-openai/system.ai.gpt-6-astra";
+    const label = "system.ai.gpt-6-astra (team)";
+    writeSessionModelLabelCache(getSessionModelLabelCacheKey(scope, reported), label);
+    expect(renderLabel({ model: reported }).result.current.label).toBe(label);
+  });
+
   it("discovers a warm cache as soon as delayed identity resolves, without an external rerender", async () => {
     writeSessionModelLabelCache(cacheKey(), named.label!);
     vi.mocked(getCurrentUserId).mockReturnValue(null);

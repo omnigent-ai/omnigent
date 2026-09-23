@@ -45,14 +45,14 @@ import json
 import os
 import re
 import signal
-import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import _server_state, open_right_rail
 
 
 def _open_new_shell(page: Page) -> None:
@@ -71,23 +71,6 @@ def _open_new_shell(page: Page) -> None:
     # type launches the default directly.
     rail.get_by_role("button", name="Open new").click()
     page.get_by_role("menuitem", name=re.compile("Shell")).click()
-
-
-def _find_runner_pids() -> list[int]:
-    """PIDs of the runner entry point (``omnigent.runner._entry``).
-
-    Same drop-the-runner stand-in for "Stop session" as
-    ``sessions/test_sidebar_stop.py``: the harness's tunneled non-host
-    runner has no stop_session path, so a kill produces the identical
-    liveness chain. The ``terminal_session`` fixture respawns it for the
-    next test.
-    """
-    result = subprocess.run(
-        ["pgrep", "-f", "omnigent.runner._entry"], capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        return []
-    return [int(line.strip()) for line in result.stdout.strip().splitlines() if line.strip()]
 
 
 def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, str]) -> None:
@@ -170,7 +153,9 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
 
 
 def test_empty_terminal_view_remains_selectable_and_resumable(
-    page: Page, terminal_session: tuple[str, str]
+    page: Page,
+    terminal_session: tuple[str, str],
+    _recover_shared_runner: Callable[[], None],
 ) -> None:
     """A stopped terminal-first session is resumable, same mount and after reload.
 
@@ -233,32 +218,34 @@ def test_empty_terminal_view_remains_selectable_and_resumable(
     # Genuine stop + hard reload, still inside the 45s creation window:
     # drop the runner, wait for the server to observe it offline, reload.
     # The fresh-session startup grace must not mask the stopped UI.
-    runner_pids = _find_runner_pids()
-    assert runner_pids, "no runner process found to stop"
-    for pid in runner_pids:
-        os.kill(pid, signal.SIGKILL)
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        health = httpx.get(f"{base_url}/health", params={"session_ids": session_id}, timeout=5.0)
-        if (
-            health.status_code == 200
-            and not health.json()["sessions"][session_id]["runner_online"]
-        ):
-            break
-        time.sleep(0.5)
-    else:
-        raise AssertionError("server never observed the runner offline")
+    os.kill(int(_server_state["runner_pid"]), signal.SIGKILL)
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            health = httpx.get(
+                f"{base_url}/health", params={"session_ids": session_id}, timeout=5.0
+            )
+            if (
+                health.status_code == 200
+                and not health.json()["sessions"][session_id]["runner_online"]
+            ):
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError("server never observed the runner offline")
 
-    page.reload()
+        page.reload()
 
-    expect(terminal_button).to_be_enabled()
-    if terminal_button.get_attribute("aria-pressed") != "true":
-        terminal_button.click()
-    expect(terminal_button).to_have_attribute("aria-pressed", "true")
-    expect(terminal_view).to_be_visible()
-    expect(terminal_view).to_contain_text("The harness is not running.")
-    expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
-    expect(terminal_view.get_by_role("status")).to_have_count(0)
+        expect(terminal_button).to_be_enabled()
+        if terminal_button.get_attribute("aria-pressed") != "true":
+            terminal_button.click()
+        expect(terminal_button).to_have_attribute("aria-pressed", "true")
+        expect(terminal_view).to_be_visible()
+        expect(terminal_view).to_contain_text("The harness is not running.")
+        expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
+        expect(terminal_view.get_by_role("status")).to_have_count(0)
+    finally:
+        _recover_shared_runner()
 
 
 def test_starting_terminal_view_shows_loading_without_resume(

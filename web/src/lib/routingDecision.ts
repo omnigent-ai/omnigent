@@ -21,6 +21,12 @@ export interface RoutingDecisionExtras {
   attemptedOverride?: string | null;
   /** Which router answered — `"databricks-aigw"` or `"oss-llm"`; absent on legacy rows. */
   routerSource?: string | null;
+  /**
+   * Human label of the task the decision governed, e.g. `"Research auth
+   * flows"` — what tells a fan-out's decisions apart when every spawn
+   * shares one subagent type. Absent on legacy rows and unlabeled spawns.
+   */
+  taskDescription?: string | null;
 }
 
 const SCOPES = new Set<string>(["session", "turn", "child_session", "native_subagent"]);
@@ -54,6 +60,9 @@ export function routingExtrasFromWire(rec: Record<string, unknown>): RoutingDeci
       attemptedOverride: str(rec.attempted_override),
     }),
     ...(str(rec.router_source) !== undefined && { routerSource: str(rec.router_source) }),
+    ...(str(rec.task_description) !== undefined && {
+      taskDescription: str(rec.task_description),
+    }),
   };
 }
 
@@ -75,6 +84,7 @@ export function routingExtras(
     ...(source.rawModel != null && { rawModel: source.rawModel }),
     ...(source.attemptedOverride != null && { attemptedOverride: source.attemptedOverride }),
     ...(source.routerSource != null && { routerSource: source.routerSource }),
+    ...(source.taskDescription != null && { taskDescription: source.taskDescription }),
   };
 }
 

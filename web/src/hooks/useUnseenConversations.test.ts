@@ -130,14 +130,13 @@ describe("unseen suppression during Undo restore", () => {
     mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
     // The unarchive bumps updated_at past the baseline, which normally reads unseen.
     expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(true);
-    // While Undo's restore is in flight, that self-initiated bump is held off so
-    // the row doesn't flash an unread dot on the way back in.
+    // Suppress the self-initiated bump during restore.
     mod.beginUnseenSuppression("conv-1");
     expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(false);
     // Other sessions are unaffected by the hold.
     mod.seedReadState([{ id: "conv-2", viewer_last_seen: 1_000 }]);
     expect(mod.isConversationUnseen("conv-2", 2_000, "idle")).toBe(true);
-    // Once the restore settles (the seen-anchor has landed), the dot reads normally.
+    // Resume normal detection after the seen anchor lands.
     mod.endUnseenSuppression("conv-1");
     expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(true);
   });

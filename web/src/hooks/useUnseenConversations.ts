@@ -42,12 +42,7 @@ type LastSeenMap = Record<string, number>;
 let lastSeenMap: LastSeenMap = {};
 const explicitlyUnread = new Set<string>();
 
-// Sessions with an Undo-restore in flight. Unarchiving is a self-initiated
-// write that bumps the server's `updated_at`, which the WS push surfaces before
-// the restore's seen-anchor lands, so the row would briefly read as unseen and
-// flash an unread dot. Hold the dot off for that in-flight window (see
-// `beginUnseenSuppression`). Kept sub-second: released the moment the restore
-// settles, not for the archived-flag propagation window.
+// Undo owns its timestamp bump until the restore's seen anchor lands.
 const restoringSessions = new Set<string>();
 
 // localStorage persistence. Best-effort everywhere: storage can be
@@ -293,14 +288,7 @@ export function markConversationUnread(conversationId: string, updatedAt: number
   void syncReadState(conversationId);
 }
 
-/**
- * Hold the unseen dot off a session while an Undo-restore is in flight — the
- * unarchive's own `updated_at` bump is self-initiated and shouldn't read as new
- * activity before the seen-anchor lands. Paired with {@link endUnseenSuppression},
- * which the restore calls once it settles (a sub-second window, not the full
- * archived-flag propagation window). Explicitly-unread rows are left alone: the
- * dot condition already short-circuits on those, and the user's intent wins.
- */
+/** Suppress unseen state until an Undo restore records its seen anchor. */
 export function beginUnseenSuppression(conversationId: string): void {
   if (restoringSessions.has(conversationId)) return;
   restoringSessions.add(conversationId);
@@ -385,8 +373,7 @@ export function isConversationUnseen(
   status: string | undefined,
 ): boolean {
   if (status === "running" || status === undefined) return false;
-  // An Undo-restore in flight owns this row's updated_at bump (its own
-  // unarchive write); don't read that self-initiated bump as new activity.
+  // Ignore the restore's own timestamp bump.
   if (restoringSessions.has(conversationId)) return false;
   const stored = lastSeenMap[conversationId];
   if (stored === undefined) return false;

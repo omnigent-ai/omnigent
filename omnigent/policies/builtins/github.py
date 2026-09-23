@@ -76,8 +76,10 @@ from typing import Any
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
+    is_shell_interpreter,
     is_unresolved_invocation,
     real_invocation_tokens,
+    spawns_gated_command_as_child,
     split_command_segments,
     unwrap_shell_command,
 )
@@ -903,8 +905,11 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
             tokens = real_invocation_tokens(tokens)
             # A leading option means some wrapper's own flags were not modelled,
             # so the real command was never reached. Same fail-safe as an
-            # un-tokenizable segment rather than a silent abstain.
-            unreadable = is_unresolved_invocation(tokens)
+            # un-tokenizable segment rather than a silent abstain. A
+            # process-spawning utility (find -exec, xargs, perl -e, python -c,
+            # awk, make) likewise runs the gated command as a child whose argv is
+            # not modelled here, so route it through the same fail-safe.
+            unreadable = is_unresolved_invocation(tokens) or spawns_gated_command_as_child(tokens)
         if unreadable:
             if re.search(r"\b(git|gh)\b", segment):
                 ops.append(
@@ -924,6 +929,23 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
         inner = unwrap_shell_command(tokens)
         if inner is not None:
             ops.extend(_classify_shell_command(inner, _depth + 1))
+            continue
+        # A shell interpreter with no ``-c`` reads its program from stdin or a
+        # script file (``printf '…' | sh``, ``sh script.sh``), which this parser
+        # cannot see. The gated git/gh could be in that opaque program — for
+        # ``… | sh`` the payload is even in a different segment — so its absence
+        # from this segment's tokens is not safe evidence. Surface it for
+        # approval rather than abstain → ALLOW.
+        if is_shell_interpreter(tokens):
+            ops.append(
+                _ShellOp(
+                    kind="unparseable",
+                    repo=None,
+                    branches=frozenset(),
+                    branch_targeted=False,
+                    detail=segment[:60],
+                )
+            )
             continue
         if tokens[0] == "git":
             op = _classify_git(tokens)

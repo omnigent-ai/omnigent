@@ -1,6 +1,9 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
+  /** Mine/Shared session refresh intervals in milliseconds; positive integers. */
+  readonly VITE_MINE_REFRESH_MS?: string;
+  readonly VITE_SHARED_REFRESH_MS?: string;
   /**
    * Base URL of an OTLP/HTTP collector for browser tracing, e.g.
    * `http://localhost:4318`. When unset, browser tracing is disabled.

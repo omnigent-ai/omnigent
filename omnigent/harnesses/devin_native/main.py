@@ -225,6 +225,139 @@ def _find_devin_family(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Fusion mode
+# ---------------------------------------------------------------------------
+#
+# Fusion is a single family whose ~175 variant ids pair a *lead* model with a
+# cheaper *sidekick*: ``fusion-<lead_uid>-sidekick-<sidekick_uid>`` where BOTH
+# halves are real model_uids elsewhere in the catalog. The lead carries a
+# reasoning effort and an optional ``-fast`` serving modifier; the sidekick
+# carries an optional ``-priority`` modifier. Not every (lead, effort, fast,
+# sidekick) combination exists, so the picker is driven off the real combo list
+# rather than a cartesian product — see :func:`build_fusion_descriptor`.
+
+_FUSION_SLUG = "fusion"
+_FUSION_SIDEKICK_SEP = "-sidekick-"
+_FUSION_FAST_SUFFIX = "-fast"
+_FUSION_PRIORITY_SUFFIX = "-priority"
+
+#: ``model_uid`` -> ``(owning family, variant)``.
+_FlatVariantIndex = Mapping[str, "tuple[Mapping[str, object], Mapping[str, object]]"]
+
+
+def _flat_variant_index(
+    families: Sequence[Mapping[str, object]],
+) -> dict[str, tuple[Mapping[str, object], Mapping[str, object]]]:
+    """Map every ``model_uid`` to its ``(owning family, variant)`` pair."""
+    index: dict[str, tuple[Mapping[str, object], Mapping[str, object]]] = {}
+    for family in families:
+        if not isinstance(family, dict):
+            continue
+        variants = family.get("variants")
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            uid = variant.get("model_uid")
+            if isinstance(uid, str) and uid:
+                index.setdefault(uid, (family, variant))
+    return index
+
+
+def _effort_suffix(uid: str) -> str | None:
+    """Return the trailing effort rung on *uid*, or ``None``."""
+    return next((rung for rung in DEVIN_EFFORTS if uid.endswith(f"-{rung}")), None)
+
+
+def _family_label(
+    entry: tuple[Mapping[str, object], Mapping[str, object]] | None, fallback: str
+) -> str:
+    """Human label for a resolved ``(family, variant)`` entry."""
+    if entry is None:
+        return fallback
+    family, _ = entry
+    label = family.get("family_label")
+    if isinstance(label, str) and label.strip():
+        return label.strip()
+    slug = family.get("slug")
+    return slug if isinstance(slug, str) and slug else fallback
+
+
+def _parse_fusion_variant(uid: str, flat: _FlatVariantIndex) -> _JsonObject | None:
+    """Decompose one ``fusion-…`` variant id into picker facets.
+
+    :param uid: A fusion ``model_uid``.
+    :param flat: The flat ``model_uid`` index from :func:`_flat_variant_index`.
+    :returns: ``{modelUid, lead, leadLabel, effort, fast, sidekick, sidekickLabel,
+        priority}``, or ``None`` when the id is not a parseable fusion pairing.
+    """
+    if not uid.startswith("fusion-") or _FUSION_SIDEKICK_SEP not in uid:
+        return None
+    lead_uid, _, sidekick_uid = uid[len("fusion-") :].partition(_FUSION_SIDEKICK_SEP)
+    if not lead_uid or not sidekick_uid:
+        return None
+
+    fast = lead_uid.endswith(_FUSION_FAST_SUFFIX)
+    lead_base = lead_uid[: -len(_FUSION_FAST_SUFFIX)] if fast else lead_uid
+    effort = _effort_suffix(lead_base)
+    if effort is None:
+        return None
+    lead_entry = flat.get(lead_uid) or flat.get(lead_base)
+    lead_slug = lead_entry[0].get("slug") if lead_entry else None
+    lead_family = lead_slug if isinstance(lead_slug, str) and lead_slug else lead_base
+    lead_label = _family_label(lead_entry, lead_family)
+
+    priority = sidekick_uid.endswith(_FUSION_PRIORITY_SUFFIX)
+    sidekick_base = sidekick_uid[: -len(_FUSION_PRIORITY_SUFFIX)] if priority else sidekick_uid
+    side_entry = flat.get(sidekick_base) or flat.get(sidekick_uid)
+    side_family_label = _family_label(side_entry, sidekick_base)
+    side_effort = _effort_suffix(sidekick_base)
+    sidekick_label = (
+        f"{side_family_label} {side_effort.title()}" if side_effort else side_family_label
+    )
+
+    return {
+        "modelUid": uid,
+        "lead": lead_family,
+        "leadLabel": lead_label,
+        "effort": effort,
+        "fast": fast,
+        "sidekick": sidekick_base,
+        "sidekickLabel": sidekick_label,
+        "priority": priority,
+    }
+
+
+def build_fusion_descriptor(
+    fusion_family: Mapping[str, object],
+    families: Sequence[Mapping[str, object]],
+) -> _JsonObject | None:
+    """Build the structured Fusion picker payload from the fusion family.
+
+    Every fusion combo is parsed into lead/effort/fast + sidekick/priority facets
+    so the web can render dependent Lead / Effort / Sidekick selectors (plus Fast
+    and Priority checkboxes) and resolve the exact ``modelUid`` — the picker only
+    ever offers combinations that exist. Variant (catalog) order is preserved, so
+    the first combo is the sensible default.
+
+    :param fusion_family: The ``fusion`` family row.
+    :param families: All family rows, for resolving each half's label/effort.
+    :returns: ``{"combos": [...], "default": modelUid}``, or ``None`` when the
+        family yields no parseable combos.
+    """
+    flat = _flat_variant_index(families)
+    combos: list[_JsonObject] = []
+    for uid in _variant_ids(fusion_family):
+        parsed = _parse_fusion_variant(uid, flat)
+        if parsed is not None:
+            combos.append(parsed)
+    if not combos:
+        return None
+    return {"combos": combos, "default": combos[0]["modelUid"]}
+
+
 def list_devin_cli_model_options(
     *,
     env: Mapping[str, str] | None = None,
@@ -265,16 +398,25 @@ def list_devin_cli_model_options(
             "displayName": display_name,
             "isDefault": slug == default_id,
         }
-        rung_variants = family_effort_variants(family)
-        efforts = [effort for effort in DEVIN_EFFORTS if effort in rung_variants]
-        if efforts:
-            option["efforts"] = efforts
-            # Also emit the shared native-catalog shape (`supportedReasoningEfforts`)
-            # so the web effort picker shows only THIS model's rungs — swe-2 has
-            # only medium/high/max, and no `swe-2-low` exists in the catalog.
-            option["supportedReasoningEfforts"] = [
-                {"reasoningEffort": effort} for effort in efforts
-            ]
+        if slug == _FUSION_SLUG:
+            # Fusion's variant ids pair a lead with a sidekick and do not carry a
+            # plain effort rung, so the flat rung extractor would read the wrong
+            # suffix. Emit a structured descriptor the web renders as Lead / Effort
+            # / Sidekick selectors instead.
+            descriptor = build_fusion_descriptor(family, families)
+            if descriptor is not None:
+                option["fusion"] = descriptor
+        else:
+            rung_variants = family_effort_variants(family)
+            efforts = [effort for effort in DEVIN_EFFORTS if effort in rung_variants]
+            if efforts:
+                option["efforts"] = efforts
+                # Also emit the shared native-catalog shape (`supportedReasoningEfforts`)
+                # so the web effort picker shows only THIS model's rungs — swe-2 has
+                # only medium/high/max, and no `swe-2-low` exists in the catalog.
+                option["supportedReasoningEfforts"] = [
+                    {"reasoningEffort": effort} for effort in efforts
+                ]
         aliases = family.get("aliases")
         if isinstance(aliases, list):
             alias_strings = [a for a in aliases if isinstance(a, str) and a]
@@ -336,6 +478,11 @@ def compose_devin_model(
     family = _find_devin_family(model, families)
     if family is None:
         return model
+    if family.get("slug") == _FUSION_SLUG:
+        # A fusion variant id is self-contained (`fusion-<lead+effort>-sidekick-…`):
+        # the lead effort is baked in and Omnigent's flat rungs do not apply, so a
+        # full id is kept as-is and the bare slug defers to Devin's default.
+        return model if model in _variant_ids(family) else _FUSION_SLUG
     rung_variants = family_effort_variants(family)
     if effort in rung_variants:
         return rung_variants[effort]
