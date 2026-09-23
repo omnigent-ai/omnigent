@@ -362,7 +362,7 @@ jobs:
 
           # Reviewers read the shared snapshot; Polly passes only its path and identity.
           python3 -u <<'PYEOF'
-          import hashlib, json, pathlib, re
+          import hashlib, json, pathlib, re, subprocess
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff_sha256 = hashlib.sha256(pathlib.Path("/tmp/pr_diff.txt").read_bytes()).hexdigest()
@@ -370,6 +370,23 @@ jobs:
           database_guidance_path = pathlib.Path("docs/DATABASE_BEST_PRACTICES.md").resolve()
           try:
               database_guidance = database_guidance_path.read_text(encoding="utf-8")
+          except FileNotFoundError:
+              # The default branch may predate this guide during its initial rollout.
+              # Fetch only this immutable, verified snapshot; never use PR-head policy.
+              try:
+                  bootstrap = subprocess.run(
+                      ["gh", "api", "repos/omnigent-ai/omnigent/contents/docs/DATABASE_BEST_PRACTICES.md?ref=2a3657c2e8081c37cc6741fe062c0ac50a02934f",
+                       "-H", "Accept: application/vnd.github.raw+json"],
+                      check=True, capture_output=True, timeout=30,
+                  ).stdout
+              except (OSError, subprocess.SubprocessError) as exc:
+                  raise SystemExit(f"::error::Cannot load required database review guidance at {database_guidance_path} or its pinned bootstrap snapshot") from exc
+              if hashlib.sha256(bootstrap).hexdigest() != "a8c4c1237aad86004f47475f81a3fb8bde672e095fa4e6f87ad79c89a5b381c4":
+                  raise SystemExit("::error::Database review guidance bootstrap checksum mismatch")
+              database_guidance = bootstrap.decode("utf-8")
+              database_guidance_path = pathlib.Path("/tmp/polly_database_best_practices.md")
+              database_guidance_path.write_bytes(bootstrap)
+              database_guidance_path.chmod(0o444)
           except (OSError, UnicodeError) as exc:
               raise SystemExit(f"::error::Cannot read required database review guidance at {database_guidance_path}: {exc}") from exc
           if not database_guidance.strip():
@@ -475,8 +492,9 @@ jobs:
           The codebase is checked out at `main` — read source files freely for
           additional context when needed.
 
-          The database review reference is `{database_guidance_path}`, from this
-          trusted checkout. Polly and every reviewer must read the full document
+          The database review reference is `{database_guidance_path}`, from the
+          trusted checkout or its verified bootstrap snapshot. Polly and every
+          reviewer must read the full document
           with their own tools before completing the review. Include its absolute
           path and the requirement to apply it in every reviewer task; the document
           is part of each reviewer's acceptance contract. If it cannot be read,
