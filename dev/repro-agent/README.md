@@ -59,6 +59,13 @@ with `git worktree remove <path>` when done.
 
 ## What it does
 
+An automated launcher may optionally supply a report snapshot and a coordinated
+planning protocol. In that mode the agent submits a plan, waits for the
+coordinator's automatic continuation, and produces a requirement-by-requirement
+account alongside its handoff. The coordinator owns record validation and
+storage; an independent reviewer still judges the journey and evidence. Normal
+invocations below do not pause for registration or require those records.
+
 1. Reconstructs the user journey from the linked bug report.
 2. Drives the running app through that journey — Playwright `tests/e2e_ui/` for
    headless web UI runs (including CI), embedded-browser tools for local sessions
