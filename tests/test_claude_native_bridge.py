@@ -71,6 +71,10 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
 )
 from omnigent.native import native_cost_popup
+from omnigent.native.child_interpreter import (
+    OMNIGENT_IMPORT_ROOT,
+    omnigent_module_argv,
+)
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 
@@ -11679,3 +11683,75 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+def test_hook_argv_resolves_the_running_omnigent_from_a_shadowing_workspace(
+    tmp_path: Path,
+) -> None:
+    """A hook child must import the omnigent that built its command.
+
+    Three shapes are compared from a workspace holding a decoy ``omnigent/``
+    package, with ``PYTHONPATH`` stripped from the environment so nothing but
+    the command itself can point the child at the right install:
+
+    - the built argv (``env PYTHONPATH=<root> python -P -m …``) succeeds;
+    - plain ``-m`` imports the decoy, because cwd precedes everything;
+    - ``-I`` finds no omnigent at all, because it discards the environment
+      and the user site that made the package reachable.
+    """
+    workspace = tmp_path / "workspace"
+    decoy = workspace / "omnigent"
+    decoy.mkdir(parents=True)
+    (decoy / "__init__.py").write_text("raise AssertionError('decoy package imported')\n")
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    module = "omnigent.harnesses.claude_native.hook"
+
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            argv,
+            cwd=str(workspace),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    built = _run(omnigent_module_argv(sys.executable, module, "--help"))
+    assert built.returncode == 0, built.stderr
+    assert "decoy package imported" not in built.stderr
+
+    shadowed = _run([sys.executable, "-m", module, "--help"])
+    assert shadowed.returncode != 0, "cwd must not be able to shadow the install"
+
+    isolated = _run([sys.executable, "-I", "-m", module, "--help"])
+    assert isolated.returncode != 0, (
+        "-I discards the environment that makes omnigent importable, which is "
+        "why the built argv pins PYTHONPATH instead"
+    )
+
+
+def test_every_claude_hook_command_pins_the_running_omnigent(tmp_path: Path) -> None:
+    """No hook may spawn a bare interpreter that could resolve another omnigent."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    settings = claude_native_bridge.build_hook_settings(
+        bridge_dir,
+        python_executable=sys.executable,
+        subagent_router_dir=tmp_path / "router",
+        turn_routing=True,
+    )
+    commands = [
+        entry["command"]
+        for matchers in settings["hooks"].values()
+        for matcher in matchers
+        for entry in matcher["hooks"]
+    ]
+    python_commands = [command for command in commands if sys.executable in command]
+    assert python_commands, "expected at least one interpreter-backed hook"
+    root = OMNIGENT_IMPORT_ROOT
+    for command in python_commands:
+        assert f"PYTHONPATH={shlex.quote(root)}" in command or f"PYTHONPATH={root}" in command, (
+            command
+        )
+        assert " -I " not in command, command
