@@ -11194,8 +11194,13 @@ def create_runner_app(
         exclude: str | None,
         limit: int,
     ) -> JSONResponse:
+        import asyncio as _asyncio
+
         from omnigent.runner.environment_filesystem import (
             CallerProcessFilesystem,
+            _validate_path,
+            index_search,
+            merge_entries,
             split_glob_list,
         )
 
@@ -11206,13 +11211,45 @@ def create_runner_app(
         await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env)
-        entries, truncated = await fs.search_files(
-            q,
-            path=path,
-            include=include_patterns,
-            exclude=exclude_patterns,
-            limit=limit,
+
+        # The budgeted walk is the only source for ignored files (and, until a
+        # ``git status`` has run, untracked ones), so it always runs. Alongside
+        # it, git's index adds every tracked file in one read however large the
+        # repo, and the Changed tab's latest ``git status`` adds untracked files
+        # past the budget. Absolute (browse-anywhere) paths have no registry.
+        walk = _asyncio.ensure_future(
+            fs.search_files(
+                q,
+                path=path,
+                include=include_patterns,
+                exclude=exclude_patterns,
+                limit=limit,
+            )
         )
+        indexed: list[FilesystemEntry] | None = None
+        complete = True
+        try:
+            session_registry = (
+                None if fs._absolute(path) else await _resolve_session_fs_registry(session_id)
+            )
+            if session_registry is not None:
+                indexed, complete = await _asyncio.to_thread(
+                    index_search,
+                    session_registry,
+                    fs._resolve(path),
+                    _validate_path(path) if path else "",
+                    q,
+                    include=include_patterns,
+                    exclude=exclude_patterns,
+                    limit=limit,
+                )
+        except BaseException:
+            walk.cancel()
+            raise
+        entries, truncated = await walk
+        if indexed is not None:
+            entries = merge_entries(indexed, entries, limit)
+            truncated = truncated or not complete
         data = [_fs_entry_to_dict(e) for e in entries]
         return JSONResponse(
             status_code=200,
@@ -12247,15 +12284,9 @@ def create_runner_app(
         return JSONResponse(status_code=200, content=payload)
 
     def _fs_entry_to_dict(entry: FilesystemEntry) -> dict[str, object]:
-        return {
-            "id": entry.id,
-            "object": "session.environment.filesystem.entry",
-            "name": entry.name,
-            "path": entry.path,
-            "type": entry.type,
-            "bytes": entry.bytes,
-            "modified_at": entry.modified_at,
-        }
+        from omnigent.runner.environment_filesystem import entry_payload
+
+        return entry_payload(entry)
 
     @app.post("/v1/sessions/{session_id}/resources/environments/{environment_id}/shell")
     async def run_environment_shell(

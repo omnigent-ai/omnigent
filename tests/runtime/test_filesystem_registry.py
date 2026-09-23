@@ -1483,3 +1483,61 @@ def test_git_line_counts_numstat_failure_degrades_but_status_intact(
     assert rec["status"] == "modified"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
+
+
+def test_git_list_tracked_files_is_relative_to_the_requested_subdir(tmp_path: Path) -> None:
+    """Search relies on the index for repos too big to walk, so the listing must
+    cover every tracked file, ignore untracked ones, re-root under a scoped
+    directory the way the walk reports paths, and admit failure with ``None``."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "src" / "app").mkdir(parents=True)
+    (tmp_path / "src" / "app" / "main.py").write_text("x")
+    (tmp_path / "README.md").write_text("y")
+    (tmp_path / "untracked.txt").write_text("z")
+    subprocess.run(
+        ["git", "add", "src", "README.md"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert reg.list_tracked_files() == ["README.md", "src/app/main.py"]
+    assert reg.list_tracked_files("src") == ["app/main.py"]
+    assert reg.list_tracked_files("missing-dir") is None
+
+
+def test_agent_edit_registry_has_no_index_to_consult(
+    registry: AgentEditFilesystemRegistry,
+) -> None:
+    """A non-git workspace offers neither listing, so search keeps walking."""
+    assert registry.list_tracked_files() is None
+    assert registry.last_changed_files() is None
+
+
+def test_git_last_changed_files_snapshots_the_paths_still_on_disk(tmp_path: Path) -> None:
+    """Search reuses the latest ``git status`` for untracked files. The snapshot
+    must exist only after a run, keep modified and new paths, drop deleted ones,
+    and say when the run's limit may have hidden some."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "kept.txt").write_text("a")
+    (tmp_path / "gone.txt").write_text("b")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "kept.txt").write_text("changed")
+    (tmp_path / "gone.txt").unlink()
+    (tmp_path / "new.txt").write_text("c")
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    assert reg.last_changed_files() is None
+
+    reg.list_changed_files("conv", limit=10)
+    snapshot = reg.last_changed_files()
+    assert snapshot is not None
+    assert sorted(snapshot.paths) == ["kept.txt", "new.txt"]
+    assert snapshot.complete is True
+
+    reg.list_changed_files("conv", limit=1)
+    capped = reg.last_changed_files()
+    assert capped is not None
+    assert capped.complete is False

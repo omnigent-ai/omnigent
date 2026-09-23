@@ -521,3 +521,80 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
 
     assert "diff --git a/app.txt b/app.txt" in result["patch"]
     assert "+changed" in result["patch"]
+
+
+def test_search_finds_tracked_files_past_the_scan_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors the runner: tracked files come from git's index whatever the walk
+    budget, and untracked ones from the latest ``git status`` once one has run,
+    so a host-served search on a huge repo agrees with the runner's."""
+    _git_repo(tmp_path)
+    env = _git_env()
+    many = tmp_path / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (tmp_path / "zzz").mkdir()
+    (tmp_path / "zzz" / "target.jsonnet").write_text("y")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "more"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target")
+    assert [e["path"] for e in result["data"]] == ["zzz/target.jsonnet"], result
+    # Until a git status has run, untracked coverage is the walk's — which ran
+    # out of budget in aaa/.
+    assert result["truncated"] is True
+
+    reader.changes("conv")
+    result = reader.search("zzz")
+    assert [(e["path"], e["type"]) for e in result["data"]] == [
+        ("zzz", "directory"),
+        ("zzz/scratch.txt", "file"),
+        ("zzz/target.jsonnet", "file"),
+    ], result
+    # The walk still ran (only it can find ignored files) and still ran out of
+    # budget in aaa/, so the answer stays flagged as possibly incomplete.
+    assert result["truncated"] is True
+
+
+def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``.git`` sorts first and in a clone holds more entries than the whole
+    budget; the walk used to spend all of it there and miss every real file."""
+    _git_repo(tmp_path)
+    (tmp_path / "zz.txt").write_text("x")  # untracked: only the walk can find it
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("zz")
+
+    assert [e["path"] for e in result["data"]] == ["zz.txt"]
+    assert result["truncated"] is False
+
+
+def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Path) -> None:
+    """Ignored files are in neither git's index nor ``git status``, so only the
+    walk can find them — it must keep running once a status snapshot exists."""
+    _git_repo(tmp_path)
+    env = _git_env()
+    (tmp_path / ".gitignore").write_text("build/\n")
+    subprocess.run(
+        ["git", "add", ".gitignore"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "ignore"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "out.log").write_text("ignored")
+    reader = WorkspaceReader(tmp_path)
+
+    reader.changes("conv")
+    result = reader.search("out.log")
+
+    assert [e["path"] for e in result["data"]] == ["build/out.log"], result
+    assert result["truncated"] is False

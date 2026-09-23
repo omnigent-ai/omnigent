@@ -40,7 +40,7 @@ from collections import deque
 from pathlib import Path
 from typing import TypeAlias, cast
 
-from omnigent.entities.environment_filesystem import InvalidPath
+from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
@@ -49,6 +49,9 @@ from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
     _validate_path,
+    entry_payload,
+    index_search,
+    merge_entries,
     split_glob_list,
 )
 from omnigent.runtime.filesystem_registry import (
@@ -317,16 +320,36 @@ class WorkspaceReader:
             subset), e.g. ``"*.ts,src/**"``.
         :param exclude: Comma-separated exclude globs.
         :param limit: Maximum results (capped at 500 by the caller).
-        :returns: A list payload of matching file entries.
+        :returns: A list payload of matching file and directory entries. In a
+            git workspace tracked files come from the index and untracked
+            ones from the latest ``git status`` when one has run; a budgeted
+            walk always runs too so ignored files stay findable, and
+            ``truncated`` says if it ran out.
         """
         q = query.strip().lower()
         if not q:
             return {"object": "list", "data": [], "has_more": False}
 
-        inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(include)]
-        exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
+        include_patterns = split_glob_list(include)
+        exclude_patterns = split_glob_list(exclude)
+        inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include_patterns]
+        exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude_patterns]
 
-        results: list[_WorkspacePayload] = []
+        # The budgeted walk below is the only source for ignored files (and,
+        # until a ``git status`` has run, untracked ones), so it always runs;
+        # git's index adds every tracked file however large the repo, and the
+        # latest ``git status`` adds untracked files past the budget.
+        indexed, complete = index_search(
+            self._registry,
+            self._root,
+            "",
+            q,
+            include=include_patterns,
+            exclude=exclude_patterns,
+            limit=limit,
+        )
+
+        results: list[FilesystemEntry] = []
         # State the two-pass walk mutates via closures (rebound through the
         # `nonlocal` in scan()). deferred is a FIFO of noise-dir roots to drain
         # in pass 2.
@@ -356,15 +379,14 @@ class WorkspaceReader:
                 size = None
                 mtime = None
             results.append(
-                {
-                    "id": p,
-                    "object": "session.environment.filesystem.entry",
-                    "name": name,
-                    "path": p,
-                    "type": "directory" if is_dir else "file",
-                    "bytes": size,
-                    "modified_at": mtime,
-                }
+                FilesystemEntry(
+                    id=p,
+                    name=name,
+                    path=p,
+                    type="directory" if is_dir else "file",
+                    bytes=size,
+                    modified_at=mtime,
+                )
             )
 
         def scan(root: str, defer: bool) -> None:
@@ -375,6 +397,10 @@ class WorkspaceReader:
             for dirpath, dirnames, filenames in os.walk(root):
                 kept = []
                 for d in sorted(dirnames):
+                    if d == ".git":
+                        # Git's own store is never a search target, and in a
+                        # plain clone its reflogs alone can outnumber the tree.
+                        continue
                     full = os.path.join(dirpath, d)
                     dp = rel(dirpath, d)
                     if any(r.match(dp) for r in exc):
@@ -428,11 +454,27 @@ class WorkspaceReader:
         # has_more); the loop exits only once deferred is drained or stop is
         # set, so no extra truncation flag is needed here.
 
-        results.sort(key=lambda entry: cast(str, entry["path"]))
+        results.sort(key=lambda entry: entry.path)
+        if indexed is not None:
+            results = merge_entries(indexed, results, limit)
+            truncated = truncated or not complete
+        return self._search_payload(results, limit, truncated=truncated)
+
+    @staticmethod
+    def _search_payload(
+        entries: list[FilesystemEntry], limit: int, *, truncated: bool
+    ) -> _WorkspacePayload:
+        """Wrap search *entries* in the runner's ``/search`` response shape.
+
+        :param entries: Matching entries, already sorted and capped.
+        :param limit: The cap, so ``has_more`` reads the same as the runner's.
+        :param truncated: Whether the scan stopped before covering the tree.
+        :returns: The list payload.
+        """
         return {
             "object": "list",
-            "data": results,
-            "has_more": len(results) >= limit,
+            "data": [entry_payload(e) for e in entries],
+            "has_more": len(entries) >= limit,
             "truncated": truncated,
         }
 

@@ -2042,3 +2042,124 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
         assert "error" in resp.json()
     finally:
         locked.chmod(0o700)
+
+
+def _git_runner_client(ws: Path, session_id: str) -> httpx.AsyncClient:
+    """Runner app whose workspace registry is git-backed, for the search tests.
+
+    :param ws: A git working tree to serve as both runner and session workspace.
+    :param session_id: Session to register the OS environment under.
+    :returns: An httpx client bound to the runner app.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+    reg = SessionResourceRegistry()
+    reg._primary_envs[session_id] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://runner")
+
+
+@pytest.mark.asyncio
+async def test_search_finds_tracked_files_past_the_scan_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported failure: a repo far larger than the walk budget, so the walk
+    quit in the first directories and the panel said the file did not exist.
+    Tracked files must come from git's index whatever the budget; untracked
+    ones ride on the Changed tab's ``git status`` once it has run; and the
+    walk keeps running regardless, because ignored files live nowhere else."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "target.jsonnet").write_text("y")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_git/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_git") as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        # No git status has run yet, so untracked coverage is still the walk's
+        # — and the walk ran out of budget in aaa/.
+        assert body["truncated"] is True
+
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search", params={"q": "zzz"})
+        body = resp.json()
+        assert [(e["path"], e["type"]) for e in body["data"]] == [
+            ("zzz", "directory"),
+            ("zzz/scratch.txt", "file"),
+            ("zzz/target.jsonnet", "file"),
+        ], body
+        # The walk still ran (only it can find ignored files) and still ran out
+        # of budget in aaa/, so the answer stays flagged as possibly incomplete.
+        assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``.git`` sorts first and in a clone holds more entries than the whole
+    budget; the walk used to spend all of it there and miss every real file."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "zz.txt").write_text("x")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+
+    entries, truncated = await fs.search_files("zz")
+
+    assert [e.path for e in entries] == ["zz.txt"]
+    assert truncated is False
+
+
+@pytest.mark.asyncio
+async def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Path) -> None:
+    """Ignored files are in neither git's index nor ``git status``, so only the
+    walk can find them — it must keep running once a status snapshot exists."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / ".gitignore").write_text("build/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "build").mkdir()
+    (ws / "build" / "out.log").write_text("ignored")
+    base = f"/v1/sessions/conv_ignored/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_ignored") as client:
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search", params={"q": "out.log"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["build/out.log"], body
+        assert body["truncated"] is False

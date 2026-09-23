@@ -15,7 +15,7 @@ import base64
 import os
 import re
 import stat
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec
 
@@ -50,6 +50,7 @@ from omnigent.inner.sandbox import (
 
 if TYPE_CHECKING:
     from omnigent.inner.os_env import OpResult, OSEnvironment
+    from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
 # Cap on entries a single search may examine. Distinct from the result
@@ -177,6 +178,174 @@ def split_glob_list(raw: str | None) -> list[str]:
             current.append(ch)
     patterns.append("".join(current))
     return [p.strip() for p in patterns if p.strip()]
+
+
+def search_indexed_paths(
+    root: Path,
+    paths: Iterable[str],
+    query: str,
+    *,
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+    limit: int = 500,
+) -> list[FilesystemEntry]:
+    """Match already-enumerated *paths* the way the directory walk would.
+
+    Applies the same filters as :meth:`CallerProcessFilesystem.search_files`
+    — case-insensitive substring on the path, include/exclude globs — and
+    reports a matching path's ancestor directories as directory entries, so
+    a query like ``"src"`` still surfaces the ``src`` folder. Only the
+    entries returned are stat'ed; a path that no longer exists (indexed but
+    deleted from the working tree) is dropped.
+
+    :param root: Absolute directory the paths are relative to.
+    :param paths: File paths relative to *root*, e.g. from ``git ls-files``.
+    :param query: Case-insensitive substring; whitespace-only matches nothing.
+    :param include: Pre-split include globs (see :func:`_glob_to_regex`).
+    :param exclude: Pre-split exclude globs; an excluded directory takes its
+        whole subtree with it, as the walk's pruning does.
+    :param limit: Maximum number of entries to return.
+    :returns: Matching entries sorted by path.
+    """
+    q = query.strip().lower()
+    if not q:
+        return []
+    inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include]
+    exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude]
+
+    def kept(rel: str) -> bool:
+        parts = rel.split("/")
+        ancestors = ("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+        if any(r.match(a) for a in ancestors for r in exc):
+            return False
+        return not inc or any(r.match(rel) for r in inc)
+
+    # A directory whose path contains q is a prefix of every file under it,
+    # so only files that match can contribute matching directories.
+    candidates: dict[str, bool] = {}  # path -> is a directory
+    seen_dirs: set[str] = set()
+    for p in paths:
+        if q not in p.lower():
+            continue
+        candidates.setdefault(p, False)
+        cut = p.rfind("/")
+        while cut != -1:
+            ancestor = p[:cut]
+            if ancestor in seen_dirs:
+                break
+            seen_dirs.add(ancestor)
+            if q in ancestor.lower():
+                candidates[ancestor] = True
+            cut = p.rfind("/", 0, cut)
+
+    entries: list[FilesystemEntry] = []
+    for rel in sorted(candidates):
+        if not kept(rel):
+            continue
+        try:
+            st = (root / rel).stat()
+        except OSError:
+            continue
+        # A submodule is one index entry but a directory on disk.
+        is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)
+        entries.append(
+            FilesystemEntry(
+                id=rel,
+                name=rel.rsplit("/", 1)[-1],
+                path=rel,
+                type="directory" if is_dir else "file",
+                bytes=None if is_dir else st.st_size,
+                modified_at=int(st.st_mtime),
+            )
+        )
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def merge_entries(
+    primary: Sequence[FilesystemEntry], secondary: Sequence[FilesystemEntry], limit: int
+) -> list[FilesystemEntry]:
+    """Union two result sets by path, sorted by path and capped at *limit*.
+
+    :param primary: Entries that win on a duplicate path, e.g. index matches.
+    :param secondary: Entries filling in the rest, e.g. from a walk.
+    :param limit: Maximum number of entries to return.
+    :returns: Deduplicated entries sorted by path.
+    """
+    by_path = {e.path: e for e in secondary}
+    by_path.update((e.path, e) for e in primary)
+    return sorted(by_path.values(), key=lambda e: e.path)[:limit]
+
+
+def paths_under(paths: Iterable[str], subdir: str) -> list[str]:
+    """Narrow workspace-relative *paths* to those below *subdir*, re-rooted there.
+
+    :param paths: Paths relative to the workspace root.
+    :param subdir: Directory relative to the workspace root; ``""`` keeps all.
+    :returns: The paths under *subdir*, relative to it.
+    """
+    if not subdir:
+        return list(paths)
+    prefix = subdir.rstrip("/") + "/"
+    return [p[len(prefix) :] for p in paths if p.startswith(prefix)]
+
+
+def index_search(
+    registry: FilesystemRegistry,
+    root: Path,
+    subdir: str,
+    query: str,
+    *,
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+    limit: int = 500,
+) -> tuple[list[FilesystemEntry] | None, bool]:
+    """Match the workspace's index plus its latest change snapshot, if any.
+
+    Covers every tracked file in one index read, however large the repo, and
+    the untracked files the Changed tab's most recent ``git status`` listed.
+    Ignored files are in neither, so callers still union in a walk.
+
+    :param registry: The workspace's change registry.
+    :param root: Absolute directory the results are relative to.
+    :param subdir: Directory relative to the workspace root being searched;
+        ``""`` for the whole workspace.
+    :param query: Case-insensitive substring.
+    :param include: Pre-split include globs.
+    :param exclude: Pre-split exclude globs.
+    :param limit: Maximum number of entries to return.
+    :returns: ``(entries, complete)``. ``entries`` is ``None`` when the
+        workspace has no index; ``complete`` is ``False`` when the snapshot
+        hit its own limit and so may be missing untracked files.
+    """
+    tracked = registry.list_tracked_files(subdir)
+    if tracked is None:
+        return None, True
+    snapshot = registry.last_changed_files()
+    if snapshot is not None:
+        tracked += paths_under(snapshot.paths, subdir)
+    entries = search_indexed_paths(
+        root, tracked, query, include=include, exclude=exclude, limit=limit
+    )
+    return entries, snapshot is None or snapshot.complete
+
+
+def entry_payload(entry: FilesystemEntry) -> dict[str, object]:
+    """Serialize *entry* in the shape the filesystem endpoints return.
+
+    :param entry: Entry to serialize.
+    :returns: JSON-ready dict.
+    """
+    return {
+        "id": entry.id,
+        "object": "session.environment.filesystem.entry",
+        "name": entry.name,
+        "path": entry.path,
+        "type": entry.type,
+        "bytes": entry.bytes,
+        "modified_at": entry.modified_at,
+    }
 
 
 async def _run_os_env_async(
@@ -625,9 +794,9 @@ class CallerProcessFilesystem:
     ) -> tuple[list[FilesystemEntry], bool]:
         """Search recursively by name/path substring and glob filters.
 
-        Walks the full directory tree via ``os.walk()`` inside the sandbox and
-        returns entries — both files and directories — that satisfy all of the
-        supplied filters:
+        Walks the full directory tree via ``os.walk()`` inside the sandbox
+        (never entering ``.git``) and returns entries — both files and
+        directories — that satisfy all of the supplied filters:
 
         - ``exclude`` (highest priority): the entry is dropped if its path
           matches any exclude glob. Excluded subtrees are pruned from the
@@ -752,6 +921,10 @@ def scan(root, defer):
     for dirpath, dirnames, filenames in os.walk(root):
         kept = []
         for d in sorted(dirnames):
+            if d == '.git':
+                # Git's own store is never a search target, and in a plain
+                # clone its reflogs alone can outnumber the source tree.
+                continue
             full = os.path.join(dirpath, d)
             dp = os.path.relpath(full, start)
             if any(r.match(dp) for r in exc):

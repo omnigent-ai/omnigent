@@ -531,3 +531,29 @@ describe("FolderTree default expansion on conversation switch", () => {
     expect(screen.getByRole("button", { name: "beta/" })).toHaveAttribute("aria-expanded", "true");
   });
 });
+
+describe("FolderTree truncated search", () => {
+  it("says the scan stopped early instead of a flat no-match when results were truncated", () => {
+    // A repo larger than the server's scan budget returns zero matches AND
+    // truncated=true; presenting that as "No files match" told users a file
+    // they could see on disk did not exist.
+    renderTree({ searchQuery: "reyden", searchResults: [], searchTruncated: true });
+
+    expect(screen.getByText(/No files match "reyden"/)).toHaveTextContent(
+      "the search stopped early, so results may be incomplete",
+    );
+  });
+
+  it("footnotes partial results when the scan was truncated", () => {
+    renderTree({
+      searchQuery: "main",
+      searchResults: [file("src/main.py")],
+      searchTruncated: true,
+    });
+
+    expect(screen.getByText("src/main.py")).toBeInTheDocument();
+    expect(
+      screen.getByText("Search stopped early — results may be incomplete."),
+    ).toBeInTheDocument();
+  });
+});

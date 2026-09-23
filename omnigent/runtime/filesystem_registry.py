@@ -459,6 +459,20 @@ class _FileEvent:
 # ── Abstract base ─────────────────────────────────────────────────────────────
 
 
+@dataclasses.dataclass(frozen=True)
+class ChangedFilesSnapshot:
+    """Paths from one ``list_changed_files`` run, kept for search to reuse.
+
+    :param paths: Workspace-relative paths of files that exist on disk
+        (created or modified; deleted ones are dropped).
+    :param complete: ``False`` when the run hit its ``limit`` and so may
+        have missed paths.
+    """
+
+    paths: list[str]
+    complete: bool
+
+
 class FilesystemRegistry(ABC):
     """Abstract base for per-conversation file-change registries.
 
@@ -545,6 +559,28 @@ class FilesystemRegistry(ABC):
     def stop(self) -> None:
         """Stop any background observers.  Idempotent."""
         return
+
+    # ── Concrete: index-backed enumeration (no-op default) ─────────
+
+    def list_tracked_files(self, subdir: str = "") -> list[str] | None:
+        """Return every path the workspace's index knows about under *subdir*.
+
+        ``None`` means there is no index to consult, so callers must walk the
+        filesystem instead. Only :class:`GitFilesystemRegistry` has one.
+
+        :param subdir: Directory relative to the workspace root, e.g.
+            ``"src/app"``; ``""`` for the whole workspace.
+        :returns: Paths relative to *subdir*, or ``None``.
+        """
+        return None
+
+    def last_changed_files(self) -> ChangedFilesSnapshot | None:
+        """Return the paths reported by the latest :meth:`list_changed_files`.
+
+        ``None`` until that method has run in this process. Lets search reuse
+        an answer the Changed tab already paid for.
+        """
+        return None
 
     # ── Abstract: must be implemented by subclasses ───────────────
 
@@ -832,6 +868,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         self._git_root = git_root
         self._optimization_start_lock = threading.Lock()
         self._optimization_started = False
+        self._last_changes: ChangedFilesSnapshot | None = None
 
     def start(self) -> None:
         """Start optional Git performance setup without blocking the caller."""
@@ -948,6 +985,43 @@ class GitFilesystemRegistry(FilesystemRegistry):
             config.returncode,
         )
 
+    def list_tracked_files(self, subdir: str = "") -> list[str] | None:
+        """Return every path in git's index under *subdir*, relative to it.
+
+        One index read covers a repo of any size, where a filesystem walk has
+        to be budgeted. Failures return ``None`` so callers fall back to the
+        walk.
+
+        :param subdir: Directory relative to the workspace root, e.g.
+            ``"src/app"``; ``""`` for the whole workspace.
+        :returns: Paths relative to *subdir*, or ``None`` when git could not
+            answer.
+        """
+        argv = ["git", "ls-files", "-z"]
+        cwd = self._cwd / subdir if subdir else self._cwd
+        try:
+            result = subprocess.run(
+                argv, cwd=str(cwd), capture_output=True, timeout=_git_timeout_seconds()
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _logger.warning(
+                "GitFilesystemRegistry.list_tracked_files: %r in %s failed: %s", argv, cwd, exc
+            )
+            return None
+        if result.returncode != 0:
+            _logger.warning(
+                "GitFilesystemRegistry.list_tracked_files: %r in %s exited %d: %s",
+                argv,
+                cwd,
+                result.returncode,
+                result.stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return None
+        return [p for p in result.stdout.decode("utf-8", errors="replace").split("\0") if p]
+
+    def last_changed_files(self) -> ChangedFilesSnapshot | None:
+        return self._last_changes
+
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
 
@@ -1037,6 +1111,12 @@ class GitFilesystemRegistry(FilesystemRegistry):
             counts = numstat.get(rel_path, (None, None))
             records.append(self._make_record(rel_path, operation, counts))
 
+        # Search reuses this answer for untracked files instead of paying for
+        # its own ``git status``, which can take tens of seconds on a big repo.
+        self._last_changes = ChangedFilesSnapshot(
+            paths=[r["path"] for r in records if r["status"] != "deleted"],
+            complete=len(records) <= limit,
+        )
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
 
