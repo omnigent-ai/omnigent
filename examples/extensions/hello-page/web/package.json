@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build && node scripts/ensure-newline.mjs",
+    "build": "node init && vite build && node scripts/ensure-newline.mjs",
     "type-check": "tsc --noEmit"
   },
   "dependencies": {

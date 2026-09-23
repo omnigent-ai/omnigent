@@ -73,7 +73,7 @@
     }
   },
   "scripts": {
-    "build": "node esbuild.js",
+    "build": "node init && node esbuild.js",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
     "package": "vsce package"

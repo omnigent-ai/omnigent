@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node init && tsc -p tsconfig.json",
     "type-check": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

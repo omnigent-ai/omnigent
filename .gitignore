@@ -55,8 +55,6 @@ run-omnigents.sh
 
 # Local env files (DB passwords, cookie secrets) created by
 # `bootstrap.sh` / `cp .env.example .env`. Only .env.example is tracked.
-.env
-**/.env
 
 # Local server databases — created by ap/omnigents server runs in
 # this directory, should never be committed.
@@ -101,3 +99,4 @@ deploy/databricks/.databricks/
 web/package-lock.json
 # Generated demo recordings belong in PR evidence or artifacts, not Git.
 recordings/
+config.bat

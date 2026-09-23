@@ -4,13 +4,13 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "build:embed": "vite build --config vite.embed.config.ts",
+    "dev": "node init && vite",
+    "build": "node init && vite build",
+    "build:embed": "node init && vite build --config vite.embed.config.ts",
     "type-check": "tsc -b",
     "preview": "vite preview",
     "storybook": "storybook dev -p 6006 --no-open",
-    "build:storybook": "storybook build --output-dir storybook-static",
+    "build:storybook": "node init && storybook build --output-dir storybook-static",
     "lint": "oxlint --deny-warnings --report-unused-disable-directives .",
     "lint:fix": "oxlint --fix .",
     "format": "prettier --write .",
@@ -18,9 +18,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "build:overlay": "vite build --config vite.update-overlay.config.ts",
-    "build:server-selector-v2": "vite build --config vite.server-selector-v2.config.ts",
-    "dev:server-selector-v2": "vite --config vite.server-selector-v2.config.ts"
+    "build:overlay": "node init && vite build --config vite.update-overlay.config.ts",
+    "build:server-selector-v2": "node init && vite build --config vite.server-selector-v2.config.ts",
+    "dev:server-selector-v2": "node init && vite --config vite.server-selector-v2.config.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
