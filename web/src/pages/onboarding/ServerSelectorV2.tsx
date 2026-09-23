@@ -120,9 +120,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
               Switch to legacy selector experience
             </DropdownMenuItem>
             {/* Debug aid: flip the theme in place (not persisted). */}
-            <DropdownMenuItem
-              onSelect={() => document.documentElement.classList.toggle("dark")}
-            >
+            <DropdownMenuItem onSelect={() => document.documentElement.classList.toggle("dark")}>
               Toggle light/dark mode
             </DropdownMenuItem>
           </DropdownMenuContent>

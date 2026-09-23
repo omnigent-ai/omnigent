@@ -63,36 +63,74 @@
     transform: translate(-50%, -50%) scaleY(0.62) rotate(var(--blob-start-angle));
   }
   to {
-    transform: translate(-50%, -50%) scaleY(0.62)
-      rotate(calc(var(--blob-start-angle) + 360deg));
+    transform: translate(-50%, -50%) scaleY(0.62) rotate(calc(var(--blob-start-angle) + 360deg));
   }
 }
 
 @keyframes blob-float-pink {
-  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-  18% { transform: translate3d(24px, -18px, 0) scale(1.05); }
-  39% { transform: translate3d(38px, 12px, 0) scale(0.97); }
-  57% { transform: translate3d(6px, 30px, 0) scale(1.08); }
-  78% { transform: translate3d(-28px, 14px, 0) scale(0.95); }
-  91% { transform: translate3d(-14px, -24px, 0) scale(1.03); }
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  18% {
+    transform: translate3d(24px, -18px, 0) scale(1.05);
+  }
+  39% {
+    transform: translate3d(38px, 12px, 0) scale(0.97);
+  }
+  57% {
+    transform: translate3d(6px, 30px, 0) scale(1.08);
+  }
+  78% {
+    transform: translate3d(-28px, 14px, 0) scale(0.95);
+  }
+  91% {
+    transform: translate3d(-14px, -24px, 0) scale(1.03);
+  }
 }
 
 @keyframes blob-float-orange {
-  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-  16% { transform: translate3d(-24px, 20px, 0) scale(0.96); }
-  34% { transform: translate3d(-8px, 38px, 0) scale(1.06); }
-  53% { transform: translate3d(28px, 24px, 0) scale(0.98); }
-  71% { transform: translate3d(34px, -16px, 0) scale(1.07); }
-  88% { transform: translate3d(-12px, -30px, 0) scale(0.95); }
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  16% {
+    transform: translate3d(-24px, 20px, 0) scale(0.96);
+  }
+  34% {
+    transform: translate3d(-8px, 38px, 0) scale(1.06);
+  }
+  53% {
+    transform: translate3d(28px, 24px, 0) scale(0.98);
+  }
+  71% {
+    transform: translate3d(34px, -16px, 0) scale(1.07);
+  }
+  88% {
+    transform: translate3d(-12px, -30px, 0) scale(0.95);
+  }
 }
 
 @keyframes blob-float-blue {
-  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-  14% { transform: translate3d(-30px, -14px, 0) scale(1.06); }
-  31% { transform: translate3d(-36px, 20px, 0) scale(0.96); }
-  49% { transform: translate3d(-4px, 34px, 0) scale(1.08); }
-  68% { transform: translate3d(30px, 10px, 0) scale(0.97); }
-  86% { transform: translate3d(18px, -28px, 0) scale(1.04); }
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  14% {
+    transform: translate3d(-30px, -14px, 0) scale(1.06);
+  }
+  31% {
+    transform: translate3d(-36px, 20px, 0) scale(0.96);
+  }
+  49% {
+    transform: translate3d(-4px, 34px, 0) scale(1.08);
+  }
+  68% {
+    transform: translate3d(30px, 10px, 0) scale(0.97);
+  }
+  86% {
+    transform: translate3d(18px, -28px, 0) scale(1.04);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
