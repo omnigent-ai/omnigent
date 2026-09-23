@@ -113,13 +113,14 @@ _FORBIDDEN_STATUS_SOURCES = frozenset(
 # reference (say, from a merge) reads a store that no longer exists.
 _RETIRED_STATUS_NAMES = frozenset({"_native_pane_status", "_published_session_status"})
 
-# app.py functions that decide from session status: the reaper's busy check and
-# its hold reasons, the claude /model mid-turn check, and the runner idle
-# watchdog's native-turn hold. Each must read status only through the book's
-# reader API.
+# app.py functions that decide from session status: the reaper's assessment,
+# its hold reasons and the teardown re-test, the claude /model mid-turn check,
+# and the runner idle watchdog's native-turn hold. Each must read status only
+# through the book's reader API.
 _STATUS_READING_PATHS: dict[str, frozenset[str]] = {
     "_native_session_hold_reasons": frozenset({"blocked"}),
-    "_native_pane_is_busy": frozenset({"claim"}),
+    "_native_pane_assess": frozenset({"claim", "current"}),
+    "_dispatched_since_reap_decision": frozenset({"last_dispatch_at"}),
     "_native_pane_close_snapshot": frozenset({"claim"}),
     "_native_sidecars_still_needed": frozenset(),
     "_handle_claude_native_model_change": frozenset({"current"}),

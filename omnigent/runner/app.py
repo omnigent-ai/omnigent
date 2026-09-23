@@ -23,6 +23,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+import weakref
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -8462,6 +8463,26 @@ def create_runner_app(
             return asyncio.Lock()
         return locks.setdefault(conv_id, asyncio.Lock())
 
+    # Finished turn tasks already reported as a stale slot (warned once each).
+    _stale_turn_slot_warned: weakref.WeakSet[asyncio.Task[None]] = weakref.WeakSet()
+
+    def _runner_turn_is_live(conv_id: str, facts: dict[str, object]) -> bool:
+        if conv_id in _active_turns:
+            slot = _active_turns.get(conv_id)
+            if slot is None or not slot.done():
+                facts["turn_slot"] = "sentinel" if slot is None else "task"
+                return True
+            facts["turn_slot"] = "done"
+            if slot not in _stale_turn_slot_warned:
+                _stale_turn_slot_warned.add(slot)
+                _logger.warning(
+                    "native pane %s: runner turn slot holds a finished task; "
+                    "not counting it as a live turn",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+        return process_manager is not None and process_manager.has_active_turn(conv_id)
+
     # Monotonic time each session's message buffer was first seen non-empty,
     # and the sessions already warned about as stranded.
     _queued_input_since: dict[str, float] = {}
@@ -8506,7 +8527,7 @@ def create_runner_app(
     ) -> set[SpareReason]:
         """Live work or a human wait holding *conv_id*'s native pane.
 
-        The one reading of these signals, shared by the reaper's busy check and
+        The one reading of these signals, shared by the reaper's assessment and
         the teardown re-test. Synchronous and free of tmux I/O, so a teardown
         re-tests it with no await before acting.
 
@@ -8517,9 +8538,7 @@ def create_runner_app(
         from omnigent.native import prompt_parks
 
         reasons: set[SpareReason] = set()
-        if conv_id in _active_turns or (
-            process_manager is not None and process_manager.has_active_turn(conv_id)
-        ):
+        if _runner_turn_is_live(conv_id, facts):
             reasons.add(SpareReason.RUNNER_TURN)
         if _queued_input_holds(conv_id, facts):
             reasons.add(SpareReason.QUEUED_INPUT)
@@ -8553,6 +8572,21 @@ def create_runner_app(
             conv_id, {}, approval_max_s=resolve_approval_max_s()
         )
         return ",".join(sorted(reason.value for reason in reasons)) or None
+
+    # The runner-dispatch stamp each pending reap was decided on, set by the
+    # reaper's deep check. A turn dispatched since may have finished its runner
+    # side already (opencode and devin publish idle right after injecting)
+    # before the TUI shows it, so the teardown checks the stamp did not move.
+    _native_reap_dispatch_fence: dict[str, float | None] = {}
+
+    def _dispatched_since_reap_decision(conv_id: str) -> str | None:
+        """``"turn_dispatched"`` if a turn was sent after the reap was decided."""
+        if conv_id not in _native_reap_dispatch_fence:
+            return None
+        decided = _native_reap_dispatch_fence.pop(conv_id)
+        if _status_book.last_dispatch_at(conv_id) != decided:
+            return "turn_dispatched"
+        return None
 
     async def _run_native_turn_probe(
         conv_id: str, harness_key: str | None, *, cheap_only: bool
@@ -8776,8 +8810,11 @@ def create_runner_app(
                 _list_tmux_clients, str(socket_path), "main"
             ):
                 why = "client_attached"
+                _native_reap_dispatch_fence.pop(conv_id, None)
             else:
-                why = _native_session_live_work(conv_id)
+                why = _native_session_live_work(conv_id) or _dispatched_since_reap_decision(
+                    conv_id
+                )
             if why is not None:
                 _log_native_teardown_spared(conv_id, terminal_name, why)
                 return False
@@ -13783,14 +13820,27 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
+        from types import MappingProxyType
+
         from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.terminals.pane_reaper import (
-            PANE_OUTPUT_BUSY_WINDOW_S,
+            ConfirmVerdict,
             NativePaneReaper,
+            PaneAssessment,
             PaneRef,
+            resolve_server_check_enabled,
+            resolve_server_unreachable_grace_s,
         )
 
+        _pane_idle_timeout_s = resolve_native_pane_idle_timeout_s()
         _pane_approval_max_s = resolve_approval_max_s()
+        _pane_server_check = resolve_server_check_enabled()
+        _pane_server_grace_s = resolve_server_unreachable_grace_s(_pane_idle_timeout_s)
+        # Pane-reaper bookkeeping: server outage start (and whether it was
+        # warned about), and the last claim episode warned about.
+        _pane_server_unreachable_since: dict[str, float] = {}
+        _pane_server_unreachable_warned: set[str] = set()
+        _pane_claim_warned: dict[str, int] = {}
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -13800,40 +13850,174 @@ def create_runner_app(
                     resource_registry.terminal_resource_role(conv_id, terminal_id)
                 ):
                     panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
+            listed = {pane.conversation_id for pane in panes}
+            for bookkeeping in (
+                _pane_claim_warned,
+                _pane_server_unreachable_since,
+                _native_reap_dispatch_fence,
+            ):
+                for gone in bookkeeping.keys() - listed:
+                    del bookkeeping[gone]
+            _pane_server_unreachable_warned.intersection_update(listed)
             return panes
 
-        async def _native_pane_is_busy(pane: PaneRef) -> bool:
-            conv_id = pane.conversation_id
-            if _native_session_hold_reasons(conv_id, {}, approval_max_s=_pane_approval_max_s):
-                return True
-            if _status_book.claim(conv_id) is not None:
-                return True
-            clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
-            if clients:
-                return True
-            # Primary evidence: tmux stamps window_activity on every byte the
-            # pane emits, so a producing terminal stays busy even when the
-            # status pipeline above has silently stalled (a stalled forwarder
-            # once froze the busy signal and got a live session reaped).
+        async def _pane_output_age(pane: PaneRef) -> float | None:
+            """Seconds since the pane last printed; ``None`` if unreadable.
+
+            Primary evidence: tmux stamps window_activity on every byte the
+            pane emits, so a producing terminal stays busy even when the
+            status pipeline has silently stalled.
+            """
             activity_at = await asyncio.to_thread(
                 _tmux_window_activity_at, str(pane.socket_path), "main"
             )
-            return (
-                activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
+            return None if activity_at is None else max(0.0, time.time() - activity_at)
+
+        async def _native_pane_assess(pane: PaneRef) -> PaneAssessment:
+            """Every liveness signal for one pane (see ``pane_reaper``).
+
+            Status is read only through the book's reader API. A ``running``
+            recorded by a local channel is a hard reason.
+            """
+            conv_id = pane.conversation_id
+            facts: dict[str, object] = {"harness": pane.terminal_name}
+            reasons = _native_session_hold_reasons(
+                conv_id, facts, approval_max_s=_pane_approval_max_s
             )
+            clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
+            if clients:
+                reasons.add(SpareReason.CLIENT_ATTACHED)
+                facts["clients"] = len(clients)
+            output_age = await _pane_output_age(pane)
+            facts["output_age_s"] = output_age
+            current = _status_book.current(conv_id)
+            facts["status"] = current.status if current is not None else None
+            evidence_age = output_age
+            dispatch_at = _status_book.last_dispatch_at(conv_id)
+            if dispatch_at is not None:
+                facts["dispatch_age_s"] = _status_book.age_s(dispatch_at)
+            claim = _status_book.claim(conv_id)
+            if claim is not None:
+                # A new runner dispatch restarts the claim's clock even when the
+                # previous turn's ``running`` was never ended.
+                claim_start = max(claim.since, dispatch_at or claim.since)
+                claim_age = _status_book.age_s(claim_start)
+                silent = claim_age if output_age is None else min(output_age, claim_age)
+                facts.update(
+                    claim_source=claim.origin.value,
+                    claim_sources=",".join(sorted(claim.sources)),
+                    claim_age_s=claim_age,
+                    claim_silent_s=silent,
+                )
+                reasons.add(SpareReason.STATUS_CLAIM)
+                if (
+                    silent >= _pane_idle_timeout_s
+                    and reasons <= {SpareReason.STATUS_CLAIM}
+                    and _pane_claim_warned.get(conv_id) != claim.seq
+                ):
+                    _pane_claim_warned[conv_id] = claim.seq
+                    _logger.warning(
+                        "native pane %s: status claims running (%s, %.0fs) while "
+                        "every other signal has read idle for %.0fs",
+                        conv_id,
+                        claim.origin.value,
+                        claim_age,
+                        silent,
+                        extra=debug_event(
+                            "native_pane_status_contradiction",
+                            session_id=conv_id,
+                            claim_source=claim.origin.value,
+                            claim_age_s=claim_age,
+                            silent_s=silent,
+                        ),
+                    )
+            return PaneAssessment(frozenset(reasons), evidence_age, MappingProxyType(facts))
+
+        async def _server_pending_check(
+            conv_id: str, facts: dict[str, object]
+        ) -> tuple[ConfirmVerdict | None, str | None]:
+            """Ask the server for this session's pending prompts and status.
+
+            Fails closed while the server is unreachable, for at most the grace
+            window: its prompt index is per-process memory, and every harness
+            also has a local human-wait signal.
+            """
+            try:
+                resp = await server_client.get(
+                    f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=5.0
+                )
+                status_code = resp.status_code
+                body = resp.json() if status_code == 200 else None
+            except Exception as exc:  # noqa: BLE001 - any failure is "unreachable".
+                status_code, body = None, None
+                facts["server_error"] = type(exc).__name__
+            if status_code == 404:
+                _pane_server_unreachable_since.pop(conv_id, None)
+                _pane_server_unreachable_warned.discard(conv_id)
+                facts["server"] = "session gone"
+                return None, None
+            if status_code != 200 or not isinstance(body, dict):
+                now = time.monotonic()
+                first = _pane_server_unreachable_since.setdefault(conv_id, now)
+                facts["server"] = f"unreachable ({status_code})"
+                if now - first < _pane_server_grace_s:
+                    return ConfirmVerdict(False, SpareReason.SERVER_CHECK, facts=facts), None
+                if conv_id not in _pane_server_unreachable_warned:
+                    _pane_server_unreachable_warned.add(conv_id)
+                    _logger.warning(
+                        "native pane %s: server unreachable for %.0fs; deciding on local signals",
+                        conv_id,
+                        now - first,
+                        extra={"session_id": conv_id},
+                    )
+                return None, None
+            _pane_server_unreachable_since.pop(conv_id, None)
+            _pane_server_unreachable_warned.discard(conv_id)
+            for entry in body.get("pending_elicitations") or []:
+                params = entry.get("params") if isinstance(entry, dict) else None
+                target = params.get("target_session_id") if isinstance(params, dict) else None
+                if not target or target == conv_id:
+                    facts["server"] = "pending prompt"
+                    return ConfirmVerdict(False, SpareReason.SERVER_CHECK, facts=facts), None
+            server_status = body.get("status")
+            facts["server_status"] = server_status
+            return None, server_status if isinstance(server_status, str) else None
+
+        async def _confirm_native_pane_reap(pane: PaneRef) -> ConfirmVerdict:
+            """Deep check before teardown: the server's pending prompts."""
+            conv_id = pane.conversation_id
+            facts: dict[str, object] = {"harness": pane.terminal_name}
+            # The teardown checks no turn was dispatched after this point.
+            dispatch_before = _status_book.last_dispatch_at(conv_id)
+            _native_reap_dispatch_fence[conv_id] = dispatch_before
+            if _pane_server_check:
+                spare, _server_status = await _server_pending_check(conv_id, facts)
+                if spare is not None:
+                    return spare
+            if _status_book.last_dispatch_at(conv_id) != dispatch_before:
+                # A turn was sent while this check awaited the server.
+                facts["turn_dispatched"] = True
+                return ConfirmVerdict(False, SpareReason.RUNNER_TURN, facts=facts)
+            return ConfirmVerdict(True, facts=facts)
 
         async def _reap_native_pane(pane: PaneRef) -> bool:
-            return await _teardown_native_pane(
-                pane.conversation_id,
-                pane.terminal_name,
-                reason="idle_reap",
-                socket_path=pane.socket_path,
+            conv_id = pane.conversation_id
+            reaped = await _teardown_native_pane(
+                conv_id, pane.terminal_name, reason="idle_reap", socket_path=pane.socket_path
             )
+            if reaped:
+                _pane_server_unreachable_since.pop(conv_id, None)
+                _pane_server_unreachable_warned.discard(conv_id)
+                _pane_claim_warned.pop(conv_id, None)
+            return reaped
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,
-            is_busy=_native_pane_is_busy,
+            assess=_native_pane_assess,
+            confirm_reap=_confirm_native_pane_reap,
             reap=_reap_native_pane,
+            idle_timeout_s=_pane_idle_timeout_s,
+            approval_max_s=_pane_approval_max_s,
         )
     else:
         app.state.native_pane_reaper = None

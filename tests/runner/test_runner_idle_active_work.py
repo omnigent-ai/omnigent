@@ -1577,3 +1577,67 @@ async def test_a_reap_ends_the_runner_hold_at_once(
     finally:
         sidecars.discard()
         rig.drain()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["pi", "cursor"])
+async def test_the_reapers_scan_ends_a_lost_relayed_idles_runner_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, key: str
+) -> None:
+    """A lost relayed idle holds the runner until the reaper's next real scan reaps.
+
+    The relay's ``running`` was never closed and has aged two idle windows,
+    well inside the runner's ceiling, so the runner still holds for it. The
+    reaper's assessment does not count it as a hard reason, so the silent
+    pane goes through the whole reap path (assessment, the server's pending
+    prompts, the re-assessment, teardown), and the teardown's status reset
+    lets the runner shut down at once.
+
+    :param key: Native harness key with no turn probe, e.g. ``"pi"``.
+    """
+    from omnigent.terminals.pane_reaper import SpareReason
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    monkeypatch.delenv(_MAX_TURN_ENV, raising=False)
+    clock = _Clock()
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key=key,
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec(f"{key}-native")),
+    )
+    app, conv_id = rig.app, rig.conv_id
+    sidecars = await _plant_pane_sidecars(app, conv_id, tmp_path, key)
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            await _post_status(client, conv_id, "running")
+            clock.now += 2 * 3600.0  # the relayed idle was lost two windows ago
+            assessment = await rig.assess()
+            assert SpareReason.STATUS_CLAIM not in assessment.reasons
+            assert assessment.facts["status"] == "running"
+            assert not assessment.busy
+            assert app.state.has_active_work() is True
+            gets_before = rig.server.snapshot_gets
+
+            async def _scan() -> None:
+                # The pane has been silent for longer than the idle window.
+                rig.reaper._last_busy_at[conv_id] = time.monotonic() - 2 * 3600.0
+                await rig.reaper._scan_once()
+
+            with caplog.at_level(logging.INFO, logger="omnigent.terminals.pane_reaper"):
+                await _assert_monitor_blocked_then_shuts_down(
+                    has_active_work=app.state.has_active_work,
+                    release=_scan,
+                )
+            assert not rig.alive()
+            # The deep check asked the server for pending prompts once.
+            assert rig.server.snapshot_gets == gets_before + 1
+            assert app.state.session_status_book.current(conv_id) is None
+            assert len(_events(caplog, "native_pane_reaped")) == 1
+            assert sidecars.leftovers(app) == []
+    finally:
+        sidecars.discard()
+        rig.drain()

@@ -9,6 +9,7 @@ pin the complete, lock-serialized teardown for every reapable built-in harness.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -122,6 +123,27 @@ async def test_live_work_found_at_teardown_spares_the_pane_and_its_sidecars(
         rig.app.state.active_turns.pop(rig.conv_id, None)
         rig.app.state.session_message_buffers.pop(rig.conv_id, None)
         sidecars.discard()
+
+
+async def test_a_turn_bound_mid_scan_makes_the_reaper_rearm_instead_of_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = await build_pane_rig(tmp_path, monkeypatch, key="goose")
+    rig.reaper._last_busy_at[rig.conv_id] = 0.0
+
+    async def _bind_turn_during_confirm(pane: Any) -> Any:
+        from omnigent.terminals.pane_reaper import ConfirmVerdict
+
+        rig.app.state.active_turns[rig.conv_id] = None
+        return ConfirmVerdict(True)
+
+    monkeypatch.setattr(rig.reaper, "_confirm_reap", _bind_turn_during_confirm)
+    try:
+        await rig.reaper._scan_once()
+        assert rig.alive()
+        assert rig.reaper._last_busy_at[rig.conv_id] > 0.0
+    finally:
+        rig.app.state.active_turns.pop(rig.conv_id, None)
 
 
 async def test_an_ensure_during_a_reap_waits_on_the_lock_then_recreates_the_pane(
@@ -439,17 +461,22 @@ async def test_a_turn_that_starts_while_the_pane_closes_keeps_its_own_state(
 async def test_queued_input_holds_a_pane_for_one_idle_window_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    from omnigent.terminals.pane_reaper import SpareReason
+
     # The bound is one idle window; a tiny one keeps the test fast.
     rig = await build_pane_rig(tmp_path, monkeypatch, key="claude", idle_timeout_s=0.05)
     queued = [{"content": "next"}]
     rig.app.state.session_message_buffers[rig.conv_id] = queued
     try:
-        assert await rig.is_busy() is True
+        assessment = await rig.assess()
+        assert SpareReason.QUEUED_INPUT in assessment.reasons
+        assert assessment.facts["queued_input"] == 1
         assert await rig.reaper._reap(rig.pane) is False
         await asyncio.sleep(0.1)
         with caplog.at_level("WARNING", logger="omnigent.runner.app"):
             for _ in range(2):
-                assert await rig.is_busy() is False
+                assessment = await rig.assess()
+                assert SpareReason.QUEUED_INPUT not in assessment.reasons
         stranded = [r for r in caplog.records if "queued message" in r.getMessage()]
         assert len(stranded) == 1
         assert await rig.reaper._reap(rig.pane) is True
@@ -458,3 +485,109 @@ async def test_queued_input_holds_a_pane_for_one_idle_window_only(
     finally:
         rig.app.state.session_message_buffers.pop(rig.conv_id, None)
         rig.drain()
+
+
+@pytest.mark.parametrize("channel", ["pty", "runner"])
+async def test_a_fresh_running_claim_from_a_local_channel_spares_a_silent_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str
+) -> None:
+    """A ``running`` the pane watcher or the runner just recorded keeps the pane.
+
+    The pane has been silent for two hours and nothing else holds it; the
+    claim alone decides. (A relay-only ``running`` does not; see
+    tests/runner/test_runner_idle_active_work.py.)
+    """
+    rig = await build_pane_rig(tmp_path, monkeypatch, key="pi")
+    try:
+        if channel == "pty":
+            await rig.fire("on_activity")  # the pane watcher's own running edge
+        else:
+            rig.book.record(rig.conv_id, "running", source=StatusSource.RUNNER)
+        assessment = await rig.assess()
+        assert assessment.busy
+        assert assessment.facts["claim_source"] == channel
+        rig.reaper._last_busy_at[rig.conv_id] = time.monotonic() - 10 * 3600
+        await rig.reaper._scan_once()
+        assert rig.alive()
+    finally:
+        rig.drain()
+
+
+async def test_a_new_dispatch_restarts_a_claims_clock_and_it_is_warned_about_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A claim is timed from its last runner dispatch; a silent one warns once per episode."""
+    clock = _BookClock()
+    rig = await build_pane_rig(tmp_path, monkeypatch, key="pi", status_clock=clock)
+
+    def _contradictions() -> int:
+        return sum(
+            getattr(r, "event_name", None) == "native_pane_status_contradiction"
+            for r in caplog.records
+        )
+
+    try:
+        with caplog.at_level("WARNING", logger="omnigent.runner.app"):
+            rig.book.record(rig.conv_id, "running", source=StatusSource.RUNNER)
+            clock.now += 2 * 3600.0
+            for _ in range(2):
+                facts = (await rig.assess()).facts
+                assert facts["claim_age_s"] == pytest.approx(2 * 3600.0)
+            assert _contradictions() == 1
+            # The next turn's dispatch re-asserts running: same episode, new clock.
+            rig.book.record(rig.conv_id, "running", source=StatusSource.RUNNER)
+            facts = (await rig.assess()).facts
+            assert facts["claim_age_s"] == pytest.approx(0.0)
+            assert facts["claim_silent_s"] == pytest.approx(0.0)
+            # A new episode that goes silent is warned about again.
+            rig.book.record(rig.conv_id, "idle", source=StatusSource.RUNNER)
+            rig.book.record(rig.conv_id, "running", source=StatusSource.RUNNER)
+            clock.now += 2 * 3600.0
+            await rig.assess()
+            assert _contradictions() == 2
+    finally:
+        rig.drain()
+
+
+async def test_a_turn_dispatched_after_the_deep_check_spares_the_pane_at_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The teardown re-tests that no turn was sent since the pre-reap check.
+
+    opencode and devin publish the runner's idle right after injecting a
+    prompt, so by teardown the turn has left no live-work signal, only a
+    moved dispatch stamp.
+    """
+    rig = await build_pane_rig(tmp_path, monkeypatch, key="pi")
+    try:
+        confirm = rig.reaper._confirm_reap
+        assert confirm is not None
+        assert (await confirm(rig.pane)).proceed
+        rig.book.record(rig.conv_id, "running", source=StatusSource.RUNNER)
+        rig.book.record(rig.conv_id, "idle", source=StatusSource.RUNNER)
+        caplog.set_level("INFO", logger="omnigent.runner.app")
+        assert await rig.reaper._reap(rig.pane) is False
+        assert rig.alive()
+        spared = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "native_pane_spared"
+            and r.attributes.get("stage") == "teardown"  # type: ignore[attr-defined]
+        ]
+        assert [r.attributes["reasons"] for r in spared] == ["turn_dispatched"]  # type: ignore[attr-defined]
+        # The fence belongs to that one decision; a reap decided afresh proceeds.
+        assert (await confirm(rig.pane)).proceed
+        assert await rig.reaper._reap(rig.pane) is True
+        assert not rig.alive()
+    finally:
+        rig.drain()
+
+
+class _BookClock:
+    """A hand-driven monotonic clock for the status book."""
+
+    def __init__(self) -> None:
+        self.now = 10_000.0
+
+    def __call__(self) -> float:
+        return self.now

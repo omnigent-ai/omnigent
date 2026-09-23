@@ -137,7 +137,7 @@ class _Rig:
         return panes[0]
 
     async def is_busy(self) -> bool:
-        """The runner's real ``_native_pane_is_busy`` via the reaper."""
+        """The runner's real ``_native_pane_assess`` verdict via the reaper."""
         return await self.app.state.native_pane_reaper._is_busy(self.pane())
 
     async def two_reaper_scans(self) -> None:

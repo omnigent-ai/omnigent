@@ -28,7 +28,7 @@ from omnigent.native import native_cost_popup
 from omnigent.runner.app import _session_event_queues_ref, create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.session_status import SessionStatusBook
-from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
+from omnigent.terminals.pane_reaper import NativePaneReaper, PaneAssessment, PaneRef
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
 
@@ -172,6 +172,9 @@ class PaneRig:
         return (
             self.terminal_registry.get(self.conv_id, self.agent.terminal_name, "main") is not None
         )
+
+    async def assess(self) -> PaneAssessment:
+        return await self.reaper.assess(self.pane)
 
     async def is_busy(self) -> bool:
         return await self.reaper._is_busy(self.pane)
