@@ -42,6 +42,8 @@ import {
   ChatComposer,
   type ComposerKeyIntent,
   COMPOSER_COLUMN_WIDTH,
+  ComposerChipRow,
+  ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
@@ -3690,7 +3692,7 @@ function ComposerImpl(
           data-testid="composer-workspace-controls"
           className={cn(
             hasQueuedComposerMessages &&
-              "rounded-t-none border-t-0 border-border/50 pl-2.5 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
+              "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
           )}
         >
           <ComposerWorkspaceStatus
@@ -3910,14 +3912,12 @@ function ComposerImpl(
               <ComposerAttachments files={files} onRemove={removeFile} />
               {/* Rejected-attachment feedback: unsupported type or too large */}
               {attachmentError !== null && (
-                <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
-                  {attachmentError}
-                </div>
+                <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
               {/* "@"-mention chips — one per tagged workspace file/folder. Each is
             delivered as a "[Attached: <path>]" marker at send time. */}
               {mentionedItems.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                <ComposerChipRow className="gap-1.5">
                   {mentionedItems.map((item, i) => (
                     <span
                       key={mentionItemPath(item)}
@@ -3947,14 +3947,10 @@ function ComposerImpl(
                       </button>
                     </span>
                   ))}
-                </div>
+                </ComposerChipRow>
               )}
               {/* Inline slash-command feedback: errors and /help output */}
-              {commandError !== null && (
-                <div className="px-4 pb-2 text-sm text-muted-foreground whitespace-pre-wrap">
-                  {commandError}
-                </div>
-              )}
+              {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>
           ),
         }}

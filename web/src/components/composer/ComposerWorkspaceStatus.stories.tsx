@@ -62,7 +62,7 @@ export const QueuedPresentNesting: Story = {
           onEdit={() => undefined}
           widthClassName="mx-3 w-auto"
         />
-        <ComposerWorkspaceBar className="rounded-t-none border-t-0 border-border/50 pl-2.5 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']">
+        <ComposerWorkspaceBar className="rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']">
           <Story />
         </ComposerWorkspaceBar>
       </div>

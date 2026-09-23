@@ -31,6 +31,8 @@ import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
+  ComposerChipRow,
+  ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -5824,11 +5826,11 @@ export function NewChatLandingScreen() {
       className="relative flex flex-1 items-center justify-center pb-24"
       data-testid="new-chat-landing"
     >
-      {/* Padding lives inside the 800px cap, so the composer renders at
-          800 − 80 = 720px max on desktop. px-4 on phones (16px gutters)
-          keeps the composer from feeling cramped against the viewport
-          edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-16 md:select-none md:px-10">
+      {/* Padding lives inside the 800px cap, so the composer surface reaches
+          its shared 48rem column (800 − 32 = 768px) on desktop. px-4 (16px
+          gutters) keeps the composer from feeling cramped against the
+          viewport edges on phones. */}
+      <div className="flex w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-16 md:select-none">
         <div className="mb-6 flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
@@ -5877,7 +5879,7 @@ export function NewChatLandingScreen() {
                     aria-label={`Sandbox repositories: ${
                       sandboxRepoSelections.length > 0 ? sandboxRepoLabel : "None selected"
                     }`}
-                    className="relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-0.5 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:min-w-11 md:px-1"
+                    className="relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:min-w-11"
                     data-testid="new-chat-landing-repo-chip"
                   >
                     <GitBranchIcon className="ui-icon" />
@@ -6493,7 +6495,7 @@ export function NewChatLandingScreen() {
                 delivered as an "[Attached: <path>]" marker prepended to the
                 first message at create time. */}
                     {mentionedItems.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                      <ComposerChipRow className="gap-1.5">
                         {mentionedItems.map((item, i) => (
                           <span
                             key={mentionItemPath(item)}
@@ -6518,18 +6520,18 @@ export function NewChatLandingScreen() {
                             </button>
                           </span>
                         ))}
-                      </div>
+                      </ComposerChipRow>
                     )}
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments files={files} onRemove={removeFile} />
                     {/* Rejected-attachment feedback: unsupported type or too large */}
                     {attachmentError !== null && (
-                      <div
-                        className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap"
+                      <ComposerFeedbackRow
+                        tone="error"
                         data-testid="new-chat-landing-attachment-error"
                       >
                         {attachmentError}
-                      </div>
+                      </ComposerFeedbackRow>
                     )}
                     {/* No own bg — the pill paints the surface. An explicit bg-card
                 here would also catch the .dark .bg-card glass rule (border +

@@ -198,8 +198,10 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     assert bounds["height"] == pytest.approx(37, abs=0.5)
     assert center_y == pytest.approx(bounds["y"] + 19, abs=0.5)
     trailing = control_bounds[status_ids[-1]]
+    # The docked tray's content inset matches the card's shared inset
+    # (1px border + 12px padding).
     assert trailing["x"] + trailing["width"] == pytest.approx(
-        bounds["x"] + bounds["width"] - 9, abs=0.5
+        bounds["x"] + bounds["width"] - 13, abs=0.5
     )
     background = control_bounds["background-task-pill"]
     subagent = control_bounds["subagent-task-pill"]

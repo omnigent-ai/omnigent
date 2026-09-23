@@ -24,16 +24,16 @@ land):
   keep first-line baseline and trailing-action alignment, and
   focus/hover/selected backgrounds have equal left/right insets.
 
-Mention attachments render through the same chip component as file
-attachments (``ComposerAttachments``), so the attachment-chip grid tests
-cover mention chips as well; the vitest parity suites own mention behavior.
+Mention chips are custom spans rendered inside ``ComposerChipRow`` (not
+``ComposerAttachments`` file tiles), so an explicit mention-chip test owns
+their geometry; the vitest parity suites own mention behavior.
 
-The current layout does NOT yet satisfy this contract, so every
-target-contract test is committed SKIPPED with the shared reason
-:data:`_GEOMETRY_CONTRACT_SKIP` (one grep finds them all when the primitives
-land). Tests without the marker characterize current behavior that must
-remain true (no horizontal overflow; the shared column width the two
-surfaces already have).
+The workspace bar is a tray docked above the card, not a content row: it
+nests inside the card's outer edges by the same 12px inset the card's
+content rows align to (symmetric on both sides), and its chips sit on the
+card's content inset line. The queued-messages strip shares the tray's
+inset column. This nesting is the documented intent encoded in the
+workspace-bar tests below.
 
 Harness notes:
 
@@ -52,14 +52,18 @@ from __future__ import annotations
 import json
 import re
 from itertools import pairwise
+from urllib.parse import urlparse
 
-import pytest
 from playwright.async_api import Page as AsyncPage
 from playwright.async_api import async_playwright
 from playwright.async_api import expect as async_expect
-from playwright.sync_api import FloatRect, Page, expect
+from playwright.sync_api import FloatRect, Page, Route, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
+from tests.e2e_ui.conftest import (
+    configure_mock_llm,
+    fetch_with_retry,
+    reset_mock_llm,
+)
 from tests.e2e_ui.mobile.test_composer_model_label_stop_overlap import (
     _assert_same_row,
     _box,
@@ -74,13 +78,6 @@ from tests.e2e_ui.start_session.test_start_session import (
     _register_common_routes,
     _run_in_fresh_loop,
 )
-
-# Shared skip reason for every target-contract test — flipping the gate
-# constant enables them all when the layout primitives land (a single grep
-# for the reason string or the constant finds them). skipif, not skip: the
-# repo's no-skipped-tests lint only permits conditional skips.
-_GEOMETRY_CONTRACT_SKIP = "composer geometry contract — pending layout primitives"
-_GEOMETRY_CONTRACT_ENABLED = False
 
 _PHONE = {"width": 390, "height": 664}
 _TABLET = {"width": 768, "height": 1024}
@@ -127,6 +124,43 @@ def _assert_within_viewport(box: FloatRect, viewport_width: int, tol: float = _T
     )
 
 
+# Picker menus open with a 150ms zoom/fade animation; measuring row geometry
+# mid-flight reads divergent scales on sibling rows. Awaiting every animation
+# on the menu subtree pins the settled layout.
+_MENU_SETTLE_JS = (
+    "(el) => Promise.all("
+    "el.getAnimations({ subtree: true }).map((a) => a.finished.catch(() => {}))"
+    ")"
+)
+
+# The layout primitive every inset is pinned against (px-3 / mx-3 in
+# ChatComposer's contract): 12px, plus whatever border separates the measured
+# box from the reference's outer edge (the card's 1px border for content
+# insets; the tray's own 1px border for its content).
+_PRIMITIVE_INSET_PX = 12.0
+
+
+def _assert_primitive_inset(measured: float, border_px: float, what: str) -> None:
+    """Fail unless ``measured`` matches the 12px primitive plus ``border_px``."""
+    expected = _PRIMITIVE_INSET_PX + border_px
+    assert abs(measured - expected) <= _TOL, (
+        f"{what} inset {measured:.2f}px off the shared primitive: expected "
+        f"{expected:.2f}px (12px inset + {border_px:.0f}px border)"
+    )
+
+
+def _border_left_px(locator) -> float:
+    """Computed left border width (px) of a sync locator's element."""
+    value = locator.evaluate("(el) => getComputedStyle(el).borderLeftWidth")
+    return float(value.removesuffix("px"))
+
+
+async def _border_left_px_async(locator) -> float:
+    """Computed left border width (px) of an async locator's element."""
+    value = await locator.evaluate("(el) => getComputedStyle(el).borderLeftWidth")
+    return float(value.removesuffix("px"))
+
+
 def _right_inset(card: FloatRect, box: FloatRect) -> float:
     """The gap between a box's right edge and its card's right edge."""
     return card["x"] + card["width"] - (box["x"] + box["width"])
@@ -149,7 +183,7 @@ def _assert_row_grid(boxes: list[FloatRect], tol: float = _TOL) -> None:
         )
     for a, b in pairwise(boxes):
         pitch = b["y"] - a["y"]
-        assert abs(pitch - a["height"]) <= tol + 1.0, (
+        assert abs(pitch - a["height"]) <= tol, (
             f"rows are not stacked evenly: pitch {pitch:.2f}px vs height {a['height']:.2f}px"
         )
 
@@ -305,11 +339,10 @@ def test_live_composer_never_overflows_the_viewport(
 
 
 # ---------------------------------------------------------------------------
-# Target contract — SKIPPED until the layout primitives land
+# Target contract — the layout the composer primitives normalize to
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_landing_card_centered_with_symmetric_insets(seeded_session: tuple[str, str]) -> None:
     """The landing card is horizontally centered with left/right insets
     symmetric within 1 CSS px at every width."""
@@ -336,7 +369,6 @@ async def _landing_symmetry(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_card_centered_with_symmetric_insets(
     page: Page,
     seeded_session: tuple[str, str],
@@ -352,7 +384,6 @@ def test_live_card_centered_with_symmetric_insets(
         _assert_symmetric_insets(card, container)
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_landing_content_aligns_to_shared_inset_lines(seeded_session: tuple[str, str]) -> None:
     """Landing input, attachment chips, error row, and action-row content sit
     on shared left/right inset lines within 1 px."""
@@ -404,6 +435,8 @@ async def _landing_inset_lines(base_url: str, session_id: str) -> None:
                 "action row leading": leading["x"] - card["x"],
             }
             reference = lefts["input"]
+            border = await _border_left_px_async(page.locator("[data-composer-card]"))
+            _assert_primitive_inset(reference, border, "landing content")
             for name, inset in lefts.items():
                 assert abs(inset - reference) <= _TOL, (
                     f"{name} left inset {inset:.2f}px diverges from the input's {reference:.2f}px"
@@ -418,7 +451,6 @@ async def _landing_inset_lines(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_content_aligns_to_shared_inset_lines(
     page: Page,
     seeded_session: tuple[str, str],
@@ -445,6 +477,9 @@ def test_live_content_aligns_to_shared_inset_lines(
         "action row leading": leading["x"] - card["x"],
     }
     reference = lefts["input"]
+    _assert_primitive_inset(
+        reference, _border_left_px(page.locator("[data-composer-card]")), "live content"
+    )
     for name, inset in lefts.items():
         assert abs(inset - reference) <= _TOL, (
             f"{name} left inset {inset:.2f}px diverges from the input's {reference:.2f}px"
@@ -456,7 +491,6 @@ def test_live_content_aligns_to_shared_inset_lines(
     )
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_landing_action_row_controls_share_a_vertical_center(
     seeded_session: tuple[str, str],
 ) -> None:
@@ -493,7 +527,6 @@ async def _landing_row_centers(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_action_row_controls_share_a_vertical_center(
     page: Page,
     seeded_session: tuple[str, str],
@@ -514,7 +547,6 @@ def test_live_action_row_controls_share_a_vertical_center(
     _assert_within_viewport(_box(page.get_by_test_id("composer-action-row")), _DESKTOP["width"])
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_landing_label_collapse_preserves_submit_geometry(seeded_session: tuple[str, str]) -> None:
     """Collapsing the landing row's labels to icons moves nothing: the submit
     button keeps its right inset and row centering across the collapse."""
@@ -561,7 +593,6 @@ async def _landing_collapse_geometry(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_label_collapse_preserves_send_geometry(
     page: Page,
     seeded_session: tuple[str, str],
@@ -590,7 +621,6 @@ def test_live_label_collapse_preserves_send_geometry(
         page.unroute_all(behavior="ignoreErrors")
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_landing_attachment_chips_follow_the_row_grid(seeded_session: tuple[str, str]) -> None:
     """Landing attachment chips on one visual row share height, vertical
     center, and equal gaps within 1 px, and start on the shared inset line."""
@@ -640,7 +670,6 @@ async def _landing_chip_grid(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_attachment_chips_follow_the_row_grid(
     page: Page,
     seeded_session: tuple[str, str],
@@ -649,6 +678,13 @@ def test_live_attachment_chips_follow_the_row_grid(
     and equal gaps within 1 px, and start on the shared inset line."""
     base_url, session_id = seeded_session
     _open_live(page, base_url, session_id, _DESKTOP)
+    # The Workspace rail defaults open on desktop and squeezes the chat
+    # column below the three-chip row width; close it so the chips share
+    # one visual row.
+    rail = page.get_by_role("complementary", name="Workspace")
+    if rail.is_visible():
+        page.keyboard.press("Control+Alt+BracketRight")
+        expect(rail).not_to_be_visible()
     _attach_files(
         page,
         [
@@ -670,7 +706,130 @@ def test_live_attachment_chips_follow_the_row_grid(
     assert abs(chips[0]["x"] - input_box["x"]) <= _TOL
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
+def _patch_session_as_mention_capable_claude_native(page: Page, session_id: str) -> None:
+    """Shape the session snapshot so the composer enables ``@``-mentions:
+    ``nativeCodingAgentForHarness`` gates them on a native harness id, which
+    the databricks-claude label patch (``harness="claude"``) does not set.
+    Everything else goes to the real spawned server."""
+
+    def _handle(route: Route) -> None:
+        request = route.request
+        if urlparse(request.url).path != f"/v1/sessions/{session_id}" or request.method != "GET":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        payload["harness"] = "claude-native"
+        payload["labels"] = {
+            **payload.get("labels", {}),
+            "omnigent.wrapper": "claude-code-native-ui",
+        }
+        route.fulfill(response=response, json=payload)
+
+    page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), _handle)
+
+
+def test_live_mention_chips_follow_the_row_grid(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Mention chips (custom spans in ``ComposerChipRow``, not file tiles)
+    follow the chip-row grid: shared height, vertical center, equal gaps
+    within 1 px, and the first chip on the shared inset line."""
+    base_url, session_id = seeded_session
+    _patch_session_as_mention_capable_claude_native(page, session_id)
+    names = ["alpha.md", "beta.md", "gamma.md"]
+    listing = {
+        "available": True,
+        "data": [
+            {"path": name, "name": name, "type": "file", "bytes": 10, "modified_at": None}
+            for name in names
+        ],
+        "has_more": False,
+    }
+    try:
+        page.route(
+            re.compile(r"/v1/sessions/[^/]+/resources/environments/[^/]+/filesystem[?].*"),
+            lambda route: route.fulfill(json=listing),
+        )
+        _open_live(page, base_url, session_id, _DESKTOP)
+        input_loc = page.get_by_label("Message the agent")
+        input_loc.click()
+        for name in names:
+            input_loc.press_sequentially("@")
+            option = page.get_by_role("option", name=re.compile(name))
+            expect(option).to_be_visible(timeout=15_000)
+            option.get_by_role("button", name=name).click()
+            expect(page.locator(f"span[title='{name}']")).to_be_visible()
+        chips = [_box(page.locator(f"span[title='{name}']").locator("..")) for name in names]
+        first, *rest = chips
+        for chip in rest:
+            assert abs(chip["height"] - first["height"]) <= _TOL, (
+                f"mention-chip heights diverge: {first['height']:.2f} vs {chip['height']:.2f}"
+            )
+            _assert_same_vertical_center(first, chip)
+        gaps = [chips[i + 1]["x"] - (chips[i]["x"] + chips[i]["width"]) for i in range(2)]
+        assert abs(gaps[1] - gaps[0]) <= _TOL, (
+            f"mention-chip gaps diverge: {gaps[0]:.2f}px vs {gaps[1]:.2f}px"
+        )
+        input_box = _box(page.get_by_label("Message the agent"))
+        assert abs(first["x"] - input_box["x"]) <= _TOL, (
+            f"first mention chip starts at x={first['x']:.2f}, off the input's "
+            f"inset line x={input_box['x']:.2f}"
+        )
+    finally:
+        page.unroute_all(behavior="ignoreErrors")
+
+
+def test_live_wrapped_chip_rows_keep_the_grid(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Attachment chips wrapped across visual lines keep the grid: every line
+    starts on the shared inset line, chips on one line share a baseline, and
+    lines do not overlap. The Workspace rail stays OPEN — its squeeze is what
+    wraps the row."""
+    base_url, session_id = seeded_session
+    _open_live(page, base_url, session_id, _DESKTOP)
+    names = [
+        "quarterly-planning-notes.txt",
+        "customer-feedback-export.csv",
+        "incident-review-minutes.md",
+        "onboarding-checklist-draft.txt",
+        "competitive-analysis-sheet.csv",
+        "roadmap-brainstorm-doc.md",
+    ]
+    _attach_files(page, [(name, "text/plain", b"x") for name in names])
+    chips = sorted(
+        (_box(page.get_by_role("button", name=f"Remove {name}").locator("..")) for name in names),
+        key=lambda box: (box["y"], box["x"]),
+    )
+    lines: list[list[FloatRect]] = []
+    for chip in chips:
+        if lines and abs(chip["y"] - lines[-1][0]["y"]) <= _TOL:
+            lines[-1].append(chip)
+        else:
+            lines.append([chip])
+    assert len(lines) >= 2, f"chips did not wrap: one line of {len(chips)}"
+    for line in lines:
+        for chip in line[1:]:
+            _assert_same_vertical_center(line[0], chip)
+    first_line_first = lines[0][0]
+    input_box = _box(page.get_by_label("Message the agent"))
+    assert abs(first_line_first["x"] - input_box["x"]) <= _TOL, (
+        f"first wrapped-row chip starts at x={first_line_first['x']:.2f}, off the "
+        f"input's inset line x={input_box['x']:.2f}"
+    )
+    for line in lines[1:]:
+        assert abs(line[0]["x"] - first_line_first["x"]) <= _TOL, (
+            f"wrapped line starts at x={line[0]['x']:.2f}, off the first line's "
+            f"x={first_line_first['x']:.2f}"
+        )
+    for above, below in pairwise(lines):
+        overlap = (above[0]["y"] + above[0]["height"]) - below[0]["y"]
+        assert overlap <= _TOL, f"wrapped lines overlap by {overlap:.2f}px"
+
+
 def test_landing_slash_rows_follow_the_row_grid(seeded_session: tuple[str, str]) -> None:
     """Landing slash-suggestion rows share icon x, label x, width, and height
     within 1 px and stack without overlap."""
@@ -704,7 +863,7 @@ async def _landing_slash_grid(base_url: str, session_id: str) -> None:
                 assert abs(row["height"] - first["height"]) <= _TOL
             for a, b in pairwise(boxes):
                 pitch = b["y"] - a["y"]
-                assert abs(pitch - a["height"]) <= _TOL + 1.0, (
+                assert abs(pitch - a["height"]) <= _TOL, (
                     f"rows are not stacked evenly: pitch {pitch:.2f}px vs height "
                     f"{a['height']:.2f}px"
                 )
@@ -713,7 +872,6 @@ async def _landing_slash_grid(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_slash_rows_follow_the_row_grid(
     page: Page,
     seeded_session: tuple[str, str],
@@ -739,12 +897,30 @@ def test_live_slash_rows_follow_the_row_grid(
             assert abs(row["height"] - first["height"]) <= _TOL
         for a, b in pairwise(boxes):
             pitch = b["y"] - a["y"]
-            assert abs(pitch - a["height"]) <= _TOL + 1.0
+            assert abs(pitch - a["height"]) <= _TOL
+        # A hovered row paints its background with symmetric left/right
+        # insets inside the menu's content box.
+        hovered = rows.nth(1)
+        hovered.hover()
+        background = hovered.evaluate("(el) => getComputedStyle(el).backgroundColor")
+        assert background not in {"rgba(0, 0, 0, 0)", "transparent"}, (
+            f"hovered slash row has no painted background: {background}"
+        )
+        panel = _box(hovered.locator("xpath=../.."))
+        row_box = _box(hovered)
+        menu_chrome = _border_left_px(hovered.locator("xpath=../..")) + 8  # border + p-2
+        left_inset = row_box["x"] - (panel["x"] + menu_chrome)
+        right_inset = (panel["x"] + panel["width"] - menu_chrome) - (
+            row_box["x"] + row_box["width"]
+        )
+        assert abs(left_inset - right_inset) <= _TOL, (
+            f"hovered row background insets asymmetric: left={left_inset:.2f}px "
+            f"right={right_inset:.2f}px"
+        )
     finally:
         page.unroute_all(behavior="ignoreErrors")
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_queued_rows_follow_the_row_grid(
     page: Page,
     seeded_session: tuple[str, str],
@@ -778,6 +954,27 @@ def test_live_queued_rows_follow_the_row_grid(
         assert abs(second["x"] - first["x"]) <= _TOL
         assert abs(second["width"] - first["width"]) <= _TOL
         assert abs(second["height"] - first["height"]) <= _TOL
+        # Inner columns: the leading icon/status (drag grip or clock), the
+        # primary label, and the trailing action group share x across rows.
+        columns = []
+        for i in range(2):
+            row = rows.nth(i)
+            status = _box(row.locator(":scope > *:first-child"))
+            label = _box(row.locator("span.truncate").first)
+            trailing = _box(row.locator(":scope > span").last)
+            columns.append({"status icon": status, "label": label, "trailing action": trailing})
+        for name in ("status icon", "label", "trailing action"):
+            a, b = columns[0][name], columns[1][name]
+            assert abs(a["x"] - b["x"]) <= _TOL, (
+                f"queued-row {name} columns diverge: {a['x']:.2f} vs {b['x']:.2f}"
+            )
+        # The strip's leading column sits on the tray's shared inset line.
+        strip_box = _box(strip)
+        _assert_primitive_inset(
+            columns[0]["status icon"]["x"] - strip_box["x"],
+            0.0,
+            "queued-row leading column",
+        )
         _screenshot(page, "live-queued-rows-grid")
     finally:
         page.unroute_all(behavior="ignoreErrors")
@@ -785,7 +982,6 @@ def test_live_queued_rows_follow_the_row_grid(
         reset_mock_llm(mock_llm_server_url)
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_landing_and_live_cards_share_max_width_and_centering(
     page: Page,
     seeded_session: tuple[str, str],
@@ -851,7 +1047,6 @@ def _row_boxes(page: Page | AsyncPage, locator) -> list[FloatRect]:
     return [_box(locator.nth(i)) for i in range(min(count, 3))]
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_landing_picker_rows_follow_the_row_grid(seeded_session: tuple[str, str]) -> None:
     """Landing agent-picker rows share the row grid (icon x, label x, trailing
     x, height, pitch) at desktop and phone widths."""
@@ -867,11 +1062,19 @@ async def _landing_picker_grid(base_url: str, session_id: str) -> None:
         try:
             await _open_landing(page, base_url, session_id, agents_body=_three_agent_agents_body())
             for viewport in [_DESKTOP, _PHONE]:
+                # A fresh load at each width: resizing desktop-to-phone leaves
+                # the sidebar drawer open over the composer and it eats the
+                # click (the live picker test reloads for the same reason).
                 await page.set_viewport_size(viewport)
+                await page.reload()
+                await async_expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(
+                    timeout=30_000
+                )
                 trigger = page.get_by_test_id("new-chat-landing-agent-select")
                 await trigger.click()
                 rows = page.locator(".composer-agent-menu .composer-agent-row")
                 await async_expect(rows.first).to_be_visible()
+                await page.locator(".composer-agent-menu").first.evaluate(_MENU_SETTLE_JS)
                 boxes = []
                 count = await rows.count()
                 assert count >= 2, f"expected several picker rows, found {count}"
@@ -880,18 +1083,45 @@ async def _landing_picker_grid(base_url: str, session_id: str) -> None:
                     assert box is not None
                     boxes.append(box)
                 _assert_row_grid(boxes)
-                icons = [await rows.nth(i).locator("svg").first.bounding_box() for i in range(2)]
+                # Harness marks render as <img> glyphs (data-URI SVG), so the
+                # icon column is the first vector-or-image element in the row.
+                icons = [
+                    await rows.nth(i).locator("img, svg").first.bounding_box() for i in range(2)
+                ]
                 assert icons[0] is not None and icons[1] is not None
                 assert abs(icons[0]["x"] - icons[1]["x"]) <= _TOL, (
                     f"row icons do not share x: {icons[0]['x']:.2f} vs {icons[1]['x']:.2f}"
                 )
+                # Label column: the first truncate span in each row.
+                labels = [
+                    await rows.nth(i).locator("span.truncate").first.bounding_box()
+                    for i in range(2)
+                ]
+                assert labels[0] is not None and labels[1] is not None
+                assert abs(labels[0]["x"] - labels[1]["x"]) <= _TOL, (
+                    f"picker-row label columns diverge ({viewport['width']}px): "
+                    f"{labels[0]['x']:.2f} vs {labels[1]['x']:.2f}"
+                )
+                # Value column: the summary cell's right edge.
+                values = [
+                    await rows.nth(i).locator("[data-testid*='agent-summary-']").bounding_box()
+                    for i in range(2)
+                ]
+                assert values[0] is not None and values[1] is not None
+                rights = [v["x"] + v["width"] for v in values]
+                assert abs(rights[0] - rights[1]) <= _TOL, (
+                    f"picker-row value columns diverge ({viewport['width']}px): "
+                    f"{rights[0]:.2f} vs {rights[1]:.2f}"
+                )
                 await page.keyboard.press("Escape")
+                # The menu unmounts after its close animation; reopening before
+                # then races the outgoing overlay for the pointer.
+                await async_expect(page.locator(".composer-agent-menu")).to_have_count(0)
         finally:
             await context.close()
             await browser.close()
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_picker_rows_follow_the_row_grid(
     page: Page,
     seeded_session: tuple[str, str],
@@ -910,19 +1140,55 @@ def test_live_picker_rows_follow_the_row_grid(
             gear.click()
             rows = page.locator(".composer-agent-menu [role=menuitem]")
             expect(rows.first).to_be_visible()
+            page.locator(".composer-agent-menu").first.evaluate(_MENU_SETTLE_JS)
             boxes = _row_boxes(page, rows)
             _assert_row_grid(boxes)
+            # Inner columns on the config sub-trigger rows: the label span's x
+            # and the value span's right edge.
+            columns = []
+            for i in range(2):
+                label = _box(rows.nth(i).locator("span.flex-1").first)
+                value = _box(rows.nth(i).locator("span.text-right").first)
+                columns.append((label, value))
+            (a_label, a_value), (b_label, b_value) = columns
+            assert abs(a_label["x"] - b_label["x"]) <= _TOL, (
+                f"config-row label columns diverge ({viewport['width']}px): "
+                f"{a_label['x']:.2f} vs {b_label['x']:.2f}"
+            )
+            a_right = a_value["x"] + a_value["width"]
+            b_right = b_value["x"] + b_value["width"]
+            assert abs(a_right - b_right) <= _TOL, (
+                f"config-row value columns diverge ({viewport['width']}px): "
+                f"{a_right:.2f} vs {b_right:.2f}"
+            )
             page.keyboard.press("Escape")
     finally:
         page.unroute_all(behavior="ignoreErrors")
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_landing_workspace_bar_aligns_with_the_card(seeded_session: tuple[str, str]) -> None:
-    """The landing workspace bar's content inset line matches the composer
-    card's inset line, and the bar shares the card's outer edges."""
+    """The landing workspace tray nests inside the card's edges by the shared
+    inset, with its content on the card's inset line."""
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_landing_workspace_bar(base_url, session_id))
+
+
+def _assert_tray_nesting(bar: FloatRect, card: FloatRect, content_inset: float) -> None:
+    """Fail unless the docked tray nests inside the card's outer edges by the
+    shared content inset, symmetric left/right within ``_TOL`` px."""
+    tray_left = bar["x"] - card["x"]
+    tray_right = _right_inset(card, bar)
+    assert abs(tray_left - content_inset) <= _TOL, (
+        f"tray nesting inset {tray_left:.2f}px diverges from the card's content "
+        f"inset {content_inset:.2f}px"
+    )
+    assert abs(tray_left - _PRIMITIVE_INSET_PX) <= _TOL, (
+        f"tray nesting inset {tray_left:.2f}px off the shared "
+        f"{_PRIMITIVE_INSET_PX:.0f}px primitive"
+    )
+    assert abs(tray_right - tray_left) <= _TOL, (
+        f"tray nests asymmetrically: left={tray_left:.2f}px right={tray_right:.2f}px"
+    )
 
 
 async def _landing_workspace_bar(base_url: str, session_id: str) -> None:
@@ -939,50 +1205,47 @@ async def _landing_workspace_bar(base_url: str, session_id: str) -> None:
             assert (
                 bar is not None and card is not None and chip is not None and input_box is not None
             )
-            assert abs(bar["x"] - card["x"]) <= _TOL, (
-                f"bar and card left edges diverge: {bar['x']:.2f} vs {card['x']:.2f}"
-            )
-            assert abs(_right_inset(card, bar)) <= _TOL, (
-                f"bar and card right edges diverge by {_right_inset(card, bar):.2f}px"
-            )
-            chip_inset = chip["x"] - bar["x"]
             input_inset = input_box["x"] - card["x"]
+            _assert_tray_nesting(bar, card, input_inset)
+            chip_inset = chip["x"] - bar["x"]
             assert abs(chip_inset - input_inset) <= _TOL, (
                 f"bar content inset {chip_inset:.2f}px diverges from the card's "
                 f"{input_inset:.2f}px"
             )
+            bar_border = await _border_left_px_async(
+                page.get_by_test_id("new-chat-landing-workspace-controls")
+            )
+            _assert_primitive_inset(chip_inset, bar_border, "landing tray content")
         finally:
             await context.close()
             await browser.close()
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_workspace_bar_aligns_with_the_card(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The live workspace bar's content inset line matches the composer
-    card's inset line, and the bar shares the card's outer edges."""
+    """The live workspace tray nests inside the card's edges by the shared
+    inset, with its content on the card's inset line."""
     base_url, session_id = seeded_session
     _open_live(page, base_url, session_id, _DESKTOP)
     bar = _box(page.get_by_test_id("composer-workspace-controls"))
     card = _box(page.locator("[data-composer-card]"))
     chip = _box(page.get_by_test_id("composer-workspace-dir"))
     input_box = _box(page.get_by_label("Message the agent"))
-    assert abs(bar["x"] - card["x"]) <= _TOL, (
-        f"bar and card left edges diverge: {bar['x']:.2f} vs {card['x']:.2f}"
-    )
-    assert abs(_right_inset(card, bar)) <= _TOL, (
-        f"bar and card right edges diverge by {_right_inset(card, bar):.2f}px"
-    )
-    chip_inset = chip["x"] - bar["x"]
     input_inset = input_box["x"] - card["x"]
+    _assert_tray_nesting(bar, card, input_inset)
+    chip_inset = chip["x"] - bar["x"]
     assert abs(chip_inset - input_inset) <= _TOL, (
         f"bar content inset {chip_inset:.2f}px diverges from the card's {input_inset:.2f}px"
     )
+    _assert_primitive_inset(
+        chip_inset,
+        _border_left_px(page.get_by_test_id("composer-workspace-controls")),
+        "live tray content",
+    )
 
 
-@pytest.mark.skipif(not _GEOMETRY_CONTRACT_ENABLED, reason=_GEOMETRY_CONTRACT_SKIP)
 def test_live_workspace_bar_nested_variant_keeps_the_inset_line(
     page: Page,
     seeded_session: tuple[str, str],
@@ -1015,8 +1278,8 @@ def test_live_workspace_bar_nested_variant_keeps_the_inset_line(
         assert border_top == "0px", f"nesting variant keeps a top border: {border_top}"
         bar_box = _box(bar)
         card_box = _box(page.locator("[data-composer-card]"))
-        assert abs(bar_box["x"] - card_box["x"]) <= _TOL
-        assert abs(_right_inset(card_box, bar_box)) <= _TOL
+        input_box = _box(page.get_by_label("Message the agent"))
+        _assert_tray_nesting(bar_box, card_box, input_box["x"] - card_box["x"])
         strip_box = _box(strip)
         assert abs(strip_box["x"] - bar_box["x"]) <= _TOL, (
             f"queued strip and bar left edges diverge: {strip_box['x']:.2f} vs {bar_box['x']:.2f}"

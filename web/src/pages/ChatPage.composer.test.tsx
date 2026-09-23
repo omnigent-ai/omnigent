@@ -4079,7 +4079,6 @@ describe("Composer sub-agent tray", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
       "rounded-t-none",
-      "pl-2.5",
       "border-t-0",
       "border-border/50",
       "before:inset-x-4",

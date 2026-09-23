@@ -212,9 +212,10 @@ def test_queued_strip_attaches_to_composer(
                 )
                 drag_handle_center = drag_handle_box["x"] + drag_handle_box["width"] / 2
                 workspace_icon_center = workspace_icon_box["x"] + workspace_icon_box["width"] / 2
-                assert abs((workspace_icon_center - drag_handle_center) - 2) <= _EPSILON, (
-                    "workspace icon needs the 2px optical offset from queued drag handles: "
-                    f"drag={drag_handle_center:.1f}, workspace={workspace_icon_center:.1f}"
+                assert abs(workspace_icon_center - drag_handle_center) <= _EPSILON, (
+                    "workspace icon and queued drag handles share the tray's icon "
+                    f"column: drag={drag_handle_center:.1f}, "
+                    f"workspace={workspace_icon_center:.1f}"
                 )
                 assert (
                     abs(
