@@ -561,6 +561,14 @@ _SESSION_STREAM_HEARTBEAT_S = 15.0
 # wait is bounded and the stream failure is then attributed to the exit.
 _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
 
+# Substring printed by the Claude Code CLI on a voluntary /exit or /quit.
+# When the required terminal exits with status 0 and this marker is present in
+# the last captured pane output, the exit was user-initiated. The pane activity
+# from printing this banner can trip the PTY watcher back to "running" before
+# the pane dies, making session_was_idle False even though the user quit
+# intentionally.
+_CLAUDE_VOLUNTARY_EXIT_MARKER = "Resume this session with:"
+
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
 # /v1/summarize endpoint is optional). The concrete type is imported only
@@ -3517,6 +3525,20 @@ def create_runner_app(
         _native_pane_status.pop(event.session_id, None)
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
+            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _release_required_terminal_session(event.session_id)
+            return
+
+        # A voluntary exit: the terminal printed the CLI's own "Resume this
+        # session with:" banner and exited 0. Publishing the banner can re-trip
+        # the PTY watcher to "running" before the pane dies, so session_was_idle
+        # may be False even though the user intentionally quit. Treat it the
+        # same as the idle path: publish idle to clear any spinner and release.
+        if (
+            event.exit_status == 0
+            and event.last_output is not None
+            and _CLAUDE_VOLUNTARY_EXIT_MARKER in event.last_output
+        ):
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
             return
