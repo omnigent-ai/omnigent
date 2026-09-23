@@ -174,3 +174,17 @@ is the review gate after the fact.
    `maintainer_review`).
 
 It does **not** merge. See `AGENTS.md` for the full operating procedure.
+
+### Verification limits
+
+The shared audit is an instruction-level requirement, not an execution gate.
+The CI handoff parser and checkpoint delivery-readiness check can accept a
+`fixed` claim without test evidence when their identity and publication-shape
+checks pass. Neither test restoration nor a `test_audit` narrative proves that
+the agent executed the same assertions before and after the fix.
+
+Mechanically checking that requirement needs a separate change: retain actual
+verification executions, identify the tested code/assertions and environment,
+carry results through retries, and detect missing or stale proof before delivery.
+Until then, inspect retained tool output as well as the handoff when assessing
+a run; configuration and prompt tests do not establish model compliance.

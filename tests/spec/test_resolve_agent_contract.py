@@ -104,6 +104,31 @@ def test_both_resolution_paths_require_audited_evidence() -> None:
     assert "`test_audit` — required in both author and review modes" in instructions
 
 
+def test_repro_audit_repeats_baseline_when_assertions_or_retry_context_change() -> None:
+    audit = _shared_repro_audit()
+    for requirement in (
+        "If you change the test while evaluating the fix, repeat the baseline audit",
+        "Preserve the original and revised test evidence",
+        "test, product revisions, and relevant environment still match",
+        "otherwise re-audit without overwriting the saved checkpoint",
+        "use a separate baseline worktree",
+    ):
+        assert requirement in audit
+
+
+def test_output_outcomes_include_repro_audit_blockers() -> None:
+    output = _normalized_resolve_instructions().split("## Output —", 1)[1]
+    outcomes = output.split("- `outcome`", 1)[1].split("- `problem_summary`", 1)[0]
+    for requirement in (
+        "`needs_more_info`",
+        "reliable reproduction",
+        "evidence is unsafe",
+        "intended behavior is ambiguous",
+        "setup/environment blocks verification",
+    ):
+        assert requirement in outcomes
+
+
 def test_repro_audit_preserves_non_repro_mode_contracts() -> None:
     instructions = _normalized_resolve_instructions()
     assert "Skip reproduction handoff recovery, fail-before proof" in instructions

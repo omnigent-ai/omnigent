@@ -1585,7 +1585,8 @@ Field meanings:
   reviewed PR doesn't fix it), `nothing_to_fix` (recovered verdict was
   `already_fixed`/`not_reproduced`, or the 2B.1 audit showed `main` has since
   fixed it — name the fixing commit and recommend closing the ticket), or
-  `needs_more_info` (couldn't recover the reproduction).
+  `needs_more_info` (couldn't recover a reliable reproduction, evidence is unsafe,
+  intended behavior is ambiguous, or setup/environment blocks verification).
 - `problem_summary` / `solution_summary` — the two user-facing paragraphs shown
   prominently in the Linear update under **What's the problem?** and **How is it
   fixed?** Write plain, natural English for someone who uses the product but has
