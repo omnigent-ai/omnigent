@@ -32,6 +32,19 @@ from tests.server.helpers import create_test_session
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _no_archive_stop_grace() -> object:
+    """
+    Fire the deferred archive stop immediately in these tests.
+
+    The handler defers the runner teardown past the Undo window (see
+    ``_ARCHIVE_STOP_UNDO_GRACE_S``); zeroing it here keeps the stop-runs /
+    stop-skipped assertions fast. The undo-cancel test sets its own grace.
+    """
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0):
+        yield
+
+
 # ── Archive / unarchive lifecycle ────────────────────────
 
 
@@ -411,6 +424,41 @@ async def test_unarchive_skips_stop(
             )
         assert resp.status_code == 200
         assert resp.json()["archived"] is False
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_undo_within_grace_cancels_archive_stop(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Unarchiving before the grace elapses cancels the deferred stop.
+
+    The archive PATCH defers the runner teardown past the Undo window;
+    an Undo (which re-PATCHes ``archived=false``) must cancel it so the
+    runner is never torn down for a session the user kept.
+    """
+    session = await create_test_session(client, name="archive-undo-cancel")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    # A grace long enough that the stop can't fire before the Undo lands.
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
+            archive = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            assert archive.status_code == 200
+            assert session_id in _sessions_orchestration._pending_archive_stops
+            undo = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+            assert undo.status_code == 200
+            assert undo.json()["archived"] is False
+            # The pending stop is cancelled and drops out of the registry.
+            assert session_id not in _sessions_orchestration._pending_archive_stops
+            await _drain_detached_stops()
         mock_stop.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)

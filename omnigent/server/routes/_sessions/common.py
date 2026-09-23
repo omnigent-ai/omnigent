@@ -486,6 +486,14 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
 
 
+# How long an archive defers tearing down the session's runner, giving the
+# client's Undo pill time to unarchive first (the pill shows for 3s; see
+# ARCHIVE_UNDO_DURATION_MS in web/src/shell/archiveUndoToast.tsx). Wide enough
+# to cover the pill plus the unarchive round trip, so undoing keeps the runner
+# alive instead of relaunching a torn-down pane.
+_ARCHIVE_STOP_UNDO_GRACE_S = 5.0
+
+
 _HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
 
 

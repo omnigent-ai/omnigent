@@ -712,6 +712,12 @@ async def _best_effort_stop(
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
 
+# Archive stops deferred past the undo grace, keyed by session id so an Undo
+# (which unarchives via the same PATCH) can cancel the pending stop before the
+# runner is torn down. One entry per session — a re-archive replaces it.
+# custom-lint: disable-next=workspace-scoped-cache -- undo-window teardown timers
+_pending_archive_stops: dict[str, asyncio.Task[None]] = {}
+
 
 async def _archive_stop(
     session_id: str,
@@ -786,13 +792,21 @@ def _spawn_archive_stop(
     host_registry: Any = None,
 ) -> None:
     """
-    Run :func:`_archive_stop` as a retained background task.
+    Defer :func:`_archive_stop` past the undo grace, as a retained task.
 
     Archiving needs the stop to *happen*, not to have happened before
     the response is written: awaiting it inline held the PATCH for the
     stop's per-runner timeouts (seconds per running session against a
     wedged or asleep runner) even though the archive proceeds
     regardless of the stop's outcome.
+
+    The stop also waits out the client's Undo window: archiving pops an
+    Undo pill, and undoing it unarchives the session — but a stop that
+    already tore the runner down leaves an unarchived session with a dead
+    pane. So the actual teardown sleeps past the grace, and an Undo
+    (which unarchives via the same PATCH) cancels it through
+    :func:`_cancel_pending_archive_stop` before it fires. A re-archive of
+    the same session while a stop is still pending replaces it.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
@@ -801,11 +815,48 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     """
-    task = asyncio.create_task(
-        _archive_stop(session_id, conversation_store, runner_router, host_registry)
-    )
+    # A pending stop for the same session is stale now — replace it.
+    _cancel_pending_archive_stop(session_id)
+
+    async def _stop_after_grace() -> None:
+        # Resolve through the facade so a test's monkeypatch of the grace
+        # constant is honored here.
+        from omnigent.server.routes import sessions as _facade
+
+        try:
+            await asyncio.sleep(_facade._ARCHIVE_STOP_UNDO_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        await _archive_stop(session_id, conversation_store, runner_router, host_registry)
+
+    task = asyncio.create_task(_stop_after_grace())
+    _pending_archive_stops[session_id] = task
     _detached_stop_tasks.add(task)
-    task.add_done_callback(_detached_stop_tasks.discard)
+
+    def _done(t: asyncio.Task[None]) -> None:
+        _detached_stop_tasks.discard(t)
+        # Only clear the map entry if it still points at this task — a
+        # re-archive may have already replaced it.
+        if _pending_archive_stops.get(session_id) is t:
+            del _pending_archive_stops[session_id]
+
+    task.add_done_callback(_done)
+
+
+def _cancel_pending_archive_stop(session_id: str) -> None:
+    """
+    Cancel a session's deferred archive stop if it hasn't fired yet.
+
+    Called when a session is unarchived (Undo, or an explicit unarchive)
+    within the grace window, so the runner is never torn down for a
+    session the user kept. A no-op when no stop is pending or it already
+    ran — the done-callback clears the map entry.
+
+    :param session_id: Session/conversation identifier.
+    """
+    task = _pending_archive_stops.pop(session_id, None)
+    if task is not None:
+        task.cancel()
 
 
 def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
@@ -11026,6 +11077,7 @@ __all__ = [
     "_build_native_terminal_message_event",
     "_build_session_list_item",
     "_build_session_response",
+    "_cancel_pending_archive_stop",
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
