@@ -78,7 +78,7 @@ def test_pending_message_link_persists_and_opens_from_terminal(
         page.goto(clipboard)
         target = page.locator(f'[data-message-id="{message_id}"]')
         # Assert the short-lived flash first, before waiting for other UI state.
-        expect(target).to_have_class(re.compile(r"\banimate-message-highlight\b"), timeout=20_000)
+        expect(target.locator(".animate-message-highlight")).to_be_visible(timeout=20_000)
         expect(target).to_contain_text(marker)
         expect(target).to_be_in_viewport(timeout=5_000)
         expect(page.get_by_test_id("main-terminal-view")).not_to_be_visible()
@@ -113,6 +113,6 @@ def test_message_link_reaches_virtualized_history(
     page.set_viewport_size({"width": 1280, "height": 720})
     page.goto(f"{base_url}/c/{session_id}?message={message_id}")
     target = page.locator(f'[data-message-id="{message_id}"]')
-    expect(target).to_have_class(re.compile(r"\banimate-message-highlight\b"), timeout=20_000)
+    expect(target.locator(".animate-message-highlight")).to_be_visible(timeout=20_000)
     expect(target).to_contain_text(expected_text)
     expect(target).to_be_in_viewport(timeout=5_000)
