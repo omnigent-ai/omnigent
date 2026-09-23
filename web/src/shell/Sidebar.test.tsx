@@ -944,23 +944,24 @@ describe("Sidebar session list", () => {
     expect(slot).toHaveClass("right-1", "w-6", "justify-center");
   });
 
-  it("shifts a row's dot marker clear of the persistent touch-tablet controls", () => {
-    // On a hover-incapable md+ device the pin + kebab stay visible (there is
-    // no hover to reveal them), so the badge can't share their right-1 anchor:
-    // it moves left of the control column (right-20) instead of being
-    // hover-faded away, and the row reserves width for both persistently.
+  it("keeps a row's dot marker at the right edge without fine hover", () => {
+    // Touch devices of any width (including unfolded foldables at md+) have no
+    // row controls, so the badge keeps its right-1 anchor and the row reserves
+    // only the badge's own width, never a control column.
     mockConversations([
       conv("conv_running", "Claude Code", { title: "Running row", status: "running" }),
     ]);
     renderSidebar();
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
-    expect(slot).toHaveClass("no-fine-hover:md:right-20");
+    expect(slot).toHaveClass("right-1");
+    expect(slot.className).not.toContain("no-fine-hover:");
     const row = screen.getByRole("link", { name: /Running row/ });
-    expect(row.className).toContain("no-fine-hover:md:pr-27");
-    // The fades and the hover reserve are gated the same way as the reveals,
-    // so a tap's sticky :hover or a keyboard focus on the persistent controls
-    // neither hides the badge nor collapses the reserve under it.
+    expect(row).toHaveClass("pr-8");
+    expect(row.className).not.toContain("no-fine-hover:");
+    // The fades and the hover reserve are gated to fine hover, so a tap's
+    // sticky :hover or a keyboard focus neither hides the badge nor collapses
+    // the reserve under it.
     expect(slot).toHaveClass(
       "fine-hover:md:group-hover:opacity-0",
       "fine-hover:md:group-has-[:focus-visible]:opacity-0",
