@@ -28,7 +28,7 @@ describe("ComposerPrLink", () => {
     expect(link).toHaveTextContent("#42");
     expect(link).toHaveClass("text-sm", "gap-1", "min-w-0");
     expect(link).not.toHaveClass("shrink-0");
-    expect(link.querySelector("svg")).toHaveClass("shrink-0");
+    expect(link.querySelector("svg")).toHaveClass("lucide-git-pull-request", "shrink-0");
     expect(screen.getByText("#42")).toHaveClass("truncate");
     expect(screen.getByText("#42")).not.toHaveClass("underline");
     expect(screen.getByText("#42")).toHaveClass("group-hover:underline");

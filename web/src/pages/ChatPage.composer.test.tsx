@@ -2167,7 +2167,7 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
   });
 
-  it("keeps the PR to the left of the confirmed worktree status", () => {
+  it("keeps the PR to the right of the confirmed worktree status", () => {
     setComposerGitStatus({
       branch: "feature/shared-composer",
       branchState: "branch",
@@ -2181,7 +2181,7 @@ describe("Composer shared visible controls", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     const pr = screen.getByTestId("composer-pr-link");
     const worktree = screen.getByTestId("composer-git-branch");
-    expect(pr.compareDocumentPosition(worktree) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(worktree.compareDocumentPosition(pr) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
   });
 
   it("mounts task indicators before the context ring with sub-agent navigation", () => {

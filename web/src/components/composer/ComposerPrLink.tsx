@@ -1,5 +1,4 @@
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
-import { Loader2Icon } from "lucide-react";
+import { GitPullRequestIcon, Loader2Icon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 export type ComposerPrState = "loading" | "ready" | "unknown";
@@ -44,7 +43,7 @@ export function ComposerPrLink({
         data-testid="composer-pr-unknown"
         className={cn("flex shrink-0 items-center gap-1 text-sm text-muted-foreground", className)}
       >
-        <GithubMono size={14} className="shrink-0" aria-hidden />
+        <GitPullRequestIcon className="size-3.5 shrink-0" aria-hidden />
         <span>PR unavailable</span>
       </span>
     );
@@ -65,7 +64,7 @@ export function ComposerPrLink({
         className,
       )}
     >
-      <GithubMono size={14} className="shrink-0" aria-hidden />
+      <GitPullRequestIcon className="size-3.5 shrink-0" aria-hidden />
       {/* Short and informative, so it stays when the bar collapses; a PR
           number that would truncate still asks the bar to collapse the
           directory and branch text, which frees the room it needs. */}
