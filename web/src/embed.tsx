@@ -42,7 +42,8 @@ import {
   setEmbedScopeRoot,
   setOmnigentHostConfig,
 } from "./lib/host";
-import { resolveIdentity } from "./lib/identity";
+import { prefetchSessionHostChain } from "./hooks/useSession";
+import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import {
   applyDesktopUiFontSize,
   applyUiFontFamily,
@@ -169,6 +170,9 @@ function OmnigentProviders({
   const hostQueryClient = useQueryClient();
   useState(() => {
     initChatStore(hostQueryClient);
+    // Resolve a session's routing host on demand (a hostless sub-agent child
+    // walks up to its host-bound ancestor) before host-scoped requests key.
+    setSessionHostResolver((sessionId) => prefetchSessionHostChain(hostQueryClient, sessionId));
     void resolveIdentity();
     return null;
   });

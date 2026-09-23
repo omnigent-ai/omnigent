@@ -876,6 +876,37 @@ describe("getSession", () => {
     expect(getSessionHost("conv_routing_child")).toBe("host_devbox");
   });
 
+  it("resolves the routing host through an arbitrarily deep child chain", async () => {
+    // Nesting has no depth limit; only the root is host-bound.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_deep_0",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        host_id: "host_root",
+      }),
+    );
+    await getSessionSlim("conv_deep_0");
+    for (let depth = 1; depth <= 6; depth++) {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: `conv_deep_${depth}`,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          host_id: null,
+          kind: "sub_agent",
+          parent_session_id: `conv_deep_${depth - 1}`,
+        }),
+      );
+      // oxlint-disable-next-line no-await-in-loop
+      await getSessionSlim(`conv_deep_${depth}`);
+    }
+
+    expect(getSessionHost("conv_deep_6")).toBe("host_root");
+  });
+
   it("getSessionSlim skips items, liveness, and subtree usage", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
