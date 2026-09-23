@@ -2044,11 +2044,14 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
         locked.chmod(0o700)
 
 
-def _git_runner_client(ws: Path, session_id: str) -> httpx.AsyncClient:
-    """Runner app whose workspace registry is git-backed, for the search tests.
+def _git_runner_client(
+    ws: Path, session_id: str, *, runner_workspace: Path | None = None
+) -> httpx.AsyncClient:
+    """Runner app serving *ws* as the session's environment, for the search tests.
 
-    :param ws: A git working tree to serve as both runner and session workspace.
+    :param ws: The session environment's working tree.
     :param session_id: Session to register the OS environment under.
+    :param runner_workspace: The runner's own workspace; defaults to *ws*.
     :returns: An httpx client bound to the runner app.
     """
     os_env = create_os_environment(
@@ -2062,7 +2065,7 @@ def _git_runner_client(ws: Path, session_id: str) -> httpx.AsyncClient:
     reg._primary_envs[session_id] = os_env
     app = create_runner_app(
         resource_registry=reg,
-        runner_workspace=ws,
+        runner_workspace=runner_workspace if runner_workspace is not None else ws,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://runner")
@@ -2189,3 +2192,81 @@ async def test_search_from_filesystem_root_keeps_paths_intact(
     paths = [e.path for e in entries]
     assert "etc" in paths, paths
     assert all((Path("/") / p).exists() for p in paths), paths
+
+
+def _seed_budget_busting_repo(ws: Path, *, commit: bool = True) -> None:
+    """Fill *ws* so an alphabetical walk exhausts a small budget before ``zzz/``.
+
+    :param ws: Directory to seed.
+    :param commit: Whether to also ``git init`` + commit the tree.
+    """
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "target.jsonnet").write_text("y")
+    if commit:
+        env = _git_env()
+        subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_indexes_the_walked_workspace_not_the_runners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner-managed session searches its own generated workspace, which is
+    neither the session's stored workspace nor the runner's. The index consulted
+    must belong to the walked tree, or tracked files past the walk budget stay
+    unfindable there while the runner's registry answers for the wrong files."""
+    ws = tmp_path / "session-ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws)
+    runner_ws = tmp_path / "runner-ws"
+    runner_ws.mkdir()
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_env_ws/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_env_ws", runner_workspace=runner_ws) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_picks_up_a_repo_created_mid_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that becomes a git repository after its first search (an
+    agent cloning into it) must gain index coverage on the next search rather
+    than staying pinned to the walk-only answer."""
+    ws = tmp_path / "session-ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws, commit=False)
+    runner_ws = tmp_path / "runner-ws"
+    runner_ws.mkdir()
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_late_git/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_late_git", runner_workspace=runner_ws) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert body["data"] == [], body
+        assert body["truncated"] is True
+
+        env = _git_env()
+        subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+        )
+
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        assert body["truncated"] is True

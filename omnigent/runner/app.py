@@ -3534,6 +3534,7 @@ def create_runner_app(
 
     from omnigent.runtime.filesystem_registry import (
         FilesystemRegistry,
+        GitFilesystemRegistry,
         create_filesystem_registry,
     )
 
@@ -3545,6 +3546,28 @@ def create_runner_app(
     app.state.filesystem_registry = filesystem_registry
 
     _session_fs_registries: dict[str, FilesystemRegistry] = {}
+    _search_fs_registries: dict[str, FilesystemRegistry] = {}
+
+    def _search_registry_for_root(root: Path) -> FilesystemRegistry:
+        """Registry rooted at *root*, the tree a search actually walks.
+
+        The session registry watches the session's stored workspace (or the
+        runner's), which is not necessarily the environment root the search
+        walks — runner-managed sessions get a generated per-session workspace
+        no other registry covers. Non-git roots are re-detected on every call,
+        so a repository cloned into the workspace mid-session gains index
+        coverage on the next search.
+
+        :param root: Absolute directory the search walks.
+        :returns: A registry whose workspace root is *root*.
+        """
+        key = str(root)
+        registry = _search_fs_registries.get(key)
+        if registry is None or not isinstance(registry, GitFilesystemRegistry):
+            registry = create_filesystem_registry(watch_path=root)
+            registry.start()
+            _search_fs_registries[key] = registry
+        return registry
 
     async def _session_snapshot(session_id: str) -> _SessionSnapshot:
         cached = _session_snapshot_cache.get(session_id)
@@ -11228,13 +11251,19 @@ def create_runner_app(
         )
         indexed: list[FilesystemEntry] | None = None
         try:
-            session_registry = (
-                None if fs._absolute(path) else await _resolve_session_fs_registry(session_id)
-            )
-            if session_registry is not None:
+            registry = None
+            if not fs._absolute(path):
+                env_root = fs._resolve("")
+                registry = await _resolve_session_fs_registry(session_id)
+                if registry is None or registry.cwd != env_root:
+                    # The session registry watches a different tree than this
+                    # walk covers, so its index would answer for the wrong
+                    # files; consult one rooted where the search actually runs.
+                    registry = _search_registry_for_root(env_root)
+            if registry is not None:
                 indexed = await _asyncio.to_thread(
                     index_search,
-                    session_registry,
+                    registry,
                     fs._resolve(path),
                     _validate_path(path) if path else "",
                     q,
