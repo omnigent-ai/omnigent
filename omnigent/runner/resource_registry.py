@@ -12,6 +12,7 @@ See ``designs/SESSION_RESOURCES_API_DESIGN.md`` §Runner internal model.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -1278,6 +1279,56 @@ class SessionResourceRegistry:
             with self._lock:
                 self._status_pollers[session_id] = status_poller
 
+        native_input_ready = False
+
+        def _on_tick() -> None:
+            nonlocal native_input_ready
+            if status_poller is not None:
+                status_poller.tick()
+            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
+                try:
+                    from omnigent.harnesses.claude_native.bridge import (
+                        acknowledge_auto_mode_billing_notice,
+                        auto_mode_billing_notice_visible,
+                        bridge_dir_for_conversation_id,
+                        bridge_dir_from_launch_args,
+                    )
+
+                    # Recheck a cached match before sending any acknowledgement.
+                    if auto_mode_billing_notice_visible(instance.last_pane_text() or ""):
+                        bridge_dir = bridge_dir_from_launch_args(instance.args)
+                        if bridge_dir is None:
+                            bridge_dir = bridge_dir_for_conversation_id(session_id)
+                        acknowledge_auto_mode_billing_notice(
+                            bridge_dir,
+                            expected_socket_path=str(instance.socket_path),
+                            expected_tmux_target=instance.tmux_target,
+                        )
+                except Exception:  # noqa: BLE001 - keep lifecycle observation running.
+                    _logger.debug(
+                        "Claude auto-mode billing notice acknowledgement failed",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE and not native_input_ready:
+                # Readiness logging must not stop the lifecycle watcher on failure.
+                with contextlib.suppress(Exception):
+                    from omnigent.harnesses.claude_native.bridge import claude_pane_text_ready
+
+                    # The watcher already captured this live pane; no extra tmux query.
+                    if claude_pane_text_ready(instance.last_pane_text() or ""):
+                        native_input_ready = True
+                        _logger.info(
+                            "Claude native input ready",
+                            extra=debug_event(
+                                "native_input_ready",
+                                session_id=session_id,
+                                harness="claude-native",
+                                terminal_instance_id=instance.diagnostic_id,
+                                stage="native_input",
+                            ),
+                        )
+
         def _on_activity() -> None:
             # Runs on the watcher daemon thread; hop to the loop so the
             # loop-only publishers (queue.put_nowait) are touched safely.
@@ -1355,6 +1406,7 @@ class SessionResourceRegistry:
             instance.start_idle_watcher_thread(
                 on_activity=_on_activity if activity_publisher is not None else None,
                 on_exit=_on_exit,
+                on_tick=_on_tick if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE else None,
                 replace=replace,
             )
             return
@@ -1377,19 +1429,11 @@ class SessionResourceRegistry:
             # behind it.
             last_activity_emit["value"] = None
 
-        def _on_tick() -> None:
-            # Drive the status-file poller on the watcher cadence. No-op
-            # once it resolves the file and every read is unchanged, cheap
-            # (one ``stat``) otherwise; retires to the PTY watcher if the
-            # file never appears (old Claude) or later vanishes.
-            if status_poller is not None:
-                status_poller.tick()
-
         instance.start_idle_watcher_thread(
             on_activity=_on_activity,
             on_idle=_on_idle,
             on_exit=_on_exit,
-            on_tick=_on_tick if status_poller is not None else None,
+            on_tick=_on_tick,
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,
@@ -1459,7 +1503,7 @@ class SessionResourceRegistry:
         terminal_id = terminal_resource_id(terminal_name, session_key)
         with self._lock:
             observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
-            self._terminal_roles.pop((session_id, terminal_id), None)
+            observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
         if observed is None:
             return
         if observed != lifecycle:
@@ -1498,6 +1542,18 @@ class SessionResourceRegistry:
                 if current is not None and instance is not None and current is not instance:
                     superseded_by = current
 
+        # Only the Codex terminal records a final-screen excerpt on its exit
+        # event. Codex takes the pane-dead path (keep_alive_after_exit) but its
+        # last_output is dropped by the publisher's auxiliary short-circuit, so
+        # the debug log is the only durable path to that evidence. Every other
+        # terminal keeps the guarantee that lifecycle attributes hold no pane
+        # contents, so their excerpt stays absent.
+        redacted_last_output: str | None = None
+        if observed_role == CODEX_NATIVE_TERMINAL_ROLE and last_output:
+            from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+
+            redacted_last_output = sanitize_diagnostic_text(last_output) or None
+
         publisher = self._terminal_exit_publisher
         _logger.info(
             "Terminal exit observed: session=%s terminal=%s:%s "
@@ -1518,6 +1574,7 @@ class SessionResourceRegistry:
                 terminal_lifecycle=lifecycle.value,
                 session_status_before_exit=session_status_before_exit or "unknown",
                 terminal_exit_status=exit_status,
+                terminal_last_output=redacted_last_output,
                 superseded=superseded_by is not None,
             ),
         )
@@ -1572,6 +1629,7 @@ class SessionResourceRegistry:
                         session_id=session_id,
                         terminal_id=terminal_id,
                         terminal_instance_id=entry.instance.diagnostic_id,
+                        terminal_name=entry.terminal_name,
                     ),
                 )
                 closed = await self._terminal_registry.close(

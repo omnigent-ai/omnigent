@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
 
+from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.stores.conversation_store import ConversationStore
+    from omnigent.stores.file_store import FileStore
 
 
 def runner_inference_verified(conversation: Conversation, response: httpx.Response) -> bool:
@@ -28,12 +32,24 @@ def runner_inference_verified(conversation: Conversation, response: httpx.Respon
     return isinstance(payload, dict) and payload.get("inference_config_verified") is True
 
 
+_logger = logging.getLogger(__name__)
+
+
 class RunnerSessionInitializer:
     """Share initialization readiness within one runner tunnel generation."""
 
-    def __init__(self, registry: TunnelRegistry, *, server_version: str) -> None:
+    def __init__(
+        self,
+        registry: TunnelRegistry,
+        *,
+        server_version: str,
+        conversation_store: ConversationStore | None = None,
+        file_store: FileStore | None = None,
+    ) -> None:
         self._registry = registry
         self._server_version = server_version
+        self._conversation_store = conversation_store
+        self._file_store = file_store
         self._tasks: dict[
             tuple[str, int, str, str, str | None, bool],
             asyncio.Task[httpx.Response],
@@ -69,22 +85,48 @@ class RunnerSessionInitializer:
         )
         task = self._tasks.get(key)
         if task is None:
-            task = asyncio.create_task(
-                runner_client.post(
-                    "/v1/sessions",
-                    json=build_runner_session_init_payload(
-                        conversation,
-                        server_version=self._server_version,
-                        suppress_recovery_turn=suppress_recovery_turn,
-                        resume_interrupted_turn=resume_interrupted_turn,
-                        recovery_id=(
-                            self._recovery_ids.setdefault(key, uuid4().hex)
-                            if resume_interrupted_turn
-                            else None
-                        ),
-                    ),
-                    timeout=timeout,
+            payload = build_runner_session_init_payload(
+                conversation,
+                server_version=self._server_version,
+                suppress_recovery_turn=suppress_recovery_turn,
+                resume_interrupted_turn=resume_interrupted_turn,
+                recovery_id=(
+                    self._recovery_ids.setdefault(key, uuid4().hex)
+                    if resume_interrupted_turn
+                    else None
                 ),
+            )
+
+            async def post_session_init() -> httpx.Response:
+                if self._conversation_store is not None and self._file_store is not None:
+                    from omnigent.server.routes._sessions.helpers import (
+                        _filesystem_attachment_in_history,
+                        require_filesystem_attachment_runtime,
+                    )
+
+                    attachment = await asyncio.to_thread(
+                        _filesystem_attachment_in_history,
+                        conversation.id,
+                        self._conversation_store,
+                        self._file_store,
+                    )
+                    if attachment is not None:
+                        require_filesystem_attachment_runtime(
+                            host_id=None,
+                            runner_id=runner_id,
+                            host_registry=None,
+                            tunnel_registry=self._registry,
+                        )
+                return await self._post_initialize(
+                    runner_client,
+                    session_id=conversation.id,
+                    runner_id=runner_id,
+                    payload=payload,
+                    timeout=timeout,
+                )
+
+            task = asyncio.create_task(
+                post_session_init(),
                 name=f"runner-session-init-{conversation.id}",
             )
             self._tasks[key] = task
@@ -127,6 +169,44 @@ class RunnerSessionInitializer:
             if key[2] == session_id:
                 self._tasks.pop(key, None)
                 self._recovery_ids.pop(key, None)
+
+    async def _post_initialize(
+        self,
+        runner_client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        runner_id: str,
+        payload: dict[str, object],
+        timeout: float,
+    ) -> httpx.Response:
+        with runner_log_scope(session_id, runner_id):
+            _logger.info(
+                "Initializing runner session",
+                extra=debug_event("runner_session_init_started", stage="session_init"),
+            )
+            try:
+                response = await runner_client.post(
+                    "/v1/sessions",
+                    json=payload,
+                    timeout=timeout,
+                )
+            except Exception:
+                _logger.exception(
+                    "Runner session initialization failed",
+                    extra=debug_event("runner_session_init_failed", stage="session_init"),
+                )
+                raise
+            failed = not 200 <= response.status_code < 300
+            log = _logger.error if failed else _logger.info
+            log(
+                "Runner session initialization finished",
+                extra=debug_event(
+                    "runner_session_init_failed" if failed else "runner_session_initialized",
+                    stage="session_init",
+                    status_code=response.status_code,
+                ),
+            )
+            return response
 
     def invalidate_runner(self, runner_id: str) -> None:
         """Forget completed readiness when a runner tunnel goes away."""

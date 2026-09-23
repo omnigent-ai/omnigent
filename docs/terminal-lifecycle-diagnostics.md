@@ -32,8 +32,11 @@ idle differs from losing it during a turn. Check the subsequent turn-status
 event for the actual user-visible outcome.
 
 The new attributes contain no pane contents, command arguments, or filesystem
-paths. Existing human-readable errors remain unchanged. No extra tmux probes
-are introduced for diagnostics.
+paths, with one scoped exception: the Codex terminal's `terminal_exit_observed`
+event carries `terminal_last_output`, a bounded, redacted excerpt of its final
+screen (terminal control sequences stripped and known credential patterns
+redacted). No other terminal records pane contents. Existing human-readable
+errors remain unchanged. No extra tmux probes are introduced for diagnostics.
 
 ## Verification
 

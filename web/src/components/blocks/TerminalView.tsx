@@ -9,12 +9,22 @@
 // guard against a missing `ref.current`.
 
 import { Loader2Icon } from "lucide-react";
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { copyText } from "@/lib/clipboard";
-import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
+import {
+  isTerminalClipboardWritePending,
+  queueTerminalClipboardWrite,
+} from "@/lib/terminalClipboardWriter";
+import { getOmnigentServerIdentity, isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
+import {
+  canRememberTerminalClipboardPreference,
+  readTerminalClipboardPreference,
+  subscribeTerminalClipboardPreference,
+  writeTerminalClipboardPreference,
+  type TerminalClipboardPreference,
+} from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
@@ -26,9 +36,15 @@ import {
 } from "@/lib/terminalThemePreferences";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
+  TerminalClipboardPrompt,
+  type TerminalClipboardDecision,
+  type TerminalClipboardPromptReason,
+} from "./TerminalClipboardPrompt";
+import {
   type ConnectionState,
   type TerminalActivityListener,
   type TerminalInputListener,
+  applyTerminalCopy,
   isUnexpectedTerminalClose,
   resolveTerminalWorkspaceFileLink,
   TerminalSession,
@@ -70,6 +86,14 @@ export const RECONNECT_BACKOFF_MS = [
  * plain reset-on-connect, a connect→drop hot loop would retry forever.
  */
 export const RECONNECT_STABLE_MS = 30_000;
+
+interface TerminalClipboardRequest {
+  scope: string;
+  epoch: number;
+  generation: number;
+  text: string;
+  source: "terminal" | "selection";
+}
 
 interface TerminalViewProps {
   /** Session/conversation identifier, e.g. ``"conv_abc123"``. */
@@ -153,53 +177,74 @@ export function TerminalView({
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
-  const clipboardScope = `${sessionId}\0${terminalId}\0${readOnly ? "read-only" : "writable"}`;
-  const [clipboardPrompt, setClipboardPrompt] = useState<{
-    scope: string;
-    epoch: number;
-    generation: number;
-    text: string;
-  } | null>(null);
+  const clipboardServerIdentity = getOmnigentServerIdentity();
+  const clipboardScope = JSON.stringify([clipboardServerIdentity, sessionId, terminalId, readOnly]);
+  const [clipboardPrompt, setClipboardPrompt] = useState<
+    | (TerminalClipboardRequest & {
+        reason: TerminalClipboardPromptReason;
+        copyFailed?: boolean;
+      })
+    | null
+  >(null);
   const clipboardScopeRef = useRef({ scope: clipboardScope, epoch: 0 });
-  // Consent is scoped to one terminal identity and never persisted. A WS
-  // reconnect keeps it; switching terminals starts from "ask" synchronously.
+  // Unremembered choices apply to one mounted terminal; saved choices apply
+  // to every terminal on this server in the current browser or app.
   const clipboardConsentRef = useRef<{
     scope: string;
-    decision: "ask" | "session" | "blocked";
-  }>({ scope: clipboardScope, decision: "ask" });
+    decision: TerminalClipboardPreference;
+  }>({ scope: clipboardScope, decision: readTerminalClipboardPreference() });
+  const clipboardNeedsClickRef = useRef(false);
   const clipboardRequestGenerationRef = useRef(0);
   const clipboardMountedRef = useRef(true);
   const clipboardActiveRef = useRef(active);
-  const clipboardWorkerEpochRef = useRef(0);
-  const clipboardConsentToastKey = useId();
-  const clipboardConsentToastIdRef = useRef<string | number | null>(null);
-  const clipboardAutoRunningRef = useRef<number | null>(null);
-  const clipboardAutoPendingRef = useRef<{
-    scope: string;
-    epoch: number;
-    workerEpoch: number;
-    generation: number;
-    text: string;
-    kind: "automatic" | "user";
-  } | null>(null);
   const [clipboardScopeEpoch, setClipboardScopeEpoch] = useState(0);
   useLayoutEffect(() => {
     if (clipboardActiveRef.current !== active) {
       clipboardActiveRef.current = active;
       clipboardRequestGenerationRef.current += 1;
-      clipboardWorkerEpochRef.current += 1;
-      if (!active) clipboardAutoPendingRef.current = null;
+      if (!active) {
+        setClipboardPrompt(null);
+      }
     }
     if (clipboardScopeRef.current.scope !== clipboardScope) {
       const epoch = clipboardScopeRef.current.epoch + 1;
       clipboardScopeRef.current = { scope: clipboardScope, epoch };
-      clipboardConsentRef.current = { scope: clipboardScope, decision: "ask" };
+      clipboardConsentRef.current = {
+        scope: clipboardScope,
+        decision: readTerminalClipboardPreference(),
+      };
+      clipboardNeedsClickRef.current = false;
       clipboardRequestGenerationRef.current += 1;
-      clipboardWorkerEpochRef.current += 1;
-      clipboardAutoPendingRef.current = null;
+      setClipboardPrompt(null);
       setClipboardScopeEpoch(epoch);
     }
   }, [active, clipboardScope]);
+  useEffect(
+    () =>
+      subscribeTerminalClipboardPreference((decision) => {
+        const { scope, epoch } = clipboardScopeRef.current;
+        const previousGeneration = clipboardRequestGenerationRef.current;
+        const generation = (clipboardRequestGenerationRef.current += 1);
+        clipboardConsentRef.current = { scope, decision };
+        clipboardNeedsClickRef.current = false;
+        // Shared grants keep waiting text visible; revocations discard it.
+        const keepPendingRequest =
+          decision === "allow" && clipboardMountedRef.current && clipboardActiveRef.current;
+        setClipboardPrompt((current) =>
+          keepPendingRequest &&
+          current?.scope === scope &&
+          current.epoch === epoch &&
+          current.generation === previousGeneration
+            ? {
+                ...current,
+                generation,
+                reason: current.reason === "consent" ? "permission" : current.reason,
+              }
+            : null,
+        );
+      }),
+    [clipboardServerIdentity],
+  );
   // True between an unexpected close and the re-dial it scheduled, so
   // the overlay reads "Reconnecting…" instead of the dead-end
   // "Bridge closed" message during automatic recovery.
@@ -255,8 +300,6 @@ export function TerminalView({
     return () => {
       clipboardMountedRef.current = false;
       clipboardRequestGenerationRef.current += 1;
-      clipboardWorkerEpochRef.current += 1;
-      clipboardAutoPendingRef.current = null;
     };
   }, []);
 
@@ -274,81 +317,41 @@ export function TerminalView({
     onInputRef.current?.();
   }, []);
 
-  const copyTerminalText = useCallback(async (text: string): Promise<boolean> => {
-    try {
-      await copyText(text);
-      return true;
-    } catch {
-      return false;
-    }
-  }, []);
-
   const queueSessionClipboardCopy = useCallback(
-    (request: {
-      scope: string;
-      epoch: number;
-      generation: number;
-      text: string;
-      kind: "automatic" | "user";
-    }) => {
-      // At most one browser clipboard promise is in flight per live terminal
-      // epoch; newer requests replace the single pending text value.
-      const workerEpoch = clipboardWorkerEpochRef.current;
-      clipboardAutoPendingRef.current = { ...request, workerEpoch };
-      if (clipboardAutoRunningRef.current === workerEpoch) return;
-      clipboardAutoRunningRef.current = workerEpoch;
-      void (async () => {
-        try {
-          while (
-            clipboardWorkerEpochRef.current === workerEpoch &&
-            clipboardAutoPendingRef.current?.workerEpoch === workerEpoch
-          ) {
-            const next = clipboardAutoPendingRef.current;
-            clipboardAutoPendingRef.current = null;
-            if (
-              !clipboardMountedRef.current ||
-              !clipboardActiveRef.current ||
-              clipboardScopeRef.current.scope !== next.scope ||
-              clipboardScopeRef.current.epoch !== next.epoch ||
-              (next.kind === "automatic" && clipboardConsentRef.current.decision !== "session")
-            ) {
-              continue;
-            }
-            // oxlint-disable-next-line no-await-in-loop
-            const copied = await copyTerminalText(next.text);
-            if (
-              !clipboardMountedRef.current ||
-              !clipboardActiveRef.current ||
-              clipboardRequestGenerationRef.current !== next.generation ||
-              clipboardConsentRef.current.scope !== next.scope ||
-              clipboardScopeRef.current.epoch !== next.epoch
-            ) {
-              continue;
-            }
-            if (copied) {
-              toast.success("Copied from terminal.", { duration: 1500 });
-            } else if (next.kind === "automatic") {
-              clipboardConsentRef.current = { scope: next.scope, decision: "ask" };
-              setClipboardPrompt(next);
-            } else {
-              toast.error("Couldn't copy terminal selection to the clipboard.", {
-                duration: Number.POSITIVE_INFINITY,
-              });
-            }
+    (request: TerminalClipboardRequest & { kind: "automatic" | "user" }) => {
+      queueTerminalClipboardWrite({
+        text: request.text,
+        isCurrent: () =>
+          clipboardMountedRef.current &&
+          clipboardActiveRef.current &&
+          clipboardRequestGenerationRef.current === request.generation &&
+          clipboardScopeRef.current.scope === request.scope &&
+          clipboardScopeRef.current.epoch === request.epoch &&
+          (request.kind === "user" || clipboardConsentRef.current.decision === "allow"),
+        onResult: (copied) => {
+          if (copied) {
+            clipboardNeedsClickRef.current = false;
+            toast.success("Copied from terminal.", { duration: 1500 });
+          } else {
+            clipboardNeedsClickRef.current = true;
+            setClipboardPrompt({
+              ...request,
+              reason: "browser",
+              copyFailed: request.kind === "user",
+            });
           }
-        } finally {
-          if (clipboardAutoRunningRef.current === workerEpoch) {
-            clipboardAutoRunningRef.current = null;
-          }
-        }
-      })();
+        },
+      });
     },
-    [copyTerminalText],
+    [],
   );
 
   const notifyClipboardRequest = useCallback(
-    (text: string) => {
+    (text: string, copyEvent?: ClipboardEvent) => {
       if (
+        !clipboardMountedRef.current ||
+        !clipboardActiveRef.current ||
+        (readOnly && !copyEvent) ||
         clipboardScopeRef.current.scope !== clipboardScope ||
         clipboardScopeRef.current.epoch !== clipboardScopeEpoch
       ) {
@@ -356,155 +359,120 @@ export function TerminalView({
       }
       const generation = (clipboardRequestGenerationRef.current += 1);
       if (clipboardConsentRef.current.scope !== clipboardScope) {
-        clipboardConsentRef.current = { scope: clipboardScope, decision: "ask" };
+        clipboardConsentRef.current = {
+          scope: clipboardScope,
+          decision: readTerminalClipboardPreference(),
+        };
       }
-      if (clipboardConsentRef.current.decision === "blocked") return;
-      if (clipboardConsentRef.current.decision === "session") {
+      if (clipboardConsentRef.current.decision === "block") {
+        toast.info("Copying from this terminal is blocked.", {
+          id: "terminal-clipboard-blocked",
+          description: "Change this in Settings → General.",
+        });
+        return;
+      }
+      const source = copyEvent ? "selection" : "terminal";
+      if (
+        clipboardConsentRef.current.decision === "allow" &&
+        copyEvent?.clipboardData &&
+        !isTerminalClipboardWritePending()
+      ) {
+        // Keep native copy gestures independent of browser async-clipboard permissions.
+        // If a write is in flight, queue below so it cannot overwrite this selection.
+        setClipboardPrompt(null);
+        clipboardNeedsClickRef.current = false;
+        applyTerminalCopy(copyEvent, text);
+        return;
+      }
+      if (
+        clipboardConsentRef.current.decision === "allow" &&
+        (copyEvent || !clipboardNeedsClickRef.current)
+      ) {
+        setClipboardPrompt(null);
         queueSessionClipboardCopy({
           scope: clipboardScope,
           epoch: clipboardScopeEpoch,
           generation,
           text,
+          source,
           kind: "automatic",
         });
         return;
       }
-      // Keep only the newest request while the prompt is open. This avoids a
-      // malicious/noisy pane stacking prompts and copies the latest tmux buffer.
+      // Keep only the newest request while the prompt is open.
       setClipboardPrompt({
         scope: clipboardScope,
         epoch: clipboardScopeEpoch,
         generation,
         text,
+        source,
+        reason: clipboardConsentRef.current.decision === "allow" ? "browser" : "consent",
       });
     },
-    [clipboardScope, clipboardScopeEpoch, queueSessionClipboardCopy],
+    [clipboardScope, clipboardScopeEpoch, queueSessionClipboardCopy, readOnly],
   );
 
   const handleClipboardConsent = useCallback(
-    (decision: "session" | "once" | "blocked") => {
-      if (clipboardConsentToastIdRef.current !== null) {
-        toast.dismiss(clipboardConsentToastIdRef.current);
-        clipboardConsentToastIdRef.current = null;
-      }
+    (decision: TerminalClipboardDecision | "retry", remember = false) => {
       const prompt =
+        clipboardMountedRef.current &&
+        clipboardActiveRef.current &&
+        (!readOnly || clipboardPrompt?.source === "selection") &&
         clipboardPrompt?.scope === clipboardScope &&
         clipboardPrompt.epoch === clipboardScopeEpoch &&
         clipboardPrompt.generation === clipboardRequestGenerationRef.current
           ? clipboardPrompt
           : null;
+      if (prompt === null) return;
       setClipboardPrompt(null);
-      const generation = (clipboardRequestGenerationRef.current += 1);
-      if (decision === "blocked") {
-        clipboardConsentRef.current = { scope: clipboardScope, decision: "blocked" };
-        sessionRef.current?.focus();
-        return;
+      if (remember && (decision === "allow" || decision === "block")) {
+        if (!writeTerminalClipboardPreference(decision)) {
+          toast.error(
+            "Couldn't remember your clipboard choice. It applies only to this open terminal.",
+            {
+              duration: Number.POSITIVE_INFINITY,
+              closeButton: true,
+            },
+          );
+        }
       }
-      clipboardConsentRef.current = {
-        scope: clipboardScope,
-        decision: decision === "session" ? "session" : "ask",
-      };
-      if (prompt !== null) {
+      // Saving can synchronously invalidate requests in every mounted terminal.
+      const generation = (clipboardRequestGenerationRef.current += 1);
+      if (decision !== "retry") {
+        clipboardConsentRef.current = {
+          scope: clipboardScope,
+          decision: decision === "once" ? "ask" : decision,
+        };
+      }
+      if (decision !== "block") {
         queueSessionClipboardCopy({
           scope: clipboardScope,
           epoch: clipboardScopeEpoch,
           generation,
           text: prompt.text,
+          source: prompt.source,
           kind: "user",
         });
       }
       sessionRef.current?.focus();
     },
-    [clipboardPrompt, clipboardScope, clipboardScopeEpoch, queueSessionClipboardCopy],
+    [clipboardPrompt, clipboardScope, clipboardScopeEpoch, queueSessionClipboardCopy, readOnly],
   );
 
-  useEffect(() => {
-    const prompt =
-      clipboardPrompt?.scope === clipboardScope &&
-      clipboardPrompt.epoch === clipboardScopeEpoch &&
-      clipboardPrompt.generation === clipboardRequestGenerationRef.current &&
-      active &&
-      !readOnly
-        ? clipboardPrompt
-        : null;
-    if (prompt === null) {
-      if (clipboardConsentToastIdRef.current !== null) {
-        toast.dismiss(clipboardConsentToastIdRef.current);
-        clipboardConsentToastIdRef.current = null;
-      }
-      return;
-    }
+  const dismissClipboardPrompt = useCallback(() => {
+    clipboardRequestGenerationRef.current += 1;
+    setClipboardPrompt(null);
+    sessionRef.current?.focus();
+  }, []);
 
-    const toastId = `${clipboardConsentToastKey}-${prompt.generation}`;
-    if (
-      clipboardConsentToastIdRef.current !== null &&
-      clipboardConsentToastIdRef.current !== toastId
-    ) {
-      toast.dismiss(clipboardConsentToastIdRef.current);
-    }
-    toast("Allow this terminal to copy to your clipboard?", {
-      id: toastId,
-      description: (
-        <div className="flex flex-col gap-2">
-          <div>Terminal applications may replace clipboard contents.</div>
-          <div className="flex flex-wrap gap-2 pt-1">
-            <Button
-              type="button"
-              size="xs"
-              onClick={() => handleClipboardConsent("session")}
-              componentId="diagnostics.terminal.copy"
-            >
-              Allow for this session
-            </Button>
-            <Button
-              type="button"
-              size="xs"
-              variant="secondary"
-              onClick={() => handleClipboardConsent("once")}
-              componentId="diagnostics.terminal.copy"
-            >
-              Copy once
-            </Button>
-            <Button
-              type="button"
-              size="xs"
-              variant="ghost"
-              onClick={() => handleClipboardConsent("blocked")}
-            >
-              Block
-            </Button>
-          </div>
-        </div>
-      ),
-      duration: Number.POSITIVE_INFINITY,
-      closeButton: true,
-      testId: "terminal-clipboard-consent",
-      onDismiss: () => {
-        setClipboardPrompt((current) =>
-          current?.scope === prompt.scope &&
-          current.epoch === prompt.epoch &&
-          current.generation === prompt.generation
-            ? null
-            : current,
-        );
-      },
-    });
-    clipboardConsentToastIdRef.current = toastId;
-    return () => {
-      if (clipboardConsentToastIdRef.current === toastId) {
-        toast.dismiss(toastId);
-        clipboardConsentToastIdRef.current = null;
-      }
-    };
-  }, [
-    active,
-    clipboardConsentToastKey,
-    clipboardPrompt,
-    clipboardScope,
-    clipboardScopeEpoch,
-    handleClipboardConsent,
-    readOnly,
-  ]);
+  const visibleClipboardPrompt =
+    clipboardPrompt?.scope === clipboardScope &&
+    clipboardPrompt.epoch === clipboardScopeEpoch &&
+    clipboardPrompt.generation === clipboardRequestGenerationRef.current &&
+    active &&
+    (!readOnly || clipboardPrompt.source === "selection")
+      ? clipboardPrompt
+      : null;
 
   // Dispose the outgoing session before a remount re-dials. React 18
   // ignores the cleanup function attachSession returns (ref cleanups
@@ -768,22 +736,32 @@ export function TerminalView({
       data-terminal-theme={isDark ? "dark" : "light"}
       className="relative flex min-h-0 flex-1 flex-col"
     >
+      {visibleClipboardPrompt !== null && (
+        <TerminalClipboardPrompt
+          reason={visibleClipboardPrompt.reason}
+          canRemember={canRememberTerminalClipboardPreference()}
+          copyFailed={visibleClipboardPrompt.copyFailed === true}
+          onDecision={handleClipboardConsent}
+          onRetry={() => handleClipboardConsent("retry")}
+          onDismiss={dismissClipboardPrompt}
+        />
+      )}
       {/* `p-1` lives on the wrapper, not the xterm mount node: FitAddon
           reads the parent's border-box height but only subtracts the xterm
           element's own padding, so padding on the mount node oversizes the
           grid by a row and `overflow-hidden` clips the footer. */}
-      <div className="min-h-0 flex-1 overflow-hidden p-1">
+      <div className="relative min-h-0 flex-1 overflow-hidden p-1">
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
+        {state.kind !== "connected" && (
+          <StatusOverlay
+            state={state}
+            reconnectPending={reconnectPending}
+            onResume={onResume ? handleResume : undefined}
+            resumePending={resumePending}
+            resumeError={resumeError}
+          />
+        )}
       </div>
-      {state.kind !== "connected" && (
-        <StatusOverlay
-          state={state}
-          reconnectPending={reconnectPending}
-          onResume={onResume ? handleResume : undefined}
-          resumePending={resumePending}
-          resumeError={resumeError}
-        />
-      )}
     </div>
   );
 }

@@ -128,6 +128,7 @@ from omnigent.server.routes._sessions.common import (
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_STATUS_TYPE,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _logger,
@@ -147,6 +148,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_skill_slash_command_policy_body,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
+    _filesystem_attachment_in_history,
     _forward_session_change_to_runner,
     _get_runner_client,
     _get_runner_client_for_resource_access,
@@ -184,6 +186,8 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
+    _require_filesystem_attachment_harness,
+    _response_agent_name_from_store,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
@@ -191,6 +195,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stream_live_events,
     _wait_for_runner_client,
     reconcile_orphaned_running_status,
+    require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -571,6 +576,9 @@ def register_events_routes(
         - ``"external_session_status"`` publishes a terminal-observed
           ``session.status`` edge without persisting an item or
           starting/steering a task.
+        - ``"subagent.status"`` with ``data.idle=true`` publishes idle status
+          for transcript inactivity without forwarding a completion
+          to the runner.
         - ``"external_model_change"`` persists a terminal-observed
           model switch to ``model_override`` and publishes a
           ``session.model`` SSE event so the web picker reflects it.
@@ -696,6 +704,7 @@ def register_events_routes(
             _EXTERNAL_BTW_DISMISS_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
+            _SUBAGENT_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
@@ -720,6 +729,32 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        if body.type in ("message", _SLASH_COMMAND_TYPE):
+            from omnigent.inner.native_attachments import (
+                inline_filesystem_attachment_name,
+                requires_filesystem,
+            )
+
+            content = body.data.get("content")
+            inline_name = inline_filesystem_attachment_name(content)
+            if inline_name is not None:
+                raise OmnigentError(
+                    f"Attachment {inline_name!r} must be uploaded to the session's "
+                    "files and referenced by file_id.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            # Unsent uploads survive a switch or fork without appearing in history.
+            if file_store is not None and isinstance(content, list):
+                for block in content:
+                    file_id = block.get("file_id") if isinstance(block, dict) else None
+                    if not isinstance(file_id, str):
+                        continue
+                    stored = await asyncio.to_thread(file_store.get, file_id)
+                    if stored is None or stored.session_id not in (None, session_id):
+                        continue
+                    if stored.filename is not None and requires_filesystem(stored.filename):
+                        await _require_filesystem_attachment_harness(conv, stored.filename)
+                        break
         # Fail fast on malformed tools at the boundary. The raw dicts
         # (not the parsed objects) are what the runner stores — the
         # parse call is purely a validator.
@@ -1390,9 +1425,15 @@ def register_events_routes(
                 )
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
-        if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
+        if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
             status = body.data.get("status")
-            if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
+            if body.type == _SUBAGENT_STATUS_TYPE:
+                if body.data.get("idle") is not True:
+                    raise OmnigentError(
+                        "subagent.status requires data.idle to be true",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+            elif not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
                 raise OmnigentError(
                     f"external_session_status requires data.status in "
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
@@ -1401,7 +1442,7 @@ def register_events_routes(
             response_id = body.data.get("response_id")
             if response_id is not None and not isinstance(response_id, str):
                 raise OmnigentError(
-                    "external_session_status data.response_id must be a string",
+                    f"{body.type} data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
             # ``None`` (field absent) = no information; leave the sticky
@@ -1428,22 +1469,8 @@ def register_events_routes(
             blocked_on = (
                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
             )
-            # A background-task ``waiting`` marks an ended turn, so deliver it
-            # as ``idle``: the session takes a new message now, and for a
-            # sub-agent the terminal-delivery branch below must fire (otherwise
-            # the orchestrator hangs). The tally still drives the indicator.
-            # The claude-native forwarder no longer sends ``waiting`` at all —
-            # this normalizes it for runners that predate that change.
-            effective_status = _background_task_delivery_status(status, bg_count, conv)
-            if effective_status != status:
-                status = effective_status
-                body.data["status"] = status
-            if status == "quiesced":
-                # The claude-native sub-agent transcript-quiescence badge: a
-                # UI signal only. Publish it as an idle badge, but never
-                # forward it to the runner — the runner's terminal-delivery
-                # branch consumes "idle"/"failed" as authoritative
-                # completions, and a >5s transcript gap is not one.
+            if body.type == _SUBAGENT_STATUS_TYPE:
+                # A transcript lull publishes idle but is not a runner completion.
                 _publish_status(
                     session_id,
                     "idle",
@@ -1454,6 +1481,17 @@ def register_events_routes(
                     blocked_on=blocked_on,
                 )
                 return {"queued": False}
+            assert isinstance(status, str)
+            # A background-task ``waiting`` marks an ended turn, so deliver it
+            # as ``idle``: the session takes a new message now, and for a
+            # sub-agent the terminal-delivery branch below must fire (otherwise
+            # the orchestrator hangs). The tally still drives the indicator.
+            # The claude-native forwarder no longer sends ``waiting`` at all —
+            # this normalizes it for runners that predate that change.
+            effective_status = _background_task_delivery_status(status, bg_count, conv)
+            if effective_status != status:
+                status = effective_status
+                body.data["status"] = status
             # Terminal edges carry the harness's own persisted text: the
             # child's result on ``idle``, and on ``failed`` — when the
             # forwarder attached no detail — its error report (claude-native's
@@ -1482,8 +1520,14 @@ def register_events_routes(
                     message=output.strip(),
                 )
             if status_error is not None:
+                failed_agent_name = await asyncio.to_thread(
+                    _response_agent_name_from_store, conversation_store, session_id, response_id
+                )
                 await _persist_session_status_error_labels(
-                    session_id, status_error, conversation_store
+                    session_id,
+                    status_error,
+                    conversation_store,
+                    agent_name=failed_agent_name,
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
@@ -2068,6 +2112,26 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        # Recheck the bound runtime: forks and host restarts can change it
+        # after upload, while retained history still needs these files.
+        if body.type in ("message", _SLASH_COMMAND_TYPE) and _is_native_terminal_session(conv):
+            content = body.data.get("content")
+            attachment = await asyncio.to_thread(
+                _filesystem_attachment_in_history,
+                session_id,
+                conversation_store,
+                file_store,
+                content=content if isinstance(content, list) else [],
+            )
+            if attachment is not None:
+                await asyncio.to_thread(
+                    require_filesystem_attachment_runtime,
+                    host_id=conv.host_id,
+                    runner_id=conv.runner_id,
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                    tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    runner_router=runner_router,
+                )
         native_terminal_ready = False
         if _runner_needs_session_init:
             # The runner was unavailable when this request began, so its

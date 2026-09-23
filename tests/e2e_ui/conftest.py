@@ -172,7 +172,38 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
 # Populated by ``live_server`` so test-scoped fixtures can access the
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
-_server_state: dict[str, object] = {}
+class _ServerState(dict[str, object]):
+    def __missing__(self, key: str) -> object:
+        if self.get("workflow_owned") and key in {
+            "pid",
+            "runner_pid",
+            "database_uri",
+            "restart_server",
+            "binding_token",
+        }:
+            raise RuntimeError(
+                f"Workflow-owned reproduction does not expose {key!r} to test fixtures. "
+                "Use the product HTTP API, or run this process/database test in a "
+                "separate fixture-owned environment outside dev.repro_env exec."
+            )
+        raise KeyError(key)
+
+
+_server_state: dict[str, object] = _ServerState()
+
+
+def _prepared_repro_environment() -> dict[str, str]:
+    keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
+    values = {key: os.environ.get(key, "") for key in keys}
+    if any(values.values()) and not all(values.values()):
+        missing = ", ".join(key for key, value in values.items() if not value)
+        raise RuntimeError(
+            f"Incomplete prepared reproduction environment: missing {missing}. "
+            "Launch tests via python -m dev.repro_env exec -- ..."
+        )
+    return values
+
+
 _WEB_DIR = _REPO_ROOT / "web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
@@ -567,6 +598,9 @@ def mock_llm_server_url(
     :param tmp_path_factory: Pytest temp path factory for logs.
     :returns: The mock server base URL, e.g. ``"http://127.0.0.1:51235"``.
     """
+    if url := _prepared_repro_environment()["OMNIGENT_REPRO_MODEL_URL"]:
+        yield url
+        return
     mock_port = _find_free_port()
     mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
     log_handle = open(mock_log, "w")  # noqa: SIM115
@@ -689,7 +723,7 @@ def seed_committed_items(session_id: str, items: list[Any]) -> None:
     if not database_uri:
         raise RuntimeError(
             "seeding needs the spawned server's database; it is "
-            "unavailable when running against --ui-base-url."
+            "unavailable with --ui-base-url or a workflow-owned reproduction environment."
         )
     SqlAlchemyConversationStore(str(database_uri)).append(session_id, items)
 
@@ -757,7 +791,7 @@ def set_session_task_summary(session_id: str, task_summary: str) -> None:
     if not database_uri:
         raise RuntimeError(
             "set_session_task_summary needs the spawned server's database; it "
-            "is unavailable when running against --ui-base-url."
+            "is unavailable with --ui-base-url or a workflow-owned reproduction environment."
         )
     SqlAlchemyConversationStore(str(database_uri)).set_task_summary(session_id, task_summary)
 
@@ -836,7 +870,9 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         ``--ui-skip-build``.
     :returns: ``None``. Side effect is the populated build dir.
     """
-    if request.config.getoption("--ui-base-url"):
+    if _prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"] or request.config.getoption(
+        "--ui-base-url"
+    ):
         return
     if request.config.getoption("--ui-skip-build"):
         return
@@ -1005,6 +1041,19 @@ def live_server(
         the expected local runner does not report online within
         :data:`_HEALTH_TIMEOUT_S` seconds.
     """
+    prepared = _prepared_repro_environment()
+    if base_url := prepared["OMNIGENT_REPRO_SERVER_URL"]:
+        _server_state.update(
+            runner_id=prepared["OMNIGENT_REPRO_RUNNER_ID"],
+            server_url=base_url,
+            mock_llm_url=mock_llm_server_url,
+            workflow_owned=True,
+        )
+        try:
+            yield base_url
+        finally:
+            _server_state.clear()
+        return
     override = request.config.getoption("--ui-base-url")
     if override:
         yield from _spawn_runner_against_external_server(override, tmp_path_factory)
@@ -1419,6 +1468,10 @@ def _ensure_runner_online(
     if _online():
         return None
 
+    if _server_state.get("workflow_owned"):
+        raise RuntimeError(
+            "Workflow-owned reproduction runner is offline; inspect .omnigent/repro-env logs"
+        )
     binding_token = str(_server_state["binding_token"])
     mock_url = str(_server_state.get("mock_llm_url", ""))
     runner_tmp = tmp_path_factory.mktemp("e2e_ui_respawn_runner")
@@ -2788,7 +2841,7 @@ def native_codex_session(
 def _temp_omnigent_mock_config(
     mock_llm_server_url: str, harness: str
 ) -> Generator[None, None, None]:
-    """Temporarily write a mock provider config to ~/.omnigent/config.yaml.
+    """Temporarily write a mock provider config in the selected config home.
 
     Native credential helpers may read provider configuration on every turn,
     so the mock config stays in place for the fixture's full lifetime.
@@ -2798,10 +2851,19 @@ def _temp_omnigent_mock_config(
         ``"http://127.0.0.1:51235"``.
     :param harness: ``"claude"`` or ``"codex"``.
     """
-    config_dir = Path.home() / ".omnigent"
-    config_path = config_dir / "config.yaml"
+    from omnigent.config import global_config_path
+
+    # Back up and restore the target without replacing a user's config symlink.
+    config_path = global_config_path().resolve()
+    config_dir = config_path.parent
     config_dir.mkdir(parents=True, exist_ok=True)
-    original = config_path.read_text() if config_path.exists() else None
+    backup = config_path.with_name(config_path.name + ".e2e-backup")
+    if backup.exists():
+        raise RuntimeError(
+            f"Unrestored mock-provider backup at {backup}; "
+            "recover the original config before retrying"
+        )
+    original = config_path.read_bytes() if config_path.exists() else None
 
     if harness == "claude":
         mock_config = textwrap.dedent(f"""\
@@ -2829,12 +2891,18 @@ def _temp_omnigent_mock_config(
                     default: {_CODEX_MOCK_MODEL}
             """)
 
-    config_path.write_text(mock_config)
+    if original is not None:
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(original)
+            handle.flush()
+            os.fsync(handle.fileno())
     try:
+        config_path.write_text(mock_config)
         yield
     finally:
         if original is not None:
-            config_path.write_text(original)
+            backup.replace(config_path)
         else:
             config_path.unlink(missing_ok=True)
 
@@ -2845,22 +2913,14 @@ def native_claude_mock_session(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
-    """A runner-bound claude-native session whose LLM backend depends on env.
+    """A real Claude CLI using an explicitly configured mock provider.
 
-    When ``LLM_API_KEY`` is set in the environment (local dev / CI with real
-    credentials), the existing ``~/.omnigent/config.yaml`` is left untouched so
-    the runner boots Claude Code against the real gateway. When ``LLM_API_KEY``
-    is absent, a mock anthropic provider config is written to
-    ``~/.omnigent/config.yaml`` and restored on teardown.
-
-    :param live_server: Spawned server fixture; its runner is reused.
-    :param mock_llm_server_url: Session-scoped mock LLM server base URL.
-    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
-    :returns: ``(base_url, session_id)``.
+    Workflow-owned runners are already configured. Standalone tests temporarily
+    install a mock provider regardless of ambient credential placeholders.
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    use_mock = not os.environ.get("LLM_API_KEY")
+    use_mock = not _server_state.get("workflow_owned")
     if use_mock:
         ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "claude")
     else:
@@ -2886,19 +2946,14 @@ def native_codex_mock_session(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
-    """A runner-bound codex-native session whose LLM backend depends on env.
+    """A real Codex CLI using an explicitly configured mock provider.
 
-    Mirrors :func:`native_claude_mock_session` for the Codex wrapper: uses
-    mock LLM when ``LLM_API_KEY`` is absent, real gateway when it is set.
-
-    :param live_server: Spawned server fixture; its runner is reused.
-    :param mock_llm_server_url: Session-scoped mock LLM server base URL.
-    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
-    :returns: ``(base_url, session_id)``.
+    Workflow-owned runners reuse their startup config; standalone tests install
+    a temporary mock provider regardless of ambient credentials.
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    use_mock = not os.environ.get("LLM_API_KEY")
+    use_mock = not _server_state.get("workflow_owned")
     if use_mock:
         ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "codex")
     else:

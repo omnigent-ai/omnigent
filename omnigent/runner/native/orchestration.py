@@ -14,6 +14,7 @@ import dataclasses
 import json
 import logging
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -4417,6 +4418,7 @@ async def _auto_create_codex_terminal(
         _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         CodexAppServerClient,
         CodexAppServerResponseError,
+        _format_codex_version,
         apply_codex_thread_effort,
         build_codex_native_server,
         build_codex_remote_args,
@@ -4436,6 +4438,7 @@ async def _auto_create_codex_terminal(
         socket_path_for_bridge_dir,
         write_bridge_state,
     )
+    from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
     from omnigent.inner.codex_executor import codex_extended_catalog_env
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -4864,6 +4867,7 @@ async def _auto_create_codex_terminal(
     # Keep it off the runner loop so heartbeats and other sessions can progress.
     app_server = await asyncio.to_thread(
         build_codex_native_server,
+        session_id=session_id,
         socket_path=socket_path,
         codex_home=codex_home,
         cwd=Path(workspace),
@@ -5134,6 +5138,25 @@ async def _auto_create_codex_terminal(
         codex_launch_args = resolve_harness_args(
             "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
         )
+        # One row per launch with the argv the TUI actually receives, so a
+        # dead terminal can be tied to its flags, wrapper and probed version.
+        loggable_launch_args = shlex.join(redact_codex_launch_args(codex_launch_args))
+        _logger.info(
+            "Codex terminal launch: session=%s command=%s codex_cli_version=%s resume=%s args=%s",
+            session_id,
+            codex_command,
+            _format_codex_version(app_server.codex_cli_version),
+            launch_config.external_session_id is not None,
+            loggable_launch_args,
+            extra=debug_event(
+                "codex_terminal_launch",
+                session_id=session_id,
+                command=codex_command,
+                codex_cli_version=_format_codex_version(app_server.codex_cli_version),
+                resume=launch_config.external_session_id is not None,
+                args=loggable_launch_args,
+            ),
+        )
         terminal_view = await resource_registry.launch_auxiliary_terminal(
             session_id=session_id,
             terminal_name="codex",
@@ -5164,6 +5187,10 @@ async def _auto_create_codex_terminal(
                 # in the detached tmux pane (no tunnel traffic) and create its
                 # thread before anyone attaches.
                 tmux_start_on_attach=False,
+                # Keep the private tmux server alive after the TUI exits so the
+                # exit event carries the exit status and final screen instead
+                # of a bare "no server running" probe failure (claude/pi parity).
+                keep_alive_after_exit=True,
             ),
         )
         publish_event(
@@ -5191,6 +5218,17 @@ async def _auto_create_codex_terminal(
             await app_server.close()
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
+
+    if launch_config.external_session_id is not None:
+        _logger.info(
+            "Codex native input ready",
+            extra=debug_event(
+                "native_input_ready",
+                session_id=session_id,
+                harness="codex-native",
+                stage="native_input",
+            ),
+        )
 
     # Known-thread resumes publish bridge state before the terminal starts;
     # only fresh discovery needs to extend the executor's state wait.
@@ -5224,6 +5262,7 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 workspace=workspace,
                 event_client=event_client,
+                app_server=app_server,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
@@ -5285,6 +5324,7 @@ async def _codex_discover_thread_and_forward(
     workspace: str,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    app_server: CodexNativeAppServer | None = None,
     login_required: bool = False,
     thread_start_timeout_seconds: float | None = None,
     subagent_router: SubagentRouter | None = None,
@@ -5316,6 +5356,8 @@ async def _codex_discover_thread_and_forward(
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param app_server: This launch's process, retained for failure diagnostics
+        before cleanup. A later launch may replace the session registry entry.
     :param login_required: ``True`` when the resolved launch defers to
         Codex's own login with no usable stored credential — the TUI parks
         on the sign-in screen and cannot start a thread on its own. Chat
@@ -5339,6 +5381,7 @@ async def _codex_discover_thread_and_forward(
         write_bridge_startup_error,
         write_bridge_state,
     )
+    from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
     from omnigent.harnesses.codex_native.forwarder import (
         supervise_forwarder,
         wait_for_thread_started,
@@ -5372,6 +5415,7 @@ async def _codex_discover_thread_and_forward(
             "(`omnigent setup`), then send the message again.",
         )
 
+    discovery_started_at = time.monotonic()
     try:
         try:
             if login_required:
@@ -5390,9 +5434,38 @@ async def _codex_discover_thread_and_forward(
             # at startup, or the event stream ended before a thread was
             # created. Stop forwarding (cleanup runs in ``finally``); any other
             # error is a bug and propagates.
+            try:
+                diagnostics = collect_codex_startup_diagnostics(app_server)
+            except Exception as diagnostics_error:  # noqa: BLE001
+                # Diagnostics must not replace the startup error or prevent cleanup.
+                diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
+            failure_event = debug_event("codex_thread_start_failed", session_id=session_id)
+            failure_event["attributes"] = {
+                "harness": "codex-native",
+                "phase": "thread_discovery",
+                "reason": "timeout" if isinstance(exc, TimeoutError) else "event_stream_ended",
+                "timeout_s": (
+                    None
+                    if login_required
+                    else (
+                        thread_start_timeout_seconds
+                        if thread_start_timeout_seconds is not None
+                        else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                    )
+                ),
+                "elapsed_ms": round((time.monotonic() - discovery_started_at) * 1000),
+                "login_required": login_required,
+                **diagnostics,
+            }
             _logger.exception(
-                "Codex TUI never started a thread for %s; chat will not forward",
+                "Codex TUI never started a thread for %s; chat will not forward%s",
                 session_id,
+                (
+                    f"\nCodex startup stderr:\n{diagnostics['stderr_tail']}"
+                    if diagnostics.get("stderr_tail")
+                    else ""
+                ),
+                extra=failure_event,
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
             if isinstance(exc, TimeoutError):
@@ -5426,6 +5499,16 @@ async def _codex_discover_thread_and_forward(
                 # The session workspace: without it the executor falls back
                 # to the runner process's own cwd when starting turns.
                 cwd=workspace,
+            ),
+        )
+
+        _logger.info(
+            "Codex native input ready",
+            extra=debug_event(
+                "native_input_ready",
+                session_id=session_id,
+                harness="codex-native",
+                stage="native_input",
             ),
         )
 
@@ -5494,6 +5577,15 @@ async def _codex_discover_thread_and_forward(
         # in its own ``finally``; ``close()`` is idempotent. The app-server
         # subprocess is ours to stop, else it orphans one process per session.
         # Pop first so the dict never holds a closed reference.
+        _logger.info(
+            "Codex native input stopped",
+            extra=debug_event(
+                "native_input_stopped",
+                session_id=session_id,
+                harness="codex-native",
+                stage="native_input",
+            ),
+        )
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         with contextlib.suppress(Exception):
             await event_client.close()
@@ -5557,6 +5649,15 @@ async def _codex_forward_known_thread(
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
+        _logger.info(
+            "Codex native input stopped",
+            extra=debug_event(
+                "native_input_stopped",
+                session_id=session_id,
+                harness="codex-native",
+                stage="native_input",
+            ),
+        )
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
@@ -7555,6 +7656,7 @@ async def _auto_create_claude_terminal(
                 session_id=session_id,
                 external_session_id=session_external_id,
                 workspace=Path(workspace).resolve(),
+                bridge_dir=bridge_dir,
             )
             if _transcript is not None:
                 resume_external_session_id = session_external_id
@@ -7651,6 +7753,7 @@ async def _auto_create_claude_terminal(
                 session_id=session_id,
                 external_session_id=our_uuid,
                 workspace=_clone_workspace,
+                bridge_dir=bridge_dir,
             )
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _built = None
@@ -8118,13 +8221,19 @@ async def _auto_create_claude_terminal(
             # activity drives the session's PTY-derived working status.
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
         )
-    except Exception:
-        _logger.exception(
-            "Claude terminal tmux launch failed: session=%s elapsed_ms=%.0f",
-            session_id,
-            (time.monotonic() - started_at) * 1000,
-            extra={"session_id": session_id},
-        )
+    except (Exception, asyncio.CancelledError) as launch_error:
+        # Preserve the original failure even if diagnostic cleanup is cancelled.
+        if not isinstance(launch_error, asyncio.CancelledError):
+            _logger.exception(
+                "Claude terminal tmux launch failed: session=%s elapsed_ms=%.0f",
+                session_id,
+                (time.monotonic() - started_at) * 1000,
+                extra={"session_id": session_id},
+            )
+        from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
+
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
@@ -8376,7 +8485,7 @@ async def _delete_native_bridge_dirs(
     session_id: str,
 ) -> None:
     """
-    Remove any native-harness bridge dirs left behind by a session.
+    Remove native-harness bridge directories and attachment caches for a session.
 
     Each native harness keeps a per-conversation bridge dir under
     ``/tmp/omnigent-<uid>/<harness>-native/<digest>`` (some use ``~/.omnigent``)
@@ -8440,6 +8549,7 @@ async def _delete_native_bridge_dirs(
     from omnigent.harnesses.qwen_native.bridge import (
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
+    from omnigent.inner.native_attachments import attachment_cache_dir
 
     labels: dict[str, str] = {}
     if server_client is not None:
@@ -8465,6 +8575,8 @@ async def _delete_native_bridge_dirs(
         pi_bridge_dir(session_id),
         qwen_bridge_dir(session_id),
     }
+    # A cache can survive a missing bridge directory, including after a reboot.
+    targets.update(attachment_cache_dir(target) for target in tuple(targets))
     for target in targets:
         try:
             shutil.rmtree(target, ignore_errors=False)
@@ -8472,7 +8584,7 @@ async def _delete_native_bridge_dirs(
             pass
         except OSError as exc:
             _logger.debug(
-                "Failed to remove native bridge dir %s for session %s: %s",
+                "Failed to remove native session directory %s for session %s: %s",
                 target,
                 session_id,
                 exc,
@@ -8893,13 +9005,37 @@ async def _launch_native_terminal(
                 ctx = await build_context(ctx)
             elif resolve_agent_spec is not None:
                 ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
+            _logger.info(
+                "Native input startup",
+                extra=debug_event(
+                    "native_input_starting",
+                    session_id=ctx.session_id,
+                    harness=harness_name,
+                    stage="native_input",
+                ),
+            )
             await adapter(ctx)
+            _logger.info(
+                "Native terminal started",
+                extra=debug_event(
+                    "terminal_started",
+                    session_id=ctx.session_id,
+                    harness=harness_name,
+                    stage="terminal_start",
+                ),
+            )
             return True
         except Exception as exc:
             _logger.exception(
                 "Failed to auto-create %s terminal for %s",
                 agent.terminal_name,
                 ctx.session_id,
+                extra=debug_event(
+                    "terminal_start_failed",
+                    session_id=ctx.session_id,
+                    harness=harness_name,
+                    stage="terminal_start",
+                ),
             )
             if reraise:
                 raise
@@ -9016,7 +9152,25 @@ async def _ensure_native_terminal(
         try:
             if build_context is not None:
                 ctx = await build_context(ctx)
+            _logger.info(
+                "Native input startup",
+                extra=debug_event(
+                    "native_input_starting",
+                    session_id=ctx.session_id,
+                    harness=agent.harness,
+                    stage="native_input",
+                ),
+            )
             view = await adapter(ctx)
+            _logger.info(
+                "Native terminal started",
+                extra=debug_event(
+                    "terminal_started",
+                    session_id=ctx.session_id,
+                    terminal_name=terminal_name,
+                    stage="terminal_start",
+                ),
+            )
         except Exception as exc:
             if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
                 # Expected lifecycle event (agent deleted/rebound), not an
@@ -9034,7 +9188,12 @@ async def _ensure_native_terminal(
                     "%s terminal ensure failed for session=%s",
                     agent.display_name,
                     ctx.session_id,
-                    extra={"session_id": ctx.session_id},
+                    extra=debug_event(
+                        "terminal_start_failed",
+                        session_id=ctx.session_id,
+                        terminal_name=terminal_name,
+                        stage="terminal_start",
+                    ),
                 )
             return _native_terminal_start_error_response(
                 exc, agent.display_name, session_id=ctx.session_id

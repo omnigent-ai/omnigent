@@ -1156,6 +1156,17 @@ describe("right-click context menu", () => {
     );
   });
 
+  it.each(["quick-pin-conversation", "quick-archive-conversation", "conversation-actions"])(
+    "opens the session menu when right-clicking the %s button",
+    (testId) => {
+      renderSidebar();
+
+      expect(fireEvent.contextMenu(screen.getByTestId(testId))).toBe(false);
+
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    },
+  );
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 

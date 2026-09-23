@@ -10,9 +10,10 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // the aside sits off (0,0), e.g. while it peeks as a floating card.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
 
 const orderingState = vi.hoisted(() => ({ available: true }));
@@ -63,6 +64,18 @@ vi.mock("@/hooks/useConversations", () => ({
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("./ForkSessionDialog", () => ({
+  ForkSessionDialog: ({ open }: { open: boolean }) => (
+    <Dialog open={open}>
+      <DialogContent aria-describedby={undefined}>
+        <DialogTitle>Clone session</DialogTitle>
+        <button type="button" className="select-text">
+          Advanced settings
+        </button>
+      </DialogContent>
+    </Dialog>
+  ),
+}));
 
 vi.mock("@/lib/serverOrigin", () => ({
   isCurrentServerLocal: () => false,
@@ -143,13 +156,46 @@ beforeEach(() => {
   mockConversations([conv("conv_a")]);
 });
 
-afterEach(() => {
+afterEach(async () => {
   fireEvent.mouseUp(document);
+  fireEvent.touchEnd(document);
   cleanup();
+  // dnd-kit defers removing its document click/selection listeners by 50 ms.
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(50);
+  vi.useRealTimers();
+  await new Promise((resolve) => {
+    setTimeout(resolve, 50);
+  });
+  vi.restoreAllMocks();
   vi.clearAllMocks();
 });
 
 describe("session drag preview portal", () => {
+  it.each(["mouse", "touch"])(
+    "does not start a session drag or clear selection for %s gestures in the fork dialog",
+    async (input) => {
+      renderSidebar();
+      const row = screen.getByRole("link", { name: "conv_a" }).closest("li")!;
+      fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+      fireEvent.click(screen.getByTestId("fork-conversation"));
+      const label = screen.getByRole("button", { name: "Advanced settings" });
+      expect(row.contains(label)).toBe(false);
+      const clearSelection = vi.spyOn(window.getSelection()!, "removeAllRanges");
+
+      if (input === "mouse") {
+        startRowDrag(label);
+      } else {
+        vi.useFakeTimers();
+        const touch = { identifier: 0, clientX: 10, clientY: 10 };
+        fireEvent.touchStart(label, { touches: [touch], changedTouches: [touch] });
+        await act(() => vi.advanceTimersByTimeAsync(300));
+      }
+
+      expect(clearSelection).not.toHaveBeenCalled();
+      expect(document.body.querySelector('[class*="max-w-[16rem]"]')).toBeNull();
+    },
+  );
+
   it.each([false, true])("enables project dragging only with order data: %s", (available) => {
     orderingState.available = available;
     vi.mocked(useProjects).mockReturnValue({

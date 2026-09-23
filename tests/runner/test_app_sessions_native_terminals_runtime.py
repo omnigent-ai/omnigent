@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import shlex
 import shutil
 import threading
 import uuid
@@ -452,6 +453,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         lambda bridge_dir: session_reap_calls.append(bridge_dir),
     )
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    caplog.set_level(logging.INFO, logger="omnigent.runner.native.orchestration")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
     codex_native_bridge.write_bridge_state(
         bridge_dir,
@@ -707,6 +709,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                 )
             assert retained_client.closed is retain_subscription
             assert app_server.closed
+            assert not any(
+                getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records
+            )
             assert not forward_calls
             assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
             return
@@ -721,6 +726,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     finally:
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
+    readiness = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"
+    ]
+    assert len(readiness) == 1
+    assert readiness[0].session_id == session_id
     assert terminal_view.id == "terminal_codex_main"
     assert app_server.started is True
     expected_codex_home = codex_native_bridge.codex_home_for_bridge_dir(
@@ -753,6 +763,20 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
+    # A kept pane is what lets the exit event carry Codex's exit status and
+    # final screen; without it an early exit is just "no server running".
+    assert launched.keep_alive_after_exit is True
+    launch_events = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "codex_terminal_launch"
+    ]
+    assert len(launch_events) == 1
+    assert launch_events[0].session_id == session_id
+    assert launch_events[0].attributes["command"] == "codex-wrapper"
+    assert launch_events[0].attributes["resume"] is True
+    assert launch_events[0].attributes["args"] == shlex.join(launched.args)
+    from omnigent.harnesses.codex_native.app_server import _format_codex_version
+
+    assert launch_events[0].attributes["codex_cli_version"] == _format_codex_version(version)
     assert preload_calls == [
         (
             app_server.listen_url,
@@ -3377,7 +3401,7 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
 
 @pytest.mark.asyncio
 async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
     When the fresh TUI never starts a thread, the background task must close
@@ -3391,6 +3415,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
         _codex_discover_thread_and_forward,
     )
 
+    caplog.set_level("INFO", logger="omnigent.runner.native.orchestration")
     closed = {"client": False, "app_server": False}
 
     class _Client:
@@ -3425,6 +3450,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 
     # client closed = no dangling reader task/socket; app_server closed = no
     # orphaned subprocess; dropped from registry = no leaked dict reference.
+    assert not any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
     assert closed["client"] is True
     assert closed["app_server"] is True
     assert session_id not in _AUTO_CODEX_APP_SERVERS
@@ -3504,6 +3530,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     The fresh-session bridge state must carry the session workspace as ``cwd``.
@@ -3520,6 +3547,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
         _codex_discover_thread_and_forward,
     )
 
+    caplog.set_level("INFO", logger="omnigent.runner.native.orchestration")
     thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
     workspace = tmp_path / "selected-workspace"
     wait_calls: list[dict[str, object]] = []
@@ -3582,6 +3610,10 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
 
     state = codex_native_bridge.read_bridge_state(tmp_path)
     assert state is not None
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
+    assert len(events) == 1
+    assert events[0].session_id == session_id
+    assert events[0].attributes["harness"] == "codex-native"
     assert state.thread_id == thread_id
     assert state.cwd == str(workspace)
     assert wait_calls == [{"timeout": 120.0}]

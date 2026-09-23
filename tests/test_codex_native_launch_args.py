@@ -14,6 +14,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     canonical_codex_launch_args,
     codex_config_profile,
     materialize_codex_config_profile,
+    redact_codex_launch_args,
 )
 
 
@@ -451,3 +452,86 @@ async def test_remote_resume_relative_config_roots_are_absolute(
         str(tmp_path / "extra"),
         str(tmp_path / "relative-output"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        pytest.param(
+            [
+                "OPENAI_API_KEY=sk-live-secret",
+                "codex",
+                "--",
+                "--dangerously-bypass-hook-trust",
+                "resume",
+                "--remote",
+                "ws://user:pw@127.0.0.1:4321/ws?token=abc",
+                "019e96aa-0be2-7343-8d3b-6f914d60936b",
+            ],
+            [
+                "OPENAI_API_KEY=***",
+                "codex",
+                "--",
+                "--dangerously-bypass-hook-trust",
+                "resume",
+                "--remote",
+                "ws://127.0.0.1:4321/ws",
+                "019e96aa-0be2-7343-8d3b-6f914d60936b",
+            ],
+            id="env-wrapper-and-url",
+        ),
+        pytest.param(
+            [
+                "-c",
+                'model="gpt-5.4-mini"',
+                "-c",
+                'model_providers.gateway.api_key="k"',
+                "--config=approval_policy=never",
+                '-cbase_url="https://h"',
+                "--config",
+                "sandbox_mode",
+                "--add-dir",
+                "/tmp/extra",
+                "-c",
+            ],
+            [
+                "-c",
+                'model="gpt-5.4-mini"',
+                "-c",
+                "model_providers.gateway.api_key=***",
+                "--config=approval_policy=never",
+                "-cbase_url=***",
+                "--config",
+                "sandbox_mode",
+                "--add-dir",
+                "/tmp/extra",
+                "-c",
+            ],
+            id="config-overrides",
+        ),
+        pytest.param(
+            [
+                "codex",
+                "--remote=ws://user:pw@127.0.0.1:4321/ws?sig=secret",
+                "--cd=/tmp/work",
+                "resume",
+            ],
+            [
+                "codex",
+                "--remote=ws://127.0.0.1:4321/ws",
+                "--cd=/tmp/work",
+                "resume",
+            ],
+            id="attached-url-option",
+        ),
+        pytest.param(
+            ["codex", "--remote", "ws://[broken", "-c", 'endpoint="ws://[broken'],
+            ["codex", "--remote", "***", "-c", "endpoint=***"],
+            id="malformed-url-never-raises",
+        ),
+    ],
+)
+def test_redact_codex_launch_args_masks_secret_bearing_values(
+    args: list[str], expected: list[str]
+) -> None:
+    assert redact_codex_launch_args(args) == expected

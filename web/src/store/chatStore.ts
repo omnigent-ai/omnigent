@@ -3997,7 +3997,7 @@ async function bindStream(
               message: session.lastTaskError.message,
               source: "",
               code: session.lastTaskError.code,
-              ...structuredErrorFields(session.lastTaskError),
+              ...structuredErrorFields(session.lastTaskError, session.lastTaskError.agent_name),
             }
           : null;
       return {
@@ -5721,7 +5721,7 @@ export async function pumpStreamEvents(
         // in-flight preview — the first-turn "no spinner" bug. On a matching
         // (or absent) active response this is the normal terminal path.
         const active = get().activeResponse;
-        const endedId = block.response?.id ?? block.ctx?.responseId ?? "";
+        const endedId = block.response?.id || block.ctx?.responseId || "";
         if (active !== null && active.responseId !== endedId) {
           continue;
         }
@@ -6481,16 +6481,32 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // Deduplicate repeated status edges for one response, but preserve the
         // same failure on later turns so each rejected prompt has a visible error.
         const statusError = event.error;
+        const statusResponseId = event.responseId ?? s.activeResponse?.responseId ?? "";
         const hasMatchingStatusError =
           statusError != null &&
           s.blocks.some(
             (block) =>
               block.type === "error" &&
-              block.ctx.responseId === (event.responseId ?? "") &&
+              block.ctx.responseId === statusResponseId &&
               block.code === statusError.code &&
               block.message === statusError.message,
           );
         if (event.status === "failed" && statusError != null && !hasMatchingStatusError) {
+          const responseAgents = new Set(
+            s.blocks.flatMap((block) =>
+              event.responseId &&
+              block.ctx.responseId === event.responseId &&
+              (block.type === "response_start" ||
+                block.type === "text_done" ||
+                block.type === "tool_group" ||
+                block.type === "reasoning_block") &&
+              block.ctx.agent?.trim()
+                ? [block.ctx.agent.trim()]
+                : [],
+            ),
+          );
+          const statusAgentName =
+            responseAgents.size === 1 ? responseAgents.values().next().value : undefined;
           patch.blocks = [
             ...s.blocks,
             {
@@ -6500,13 +6516,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 depth: 0,
                 turn: 0,
                 timestamp: 0,
-                responseId: event.responseId ?? "",
+                responseId: statusResponseId,
                 itemId: null,
               },
               message: statusError.message,
               source: "",
               code: statusError.code,
-              ...structuredErrorFields(statusError),
+              ...structuredErrorFields(statusError, statusAgentName),
             } satisfies ErrorBlock,
           ];
         }
