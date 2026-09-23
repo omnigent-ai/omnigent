@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
@@ -220,10 +221,23 @@ def test_intake_assigns_before_duplicate_closure() -> None:
     assert events == ["labels", "comment", "assign", "close"]
 
 
-@pytest.mark.parametrize("intake", [False, True])
-def test_event_fetches_related_issues_for_intake_and_edits(monkeypatch, tmp_path, intake) -> None:
+@pytest.mark.parametrize(
+    "intake,mode,corpus_status",
+    [
+        (True, "dry_run", None),
+        (False, "dry_run", None),
+        (False, "apply", None),
+        (False, "apply", 429),
+        (False, "apply", 503),
+    ],
+)
+def test_event_fetches_related_issues_for_intake_and_edits(
+    monkeypatch, tmp_path, intake, mode, corpus_status
+) -> None:
     issue = replace(_issue(), body="Cannot start a session; see #3.")
     captured = []
+    writes = []
+    labels = set()
 
     class Client:
         def open_issue(self, number, *, full_author_history):
@@ -232,13 +246,14 @@ def test_event_fetches_related_issues_for_intake_and_edits(monkeypatch, tmp_path
             return issue
 
         def issue_corpus(self):
+            if corpus_status:
+                raise HTTPError("https://api.github.com", corpus_status, "Unavailable", {}, None)
             return (
                 {
                     "number": 3,
                     "title": "Session fails",
                     "body": "Cannot start a session",
-                    "state": "closed",
-                    "state_reason": "completed",
+                    "state": "open",
                 },
             )
 
@@ -250,10 +265,44 @@ def test_event_fetches_related_issues_for_intake_and_edits(monkeypatch, tmp_path
             assert intake
             return {}
 
+        def sync_missing_labels(self, manifest):
+            writes.append("sync_labels")
+
+        def issue_labels(self, number):
+            return tuple(sorted(labels))
+
+        def apply_labels(self, number, labels_add, labels_remove):
+            writes.append("labels")
+            labels.update(labels_add)
+            labels.difference_update(labels_remove)
+
+        def upsert_issue_comment(self, number, body):
+            assert "Automated triage" in body
+            writes.append("triage_comment")
+            return 1
+
+        def assign_issue(self, *args):
+            pytest.fail("Edit runs must not assign an issue")
+
+        def comment_on_issue_once(self, *args):
+            pytest.fail("Edit runs must not post duplicate comments")
+
+        def close_as_duplicate(self, *args):
+            pytest.fail("Edit runs must not close duplicates")
+
+    class DuplicateClassifier(FakeClassifier):
+        def classify(self, content):
+            return replace(
+                super().classify(content),
+                duplicate_decision="duplicate",
+                duplicate_of=3,
+                duplicate_confidence=1.0,
+            )
+
     def classifier(endpoint, areas, *, duplicate_candidates, review_bugs):
         captured.extend(duplicate_candidates)
         assert review_bugs
-        return FakeClassifier()
+        return DuplicateClassifier()
 
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setattr(event, "GitHubClient", lambda *_: Client())
@@ -275,6 +324,8 @@ def test_event_fetches_related_issues_for_intake_and_edits(monkeypatch, tmp_path
         str(tmp_path),
         "--run-id",
         "test-event",
+        "--mode",
+        mode,
         "--close-duplicates",
         "--post-duplicate-comments",
     ]
@@ -282,8 +333,27 @@ def test_event_fetches_related_issues_for_intake_and_edits(monkeypatch, tmp_path
         argv.extend(["--intake", "--maintainers", str(github_dir / "MAINTAINER")])
     monkeypatch.setattr("sys.argv", argv)
 
+    if corpus_status:
+        with pytest.raises(HTTPError) as raised:
+            event.main()
+        assert raised.value.code == corpus_status
+        payload = json.loads((tmp_path / "event.json").read_text())
+        assert payload["status"] == "failed"
+        assert payload["operation"] == "fetch_related_issues"
+        assert payload["error_type"] == "HTTPError"
+        assert payload["issue_number"] == 7
+        assert payload["mode"] == mode
+        assert captured == []
+        assert writes == []
+        return
+
     event.main()
 
     assert [candidate["number"] for candidate in captured] == [3]
     payload = json.loads((tmp_path / "event.json").read_text())
     assert (payload["intake"] is not None) == intake
+    assert payload["status"] == ("applied" if mode == "apply" else "planned")
+    assert writes == (["sync_labels", "labels", "triage_comment"] if mode == "apply" else [])
+    if mode == "apply":
+        assert "Bug" in labels
+        assert "duplicate" not in labels
