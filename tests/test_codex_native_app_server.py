@@ -4374,6 +4374,86 @@ def test_probe_codex_home_bridges_provider_tables_and_credential(
     assert "https://two.example" in (home / "config.toml").read_text()
 
 
+def test_probe_codex_home_refreshes_stale_credential_symlinks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reused probe home re-bridges credentials when the source home moved."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    old_source = tmp_path / "codex-old"
+    old_source.mkdir()
+    stale_auth = old_source / "auth.json"
+    stale_auth.write_text(json.dumps({"account": "stale"}))
+
+    source = tmp_path / "codex-current"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "gateway"\n[model_providers.gateway]\nname = "Gateway"\n'
+    )
+    (source / "auth.json").write_text(json.dumps({"account": "current"}))
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_codex_home_config_source_from_env",
+        lambda: source,
+    )
+
+    home = codex_native_app_server._probe_codex_home([])
+    auth = home / "auth.json"
+    assert auth.is_symlink()
+    assert json.loads(auth.read_text()) == {"account": "current"}
+
+    # Leave a symlink that still points at the previous source home.
+    auth.unlink()
+    auth.symlink_to(stale_auth)
+
+    home = codex_native_app_server._probe_codex_home([])
+    auth = home / "auth.json"
+    assert auth.is_symlink()
+    assert auth.resolve() == (source / "auth.json").resolve()
+    assert json.loads(auth.read_text()) == {"account": "current"}
+
+
+def test_probe_codex_home_refreshes_dangling_credential_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Removing and recreating the source credential re-bridges on the next probe."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source = tmp_path / ".codex"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "gateway"\n[model_providers.gateway]\nname = "Gateway"\n'
+    )
+    cred_path = source / ".credentials.json"
+    cred_path.write_text(json.dumps({"token": "first"}))
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_codex_home_config_source_from_env",
+        lambda: source,
+    )
+
+    home = codex_native_app_server._probe_codex_home([])
+    credentials = home / ".credentials.json"
+    assert credentials.is_symlink()
+    assert json.loads(credentials.read_text()) == {"token": "first"}
+
+    cred_path.unlink()
+    credentials.unlink()
+    credentials.symlink_to(tmp_path / "removed-credentials.json")
+
+    cred_path.write_text(json.dumps({"token": "second"}))
+    home = codex_native_app_server._probe_codex_home([])
+    credentials = home / ".credentials.json"
+    assert credentials.is_symlink()
+    assert json.loads(credentials.read_text()) == {"token": "second"}
+
+
 async def test_discovery_stderr_tail_is_bounded_and_redacted() -> None:
     """The probe retains one safe diagnostic without persisting raw stderr."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
