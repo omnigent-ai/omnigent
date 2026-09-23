@@ -13,12 +13,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -26,6 +29,7 @@ from omnigent.runner.native.orchestration import (
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
 )
+from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
 _ERROR_ID_RE = re.compile(r" Error ID: (err_[0-9a-f]{32})\.$")
 
@@ -76,6 +80,54 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
     assert payload["code"] == "native_terminal_start_failed"
     assert "agent is no longer available" not in payload["message"]
+
+
+def test_codex_early_exit_with_unknown_status_does_not_invent_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+    )
+    read_output = Mock(side_effect=AssertionError("capture is disabled"))
+    monkeypatch.setattr(instance, "last_exit_text", read_output)
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Codex", session_id="conv_1"
+    )
+
+    assert "Codex terminal exited before becoming available." in payload["message"]
+    assert "with status" not in payload["message"]
+    assert "Codex startup terminal output:" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+    read_output.assert_not_called()
+
+
+def test_codex_early_exit_diagnostic_failure_preserves_exit_cause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_status("1 2")
+    read_output = Mock(side_effect=ValueError("private diagnostic failure detail"))
+    monkeypatch.setattr(instance, "last_exit_text", read_output)
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Codex", session_id="conv_1"
+    )
+
+    assert "Codex terminal exited with status 2 before becoming available." in payload["message"]
+    assert "Codex startup terminal output:" not in payload["message"]
+    assert "private diagnostic failure detail" not in payload["message"]
+    read_output.assert_called_once_with()
 
 
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:

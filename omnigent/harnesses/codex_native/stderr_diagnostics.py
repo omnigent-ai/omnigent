@@ -4,22 +4,43 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import threading
 import uuid
 from collections import deque
+from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
 from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from omnigent.harnesses.diagnostics import DIAGNOSTIC_TAIL_BYTES, bounded_diagnostic_tail
+from omnigent.process_logging import harness_stderr_capture_enabled
 
+CODEX_DIAGNOSTIC_RUST_LOG = (
+    "warn,codex_core::client=info,codex_core::tools::parallel=debug,"
+    "codex_core::mcp=info,codex_http_client=debug,codex_client::default_client=debug,"
+    "codex_mcp_client=info,codex_code_mode::timing=debug"
+)
 MAX_STDERR_RECORD_BYTES = 1024 * 1024  # Includes the newline when present.
 _QUEUE_BYTES = MAX_STDERR_RECORD_BYTES
 _QUEUE_RECORDS = 256
 _EXPORT_INTERVAL_S = 0.25
 _CLOSE_TIMEOUT_S = 1.0
 _logger = logging.getLogger(__name__)
+
+
+def codex_app_server_diagnostic_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Enable native runtime stderr diagnostics only for opted-in app-servers.
+
+    Keep explicit launch/host filters, including an empty value or ``off``.
+    Broad core/protocol debug filters can include prompts and tool payloads;
+    the default selects request metadata, runtime timing, and warnings instead.
+    """
+    configured = dict(env)
+    if harness_stderr_capture_enabled():
+        configured.setdefault("RUST_LOG", os.environ.get("RUST_LOG", CODEX_DIAGNOSTIC_RUST_LOG))
+    return configured
 
 
 def report_capture_start_failure(*, session_id: str | None, pid: int, error_type: str) -> None:
