@@ -6527,13 +6527,10 @@ async def _dispatch_session_event_to_runner_impl(
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
 
-# Transient runner-tunnel drops (Apps ingress recycles, sleep-wake
-# reconnects) usually re-register in well under a second, and the worst
-# observed ingress-recycle burst took ~5s of failed attempts before the
-# tunnel was back. Hold the user-visible failure surface for double that
-# so those drops resolve silently; a runner still gone afterwards fails
-# as before. Crash-reported runner deaths bypass this grace entirely.
-RUNNER_DISCONNECT_GRACE_S: float = 10.0
+# Deployed runners back off to a 10s cap with ±50% jitter, so the
+# worst-case reconnect is ~15s plus handshake. 20s covers that cluster
+# and resolves transient drops silently; a runner still gone afterwards fails.
+RUNNER_DISCONNECT_GRACE_S: float = 20.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
