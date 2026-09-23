@@ -113,7 +113,26 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
             assert all(partial[key].inference_snapshot == value for key, value in original.items())
             assert partial[(0, bytes([2]) * 16)]._inference_snapshot_blob == encode(small)
             assert partial[(0, bytes([batch_size + 1]) * 16)]._inference_snapshot_blob is None
-        _migrate(engine, _REVISION)
+        plans: list[str] = []
+
+        def explain_mysql_cursor(conn, cursor, statement, parameters, context, executemany):
+            if (
+                not plans
+                and engine.dialect.name == "mysql"
+                and statement.startswith(f"SELECT {_TABLE}.workspace_id")
+                and "WHERE" in statement
+            ):
+                plans.append(
+                    conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+                )
+
+        sa.event.listen(engine, "before_cursor_execute", explain_mysql_cursor)
+        try:
+            _migrate(engine, _REVISION)
+        finally:
+            sa.event.remove(engine, "before_cursor_execute", explain_mysql_cursor)
+        if engine.dialect.name == "mysql":
+            assert plans and f"Index range scan on {_TABLE} using PRIMARY" in plans[0]
         after = _rows(engine)
         assert set(after) == set(before)
         for key, row in after.items():

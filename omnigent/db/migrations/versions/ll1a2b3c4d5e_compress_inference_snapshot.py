@@ -79,7 +79,16 @@ def _convert(to_binary: bool) -> None:
                 table.c.workspace_id, table.c.id
             )
             if cursor is not None:
-                query = query.where(sa.tuple_(table.c.workspace_id, table.c.id) > cursor)
+                if bind.dialect.name == "mysql":
+                    # MySQL treats tuple inequalities as filters over a full index scan.
+                    query = query.where(
+                        sa.or_(
+                            table.c.workspace_id > cursor[0],
+                            sa.and_(table.c.workspace_id == cursor[0], table.c.id > cursor[1]),
+                        )
+                    )
+                else:
+                    query = query.where(sa.tuple_(table.c.workspace_id, table.c.id) > cursor)
             rows = bind.execute(query.limit(_BATCH_SIZE)).all()
             if not rows:
                 break
