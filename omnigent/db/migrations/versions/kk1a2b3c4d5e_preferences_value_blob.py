@@ -3,6 +3,10 @@
 Oversized rows are discarded so preference reads fall back to defaults.
 Remaining bytes, including legacy uncompressed values, are unchanged.
 Downgrade widens MySQL storage but cannot restore discarded preferences.
+
+Stop old application instances before upgrading, or enforce strict SQL mode
+on their MySQL connections. This migration's strict mode protects its ALTER;
+old non-strict writers could still truncate oversized saves after it finishes.
 """
 
 from __future__ import annotations

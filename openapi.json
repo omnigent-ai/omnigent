@@ -3807,7 +3807,7 @@
         "type": "object"
       },
       "ProjectOrderRequest": {
-        "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.",
+        "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.\nThe serialized preference must fit in 65,535 bytes after compression and\nframing; lists below the 10,000-ID limit can still exceed this byte limit.",
         "properties": {
           "ordered_project_ids": {
             "anyOf": [

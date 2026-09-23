@@ -4971,6 +4971,8 @@ class ProjectOrderRequest(BaseModel):
     """Rank owned project IDs; unranked projects append in discovery order.
 
     Null selects alphabetical mode without erasing the remembered manual IDs.
+    The serialized preference must fit in 65,535 bytes after compression and
+    framing; lists below the 10,000-ID limit can still exceed this byte limit.
     """
 
     ordered_project_ids: (
