@@ -1256,9 +1256,14 @@ async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
         keep_alive_after_exit=True,
     )
     refresh_calls = 0
+    reap_requests = 0
 
     def output(*args: str) -> str:
-        nonlocal refresh_calls
+        nonlocal refresh_calls, reap_requests
+        if args[0] == "run-shell":
+            assert args == ("run-shell", "-b", ":")
+            reap_requests += 1
+            return ""
         if args[0] == "list-panes":
             if args[-1] != terminal_mod._PANE_EXIT_STATUS_FORMAT:
                 return "1\n"
@@ -1311,13 +1316,84 @@ async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
         assert instance.last_exit_status() == expected_status
         assert instance.last_exit_text() == "safe exit diagnostic"
         assert refresh_calls == (1 if final_fields == "1||" else 2)
+        assert reap_requests == (0 if final_fields == "1||" else 1)
     finally:
         await instance._stop_idle_watcher()
         instance._stop_idle_watcher_thread()
 
 
+@pytest.mark.parametrize("capture", ["async", "sync"])
+async def test_exit_status_refresh_recovers_a_lost_child_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str
+) -> None:
+    """A missed SIGCHLD leaves the pane unreaped until another server child exits."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    clock = iter([10.0, 10.04, 10.09, 10.1])
+    monkeypatch.setattr(
+        terminal_mod, "time", SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _: None)
+    )
+    monkeypatch.setattr(terminal_mod, "_EXIT_STATUS_POLL_SECONDS", 0)
+    probes = 0
+    reap_requests = 0
+
+    def output(*args: str) -> str:
+        nonlocal probes, reap_requests
+        if args[0] == "run-shell":
+            assert args == ("run-shell", "-b", ":")
+            reap_requests += 1
+            return ""
+        assert args[0] == "list-panes"
+        probes += 1
+        return "1|2|" if reap_requests and probes >= 3 else "1||"
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=output))
+    monkeypatch.setattr(instance, "_tmux_output_sync", output)
+    if capture == "async":
+        await instance._refresh_exit_status()
+    else:
+        instance._refresh_exit_status_sync()
+
+    assert instance.last_exit_status() == 2
+    assert probes == 3
+    assert reap_requests == 1
+
+
+@pytest.mark.parametrize("capture", ["async", "sync"])
+@pytest.mark.parametrize("fields", ["1|0|", "1|2|", "1||TERM", "1||15"])
+async def test_exit_status_refresh_does_not_nudge_already_reaped_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str, fields: str
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    commands: list[tuple[str, ...]] = []
+
+    def output(*args: str) -> str:
+        commands.append(args)
+        return fields
+
+    monkeypatch.setattr(instance, "_tmux_output", AsyncMock(side_effect=output))
+    monkeypatch.setattr(instance, "_tmux_output_sync", output)
+    if capture == "async":
+        await instance._refresh_exit_status()
+    else:
+        instance._refresh_exit_status_sync()
+
+    assert len(commands) == 1
+    assert commands[0][0] == "list-panes"
+
+
+@pytest.mark.parametrize("cancel_during", ["probe", "reap_request"])
 async def test_exit_status_refresh_propagates_cancellation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_during: str
 ) -> None:
     instance = TerminalInstance(
         name="codex",
@@ -1327,7 +1403,9 @@ async def test_exit_status_refresh_propagates_cancellation(
     )
     probing = asyncio.Event()
 
-    async def waiting_probe(*_args: str) -> str:
+    async def waiting_probe(*args: str) -> str:
+        if cancel_during == "reap_request" and args[0] == "list-panes":
+            return "1||"
         probing.set()
         await asyncio.Future()
         raise AssertionError("unreachable")
@@ -1342,8 +1420,14 @@ async def test_exit_status_refresh_propagates_cancellation(
 
 
 @pytest.mark.parametrize("capture", ["async", "sync"])
+@pytest.mark.parametrize(
+    "reap_error", [None, RuntimeError("tmux target gone"), OSError("fork failed")]
+)
 async def test_exit_status_refresh_stops_at_its_grace_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capture: str,
+    reap_error: Exception | None,
 ) -> None:
     instance = TerminalInstance(
         name="codex",
@@ -1359,9 +1443,15 @@ async def test_exit_status_refresh_stops_at_its_grace_deadline(
         SimpleNamespace(monotonic=lambda: next(clock), sleep=sleep_intervals.append),
     )
     probes = 0
+    reap_requests = 0
 
-    def pending(*_args: str) -> str:
-        nonlocal probes
+    def pending(*args: str) -> str:
+        nonlocal probes, reap_requests
+        if args[0] == "run-shell":
+            reap_requests += 1
+            if reap_error is not None:
+                raise reap_error
+            return ""
         probes += 1
         return "1||"
 
@@ -1374,6 +1464,7 @@ async def test_exit_status_refresh_stops_at_its_grace_deadline(
         assert sleep_intervals == pytest.approx([0.01, 0.01])
 
     assert probes == 3
+    assert reap_requests == 1
     assert instance.last_exit_status() is None
     assert list(clock) == []
 
@@ -1871,6 +1962,39 @@ async def _capture_launch_argv(
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
     return captured[0]
+
+
+@pytest.mark.parametrize("launch_fails", [False, True])
+async def test_launch_discards_previous_exit_diagnostics_before_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool
+) -> None:
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_status("1 2")
+    instance._remember_exit_snapshot("0 10000\nprevious startup failure")
+
+    async def spawn(*_args: object, **_kwargs: object) -> _ProcessWithStdout:
+        assert instance.last_exit_status() is None
+        assert instance.last_exit_text() is None
+        return _ProcessWithStdout(returncode=1 if launch_fails else 0, stderr=b"launch failed")
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+    )
+    if launch_fails:
+        with pytest.raises(RuntimeError, match="tmux launch failed"):
+            await instance.launch(cwd=tmp_path)
+    else:
+        await instance.launch(cwd=tmp_path)
+
+    assert instance.last_exit_status() is None
+    assert instance.last_exit_text() is None
 
 
 @pytest.mark.parametrize("version", [(3, 3), (3, 10)])

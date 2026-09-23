@@ -153,8 +153,10 @@ lifecycle-event attributes carry no pane contents (see
 required-terminal only); the event excerpt is its durable record.
 
 Liveness probes preserve the exit status and output before marking a pane
-stopped, so they cannot silence the exit watcher. A terminal that exits before
-registration also emits `terminal_exit_observed`, with
+stopped, so they cannot silence the exit watcher. If tmux reports a dead pane
+without a wait status, a bounded refresh nudges its private server to reap the
+child; signal-only or unavailable statuses remain unknown. A terminal that exits
+before registration also emits `terminal_exit_observed`, with
 `before_observation=True`. These early records always include available exit
 metadata; only opted-in Codex launches include a sanitized recent-output tail.
 They do not publish lifecycle changes for a resource that was never observed.

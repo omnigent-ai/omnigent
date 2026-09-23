@@ -1,10 +1,8 @@
 """E2E: an early codex-native TUI startup failure must report its real cause.
 
-The native Codex TUI is a separate ``--remote`` process from the app-server. When
-that TUI dies at startup, the runner's thread discovery keeps waiting on the
-still-healthy app-server event stream and finally fails the first chat turn
-with a *generic* thread-discovery timeout, never capturing the TUI's exit
-status or actionable error.
+The native Codex TUI is a separate ``--remote`` process from the app-server.
+If it dies before creating a thread, the first chat turn must report the TUI's
+exit status and parser error, not a generic thread-discovery timeout.
 
 The rig forces the failure deterministically by injecting an unsupported
 launch arg via ``harness.codex-native.args`` — the real ``codex`` binary then
@@ -12,12 +10,8 @@ prints ``error: unexpected argument '--omni-telemetry-invalid-flag' found``
 and exits 2 before any thread exists. A mock provider routes the codex harness
 so login is not required (the launch is otherwise healthy).
 
-While the bug is live the first turn hangs through the 30s
-``wait_for_thread_started`` and fails with the ``startup timed out`` /
-``never started a thread`` executor error, losing the exit-2 cause. After a
-fix the turn must instead report the actual startup cause (or otherwise fail
-fast) — either way the generic thread-discovery-timeout markers disappear,
-which is what this test asserts.
+The test requires a visible error and a canonical transcript error containing
+exit status 2, the parser diagnostic, and the injected flag together.
 """
 
 from __future__ import annotations
@@ -43,11 +37,9 @@ from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view, 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _HEALTH_TIMEOUT_S = 60.0
-# The buggy path errors after the 30s thread-start timeout plus the executor's
-# bridge-state poll; give the terminal outcome ample room.
+# Allow slow CI startup while still requiring the specific parser error.
 _TURN_OUTCOME_TIMEOUT_S = 150.0
 _ERROR_PILL = '[data-testid="error-pill"]'
-_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _BAD_FLAG = "--omni-telemetry-invalid-flag"
 
 # The generic thread-discovery-timeout markers the buggy path emits instead of
@@ -194,6 +186,7 @@ def bad_flag_codex_session(
                         online = True
                         break
             except httpx.HTTPError:
+                # Transient HTTP failures are expected while the local rig starts.
                 pass
             time.sleep(0.5)
         if not online:
@@ -228,13 +221,11 @@ def test_codex_early_tui_startup_failure_reports_cause_not_timeout(
     page: Page,
     bad_flag_codex_session: tuple[str, str],
 ) -> None:
-    """The first turn must not die by burning the generic thread-start timeout.
+    """The first turn must expose the TUI's exit-2 parser error.
 
     Journey: open a codex-native session whose TUI exits 2 at startup, send
-    the first chat message, and watch the outcome. While the bug is live the
-    turn hangs through ``wait_for_thread_started`` and fails with the generic
-    ``startup timed out`` / ``never started a thread`` executor error, losing
-    the actual exit-2 startup cause — that is exactly what this test rejects.
+    the first chat message, and require an error with the actual startup
+    cause in the transcript rather than a generic thread-discovery timeout.
     """
     base_url, session_id = bad_flag_codex_session
     page.goto(f"{base_url}/c/{session_id}")
@@ -243,10 +234,9 @@ def test_codex_early_tui_startup_failure_reports_cause_not_timeout(
     _send(page, "Run a harmless command and report the result.")
     sent_at = time.monotonic()
 
-    # Wait for a terminal, user-visible outcome: an assistant reply (thread
-    # started) or an error pill.
-    outcome = page.locator(_ERROR_PILL).or_(page.locator(_ASSISTANT))
-    expect(outcome.first).to_be_visible(timeout=int(_TURN_OUTCOME_TIMEOUT_S * 1000))
+    expect(page.locator(_ERROR_PILL).first).to_be_visible(
+        timeout=int(_TURN_OUTCOME_TIMEOUT_S * 1000)
+    )
     elapsed = time.monotonic() - sent_at
 
     # Assert against the canonical transcript, not the pill's summarized text.
@@ -257,6 +247,13 @@ def test_codex_early_tui_startup_failure_reports_cause_not_timeout(
         for item in items.json()["data"]
         if item.get("type") == "error"
     ]
+    assert error_messages, "The visible startup error must be recorded in the transcript."
+    assert any(
+        "Codex terminal exited with status 2 before starting a thread." in message
+        and "unexpected argument" in message
+        and _BAD_FLAG in message
+        for message in error_messages
+    ), f"Expected the TUI exit status and parser cause in one error: {error_messages!r}"
 
     timed_out = [m for m in error_messages if _TIMEOUT_MARKER in m]
     assert not timed_out, (

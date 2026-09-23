@@ -1364,6 +1364,7 @@ class TerminalInstance:
             return
         # PTY EOF can mark a pane dead before SIGCHLD supplies its wait status.
         deadline = time.monotonic() + _EXIT_STATUS_REFRESH_SECONDS
+        reap_requested = False
         while True:
             try:
                 fields = await self._tmux_output(
@@ -1376,6 +1377,12 @@ class TerminalInstance:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
+            if not reap_requested:
+                reap_requested = True
+                # Older tmux builds can lose SIGCHLD while updating utmp.
+                # A no-op child asks this private server to reap again.
+                with contextlib.suppress(RuntimeError, OSError):
+                    await self._tmux_output("run-shell", "-b", ":")
             await asyncio.sleep(min(_EXIT_STATUS_POLL_SECONDS, remaining))
 
     def _refresh_exit_status_sync(self) -> None:
@@ -1383,6 +1390,7 @@ class TerminalInstance:
         if self._last_exit_status is not None:
             return
         deadline = time.monotonic() + _EXIT_STATUS_REFRESH_SECONDS
+        reap_requested = False
         while True:
             try:
                 fields = self._tmux_output_sync(
@@ -1395,6 +1403,10 @@ class TerminalInstance:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
+            if not reap_requested:
+                reap_requested = True
+                with contextlib.suppress(RuntimeError, OSError):
+                    self._tmux_output_sync("run-shell", "-b", ":")
             time.sleep(min(_EXIT_STATUS_POLL_SECONDS, remaining))
 
     def _tmux_base_cmd(self) -> list[str]:
