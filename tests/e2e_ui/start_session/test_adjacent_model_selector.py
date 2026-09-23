@@ -59,7 +59,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
                 "el => getComputedStyle(el).backgroundColor"
             )
             assert hovered_background != "rgba(0, 0, 0, 0)"
-            other = page.get_by_role("menu").get_by_role("menuitem", name="Other...", exact=True)
+            other = page.get_by_role("menu").get_by_role("menuitem", name="Custom agents...", exact=True)
             await other.hover()
             await expect(harness_row).to_have_css("background-color", "rgba(0, 0, 0, 0)")
             await expect(other).to_have_css("background-color", hovered_background)
@@ -124,7 +124,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             await page.mouse.move(parent_box["x"] + parent_box["width"] / 2, parent_box["y"] + 2)
             await page.wait_for_timeout(500)
             await expect(models).to_be_visible()
-            await parent.get_by_role("menuitem", name="Other...", exact=True).hover()
+            await parent.get_by_role("menuitem", name="Custom agents...", exact=True).hover()
             await page.wait_for_timeout(500)
             await expect(models).to_be_visible()
             await edit.hover()
@@ -168,7 +168,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             await trigger.click()
             await edit.click()
             await expect(models).to_be_visible()
-            await parent.get_by_role("menuitem", name="Other...", exact=True).click()
+            await parent.get_by_role("menuitem", name="Custom agents...", exact=True).click()
             await expect(models).not_to_be_visible()
             await expect(page.get_by_role("menuitem", name="Create custom agent")).to_be_visible()
             await page.mouse.click(20, 20)

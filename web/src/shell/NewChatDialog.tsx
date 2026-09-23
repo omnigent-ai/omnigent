@@ -1957,7 +1957,7 @@ export function AgentHarnessPicker({
                     }}
                     className="items-center"
                   >
-                    <span className="flex-1 text-left">{otherHarnessLabel}</span>
+                    <span className="flex-1 pl-6 text-left">{otherHarnessLabel}</span>
                     <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
                   </DropdownMenuItem>
                 ) : (
@@ -1977,7 +1977,7 @@ export function AgentHarnessPicker({
                         }
                       }}
                     >
-                      <span className="flex-1 text-left">{otherHarnessLabel}</span>
+                      <span className="flex-1 pl-6 text-left">{otherHarnessLabel}</span>
                     </DropdownMenuSubTrigger>
                     <HarnessPickerSubContent
                       sideOffset={-4}
@@ -2009,7 +2009,7 @@ export function AgentHarnessPicker({
                 }}
                 className="items-center"
               >
-                <span className="flex-1 text-left">Other...</span>
+                <span className="flex-1 pl-6 text-left">Custom agents...</span>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
               </DropdownMenuItem>
             ) : (
@@ -2019,7 +2019,7 @@ export function AgentHarnessPicker({
                   data-testid="new-chat-landing-custom-agents"
                   className="cursor-pointer items-center"
                 >
-                  <span className="flex-1 text-left">Other...</span>
+                  <span className="flex-1 pl-6 text-left">Custom agents...</span>
                 </DropdownMenuSubTrigger>
                 <HarnessPickerSubContent
                   sideOffset={-4}
