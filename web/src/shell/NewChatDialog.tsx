@@ -1685,10 +1685,13 @@ export function AgentHarnessPicker({
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
       const readiness = harnessReadinessOnHost(agent.harness, host);
-      if (!selected && hideUnconfigured && !readiness.selectable && readiness.fallbackRelevant)
-        continue;
+      const unavailable = !readiness.selectable && readiness.fallbackRelevant;
+      if (!selected && hideUnconfigured && unavailable) continue;
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      if (primaryOrder.includes(key) || agent.id === promotedHarnessId) {
+      const primary = primaryOrder.includes(key) || agent.id === promotedHarnessId;
+      // Unavailable primaries demote to "Other..." — the main list stays
+      // launch-ready; the selected harness always keeps its slot.
+      if (primary && (selected || !unavailable)) {
         ready.push(agent);
       } else more.push(agent);
     }

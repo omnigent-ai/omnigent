@@ -417,7 +417,9 @@
   background-color: var(--muted);
 }
 
-.composer-agent-menu .composer-agent-row > [role="menuitem"] {
+/* Disabled rows wrap the item in a tooltip span, so match through one wrapper. */
+.composer-agent-menu .composer-agent-row > [role="menuitem"],
+.composer-agent-menu .composer-agent-row > span > [role="menuitem"] {
   gap: 0;
   padding: 0;
 }

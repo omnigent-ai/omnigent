@@ -5112,11 +5112,14 @@ describe("NewChatLandingScreen", () => {
     ]);
   }
 
-  it("keeps primary harnesses visible when unconfigured and hiding is off", () => {
+  it("demotes unconfigured primary harnesses to the Other submenu when hiding is off", () => {
     mockHostWithHarnessReadiness();
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    // Unconfigured primaries leave the inline list but stay discoverable.
+    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
   });
 
@@ -5133,9 +5136,9 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
   });
 
-  it("leads with fully supported harnesses even when they need setup on the host", () => {
-    // Support level outranks readiness for the primary list: an unconfigured
-    // Codex still leads (badged), rather than being demoted to "More".
+  it("demotes primary harnesses that need setup on the host to the Other submenu", () => {
+    // Readiness gates the primary list: an unconfigured Codex demotes to
+    // "Other..." (still badged) instead of leading inline.
     mockHosts([
       {
         ...host("online"),
@@ -5145,9 +5148,9 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a2")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
-    // Nothing left to group → no "More" trigger at all.
-    expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
   });
 
   it("falls back from an unavailable remembered native harness to the first ready harness", () => {
@@ -5822,6 +5825,8 @@ describe("NewChatLandingScreen", () => {
     renderLanding({ harness_install_enabled: true });
 
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    // needs-auth Codex demotes to "Other..."; the badge rides along.
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     const warning = screen.getByTestId("new-chat-landing-agent-warning-a2");
     expect(warning).not.toHaveAttribute("title");
     fireEvent.focus(warning);
@@ -5837,6 +5842,8 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    // Broken Codex demotes to "Other..."; the row stays disabled there.
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     const row = screen.getByTestId("new-chat-landing-agent-a2");
     expect(row.closest("[data-harness-menu-row]")).toHaveAttribute("data-disabled");
     expect(row).toHaveAttribute("aria-disabled", "true");
@@ -5858,7 +5865,10 @@ describe("NewChatLandingScreen", () => {
     healthyRow.focus();
     expect(healthyRow).toHaveFocus();
     await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
-    fireEvent.focus(row);
+    // Moving focus to the main menu closes the submenu; reopen it before
+    // checking the same tooltip appears on keyboard focus.
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-agent-a2"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
       "Codex isn't configured on machine-1 — run omni setup on that machine.",
     );
@@ -9276,7 +9286,15 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
       );
       expect(screen.queryByTestId("new-chat-landing-smart-routing-dropped")).toBeNull();
       openPicker();
-      expectSmartRoutingHidden();
+      if (configured?.["claude-native"] === false) {
+        // Claude missing on the host demotes its row to "Other...".
+        expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+        expect(screen.queryByTestId("new-chat-landing-agent-a1")).toBeNull();
+        fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+        expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+      } else {
+        expectSmartRoutingHidden();
+      }
       // The arm may come back, so the pick stays remembered.
       expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
         a1: "auto-native",
