@@ -5562,21 +5562,28 @@ async def _codex_discover_thread_and_forward(
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
             if isinstance(exc, _CodexTerminalExited):
-                cause = f"terminal exited with status {exc.instance.last_exit_status()}"
-            elif isinstance(exc, TimeoutError):
-                timeout_seconds = (
-                    thread_start_timeout_seconds
-                    if thread_start_timeout_seconds is not None
-                    else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
-                )
-                cause = f"startup timed out after {timeout_seconds:g}s"
+                # The app-server stayed healthy; lead with the TUI's actual
+                # failure instead of the generic thread-discovery wrapper.
+                exit_status = exc.instance.last_exit_status()
+                status_text = f" with status {exit_status}" if exit_status is not None else ""
+                summary = f"Codex terminal exited{status_text} before starting a thread."
             else:
-                cause = "event stream ended before a thread was created"
+                if isinstance(exc, TimeoutError):
+                    timeout_seconds = (
+                        thread_start_timeout_seconds
+                        if thread_start_timeout_seconds is not None
+                        else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                    )
+                    cause = f"startup timed out after {timeout_seconds:g}s"
+                else:
+                    cause = "event stream ended before a thread was created"
+                summary = (
+                    f"Codex app-server never started a thread ({cause}: {type(exc).__name__})."
+                )
             if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
                 write_bridge_startup_error(
                     bridge_dir,
-                    f"Codex app-server never started a thread ({cause}: "
-                    f"{type(exc).__name__}). Launch routing: {routing_summary}. "
+                    f"{summary} Launch routing: {routing_summary}. "
                     "(The runner log has the same near 'native-codex routing'.)"
                     + (
                         f"\nCodex startup terminal output:\n{diagnostics['terminal_last_output']}"

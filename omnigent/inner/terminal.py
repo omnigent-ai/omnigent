@@ -1438,6 +1438,7 @@ class TerminalInstance:
         if self.running:
             return
         self._last_exit_snapshot = None
+        self._last_exit_status = None
         effective_cwd = str(cwd or self.private_dir)
 
         # Do NOT advertise the tmux control socket path to the
