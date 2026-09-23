@@ -188,3 +188,65 @@ async def test_supervise_raises_one_card_per_episode(tmp_path, monkeypatch) -> N
             base_url="http://x", headers={}, session_id="c", bridge_dir=tmp_path
         )
     assert len(created) == 1
+
+
+async def test_supervise_parks_the_session_while_the_prompt_is_visible(
+    tmp_path, monkeypatch
+) -> None:
+    from omnigent.native import prompt_parks
+
+    panes = [_THREE_ITEM, _THREE_ITEM, None, None]
+    seq = {"i": 0}
+
+    def _cap(_bd):
+        i = seq["i"]
+        seq["i"] += 1
+        return panes[i] if i < len(panes) else None
+
+    monkeypatch.setattr(gp, "capture_goose_pane", _cap)
+
+    async def _card_post_failed(_client, *, session_id, bridge_dir, prompt, elicitation_id):
+        return None
+
+    monkeypatch.setattr(gp, "_run_one_approval", _card_post_failed)
+    observed: list[tuple[str, ...]] = []
+
+    async def _sleep(_s):
+        observed.append(prompt_parks.open_keys("conv_park"))
+        if len(observed) >= 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(gp.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await gp.supervise_goose_approval_mirror(
+            base_url="http://x", headers={}, session_id="conv_park", bridge_dir=tmp_path
+        )
+    assert observed == [("goose:1",), ("goose:1",), (), ()]
+
+
+async def test_supervise_releases_its_park_when_cancelled_mid_prompt(
+    tmp_path, monkeypatch
+) -> None:
+    from omnigent.native import prompt_parks
+
+    monkeypatch.setattr(gp, "capture_goose_pane", lambda _bd: _THREE_ITEM)
+
+    async def _card(_client, *, session_id, bridge_dir, prompt, elicitation_id):
+        return None
+
+    monkeypatch.setattr(gp, "_run_one_approval", _card)
+    observed: list[tuple[str, ...]] = []
+
+    async def _sleep(_s):
+        observed.append(prompt_parks.open_keys("conv_cancel"))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(gp.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await gp.supervise_goose_approval_mirror(
+            base_url="http://x", headers={}, session_id="conv_cancel", bridge_dir=tmp_path
+        )
+    assert observed == [("goose:1",)]
+    assert prompt_parks.open_keys("conv_cancel") == ()

@@ -558,3 +558,56 @@ async def test_supervise_mirror_reaps_finished_task_and_mirrors_next_request(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_supervise_parks_from_request_to_response_not_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The park follows Kiro's prompt: it outlives a finished (failed) card delivery."""
+    from omnigent.native import prompt_parks
+
+    delivered = asyncio.Event()
+
+    async def _card_post_failed(_client: object, **_kw: object) -> None:
+        delivered.set()
+
+    monkeypatch.setattr(knp, "_run_one_permission", _card_post_failed)
+    record_file = acp_record_path(tmp_path)
+    record_file.write_bytes(b"")
+    task = asyncio.create_task(
+        knp.supervise_kiro_permission_mirror(
+            base_url="http://t",
+            headers={},
+            session_id="conv_park",
+            bridge_dir=tmp_path,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        await asyncio.sleep(0.02)
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_msg("req-9")))
+        await asyncio.wait_for(delivered.wait(), 2.0)
+        await asyncio.sleep(0.02)
+        assert prompt_parks.open_keys("conv_park") == ("kiro:req-9",)
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_result_msg("req-9"), direction="in"))
+        for _ in range(400):
+            if not prompt_parks.open_keys("conv_park"):
+                break
+            await asyncio.sleep(0.005)
+        assert prompt_parks.open_keys("conv_park") == ()
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_msg("req-10")))
+        for _ in range(400):
+            if prompt_parks.open_keys("conv_park"):
+                break
+            await asyncio.sleep(0.005)
+        assert prompt_parks.open_keys("conv_park") == ("kiro:req-10",)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    assert prompt_parks.open_keys("conv_park") == ()

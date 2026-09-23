@@ -9,16 +9,20 @@ without bound as idle conversations accumulate, independent of how many are
 actually active (#1349).
 
 This reaps a single native pane only when it is genuinely unused. "Busy" is the
-disjunction of three signals (any one spares the pane):
+disjunction of these signals (any one spares the pane):
 
   * an in-flight runner turn (``has_active_turn``), OR
+  * live work or a human wait: a running tool call, a pending runner approval,
+    an open prompt park younger than
+    :envvar:`OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S`, claude's approval marker, or
+    running or owed sub-agents, OR
   * the pane's PTY watcher currently reports ``running`` — i.e. the vendor CLI is
     working autonomously *between* runner turns (native turns clear the runner's
     ``_active_turns`` right after the prompt is pasted, so this is the load-bearing
     signal for a long autonomous turn), OR
   * a tmux client is attached (a human is watching the pane).
 
-A pane idle on all three for longer than the window is reaped, with a **second
+A pane idle on all of them for longer than the window is reaped, with a **second
 busy re-check immediately before teardown** to close the select→reap race. The
 tmux client probe is a blocking ``subprocess`` call, so it runs off the event
 loop via ``asyncio.to_thread``.
@@ -34,9 +38,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable
+from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
@@ -79,6 +85,19 @@ _DEFAULT_IDLE_TIMEOUT_S = 60 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 
+# How long an open prompt park may hold a pane: the runner's own ASK wait budget.
+_DEFAULT_APPROVAL_MAX_S = 86400.0
+_APPROVAL_MAX_ENV = "OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S"
+
+
+class SpareReason(StrEnum):
+    """Why a pane is not reaped this scan."""
+
+    RUNNER_TURN = "runner_turn"
+    TOOL_CALL = "tool_call"
+    AWAITING_HUMAN = "awaiting_human"
+    CHILDREN = "children"
+
 
 class PaneRef(NamedTuple):
     """A live native CLI pane the reaper may reclaim.
@@ -96,37 +115,46 @@ class PaneRef(NamedTuple):
     socket_path: Path
 
 
+def _resolve_seconds_env(name: str, default: float) -> float:
+    """Resolve a non-negative seconds knob, falling back on bad input.
+
+    An unparseable, non-finite (``nan``, ``inf``) or negative value logs a
+    warning and uses *default* rather than failing the runner at boot — an env
+    typo shouldn't take the runner down or (worse) make the reaper act on a
+    bogus window.
+
+    :param name: Environment variable, e.g. ``"OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S"``.
+    :param default: Value when unset or invalid.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning("%s=%r is not a number; using default %ss", name, raw, default)
+        return float(default)
+    if not math.isfinite(value):
+        _logger.warning("%s=%r is not a finite number; using default %ss", name, raw, default)
+        return float(default)
+    if value < 0:
+        _logger.warning("%s=%r is negative; using default %ss", name, raw, default)
+        return float(default)
+    return value
+
+
 def resolve_native_pane_idle_timeout_s() -> float:
     """Resolve the native-pane idle window in seconds.
 
     Honors :envvar:`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S` (``0`` disables pane
-    reaping); otherwise the 1-hour default. An unparseable or negative value
-    logs a warning and falls back to the default rather than failing the runner
-    at boot — an env typo shouldn't take the runner down or (worse) make the
-    reaper act on a bogus window.
+    reaping); otherwise the 1-hour default.
     """
-    raw = os.environ.get(_IDLE_TIMEOUT_ENV)
-    if not raw:
-        return float(_DEFAULT_IDLE_TIMEOUT_S)
-    try:
-        value = float(raw)
-    except ValueError:
-        _logger.warning(
-            "%s=%r is not a number; using default %ss",
-            _IDLE_TIMEOUT_ENV,
-            raw,
-            _DEFAULT_IDLE_TIMEOUT_S,
-        )
-        return float(_DEFAULT_IDLE_TIMEOUT_S)
-    if value < 0:
-        _logger.warning(
-            "%s=%r is negative; using default %ss",
-            _IDLE_TIMEOUT_ENV,
-            raw,
-            _DEFAULT_IDLE_TIMEOUT_S,
-        )
-        return float(_DEFAULT_IDLE_TIMEOUT_S)
-    return value
+    return _resolve_seconds_env(_IDLE_TIMEOUT_ENV, _DEFAULT_IDLE_TIMEOUT_S)
+
+
+def resolve_approval_max_s() -> float:
+    """Longest a human-wait signal may hold a pane (default one day)."""
+    return _resolve_seconds_env(_APPROVAL_MAX_ENV, _DEFAULT_APPROVAL_MAX_S)
 
 
 class NativePaneReaper:

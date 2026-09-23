@@ -4455,3 +4455,52 @@ def test_thread_started_is_ephemeral_false_for_missing_thread() -> None:
     """Event with params but no thread is not ephemeral."""
     event = {"method": "thread/started", "params": {}}
     assert fwd._thread_started_is_ephemeral(event) is False
+
+
+@pytest.mark.asyncio
+async def test_elicitation_tracker_parks_until_codex_resolves_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex is blocked on a server request from start until it resolves or ends."""
+    from omnigent.native import prompt_parks
+
+    release = asyncio.Event()
+
+    async def _parked_hook(*_args: object, **_kwargs: object) -> None:
+        await release.wait()
+
+    async def _accepted(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr(fwd, "_handle_codex_elicitation_request", _parked_hook)
+    monkeypatch.setattr(fwd, "_post_external_elicitation_resolved", _accepted)
+    tracker = fwd._CodexElicitationTaskTracker()
+    request = {
+        "method": "item/commandExecution/requestApproval",
+        "id": 7,
+        "params": {"threadId": "thread_1", "turnId": "turn_1"},
+    }
+    try:
+        tracker.start(object(), object(), session_id="conv_cdx", event=request)  # type: ignore[arg-type]
+        keys = prompt_parks.open_keys("conv_cdx")
+        assert len(keys) == 1 and keys[0].startswith("codex:")
+
+        await tracker.resolve_by_server_notification(
+            object(),  # type: ignore[arg-type]
+            session_id="conv_cdx",
+            params={"threadId": "thread_1", "requestId": 7},
+        )
+        assert prompt_parks.open_keys("conv_cdx") == ()
+
+        tracker.start(object(), object(), session_id="conv_cdx", event={**request, "id": 8})  # type: ignore[arg-type]
+        assert len(prompt_parks.open_keys("conv_cdx")) == 1
+        release.set()
+        await tracker.drain()
+        assert prompt_parks.open_keys("conv_cdx") == ()
+
+        release.clear()
+        tracker.start(object(), object(), session_id="conv_cdx", event={**request, "id": 9})  # type: ignore[arg-type]
+        assert len(prompt_parks.open_keys("conv_cdx")) == 1
+    finally:
+        await tracker.close()
+    assert prompt_parks.open_keys("conv_cdx") == ()

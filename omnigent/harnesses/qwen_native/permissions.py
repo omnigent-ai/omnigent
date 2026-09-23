@@ -46,6 +46,7 @@ from typing import TypedDict
 import httpx
 
 from omnigent.harnesses.qwen_native.bridge import events_file_path, submit_confirmation
+from omnigent.native import prompt_parks
 
 _logger = logging.getLogger(__name__)
 
@@ -262,7 +263,10 @@ async def supervise_qwen_approval_mirror(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        prompt_parks.released(session_id, "qwen:"),
+    ):
         while True:
             try:
                 events, offset = await asyncio.to_thread(
@@ -299,7 +303,9 @@ async def supervise_qwen_approval_mirror(
                             "elicitation_id": elicitation_id,
                             "task": task,
                         }
+                        prompt_parks.open_park(session_id, f"qwen:{ev.request_id}")
                     else:  # "response": the request was resolved
+                        prompt_parks.close_park(session_id, f"qwen:{ev.request_id}")
                         entry = pending.pop(ev.request_id, None)
                         if entry is None:
                             continue

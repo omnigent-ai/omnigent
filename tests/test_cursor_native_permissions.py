@@ -1060,3 +1060,51 @@ class _FakeAsyncCM:
 
     async def __aexit__(self, *_exc: object) -> bool:
         return False
+
+
+async def test_supervise_transcript_parks_while_a_surfaced_call_is_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A surfaced call parks the session, card POST or not, until it leaves the store."""
+    from omnigent.native import prompt_parks
+
+    pending_now = [
+        CursorPendingToolCall(tool_call_id="call_p", tool_name="Delete", args={"path": "/x"})
+    ]
+    monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
+    (tmp_path / "store.db").write_bytes(b"")
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
+
+    async def _card_post_failed(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(cnp, "_run_one_approval", _card_post_failed)
+    task = asyncio.create_task(
+        cnp.supervise_cursor_transcript_elicitations(
+            base_url="http://x",
+            headers={},
+            session_id="conv_cpark",
+            bridge_dir=tmp_path,
+            workspace="/ws",
+            launch_epoch_ms=0,
+            poll_interval_s=0.005,
+            settle_s=0.0,
+        )
+    )
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.005)
+            if prompt_parks.open_keys("conv_cpark"):
+                break
+        await asyncio.sleep(0.03)
+        assert prompt_parks.open_keys("conv_cpark") == ("cursor:call_p",)
+        pending_now.clear()
+        for _ in range(100):
+            await asyncio.sleep(0.005)
+            if not prompt_parks.open_keys("conv_cpark"):
+                break
+        assert prompt_parks.open_keys("conv_cpark") == ()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

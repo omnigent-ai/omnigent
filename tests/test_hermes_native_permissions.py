@@ -194,3 +194,65 @@ async def test_supervise_raises_one_card_per_episode(tmp_path, monkeypatch) -> N
             base_url="http://x", headers={}, session_id="c", bridge_dir=tmp_path
         )
     assert len(created) == 1  # one episode → one card, not one per poll
+
+
+async def test_supervise_parks_the_session_while_the_prompt_is_visible(
+    tmp_path, monkeypatch
+) -> None:
+    from omnigent.native import prompt_parks
+
+    panes = [_PANEL_4, _PANEL_4, None, None]
+    seq = {"i": 0}
+
+    def _cap(_bd):
+        i = seq["i"]
+        seq["i"] += 1
+        return panes[i] if i < len(panes) else None
+
+    monkeypatch.setattr(hp, "capture_hermes_pane", _cap)
+
+    async def _card_post_failed(_client, *, session_id, bridge_dir, prompt, elicitation_id):
+        return None
+
+    monkeypatch.setattr(hp, "_run_one_approval", _card_post_failed)
+    observed: list[tuple[str, ...]] = []
+
+    async def _sleep(_s):
+        observed.append(prompt_parks.open_keys("conv_park"))
+        if len(observed) >= 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(hp.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await hp.supervise_hermes_approval_mirror(
+            base_url="http://x", headers={}, session_id="conv_park", bridge_dir=tmp_path
+        )
+    assert observed == [("hermes:1",), ("hermes:1",), (), ()]
+
+
+async def test_supervise_releases_its_park_when_cancelled_mid_prompt(
+    tmp_path, monkeypatch
+) -> None:
+    from omnigent.native import prompt_parks
+
+    monkeypatch.setattr(hp, "capture_hermes_pane", lambda _bd: _PANEL_4)
+
+    async def _card(_client, *, session_id, bridge_dir, prompt, elicitation_id):
+        return None
+
+    monkeypatch.setattr(hp, "_run_one_approval", _card)
+    observed: list[tuple[str, ...]] = []
+
+    async def _sleep(_s):
+        observed.append(prompt_parks.open_keys("conv_cancel"))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(hp.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await hp.supervise_hermes_approval_mirror(
+            base_url="http://x", headers={}, session_id="conv_cancel", bridge_dir=tmp_path
+        )
+    assert observed == [("hermes:1",)]
+    assert prompt_parks.open_keys("conv_cancel") == ()

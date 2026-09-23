@@ -1298,3 +1298,66 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
             ) as c:
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/policies/evaluate", "/hook/claude/evaluate-policy"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_relay_policy_wait_parks_the_session_for_its_duration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    fails: bool,
+) -> None:
+    """The agent waits on the policy verdict, possibly on a human ASK card."""
+    import asyncio
+
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir as _prep
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
+    from omnigent.native import prompt_parks
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prep("relay-policy-park", workspace=tmp_path)
+    session_id = "conv_relay_park"
+    seen: list[tuple[str, ...]] = []
+
+    class _ServerClient:
+        content = b'{"result":"POLICY_ACTION_ALLOW"}'
+        status_code = 200
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+
+        async def post(self, url: str, **kwargs: object) -> _ServerClient:
+            del url, kwargs
+            seen.append(prompt_parks.open_keys(session_id))
+            if fails:
+                raise httpx.ConnectError("server down")
+            return self
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=asyncio.get_running_loop(),
+        policy_client=_ServerClient(),
+        session_id=session_id,
+    )
+    try:
+        info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+        body = (
+            {"event": {"type": "PHASE_TOOL_CALL", "target": "", "data": {"name": "Bash"}}}
+            if path == "/policies/evaluate"
+            else {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+        )
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{info['url']}{path}",
+                json=body,
+                headers={"Authorization": f"Bearer {info['token']}"},
+                timeout=10.0,
+            )
+    finally:
+        relay.close()
+    assert seen
+    assert all(len(keys) == 1 and keys[0].startswith("relay-policy:") for keys in seen)
+    assert prompt_parks.open_keys(session_id) == ()
