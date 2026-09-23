@@ -1528,6 +1528,10 @@ def extended_model_catalog(
     by_slug = {m.get("slug"): m for m in models if isinstance(m, dict)}
     template = by_slug.get(clone_source)
     if template is None:
+        # Older installed Codex CLIs may not ship the current clone source yet.
+        # Keep gateway-only arms spawnable from a compatible older catalog row.
+        template = by_slug.get("gpt-5.6-luna")
+    if template is None:
         return None
     added: list[dict[str, Any]] = []
     for bare, slug in EXTENDED_CATALOG_MODELS.items():

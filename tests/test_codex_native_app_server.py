@@ -1702,20 +1702,23 @@ def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
 
 
 def test_mark_launch_default_prefers_omnigent_default_over_codex_default() -> None:
-    """An unpinned catalog prefers Sol over Codex's current catalog default."""
+    """An unpinned catalog prefers Luna over Codex's current catalog default."""
     from omnigent.harnesses.codex_native.app_server import mark_launch_default
 
     rows = [
         {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "gpt-6-luna"},
         {"id": "system.ai.gpt-5-6-sol"},
     ]
 
     assert mark_launch_default(rows, None) == [
         {"id": "gpt-6-astra"},
-        {"id": "system.ai.gpt-5-6-sol", "isDefault": True},
+        {"id": "gpt-6-luna", "isDefault": True},
+        {"id": "system.ai.gpt-5-6-sol"},
     ]
     assert mark_launch_default(rows, "gpt-6-astra") == [
         {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "gpt-6-luna"},
         {"id": "system.ai.gpt-5-6-sol"},
     ]
 

@@ -64,6 +64,25 @@ def test_the_added_entry_carries_the_clone_sources_fields() -> None:
     assert glm["upgrade"] is None
 
 
+def test_older_codex_catalog_uses_legacy_luna_as_clone_source() -> None:
+    catalog = {
+        "models": [
+            {
+                "slug": "gpt-5.6-luna",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                "context_window": 128000,
+            }
+        ]
+    }
+
+    extended = extended_model_catalog(catalog)
+
+    assert extended is not None
+    glm = next(model for model in extended["models"] if model["slug"] == _GLM_SLUG)
+    assert glm["context_window"] == 128000
+    assert glm["supported_reasoning_levels"] == [{"effort": "low"}, {"effort": "high"}]
+
+
 def test_the_added_entry_declares_only_the_efforts_glm_accepts() -> None:
     # Codex refuses a pairing outside the ladder ("Reasoning effort `xhigh` is
     # not supported for model `system.ai.glm-5-2`"), and applies the default
