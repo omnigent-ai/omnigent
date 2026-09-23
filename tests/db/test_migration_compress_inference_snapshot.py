@@ -13,6 +13,7 @@ from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.compression import decode, encode
 from omnigent.db.utils import _build_alembic_config, get_or_create_engine
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -25,9 +26,12 @@ _MIGRATION = "omnigent.db.migrations.versions.ll1a2b3c4d5e_compress_inference_sn
 
 def _migrate(engine: sa.Engine, revision: str, *, downgrade: bool = False) -> None:
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    with engine.begin() as connection:
+    with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
         config.attributes["connection"] = connection
         (command.downgrade if downgrade else command.upgrade)(config, revision)
+        connection.commit()
 
 
 def _rows(engine: sa.Engine) -> dict[tuple[int, bytes], sa.Row]:
@@ -166,3 +170,43 @@ def test_offline_migration_does_not_emit_incomplete_sql() -> None:
     with Operations.context(context):
         with pytest.raises(RuntimeError, match="requires an online migration"):
             import_module(_MIGRATION).upgrade()
+
+
+def test_migration_preserves_sqlite_text_and_binary_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    migration = import_module(_MIGRATION)
+    monkeypatch.setattr(migration, "_BATCH_SIZE", 1)
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'legacy-ids.db'}")
+    original = [(0, "a", '{"saved":1}'), (0, "b", None), (0, b"c" * 16, '{"saved":2}')]
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"CREATE TABLE {_TABLE} (workspace_id BIGINT, id BLOB, "
+                    "inference_snapshot TEXT, PRIMARY KEY (workspace_id, id))"
+                )
+            )
+            for workspace_id, row_id, snapshot in original:
+                connection.execute(
+                    sa.text(f"INSERT INTO {_TABLE} VALUES (:workspace, :id, :snapshot)"),
+                    {"workspace": workspace_id, "id": row_id, "snapshot": snapshot},
+                )
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+                rows = connection.execute(
+                    sa.text(f"SELECT * FROM {_TABLE} ORDER BY workspace_id, id")
+                ).all()
+                assert [tuple(row) for row in rows] == [
+                    (workspace, row_id, encode(snapshot))
+                    for workspace, row_id, snapshot in original
+                ]
+                migration.downgrade()
+                assert (
+                    connection.execute(
+                        sa.text(f"SELECT * FROM {_TABLE} ORDER BY workspace_id, id")
+                    ).all()
+                    == original
+                )
+    finally:
+        engine.dispose()

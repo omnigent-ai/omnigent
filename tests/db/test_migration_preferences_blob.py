@@ -12,6 +12,7 @@ from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.compression import encode
 from omnigent.db.utils import _build_alembic_config, get_or_create_engine
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
@@ -23,9 +24,12 @@ _MIGRATION = "omnigent.db.migrations.versions.kk1a2b3c4d5e_preferences_value_blo
 
 def _migrate(engine: sa.Engine, uri: str, revision: str, *, downgrade: bool = False) -> None:
     config = _build_alembic_config(uri)
-    with engine.begin() as connection:
+    with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
         config.attributes["connection"] = connection
         (command.downgrade if downgrade else command.upgrade)(config, revision)
+        connection.commit()
 
 
 def _values(engine: sa.Engine, table: sa.Table) -> dict[tuple[int, str, str], bytes | str]:

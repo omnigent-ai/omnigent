@@ -68,11 +68,11 @@ def _convert(to_binary: bool) -> None:
         table = sa.table(
             _TABLE,
             sa.column("workspace_id", sa.BigInteger()),
-            sa.column("id", sa.LargeBinary()),
+            sa.column("id"),
             sa.column(_COLUMN),
             sa.column(temporary, target_type),
         )
-        cursor: tuple[int, bytes] | None = None
+        cursor: tuple[int, bytes | str] | None = None
         cleared = 0
         while True:
             query = sa.select(table.c.workspace_id, table.c.id, table.c[_COLUMN]).order_by(
@@ -104,7 +104,11 @@ def _convert(to_binary: bool) -> None:
                     .where(table.c.workspace_id == workspace_id, table.c.id == row_id)
                     .values({temporary: stored})
                 )
-            cursor = (rows[-1].workspace_id, bytes(rows[-1].id))
+            last_id = rows[-1].id
+            cursor = (
+                rows[-1].workspace_id,
+                last_id if isinstance(last_id, str) else bytes(last_id),
+            )
         if cleared:
             _logger.warning(
                 "Cleared %d inference snapshots exceeding 65,535 compressed bytes", cleared
