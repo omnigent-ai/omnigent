@@ -174,11 +174,9 @@ def test_heavier_code_text_applies_to_monaco_and_persists(
     assert _monaco_font_weight(file_viewer) == "500", "weight was not restored after reload"
 
 
-def test_code_font_size_steppers_clamp_at_bounds(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_code_font_size_steppers_clamp_at_bounds(page: Page, live_server: str) -> None:
     """The ``−`` / ``+`` buttons disable at the 10px min and 24px max."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
 
     # Seed the max before the app boots so the "+" button renders disabled.
     page.goto(base_url)

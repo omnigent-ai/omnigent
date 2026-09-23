@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Radix capacity planning fixture</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 24px;
+        background: #f4f6fa;
+        color: #17243a;
+        font: 15px system-ui;
+      }
+      h1 {
+        font-size: 24px;
+      }
+      h2 {
+        margin: 0;
+        font-size: 20px;
+      }
+      p {
+        font-size: 13px;
+      }
+      label {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        margin: 16px 0;
+        font-size: 13px;
+      }
+      input {
+        box-sizing: border-box;
+        width: 100%;
+        padding: 9px;
+        border: 1px solid #ccd5e2;
+        border-radius: 6px;
+        font: 15px system-ui;
+      }
+      button {
+        padding: 9px 14px;
+        border: 0;
+        border-radius: 6px;
+        background: #345ddd;
+        color: white;
+        font: 14px system-ui;
+      }
+      .dialog-overlay {
+        position: fixed;
+        inset: 0;
+        background: #17243a66;
+      }
+      .dialog-content {
+        box-sizing: border-box;
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: min(280px, calc(100vw - 48px));
+        height: min(440px, calc(100vh - 64px));
+        overflow: auto;
+        padding: 24px;
+        border: 1px solid #d4dce8;
+        border-radius: 12px;
+        background: white;
+      }
+      .scroll-space {
+        height: 300px;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+      }
+      output {
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

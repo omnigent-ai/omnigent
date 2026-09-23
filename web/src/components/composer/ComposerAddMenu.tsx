@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FolderIcon, LightbulbIcon, PaperclipIcon, PlusIcon, TargetIcon } from "lucide-react";
+import {
+  FolderIcon,
+  LightbulbIcon,
+  MessagesSquareIcon,
+  PaperclipIcon,
+  PlusIcon,
+  TargetIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -25,6 +32,7 @@ export function ComposerAddMenu({
   testIdPrefix = "composer",
   onPlan,
   planActive,
+  onSideChat,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
 }: {
@@ -42,6 +50,9 @@ export function ComposerAddMenu({
   testIdPrefix?: string;
   onPlan?: () => void;
   planActive: boolean;
+  /** Start a new side chat (a fork of this conversation opened as a rail tab).
+   *  Absent when the session can't host one. */
+  onSideChat?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
 }) {
@@ -147,10 +158,21 @@ export function ComposerAddMenu({
                 <span>Files and images</span>
               </DropdownMenuItem>
             </div>
-            {(showGoal || showPlan || onProjectSelect) && (
+            {(showGoal || showPlan || onProjectSelect || onSideChat) && (
               <div className="flex flex-col gap-0.5">
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
+                  {onSideChat && (
+                    <DropdownMenuItem data-testid="composer-side-chat-action" onSelect={onSideChat}>
+                      <span className="flex size-4 shrink-0 items-center justify-center">
+                        <MessagesSquareIcon className="size-3.5" />
+                      </span>
+                      <span className="shrink-0">Start a new side chat</span>
+                      <span className="truncate text-xs leading-4 text-muted-foreground">
+                        Ask without affecting this conversation
+                      </span>
+                    </DropdownMenuItem>
+                  )}
                   {showGoal && (
                     <DropdownMenuItem
                       disabled={!onGoal || goalDisabled}

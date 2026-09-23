@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -246,11 +247,12 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     :returns: Prepared absolute bridge directory.
     """
     bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(bridge_dir, 0o700)
-    # Owner-pid marker for the periodic dead-owner prune; refreshed every
-    # turn so it always names the current runner. See native_bridge_common.
-    native_bridge_common.write_owner_pid_marker(bridge_dir)
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(bridge_dir, 0o700)
+        # Owner-pid marker for the periodic dead-owner prune; refreshed every
+        # turn so it always names the current runner. See native_bridge_common.
+        native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
 
 
@@ -259,7 +261,7 @@ def prune_orphaned_bridge_dirs() -> int:
     Remove antigravity-native bridge dirs whose owner process is provably dead.
 
     Delegates to the shared sweep against this harness's bridge root; the
-    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
     at startup to reclaim dirs leaked by a prior runner that died without
     running the explicit delete path.
 
@@ -374,6 +376,9 @@ _AGY_SEED_FILES = (
 # visible instead of pinning a stale copy.
 _AGY_PLUGINS_DIR = "plugins"
 _AGY_IMPORT_MANIFEST = "import_manifest.json"
+
+
+_AGY_HOOKS_FILE = "hooks.json"
 
 
 # agy's non-plugin skill trees, relative to the Gemini dir — the "Global" and
@@ -531,8 +536,9 @@ def seed_isolated_agy_home(
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
     Copies known file-based agy OAuth markers, the user's ``settings.json``
-    (backend config such as the GCP project/location block), and
-    onboarding/migration state (NEVER moving or modifying the real files) into
+    (backend config such as the GCP project/location block), the user's global
+    lifecycle hooks (``config/hooks.json``), and onboarding/migration state
+    (NEVER moving or modifying the real files) into
     ``<bridge_dir>/agy-home/.gemini``.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
@@ -577,6 +583,7 @@ def seed_isolated_agy_home(
 
     _seed_isolated_agy_plugins(real_home, iso_gemini)
     _seed_isolated_agy_skills(real_home, iso_gemini)
+    _seed_isolated_agy_hooks(real_home, iso_gemini)
 
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
@@ -684,6 +691,40 @@ def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
     """
     for rel in _AGY_SKILL_DIRS:
         _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
+
+
+def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
+    """Refresh session hooks while preserving each command's original working directory."""
+    real_hooks = real_home / ".gemini" / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
+    iso_hooks = iso_gemini / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
+
+    def preserve_cwd(value: dict[str, object]) -> dict[str, object]:
+        command = value.get("command")
+        if isinstance(command, str) and command and value.get("type", "command") == "command":
+            # agy runs hook commands from the directory containing hooks.json.
+            value["command"] = (
+                f"cd {shlex.quote(str(real_hooks.parent))} && exec sh -c {shlex.quote(command)}"
+            )
+        return value
+
+    try:
+        try:
+            content = real_hooks.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            iso_hooks.unlink(missing_ok=True)
+            return
+        hooks = json.loads(content, object_hook=preserve_cwd)
+        iso_hooks.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="hooks.json.", dir=iso_hooks.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(hooks, stream)
+                stream.write("\n")
+            os.replace(tmp_name, iso_hooks)
+        finally:
+            Path(tmp_name).unlink(missing_ok=True)
+    except (OSError, ValueError):
+        _logger.warning("Could not refresh Antigravity hooks at %s", iso_hooks, exc_info=True)
 
 
 def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:

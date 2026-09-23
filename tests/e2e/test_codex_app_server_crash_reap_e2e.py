@@ -1,39 +1,8 @@
-"""Crash-reaping of native Codex ``app-server`` processes after a Host death.
+"""Reconcile native Codex session and model-probe processes after owner-lock release.
 
-The user-observable failure: after a macOS/Linux Host restarts,
-``ps -axo pid,ppid,command | grep 'codex app-server'`` still shows orphaned
-``node .../codex app-server`` process trees with PPID 1, alive for hours/days.
-Two independent gaps let a ``codex app-server`` survive a Host death and never
-be reaped at the next reconcile:
-
-1. **The model-probe app-server is never registered.**
-   ``_start_codex_model_discovery_process`` spawns ``codex app-server --listen
-   ws://...`` detached but never calls ``register_codex_native_process``, so the
-   crash-safe registry has no entry for it. A Host that dies mid-probe orphans
-   the probe app-server under PID 1 and no later reconcile can reap it.
-
-2. **The reap tag never reaches the running process.** Session app-servers are
-   registered, but the tag that proves a PID is ours was carried in ``argv[0]``.
-   The npm/Homebrew ``codex`` launcher is a ``#!/usr/bin/env node`` shebang
-   script; when the kernel execs a shebang script it rewrites ``argv[0]`` to the
-   interpreter + script path, so the tag never appears in the running command
-   line. ``_process_cmdline_has_tag`` then fails for every entry and reconcile
-   drops the entry *without* reaping it.
-
-Both tests drive the REAL npm ``codex`` binary (a shebang wrapper, exactly like
-a user's install) through the product's own spawn paths, simulate a Host crash
-by releasing the launcher's owner lock, and assert the true expected behaviour:
-"an app-server left behind by a dead Host is reaped at the next reconcile".
-
-On unfixed code both tests fail:
-  - facet 1: the probe pid is absent from the crash-safe registry;
-  - facet 2: the tag is not in the running command line and the orphaned
-    session app-server survives reconcile.
-
-Usage::
-
-    python -m pytest tests/e2e/test_codex_app_server_crash_reap_e2e.py -v
-"""
+Use the real npm Codex shebang launcher to verify that registry tags survive
+exec and identify the process tree. Releasing the owner lock simulates host
+death; the test does not crash a live host or make model calls."""
 
 from __future__ import annotations
 
@@ -42,6 +11,7 @@ import contextlib
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -100,6 +70,11 @@ def _proc_state(pid: int) -> str:
     :param pid: Process id to inspect.
     :returns: State char (``R``/``S``/``Z``/...), or ``""`` when the pid is gone.
     """
+    if not Path("/proc").is_dir():
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip()[:1]
     try:
         after_comm = (Path("/proc") / str(pid) / "stat").read_text().split(")", 1)[1]
     except (OSError, IndexError):
@@ -121,6 +96,19 @@ def _tagged_pids(tag: str) -> set[int]:
     marker = codex_native_session_tag_cmdline_arg(tag)
     found: set[int] = set()
     proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) == 2 and marker in fields[1]:
+                found.add(int(fields[0]))
+        return found
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
@@ -143,19 +131,9 @@ def _reap_zombie_children() -> None:
 
 
 async def _wait_group_terminated(tag: str, timeout: float = 8.0) -> set[int]:
-    """Await until every tagged process has terminated, reaping zombies.
+    """Wait for tagged processes to exit, allowing child watchers to reap zombies.
 
-    A crash orphan reparents to init; init reaps its zombies. This mirrors that
-    by treating a zombie as terminated and yielding to the event loop so its
-    child watcher reaps our exited children. The Rust ``codex app-server``
-    grandchild reparents to the PID-namespace init (which reaps it) once its
-    ``node`` parent exits.
-
-    :param tag: The crash-reap session tag identifying our processes.
-    :param timeout: Seconds to wait for the group to terminate.
-    :returns: The set of tagged pids still *live* (non-zombie) at the deadline;
-        empty means the whole tree was reaped.
-    """
+    Returns any tagged non-zombie PIDs still alive at the deadline."""
     deadline = time.monotonic() + timeout
     while True:
         still_live = {pid for pid in _tagged_pids(tag) if _proc_state(pid) not in ("", "Z")}
@@ -237,21 +215,7 @@ async def test_model_probe_app_server_registered_for_crash_reaping(
 async def test_session_app_server_reaped_after_host_crash(
     _hermetic_state_root: Path,
 ) -> None:
-    """Facet 2: a crash-orphaned session app-server is reaped at reconcile.
-
-    Drives the real ``CodexNativeAppServer.start()`` (which owns the reap-tag
-    placement) against the real npm ``codex`` shebang launcher, then:
-
-    * asserts the reap tag actually reaches the running process command line
-      (``_process_cmdline_has_tag`` is ``True``) — before the fix the tag lives
-      in ``argv[0]`` and is stripped by the shebang exec, so this is ``False``;
-    * simulates a Host death by dropping the launcher's process handle and
-      releasing its owner lock (leaving the app-server running, exactly like an
-      orphan reparented to init), runs the reconcile a fresh Host performs at
-      boot, and asserts the orphaned app-server tree is reaped — before the fix
-      the tagless entry is dropped un-reaped, so the Rust ``codex app-server``
-      survives under PID 1.
-    """
+    """Verify the real launcher preserves its tag, then release ownership and reap its tree."""
     codex = _codex_cli()
     root = _hermetic_state_root
     codex_home = root / "session-home"

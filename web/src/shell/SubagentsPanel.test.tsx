@@ -1326,10 +1326,12 @@ describe("SubagentsPanel", () => {
     renderPanel({
       rootSessionId: "conv_root",
       // Simulate stale session-scoped params carried over from the
-      // previous session — the bug condition the fix targets. All four
-      // are listed so any regression that drops a key from
-      // SESSION_SCOPED_PARAMS surfaces here.
-      initialEntries: ["/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed"],
+      // previous session — the bug condition the fix targets. All five
+      // are listed so any regression that drops a key from the shared
+      // session-scoped search-param list surfaces here.
+      initialEntries: [
+        "/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed&message=msg_1",
+      ],
     });
 
     const main = screen.getByTestId("subagent-main-row");

@@ -92,7 +92,7 @@ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultE
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
-from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
@@ -4115,6 +4115,7 @@ def _spec_with_real_subagent(harness: str) -> AgentSpec:
     return AgentSpec(
         spec_version=1,
         name="parent",
+        tools=ToolsConfig(agents=["worker"]),
         sub_agents=[
             AgentSpec(
                 spec_version=1,
@@ -4325,6 +4326,58 @@ async def test_sys_session_send_strips_gateway_prefix_for_vendor_direct_child(
     assert len(result.create_bodies) == 1
     # Stripped: the vendor API only routes the bare canonical id.
     assert result.create_bodies[0]["model_override"] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["acp", "acp:synthetic"])
+async def test_sys_session_send_preserves_acp_model_id_through_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """ACP dispatch metadata and launch preserve the command's literal model namespace."""
+    from omnigent.models.model_catalog import validate_acp_model
+    from omnigent.runner.app import _build_spawn_env_from_spec
+    from omnigent.spec.types import ProviderAuth
+
+    model = "databricks-gpt-5-4"
+    _isolate_model_providers(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  acp-key:\n"
+        "    kind: key\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.invalid/v1\n"
+        "      api_key: synthetic-test-key\n"
+        "      models:\n"
+        "        default: model-a\n"
+        f"        alternate: {model}\n",
+    )
+    parent_spec = _spec_with_real_subagent(harness)
+    worker_spec = parent_spec.sub_agents[0]
+    worker_spec.executor.auth = ProviderAuth(name="acp-key")
+    worker_spec.executor.config["acp_agent"] = {
+        "name": "Synthetic ACP",
+        "command": "synthetic-acp",
+        "model": "model-a",
+        "send_model": True,
+    }
+
+    result = await _dispatch_model_send(
+        monkeypatch,
+        agent_spec=parent_spec,
+        model=model,
+        conv_id="conv_parent_acp_literal_model",
+    )
+
+    assert json.loads(result.output)["status"] == "launching"
+    assert len(result.create_bodies) == 1
+    selected_model = result.create_bodies[0]["model_override"]
+    assert selected_model == model
+    validate_acp_model(worker_spec, selected_model)
+    env = _build_spawn_env_from_spec(worker_spec, harness, model_override=selected_model)
+    assert env is not None
+    assert env["HARNESS_ACP_MODEL"] == model
+    assert env["HARNESS_ACP_DEFAULT_MODEL"] == "model-a"
 
 
 @pytest.mark.asyncio
@@ -7242,6 +7295,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
+    assert sessions_params.get("visibility") == "all"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [
@@ -11012,6 +11066,7 @@ def _fake_entry(harness: str, model: str | None, returncode: int | None = None) 
 
     class _FakeProc:
         def __init__(self, rc: int | None) -> None:
+            self.pid = 12345
             self.returncode = rc
 
     return _SubprocessEntry(

@@ -25,6 +25,7 @@ import { createPortal } from "react-dom";
 import { Streamdown, type StreamdownProps } from "streamdown";
 
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
+import { MERMAID_STREAMDOWN_OPTIONS } from "./MermaidError";
 
 import {
   CHAT_LINK_SAFETY,
@@ -299,7 +300,7 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
   );
 };
 
-export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins"> & {
+export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "mermaid"> & {
   /**
    * Hand file-path links to the `a` component override instead of letting the
    * harden pass turn them into app-origin navigations or " [blocked]" text.
@@ -659,6 +660,7 @@ export const MessageResponse = memo(
           {...props}
           components={messageComponents}
           controls={messageControls}
+          mermaid={MERMAID_STREAMDOWN_OPTIONS}
           // Block remote image fetches that can exfiltrate data through URLs.
           rehypePlugins={
             markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS

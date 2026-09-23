@@ -5,23 +5,13 @@ enum WorkspaceURLExpander {
   /// Android and Electron's `WORKSPACE_UI_PATH`.
   static let workspaceUIPath = "/omnigent"
 
-  /// Databricks domains that serve a workspace, and therefore mount the SPA at
-  /// ``workspaceUIPath``. `databricksapps.com` is deliberately absent: Apps share
-  /// the workspace login story but serve their own app at the root, with no
-  /// workspace mount to redirect to.
-  private static let workspaceDomains = ["databricks.com", "azuredatabricks.net"]
-
-  /// Databricks Apps are served from `*.databricksapps.com` and answer with the
-  /// same `server: databricks` header as a workspace, but they are NOT
-  /// workspaces and have no SPA mount, so expansion is skipped for
-  /// these hosts.
-  static let databricksAppsHostSuffix = "databricksapps.com"
-
   static func expandIfNeeded(
     _ url: URL,
     session: URLSession = SameOriginRedirectHandler.session
   ) async -> URL {
-    guard url.scheme?.lowercased() == "https", isBareRoot(url), !isDatabricksAppsHost(url),
+    // Apps share the workspace's server header but serve their UI at the root.
+    guard url.scheme?.lowercased() == "https", isBareRoot(url),
+      ServerAuthentication(host: url.host) != .databricksApp,
       let origin = originURL(for: url)
     else {
       return url
@@ -65,7 +55,7 @@ enum WorkspaceURLExpander {
   /// selects which workspace the request lands in.
   static func workspaceUIURL(forBareRoot url: URL) -> URL? {
     guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
-      isWorkspaceHost(url.host), isBareRoot(url)
+      ServerAuthentication(host: url.host) == .databricksWorkspace, isBareRoot(url)
     else {
       return nil
     }
@@ -82,20 +72,8 @@ enum WorkspaceURLExpander {
     return components.url
   }
 
-  /// Whether `host` is, or sits under, a Databricks workspace domain. Matched on a
-  /// dot boundary so a lookalike like `databricks.com.example.org` doesn't qualify.
-  private static func isWorkspaceHost(_ host: String?) -> Bool {
-    guard let host = host?.lowercased() else { return false }
-    return workspaceDomains.contains { host == $0 || host.hasSuffix(".\($0)") }
-  }
-
   private static func isBareRoot(_ url: URL) -> Bool {
     url.path.isEmpty || url.path == "/"
-  }
-
-  private static func isDatabricksAppsHost(_ url: URL) -> Bool {
-    guard let host = url.host?.lowercased() else { return false }
-    return host == databricksAppsHostSuffix || host.hasSuffix(".\(databricksAppsHostSuffix)")
   }
 
   private static func originURL(for url: URL) -> URL? {

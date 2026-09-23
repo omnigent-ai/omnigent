@@ -30,6 +30,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { copyText } from "@/lib/clipboard";
+import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
 import {
   type RoutingDecisionExtras,
   harnessDisplayLabel,
@@ -39,6 +40,7 @@ import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
 interface ErrorBannerProps {
+  itemId?: string | null;
   message: string;
   source: string;
   code: string;
@@ -51,7 +53,9 @@ interface ErrorBannerProps {
   /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
   level?: "error" | "info";
   /** Recover the existing session or continue after a retryable turn failure. */
-  onRetry?: () => Promise<void>;
+  onRetry?: (error: RelatedRenderError) => Promise<void>;
+  /** Later failures emitted by the same response, turn, and agent. */
+  relatedErrors?: RelatedRenderError[];
 }
 
 /**
@@ -97,6 +101,24 @@ const DIAGNOSTICS_HEADING = /^(?:terminal|lifecycle) diagnostics:\s*$/i;
 const LAST_OUTPUT_HEADING = /^last captured (?:terminal )?output:\s*(.*)$/i;
 const UNAVAILABLE_OUTPUT =
   /^unavailable(?:[.!]|\. The process exited before Omnigent captured a pane snapshot\.)?$/i;
+const EMPTY_RELATED_ERRORS: RelatedRenderError[] = [];
+
+function errorHeadline(error: RenderErrorDetails): string {
+  return (
+    error.title ||
+    FAILURE_CODE_DESCRIPTIONS[error.code] ||
+    (error.level === "info" ? "Notice" : "Something went wrong")
+  );
+}
+
+function relatedErrorText(error: RenderErrorDetails): string {
+  const parts = [
+    error.cause,
+    error.remediation ? `Try this: ${error.remediation}` : undefined,
+    error.message || error.code,
+  ].filter((part): part is string => Boolean(part));
+  return parts.filter((part, index) => parts.indexOf(part) === index).join("\n\n");
+}
 
 function trimBlankBoundaryLines(lines: string[]): string | null {
   let start = 0;
@@ -148,18 +170,29 @@ function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
  * never a blank panel.
  */
 export function ErrorBanner({
+  itemId = null,
   message,
+  source,
   code,
   title,
   cause,
   remediation,
   level,
   onRetry,
+  relatedErrors = EMPTY_RELATED_ERRORS,
 }: ErrorBannerProps) {
-  const notice = level === "info";
+  const notice = level === "info" && relatedErrors.every((error) => error.level === "info");
   const tone = notice ? "var(--muted-foreground)" : "var(--destructive)";
-  const headline =
-    title || FAILURE_CODE_DESCRIPTIONS[code] || (notice ? "Notice" : "Something went wrong");
+  const headline = errorHeadline({ message, source: "", code, title, cause, remediation, level });
+  const relatedDetails = useMemo(
+    () =>
+      relatedErrors.map((error) => ({
+        key: error.itemId ?? `${error.code}:${error.source}:${error.message}`,
+        headline: errorHeadline(error),
+        text: relatedErrorText(error),
+      })),
+    [relatedErrors],
+  );
   const parsed = useMemo(() => parseErrorMessage(message), [message]);
   const messageText = useMemo(() => {
     const parts: string[] = [];
@@ -191,7 +224,12 @@ export function ErrorBanner({
   const dismissButtonRef = useRef<HTMLButtonElement>(null);
   const messageId = useId();
   const diagnosticsId = useId();
-  const retryable = onRetry !== undefined && RETRYABLE_ERROR_CODES.has(code);
+  const actionableError = [
+    { itemId, message, source, code, level, title, cause, remediation },
+    ...relatedErrors,
+  ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
+  const retryable = onRetry !== undefined && actionableError !== undefined;
+  const retryLabel = actionableError?.code === "rate_limit_exceeded" ? "Retry" : "Resume session";
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -226,7 +264,7 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          {code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
+          {actionableError?.code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
         </Badge>
       </div>
     );
@@ -240,16 +278,18 @@ export function ErrorBanner({
   };
 
   const retry = async () => {
-    if (!onRetry || retryInFlightRef.current) return;
+    if (!onRetry || !actionableError || retryInFlightRef.current) return;
     retryInFlightRef.current = true;
     setRetrying(true);
     setRetryError(null);
     try {
-      await onRetry();
+      await onRetry(actionableError);
       setDismissed(true);
     } catch (error) {
       retryInFlightRef.current = false;
-      setRetryError(`Retry failed: ${error instanceof Error ? error.message : String(error)}`);
+      setRetryError(
+        `${retryLabel} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       setRetrying(false);
     }
   };
@@ -308,11 +348,6 @@ export function ErrorBanner({
               >
                 {headline}
               </span>
-              {!expanded && (
-                <span className="text-[11px] leading-4 text-muted-foreground/70">
-                  Expand for details
-                </span>
-              )}
             </span>
           </button>
           {retryable ? (
@@ -328,7 +363,7 @@ export function ErrorBanner({
               className="h-6 shrink-0 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
             >
               <RotateCwIcon className="size-3.5" aria-hidden="true" />
-              Retry
+              {retryLabel}
             </Button>
           ) : null}
           <Button
@@ -396,6 +431,34 @@ export function ErrorBanner({
                 {messageText}
               </div>
             </section>
+            {relatedDetails.length > 0 ? (
+              <section
+                aria-labelledby={`${messageId}-related-label`}
+                className="mx-[4px] mt-[16px] min-w-0 border-t border-border pt-[12px]"
+              >
+                <h4
+                  id={`${messageId}-related-label`}
+                  className="text-sm leading-4 font-medium text-muted-foreground"
+                >
+                  Related errors ({relatedDetails.length})
+                </h4>
+                <ol className="mt-[8px] flex min-w-0 list-decimal flex-col gap-[12px] pl-[20px] marker:text-muted-foreground">
+                  {relatedDetails.map((error) => (
+                    <li key={error.key} className="min-w-0 pl-[4px]">
+                      <h5 className="text-sm leading-5 font-medium text-destructive">
+                        {error.headline}
+                      </h5>
+                      <pre
+                        data-testid="related-error-content"
+                        className="mt-[4px] max-w-full min-w-0 whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground [overflow-wrap:anywhere]"
+                      >
+                        {error.text}
+                      </pre>
+                    </li>
+                  ))}
+                </ol>
+              </section>
+            ) : null}
             {diagnostics.length > 0 ? (
               <Collapsible
                 open={diagnosticsOpen}
@@ -599,6 +662,7 @@ export function RoutingDecisionCard({
   routing,
 }: RoutingDecisionCardProps) {
   const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
+  const taskDescription = routing?.taskDescription?.trim();
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
@@ -613,6 +677,7 @@ export function RoutingDecisionCard({
           applied,
           rationale,
           ...(agent ? { agent } : {}),
+          ...(taskDescription ? { task_description: taskDescription } : {}),
           ...(harness ? { harness } : {}),
           ...(scope ? { scope } : {}),
           ...(decisionId ? { decision_id: decisionId } : {}),
@@ -628,6 +693,7 @@ export function RoutingDecisionCard({
       applied,
       rationale,
       agent,
+      taskDescription,
       harness,
       scope,
       decisionId,
@@ -680,7 +746,18 @@ export function RoutingDecisionCard({
         </CollapsibleTrigger>
       </div>
       <div className="flex items-center gap-2 text-sm">
-        <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        {taskDescription ? (
+          // Name the work even when sibling spawns share a type and rationale.
+          <span
+            className="min-w-0 truncate text-foreground"
+            data-testid="routing-decision-task"
+            title={taskDescription}
+          >
+            {taskDescription}
+          </span>
+        ) : (
+          <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        )}
         {attemptedShort ? (
           // The spawn named its own model and the router picked another — the
           // substitution is the whole point of the row, so it shows at a glance.
