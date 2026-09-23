@@ -626,6 +626,97 @@ def _hook_posts(posts: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
     return [(u, j) for u, j in posts if "hooks/cursor-permission-request" in u]
 
 
+@pytest.mark.parametrize("resolved_in_terminal", [False, True])
+@pytest.mark.parametrize("tool_name", ["Shell", "AskQuestion"])
+async def test_supervisor_cancels_obsolete_verdict_before_it_can_send_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resolved_in_terminal: bool,
+    tool_name: str,
+) -> None:
+    pending = [CursorPendingToolCall("call_cleanup", tool_name, {})]
+    posts, sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=pending, pane=_IDLE_PANE
+    )
+    parked = asyncio.Event()
+    cancelled = asyncio.Event()
+    late_verdict = asyncio.Event()
+    verdict_tasks: list[asyncio.Task] = []
+
+    async def park(*_args, **_kwargs):
+        current = asyncio.current_task()
+        assert current is not None
+        verdict_tasks.append(current)
+        parked.set()
+        try:
+            await late_verdict.wait()
+            return {"action": "accept"}
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(cnp, "_park_cursor_elicitation", park)
+    supervisor = _start_supervisor(
+        tmp_path, session_id="conv_cleanup", auto_accept_approvals=False
+    )
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=2)
+        if resolved_in_terminal:
+            pending.clear()
+            assert await _wait_for(
+                lambda: any(
+                    body.get("type") == "external_elicitation_resolved" for _, body in posts
+                )
+            )
+        else:
+            await _stop(supervisor)
+        assert cancelled.is_set()
+        assert all(task.cancelled() for task in verdict_tasks)
+        late_verdict.set()
+        await asyncio.sleep(0)
+        assert sent == []
+    finally:
+        await _stop(supervisor)
+
+
+async def test_supervisor_observes_verdict_failure_without_restarting_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _install_supervisor_fakes(monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_IDLE_PANE)
+    failures: list[str] = []
+
+    async def fail(*_args, **_kwargs):
+        failures.append("failed")
+        raise ValueError("invalid verdict")
+
+    monkeypatch.setattr(cnp, "_park_cursor_elicitation", fail)
+    supervisor = _start_supervisor(
+        tmp_path, session_id="conv_failed_verdict", auto_accept_approvals=False
+    )
+    try:
+        assert await _wait_for(lambda: "cursor elicitation task failed" in caplog.text)
+        assert "invalid verdict" in caplog.text
+        assert not supervisor.done()
+        assert failures == ["failed"]
+    finally:
+        await _stop(supervisor)
+
+
+@pytest.mark.parametrize("error", [OSError(24, "Too many open files"), RuntimeError("gone")])
+async def test_send_keys_stops_sequence_when_terminal_command_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    attempts: list[str] = []
+
+    def fail(_bridge: Path, key: str) -> None:
+        attempts.append(key)
+        raise error
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", fail)
+    assert not await cnp._send_cursor_keys(tmp_path, "conv_keys", "Escape", "Enter")
+    assert attempts == ["Escape"]
+
+
 async def test_supervise_transcript_yolo_auto_accepts_without_card(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
