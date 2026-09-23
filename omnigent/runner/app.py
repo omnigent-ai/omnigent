@@ -3142,13 +3142,12 @@ def create_runner_app(
         """Whether a native terminal still reports this session's turn as in flight.
 
         Native delivery returns once the prompt is typed, so the terminal's own
-        published status edges decide when the turn settles. An unresolved
-        harness counts, so a cold spec cache cannot drop a live native turn.
+        status edges decide when the turn settles. SDK turns are already covered
+        by ``_active_turns`` and need not publish a closing edge.
         """
         if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
             return False
-        harness = _session_harness_name(session_id)
-        return harness is None or is_native_harness(harness)
+        return is_native_harness(_session_harness_name(session_id))
 
     app.state.has_active_work = _has_active_work
 
