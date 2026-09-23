@@ -413,6 +413,105 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ignored effort setting posts a neutral info-level notice, not an error.
+
+    When a gateway-routed model disables thinking to keep text surfacing, the
+    effort setting is silently dropped. This is informational (the session still
+    works), so it must arrive as level=info with its own code, not as the
+    destructive pi_credentials_unresolved banner.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+
+    provider = pi_native_credentials.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://wkspc.example.com/ai-gateway/responses",
+        api="openai-responses",
+        model="system.ai.placeholder-model-xyz",
+        api_key="managed-token",
+        auth_header=True,
+    )
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
+    )
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "pi_native_provider_launch",
+        lambda _agent_dir, _provider, _effort=None, **_kwargs: (
+            pi_native_credentials.PiNativeLaunch(
+                env={},
+                args=[],
+                effort_warning=(
+                    "effort ignored for gateway-routed model system.ai.placeholder-model-xyz: "
+                    "thinking disabled to keep text surfacing"
+                ),
+            )
+        ),
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, terminal_name: str, **_kwargs: Any
+        ) -> SessionResourceView:
+            del terminal_name, _kwargs
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            posts.append((url, kwargs.get("json") or {}))
+            return self._Response()
+
+    await _auto_create_pi_terminal(
+        "5e3a1b2c4d6f7e8091a2b3c4d5e6f708",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+    )
+
+    notice_posts = [
+        body
+        for url, body in posts
+        if "/events" in url and body.get("type") == "external_conversation_item"
+    ]
+    assert len(notice_posts) == 1
+    data = notice_posts[0]["data"]
+    assert data["item_type"] == "error"
+    assert data["item_data"]["code"] == "pi_native_effort_ignored"
+    assert data["item_data"]["level"] == "info"
+    # The credential error code must not appear on a notice-only post.
+    assert data["item_data"]["code"] != "pi_credentials_unresolved"
+
+
+@pytest.mark.asyncio
 async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
