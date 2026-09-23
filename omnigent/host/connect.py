@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,6 +180,9 @@ from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     from omnigent.workspace_fs import WorkspaceReader
+
+# Workspaces whose fs reader (and change registry) stay warm between requests.
+_FS_READER_CACHE_SIZE = 8
 
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -1059,9 +1063,10 @@ class HostProcess:
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
-        # One reader per workspace: its registry keeps state between requests
-        # (the changed-files snapshot that search reuses for untracked files).
-        self._fs_readers: dict[str, WorkspaceReader] = {}
+        # One reader per workspace, so its registry keeps state between
+        # requests (the changed-files snapshot search reuses for untracked
+        # files). Each entry remembers the repository root it was built for.
+        self._fs_readers: OrderedDict[str, tuple[Path | None, WorkspaceReader]] = OrderedDict()
         self._fs_readers_lock = threading.Lock()
         self._interactive_shells = normalize_interactive_shells(
             interactive_shells
@@ -2910,6 +2915,7 @@ class HostProcess:
         """
         from pathlib import Path
 
+        from omnigent.runtime.filesystem_registry import _find_git_root
         from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
         try:
@@ -2931,14 +2937,21 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
 
+        # Re-detect the repository every time: a workspace that gains or loses
+        # a .git after its first request needs a reader of the matching kind.
+        try:
+            repo_root = _find_git_root(Path(expanded))
+        except OSError:
+            repo_root = None
         with self._fs_readers_lock:
-            reader = self._fs_readers.get(expanded)
-            # A reader built before the workspace had a git repository (a
-            # clone landing after the first request) stays walk-only, so
-            # re-detect until one is git-backed. A fresh reader for a non-git
-            # workspace is what every request built before readers were cached.
-            if reader is None or not reader.git_backed:
-                reader = self._fs_readers[expanded] = WorkspaceReader(Path(expanded))
+            cached = self._fs_readers.get(expanded)
+            if cached is None or cached[0] != repo_root:
+                cached = (repo_root, WorkspaceReader(Path(expanded)))
+                self._fs_readers[expanded] = cached
+                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                    self._fs_readers.popitem(last=False)
+            self._fs_readers.move_to_end(expanded)
+            reader = cached[1]
         params = frame.params or {}
         try:
             payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)

@@ -55,7 +55,6 @@ from omnigent.runner.environment_filesystem import (
     split_glob_list,
 )
 from omnigent.runtime.filesystem_registry import (
-    GitFilesystemRegistry,
     GitStatusUnavailable,
     create_filesystem_registry,
 )
@@ -99,15 +98,6 @@ class WorkspaceReader:
         # semantics and everything else degrades to an empty list.
         self._registry = create_filesystem_registry(self._root)
         self._registry.start()
-
-    @property
-    def git_backed(self) -> bool:
-        """Whether the workspace had a git repository when this reader was built.
-
-        Callers caching readers re-detect through this: a workspace that gains
-        a repository later needs a fresh reader to get git-index coverage.
-        """
-        return isinstance(self._registry, GitFilesystemRegistry)
 
     # ── Path confinement ──────────────────────────────────────────
 
