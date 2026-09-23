@@ -48,6 +48,21 @@ export function detectIdleTransitions(
   });
 }
 
+/**
+ * True when the viewer has already seen this conversation's latest
+ * activity on some device: the server-side per-viewer read baseline
+ * (`viewer_last_seen`, raised by whichever client is actively viewing
+ * the session and redistributed through the list/updates stream) has
+ * caught up with `updated_at`. Absent read state reads as not-seen, so
+ * the caller falls back to notifying.
+ */
+export function viewerHasSeenLatestActivity(conversation: Conversation): boolean {
+  return (
+    typeof conversation.viewer_last_seen === "number" &&
+    conversation.viewer_last_seen >= conversation.updated_at
+  );
+}
+
 /** Snapshot of each conversation's pending-elicitation count, keyed by id. */
 export function buildElicitationMap(conversations: Conversation[]): Map<string, number> {
   const map = new Map<string, number>();
