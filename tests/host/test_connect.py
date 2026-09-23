@@ -5493,9 +5493,7 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     )
 
     with patch("omnigent.host.connect.subprocess.Popen", side_effect=_slow_popen):
-        task = asyncio.create_task(
-            host._dispatch_host_frame(_CollectingWs(), frame)  # type: ignore[arg-type]
-        )
+        task = asyncio.create_task(host._handle_launch(frame))
         # Cancel only once the spawn thread has actually created the process,
         # so we exercise the real leak window rather than a pre-spawn cancel.
         await asyncio.to_thread(spawn_started.wait, 10.0)
@@ -5503,26 +5501,8 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
         with pytest.raises(asyncio.CancelledError):
             await task
         assert host._runner_stop_tasks, "abandoned spawn teardown was not retained"
-        status_started = asyncio.Event()
-
-        async def _query() -> HostRunnerStatusResultFrame:
-            status_started.set()
-            return await host._handle_runner_status(
-                HostRunnerStatusFrame(
-                    request_id="status", runner_id=token_bound_runner_id(frame.binding_token)
-                )
-            )
-
-        query = asyncio.create_task(_query())
-        try:
-            await asyncio.wait_for(status_started.wait(), 5.0)
-            assert not query.done(), "status must wait for the abandoned spawn's cleanup"
-        finally:
-            release_spawn.set()
-            await host._drain_runner_stop_tasks()
-            result = await asyncio.wait_for(query, 5.0)
-        assert result.status == "unknown"
-        assert not host._pending_runner_launches
+        release_spawn.set()
+        await host._drain_runner_stop_tasks()
 
     assert spawned, "the spawn thread should have created a process"
     # Never registered (that is the leak window) ...
@@ -6274,12 +6254,12 @@ async def test_runner_status_waits_for_pending_launch(
     assert host._runners[runner_id].proc is proc
 
 
-@pytest.mark.parametrize("outcome", ["refused", "error", "cancelled"])
+@pytest.mark.parametrize("outcome", ["refused", "error"])
 async def test_runner_status_settles_after_unsuccessful_launch(
     outcome: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Refusal, handler failure, and cancellation must release status waiters."""
+    """Refusal and handler failure must release status waiters."""
     host = _make_host_process()
     ws = _CollectingWs()
     entered = asyncio.Event()
@@ -6313,8 +6293,6 @@ async def test_runner_status_settles_after_unsuccessful_launch(
         query = asyncio.create_task(_query())
         await asyncio.wait_for(status_started.wait(), 5.0)
         assert not query.done()
-        if outcome == "cancelled":
-            launch.cancel()
         release.set()
         result = await asyncio.wait_for(query, 5.0)
         assert result.status == "unknown"

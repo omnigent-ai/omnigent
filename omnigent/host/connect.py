@@ -1189,8 +1189,8 @@ class HostProcess:
         # this lock: a session DELETE racing a slow create must not have its
         # stop overtake the launch it targets.
         self._runner_lifecycle_lock = asyncio.Lock()
-        # Status queries wait for this runner's queued spawn or abandoned-spawn
-        # cleanup before deciding that an unregistered runner is unknown.
+        # Status queries wait for this runner's queued launch before deciding
+        # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
@@ -1848,7 +1848,6 @@ class HostProcess:
                     self._stop_abandoned_spawn(spawn),
                     name="host-stop-abandoned-runner-spawn",
                 )
-                self._track_pending_runner_launch(runner_id, task)
                 self._runner_stop_tasks.add(task)
                 task.add_done_callback(self._runner_stop_tasks.discard)
                 raise
@@ -2199,7 +2198,7 @@ class HostProcess:
     def _track_pending_runner_launch(
         self, runner_id: str, completion: asyncio.Future[None]
     ) -> None:
-        """Keep launch and cleanup work visible to this runner's status queries."""
+        """Keep queued and active launches visible to this runner's status queries."""
         pending = self._pending_runner_launches.setdefault(runner_id, set())
         pending.add(completion)
 
@@ -2216,10 +2215,10 @@ class HostProcess:
     ) -> HostRunnerStatusResultFrame:
         """Answer whether a runner's process is alive, dead, or unknown.
 
-        Wait for this runner's queued launch, spawn, or abandoned-spawn
-        cleanup before checking its process. An unregistered runner can
-        still be starting; reporting it as unknown would cause the server
-        to replace it. Unrelated runners' status queries remain independent.
+        Wait for this runner's queued launch and spawn before checking its
+        process. An unregistered runner can still be starting; reporting it
+        as unknown would cause the server to replace it. Unrelated runners'
+        status queries remain independent.
 
         A tracked running process is ``alive`` (booting or serving), an
         exited process is ``dead``, and an untracked runner with no pending
@@ -2230,8 +2229,7 @@ class HostProcess:
         :returns: Result frame with ``alive`` / ``dead`` / ``unknown``.
         """
         while pending := self._pending_runner_launches.get(frame.runner_id):
-            # A cancelled spawn can hand off to cleanup while we wait. Shield
-            # shared completions from a status request's cancellation.
+            # Shield shared completions from a status request's cancellation.
             await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         handle = self._runners.get(frame.runner_id)
         if handle is None:
