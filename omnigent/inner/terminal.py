@@ -309,6 +309,7 @@ _IDLE_POLL_INTERVAL_SECONDS = 1.0
 # healthy. Require repeated capture + session-probe failures before exit.
 _IDLE_EXIT_FAILURE_THRESHOLD = 3
 _PROBE_ERROR_MAX_CHARS = 1024
+_EXIT_DIAGNOSTIC_SCROLLBACK_LINES = 100
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
 
@@ -1047,6 +1048,7 @@ class TerminalInstance:
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
     _last_pane_snapshot: str | None = field(default=None, repr=False)
+    _last_exit_snapshot: str | None = field(default=None, repr=False)
     _last_capture_at: float | None = field(default=None, repr=False)
     _probe_failures: deque[dict[str, object]] = field(
         default_factory=lambda: deque(maxlen=2 * _IDLE_EXIT_FAILURE_THRESHOLD),
@@ -1111,6 +1113,65 @@ class TerminalInstance:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
         self._last_capture_at = time.monotonic()
+
+    def last_exit_text(self) -> str | None:
+        """Return bounded recent exit history without changing the visible-screen cache."""
+        if self._last_exit_snapshot is None:
+            return None
+        return _strip_ansi(self._last_exit_snapshot).strip() or None
+
+    def _exit_capture_args(self) -> tuple[str, ...]:
+        """Read stable exit-history bounds and capture joined recent records."""
+        return (
+            "display-message",
+            "-p",
+            "-t",
+            self.tmux_target,
+            "#{history_size} #{history_limit}",
+            ";",
+            "capture-pane",
+            "-t",
+            self.tmux_target,
+            "-p",
+            "-e",
+            "-J",
+            "-S",
+            f"-{_EXIT_DIAGNOSTIC_SCROLLBACK_LINES}",
+        )
+
+    def _remember_exit_snapshot(self, captured: str) -> None:
+        """Omit a leading record that may have lost its credential prefix."""
+        self._last_exit_snapshot = ""
+        bounds, separator, snapshot = captured.partition("\n")
+        if not separator:
+            return
+        try:
+            history_size, history_limit = (int(value) for value in bounds.split())
+        except ValueError:
+            return
+        if history_size < 0 or history_limit < 0:
+            return
+        # Tmux evicts history in 10% batches; small buffers can already have
+        # lost the first record's prefix even when our capture includes all rows.
+        retained_capacity = history_limit - max(1, history_limit // 10)
+        if (
+            history_size > _EXIT_DIAGNOSTIC_SCROLLBACK_LINES
+            or retained_capacity <= _EXIT_DIAGNOSTIC_SCROLLBACK_LINES
+        ):
+            snapshot = snapshot.partition("\n")[2]
+        self._last_exit_snapshot = snapshot
+
+    async def _capture_exit_snapshot(self) -> None:
+        """Retain recent output after confirmed exit, before cleanup removes tmux."""
+        self._last_exit_snapshot = ""
+        with contextlib.suppress(RuntimeError, OSError):
+            self._remember_exit_snapshot(await self._tmux_output(*self._exit_capture_args()))
+
+    def _capture_exit_snapshot_sync(self) -> None:
+        """Synchronous exit capture for the threaded lifecycle watcher."""
+        self._last_exit_snapshot = ""
+        with contextlib.suppress(RuntimeError, OSError):
+            self._remember_exit_snapshot(self._tmux_output_sync(*self._exit_capture_args()))
 
     def _probe_log_extra(
         self,
@@ -1324,6 +1385,7 @@ class TerminalInstance:
         """Start the tmux session."""
         if self.running:
             return
+        self._last_exit_snapshot = None
         effective_cwd = str(cwd or self.private_dir)
 
         # Do NOT advertise the tmux control socket path to the
@@ -1722,9 +1784,11 @@ class TerminalInstance:
 
         consecutive_capture_failures = 0
         self._probe_failures.clear()
-        while self.running:
+        while True:
             await asyncio.sleep(_IDLE_POLL_INTERVAL_SECONDS)
             if not self.running:
+                if on_exit is not None:
+                    await _fire(on_exit, "exit")
                 return
             started_at = time.monotonic()
             try:
@@ -1783,12 +1847,9 @@ class TerminalInstance:
                 await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
                 continue
             if pane_dead:
-                # remain-on-exit kept the server alive after the inner CLI
-                # exited; report the exit rather than treating the frozen pane
-                # as an idle agent. Detach all clients so attached tmux attach
-                # subprocesses (CLI direct attach, server-side bridge PTY) exit
-                # naturally instead of hanging on the dead pane. Only relevant
-                # when keep_alive_after_exit is set (remain-on-exit was enabled).
+                await self._capture_exit_snapshot()
+                # Retained dead panes must release attached clients and report
+                # exit rather than appearing to be idle agents.
                 if self.keep_alive_after_exit:
                     with contextlib.suppress(Exception):
                         await self._tmux_output("detach-client", "-s", self.tmux_target)
@@ -1909,8 +1970,9 @@ class TerminalInstance:
 
         Runs on the daemon thread spawned by
         :meth:`start_idle_watcher_thread`. Stops cleanly when
-        ``stop_event`` is set or when ``self.running`` flips to
-        ``False`` (close path). A failed ``capture-pane`` is confirmed with
+        ``stop_event`` is set. A liveness probe may mark the pane stopped
+        before this watcher polls; it must still report that exit.
+        A failed ``capture-pane`` is confirmed with
         ``has-session`` and must repeat before the watcher reports exit.
 
         :param stop_event: Event the close path sets to signal
@@ -1937,13 +1999,15 @@ class TerminalInstance:
         interval = poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
         consecutive_capture_failures = 0
         self._probe_failures.clear()
-        while self.running:
+        while True:
             # ``Event.wait`` doubles as the poll-interval sleep, so
             # ``stop_event.set()`` from :meth:`close` returns within
             # one tick instead of waiting out the full interval.
             if stop_event.wait(interval):
                 return
             if not self.running:
+                if on_exit is not None:
+                    self._fire_watch_callback(on_exit, "exit")
                 return
             try:
                 snapshot = self._capture_pane_for_idle_or_none()
@@ -1989,13 +2053,9 @@ class TerminalInstance:
                     return
                 continue
             if pane_dead:
-                # The inner CLI exited but remain-on-exit kept the server, so
-                # capture-pane still succeeds (the snapshot above is the final
-                # frame, now remembered for diagnostics). Report the exit
-                # deterministically instead of mistaking the frozen pane for an
-                # idle agent and leaving the session hung. Detach all clients
-                # so attached tmux attach subprocesses exit naturally. Only
-                # relevant when keep_alive_after_exit is set.
+                self._capture_exit_snapshot_sync()
+                # Retained dead panes must release attached clients and report
+                # exit rather than appearing to be idle agents.
                 if self.keep_alive_after_exit:
                     with contextlib.suppress(Exception):
                         self._tmux_output_sync("detach-client", "-s", self.tmux_target)
@@ -2213,7 +2273,7 @@ class TerminalInstance:
                 "-t",
                 self.tmux_target,
                 "-F",
-                "#{pane_dead}",
+                "#{pane_dead} #{pane_dead_status}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -2247,8 +2307,19 @@ class TerminalInstance:
                 self.running = False
                 return False
             # remain-on-exit can keep the session alive after its process exits.
-            panes = stdout.decode().split()
-            if not panes or "1" in panes:
+            panes = stdout.decode().strip()
+            self._remember_exit_status(panes)
+            if not panes or panes.split()[:1] == ["1"]:
+                # A client liveness probe can beat the exit watcher. Preserve
+                # the final frame before running=False lets cleanup proceed.
+                if panes:
+                    with contextlib.suppress(RuntimeError, OSError):
+                        self._remember_pane_snapshot(
+                            await self._tmux_output(
+                                "capture-pane", "-t", self.tmux_target, "-p", "-e"
+                            )
+                        )
+                    await self._capture_exit_snapshot()
                 self.running = False
                 return False
             return True

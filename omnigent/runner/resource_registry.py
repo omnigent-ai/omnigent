@@ -1047,15 +1047,29 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
 
-        instance = await self._terminal_registry.launch(
-            conversation_id=session_id,
-            terminal_name=terminal_name,
-            session_key=session_key,
-            spec=spec,
-            parent_os_env=parent_os_env,
-            cwd_override=cwd_override,
-            sandbox_override=sandbox_override,
-        )
+        from omnigent.terminals.registry import TerminalExitedDuringLaunch
+
+        try:
+            instance = await self._terminal_registry.launch(
+                conversation_id=session_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                spec=spec,
+                parent_os_env=parent_os_env,
+                cwd_override=cwd_override,
+                sandbox_override=sandbox_override,
+            )
+        except TerminalExitedDuringLaunch as exc:
+            await self._finalize_terminal_exit(
+                session_id=session_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                lifecycle=lifecycle,
+                instance=exc.instance,
+                resource_role=resource_role,
+                before_observation=True,
+            )
+            raise
         return await self._observe_terminal_with_lifecycle(
             lifecycle,
             session_id=session_id,
@@ -1125,12 +1139,18 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
         if not getattr(instance, "running", False) or not await instance.is_alive():
-            # Close by instance, not key — a successor may hold the key now.
-            await self._terminal_registry.close(
-                session_id, terminal_name, session_key, expected=instance
+            await self._finalize_terminal_exit(
+                session_id=session_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                lifecycle=lifecycle,
+                instance=instance,
+                resource_role=resource_role,
+                before_observation=True,
             )
             raise RuntimeError(
-                f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
+                f"terminal {terminal_name}:{session_key} is not running for session {session_id} "
+                f"(exit status {instance.last_exit_status()})"
             )
 
         from omnigent.terminals.registry import TerminalListEntry
@@ -1518,11 +1538,29 @@ class SessionResourceRegistry:
             )
             lifecycle = observed
 
+        await self._finalize_terminal_exit(
+            session_id=session_id,
+            terminal_name=terminal_name,
+            session_key=session_key,
+            lifecycle=lifecycle,
+            instance=instance,
+            resource_role=observed_role,
+        )
+
+    async def _finalize_terminal_exit(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        lifecycle: TerminalLifecycle,
+        instance: TerminalInstance | None,
+        resource_role: str | None,
+        before_observation: bool = False,
+    ) -> None:
+        """Preserve exit evidence even when a pane dies before observation starts."""
+        terminal_id = terminal_resource_id(terminal_name, session_key)
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
-        # Idle = clean shutdown after the turn finished. Anything else (running,
-        # or never observed → boot failure) stays a failure.
-        session_status_before_exit = self._take_session_status_memo(session_id)
-        session_was_idle = session_status_before_exit == "idle"
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1542,17 +1580,34 @@ class SessionResourceRegistry:
                 if current is not None and instance is not None and current is not instance:
                     superseded_by = current
 
-        # Only the Codex terminal records a final-screen excerpt on its exit
-        # event. Codex takes the pane-dead path (keep_alive_after_exit) but its
-        # last_output is dropped by the publisher's auxiliary short-circuit, so
-        # the debug log is the only durable path to that evidence. Every other
-        # terminal keeps the guarantee that lifecycle attributes hold no pane
-        # contents, so their excerpt stays absent.
-        redacted_last_output: str | None = None
-        if observed_role == CODEX_NATIVE_TERMINAL_ROLE and last_output:
-            from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+        # A replaced launch must not consume its successor's status memo.
+        session_status_before_exit = (
+            self._take_session_status_memo(session_id)
+            if superseded_by is None and not before_observation
+            else None
+        )
+        session_was_idle = session_status_before_exit == "idle"
 
-            redacted_last_output = sanitize_diagnostic_text(last_output) or None
+        # Codex keeps its existing final-screen event. New pre-observation
+        # diagnostics may include recent history only under explicit opt-in.
+        redacted_last_output: str | None = None
+        if resource_role == CODEX_NATIVE_TERMINAL_ROLE:
+            from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+            from omnigent.process_logging import harness_stderr_capture_enabled
+
+            if not before_observation or harness_stderr_capture_enabled():
+                # Redact the complete frame before trimming, so a long credential
+                # cannot lose its identifying prefix at the truncation boundary.
+                raw_output = last_output
+                if instance is not None:
+                    raw_output = (
+                        instance.last_exit_text()
+                        if before_observation
+                        else instance.last_pane_text()
+                    )
+                redacted_last_output = trim_terminal_output(
+                    sanitize_diagnostic_text(raw_output or "")
+                )
 
         publisher = self._terminal_exit_publisher
         _logger.info(
@@ -1575,6 +1630,7 @@ class SessionResourceRegistry:
                 session_status_before_exit=session_status_before_exit or "unknown",
                 terminal_exit_status=exit_status,
                 terminal_last_output=redacted_last_output,
+                before_observation=before_observation,
                 superseded=superseded_by is not None,
             ),
         )
@@ -1585,7 +1641,7 @@ class SessionResourceRegistry:
                 terminal_name,
                 session_key,
             )
-        elif publisher is not None:
+        elif publisher is not None and not before_observation:
             publisher(
                 TerminalExitEvent(
                     session_id=session_id,

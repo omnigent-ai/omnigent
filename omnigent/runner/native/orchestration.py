@@ -5193,6 +5193,16 @@ async def _auto_create_codex_terminal(
                 keep_alive_after_exit=True,
             ),
         )
+        terminal_registry = getattr(resource_registry, "terminal_registry", None)
+        terminal_instance = (
+            terminal_registry.get(session_id, "codex", "main")
+            if terminal_registry is not None
+            else None
+        )
+        if terminal_instance is not None and str(terminal_instance.socket_path) != (
+            terminal_view.metadata.get("tmux_socket")
+        ):
+            terminal_instance = None
         publish_event(
             session_id,
             {
@@ -5263,6 +5273,7 @@ async def _auto_create_codex_terminal(
                 workspace=workspace,
                 event_client=event_client,
                 app_server=app_server,
+                terminal_instance=terminal_instance,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
@@ -5315,6 +5326,42 @@ async def _auto_create_codex_terminal(
     return terminal_view
 
 
+class _CodexTerminalExited(RuntimeError):
+    """The exact TUI being launched stopped before creating its thread."""
+
+    def __init__(self, instance: TerminalInstance) -> None:
+        self.instance = instance
+        super().__init__(
+            f"Codex terminal exited with status {instance.last_exit_status()} "
+            "before starting a thread"
+        )
+
+
+async def _wait_for_codex_thread_or_terminal_exit(
+    thread_started: Awaitable[str], instance: TerminalInstance
+) -> str:
+    """Stop startup discovery promptly without following a replacement terminal."""
+
+    async def wait_for_exit() -> None:
+        while await instance.is_alive():
+            await asyncio.sleep(_TERMINAL_INTERACTIVE_POLL_INTERVAL_S)
+
+    thread_task = asyncio.ensure_future(thread_started)
+    exit_task = asyncio.create_task(wait_for_exit())
+    try:
+        done, _ = await asyncio.wait((thread_task, exit_task), return_when=asyncio.FIRST_COMPLETED)
+        # A created thread remains usable through the app-server after TUI exit.
+        if thread_task in done:
+            return await thread_task
+        await exit_task
+        raise _CodexTerminalExited(instance)
+    finally:
+        for task in (thread_task, exit_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(thread_task, exit_task, return_exceptions=True)
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -5325,6 +5372,7 @@ async def _codex_discover_thread_and_forward(
     event_client: CodexAppServerClient,
     routing_summary: str,
     app_server: CodexNativeAppServer | None = None,
+    terminal_instance: TerminalInstance | None = None,
     login_required: bool = False,
     thread_start_timeout_seconds: float | None = None,
     subagent_router: SubagentRouter | None = None,
@@ -5358,6 +5406,8 @@ async def _codex_discover_thread_and_forward(
         without runner-log access (see #2745).
     :param app_server: This launch's process, retained for failure diagnostics
         before cleanup. A later launch may replace the session registry entry.
+    :param terminal_instance: This launch's TUI, retained to detect early exit
+        without depending on thread creation or a later registry lookup.
     :param login_required: ``True`` when the resolved launch defers to
         Codex's own login with no usable stored credential — the TUI parks
         on the sign-in screen and cannot start a thread on its own. Chat
@@ -5421,14 +5471,21 @@ async def _codex_discover_thread_and_forward(
             if login_required:
                 # No deadline: the turn-facing failure is already recorded,
                 # so this wait only serves a possible interactive sign-in.
-                thread_id = await wait_for_thread_started(event_client, timeout=None)
+                thread_started = wait_for_thread_started(event_client, timeout=None)
             elif thread_start_timeout_seconds is not None:
-                thread_id = await wait_for_thread_started(
+                thread_started = wait_for_thread_started(
                     event_client,
                     timeout=thread_start_timeout_seconds,
                 )
             else:
-                thread_id = await wait_for_thread_started(event_client)
+                thread_started = wait_for_thread_started(event_client)
+            thread_id = (
+                await thread_started
+                if terminal_instance is None
+                else await _wait_for_codex_thread_or_terminal_exit(
+                    thread_started, terminal_instance
+                )
+            )
         except (TimeoutError, RuntimeError) as exc:
             # Expected failure modes of wait_for_thread_started: the TUI exited
             # at startup, or the event stream ended before a thread was
@@ -5436,6 +5493,19 @@ async def _codex_discover_thread_and_forward(
             # error is a bug and propagates.
             try:
                 diagnostics = collect_codex_startup_diagnostics(app_server)
+                if isinstance(exc, _CodexTerminalExited):
+                    from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+                    from omnigent.process_logging import harness_stderr_capture_enabled
+                    from omnigent.runner.resource_registry import trim_terminal_output
+
+                    diagnostics.update(
+                        terminal_instance_id=exc.instance.diagnostic_id,
+                        terminal_exit_status=exc.instance.last_exit_status(),
+                    )
+                    if harness_stderr_capture_enabled():
+                        diagnostics["terminal_last_output"] = trim_terminal_output(
+                            sanitize_diagnostic_text(exc.instance.last_exit_text() or "")
+                        )
             except Exception as diagnostics_error:  # noqa: BLE001
                 # Diagnostics must not replace the startup error or prevent cleanup.
                 diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
@@ -5443,7 +5513,13 @@ async def _codex_discover_thread_and_forward(
             failure_event["attributes"] = {
                 "harness": "codex-native",
                 "phase": "thread_discovery",
-                "reason": "timeout" if isinstance(exc, TimeoutError) else "event_stream_ended",
+                "reason": (
+                    "terminal_exited"
+                    if isinstance(exc, _CodexTerminalExited)
+                    else "timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "event_stream_ended"
+                ),
                 "timeout_s": (
                     None
                     if login_required
@@ -5458,17 +5534,24 @@ async def _codex_discover_thread_and_forward(
                 **diagnostics,
             }
             _logger.exception(
-                "Codex TUI never started a thread for %s; chat will not forward%s",
+                "Codex TUI never started a thread for %s; chat will not forward%s%s",
                 session_id,
                 (
                     f"\nCodex startup stderr:\n{diagnostics['stderr_tail']}"
                     if diagnostics.get("stderr_tail")
                     else ""
                 ),
+                (
+                    f"\nCodex startup terminal output:\n{diagnostics['terminal_last_output']}"
+                    if diagnostics.get("terminal_last_output")
+                    else ""
+                ),
                 extra=failure_event,
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
-            if isinstance(exc, TimeoutError):
+            if isinstance(exc, _CodexTerminalExited):
+                cause = f"terminal exited with status {exc.instance.last_exit_status()}"
+            elif isinstance(exc, TimeoutError):
                 timeout_seconds = (
                     thread_start_timeout_seconds
                     if thread_start_timeout_seconds is not None
@@ -5477,12 +5560,18 @@ async def _codex_discover_thread_and_forward(
                 cause = f"startup timed out after {timeout_seconds:g}s"
             else:
                 cause = "event stream ended before a thread was created"
-            write_bridge_startup_error(
-                bridge_dir,
-                f"Codex app-server never started a thread ({cause}: "
-                f"{type(exc).__name__}). Launch routing: {routing_summary}. "
-                "(The runner log has the same near 'native-codex routing'.)",
-            )
+            if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+                write_bridge_startup_error(
+                    bridge_dir,
+                    f"Codex app-server never started a thread ({cause}: "
+                    f"{type(exc).__name__}). Launch routing: {routing_summary}. "
+                    "(The runner log has the same near 'native-codex routing'.)"
+                    + (
+                        f"\nCodex startup terminal output:\n{diagnostics['terminal_last_output']}"
+                        if diagnostics.get("terminal_last_output")
+                        else ""
+                    ),
+                )
             return
 
         if login_required:
@@ -5586,7 +5675,9 @@ async def _codex_discover_thread_and_forward(
                 stage="native_input",
             ),
         )
-        leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        leftover_app_server = app_server
+        if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         with contextlib.suppress(Exception):
             await event_client.close()
         if leftover_app_server is not None:

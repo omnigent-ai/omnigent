@@ -8,12 +8,14 @@ launch environment, so start a fresh host and session after changing it.
 
 | Harness | Diagnostic source | When exported |
 | --- | --- | --- |
-| Codex native | App-server stderr pipe | Continuously throughout the app-server lifetime, plus the existing first-thread discovery failure snapshot |
+| Codex native | App-server stderr pipe; bounded terminal output on startup exit | Stderr continuously throughout the app-server lifetime; terminal evidence before startup cleanup |
 | Claude native | An Omnigent-owned Claude `--debug-file` | Continuously while the transcript forwarder runs, plus a bounded final drain on shutdown or launch failure |
 
 The flag is shared across harnesses and lifecycle phases. Codex captures the
-app-server's stderr, including startup and runtime diagnostics; it does not read
-the separate TUI's stderr or private log files. Claude's debug channel does
+app-server's stderr, including startup and runtime diagnostics. A separate
+startup-exit path captures the TUI's recent terminal output, because argument
+parsing can fail before native logging initializes. Neither path reads Codex's
+private log files. Claude's debug channel does
 not capture arbitrary child-process stderr, terminal screen contents, or errors
 that occur before Claude initializes its logger. The terminal's file descriptors
 remain unchanged.
@@ -48,6 +50,38 @@ whitespace-delimited label/value matching without `:` or `=` is confined to
 diagnostic sanitization.
 
 ## Codex continuous diagnostics
+
+Enabled capture also configures the app-server's `RUST_LOG` filter. Without an
+explicit filter, Codex can retain useful diagnostics in its native local store
+while its stderr contains only the listener banner. Omnigent selects warnings
+plus targeted HTTP, engine-client, MCP, and tool-timing diagnostics:
+
+```text
+warn,codex_core::client=info,codex_core::tools::parallel=debug,codex_core::mcp=info,codex_http_client=debug,codex_client::default_client=debug,codex_mcp_client=info,codex_code_mode::timing=debug
+```
+
+An explicit subprocess `RUST_LOG` takes precedence, then a runner/CLI environment
+value, including an empty filter or `off`. For a host-managed session, add
+`RUST_LOG` to `OMNIGENT_RUNNER_ENV_PASSTHROUGH` if you want to forward a custom
+host filter to the runner. Disabled capture does not inject or change the filter.
+Start a fresh host/session after changing its launch environment.
+
+The default avoids broad core/protocol DEBUG filters, which can include prompts,
+tool payloads, and large amounts of span activity. It is not a content-security
+boundary: warnings and request context can still contain sensitive data, and
+redaction remains pattern-based. Module names and available detail depend on the
+installed Codex version. User-selected filters can increase volume or suppress
+otherwise useful diagnostics.
+
+The HTTP targets cover both older `codex_client::default_client` and newer
+`codex_http_client` implementations; they do not enable transport-level body
+tracing. The native-binary regression is exercised against Codex 0.139.0 and
+0.152.1.
+
+This uses [Codex's supported `RUST_LOG` control](https://learn.chatgpt.com/docs/config-file/environment-variables#diagnostics)
+for native stderr logging, not a reader for Codex's private
+`logs_2.sqlite` schema. No `log_dir` override or plaintext TUI file is needed, and
+the remote TUI's logging configuration is left unchanged.
 
 Both CLI and host-managed launches drain app-server stderr for the entire
 process lifetime. With capture enabled, completed records are handed to a
@@ -118,16 +152,31 @@ lifecycle-event attributes carry no pane contents (see
 `last_output` never reaches the terminal failure display (that path is
 required-terminal only); the event excerpt is its durable record.
 
-An exit that happens before the terminal is registered (e.g. the app-server
-dies during startup) still takes the launch-failure path and does not produce
-a `terminal_exit_observed` event; the Codex startup failure snapshot below
-covers that window.
+Liveness probes preserve the exit status and output before marking a pane
+stopped, so they cannot silence the exit watcher. A terminal that exits before
+registration also emits `terminal_exit_observed`, with
+`before_observation=True`. These early records always include available exit
+metadata; only opted-in Codex launches include a sanitized recent-output tail.
+They do not publish lifecycle changes for a resource that was never observed.
+
+The new startup paths capture up to 100 rows of recent scrollback plus the visible
+screen, so an argument parser's first error line is not lost when usage text
+scrolls it away. A possibly incomplete first joined record is discarded when
+history could have lost its prefix; unknown capture metadata suppresses the new
+tail. Export sanitizes the captured text before trimming to
+the last 40 lines and 4,000 characters, plus an omission notice. Existing
+registered Codex `terminal_exit_observed` records retain their screen-only
+excerpt independently of this flag; the flag is not a master content switch for
+ordinary lifecycle logs. Other terminals still export no pane text in these
+event attributes.
 
 ## Codex startup failure snapshot
 
-When a fresh native Codex session times out waiting for its first thread, or
-the event stream ends before that thread arrives, the runner emits the existing
-error with `event_name=codex_thread_start_failed`. The record uses the actual
+When a fresh native Codex session's TUI exits, thread discovery times out, or
+the event stream ends before the first thread arrives, the runner emits
+`event_name=codex_thread_start_failed`. Discovery races the exact launched
+terminal's exit, including during an unbounded sign-in wait; it does not wait
+for a timeout or follow a replacement terminal. The record uses the actual
 session ID, including for a child sharing its parent's runner.
 
 The snapshot is taken before cleanup closes the app-server. It is available at
@@ -139,7 +188,9 @@ included; with the flag disabled, the event omits stderr text and tail metadata.
 | Field | Meaning |
 | --- | --- |
 | `harness`, `phase` | `codex-native`, `thread_discovery` |
-| `reason` | `timeout` or `event_stream_ended` |
+| `reason` | `terminal_exited`, `timeout`, or `event_stream_ended` |
+| `terminal_instance_id`, `terminal_exit_status` | Exact launched terminal and exit status, when terminal exit ended discovery |
+| `terminal_last_output` | With capture enabled, bounded sanitized recent terminal output when exit ended discovery |
 | `timeout_s`, `elapsed_ms` | Configured wait budget and observed discovery duration; the budget is absent for an unbounded sign-in wait |
 | `login_required` | Whether startup was waiting for interactive sign-in |
 | `app_server_state` | `unavailable`, `not_started`, `running`, or `exited` |
@@ -169,9 +220,16 @@ precedes any clipping. Omission counters cover this snapshot only, excluding
 earlier buffer eviction or clipping by the stderr reader.
 The collector performs no filesystem reads, subprocess probes, or network calls.
 
-This event covers fresh-thread discovery. Earlier process launch failures,
-resume failures, and errors after a thread starts keep their existing logging.
-Successful discovery and cancellation do not emit this failure event.
+The same terminal-exit cause and opted-in excerpt are retained in the bridge's
+startup-error marker for chat execution. A late failure cannot overwrite a
+replacement launch's marker or close its app-server. Successful discovery and
+cancellation do not emit this failure event; a discovered thread remains usable
+through its app-server even if the auxiliary TUI exits simultaneously.
+
+This event covers fresh-thread discovery. A terminal that dies before
+registration uses the `terminal_exit_observed` path described above, since no
+discovery task exists yet. Earlier app-server process-launch failures, resume
+failures, and errors after a thread starts keep their existing logging.
 
 ## Claude continuous diagnostics
 
@@ -238,7 +296,10 @@ or deleted.
 ```sh
 uv run --no-sync pytest -q tests/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
 uv run --no-sync pytest -q tests/test_codex_native_continuous_diagnostics.py tests/test_codex_native_app_server_stderr.py
+uv run --no-sync pytest -q tests/test_codex_native_logging_env.py
+uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_terminal_startup_exit.py
 uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
+uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/test_claude_native_diagnostics.py tests/test_claude_native_diagnostics_integration.py
 ```
 
@@ -254,6 +315,12 @@ failure. A real subprocess floods stderr while its exporter is blocked to verify
 that pipe draining and shutdown remain responsive.
 The credential-free e2e test uses an isolated runner and synthetic Codex
 subprocess to verify delivery to the real local log and structured-log handler.
+The native runtime e2e test additionally uses an installed Codex CLI (or
+`OMNIGENT_CODEX_PATH`): it executes a real shell command, directs a model request
+at an unreachable loopback endpoint, and verifies engine HTTP diagnostics reach
+the structured sink before exit. It needs no credentials or external model
+service and checks the disabled control too. A forced runner-timeout case
+verifies that the native subprocess does not survive test cleanup.
 
 Claude tests exercise both launch paths, explicit debug-file preservation,
 opt-out without file access, rotation, partial records, bounded shutdown,
@@ -271,6 +338,14 @@ and confirm `harness = 'codex-native'` and
 `source_kind = 'codex_app_server_stderr'`. Runtime stderr should appear while
 the session remains open, without requiring a startup timeout. A quiet stderr
 pipe produces no events. Setting the flag to `0` disables these INFO events.
+
+To check early failure, start a fresh opted-in session with
+`omnigent codex --omni-telemetry-invalid-flag`. Inspect that session's
+`codex_thread_start_failed` or `terminal_exit_observed` records: expect exit
+status `2` and `unexpected argument` in `terminal_last_output`. A discovery
+failure should have `reason=terminal_exited`, not `timeout`. Repeat with capture
+disabled: the discovery snapshot and pre-observation exit record retain metadata
+but omit terminal text. The CLI's separate terminal-readiness wait is unchanged.
 
 After deploying the runner, filter the debug-log table by the incident time
 window, exact session ID, and `event_name = 'codex_thread_start_failed'`.
