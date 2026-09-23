@@ -157,7 +157,10 @@ from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
+    _STATUS_EMITTING_TERMINAL_ROLES,
+    ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    CODEX_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -169,6 +172,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
+from omnigent.runner.session_status import SessionStatusBook, StatusSource
 from omnigent.runner.subagent_routing import (
     PLAIN_SESSION,
     SessionRoutingClass,
@@ -193,6 +197,7 @@ from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.pane_reaper import (
     SpareReason,
     resolve_approval_max_s,
+    resolve_max_turn_s,
 )
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.tools.builtins.load_skill import (
@@ -328,12 +333,22 @@ for _builder_name in (
     globals()[_builder_name] = _native_builder(_builder_name)
 
 
+# Native harnesses whose runner turn ends right after the prompt is pasted,
+# while the agent keeps working; their forwarder relays the real turn-end idle.
+_FORWARDER_OWNED_IDLE_HARNESSES: frozenset[str] = frozenset(
+    {CODEX_NATIVE_TERMINAL_ROLE, ANTIGRAVITY_NATIVE_TERMINAL_ROLE}
+)
+
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
-# Published statuses that mean a session's terminal is still working a turn.
-# ``waiting`` is parked on user input, so it keeps the runner alive too.
+# Recorded statuses under which a native turn may still be in flight.
+# ``waiting``: the runner's turn ended while sub-agents still work. A human
+# wait is ``running`` with ``blocked_on``, a prompt park or a pending approval.
 _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
+# Floor for the runner's native-turn hold ceiling, so a small or zero
+# OMNIGENT_NATIVE_PANE_MAX_TURN_S cannot switch the hold off.
+_IN_FLIGHT_HOLD_MIN_CEILING_S = 3600.0
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -3066,6 +3081,7 @@ def create_runner_app(
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    # custom-lint: disable-next=session-status-single-source -- this runner's own turn tasks
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
     # Conversations whose claude-sdk `/compact` published an up-front
@@ -3077,8 +3093,22 @@ def create_runner_app(
     # point reached on every exit path (clean end, setup error, cancel).
     _sdk_compact_inprogress: set[str] = set()
     app.state.sdk_compact_inprogress = _sdk_compact_inprogress
-    _native_pane_status: dict[str, str] = {}
-    app.state.native_pane_status = _native_pane_status
+    if resource_registry is None:
+        resource_registry = SessionResourceRegistry(
+            terminal_registry=terminal_registry,
+            runner_workspace=runner_workspace,
+            per_session_workspace=per_session_workspace,
+        )
+    app.state.session_resource_registry = resource_registry
+    # The one record of each session's status (see ``SessionStatusBook``).
+    # A stub registry without a book gets an app-owned one.
+    _registry_book = getattr(resource_registry, "status_book", None)
+    _status_book: SessionStatusBook = (
+        _registry_book if isinstance(_registry_book, SessionStatusBook) else SessionStatusBook()
+    )
+    app.state.session_status_book = _status_book
+    # Read-only, live view; nothing may hold a writable copy of session status.
+    app.state.native_pane_status = _status_book.status_view()
     # Detached watchers answering a /model confirm dialog that pops after
     # the active turn settles (a mid-turn switch queues in the composer).
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
@@ -3165,16 +3195,115 @@ def create_runner_app(
             return True
         return any(_native_turn_in_flight(session_id) for session_id in session_ids)
 
-    def _native_turn_in_flight(session_id: str) -> bool:
-        """Whether a native terminal still reports this session's turn as in flight.
+    # How long a recorded in-flight status may hold the runner after the last
+    # evidence of work, floored so the pane knob cannot switch the hold off.
+    _max_turn_s = resolve_max_turn_s()
+    _in_flight_hold_ceiling_s = max(_max_turn_s, _IN_FLIGHT_HOLD_MIN_CEILING_S)
+    if _max_turn_s < _IN_FLIGHT_HOLD_MIN_CEILING_S:
+        _logger.warning(
+            "OMNIGENT_NATIVE_PANE_MAX_TURN_S=%.0fs is below the runner's native-turn "
+            "hold floor; a silent native turn still holds the runner for %.0fs",
+            _max_turn_s,
+            _in_flight_hold_ceiling_s,
+            extra=debug_event(
+                "runner_in_flight_hold_ceiling_clamped",
+                max_turn_s=_max_turn_s,
+                ceiling_s=_in_flight_hold_ceiling_s,
+            ),
+        )
+    # How long a human wait (open prompt park, reported dialog) holds the runner.
+    _in_flight_hold_approval_max_s = resolve_approval_max_s()
+    # Episode (its start and the channel that opened it) each session was last
+    # warned about, so an expired hold logs once per episode. Not the record's
+    # seq: a dialog opening or closing changes that within one episode.
+    _in_flight_hold_warned: dict[str, tuple[float, StatusSource]] = {}
 
-        Native delivery returns once the prompt is typed, so the terminal's own
-        status edges decide when the turn settles. SDK turns are already covered
-        by ``_active_turns`` and need not publish a closing edge.
+    def _native_agent_output_age_s(session_id: str) -> float | None:
+        """Seconds since the session's own native agent pane last printed.
+
+        Reads the idle watcher's stamp on each native-role pane of the session;
+        client repaints never count. ``None`` when no such pane has printed.
         """
-        if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
+        terminals = getattr(resource_registry, "terminal_registry", None)
+        if terminals is None:
+            return None
+        ages: list[float] = []
+        for entry in terminals.list_for_conversation(session_id):
+            terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+            if not is_native_harness(
+                resource_registry.terminal_resource_role(session_id, terminal_id)
+            ):
+                continue
+            age = entry.instance.agent_output_age_s()
+            if age is not None:
+                ages.append(age)
+        return min(ages, default=None)
+
+    def _native_turn_in_flight(session_id: str) -> bool:
+        """Whether a native session's own turn should keep the runner up.
+
+        Native delivery returns once the prompt is typed, so the runner's turn
+        slot empties while the agent works on. The session holds the runner
+        while either:
+
+        * a human wait younger than OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S is
+          open: a prompt park, or a dialog the agent reported (``blocked_on``);
+        * the book records ``running`` or ``waiting`` and the turn showed
+          evidence of work within the ceiling: its episode start, the last
+          runner dispatch, or output on its own agent pane. A re-asserted
+          duplicate is not evidence, so a lost closing edge cannot hold the
+          runner forever, while a turn that keeps printing is never cut off.
+
+        SDK turns are covered by ``_active_turns`` and need no closing edge.
+        """
+        from omnigent.native import prompt_parks
+
+        if not is_native_harness(_session_harness_name(session_id)):
             return False
-        return is_native_harness(_session_harness_name(session_id))
+        park_age = prompt_parks.oldest_open_age_s(session_id)
+        if park_age is not None and park_age < _in_flight_hold_approval_max_s:
+            return True
+        blocked = _status_book.blocked(session_id)
+        if blocked is not None and blocked[1] < _in_flight_hold_approval_max_s:
+            return True
+        record = _status_book.current(session_id)
+        if record is None or record.status not in _IN_FLIGHT_SESSION_STATUSES:
+            _in_flight_hold_warned.pop(session_id, None)
+            return False
+        episode = (record.since, record.origin)
+        if _in_flight_hold_warned.get(session_id, episode) != episode:
+            # A new episode started; the old one's warning is spent.
+            _in_flight_hold_warned.pop(session_id, None)
+        evidence_age_s = _status_book.age_s(record.since)
+        dispatch_at = _status_book.last_dispatch_at(session_id)
+        if dispatch_at is not None:
+            evidence_age_s = min(evidence_age_s, _status_book.age_s(dispatch_at))
+        if evidence_age_s < _in_flight_hold_ceiling_s:
+            return True
+        output_age_s = _native_agent_output_age_s(session_id)
+        if output_age_s is not None:
+            evidence_age_s = min(evidence_age_s, output_age_s)
+            if evidence_age_s < _in_flight_hold_ceiling_s:
+                return True
+        if _in_flight_hold_warned.get(session_id) != episode:
+            _in_flight_hold_warned[session_id] = episode
+            _logger.warning(
+                "native session %s: %s-recorded %s showed no evidence of work for %.0fs; "
+                "no longer keeping the runner up for it",
+                session_id,
+                record.origin.value,
+                record.status,
+                evidence_age_s,
+                extra=debug_event(
+                    "runner_in_flight_hold_expired",
+                    session_id=session_id,
+                    status=record.status,
+                    claim_source=record.origin.value,
+                    evidence_age_s=evidence_age_s,
+                    ceiling_s=_in_flight_hold_ceiling_s,
+                ),
+            )
+        return False
 
     app.state.has_active_work = _has_active_work
 
@@ -3184,17 +3313,38 @@ def create_runner_app(
 
     app.state.drain_session_streams = _drain_session_streams
 
-    def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
+    def _publish_event(
+        session_id: str,
+        event: Mapping[str, object],
+        *,
+        record_status: bool = True,
+        book_status: str | None = None,
+    ) -> None:
+        """Queue *event* on the session's SSE stream.
+
+        A ``session.status`` is also recorded in the status book as a RUNNER
+        edge, unless the caller already recorded it at observation time
+        (*record_status* ``False``). *book_status* records a more precise value
+        than the wire carries (``waiting`` sent as ``running`` to old servers).
+        Nothing else is written here: a copy of what the runner published
+        misses every relayed edge and is not the session's status.
+        """
         event_body = cast(_JsonObject, event)
         queue = _session_event_queues.get(session_id)
         if queue is None:
             queue = asyncio.Queue()
             _session_event_queues[session_id] = queue
         queue.put_nowait(event_body)
-        if event_body.get("type") == "session.status":
-            _status_value = event_body.get("status")
+        if record_status and event_body.get("type") == "session.status":
+            _status_value = book_status or event_body.get("status")
+            _blocked_on = event_body.get("blocked_on")
             if isinstance(_status_value, str):
-                _native_pane_status[session_id] = _status_value
+                _status_book.record(
+                    session_id,
+                    _status_value,
+                    source=StatusSource.RUNNER,
+                    blocked_on=_blocked_on if isinstance(_blocked_on, str) else None,
+                )
         _fan_out_child_delta_to_parent(session_id, event_body)
 
     def _child_preview_from_status(
@@ -3331,14 +3481,6 @@ def create_runner_app(
             if child_update is not None:
                 _publish_event(meta.parent_id, child_update)
 
-    if resource_registry is None:
-        resource_registry = SessionResourceRegistry(
-            terminal_registry=terminal_registry,
-            runner_workspace=runner_workspace,
-            per_session_workspace=per_session_workspace,
-        )
-    app.state.session_resource_registry = resource_registry
-
     def _publish_terminal_activity(session_id: str, terminal_id: str) -> None:
         if process_manager is not None:
             process_manager.note_activity(session_id)
@@ -3361,7 +3503,9 @@ def create_runner_app(
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
-        _publish_event(session_id, event)
+        # The watcher recorded this edge when it saw it; recording again on
+        # this loop hop could undo a relayed edge that landed in between.
+        _publish_event(session_id, event, record_status=False)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
 
@@ -3541,7 +3685,7 @@ def create_runner_app(
         error = _build_required_terminal_error(event)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
-        _native_pane_status.pop(event.session_id, None)
+        resource_registry.reset_session_status(event.session_id, "required_terminal_exited")
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
@@ -4983,7 +5127,8 @@ def create_runner_app(
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
-        _native_pane_status.pop(session_id, None)
+        _status_book.forget(session_id)
+        _in_flight_hold_warned.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -5716,23 +5861,19 @@ def create_runner_app(
         *,
         source_error: Mapping[str, object] | None = None,
     ) -> None:
+        # The book keeps the real value; only the wire is downgraded for a
+        # server that predates ``waiting``.
+        semantic_status = status
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
         ):
             status = "running"
         harness = _session_harness_name(conv_id)
-        if status != "failed" and harness in {
-            "claude-native",
-            "pi-native",
-            "cursor-native",
-            "kiro-native",
-            "goose-native",
-            "qwen-native",
-            "kimi-native",
-            "hermes-native",
-        }:
+        # Pane-status harnesses: the watcher owns running/idle.
+        if status != "failed" and harness in _STATUS_EMITTING_TERMINAL_ROLES:
             return
-        if status == "idle" and harness in {"codex-native", "antigravity-native"}:
+        # The runner's turn ending is not the agent's: the forwarder owns idle.
+        if status == "idle" and harness in _FORWARDER_OWNED_IDLE_HARNESSES:
             return
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
@@ -5760,7 +5901,7 @@ def create_runner_app(
                     **dimensions,
                 ),
             )
-        _publish_event(conv_id, event)
+        _publish_event(conv_id, event, book_status=semantic_status)
 
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))
@@ -6608,7 +6749,8 @@ def create_runner_app(
             if time.monotonic() >= deadline:
                 break
             await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
-        if _native_pane_status.get(conv_id) in ("running", "waiting"):
+        _model_status = _status_book.current(conv_id)
+        if _model_status is not None and _model_status.status in ("running", "waiting"):
             # Mid-turn switch: Claude queues the typed command and applies it
             # when the turn settles — its confirm dialog can pop minutes from
             # now. Not a failure: answer success, keep a detached watcher on
@@ -8250,6 +8392,9 @@ def create_runner_app(
     # that also schedules the parent wake POST, not just the inbox insert.
     app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
 
+    def _record_control_idle(conv_id: str) -> None:
+        _status_book.record(conv_id, "idle", source=StatusSource.CONTROL)
+
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,
         resource_registry=resource_registry,
@@ -8259,6 +8404,7 @@ def create_runner_app(
         codex_bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
+        record_control_idle=_record_control_idle,
     )
 
     def _discard_comment_relay(session_id: str, relay: ClaudeNativeToolRelay) -> None:
@@ -8311,6 +8457,11 @@ def create_runner_app(
         if park_age is not None:
             facts["park_age_s"] = park_age
             if park_age < approval_max_s:
+                reasons.add(SpareReason.AWAITING_HUMAN)
+        blocked = _status_book.blocked(conv_id)
+        if blocked is not None:
+            facts["blocked_on"], facts["blocked_age_s"] = blocked
+            if blocked[1] < approval_max_s:
                 reasons.add(SpareReason.AWAITING_HUMAN)
         if approval_wait_is_fresh(conv_id):
             reasons.add(SpareReason.AWAITING_HUMAN)
@@ -10094,10 +10245,16 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
-                # Forwarders report these edges straight to the server, so record
-                # them here too; the idle watchdog reads them for native turns.
-                _native_pane_status[conversation_id] = status
-                resource_registry.note_external_session_status(conversation_id, status)
+                relayed_response_id = data.get("response_id") if isinstance(data, dict) else None
+                relayed_blocked_on = data.get("blocked_on") if isinstance(data, dict) else None
+                resource_registry.note_external_session_status(
+                    conversation_id,
+                    status,
+                    response_id=(
+                        relayed_response_id if isinstance(relayed_response_id, str) else None
+                    ),
+                    blocked_on=relayed_blocked_on if isinstance(relayed_blocked_on, str) else None,
+                )
                 _fan_out_child_delta_to_parent(
                     conversation_id,
                     {"type": "session.status", "status": status},
@@ -13224,7 +13381,7 @@ def create_runner_app(
             conv_id = pane.conversation_id
             if _native_session_hold_reasons(conv_id, {}, approval_max_s=_pane_approval_max_s):
                 return True
-            if _native_pane_status.get(conv_id) == "running":
+            if _status_book.claim(conv_id) is not None:
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             if clients:

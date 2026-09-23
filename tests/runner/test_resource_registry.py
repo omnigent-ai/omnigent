@@ -30,6 +30,7 @@ from omnigent.runner.resource_registry import (
     _terminal_exit_diagnostics,
     trim_terminal_output,
 )
+from omnigent.runner.session_status import StatusSource
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
 
@@ -668,12 +669,13 @@ async def test_parked_pane_stays_running_then_recovers_on_pane_death(tmp_path: P
 
 @pytest.mark.asyncio
 async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
-    """A forwarder's hook-derived edge rebases the shared dedup baseline.
+    """A forwarder's hook-derived edge rebases the shared wire dedup baseline.
 
     ``Stop`` → ``idle`` is posted to the server by the claude-native forwarder,
-    bypassing this watcher. Adopting it as the baseline is what makes the pair
-    idempotent: the file's own ``idle`` lands on the same edge and is collapsed,
-    so the two agree regardless of which arrives first.
+    bypassing this watcher. Adopting it as the wire baseline makes the pair
+    idempotent on the wire: the file's own ``idle`` lands on the same edge and
+    is not re-published, so the server hears one idle whichever arrives first.
+    The runner's status book still records the file's edge.
     """
     callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_resync"
@@ -701,12 +703,127 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
     poller.emit("idle")
     await asyncio.sleep(0)
     assert statuses == ["running"]
+    idle_record = registry.status_book.current("conv_resync")
+    assert idle_record is not None
+    assert idle_record.status == "idle"
+    assert idle_record.sources == {StatusSource.RELAY, StatusSource.STATUS_FILE}
+    assert registry.status_book.claim("conv_resync") is None
 
     # Next turn: the file reports work again and must publish.
     poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
     del callbacks
+
+
+@pytest.mark.asyncio
+async def test_deduped_pty_edge_is_recorded_locally(tmp_path: Path) -> None:
+    """A pane idle the wire dedup swallows still ends the runner's running."""
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_pty_dedup"
+    )
+    on_activity = callbacks["on_activity"]
+    on_idle = callbacks["on_idle"]
+    assert callable(on_activity) and callable(on_idle)
+
+    on_activity()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert registry.status_book.claim("conv_pty_dedup") is not None
+
+    registry.note_external_session_status("conv_pty_dedup", "idle")
+    on_idle()
+    await asyncio.sleep(0)
+
+    assert statuses == ["running"]
+    record = registry.status_book.current("conv_pty_dedup")
+    assert record is not None
+    assert record.status == "idle"
+    assert record.sources == {StatusSource.RELAY, StatusSource.PTY}
+    assert registry.status_book.claim("conv_pty_dedup") is None
+
+
+def test_relay_only_running_is_not_a_hard_claim() -> None:
+    """A relayed running alone is recorded but claims a turn only on request."""
+    registry = SessionResourceRegistry()
+    registry.note_external_session_status("conv_relay_only", "idle")
+    registry.note_external_session_status(
+        "conv_relay_only", "running", response_id="resp_1", blocked_on="permission prompt"
+    )
+
+    record = registry.status_book.current("conv_relay_only")
+    assert record is not None
+    assert record.status == "running"
+    assert record.sources == {StatusSource.RELAY}
+    assert record.response_id == "resp_1"
+    assert registry.status_book.blocked("conv_relay_only") is not None
+    assert registry.status_book.claim("conv_relay_only") is None
+    assert registry.status_book.claim("conv_relay_only", include_relay=True) == record
+
+
+@pytest.mark.asyncio
+async def test_registry_publish_hop_does_not_rerecord(tmp_path: Path) -> None:
+    """A queued pane running delivered after a relayed idle cannot revive the claim."""
+    from omnigent.runner.app import _session_event_queues_ref, create_runner_app
+    from tests.runner.helpers import NullServerClient
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    create_runner_app(
+        terminal_registry=terminal_registry,
+        resource_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    instance = make_test_terminal_instance("pi", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_hop", {})[("pi", "main")] = instance
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(on_idle: object | None = None, **kwargs: object) -> None:
+        callbacks["on_idle"] = on_idle
+        callbacks.update(kwargs)
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
+    await registry.observe_required_terminal(
+        "conv_hop", "pi", "main", instance, resource_role=PI_NATIVE_TERMINAL_ROLE
+    )
+    on_activity = callbacks["on_activity"]
+    assert callable(on_activity)
+
+    try:
+        on_activity()
+        registry.note_external_session_status("conv_hop", "idle")
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        queue = _session_event_queues_ref["conv_hop"]
+        published = [
+            event["status"]
+            for event in (queue.get_nowait() for _ in range(queue.qsize()))
+            if event.get("type") == "session.status"
+        ]
+        assert published == ["running"]
+        record = registry.status_book.current("conv_hop")
+        assert record is not None
+        assert record.status == "idle"
+        assert registry.status_book.claim("conv_hop") is None
+    finally:
+        _session_event_queues_ref.pop("conv_hop", None)
+
+
+def test_reset_session_status_keeps_what_the_server_heard() -> None:
+    """A reset drops the status and exit memo but not the wire baseline or epoch."""
+    registry = SessionResourceRegistry()
+    registry.note_session_turn_started("conv_reset")
+    registry.note_external_session_status("conv_reset", "running")
+    epoch = registry.session_activity_epoch("conv_reset")
+
+    registry.reset_session_status("conv_reset", "required_terminal_exited")
+
+    assert registry.status_book.current("conv_reset") is None
+    assert not registry.session_turn_is_active("conv_reset")
+    assert registry.session_activity_epoch("conv_reset") == epoch
+    # A re-created pane's first edge must still read as a change on the wire.
+    assert registry._server_delivery_baseline["conv_reset"] == ("running", None)
 
 
 @pytest.mark.asyncio
@@ -1926,3 +2043,22 @@ async def test_non_claude_terminal_never_acknowledges_billing_notice(
         on_tick()
 
     acknowledge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_status_record_never_breaks_the_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_record_fails"
+    )
+
+    def _boom(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("book unavailable")
+
+    monkeypatch.setattr(registry.status_book, "record", _boom)
+    on_activity = callbacks["on_activity"]
+    assert callable(on_activity)
+    on_activity()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]

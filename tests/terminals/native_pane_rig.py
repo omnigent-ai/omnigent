@@ -27,6 +27,7 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.native import native_cost_popup
 from omnigent.runner.app import _session_event_queues_ref, create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.session_status import SessionStatusBook
 from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
@@ -144,6 +145,10 @@ class PaneRig:
     closed: list[str]
 
     @property
+    def book(self) -> SessionStatusBook:
+        return self.app.state.session_status_book
+
+    @property
     def reaper(self) -> NativePaneReaper:
         reaper = self.app.state.native_pane_reaper
         assert reaper is not None
@@ -213,6 +218,7 @@ async def build_pane_rig(
     server: FakeServerClient | None = None,
     tmux: TmuxFakes | None = None,
     process_manager: Any = None,
+    status_clock: Callable[[], float] | None = None,
     spec_resolver: Any = None,
 ) -> PaneRig:
     """Build a runner app and observe one native pane for harness *key*."""
@@ -233,7 +239,9 @@ async def build_pane_rig(
     agent = native_agent(key)
     conv_id = f"conv_{uuid.uuid4().hex[:12]}"
     terminal_registry = TerminalRegistry()
-    resources = SessionResourceRegistry(terminal_registry=terminal_registry)
+    resources = SessionResourceRegistry(
+        terminal_registry=terminal_registry, status_clock=status_clock
+    )
     if process_manager is None:
         from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 

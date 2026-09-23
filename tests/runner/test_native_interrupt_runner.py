@@ -337,3 +337,135 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     assert isinstance(resp, Response) and resp.status_code == 204
     assert injected == [("dir/bid-conv_cl", 1.0)]
     assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+
+
+class _CodexInterruptClient:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def connect(self) -> None:
+        return None
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((method, params))
+        if self.error is not None:
+            raise self.error
+        return {"result": {}}
+
+    async def close(self) -> None:
+        return None
+
+
+def _codex_interrupt_setup(
+    monkeypatch: pytest.MonkeyPatch, *, active_turn_id: str | None, error: Exception | None = None
+) -> tuple[NativeInterruptRunner, dict[str, Any], list[str], _CodexInterruptClient]:
+    import omnigent.harnesses.codex_native.app_server as codex_app_server
+    import omnigent.harnesses.codex_native.bridge as codex_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    async def _labels(*, server_client: Any, session_id: str) -> dict[str, str]:
+        return {}
+
+    client = _CodexInterruptClient(error)
+    monkeypatch.setattr(interrupt_mod, "_session_labels_for_runner_spawn", _labels)
+    monkeypatch.setattr(codex_bridge, "cancel_pending_mcp_startup", lambda _dir: [])
+    monkeypatch.setattr(codex_app_server, "client_for_transport", lambda *_a, **_k: client)
+
+    async def _state(conv_id: str, *, action: str, **_kw: Any) -> Any:
+        return SimpleNamespace(
+            socket_path="ws://127.0.0.1:1", thread_id="thread_1", active_turn_id=active_turn_id
+        )
+
+    controls: list[str] = []
+    runner, captured = _make_runner(
+        codex_bridge_state_for_session=_state, record_control_idle=controls.append
+    )
+    return runner, captured, controls, client
+
+
+@pytest.mark.asyncio
+async def test_accepted_codex_turn_interrupt_records_a_control_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, captured, controls, client = _codex_interrupt_setup(
+        monkeypatch, active_turn_id="turn_1"
+    )
+    resp = await runner.stop("codex-native", "conv_cx")
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert client.requests == [("turn/interrupt", {"threadId": "thread_1", "turnId": "turn_1"})]
+    assert controls == ["conv_cx"]
+    assert captured["published"] == []
+
+
+@pytest.mark.asyncio
+async def test_codex_interrupt_without_a_turn_records_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _, controls, client = _codex_interrupt_setup(monkeypatch, active_turn_id=None)
+    resp = await runner.interrupt("codex-native", "conv_cx")
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert client.requests == []
+    assert controls == []
+
+
+@pytest.mark.asyncio
+async def test_failed_codex_turn_interrupt_records_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _, controls, _ = _codex_interrupt_setup(
+        monkeypatch, active_turn_id="turn_1", error=RuntimeError("app-server gone")
+    )
+    resp = await runner.interrupt("codex-native", "conv_cx")
+    assert resp is not None and resp.status_code == 503
+    assert controls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["interrupt", "stop"])
+async def test_devin_interrupt_and_stop_record_a_control_idle(
+    monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    import omnigent.harnesses.devin_native.bridge as devin_bridge
+
+    monkeypatch.setattr(devin_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(devin_bridge, "inject_interrupt", lambda _d, *, timeout_s: None)
+    monkeypatch.setattr(devin_bridge, "kill_session", lambda _d, *, timeout_s: None)
+    controls: list[str] = []
+    runner, captured = _make_runner(record_control_idle=controls.append)
+
+    resp = await getattr(runner, action)("devin-native", "conv_dv")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert controls == ["conv_dv"]
+    idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
+    assert idle == [{"type": "session.status", "status": "idle"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["interrupt", "stop"])
+async def test_pane_status_harnesses_record_no_control_idle(
+    monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda _d, *, timeout_s: None)
+    monkeypatch.setattr(goose_bridge, "kill_session", lambda _d, *, timeout_s: None)
+    controls: list[str] = []
+    runner, _ = _make_runner(record_control_idle=controls.append)
+
+    resp = await getattr(runner, action)("goose-native", "conv_g")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert controls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native"])
+async def test_no_handler_harnesses_record_no_control_idle(harness: str) -> None:
+    controls: list[str] = []
+    runner, _ = _make_runner(record_control_idle=controls.append)
+    assert await runner.interrupt(harness, "conv_x") is None
+    assert await runner.stop(harness, "conv_x") is None
+    assert controls == []

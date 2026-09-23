@@ -39,6 +39,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.runner.session_status import SessionStatusBook, StatusSource
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -372,6 +373,7 @@ class SessionResourceRegistry:
         runner_workspace: Path | None = None,
         *,
         per_session_workspace: bool = False,
+        status_clock: Callable[[], float] | None = None,
     ) -> None:
         self._terminal_registry = terminal_registry
         self._runner_workspace = runner_workspace
@@ -402,19 +404,23 @@ class SessionResourceRegistry:
         # mid-turn crash. Written from the watcher thread and the turn-start
         # hook; all access goes through the ``_*_session_status_memo`` helpers
         # under ``self._lock``.
+        # custom-lint: disable-next=session-status-single-source -- exit memo
         self._last_session_status: dict[str, str] = {}
         self._session_activity_epoch: dict[str, int] = {}
         self._active_session_turns: set[str] = set()
-        # Last status *edge published to the server* per session, shared by the
-        # watcher and the native forwarders' hook-derived edges so the two
-        # dedup against one baseline. Kept separate from the exit memo above,
-        # which the turn-start hook also writes — deduping against that one
-        # would swallow the turn's real ``running``.
-        self._published_session_status: dict[str, tuple[str, str | None]] = {}
+        # The runner's one record of each session's status. Every edge is
+        # recorded here at observation time (see ``SessionStatusBook``).
+        self.status_book = SessionStatusBook(clock=status_clock or time.monotonic)
+        # What the server has heard: the last status edge delivered per session,
+        # shared by the watcher and the forwarders' relayed edges so the two
+        # dedup against one baseline. Wire-delivery bookkeeping only, never a
+        # status source — read ``status_book`` for the session's status.
+        self._server_delivery_baseline: dict[str, tuple[str, str | None]] = {}
         # Live claude-native status-file pollers, per session. Held so a
         # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
         # poller keeps its own edge/mtime baselines on the watcher thread, and
         # clearing the registry's baseline alone would leave those intact.
+        # custom-lint: disable-next=session-status-single-source -- poller objects, not statuses
         self._status_pollers: dict[str, SessionStatusPoller] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
@@ -509,15 +515,34 @@ class SessionResourceRegistry:
                 )
             if status in {"idle", "failed"}:
                 self._active_session_turns.discard(session_id)
+            # custom-lint: disable-next=session-status-single-source -- exit memo
             self._last_session_status[session_id] = status
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
         """Pop and return the session's recorded PTY status (or ``None``)."""
         with self._lock:
             self._active_session_turns.discard(session_id)
-            self._published_session_status.pop(session_id, None)
+            self._server_delivery_baseline.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
+
+    def reset_session_status(self, session_id: str, reason: str) -> None:
+        """Drop a session's per-pane status state after its native pane is gone.
+
+        Clears the status record, the poller and the exit memo so a re-created
+        pane cannot inherit a stale ``running``. Keeps what the server heard
+        (the wire baseline): closing a pane does not change it, and forgetting
+        it would re-send a re-created pane's first edge as a duplicate. The
+        activity epoch survives too: it counts turns across pane lifetimes.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
+        :param reason: Why, for the log, e.g. ``"native_terminal_closed"``.
+        """
+        with self._lock:
+            self._status_pollers.pop(session_id, None)
+            self._last_session_status.pop(session_id, None)
+            self._active_session_turns.discard(session_id)
+        self.status_book.reset(session_id, reason)
 
     def _claim_status_edge(self, session_id: str, status: str, blocked_on: str | None) -> bool:
         """Record an edge as published, reporting whether it was a change.
@@ -532,15 +557,17 @@ class SessionResourceRegistry:
             (so the caller should publish), ``False`` when it is a duplicate.
         """
         with self._lock:
-            if self._published_session_status.get(session_id) == (status, blocked_on):
+            if self._server_delivery_baseline.get(session_id) == (status, blocked_on):
                 return False
-            self._published_session_status[session_id] = (status, blocked_on)
+            # custom-lint: disable-next=session-status-single-source -- what the server heard
+            self._server_delivery_baseline[session_id] = (status, blocked_on)
             return True
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
         """Adopt an externally-published *status* as the dedup baseline."""
         with self._lock:
-            self._published_session_status[session_id] = (status, None)
+            # custom-lint: disable-next=session-status-single-source -- what the server heard
+            self._server_delivery_baseline[session_id] = (status, None)
 
     def resync_session_statuses(self) -> None:
         """Re-arm every status source so it republishes what it already sent.
@@ -564,8 +591,8 @@ class SessionResourceRegistry:
         what the server has heard.
         """
         with self._lock:
-            sessions = sorted(self._published_session_status)
-            self._published_session_status.clear()
+            sessions = sorted(self._server_delivery_baseline)
+            self._server_delivery_baseline.clear()
             pollers = list(self._status_pollers.values())
         for poller in pollers:
             poller.resync()
@@ -601,7 +628,14 @@ class SessionResourceRegistry:
         """
         self._set_session_status_memo(session_id, "running")
 
-    def note_external_session_status(self, session_id: str, status: str) -> None:
+    def note_external_session_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        response_id: str | None = None,
+        blocked_on: str | None = None,
+    ) -> None:
         """Record a terminal-observed external status for exit classification.
 
         Structured native forwarders can know turn completion more reliably than
@@ -616,9 +650,22 @@ class SessionResourceRegistry:
         next turn's ``running`` as a duplicate — leaving the session stuck on
         the hook's ``idle`` with no working indicator for the whole turn.
 
+        The edge is recorded in ``status_book`` first, as a relayed edge: a
+        relayed ``idle`` ends the local ``running`` episode even when the pane's
+        own ``idle`` is later swallowed by the wire dedup.
+
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
+        :param response_id: Response id the forwarder attached (diagnostics).
+        :param blocked_on: Dialog reason the forwarder attached, if any.
         """
+        self.status_book.record(
+            session_id,
+            status,
+            source=StatusSource.RELAY,
+            blocked_on=blocked_on,
+            response_id=response_id,
+        )
         if status in {"idle", "failed"}:
             self._set_session_status_memo(session_id, status)
         elif status in {"running", "waiting"}:
@@ -1248,19 +1295,40 @@ class SessionResourceRegistry:
         def _publish_status(
             status: str, blocked_on: str | None = None, *, record_activity: bool = False
         ) -> None:
-            # Publish one running/idle edge: dedup against the last value,
-            # memo for exit classification, and hop to the loop (publishers
-            # are loop-only). Shared by the PTY edges and the claude-native
-            # status-file poller so both go through the same dedup/memo. The
-            # dedup baseline lives on the registry, not this closure, so a
-            # forwarder's hook-derived edge resyncs it (see
-            # :meth:`note_external_session_status`).
+            # Record one running/idle edge in the status book, then dedup it
+            # against what the server heard, memo it for exit classification,
+            # and hop to the loop (publishers are loop-only). Shared by the PTY
+            # edges and the claude-native status-file poller. Recording comes
+            # first: a relayed edge may have already moved the wire baseline
+            # (see :meth:`note_external_session_status`), and the dedup must
+            # never hide this edge from the runner itself.
             if status_publisher is None:
                 return
+            source = StatusSource.STATUS_FILE if record_activity else StatusSource.PTY
+            try:
+                self.status_book.record(session_id, status, source=source, blocked_on=blocked_on)
+            except Exception:
+                # Never raise into the watcher thread.
+                _logger.exception("Recording %s status edge failed: %s", source, session_id)
             explicit_activity = record_activity and status in {"running", "waiting"}
             if explicit_activity:
                 self._set_session_status_memo(session_id, status)
-            if not self._claim_status_edge(session_id, status, blocked_on):
+            delivered = self._claim_status_edge(session_id, status, blocked_on)
+            _logger.debug(
+                "session status wire edge: session=%s source=%s status=%s delivered=%s",
+                session_id,
+                source.value,
+                status,
+                delivered,
+                extra=debug_event(
+                    "session_status_wire_edge",
+                    session_id=session_id,
+                    source=source.value,
+                    status=status,
+                    delivered=delivered,
+                ),
+            )
+            if not delivered:
                 return
             # Pane repaints can be startup output, not a new agent turn.
             if not explicit_activity:
@@ -1750,12 +1818,14 @@ class SessionResourceRegistry:
                 lifecycle = self._terminal_lifecycles.pop((source_session_id, terminal_id), None)
                 if lifecycle is not None:
                     self._terminal_lifecycles[(target_session_id, terminal_id)] = lifecycle
-            # Move the PTY-status memo with the pane so a post-transfer exit is
+            # Move the session status with the pane so a post-transfer exit is
             # classified against the right session. Don't clobber a status the
             # target already has from its own terminal.
+            self.status_book.transfer(source_session_id, target_session_id)
             with self._lock:
                 moved_status = self._last_session_status.pop(source_session_id, None)
                 if moved_status is not None and target_session_id not in self._last_session_status:
+                    # custom-lint: disable-next=session-status-single-source -- exit memo
                     self._last_session_status[target_session_id] = moved_status
                     if source_session_id in self._active_session_turns:
                         self._active_session_turns.add(target_session_id)
@@ -1807,6 +1877,7 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier.
         """
         self._take_session_status_memo(session_id)
+        self.status_book.forget(session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)

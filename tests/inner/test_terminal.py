@@ -2967,6 +2967,188 @@ def test_idle_detector_suppress_activity_discounts_client_driven_repaint() -> No
     )
 
 
+def test_agent_output_age_counts_agent_output_not_client_repaints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The watcher stamps agent output for the runner, never a client repaint.
+
+    Drives the real threaded watcher loop over three pane snapshots: the
+    first capture (a baseline), a client-driven repaint, then agent output.
+    """
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path / "terminal",
+        running=True,
+    )
+    stop = threading.Event()
+    # (snapshot, whether a web client just interacted)
+    frames = iter([("screen-A", False), ("screen-B reflowed", True), ("screen-C output", False)])
+    ages: list[float | None] = []
+
+    def _capture() -> str:
+        ages.append(instance.agent_output_age_s())
+        try:
+            snapshot, client_repaint = next(frames)
+        except StopIteration:
+            stop.set()
+            return "screen-C output"
+        if client_repaint:
+            instance.note_client_interaction()
+        else:
+            instance._last_client_interaction_at = float("-inf")
+        return snapshot
+
+    monkeypatch.setattr(instance, "_capture_pane_for_idle_or_none", _capture)
+    monkeypatch.setattr(instance, "_pane_is_dead", lambda: False)
+    instance._idle_watch_loop_threaded(stop, poll_interval_s=0)
+
+    # Before any capture, after the baseline, and after the client repaint.
+    assert ages[:3] == [None, None, None]
+    # After the agent's own output.
+    assert ages[3] is not None and 0.0 <= ages[3] < 5.0
+
+
+async def test_async_idle_watcher_stamps_agent_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The asyncio watcher loop stamps agent output as the threaded one does."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path / "terminal",
+        running=True,
+    )
+    frames = iter(["screen-A", "screen-B output"])
+    ages: list[float | None] = []
+
+    async def _capture(*_args: str) -> str:
+        ages.append(instance.agent_output_age_s())
+        try:
+            return next(frames)
+        except StopIteration:
+            instance.running = False
+            return "screen-B output"
+
+    async def _pane_alive() -> bool:
+        return False
+
+    monkeypatch.setattr(instance, "_tmux_output", _capture)
+    monkeypatch.setattr(instance, "_pane_is_dead_async", _pane_alive)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.001)
+    await asyncio.wait_for(instance._idle_watch_loop(lambda: None), timeout=1.0)
+
+    # Before any capture and after the baseline capture.
+    assert ages[:2] == [None, None]
+    # After the agent's own output.
+    assert ages[2] is not None and 0.0 <= ages[2] < 5.0
+
+
+class _PollWithoutSleeping(threading.Event):
+    """A watcher stop event whose poll-interval wait returns at once."""
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.is_set()
+
+
+def test_a_client_repaint_first_seen_one_default_poll_later_is_not_agent_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repaint that trails its client interaction by a whole poll is still the client's.
+
+    Native panes without a status file poll every default interval, which is
+    longer than the client-interaction window. A web client that attaches just
+    after one poll makes the TUI reflow, and the next poll is the first to see
+    it, almost an interval after the interaction. That repaint must not renew
+    the runner's hold as agent output; a change seen once the interaction is a
+    poll (and a margin) old still counts.
+    """
+    interval = terminal_mod._IDLE_POLL_INTERVAL_SECONDS
+    assert interval > terminal_mod._CLIENT_INTERACTION_WINDOW_SECONDS
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path / "terminal",
+        running=True,
+    )
+    stop = _PollWithoutSleeping()
+    # (snapshot, seconds since the last client interaction when it is captured)
+    frames = iter(
+        [
+            ("screen-A", None),
+            ("screen-A reflowed by the client's resize", interval - 0.05),
+            ("screen-B agent output", 3 * interval),
+        ]
+    )
+    ages: list[float | None] = []
+
+    def _capture() -> str:
+        ages.append(instance.agent_output_age_s())
+        try:
+            snapshot, since_interaction = next(frames)
+        except StopIteration:
+            stop.set()
+            return "screen-B agent output"
+        if since_interaction is not None:
+            instance._last_client_interaction_at = time.monotonic() - since_interaction
+        return snapshot
+
+    monkeypatch.setattr(instance, "_capture_pane_for_idle_or_none", _capture)
+    monkeypatch.setattr(instance, "_pane_is_dead", lambda: False)
+    # poll_interval_s=None: the default the non-claude native panes poll at.
+    instance._idle_watch_loop_threaded(stop, poll_interval_s=None)
+
+    # Before any capture, after the baseline, and after the client's reflow.
+    assert ages[:3] == [None, None, None]
+    # After the agent's own output.
+    assert ages[3] is not None and 0.0 <= ages[3] < 5.0
+
+
+async def test_async_idle_watcher_does_not_stamp_a_client_repaint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The asyncio watcher loop discounts client repaints as the threaded one does."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path / "terminal",
+        running=True,
+    )
+    # (snapshot, whether a web client just interacted)
+    frames = iter([("screen-A", False), ("screen-B reflowed", True), ("screen-C output", False)])
+    ages: list[float | None] = []
+
+    async def _capture(*_args: str) -> str:
+        ages.append(instance.agent_output_age_s())
+        try:
+            snapshot, client_repaint = next(frames)
+        except StopIteration:
+            instance.running = False
+            return "screen-C output"
+        if client_repaint:
+            instance.note_client_interaction()
+        else:
+            instance._last_client_interaction_at = float("-inf")
+        return snapshot
+
+    async def _pane_alive() -> bool:
+        return False
+
+    monkeypatch.setattr(instance, "_tmux_output", _capture)
+    monkeypatch.setattr(instance, "_pane_is_dead_async", _pane_alive)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.001)
+    await asyncio.wait_for(instance._idle_watch_loop(lambda: None), timeout=1.0)
+
+    # Before any capture, after the baseline, and after the client's repaint.
+    assert ages[:3] == [None, None, None]
+    # After the agent's own output.
+    assert ages[3] is not None and 0.0 <= ages[3] < 5.0
+
+
 def _write_instance_dir(root: Path, name: str, owner_pid: int | None) -> Path:
     """
     Create a fake terminal instance dir under the sweep root.

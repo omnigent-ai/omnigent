@@ -9,6 +9,10 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -321,14 +325,31 @@ async def test_drain_session_streams_enqueues_done_sentinel() -> None:
         _session_event_queues_ref.pop("conv_drain_b", None)
 
 
-async def _native_app_with_session(conv_id: str, harness: str = "pi-native") -> FastAPI:
+def _native_spec(harness: str) -> Any:
+    """An agent spec whose executor runs *harness*, e.g. ``"pi-native"``."""
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    return AgentSpec(
+        spec_version=1,
+        name="native-idle-test",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+
+
+async def _native_app_with_session(
+    conv_id: str,
+    harness: str = "pi-native",
+    *,
+    status_clock: Callable[[], float] | None = None,
+) -> FastAPI:
     """Build a runner app whose spec resolves to *harness* for *conv_id*.
 
     :param conv_id: Session id the caller will create, e.g. ``"conv_native"``.
     :param harness: Executor harness the spec declares, e.g. ``"pi-native"``.
+    :param status_clock: Monotonic clock for the status book, e.g. a fake.
     :returns: Fresh FastAPI runner app.
     """
-    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.runner.resource_registry import SessionResourceRegistry
     from tests.runner.conftest import (
         _FakeProcessManager,
         _ScriptedHarnessClient,
@@ -336,11 +357,7 @@ async def _native_app_with_session(conv_id: str, harness: str = "pi-native") -> 
         _sse,
     )
 
-    spec = AgentSpec(
-        spec_version=1,
-        name="native-idle-test",
-        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
-    )
+    spec = _native_spec(harness)
     harness_client = _ScriptedHarnessClient(
         [
             _sse({"type": "response.created", "response": {"id": f"resp_{conv_id}"}}),
@@ -351,20 +368,27 @@ async def _native_app_with_session(conv_id: str, harness: str = "pi-native") -> 
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
         spec_resolver=await _spec_resolver_returning(spec),
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(status_clock=status_clock),
     )
 
 
-async def _post_status(client: Any, conv_id: str, status: str) -> None:
+async def _post_status(
+    client: Any, conv_id: str, status: str, *, blocked_on: str | None = None
+) -> None:
     """POST one forwarder-style ``external_session_status`` edge.
 
     :param client: Runner test client.
     :param conv_id: Session id, e.g. ``"conv_native"``.
     :param status: Native status, e.g. ``"running"`` or ``"idle"``.
+    :param blocked_on: Dialog reason the forwarder attaches, if any.
     :returns: None.
     """
+    data: dict[str, str] = {"status": status}
+    if blocked_on is not None:
+        data["blocked_on"] = blocked_on
     resp = await client.post(
         f"/v1/sessions/{conv_id}/events",
-        json={"type": "external_session_status", "data": {"status": status}},
+        json={"type": "external_session_status", "data": data},
     )
     assert resp.status_code == 204, resp.text
 
@@ -417,26 +441,40 @@ async def test_native_failed_status_releases_idle_pin() -> None:
 
 
 @pytest.mark.asyncio
-async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
+async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A follow-up bound mid-turn does not strand the pin on the pane's one idle edge.
 
     The pane watcher dedups edges, so a prompt queued while the terminal is
     already running produces no fresh ``running`` — only the final ``idle``.
+    The edges come from the real watcher closure, which records them in the
+    status book before the wire dedup.
     """
-    from tests.runner.conftest import _runner_client
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
 
-    conv_id = "conv_native_follow_up"
-    app = await _native_app_with_session(conv_id)
-    publish_pane_status = app.state.session_resource_registry._session_status_publisher
-    async with _runner_client(app) as client:
-        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
-        assert created.status_code == 201, created.text
-        publish_pane_status(conv_id, "running", None)
-        assert app.state.has_active_work() is True
-        app.state.begin_turn_slot(conv_id)
-        app.state.active_turns.pop(conv_id, None)
-        publish_pane_status(conv_id, "idle", None)
-        assert app.state.has_active_work() is False
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="pi",
+        spec_resolver=await _spec_resolver_returning(_native_spec("pi-native")),
+    )
+    app, conv_id = rig.app, rig.conv_id
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"}
+            )
+            assert created.status_code == 201, created.text
+            await rig.fire("on_activity")
+            assert app.state.has_active_work() is True
+            app.state.begin_turn_slot(conv_id)
+            app.state.active_turns.pop(conv_id, None)
+            await rig.fire("on_idle")
+            assert app.state.has_active_work() is False
+    finally:
+        rig.drain()
 
 
 @pytest.mark.asyncio
@@ -486,7 +524,7 @@ async def test_deleted_native_session_late_status_does_not_pin() -> None:
 
 @pytest.mark.asyncio
 async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
-    """An SDK harness's published status is covered by ``active_turns`` alone."""
+    """An SDK harness's recorded status is covered by ``active_turns`` alone."""
     from tests.runner.conftest import _runner_client
 
     conv_id = "conv_sdk_status"
@@ -507,5 +545,540 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
             if conv_id not in app.state.active_turns:
                 break
             await asyncio.sleep(0.01)
-        app.state.native_pane_status[conv_id] = "running"
+        await _post_status(client, conv_id, "running")
+        record = app.state.session_status_book.current(conv_id)
+        assert record is not None and record.status == "running"
+        assert app.state.has_active_work() is False
+
+
+# ── a native turn holds the runner only while it shows evidence of work ──
+
+_CEILING_S = 7200.0
+_MAX_TURN_ENV = "OMNIGENT_NATIVE_PANE_MAX_TURN_S"
+_APPROVAL_MAX_ENV = "OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S"
+
+
+class _Clock:
+    """A hand-driven monotonic clock, e.g. for the status book."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _events(caplog: pytest.LogCaptureFixture, name: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event_name", None) == name]
+
+
+async def _create_session(client: Any, conv_id: str) -> None:
+    created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+    assert created.status_code == 201, created.text
+
+
+async def _dispatch_turn(client: Any, app: FastAPI, conv_id: str) -> None:
+    """Send a real user message and wait until the runner's side of the turn ends."""
+    resp = await client.post(
+        f"/v1/sessions/{conv_id}/events",
+        json={
+            "type": "message",
+            "agent_id": "ag",
+            "content": [{"type": "input_text", "text": "go on"}],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    for _ in range(200):
+        if conv_id not in app.state.active_turns:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the runner's turn never ended")
+
+
+def _agent_output(instance: Any, *, ago_s: float = 0.0) -> None:
+    """Stamp pane output on *instance* as its idle watcher does, *ago_s* ago."""
+    instance._last_agent_output_at = time.monotonic() - ago_s
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "statuses", [("running",), ("running", "waiting")], ids=["running", "waiting_after_running"]
+)
+async def test_a_lost_closing_edge_holds_the_runner_only_until_the_ceiling(
+    statuses: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A recorded in-flight status whose closing edge is lost cannot pin the runner.
+
+    The forwarder's ``idle`` never arrives, so the book keeps the last
+    in-flight status. With no dispatch or pane output since its episode
+    began, it holds the watchdog until the ceiling, then the runner shuts
+    down. Each expired episode logs one WARNING.
+
+    :param statuses: Relayed edges; the last one is never closed.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_MAX_TURN_ENV, str(_CEILING_S))
+    clock = _Clock()
+    conv_id = "conv_native_lost_idle"
+    app = await _native_app_with_session(conv_id, harness="codex-native", status_clock=clock)
+    async with _runner_client(app) as client:
+        await _create_session(client, conv_id)
+        for status in statuses:
+            clock.now += 60.0
+            await _post_status(client, conv_id, status)
+        clock.now += _CEILING_S - 1.0
+        assert app.state.has_active_work() is True
+
+        async def _ceiling_passes() -> None:
+            clock.now += 1.0
+
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work,
+                release=_ceiling_passes,
+            )
+            assert app.state.has_active_work() is False
+            assert len(_events(caplog, "runner_in_flight_hold_expired")) == 1
+            # A settled turn and a new one open a new episode, warned once more.
+            await _post_status(client, conv_id, "idle")
+            await _post_status(client, conv_id, statuses[-1])
+            assert app.state.has_active_work() is True
+            clock.now += _CEILING_S
+            assert app.state.has_active_work() is False
+            assert app.state.has_active_work() is False
+        expired = _events(caplog, "runner_in_flight_hold_expired")
+        assert len(expired) == 2, [r.getMessage() for r in expired]
+        assert expired[0].session_id == conv_id  # type: ignore[attr-defined]
+        assert expired[0].attributes == {  # type: ignore[attr-defined]
+            "status": statuses[-1],
+            "claim_source": "relay",
+            "evidence_age_s": _CEILING_S,
+            "ceiling_s": _CEILING_S,
+        }
+
+
+@pytest.mark.asyncio
+async def test_a_reposted_running_cannot_extend_the_runner_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relay re-posting ``running`` is not evidence of work.
+
+    Duplicates keep the episode's start, so re-posts cannot move the end of
+    the hold. A settled turn followed by a new ``running``, or a new runner
+    dispatch, restarts it.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_MAX_TURN_ENV, str(_CEILING_S))
+    clock = _Clock()
+    conv_id = "conv_native_reposted"
+    app = await _native_app_with_session(conv_id, harness="codex-native", status_clock=clock)
+    async with _runner_client(app) as client:
+        await _create_session(client, conv_id)
+        await _post_status(client, conv_id, "running")
+        for _ in range(5):
+            clock.now += _CEILING_S / 5
+            await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is False
+
+        await _post_status(client, conv_id, "idle")
+        await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is True
+        clock.now += _CEILING_S
+        assert app.state.has_active_work() is False
+
+        # The running is still never closed; the next dispatch restarts the clock.
+        await _dispatch_turn(client, app, conv_id)
+        clock.now += _CEILING_S - 1.0
+        assert app.state.has_active_work() is True
+        clock.now += 1.0
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_a_printing_native_turn_holds_the_runner_past_the_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn whose agent pane keeps printing is never cut off by its age.
+
+    Output on the session's own agent pane renews the hold, so a codex turn
+    that runs for several ceilings keeps the runner up until its relayed
+    ``idle``. A silent pane is held until the ceiling after its last output,
+    and a side shell's output is not the agent's work.
+    """
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    monkeypatch.setenv(_MAX_TURN_ENV, str(_CEILING_S))
+    clock = _Clock()
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="codex",
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec("codex-native")),
+    )
+    app, conv_id = rig.app, rig.conv_id
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            agent_pane = rig.terminal_registry.get(conv_id, "codex", "main")
+            side_shell = make_test_terminal_instance("bash", "side", tmp_path)
+            rig.terminal_registry._by_conversation[conv_id][("bash", "side")] = side_shell
+            await _post_status(client, conv_id, "running")
+            for _ in range(6):
+                clock.now += _CEILING_S / 2
+                _agent_output(agent_pane)
+                assert app.state.has_active_work() is True
+
+            _agent_output(agent_pane, ago_s=_CEILING_S - 1.0)
+            assert app.state.has_active_work() is True
+            _agent_output(agent_pane, ago_s=_CEILING_S)
+            _agent_output(side_shell)
+            assert app.state.has_active_work() is False
+
+            _agent_output(agent_pane)
+
+            async def _relayed_idle() -> None:
+                await _post_status(client, conv_id, "idle")
+
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work,
+                release=_relayed_idle,
+            )
+    finally:
+        rig.drain()
+
+
+@pytest.mark.asyncio
+async def test_a_six_hour_native_turn_holds_the_runner_until_its_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the default ceiling, a turn many runner idle windows long is held.
+
+    Nothing refreshes the evidence for six hours: no output, no dispatch.
+    The runner still waits for the turn's own relayed ``idle``.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.delenv(_MAX_TURN_ENV, raising=False)
+    clock = _Clock()
+    conv_id = "conv_native_long_turn"
+    app = await _native_app_with_session(conv_id, harness="codex-native", status_clock=clock)
+    async with _runner_client(app) as client:
+        await _create_session(client, conv_id)
+        await _post_status(client, conv_id, "running")
+        clock.now += 6 * 3600.0
+        assert app.state.has_active_work() is True
+
+        async def _relayed_idle() -> None:
+            await _post_status(client, conv_id, "idle")
+
+        await _assert_monitor_blocked_then_shuts_down(
+            has_active_work=app.state.has_active_work,
+            release=_relayed_idle,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_claude_exit_banner_frees_the_runner_and_records_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Claude ``/exit`` during a claimed turn frees the runner and leaves ``idle``.
+
+    Printing the resume banner can flip the pane's exit memo back to
+    ``running``, so the exit arrives as not idle. The exit publisher resets
+    the session's status and records the clean stop's ``idle`` as a runner
+    edge: no stale ``running`` holds the runner and no ``failed`` is left.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+    from omnigent.runner.session_status import StatusSource
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
+
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="claude",
+        spec_resolver=await _spec_resolver_returning(_native_spec("claude-native")),
+    )
+    app, conv_id = rig.app, rig.conv_id
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            await _post_status(client, conv_id, "running")
+            assert app.state.has_active_work() is True
+            rig.drain()
+            rig.resources._terminal_exit_publisher(
+                TerminalExitEvent(
+                    session_id=conv_id,
+                    terminal_id="terminal:claude:main",
+                    terminal_name="claude",
+                    session_key="main",
+                    lifecycle=TerminalLifecycle.REQUIRED,
+                    exit_status=0,
+                    session_was_idle=False,
+                    last_output="Resume this session with:\nclaude --resume 0d5c8f3e",
+                )
+            )
+            record = rig.book.current(conv_id)
+            assert record is not None
+            assert (record.status, record.origin) == ("idle", StatusSource.RUNNER)
+            assert app.state.has_active_work() is False
+            queue = _session_event_queues_ref.get(conv_id)
+            assert queue is not None
+            published = [
+                event.get("status")
+                for event in (queue.get_nowait() for _ in range(queue.qsize()))
+                if event.get("type") == "session.status"
+            ]
+            assert published == ["idle"]
+    finally:
+        rig.drain()
+
+
+@pytest.mark.asyncio
+async def test_an_open_prompt_park_holds_the_runner_until_the_approval_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native prompt parked on a human holds the runner whatever the status says.
+
+    A pane-status harness reads ``idle`` while its TUI waits on a mirrored
+    prompt; the mirror's open park keeps the runner up until
+    OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S.
+    """
+    from omnigent.native import prompt_parks
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_APPROVAL_MAX_ENV, "600")
+    park_clock = _Clock()
+    monkeypatch.setattr(prompt_parks, "_clock", park_clock)
+    conv_id = "conv_native_parked"
+    app = await _native_app_with_session(conv_id, harness="goose-native")
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            await _post_status(client, conv_id, "idle")
+            assert app.state.has_active_work() is False
+            prompt_parks.open_park(conv_id, "goose:1")
+            park_clock.now += 599.0
+            assert app.state.has_active_work() is True
+
+            async def _bound_passes() -> None:
+                park_clock.now += 1.0
+
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work,
+                release=_bound_passes,
+            )
+    finally:
+        prompt_parks.clear_session(conv_id)
+
+
+@pytest.mark.asyncio
+async def test_a_reported_dialog_holds_the_runner_until_the_approval_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn parked on a dialog the agent reported outlives the claim ceiling.
+
+    The silent ``running`` stops holding at the ceiling; its ``blocked_on``
+    keeps the runner up until OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S after the
+    dialog opened.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_MAX_TURN_ENV, "3600")
+    monkeypatch.setenv(_APPROVAL_MAX_ENV, "7200")
+    clock = _Clock()
+    conv_id = "conv_native_dialog"
+    app = await _native_app_with_session(conv_id, harness="claude-native", status_clock=clock)
+    async with _runner_client(app) as client:
+        await _create_session(client, conv_id)
+        await _post_status(client, conv_id, "running", blocked_on="permission prompt")
+        clock.now += 3600.0
+        assert app.state.has_active_work() is True
+        clock.now += 3599.0
+        assert app.state.has_active_work() is True
+
+        async def _bound_passes() -> None:
+            clock.now += 1.0
+
+        await _assert_monitor_blocked_then_shuts_down(
+            has_active_work=app.state.has_active_work,
+            release=_bound_passes,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_turn_s", ["nan", "inf"])
+async def test_a_non_finite_max_turn_knob_keeps_the_default_runner_hold(
+    max_turn_s: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A nan or infinite OMNIGENT_NATIVE_PANE_MAX_TURN_S falls back to the default.
+
+    No evidence age is below nan, so it would switch the hold off; an infinite
+    ceiling would let a lost idle hold the runner forever.
+
+    :param max_turn_s: The knob's value, e.g. ``"nan"``.
+    """
+    from omnigent.terminals.pane_reaper import _DEFAULT_MAX_TURN_S
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_MAX_TURN_ENV, max_turn_s)
+    clock = _Clock()
+    conv_id = f"conv_native_{max_turn_s}_ceiling"
+    with caplog.at_level(logging.WARNING, logger="omnigent.terminals.pane_reaper"):
+        app = await _native_app_with_session(conv_id, harness="codex-native", status_clock=clock)
+    assert any(
+        f"{_MAX_TURN_ENV}={max_turn_s!r} is not a finite number" in record.getMessage()
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+    async with _runner_client(app) as client:
+        await _create_session(client, conv_id)
+        await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is True
+        clock.now += _DEFAULT_MAX_TURN_S - 1.0
+        assert app.state.has_active_work() is True
+        clock.now += 1.0
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_a_dialog_opening_and_closing_does_not_warn_twice_in_one_episode(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An expired hold is warned about once per episode, not once per change.
+
+    A dialog the agent reports and then clears changes the record but not its
+    episode, so the expiry is not logged again. A new episode is.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_MAX_TURN_ENV, "3600")
+    monkeypatch.setenv(_APPROVAL_MAX_ENV, "600")
+    clock = _Clock()
+    conv_id = "conv_native_dialog_churn"
+    app = await _native_app_with_session(conv_id, harness="codex-native", status_clock=clock)
+    book = app.state.session_status_book
+    async with _runner_client(app) as client:
+        await _create_session(client, conv_id)
+        await _post_status(client, conv_id, "running")
+        since = book.current(conv_id).since
+        clock.now += 3600.0
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            assert app.state.has_active_work() is False
+            assert len(_events(caplog, "runner_in_flight_hold_expired")) == 1
+            await _post_status(client, conv_id, "running", blocked_on="permission prompt")
+            assert app.state.has_active_work() is True
+            await _post_status(client, conv_id, "running")
+            assert book.current(conv_id).since == since
+            assert app.state.has_active_work() is False
+            assert len(_events(caplog, "runner_in_flight_hold_expired")) == 1
+
+            await _post_status(client, conv_id, "idle")
+            await _post_status(client, conv_id, "running")
+            clock.now += 3600.0
+            assert app.state.has_active_work() is False
+            assert app.state.has_active_work() is False
+        assert len(_events(caplog, "runner_in_flight_hold_expired")) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_new_dispatch_carries_a_recorded_turn_past_its_episodes_ceiling(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A runner dispatch is evidence of work even when the book already says ``running``.
+
+    The new turn's ``running`` repeats the recorded one, so the episode keeps
+    its start; only the dispatch keeps the runner up past that episode's
+    ceiling, and the ceiling then counts from the dispatch.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_MAX_TURN_ENV, str(_CEILING_S))
+    clock = _Clock()
+    conv_id = "conv_native_redispatched"
+    app = await _native_app_with_session(conv_id, harness="codex-native", status_clock=clock)
+    book = app.state.session_status_book
+    async with _runner_client(app) as client:
+        await _create_session(client, conv_id)
+        await _post_status(client, conv_id, "running")
+        episode_start = book.current(conv_id).since
+        clock.now += _CEILING_S - 60.0
+        await _dispatch_turn(client, app, conv_id)
+        dispatched_at = book.last_dispatch_at(conv_id)
+        assert dispatched_at == clock.now
+        record = book.current(conv_id)
+        assert record.status == "running" and record.since == episode_start
+
+        clock.now = episode_start + _CEILING_S + 60.0
+        assert app.state.has_active_work() is True
+        clock.now = dispatched_at + _CEILING_S - 1.0
+        assert app.state.has_active_work() is True
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            clock.now += 1.0
+            assert app.state.has_active_work() is False
+        expired = _events(caplog, "runner_in_flight_hold_expired")
+        assert len(expired) == 1
+        assert expired[0].attributes["evidence_age_s"] == _CEILING_S  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_an_sdk_sessions_recorded_waits_do_not_hold_the_runner() -> None:
+    """Only a native session's recorded dialog or prompt park holds the runner.
+
+    An SDK turn holds the runner through ``active_turns`` while it runs; a
+    dialog relayed for the session afterwards, or a park opened under its id,
+    is not a native turn in flight.
+    """
+    from omnigent.native import prompt_parks
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_sdk_waits"
+    app = await _native_app_with_session(conv_id, harness="openai-agents")
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            await _post_status(client, conv_id, "running", blocked_on="permission prompt")
+            assert app.state.session_status_book.blocked(conv_id) is not None
+            prompt_parks.open_park(conv_id, "sdk:1")
+            assert prompt_parks.oldest_open_age_s(conv_id) is not None
+            assert conv_id not in app.state.active_turns
+            assert app.state.has_active_work() is False
+    finally:
+        prompt_parks.clear_session(conv_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_turn_s", ["0", "60"])
+async def test_a_small_max_turn_knob_cannot_switch_the_runner_hold_off(
+    max_turn_s: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """OMNIGENT_NATIVE_PANE_MAX_TURN_S below an hour is floored for the runner.
+
+    :param max_turn_s: The knob's value, e.g. ``"0"``.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_MAX_TURN_ENV, max_turn_s)
+    clock = _Clock()
+    conv_id = "conv_native_clamped"
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        app = await _native_app_with_session(conv_id, harness="codex-native", status_clock=clock)
+    assert len(_events(caplog, "runner_in_flight_hold_ceiling_clamped")) == 1
+    async with _runner_client(app) as client:
+        await _create_session(client, conv_id)
+        await _post_status(client, conv_id, "running")
+        clock.now += 3599.0
+        assert app.state.has_active_work() is True
+        clock.now += 1.0
         assert app.state.has_active_work() is False

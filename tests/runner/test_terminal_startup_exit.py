@@ -120,7 +120,7 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
     assert resources.terminal_resource_role("failed-child", "terminal_native_main") is None
     assert resources._last_session_status["failed-child"] == "running"
     assert "failed-child" in resources._active_session_turns
-    assert resources._published_session_status["failed-child"] == ("running", None)
+    assert resources._server_delivery_baseline["failed-child"] == ("running", None)
     close_mock.assert_awaited_once()
 
     events: list[object] = []

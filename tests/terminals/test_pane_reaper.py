@@ -300,6 +300,7 @@ _LIVE_SIGNALS = (
     "tool_call",
     "pending_approval",
     "prompt_park",
+    "blocked_on",
     "approval_marker",
     "child_launching",
     "child_running",
@@ -314,6 +315,7 @@ async def test_each_live_signal_alone_spares_a_silent_pane(
     from omnigent.native import prompt_parks
     from omnigent.runner import app as runner_app
     from omnigent.runner import pending_approvals
+    from omnigent.runner.session_status import StatusSource
 
     rig = await build_pane_rig(tmp_path, monkeypatch, key="goose")
     child = f"{rig.conv_id}_child"
@@ -326,6 +328,10 @@ async def test_each_live_signal_alone_spares_a_silent_pane(
             monkeypatch.setitem(pending_approvals._session_pending, rig.conv_id, 1)
         elif signal == "prompt_park":
             prompt_parks.open_park(rig.conv_id, "goose:1")
+        elif signal == "blocked_on":
+            rig.book.record(
+                rig.conv_id, "running", source=StatusSource.RELAY, blocked_on="permission"
+            )
         elif signal == "approval_marker":
             marker = claude_native_bridge.approval_wait_marker_path(rig.conv_id)
             marker.parent.mkdir(parents=True, exist_ok=True)

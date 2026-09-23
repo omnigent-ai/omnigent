@@ -417,6 +417,25 @@ def _tmux_command_failed_error(
 # slightly-late ``running`` if the agent starts working within the window
 # of an interaction.
 _CLIENT_INTERACTION_WINDOW_SECONDS = 0.75
+# Agent output renews the runner's hold on a native turn
+# (``TerminalInstance.agent_output_age_s``), so a pane change counts as agent
+# output only once the last client interaction is older than the window above
+# and than the watcher's poll interval plus this margin: a watcher polling
+# every second first sees a reflow up to a whole interval after the
+# interaction that caused it.
+_AGENT_OUTPUT_POLL_MARGIN_SECONDS = 0.5
+
+
+def _agent_output_quiet_s(poll_interval_s: float) -> float:
+    """How old the last client interaction must be for a pane change to be agent output.
+
+    :param poll_interval_s: The watcher's poll interval, e.g. ``1.0``.
+    :returns: e.g. ``1.5`` for a 1 s poll, ``0.75`` for a 0.2 s poll.
+    """
+    return max(
+        _CLIENT_INTERACTION_WINDOW_SECONDS, poll_interval_s + _AGENT_OUTPUT_POLL_MARGIN_SECONDS
+    )
+
 
 # Substrings that indicate the terminal is waiting for a human response even
 # while other cells on the pane keep changing (e.g. Codex's blinking spinner
@@ -515,6 +534,14 @@ class _IdleDetector:
         # PTY produced output" signal that powers the web activity badge,
         # without any browser client attached.
         self.changed_this_tick: bool = False
+
+    @property
+    def last_change_at(self) -> float:
+        """Monotonic time the pane last changed because of agent output.
+
+        Client-driven repaints (``suppress_activity``) never move it.
+        """
+        return self._last_change_at
 
     def tick(self, snapshot: str, suppress_activity: bool = False) -> bool:
         """
@@ -1061,6 +1088,9 @@ class TerminalInstance:
     # so a client attaching, detaching, focusing, clicking, or typing does
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
+    # Monotonic time the idle watcher last saw the pane change because of
+    # agent output (never a client repaint); ``None`` until it first does.
+    _last_agent_output_at: float | None = field(default=None, repr=False)
     _last_pane_snapshot: str | None = field(default=None, repr=False)
     _last_exit_snapshot: str | None = field(default=None, repr=False)
     _last_capture_at: float | None = field(default=None, repr=False)
@@ -1109,6 +1139,35 @@ class TerminalInstance:
         :returns: None.
         """
         self._last_client_interaction_at = time.monotonic()
+
+    def agent_output_age_s(self) -> float | None:
+        """Seconds since the idle watcher last saw agent output on this pane.
+
+        A change seen too soon after a client interaction, by
+        :func:`_agent_output_quiet_s` for the watcher's poll interval, is a
+        client-driven repaint and never counts (see
+        :meth:`note_client_interaction`). Thread-safe: the watcher thread
+        writes one ``float`` reference, which is atomic under the GIL.
+
+        :returns: e.g. ``12.5``, or ``None`` before the watcher saw any output.
+        """
+        stamp = self._last_agent_output_at
+        if stamp is None:
+            return None
+        return max(0.0, time.monotonic() - stamp)
+
+    def _stamp_agent_output(self, detector: _IdleDetector, poll_interval_s: float) -> None:
+        """Record this tick's pane change as agent output, unless a client may have caused it.
+
+        :param detector: The watcher's detector, just ticked.
+        :param poll_interval_s: The watcher's poll interval, e.g. ``1.0``.
+        """
+        if not detector.changed_this_tick:
+            return
+        since_interaction = time.monotonic() - self._last_client_interaction_at
+        if since_interaction < _agent_output_quiet_s(poll_interval_s):
+            return
+        self._last_agent_output_at = detector.last_change_at
 
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
@@ -1942,7 +2001,9 @@ class TerminalInstance:
                 if on_exit is not None:
                     await _fire(on_exit, "exit")
                 return
-            if detector.tick(snapshot) and not await _fire(on_idle, "idle"):
+            idle_fired = detector.tick(snapshot)
+            self._stamp_agent_output(detector, _IDLE_POLL_INTERVAL_SECONDS)
+            if idle_fired and not await _fire(on_idle, "idle"):
                 return
 
     def start_idle_watcher_thread(
@@ -2162,6 +2223,7 @@ class TerminalInstance:
                 time.monotonic() - self._last_client_interaction_at
             ) < _CLIENT_INTERACTION_WINDOW_SECONDS
             idle_fired = detector.tick(snapshot, suppress_activity=suppress)
+            self._stamp_agent_output(detector, interval)
             # Activity edge first: a tick can both change the pane and
             # (much later) cross the idle threshold, but never both in
             # the same tick — a change resets the idle timer.

@@ -16,10 +16,11 @@ disjunction of these signals (any one spares the pane):
     an open prompt park younger than
     :envvar:`OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S`, claude's approval marker, or
     running or owed sub-agents, OR
-  * the pane's PTY watcher currently reports ``running`` — i.e. the vendor CLI is
+  * a local channel (the runner, the pane watcher or Claude's status file)
+    recorded the session ``running`` and no later edge ended it — the vendor CLI
     working autonomously *between* runner turns (native turns clear the runner's
-    ``_active_turns`` right after the prompt is pasted, so this is the load-bearing
-    signal for a long autonomous turn), OR
+    ``_active_turns`` right after the prompt is pasted). A relayed ``idle`` and
+    an accepted interrupt both end it, OR
   * a tmux client is attached (a human is watching the pane).
 
 A pane idle on all of them for longer than the window is reaped, with a **second
@@ -88,6 +89,11 @@ _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 # How long an open prompt park may hold a pane: the runner's own ASK wait budget.
 _DEFAULT_APPROVAL_MAX_S = 86400.0
 _APPROVAL_MAX_ENV = "OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S"
+# How long a probe's ACTIVE (or running sub-agents) may hold a silent pane.
+# The runner's idle watchdog reuses it (floored at an hour) as how long a
+# recorded native turn may keep the runner up after its last evidence of work.
+_DEFAULT_MAX_TURN_S = 86400.0
+_MAX_TURN_ENV = "OMNIGENT_NATIVE_PANE_MAX_TURN_S"
 
 
 class SpareReason(StrEnum):
@@ -123,7 +129,7 @@ def _resolve_seconds_env(name: str, default: float) -> float:
     typo shouldn't take the runner down or (worse) make the reaper act on a
     bogus window.
 
-    :param name: Environment variable, e.g. ``"OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S"``.
+    :param name: Environment variable, e.g. ``"OMNIGENT_NATIVE_PANE_MAX_TURN_S"``.
     :param default: Value when unset or invalid.
     """
     raw = os.environ.get(name)
@@ -155,6 +161,15 @@ def resolve_native_pane_idle_timeout_s() -> float:
 def resolve_approval_max_s() -> float:
     """Longest a human-wait signal may hold a pane (default one day)."""
     return _resolve_seconds_env(_APPROVAL_MAX_ENV, _DEFAULT_APPROVAL_MAX_S)
+
+
+def resolve_max_turn_s() -> float:
+    """Longest a probe's ACTIVE or running sub-agents may hold a silent pane.
+
+    The runner's idle watchdog reuses it, floored at an hour, as how long a
+    recorded native turn may keep the runner up after its last evidence of work.
+    """
+    return _resolve_seconds_env(_MAX_TURN_ENV, _DEFAULT_MAX_TURN_S)
 
 
 class NativePaneReaper:
@@ -189,6 +204,7 @@ class NativePaneReaper:
         )
         self._reaper_interval_s = reaper_interval_s
         # conversation_id -> monotonic time it was last observed busy.
+        # custom-lint: disable-next=session-status-single-source -- the reaper's own idle clock
         self._last_busy_at: dict[str, float] = {}
         self._task: asyncio.Task[None] | None = None
         self._started = False

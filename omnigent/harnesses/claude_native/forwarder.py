@@ -178,8 +178,9 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 #   ~1s-quiescence heuristic that oscillated on mid-turn lulls, firing a
 #   premature completion that idempotently locked out the real one. It also
 #   carries the background-shell count. It agrees with the file rather than
-#   competing with it, so arrival order does not matter — the shared edge
-#   dedup collapses the pair.
+#   competing with it: the shared wire dedup collapses the pair, so what the
+#   server hears does not depend on arrival order. The runner records both
+#   edges in its status book regardless.
 # - ``StopFailure`` → failed: the file has no failure literal (it returns to
 #   ``idle`` on a turn error exactly as on success), so this is the only
 #   source of the red pill, ``last_task_error``, and a failed scheduled run.
