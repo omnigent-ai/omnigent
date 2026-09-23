@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from websockets.datastructures import Headers
@@ -5493,7 +5493,9 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     )
 
     with patch("omnigent.host.connect.subprocess.Popen", side_effect=_slow_popen):
-        task = asyncio.create_task(host._handle_launch(frame))
+        task = asyncio.create_task(
+            host._dispatch_host_frame(_CollectingWs(), frame)  # type: ignore[arg-type]
+        )
         # Cancel only once the spawn thread has actually created the process,
         # so we exercise the real leak window rather than a pre-spawn cancel.
         await asyncio.to_thread(spawn_started.wait, 10.0)
@@ -5501,8 +5503,26 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
         with pytest.raises(asyncio.CancelledError):
             await task
         assert host._runner_stop_tasks, "abandoned spawn teardown was not retained"
-        release_spawn.set()
-        await host._drain_runner_stop_tasks()
+        status_started = asyncio.Event()
+
+        async def _query() -> HostRunnerStatusResultFrame:
+            status_started.set()
+            return await host._handle_runner_status(
+                HostRunnerStatusFrame(
+                    request_id="status", runner_id=token_bound_runner_id(frame.binding_token)
+                )
+            )
+
+        query = asyncio.create_task(_query())
+        try:
+            await asyncio.wait_for(status_started.wait(), 5.0)
+            assert not query.done(), "status must wait for the abandoned spawn's cleanup"
+        finally:
+            release_spawn.set()
+            await host._drain_runner_stop_tasks()
+            result = await asyncio.wait_for(query, 5.0)
+        assert result.status == "unknown"
+        assert not host._pending_runner_launches
 
     assert spawned, "the spawn thread should have created a process"
     # Never registered (that is the leak window) ...
@@ -6157,6 +6177,154 @@ async def test_slow_frame_does_not_head_of_line_block(
     release_slow.set()
     await _drain_frame_tasks(host)
     assert any('"req_slow"' in frame for frame in ws.sent)
+
+
+@pytest.mark.parametrize("stage", ["queued", "preflight", "spawn"])
+async def test_runner_status_waits_for_pending_launch(
+    stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pending launches must not look absent, including while queued."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    loop = asyncio.get_running_loop()
+    launch_started = asyncio.Event()
+    status_started = asyncio.Event()
+    release_launch = threading.Event()
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+
+    def _pause() -> None:
+        loop.call_soon_threadsafe(launch_started.set)
+        assert release_launch.wait(5.0), "test did not release launch"
+
+    def _preflight(_harness: str) -> bool:
+        if stage == "preflight":
+            _pause()
+        return True
+
+    def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        if stage == "spawn":
+            _pause()
+        return proc, tmp_path / "runner.log"
+
+    real_status = host._handle_runner_status
+
+    async def _status(frame: HostRunnerStatusFrame) -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await real_status(frame)
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _preflight)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    monkeypatch.setattr(host, "_handle_runner_status", _status)
+    frame = HostLaunchRunnerFrame(
+        request_id="launch",
+        binding_token="pending-token",
+        workspace=str(tmp_path),
+        harness="claude-native",
+    )
+    runner_id = token_bound_runner_id(frame.binding_token)
+    if stage == "queued":
+        await host._runner_lifecycle_lock.acquire()
+    launch = asyncio.create_task(host._dispatch_host_frame(ws, frame))  # type: ignore[arg-type]
+    queries: list[asyncio.Task[None]] = []
+    try:
+        if stage != "queued":
+            await asyncio.wait_for(launch_started.wait(), 5.0)
+        query = asyncio.create_task(
+            host._dispatch_host_frame(  # type: ignore[arg-type]
+                ws, HostRunnerStatusFrame(request_id="status", runner_id=runner_id)
+            )
+        )
+        queries.append(query)
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not query.done(), f"pending launch reported a premature status: {ws.sent}"
+
+        unrelated = await asyncio.wait_for(
+            real_status(HostRunnerStatusFrame(request_id="unrelated", runner_id="runner_absent")),
+            1.0,
+        )
+        assert unrelated.status == "unknown"
+
+        query.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await query
+        status_started.clear()
+        second = asyncio.create_task(
+            host._dispatch_host_frame(  # type: ignore[arg-type]
+                ws, HostRunnerStatusFrame(request_id="second", runner_id=runner_id)
+            )
+        )
+        queries.append(second)
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not second.done(), "cancelling one query must not settle the pending launch"
+    finally:
+        release_launch.set()
+        if stage == "queued":
+            host._runner_lifecycle_lock.release()
+        await asyncio.wait_for(asyncio.gather(launch, *queries, return_exceptions=True), 5.0)
+        await asyncio.gather(*host._watcher_tasks)
+
+    results = [decode_host_frame(raw) for raw in ws.sent]
+    statuses = [result for result in results if isinstance(result, HostRunnerStatusResultFrame)]
+    assert [(result.request_id, result.status) for result in statuses] == [("second", "alive")]
+    assert host._runners[runner_id].proc is proc
+
+
+@pytest.mark.parametrize("outcome", ["refused", "error", "cancelled"])
+async def test_runner_status_settles_after_unsuccessful_launch(
+    outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusal, handler failure, and cancellation must release status waiters."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    status_started = asyncio.Event()
+    frame = HostLaunchRunnerFrame(
+        request_id="launch", binding_token="failed-token", workspace="/w"
+    )
+
+    async def _launch(frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        entered.set()
+        await release.wait()
+        if outcome == "error":
+            raise RuntimeError("launch handler failed")
+        return HostLaunchRunnerResultFrame(request_id=frame.request_id, status="failed")
+
+    async def _query() -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await host._handle_runner_status(
+            HostRunnerStatusFrame(
+                request_id="status",
+                runner_id=token_bound_runner_id(frame.binding_token),
+            )
+        )
+
+    monkeypatch.setattr(host, "_handle_launch", _launch)
+    launch = asyncio.create_task(host._dispatch_host_frame(ws, frame))  # type: ignore[arg-type]
+    query: asyncio.Task[HostRunnerStatusResultFrame] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5.0)
+        query = asyncio.create_task(_query())
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not query.done()
+        if outcome == "cancelled":
+            launch.cancel()
+        release.set()
+        result = await asyncio.wait_for(query, 5.0)
+        assert result.status == "unknown"
+        assert not host._pending_runner_launches
+    finally:
+        release.set()
+        await asyncio.gather(launch, return_exceptions=True)
+        if query is not None:
+            query.cancel()
+            await asyncio.gather(query, return_exceptions=True)
 
 
 async def test_stop_frame_never_overtakes_launch(
