@@ -667,6 +667,23 @@ describe("Composer send shortcut", () => {
     }
   });
 
+  it("leaves plain Enter as a newline on a coarse pointer, even with no menu open", async () => {
+    // Touch keyboards own the send action (the on-screen button), so Enter on
+    // a coarse pointer must stay a plain newline — same rule the landing
+    // composer follows on a phone viewport.
+    const restorePointer = forceDesktopCoarsePointer();
+    const onSend = vi.fn();
+    try {
+      const user = userEvent.setup();
+      render(<Composer {...composerProps({ onSend })} />);
+      await user.type(textarea(), "first{Enter}second");
+      expect(textarea().value).toBe("first\nsecond");
+      expect(onSend).not.toHaveBeenCalled();
+    } finally {
+      restorePointer();
+    }
+  });
+
   it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();
@@ -3896,6 +3913,104 @@ describe("Composer file-attachment focus", () => {
     fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
 
     expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
+
+  it("clears the rejection notice when the accepted chip is removed", () => {
+    // A mixed attach keeps the good file and flags the bad one; removing the
+    // surviving chip must also drop the stale notice (parity with the landing
+    // composer's mixed-drop behavior).
+    render(<Composer {...composerProps()} />);
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(fileInput(), { target: { files: [ok, bad] } });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
+
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
+});
+
+// Paste mirrors drop on the in-session composer: files on the clipboard attach
+// instead of inserting as text, while a plain-text paste is left to the
+// browser. Same contract as the landing composer's paste suite.
+describe("Composer paste", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  /** Clipboard items as a real paste carries them: text and/or file entries. */
+  function pastePayload({ text, files = [] }: { text?: string; files?: File[] }) {
+    const items: {
+      kind: string;
+      type: string;
+      getAsFile: () => File | null;
+      getAsString?: (callback: (value: string) => void) => void;
+    }[] = [];
+    if (text !== undefined) {
+      items.push({
+        kind: "string",
+        type: "text/plain",
+        getAsFile: () => null,
+        getAsString: (callback) => callback(text),
+      });
+    }
+    for (const file of files) {
+      items.push({ kind: "file", type: file.type, getAsFile: () => file });
+    }
+    return { clipboardData: { items } };
+  }
+
+  it("leaves a text-only paste to the browser", () => {
+    render(<Composer {...composerProps()} />);
+    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(true);
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+    expect(textarea().value).toBe("");
+  });
+
+  it("attaches a pasted file instead of inserting it as text", () => {
+    render(<Composer {...composerProps()} />);
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [file] }))).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(textarea().value).toBe("");
+  });
+
+  it("attaches every file from a multi-file paste", () => {
+    render(<Composer {...composerProps()} />);
+    const image = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    const notes = new File(["hello"], "notes.txt", { type: "text/plain" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [image, notes] }))).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+  });
+
+  it("attaches files pasted while the slash menu is open, closing the menu", () => {
+    // The slash menu only renders with no attachments (its visibility gate
+    // includes ``files.length === 0``), so pasting a file attaches it, keeps
+    // the drafted "/query" text, and dismisses the menu. The landing composer
+    // has no such gate — its menu stays open; the parity suite there records
+    // the divergence.
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/de" } });
+    expect(activeRow()).not.toBeNull();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [file] }))).toBe(false);
+
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(textarea().value).toBe("/de");
+    expect(screen.queryByTestId("slash-menu-item-deslop")).toBeNull();
   });
 });
 

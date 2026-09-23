@@ -5638,6 +5638,39 @@ describe("NewChatLandingScreen", () => {
     },
   );
 
+  it.each([
+    [false, "{Shift>}{Enter}{/Shift}"],
+    [true, "{Enter}"],
+    [true, "{Shift>}{Enter}{/Shift}"],
+  ] as const)("preserves newline input (alternate send: %s)", async (alternate, keys) => {
+    // Same newline contract as the in-session composer: Shift+Enter (and, in
+    // alternate mode, plain Enter) inserts a line break instead of creating.
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    const user = userEvent.setup();
+    await user.type(input, "first" + keys + "second");
+    expect((input as HTMLTextAreaElement).value).toBe("first\nsecond");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves plain Enter as a newline on a phone viewport", async () => {
+    // Touch keyboards own the create action (the on-screen button), so plain
+    // Enter never creates — same rule as the in-session composer on a coarse
+    // pointer.
+    const restoreViewport = forceMobileViewport();
+    try {
+      renderLanding();
+      const input = screen.getByTestId("new-chat-landing-input");
+      const user = userEvent.setup();
+      await user.type(input, "first{Enter}second");
+      expect((input as HTMLTextAreaElement).value).toBe("first\nsecond");
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    } finally {
+      restoreViewport();
+    }
+  });
+
   it("arms Codex bypass directly from the hand dropdown", () => {
     renderLanding();
     selectAgent("a2");
@@ -7690,6 +7723,97 @@ describe("NewChatLandingScreen attachments", () => {
     });
 
     expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
+});
+
+// Paste mirrors the in-session composer exactly: files on the clipboard
+// attach instead of inserting as text, while a plain-text paste is left to
+// the browser. Keep these assertions in lockstep with the "Composer paste"
+// suite in pages/ChatPage.composer.test.tsx — the one recorded divergence is
+// the open slash menu's fate (landing keeps it open; live closes it once an
+// attachment exists).
+describe("NewChatLandingScreen paste", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  /** Clipboard items as a real paste carries them: text and/or file entries. */
+  function pastePayload({ text, files = [] }: { text?: string; files?: File[] }) {
+    const items: {
+      kind: string;
+      type: string;
+      getAsFile: () => File | null;
+      getAsString?: (callback: (value: string) => void) => void;
+    }[] = [];
+    if (text !== undefined) {
+      items.push({
+        kind: "string",
+        type: "text/plain",
+        getAsFile: () => null,
+        getAsString: (callback) => callback(text),
+      });
+    }
+    for (const file of files) {
+      items.push({ kind: "file", type: file.type, getAsFile: () => file });
+    }
+    return { clipboardData: { items } };
+  }
+
+  it("leaves a text-only paste to the browser", () => {
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    expect(fireEvent.paste(input, pastePayload({ text: "hello world" }))).toBe(true);
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+    expect((input as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("attaches a pasted file instead of inserting it as text", () => {
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(fireEvent.paste(input, pastePayload({ files: [file] }))).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect((input as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("attaches every file from a multi-file paste", () => {
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    const image = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    const notes = new File(["hello"], "notes.txt", { type: "text/plain" });
+    expect(fireEvent.paste(input, pastePayload({ files: [image, notes] }))).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+  });
+
+  it("attaches files pasted while the slash menu is open, keeping the menu open", () => {
+    // Unlike the in-session composer (whose menu gate includes
+    // ``files.length === 0``), the landing menu only reads the drafted text,
+    // so it stays open after the paste.
+    mockAgents([
+      {
+        id: "ag_skilled",
+        name: "skilled-agent",
+        display_name: "Skilled Agent",
+        description: null,
+        harness: "claude-sdk",
+        skills: [{ name: "review-pr", description: "Review a pull request" }],
+      },
+    ]);
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "/rev" } });
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toBeTruthy();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(fireEvent.paste(input, pastePayload({ files: [file] }))).toBe(false);
+
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect((input as HTMLTextAreaElement).value).toBe("/rev");
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toBeTruthy();
   });
 });
 
