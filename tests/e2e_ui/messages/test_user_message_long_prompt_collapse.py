@@ -1,6 +1,6 @@
 """E2E: long user prompts collapse by default in the chat transcript.
 
-When a user sends a message longer than the 8 000-character threshold the UI
+When a user sends a message longer than the threshold the UI
 collapses the bubble to a fixed-height preview and shows an expand button.
 Clicking the button expands the full text; clicking it again collapses.
 
@@ -16,9 +16,10 @@ from playwright.sync_api import Page, expect
 
 _COMPOSER_PLACEHOLDER = "Send a message…"
 _USER_BUBBLE = '[data-testid="message-bubble"][data-role="user"]'
+_THRESHOLD = 12_000
 
-# Generate a prompt just over the 8 000-char threshold.
-_LONG_PROMPT = "word " * 1_700  # ~8 500 chars
+# Generate a prompt just over the threshold.
+_LONG_PROMPT = "word " * (_THRESHOLD // 5 + 10)
 
 
 def _send(page: Page, text: str) -> None:
@@ -33,7 +34,7 @@ def test_long_user_prompt_collapses_by_default(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A prompt over 8 000 chars starts collapsed with an expand button visible.
+    """A prompt over THRESHOLD chars starts collapsed with an expand button visible.
 
     A failure here means the collapse threshold, initial state, or the button
     label regressed.
