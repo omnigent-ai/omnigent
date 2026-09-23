@@ -3439,24 +3439,45 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-def _is_subagent_hook_record(record: ClaudeHookRecord) -> bool:
+def _is_subagent_hook_record(
+    record: ClaudeHookRecord,
+    *,
+    parent_claude_session_id: str | None = None,
+) -> bool:
     """
     Return whether a hook record originated from a Claude subagent.
 
-    Claude Code subagent transcripts live under a ``subagents/``
-    subdirectory (e.g.
-    ``~/.claude/projects/<encoded>/<session>/subagents/agent-<id>.jsonl``).
-    When a subagent fires a lifecycle hook (``Stop``,
-    ``UserPromptSubmit``), its ``transcript_path`` contains that
-    ``subagents`` component. The parent process's transcript lives
-    one level up (``<session>.jsonl``) and never contains it.
+    Primary check: a record whose ``session_id`` differs from the
+    parent's pinned Claude session id is from a subagent process.
+    This catches background (``run_in_background=True``) subagents
+    whose transcripts may not live under a ``subagents/``
+    subdirectory. Requires the caller to supply
+    ``parent_claude_session_id`` (read from bridge state).
+
+    Fallback path check: synchronous (in-process) subagents always
+    have transcripts under
+    ``~/.claude/projects/<encoded>/<session>/subagents/agent-<id>.jsonl``.
+    When the session id comparison is unavailable, the presence of
+    ``subagents`` as a path component distinguishes them.
 
     :param record: Claude hook record read from ``hooks.jsonl``.
-    :returns: ``True`` when the record's transcript path indicates a
-        subagent, ``False`` otherwise (including when no transcript
-        path is available — conservative default so parent events
-        are never accidentally dropped).
+    :param parent_claude_session_id: The parent Claude session id
+        pinned in bridge state, e.g.
+        ``"a1b2c3d4-1234-5678-9abc-def012345678"``.  ``None`` falls
+        back to the path-only check.
+    :returns: ``True`` when the record belongs to a subagent,
+        ``False`` otherwise (including when neither signal is
+        available — conservative default so parent events are never
+        accidentally dropped).
     """
+    # Primary: session id mismatch → record is from a subagent process.
+    if (
+        parent_claude_session_id
+        and record.claude_session_id
+        and record.claude_session_id != parent_claude_session_id
+    ):
+        return True
+    # Fallback: subagent directory structure check.
     if record.transcript_path is None:
         return False
     return "subagents" in record.transcript_path.parts
@@ -3728,6 +3749,10 @@ async def _forward_available_status_events(
         retried and the failing event is retried later.
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
+    # Read once before the loop; the pinned parent session id is stable
+    # across all records in this batch (SessionStart updates would have
+    # been processed in an earlier poll).
+    parent_claude_session_id = read_claude_session_id(bridge_dir)
     if not result.records:
         if result.event_cursor == state.event_cursor and result.byte_offset == (
             state.byte_offset or 0
@@ -3759,7 +3784,9 @@ async def _forward_available_status_events(
         # failure must NOT flip the parent session to ``failed`` — the
         # parent turn is still running while it awaits the Agent tool
         # result.
-        if status is not None and _is_subagent_hook_record(record):
+        if status is not None and _is_subagent_hook_record(
+            record, parent_claude_session_id=parent_claude_session_id
+        ):
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
                 session_id,

@@ -1694,6 +1694,266 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
 
 
 @pytest.mark.asyncio
+async def test_forwarder_ignores_background_subagent_stop_failure_by_session_id(
+    tmp_path: Path,
+) -> None:
+    """
+    A background subagent's ``StopFailure`` must not flip the parent failed.
+
+    Background (``run_in_background=True``) subagents run as separate
+    processes and may store their transcripts outside the parent's
+    ``subagents/`` directory.  The forwarder must use the session id
+    difference (subagent carries its own ``session_id``, not the parent's)
+    as the primary signal to skip those records, even when the transcript
+    path does not contain a ``subagents/`` component.
+    """
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript = tmp_path / "session.jsonl"
+    parent_transcript.write_text("", encoding="utf-8")
+    # Background subagent transcript is NOT under subagents/; it has its
+    # own session directory at the same level as the parent.
+    background_transcript = tmp_path / "bg-agent.jsonl"
+    background_transcript.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    # Background subagent fails — different session_id, non-subagent path.
+    # This must NOT surface as the parent failing.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "bg-agent-session",
+            "transcript_path": str(background_transcript),
+        },
+    )
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # No status POST at all: the background subagent's StopFailure
+        # must be silently skipped.
+        with pytest.raises(AssertionError):
+            await _get_recorded_request(server, timeout_s=0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarder_parent_stop_failure_not_affected_by_background_session_check(
+    tmp_path: Path,
+) -> None:
+    """
+    A parent's ``StopFailure`` is still forwarded when the session id check is active.
+
+    When the session id comparison filters subagent hooks, a
+    ``StopFailure`` carrying the parent's own session id must still
+    produce a ``failed`` edge.
+    """
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript = tmp_path / "session.jsonl"
+    parent_transcript.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    # Parent's own StopFailure — must be forwarded.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        first = await _get_recorded_request(server)
+        with pytest.raises(AssertionError):
+            await _get_recorded_request(server, timeout_s=0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert first["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "failed"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_forwarder_ignores_background_subagent_stop_failure_by_session_id(
+    tmp_path: Path,
+) -> None:
+    """
+    A background subagent's ``StopFailure`` must not flip the parent failed.
+
+    Background (``run_in_background=True``) subagents run as separate
+    processes and may store their transcripts outside the parent's
+    ``subagents/`` directory.  The forwarder must use the session id
+    difference (subagent carries its own ``session_id``, not the parent's)
+    as the primary signal to skip those records, even when the transcript
+    path does not contain a ``subagents/`` component.
+    """
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript = tmp_path / "session.jsonl"
+    parent_transcript.write_text("", encoding="utf-8")
+    # Background subagent transcript is NOT under subagents/; it has its
+    # own session directory at the same level as the parent.
+    background_transcript = tmp_path / "bg-agent.jsonl"
+    background_transcript.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    # Background subagent fails — different session_id, non-subagent path.
+    # This must NOT surface as the parent failing.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "bg-agent-session",
+            "transcript_path": str(background_transcript),
+        },
+    )
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # No status POST at all: the background subagent's StopFailure
+        # must be silently skipped.
+        with pytest.raises(AssertionError):
+            await _get_recorded_request(server, timeout_s=0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarder_parent_stop_failure_not_affected_by_background_session_check(
+    tmp_path: Path,
+) -> None:
+    """
+    A parent's ``StopFailure`` is still forwarded when the session id check is active.
+
+    When the session id comparison filters subagent hooks, a
+    ``StopFailure`` carrying the parent's own session id must still
+    produce a ``failed`` edge.
+    """
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript = tmp_path / "session.jsonl"
+    parent_transcript.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    # Parent's own StopFailure — must be forwarded.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        first = await _get_recorded_request(server)
+        with pytest.raises(AssertionError):
+            await _get_recorded_request(server, timeout_s=0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert first["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "failed"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_forwarder_ignores_subagent_stop_hook(
     tmp_path: Path,
 ) -> None:
