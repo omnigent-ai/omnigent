@@ -1,8 +1,9 @@
 """E2E coverage for the iOS system-browser OIDC session handoff.
 
-The iOS shell and Safari have isolated cookie stores. The native shell starts
-the production browser-ticket flow, Safari completes OIDC, and the shell polls
-the ticket before installing the returned session JWT in its WebView.
+The iOS shell and Safari have isolated cookie stores. The native shell mints a
+PKCE-bound ticket, Safari completes OIDC and the user approves the consent
+page, and the shell polls the ticket with its verifier before installing the
+returned session JWT in its WebView.
 
 Playwright cannot execute UIKit or ``WKNavigationDelegate`` on Linux CI, so this
 test covers the shared production contract at the browser boundary: real auth
@@ -13,7 +14,10 @@ the polled session.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
+import secrets
 import threading
 import time
 from collections.abc import Iterator
@@ -183,21 +187,32 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
     playwright: Playwright,
     oidc_handoff_server: OidcHandoffServer,
 ) -> None:
-    """Complete browser OIDC, poll its ticket, and authenticate the WebView."""
+    """Complete browser OIDC with consent, poll the PKCE-bound ticket, and
+    authenticate the WebView."""
     base_url = oidc_handoff_server.base_url
     native_request_context = playwright.request.new_context(base_url=base_url)
     system_browser_context = browser.new_context()
     webview_context = browser.new_context()
     try:
-        ticket_response = native_request_context.post("/auth/cli-login")
+        code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+        code_challenge = (
+            base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+            .rstrip(b"=")
+            .decode()
+        )
+        ticket_response = native_request_context.post(
+            "/auth/cli-login",
+            data={"code_challenge": code_challenge, "code_challenge_method": "S256"},
+        )
         assert ticket_response.ok, ticket_response.text()
         ticket_payload = ticket_response.json()
         ticket = ticket_payload["ticket"]
+        user_code = ticket_payload["user_code"]
         login_url = f"{base_url}{ticket_payload['login_url']}"
 
         pending_response = native_request_context.get(
             "/auth/cli-poll",
-            params={"ticket": ticket},
+            params={"ticket": ticket, "code_verifier": code_verifier},
         )
         assert pending_response.status == 202
         assert pending_response.json() == {"status": "pending"}
@@ -208,13 +223,27 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
             system_browser_page.get_by_role("heading", name="Test identity provider")
         ).to_be_visible()
 
+        # Signing in lands on the consent page; the token is not released
+        # until the user explicitly approves the CLI login there.
         system_browser_page.get_by_role("link", name="Continue as test user").click()
-        expect(system_browser_page.get_by_role("heading", name="Login successful")).to_be_visible()
+        expect(
+            system_browser_page.get_by_role("heading", name="Authorize CLI login")
+        ).to_be_visible()
+        expect(system_browser_page.get_by_text(user_code)).to_be_visible()
+
+        still_pending = native_request_context.get(
+            "/auth/cli-poll",
+            params={"ticket": ticket, "code_verifier": code_verifier},
+        )
+        assert still_pending.status == 202
+
+        system_browser_page.get_by_role("button", name="Approve").click()
+        expect(system_browser_page.get_by_role("heading", name="Approved")).to_be_visible()
         expect(system_browser_page.get_by_text(_TEST_EMAIL)).to_be_visible()
 
         poll_response = native_request_context.get(
             "/auth/cli-poll",
-            params={"ticket": ticket},
+            params={"ticket": ticket, "code_verifier": code_verifier},
         )
         assert poll_response.ok, poll_response.text()
         session_token = poll_response.json()["token"]
@@ -234,7 +263,7 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
 
         consumed_response = native_request_context.get(
             "/auth/cli-poll",
-            params={"ticket": ticket},
+            params={"ticket": ticket, "code_verifier": code_verifier},
         )
         assert consumed_response.status == 410
     finally:

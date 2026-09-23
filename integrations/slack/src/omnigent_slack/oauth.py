@@ -28,8 +28,11 @@ See ``designs/DEVICE_AUTH.md`` for the device-grant design.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import enum
+import hashlib
+import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -130,8 +133,7 @@ class PendingLogin:
     """
 
     verification_url: str
-    # Short human-readable code to display, when the flow has one (device
-    # grant). Empty for the OIDC ticket flow (the IdP page needs no code).
+    # Short human-readable code to display when the flow has one.
     user_code: str
     _poll: Callable[[], Awaitable[TokenResult]]
     _close: Callable[[], Awaitable[None]]
@@ -304,8 +306,17 @@ async def _poll_device(
 async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     base = server_url.rstrip("/")
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(30.0))
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
     try:
-        resp = await client.post("/auth/cli-login")
+        resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": code_challenge, "code_challenge_method": "S256"},
+        )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         await client.aclose()
@@ -315,6 +326,7 @@ async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
         ticket = str(data["ticket"])
         # login_url is a server-relative path (e.g. "/auth/login?ticket=…").
         login_url = str(data["login_url"])
+        user_code = str(data.get("user_code", ""))
     except (ValueError, KeyError, TypeError) as exc:
         # A 200 with a malformed body would otherwise leak the open client.
         await client.aclose()
@@ -322,18 +334,22 @@ async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     verification_url = login_url if login_url.startswith("http") else f"{base}{login_url}"
 
     async def _poll() -> TokenResult:
-        return await _poll_cli_ticket(client, ticket)
+        return await _poll_cli_ticket(client, ticket, code_verifier)
 
     return PendingLogin(
         verification_url=verification_url,
-        user_code="",
+        user_code=user_code,
         _poll=_poll,
         _close=client.aclose,
     )
 
 
 async def _poll_cli_ticket(
-    client: httpx.AsyncClient, ticket: str, interval: int = 2, timeout_seconds: int = 300
+    client: httpx.AsyncClient,
+    ticket: str,
+    code_verifier: str,
+    interval: int = 2,
+    timeout_seconds: int = 300,
 ) -> TokenResult:
     deadline = asyncio.get_event_loop().time() + timeout_seconds
     while True:
@@ -341,7 +357,10 @@ async def _poll_cli_ticket(
             raise AuthorizationExpiredError("The login link expired.")
         await asyncio.sleep(interval)
         try:
-            resp = await client.get("/auth/cli-poll", params={"ticket": ticket})
+            resp = await client.get(
+                "/auth/cli-poll",
+                params={"ticket": ticket, "code_verifier": code_verifier},
+            )
         except httpx.HTTPError:
             continue  # transient — keep polling until the deadline
         if resp.status_code == 202:
@@ -352,7 +371,10 @@ async def _poll_cli_ticket(
             return _token_from_response(
                 resp, access_key="token", has_refresh=False, default_expires=8 * 3600
             )
-        # 410 (expired/unknown) or any other status → terminal.
+        if resp.status_code in (400, 403, 410):
+            raise AuthorizationExpiredError(
+                _error_code(resp) or "The login link expired or was rejected."
+            )
         raise AuthorizationExpiredError("The login link expired or was rejected.")
 
 

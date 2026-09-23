@@ -14,6 +14,8 @@ app-rejects-token failure, and non-interference with accounts mode.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -779,6 +781,50 @@ def test_login_oidc_mode_sets_default_server(
 
     assert result.exit_code == 0, result.output
     assert cli_mod._load_global_config().get("server") == server
+
+
+def test_login_oidc_ticket_uses_pkce(monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+    import time
+    import webbrowser
+
+    server = "http://omni-oidc.internal:6767"
+    fake = _FakeHttpx(
+        responses=[
+            _response(401, body={"login_url": "/auth/login"}),
+            _response(200, body={"token": "jwt", "user_id": "alice", "expires_in": 3600}),
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    post_calls: list[dict[str, object]] = []
+
+    def _post(url: str, **kwargs: object) -> httpx.Response:
+        post_calls.append(kwargs)
+        return _response(
+            200,
+            body={"ticket": "t", "login_url": "/auth/go", "user_code": "ABCD-2345"},
+        )
+
+    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(webbrowser, "open", lambda url: True)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = CliRunner().invoke(cli_group, ["login", server])
+
+    assert result.exit_code == 0, result.output
+    body = post_calls[0]["json"]
+    assert isinstance(body, dict)
+    challenge = body["code_challenge"]
+    assert body["code_challenge_method"] == "S256"
+    params = fake.requests[-1]["params"]
+    assert isinstance(params, dict)
+    verifier = params["code_verifier"]
+    assert isinstance(verifier, str)
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    assert challenge == expected
 
 
 def test_login_failure_leaves_default_server_unchanged(

@@ -1,7 +1,8 @@
 """OIDC authentication routes: login, callback, logout, CLI login.
 
 Provides ``/auth/login``, ``/auth/callback``, ``/auth/logout``,
-``/auth/cli-login``, and ``/auth/cli-poll`` endpoints that implement
+``/auth/cli-login``, ``/auth/cli-consent``, ``/auth/cli-approve``,
+``/auth/cli-deny``, and ``/auth/cli-poll`` endpoints that implement
 the full OIDC authorization code flow with PKCE. The ``cli-login``
 / ``cli-poll`` pair supports the ``omnigent login`` CLI command.
 
@@ -12,17 +13,21 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import hmac
+import html
+import json
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 import jwt
 from fastapi import APIRouter, Query, Request
-from starlette.responses import RedirectResponse, Response
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
@@ -38,7 +43,11 @@ from omnigent.server.oidc import (
     mint_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
-from omnigent.server.routes.device_auth import issue_login_grant
+from omnigent.server.routes.device_auth import (
+    _generate_user_code,
+    _require_browser_origin,
+    issue_login_grant,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -48,6 +57,8 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# RFC 7636 §4.2: base64url(SHA-256) is 43 chars; allow up to the spec max.
+_CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43,128}")
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -61,24 +72,31 @@ if TYPE_CHECKING:
 class _CliTicket:
     """A pending CLI login ticket.
 
-    Created by ``POST /auth/cli-login``, fulfilled by the browser
-    callback, polled by ``GET /auth/cli-poll``.
+    Created by ``POST /auth/cli-login``, fulfilled when the signed-in
+    user approves it at ``POST /auth/cli-approve``, polled by
+    ``GET /auth/cli-poll`` with the matching PKCE verifier.
 
     :param created_at: Unix timestamp when the ticket was created.
-    :param token: The session JWT, set when the browser callback
-        fulfills the ticket. ``None`` while pending.
+    :param token: The session JWT, set when the browser approves the
+        ticket. ``None`` while pending.
     :param user_id: The authenticated user's email, set when
         fulfilled. ``None`` while pending.
     :param refresh_token: Login-issued refresh grant material, set at
         fulfillment when a grant store is wired. ``None`` while pending
         or when grants are unavailable. Handed to the CLI exactly once
         by the poll response.
+    :param code_challenge: PKCE S256 challenge supplied by the CLI.
+    :param user_code: Human-readable code shown on the browser consent page.
+    :param denied: Whether the browser denied this login request.
     """
 
     created_at: float = field(default_factory=time.time)
     token: str | None = None
     user_id: str | None = None
     refresh_token: str | None = None
+    code_challenge: str = ""
+    user_code: str = ""
+    denied: bool = False
 
 
 def create_auth_router(
@@ -432,39 +450,13 @@ def create_auth_router(
         ticket_id = state_payload.get("ticket")
         if ticket_id and ticket_id in _cli_tickets:
             ticket = _cli_tickets[ticket_id]
-            ticket.token = session_jwt
-            ticket.user_id = email
-            # A CLI login is a long-lived unattended credential holder
-            # (hosts especially) — issue a refresh grant so it can renew
-            # instead of dying at session-JWT expiry. Best-effort: a
-            # grant-store failure must not break login itself.
-            if device_grant_store is not None:
-                try:
-                    ticket.refresh_token = issue_login_grant(
-                        device_grant_store,
-                        user_id=email,
-                        cookie_secret=config.cookie_secret,
-                    )
-                except Exception:
-                    _logger.exception("cli-login: refresh grant issuance failed")
-            # Return a simple HTML page — the CLI is polling
-            # /auth/cli-poll and will pick up the token.
-            import html as _html
-
-            from starlette.responses import HTMLResponse
-
-            safe_email = _html.escape(email)
-            html = (
-                "<html><body style='font-family:system-ui;text-align:center;"
-                "padding:60px'>"
-                "<h2>Login successful</h2>"
-                f"<p>Authenticated as <strong>{safe_email}</strong>.</p>"
-                "<p>You can close this tab and return to the terminal.</p>"
-                "</body></html>"
-            )
-            resp = HTMLResponse(content=html)
-            # Still set the session cookie (useful if they also open
-            # the web UI in the same browser).
+            if time.time() - ticket.created_at <= _CLI_TICKET_TTL_SECONDS:
+                resp = RedirectResponse(
+                    url=f"/auth/cli-consent?ticket={quote(str(ticket_id))}",
+                    status_code=302,
+                )
+            else:
+                resp = RedirectResponse(url=return_to, status_code=302)
             resp.set_cookie(
                 key=_session_cookie,
                 value=session_jwt,
@@ -581,25 +573,178 @@ def create_auth_router(
     # ── CLI login ticket endpoints ─────────────────────────────
 
     @router.post("/cli-login")
-    async def cli_login() -> dict[str, str]:
+    async def cli_login(request: Request) -> Response:
         """Create a one-time CLI login ticket.
 
         The CLI calls this, then opens the returned ``login_url``
-        in the user's browser. The browser completes the OIDC flow,
-        the callback fulfills the ticket, and the CLI polls
+        in the user's browser. The browser completes the OIDC flow and
+        explicitly approves the request, and the CLI polls
         ``/auth/cli-poll`` to retrieve the session token.
 
-        :returns: ``{"ticket": "<id>", "login_url": "/auth/login?ticket=<id>"}``.
+        :returns: Ticket metadata including the PKCE challenge and
+            human-readable browser consent code.
         """
-        # Evict expired tickets to prevent unbounded growth.
+        from fastapi.responses import JSONResponse
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        code_challenge = body.get("code_challenge")
+        code_challenge_method = body.get("code_challenge_method")
+        if (
+            not isinstance(code_challenge, str)
+            or _CODE_CHALLENGE_RE.fullmatch(code_challenge) is None
+            or (code_challenge_method is not None and code_challenge_method != "S256")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "code_challenge (S256) is required. Upgrade the "
+                    "omnigent CLI: this server requires PKCE for CLI login."
+                },
+            )
+
         _evict_expired_tickets(_cli_tickets)
 
         ticket_id = secrets.token_urlsafe(32)
-        _cli_tickets[ticket_id] = _CliTicket()
-        return {
-            "ticket": ticket_id,
-            "login_url": f"/auth/login?ticket={ticket_id}",
-        }
+        user_code = _generate_user_code()
+        _cli_tickets[ticket_id] = _CliTicket(
+            code_challenge=code_challenge,
+            user_code=user_code,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ticket": ticket_id,
+                "login_url": f"/auth/login?ticket={ticket_id}&reauth=1",
+                "user_code": user_code,
+                "expires_in": _CLI_TICKET_TTL_SECONDS,
+            },
+        )
+
+    def _bounce_to_login(ticket_id: str, *, reauth: bool) -> RedirectResponse:
+        return_to = f"/auth/cli-consent?ticket={quote(ticket_id)}"
+        url = f"/auth/login?return_to={quote(return_to, safe='')}"
+        if reauth:
+            url += "&reauth=1"
+        return RedirectResponse(url=url, status_code=302)
+
+    def _session_iat(request: Request) -> int | None:
+        token = request.cookies.get(_session_cookie)
+        if not token:
+            return None
+        try:
+            payload = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        iat = payload.get("iat")
+        return iat if isinstance(iat, int) else None
+
+    def _cli_ticket(ticket_id: str) -> _CliTicket | None:
+        ticket = _cli_tickets.get(ticket_id)
+        if ticket is None:
+            return None
+        if time.time() - ticket.created_at > _CLI_TICKET_TTL_SECONDS:
+            del _cli_tickets[ticket_id]
+            return None
+        return ticket
+
+    @router.get("/cli-consent")
+    async def cli_consent(request: Request) -> Response:
+        """Render the browser consent page for a CLI login ticket."""
+        user_id = auth_provider.get_user_id(request)
+        ticket_id = (request.query_params.get("ticket") or "").strip()
+        if user_id is None:
+            return _bounce_to_login(ticket_id, reauth=True)
+
+        ticket = _cli_ticket(ticket_id)
+        if ticket is None or ticket.token is not None or ticket.denied:
+            return HTMLResponse(
+                _cli_consent_html(error="This login request is invalid or has expired."),
+                status_code=200,
+            )
+
+        session_iat = _session_iat(request)
+        if session_iat is None or session_iat < int(ticket.created_at):
+            return _bounce_to_login(ticket_id, reauth=True)
+
+        return HTMLResponse(
+            _cli_consent_html(
+                ticket_id=ticket_id,
+                user_id=user_id,
+                user_code=ticket.user_code,
+            ),
+            status_code=200,
+        )
+
+    @router.post("/cli-approve")
+    async def cli_approve(request: Request) -> Response:
+        """Approve a pending CLI login ticket from the browser."""
+        from fastapi.responses import JSONResponse
+
+        _require_browser_origin(request)
+        user_id = auth_provider.get_user_id(request)
+        if user_id is None:
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        form = await request.form()
+        ticket_id = (str(form.get("ticket") or "")).strip()
+        ticket = _cli_ticket(ticket_id)
+        if ticket is None or ticket.token is not None or ticket.denied:
+            return HTMLResponse(
+                _cli_consent_html(error="This login request is invalid or has expired."),
+                status_code=200,
+            )
+
+        session_iat = _session_iat(request)
+        if session_iat is None or session_iat < int(ticket.created_at):
+            return HTMLResponse(
+                _cli_consent_html(
+                    error="Your session is too old to approve this login. "
+                    "Run `omnigent login` again and sign in when prompted."
+                ),
+                status_code=200,
+            )
+
+        ticket.token = mint_session_cookie(
+            user_id=user_id,
+            cookie_secret=config.cookie_secret,
+            ttl_hours=config.session_ttl_hours,
+            provider=config.provider_type,
+        )
+        ticket.user_id = user_id
+        if device_grant_store is not None:
+            try:
+                ticket.refresh_token = issue_login_grant(
+                    device_grant_store,
+                    user_id=user_id,
+                    cookie_secret=config.cookie_secret,
+                )
+            except Exception:
+                _logger.exception("cli-login: refresh grant issuance failed")
+        _logger.info("cli-approve: %s approved CLI login", user_id)
+        return HTMLResponse(
+            _cli_consent_html(approved_as=user_id),
+            status_code=200,
+        )
+
+    @router.post("/cli-deny")
+    async def cli_deny(request: Request) -> Response:
+        """Deny a pending CLI login ticket from the browser."""
+        from fastapi.responses import JSONResponse
+
+        _require_browser_origin(request)
+        user_id = auth_provider.get_user_id(request)
+        if user_id is None:
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        form = await request.form()
+        ticket_id = (str(form.get("ticket") or "")).strip()
+        ticket = _cli_tickets.get(ticket_id)
+        if ticket is not None:
+            ticket.denied = True
+        return HTMLResponse(_cli_consent_html(denied=True), status_code=200)
 
     @router.get("/cli-poll")
     async def cli_poll(request: Request) -> Response:
@@ -630,6 +775,27 @@ def create_auth_router(
             return JSONResponse(
                 status_code=410,
                 content={"error": "Ticket expired"},
+            )
+
+        code_verifier = request.query_params.get("code_verifier")
+        if not code_verifier:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "code_verifier is required. Upgrade the omnigent CLI: "
+                    "this server requires PKCE for CLI login."
+                },
+            )
+        if not hmac.compare_digest(derive_code_challenge(code_verifier), ticket.code_challenge):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "code_verifier does not match this login ticket"},
+            )
+        if ticket.denied:
+            del _cli_tickets[ticket_id]
+            return JSONResponse(
+                status_code=410,
+                content={"error": "Login request was denied in the browser"},
             )
 
         # Still pending — browser hasn't completed the flow yet.
@@ -710,6 +876,62 @@ def create_auth_router(
         )
 
     return router
+
+
+def _cli_consent_html(
+    *,
+    ticket_id: str = "",
+    user_id: str = "",
+    user_code: str = "",
+    error: str = "",
+    approved_as: str = "",
+    denied: bool = False,
+) -> str:
+    """Render the minimal, dependency-free CLI login consent page."""
+
+    def esc(value: object) -> str:
+        return html.escape(str(value or ""))
+
+    if error:
+        body = f'<p class="err">{esc(error)}</p>'
+    elif approved_as:
+        body = (
+            "<h1>Approved</h1><p>Approved — the terminal is now signed in as "
+            f"<b>{esc(approved_as)}</b>. You can close this tab.</p>"
+        )
+    elif denied:
+        body = "<h1>Denied</h1><p>No access was granted. You can close this tab.</p>"
+    else:
+        body = (
+            "<h1>Authorize CLI login</h1>"
+            f"<p>A terminal (omnigent login) is requesting a session as "
+            f"<b>{esc(user_id)}</b> on this Omnigent server.</p>"
+            f'<p class="muted">Code: {esc(user_code)}</p>'
+            '<p class="warn">⚠️ Only approve if you just ran '
+            "<code>omnigent login</code> and this code matches the one printed "
+            "in your terminal. If you didn't, click Deny — approving gives "
+            "that terminal access as you.</p>"
+            '<form method="post" action="/auth/cli-approve" class="row">'
+            f'<input type="hidden" name="ticket" value="{esc(ticket_id)}">'
+            '<button type="submit" class="primary">Approve</button></form>'
+            '<form method="post" action="/auth/cli-deny" class="row">'
+            f'<input type="hidden" name="ticket" value="{esc(ticket_id)}">'
+            '<button type="submit">Deny</button></form>'
+        )
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Authorize access — Omnigent</title><style>"
+        "body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;"
+        "padding:0 1rem;line-height:1.5}h1{font-size:1.4rem}.muted{color:#666;"
+        "font-size:.9rem}.warn{color:#8a5a00;background:#fff7e6;padding:.6rem .8rem;"
+        "border-radius:.375rem;font-size:.9rem}.err{color:#b00}"
+        "button{font-size:1rem;padding:.5rem 1rem;"
+        "margin:.25rem 0;cursor:pointer}.primary{background:#2563eb;color:#fff;"
+        "border:none;border-radius:.375rem}.row{display:inline-block;margin-right:.5rem}"
+        "input{font-size:1rem;padding:.4rem;margin:.5rem}</style></head>"
+        f"<body>{body}</body></html>"
+    )
 
 
 # ── Private helpers ──────────────────────────────────────────────

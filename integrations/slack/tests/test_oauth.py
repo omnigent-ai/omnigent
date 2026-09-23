@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -171,23 +173,31 @@ async def test_device_poll_denied() -> None:
 @respx.mock
 async def test_start_login_oidc_ticket() -> None:
     respx.get(_ME).mock(return_value=httpx.Response(401, json={"login_url": "/auth/login"}))
-    respx.post(_BASE + "/auth/cli-login").mock(
+    start = respx.post(_BASE + "/auth/cli-login").mock(
         return_value=httpx.Response(
-            200, json={"ticket": "T1", "login_url": "/auth/login?ticket=T1"}
+            200,
+            json={
+                "ticket": "T1",
+                "login_url": "/auth/login?ticket=T1&reauth=1",
+                "user_code": "ABCD-2345",
+            },
         )
     )
     pending = await start_login(_BASE, client_id="slack")
     try:
-        # Verification URL is the server-qualified login_url; no user code.
-        assert pending.verification_url == _BASE + "/auth/login?ticket=T1"
-        assert pending.user_code == ""
+        assert pending.verification_url == _BASE + "/auth/login?ticket=T1&reauth=1"
+        assert pending.user_code == "ABCD-2345"
+        body = json.loads(start.calls.last.request.content)
+        challenge = body["code_challenge"]
+        assert body["code_challenge_method"] == "S256"
+        assert len(challenge) == 43
     finally:
         await pending.close()
 
 
 @respx.mock
 async def test_oidc_poll_pending_then_session_jwt() -> None:
-    respx.get(_BASE + "/auth/cli-poll").mock(
+    poll = respx.get(_BASE + "/auth/cli-poll").mock(
         side_effect=[
             httpx.Response(202, json={"status": "pending"}),
             httpx.Response(200, json={"token": "sess-jwt", "user_id": "a@x", "expires_in": 28800}),
@@ -197,12 +207,13 @@ async def test_oidc_poll_pending_then_session_jwt() -> None:
 
     client = httpx.AsyncClient(base_url=_BASE)
     try:
-        result = await _oauth._poll_cli_ticket(client, "T1", interval=0)
+        result = await _oauth._poll_cli_ticket(client, "T1", "v" * 64, interval=0)
     finally:
         await client.aclose()
     assert result.access_token == "sess-jwt"
     assert result.refresh_token == ""  # OIDC session JWT has no refresh token
     assert result.expires_in == 28800
+    assert poll.calls.last.request.url.params["code_verifier"] == "v" * 64
 
 
 @respx.mock
@@ -220,7 +231,7 @@ async def test_oidc_poll_malformed_200_raises_oauth_error() -> None:
     client = httpx.AsyncClient(base_url=_BASE)
     try:
         with pytest.raises(OAuthError):
-            await _oauth._poll_cli_ticket(client, "T1", interval=0)
+            await _oauth._poll_cli_ticket(client, "T1", "v" * 64, interval=0)
     finally:
         await client.aclose()
 
@@ -246,7 +257,7 @@ async def test_oidc_poll_expired_ticket() -> None:
     client = httpx.AsyncClient(base_url=_BASE)
     try:
         with pytest.raises(AuthorizationExpiredError):
-            await _oauth._poll_cli_ticket(client, "T1", interval=0)
+            await _oauth._poll_cli_ticket(client, "T1", "v" * 64, interval=0)
     finally:
         await client.aclose()
 

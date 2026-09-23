@@ -20,6 +20,8 @@ minted session cookie is the production code path.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import time
 from collections.abc import Iterator
@@ -46,6 +48,16 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 _TEST_SECRET = bytes.fromhex("aa" * 32)
 _ISSUER = "https://accounts.google.com"
 _CLIENT_ID = "cid"
+
+
+def _cli_pkce_pair() -> tuple[str, str]:
+    verifier = "v" * 64
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    return verifier, challenge
 
 
 def _oidc_config(
@@ -652,12 +664,16 @@ def test_cli_ticket_fulfillment_issues_refresh_grant(
 
     with TestClient(app) as client:
         # 1. CLI requests a ticket.
-        r = client.post("/auth/cli-login")
+        cli_verifier, cli_challenge = _cli_pkce_pair()
+        r = client.post(
+            "/auth/cli-login",
+            json={"code_challenge": cli_challenge, "code_challenge_method": "S256"},
+        )
         assert r.status_code == 200, r.text
         ticket = r.json()["ticket"]
 
         # 2. Browser completes the IdP flow; the state cookie carries the
-        # ticket so the callback fulfills it.
+        # ticket so the callback redirects to the consent page.
         pending_id_token[0] = keys.sign_id_token(
             {"email": "alice@example.com", "email_verified": True}
         )
@@ -678,10 +694,17 @@ def test_cli_ticket_fulfillment_issues_refresh_grant(
             f"/auth/callback?code=auth-code&state={state}",
             follow_redirects=False,
         )
-        assert r.status_code == 200, r.text  # HTML "Login successful" page
+        assert r.status_code == 302, r.text
+        assert r.headers["location"] == f"/auth/cli-consent?ticket={ticket}"
+        r = client.post(
+            "/auth/cli-approve",
+            data={"ticket": ticket},
+            headers={"Origin": "http://localhost:8000"},
+        )
+        assert r.status_code == 200, r.text
 
         # 3. The CLI polls: session token AND refresh material.
-        r = client.get(f"/auth/cli-poll?ticket={ticket}")
+        r = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={cli_verifier}")
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["user_id"] == "alice@example.com"
@@ -744,7 +767,11 @@ def test_cli_poll_without_grant_store_keeps_legacy_shape(
         prefix="/auth",
     )
     with TestClient(app) as client:
-        r = client.post("/auth/cli-login")
+        cli_verifier, cli_challenge = _cli_pkce_pair()
+        r = client.post(
+            "/auth/cli-login",
+            json={"code_challenge": cli_challenge, "code_challenge_method": "S256"},
+        )
         ticket = r.json()["ticket"]
         pending_id_token[0] = keys.sign_id_token(
             {"email": "alice@example.com", "email_verified": True}
@@ -762,7 +789,14 @@ def test_cli_poll_without_grant_store_keeps_legacy_shape(
             algorithm="HS256",
         )
         client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
-        client.get(f"/auth/callback?code=auth-code&state={state}", follow_redirects=False)
-        r = client.get(f"/auth/cli-poll?ticket={ticket}")
+        r = client.get(f"/auth/callback?code=auth-code&state={state}", follow_redirects=False)
+        assert r.status_code == 302
+        r = client.post(
+            "/auth/cli-approve",
+            data={"ticket": ticket},
+            headers={"Origin": "http://localhost:8000"},
+        )
+        assert r.status_code == 200
+        r = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={cli_verifier}")
         assert r.status_code == 200, r.text
         assert "refresh_token" not in r.json()

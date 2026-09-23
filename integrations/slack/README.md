@@ -177,11 +177,14 @@ otherwise the `/oauth/*` routes are absent and accounts-mode login can't
 complete. If the server sets `OMNIGENT_DEVICE_CLIENT_SECRET`, set the same
 value as the bot's `OMNIGENT_DEVICE_CLIENT_SECRET` so only this authorized
 socket server can drive the device flow.
-- `oidc` **mode** → the server's **cli-login ticket flow** (`/auth/cli-login` +
-`/auth/cli-poll`). The modal shows a login link; the user signs in at *your
-IdP* in their browser. The server hands back its session JWT — the same token
-a browser session gets. There is **no device grant and no refresh token**: the
-session lasts its normal TTL (default 8h), after which the user logs in again.
+- `oidc` **mode** → the server's **PKCE-bound cli-login ticket flow**
+(`/auth/cli-login` + `/auth/cli-poll`). The modal shows a login link and
+confirmation code; the user signs in at *your IdP* in their browser, then
+explicitly approves the request on the server's consent page (checking the
+code matches). The server hands back its session JWT — the same
+token a browser session gets. There is **no device grant and no refresh token**:
+the session lasts its normal TTL (default 8h), after which the user logs in
+again.
 - `header` **/ proxy mode** → identity is asserted by a trusted upstream proxy
 header (e.g. `X-Forwarded-Email`), so the server mints no token and exposes no
 per-user login the auto-detect flow can drive. Two options:

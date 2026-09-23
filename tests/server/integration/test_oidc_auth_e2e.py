@@ -10,6 +10,8 @@ logout, and expired-ticket eviction.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,46 +23,32 @@ import pytest
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.oidc import OIDCConfig
 from omnigent.server.routes.auth import (
     _CLI_TICKET_TTL_SECONDS,
     _CliTicket,
     _evict_expired_tickets,
     create_auth_router,
 )
+from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY, make_oidc_config
 
 pytestmark = pytest.mark.asyncio
 
-_TEST_SECRET = b"a" * 32
-_GITHUB_TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
 
-
-def _make_oidc_config() -> OIDCConfig:
-    """Build a minimal GitHub-flavoured OIDCConfig for testing."""
-    return OIDCConfig(
-        issuer="https://github.com",
-        client_id="test-client-id",
-        client_secret="test-client-secret",
-        redirect_uri="http://localhost:8000/auth/callback",
-        cookie_secret=_TEST_SECRET,
-        scopes="read:user user:email",
-        session_ttl_hours=8,
-        logout_redirect_uri=None,
-        allowed_domains=None,
-        provider_type="github",
-        authorization_endpoint="https://github.com/login/oauth/authorize",
-        token_endpoint=_GITHUB_TOKEN_ENDPOINT,
-        jwks_uri=None,
-        userinfo_endpoint="https://api.github.com/user",
-        allow_invites=False,
+def _pkce_pair() -> tuple[str, str]:
+    verifier = "a" * 64
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
     )
+    return verifier, challenge
 
 
 def _build_oidc_app() -> httpx.ASGITransport:
     """Build a minimal FastAPI app with only the OIDC auth router."""
     from fastapi import FastAPI
 
-    config = _make_oidc_config()
+    config = make_oidc_config()
     auth_provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
     admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
 
@@ -82,7 +70,7 @@ def _mint_state_cookie(
     ticket: str | None = None,
 ) -> str:
     """Mint a signed auth-state cookie matching what /auth/login produces."""
-    config = _make_oidc_config()
+    config = make_oidc_config()
     payload: dict = {
         "state": state,
         "code_verifier": code_verifier,
@@ -167,14 +155,28 @@ async def test_login_redirects_to_idp_with_pkce_params() -> None:
 async def test_cli_login_creates_ticket() -> None:
     """POST /auth/cli-login returns a ticket_id and login URL."""
     transport = _build_oidc_app()
+    _, challenge = _pkce_pair()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post("/auth/cli-login")
+        resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": challenge, "code_challenge_method": "S256"},
+        )
 
     assert resp.status_code == 200
     body = resp.json()
     assert "ticket" in body
     assert "login_url" in body
     assert body["login_url"].startswith("/auth/login?ticket=")
+    assert body["user_code"]
+
+
+async def test_cli_login_rejects_old_client_without_challenge() -> None:
+    transport = _build_oidc_app()
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/auth/cli-login")
+
+    assert resp.status_code == 400
+    assert "Upgrade" in resp.json()["error"]
 
 
 # ── 3. CLI poll (pending) ─────────────────────────────────────────
@@ -183,13 +185,17 @@ async def test_cli_login_creates_ticket() -> None:
 async def test_cli_poll_returns_pending_before_callback() -> None:
     """GET /auth/cli-poll returns 202 while the ticket is unfulfilled."""
     transport = _build_oidc_app()
+    verifier, challenge = _pkce_pair()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         # Create a ticket first.
-        create_resp = await client.post("/auth/cli-login")
+        create_resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": challenge, "code_challenge_method": "S256"},
+        )
         ticket_id = create_resp.json()["ticket"]
 
         # Poll -- should be pending.
-        poll_resp = await client.get(f"/auth/cli-poll?ticket={ticket_id}")
+        poll_resp = await client.get(f"/auth/cli-poll?ticket={ticket_id}&code_verifier={verifier}")
 
     assert poll_resp.status_code == 202
     assert poll_resp.json()["status"] == "pending"
@@ -236,7 +242,7 @@ async def test_callback_exchanges_code_and_sets_session_cookie() -> None:
     assert "ap_session" in resp.cookies
     # Validate the session JWT.
     session_jwt = resp.cookies["ap_session"]
-    payload = jwt.decode(session_jwt, _TEST_SECRET, algorithms=["HS256"])
+    payload = jwt.decode(session_jwt, TEST_SIGNING_KEY, algorithms=["HS256"])
     assert payload["sub"] == "alice@example.com"
 
 

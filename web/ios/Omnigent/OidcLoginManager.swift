@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import Security
 import UIKit
 import WebKit
 
@@ -16,9 +18,13 @@ final class OidcLoginManager {
     loginTask = Task { [weak self] in
       defer { self?.loginTask = nil }
       do {
-        let ticket = try await Self.requestTicket(origin: originURL)
+        let codeVerifier = Self.generateCodeVerifier()
+        let ticket = try await Self.requestTicket(
+          origin: originURL, codeChallenge: Self.deriveCodeChallenge(codeVerifier))
         guard await UIApplication.shared.open(ticket.loginURL) else { return }
-        guard let token = try await Self.pollForToken(origin: originURL, ticket: ticket.id)
+        guard
+          let token = try await Self.pollForToken(
+            origin: originURL, ticket: ticket.id, codeVerifier: codeVerifier)
         else { return }
         let cookie = try Self.sessionCookie(origin: originURL, token: token)
         await cookieStore.setCookie(cookie)
@@ -75,10 +81,34 @@ final class OidcLoginManager {
     return cookie
   }
 
-  private static func requestTicket(origin: URL) async throws -> Ticket {
+  static func generateCodeVerifier() -> String {
+    var bytes = [UInt8](repeating: 0, count: 32)
+    if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+      // SystemRandomNumberGenerator is also cryptographically secure.
+      bytes = bytes.map { _ in UInt8.random(in: .min ... .max) }
+    }
+    return base64URL(Data(bytes))
+  }
+
+  static func deriveCodeChallenge(_ codeVerifier: String) -> String {
+    base64URL(Data(SHA256.hash(data: Data(codeVerifier.utf8))))
+  }
+
+  private static func base64URL(_ data: Data) -> String {
+    data.base64EncodedString()
+      .replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "=", with: "")
+  }
+
+  private static func requestTicket(origin: URL, codeChallenge: String) async throws -> Ticket {
     var request = URLRequest(url: endpoint("/auth/cli-login", origin: origin))
     request.httpMethod = "POST"
-    request.httpBody = Data()
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+      "code_challenge": codeChallenge,
+      "code_challenge_method": "S256",
+    ])
     request.timeoutInterval = requestTimeout
     let (data, response) = try await URLSession.shared.data(for: request)
     guard (response as? HTTPURLResponse)?.statusCode == 200 else {
@@ -87,14 +117,19 @@ final class OidcLoginManager {
     return try ticket(from: data, origin: origin)
   }
 
-  private static func pollForToken(origin: URL, ticket: String) async throws -> String? {
+  private static func pollForToken(
+    origin: URL, ticket: String, codeVerifier: String
+  ) async throws -> String? {
     let clock = ContinuousClock()
     let deadline = clock.now + pollTimeout
     while clock.now < deadline {
       try await Task.sleep(for: pollInterval)
       var components = URLComponents(
         url: endpoint("/auth/cli-poll", origin: origin), resolvingAgainstBaseURL: false)
-      components?.queryItems = [URLQueryItem(name: "ticket", value: ticket)]
+      components?.queryItems = [
+        URLQueryItem(name: "ticket", value: ticket),
+        URLQueryItem(name: "code_verifier", value: codeVerifier),
+      ]
       guard let url = components?.url else { throw LoginError.invalidResponse }
       var request = URLRequest(url: url)
       request.timeoutInterval = requestTimeout
@@ -105,7 +140,8 @@ final class OidcLoginManager {
           return try token(from: data)
         case 202:
           continue
-        case 410:
+        case 400, 403, 410:
+          // Rejected outright: verifier mismatch, or expired/denied ticket.
           return nil
         default:
           continue
