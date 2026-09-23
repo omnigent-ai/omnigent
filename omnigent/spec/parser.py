@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
@@ -24,6 +31,7 @@ from omnigent.inner.datamodel import (
     OSEnvSpec,
     TerminalEnvSpec,
 )
+from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
@@ -163,6 +171,27 @@ def _parse_float_field(raw: object, field_name: str) -> float:
         ) from exc
 
 
+class AgentImageConfigMissingError(OmnigentError, FileNotFoundError):
+    """An agent image directory that carries no ``config.yaml``.
+
+    Every other structural problem in :func:`parse` raises a coded
+    :class:`~omnigent.errors.OmnigentError`; a missing ``config.yaml`` used to
+    raise a bare :class:`FileNotFoundError`, which reached the server's
+    catch-all and was booked as an unhandled internal error. It is really a
+    404: the referenced image has no spec to read, which is what an agent cache
+    entry whose directory outlived its contents looks like.
+
+    Subclasses :class:`FileNotFoundError` as well, so callers that already
+    catch that — the documented contract of :func:`parse` — keep working.
+    """
+
+    def __init__(self, root: Path) -> None:
+        """
+        :param root: Agent image directory that has no ``config.yaml``.
+        """
+        super().__init__(f"config.yaml not found in {root}", code=ErrorCode.NOT_FOUND)
+
+
 def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     """
     Parse an agent image directory into an :class:`AgentSpec`.
@@ -178,13 +207,14 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     :raises OmnigentError: If ``config.yaml`` is not valid YAML,
         has structural issues, or (when *expand_env* is ``True``)
         contains unresolved env vars.
-    :raises FileNotFoundError: If ``config.yaml`` is missing.
+    :raises AgentImageConfigMissingError: If ``config.yaml`` is missing. Also
+        a :class:`FileNotFoundError`, so existing handlers still catch it.
     """
     config_path = root / "config.yaml"
     if not config_path.exists():
-        raise FileNotFoundError(f"config.yaml not found in {root}")
+        raise AgentImageConfigMissingError(root)
 
-    raw = yaml.load(config_path.read_text(), Loader=_ConfigYamlLoader)
+    raw = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_ConfigYamlLoader)
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"config.yaml must be a YAML mapping, got {type(raw).__name__}",
@@ -1333,7 +1363,8 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for a ``credential_proxy[*].source`` mapping.
 
     The secret origin is a structured single-key mapping —
-    ``{env: VAR}``, ``{file: path}``, or ``{command: cmd}`` — rather than
+    ``{env: VAR}``, ``{file: path}``, ``{command: cmd}``, or
+    ``{unix_socket: path}`` — rather than
     a prefix-encoded string. Exactly one key must be set. Pydantic
     validates the shape here; :meth:`to_spec` converts it to the internal
     :class:`CredentialSourceSpec` dataclass the runtime consumes.
@@ -1344,6 +1375,9 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         secret, e.g. ``"~/.config/tokens/github_pat.txt"``.
     :param command: Shell command whose stdout is the secret, e.g.
         ``"gh auth token"``.
+    :param unix_socket: Private HTTP broker socket serving a token at ``/token``.
+    :param refresh_interval_seconds: Optional positive cache lifetime for
+        file or Unix socket sources, in seconds.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1351,6 +1385,10 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     env: str | None = None
     file: str | None = None
     command: str | None = None
+    unix_socket: str | None = None
+    refresh_interval_seconds: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False, strict=True
+    )
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> _CredentialSourceModel:
@@ -1364,17 +1402,33 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         """
         set_keys = [
             name
-            for name, value in (("env", self.env), ("file", self.file), ("command", self.command))
+            for name, value in (
+                ("env", self.env),
+                ("file", self.file),
+                ("command", self.command),
+                ("unix_socket", self.unix_socket),
+            )
             if value is not None
         ]
         if len(set_keys) != 1:
-            raise ValueError("source must set exactly one of 'env', 'file', or 'command'")
+            raise ValueError(
+                "source must set exactly one of 'env', 'file', 'command', or 'unix_socket'"
+            )
         if self.env is not None and not _ENV_VAR_NAME_RE.match(self.env):
             raise ValueError("source 'env' must be a POSIX environment variable name")
         if self.file is not None and not self.file.strip():
             raise ValueError("source 'file' must be a non-empty path")
         if self.command is not None and not self.command.strip():
             raise ValueError("source 'command' must be a non-empty command")
+        if self.unix_socket is not None and not self.unix_socket.strip():
+            raise ValueError("source 'unix_socket' must be a non-empty path")
+        if self.refresh_interval_seconds is not None and (
+            self.env is not None or self.command is not None
+        ):
+            raise ValueError(
+                "refresh_interval_seconds requires a file or unix_socket source; "
+                "shell commands cannot refresh"
+            )
         return self
 
     def to_spec(self) -> CredentialSourceSpec:
@@ -1382,15 +1436,29 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         Convert this validated model into a :class:`CredentialSourceSpec`.
 
         :returns: The internal dataclass the runtime resolves the secret
-            from. Exactly one of ``env`` / ``file`` / ``command`` is set
+            from. Exactly one of ``env`` / ``file`` / ``command`` / ``unix_socket`` is set
             (guaranteed by :meth:`_exactly_one_source`).
         """
         if self.env is not None:
             return CredentialSourceSpec(kind="env", env=self.env)
+        if self.unix_socket is not None:
+            return CredentialSourceSpec(
+                kind="unix_socket",
+                path=self.unix_socket.strip(),
+                refresh_interval_seconds=self.refresh_interval_seconds,
+            )
         if self.file is not None:
-            return CredentialSourceSpec(kind="file", path=self.file.strip())
+            return CredentialSourceSpec(
+                kind="file",
+                path=self.file.strip(),
+                refresh_interval_seconds=self.refresh_interval_seconds,
+            )
         assert self.command is not None
-        return CredentialSourceSpec(kind="command", command=self.command.strip())
+        return CredentialSourceSpec(
+            kind="command",
+            command=self.command.strip(),
+            refresh_interval_seconds=self.refresh_interval_seconds,
+        )
 
 
 class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
@@ -2037,14 +2105,14 @@ def _read_contained_file(root: Path, value: str) -> str | None:
     """
     Read a bundle-relative file named by *value*, only if it stays in *root*.
 
-    The instruction-file reference comes from a spec field (``instructions:``)
-    that, for an uploaded bundle, is attacker-controlled. Resolving symlinks
-    and ``..`` and confirming the target is contained in *root* prevents a
-    crafted spec (e.g. ``instructions: ../../etc/passwd``) from reading files
+    The instruction-file reference comes from a spec field (``instructions:``
+    or ``prompt:``) or automatic context-file discovery in a bundle that may
+    be attacker-controlled. Resolving symlinks and ``..`` and confirming the
+    target is contained in *root* prevents a crafted spec
+    (e.g. ``instructions: ../../etc/passwd``) from reading files
     outside the bundle on the runner. A non-contained or non-existent path
-    returns ``None`` so the caller falls back to treating *value* as literal
-    instruction text — preserving the existing "missing file → inline text"
-    behavior for the CLI.
+    returns ``None`` so an explicit reference falls back to literal instruction
+    text, while automatic discovery skips it and tries the next context file.
 
     :param root: The bundle root directory the value is anchored to,
         e.g. ``Path("/tmp/agent-bundle")``.
@@ -2052,14 +2120,19 @@ def _read_contained_file(root: Path, value: str) -> str | None:
         ``"prompts/system.md"``.
     :returns: The file contents if *value* names a file contained within
         *root*, else ``None``.
+    :raises UnicodeDecodeError: If a contained instruction file cannot be decoded.
     """
-    candidate = root / value
     try:
-        resolved = candidate.resolve()
-        if resolved.is_relative_to(root.resolve()) and resolved.is_file():
-            return resolved.read_text()
+        root_prefix = containment_prefix(os.path.realpath(root))
+        resolved = os.path.realpath(root / value)
+    except (OSError, ValueError):
+        return None
+    try:
+        if resolved.startswith(root_prefix):
+            candidate = Path(resolved)
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8")
     except OSError:
-        # Path too long or invalid characters — treat as inline text.
         pass
     return None
 
@@ -2069,12 +2142,11 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
     Resolve the instructions for an agent image.
 
     - If ``instructions`` is set in config.yaml and the value is
-      a path to an existing file relative to *root*, read that
-      file.
+      a path to an existing file contained in *root*, read that file.
     - If ``instructions`` is set but is not a file path, treat
       the value as inline text.
     - If ``instructions`` is not set, scan ``_CONTEXT_FILE_PRIORITY``
-      and return the first file found (first-wins, no merge).
+      and return the first file contained in *root* (first-wins, no merge).
 
     :param root: Path to the agent image directory.
     :param raw_value: The raw ``instructions`` value from
@@ -2095,12 +2167,9 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
         return text
     # Default: first-wins scan across known context files.
     for filename in _CONTEXT_FILE_PRIORITY:
-        candidate = root / filename
-        try:
-            if candidate.is_file():
-                return candidate.read_text()
-        except OSError:
-            pass
+        contained = _read_contained_file(root, filename)
+        if contained is not None:
+            return contained
     return None
 
 
@@ -2459,7 +2528,7 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         ``strict=False``) can catch them uniformly.
     """
     try:
-        text = skill_md.read_text()
+        text = skill_md.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
         # OSError — funnel it through OmnigentError too so the lenient
@@ -2678,17 +2747,6 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
-        # Optional per-server tool allow-list (the YAML ``tools:`` whitelist) —
-        # only these tool names are exposed to the model; ``None`` exposes all.
-        # Mirrors ``MCPTool.tools`` and is filtered downstream in
-        # server/mcp_pool.py + runner/mcp_manager.py.
-        raw_allow = val.get("tools")
-        if raw_allow is not None and not isinstance(raw_allow, list):
-            raise OmnigentError(
-                f"Inline MCP server {name!r} 'tools' must be a list of tool names",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        tool_allowlist = [str(t) for t in raw_allow] if raw_allow else None
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -2703,10 +2761,43 @@ def _parse_inline_mcp_servers(
                 headers=headers,
                 env=env,
                 databricks_profile=databricks_profile,
-                tools=tool_allowlist,
+                tools=_parse_mcp_tool_allowlist(name, val, "inline MCP server"),
             )
         )
     return servers
+
+
+def _parse_mcp_tool_allowlist(
+    name: object,
+    raw: dict[str, object],
+    source: object,
+) -> list[str] | None:
+    """
+    Parse the optional per-server ``tools:`` allow-list.
+
+    Only these tool names are exposed to the model; ``None`` exposes
+    all. Mirrors ``MCPTool.tools`` and is filtered downstream in
+    ``server/mcp_pool.py`` + ``runner/mcp_manager.py``. Shared by the
+    inline (``config.yaml``) and sidecar (``tools/mcp/*.yaml``) MCP
+    parsers so both forms honour the same allow-list — a restriction
+    silently accepted in one form and dropped in the other would fail
+    open, granting more tools than the spec asked for.
+
+    :param name: The MCP server's ``name`` field, used in the error
+        message.
+    :param raw: Parsed YAML mapping for the MCP server.
+    :param source: Path (sidecar) or label (inline) identifying the
+        YAML source, used in the error message.
+    :returns: List of allowed tool names, or ``None`` to expose all.
+    :raises OmnigentError: If ``tools`` is present and not a list.
+    """
+    raw_allow = raw.get("tools")
+    if raw_allow is not None and not isinstance(raw_allow, list):
+        raise OmnigentError(
+            f"MCP server {name!r} 'tools' must be a list of tool names: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return [str(t) for t in raw_allow] if raw_allow else None
 
 
 def _discover_mcp_servers(
@@ -2735,7 +2826,7 @@ def _discover_mcp_servers(
         return []
     servers: list[MCPServerConfig] = []
     for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-        raw = yaml.safe_load(yaml_file.read_text())
+        raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise OmnigentError(
                 f"MCP config must be a YAML mapping: {yaml_file}",
@@ -2825,6 +2916,7 @@ def _parse_http_mcp_server(
         url=url_str,
         headers=expand_env_vars(headers) if expand_env else headers,
         description=str(raw_description) if raw_description is not None else None,
+        tools=_parse_mcp_tool_allowlist(name, raw, yaml_file),
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2923,6 +3015,7 @@ def _parse_stdio_mcp_server(
         args=[str(a) for a in raw_args],
         env=env,
         description=str(raw_description) if raw_description is not None else None,
+        tools=_parse_mcp_tool_allowlist(name, raw, yaml_file),
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -3408,6 +3501,14 @@ def _parse_function_policy(
     """
     Parse a ``type: function`` policy block.
 
+    The callable path comes from ``function:`` or its ``handler:``
+    alias. Factory arguments may be given inline as
+    ``function: {path, arguments}`` or via a sibling
+    ``factory_params:`` mapping (the ``handler`` + ``factory_params``
+    shape shared with the runtime Policy entity and the
+    ``/v1/policies`` API). The two argument sources are mutually
+    exclusive.
+
     :param name: Enclosing policy name (error messages +
         recorded on the spec).
     :param data: Raw YAML mapping for this policy.
@@ -3415,8 +3516,10 @@ def _parse_function_policy(
         policy types (``name``, ``on``, ``condition``,
         ``ask_timeout``).
     :returns: A populated :class:`FunctionPolicySpec`.
-    :raises OmnigentError: On missing ``function:`` field
-        or malformed ``action`` / ``set_labels`` values.
+    :raises OmnigentError: On missing ``function:`` field,
+        malformed ``set_labels`` / ``config`` values, a
+        non-mapping ``factory_params``, or arguments supplied via
+        both ``function.arguments`` and ``factory_params``.
     """
     # Accept both ``function:`` and ``handler:`` for the callable path.
     # ``handler`` is the proto/service-policies convention; ``function``
@@ -3438,9 +3541,30 @@ def _parse_function_policy(
             f"policy {name!r}: 'config' must be a dict, got {type(config).__name__}",
             code=ErrorCode.INVALID_INPUT,
         )
+    function = _parse_function_ref(function_raw, policy_name=name)
+    # ``factory_params:`` is a sibling-key alias for ``function.arguments`` —
+    # the ``handler:`` + ``factory_params:`` shape used by the runtime Policy
+    # entity, the ``/v1/policies`` API, and the docs. Fold it into the
+    # FunctionRef so the same block works in a spec bundle and the server
+    # ``--config``, not just the single-file omnigent loader.
+    factory_params = data.get("factory_params")
+    if factory_params is not None:
+        if not isinstance(factory_params, dict):
+            raise OmnigentError(
+                f"policy {name!r}: `factory_params` must be a mapping (or omitted), "
+                f"got {type(factory_params).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if function.arguments is not None:
+            raise OmnigentError(
+                f"policy {name!r}: set factory arguments via `function.arguments` or a "
+                f"sibling `factory_params:`, not both.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        function = FunctionRef(path=function.path, arguments=factory_params)
     return FunctionPolicySpec(
         **base_kwargs,
-        function=_parse_function_ref(function_raw, policy_name=name),
+        function=function,
         set_labels=set_labels,
         config=config,
     )

@@ -340,7 +340,7 @@ async function ensureServerAuth(cliCommand, serverUrl) {
   return {
     ok: false,
     authError: true,
-    error: `Sign-in to ${serverUrl} didn't complete. A browser window should have opened — finish signing in and try again (or run \`${cli.cliCommandParts(cliCommand).displayName} login ${serverUrl}\` in a terminal).`,
+    error: `Sign-in to ${serverUrl} didn't complete. A browser window should have opened. Finish signing in and try again (or run \`${cli.cliCommandParts(cliCommand).displayName} login ${serverUrl}\` in a terminal).`,
   };
 }
 

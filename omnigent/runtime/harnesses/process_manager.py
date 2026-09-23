@@ -28,7 +28,6 @@ import shutil
 import signal
 import socket
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -39,14 +38,20 @@ from typing import Any
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
+from omnigent.inner.agent_env import strip_desktop_session_env
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
     ZygoteHarnessUnavailable,
+)
+from omnigent.runtime.harnesses.paths import (
+    HARNESS_TMP_PARENT_ENV_VAR,
+    harness_tmp_parent,
 )
 
 _logger = logging.getLogger(__name__)
@@ -67,11 +72,7 @@ _logger = logging.getLogger(__name__)
 # (no socket-path length concern) and has no ``/tmp`` — a literal
 # ``/tmp/omnigent`` there resolves to ``\tmp\omnigent`` on the current
 # drive — so use the real (already per-user) temp dir.
-if IS_WINDOWS:
-    _TMP_PARENT = Path(tempfile.gettempdir()) / "omnigent"
-else:
-    _TMP_PARENT = Path(f"/tmp/omnigent-{os.getuid()}")
-_TMP_PARENT_ENV_VAR = "OMNIGENT_HARNESS_TMP_PARENT"
+_TMP_PARENT_ENV_VAR = HARNESS_TMP_PARENT_ENV_VAR
 
 # S1 (security): env var carrying the per-spawn bearer token for the harness
 # control channel. The parent generates a fresh token per subprocess, ships it
@@ -207,10 +208,7 @@ def _default_tmp_parent() -> Path:
     :returns: Configured parent path, or the per-uid default
         ``/tmp/omnigent-<uid>`` on POSIX.
     """
-    configured = os.environ.get(_TMP_PARENT_ENV_VAR)
-    if configured:
-        return Path(configured).expanduser()
-    return _TMP_PARENT
+    return harness_tmp_parent()
 
 
 def _socket_path(instance_dir: Path, conversation_id: str) -> Path:
@@ -460,7 +458,9 @@ class _SubprocessEntry:
         model). Most harnesses fix the model at spawn, so
         :meth:`HarnessProcessManager.get_client` re-spawns on a
         later model change. Harnesses in
-        :data:`_LIVE_MODEL_CONFIG_HARNESSES` apply it in-process.
+        :data:`_LIVE_MODEL_CONFIG_HARNESSES` and explicitly curated ACP agents
+        apply it in-process.
+    :param acp_config: ACP startup options, excluding the live model selection.
     """
 
     def __init__(
@@ -470,12 +470,14 @@ class _SubprocessEntry:
         endpoint: _HarnessEndpoint,
         harness: str,
         model: str | None = None,
+        acp_config: dict[str, str] | None = None,
     ) -> None:
         self.process = process
         self.client = client
         self.endpoint = endpoint
         self.harness = harness
         self.model = model
+        self.acp_config = acp_config or {}
         self.last_used_at: float = 0.0
 
 
@@ -498,13 +500,22 @@ def _model_env_key(harness: str) -> str:
 _LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen"})
 
 
+def _acp_startup_config(env: dict[str, str] | None) -> dict[str, str]:
+    """Keep ACP command, policy, and defaults stable while switching models live."""
+    return {
+        key: value
+        for key, value in (env or {}).items()
+        if key.startswith("HARNESS_ACP_") and key != "HARNESS_ACP_MODEL"
+    }
+
+
 def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
     """
     Build the environment for a spawned harness subprocess.
 
     Inherits the runner's ``os.environ`` (PATH / HOME / PYTHONPATH /
-    provider creds), layers the caller's per-spawn overrides on top, then
-    strips the runner-auth secrets: the harness runs the agent's
+    provider creds) without ambient desktop-session variables, then layers
+    explicit per-spawn grants on top and strips runner-auth secrets: the harness runs the agent's
     (potentially untrusted) payload and must never see the tunnel binding
     token. Always returns an explicit dict — ``env=None`` to
     ``create_subprocess_exec`` would inherit the full env and re-leak the
@@ -513,9 +524,11 @@ def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
     :param env: Per-spawn overrides merged over ``os.environ`` (caller
         keys win), e.g. ``{"HARNESS_CLAUDE_SDK_MODEL": "claude-opus-4-6"}``.
         ``None`` means no overrides.
-    :returns: The harness subprocess environment, runner-auth secrets removed.
+    :returns: The harness environment with explicit desktop grants and no runner-auth secrets.
     """
-    merged = {**os.environ, **env} if env else dict(os.environ)
+    merged = strip_desktop_session_env(os.environ)
+    if env:
+        merged.update(env)
     return strip_runner_auth_secrets(merged)
 
 
@@ -564,6 +577,9 @@ class HarnessProcessManager:
         # Pre-allocate the instance dir path so it stays stable
         # across re-entrant ``start()`` calls (idempotent boot).
         self._instance_dir = self._tmp_parent / f"ap-{uuid.uuid4().hex}"
+        # Monotonic clock at ``start()``; the harness_started event reports each
+        # spawn's readiness latency relative to it (harness boot vs manager boot).
+        self._started_at: float | None = None
         self._entries: dict[str, _SubprocessEntry] = {}
         # Per-conversation in-flight harness response_id. The runner's
         # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
@@ -650,23 +666,26 @@ class HarnessProcessManager:
         """
         return _socket_path(self._instance_dir, conversation_id)
 
-    async def start(self) -> None:
+    async def start(self, *, sweep_orphans: bool = True) -> None:
         """
-        Initialize the per-instance dir, run the orphan sweep, and
-        start the idle-reaper background task.
+        Initialize the per-instance dir and start the idle reaper.
 
         Safe to call more than once; the second call is a no-op.
         Idempotent so AP's lifespan handler doesn't have to track
         whether boot already ran.
+
+        :param sweep_orphans: Whether this process owns machine-global stale
+            harness cleanup. Host-spawned runners disable it because the host
+            performs the sweep outside session startup.
         """
         if self._started:
             return
         self._shutting_down = False
         self._tmp_parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Sweep BEFORE creating our own dir, so a crashed prior
-        # instance whose dir uuid happens to collide with ours
-        # (vanishingly unlikely but possible) gets cleaned first.
-        await self._sweep_orphans()
+        if sweep_orphans:
+            # Sweep BEFORE creating our own dir, so a crashed prior instance
+            # whose dir uuid happens to collide with ours gets cleaned first.
+            await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
         self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
         # Write the AP_PID sentinel so other instances' sweeps can
         # tell our dir is live. Strict ``"x"`` because the dir is
@@ -679,6 +698,7 @@ class HarnessProcessManager:
             name="harness-process-manager-idle-reaper",
         )
         self._started = True
+        self._started_at = time.monotonic()
         _logger.info(
             "HarnessProcessManager started; instance_dir=%s",
             self._instance_dir,
@@ -697,8 +717,8 @@ class HarnessProcessManager:
         runner subprocess of the right harness type, waits for the
         Unix socket to appear, and constructs an
         :class:`httpx.AsyncClient` over it. Subsequent calls
-        return the cached client (``env`` is ignored on cache
-        hits — config is fixed at first-spawn time).
+        return the cached client. Model changes restart harnesses without live
+        switching support; changes to ACP startup options also require a restart.
 
         Crash detection: if the previously-spawned subprocess has
         exited (``returncode is not None``), the entry is dropped
@@ -775,6 +795,18 @@ class HarnessProcessManager:
                     entry.harness,
                     conversation_id,
                     entry.process.returncode,
+                    extra={
+                        "session_id": conversation_id,
+                        "event_name": "harness_exit_detected",
+                        "attributes": {
+                            "harness": entry.harness,
+                            "pid": entry.process.pid,
+                            "returncode": entry.process.returncode,
+                            "tracked_response_id": self._in_flight_response_ids.get(
+                                conversation_id
+                            ),
+                        },
+                    },
                 )
                 await self._close_entry(entry)
                 entry = None
@@ -803,10 +835,27 @@ class HarnessProcessManager:
                 await self._close_entry(entry)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if entry is not None and harness not in _LIVE_MODEL_CONFIG_HARNESSES:
+            if (
+                entry is not None
+                and harness == "acp"
+                and env is not None
+                and entry.acp_config != _acp_startup_config(env)
+            ):
+                _logger.info(
+                    "ACP startup config changed for conversation %s; respawning",
+                    conversation_id,
+                )
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                await self._close_entry(entry)
+                entry = None
+                respawn_reason = "harness_respawn_agent_switch"
+            if entry is not None and not (
+                harness in _LIVE_MODEL_CONFIG_HARNESSES
+                or (harness == "acp" and entry.acp_config.get("HARNESS_ACP_MODEL_LIST"))
+            ):
                 # Most harnesses bake the model into the subprocess env. A
-                # later concrete model change must respawn them; ACP harnesses
-                # in the live-config set instead apply the request in-session.
+                # later model change respawns them; curated ACP and harnesses
+                # in the live-config set instead apply it in-session.
                 requested_model = (env or {}).get(_model_env_key(harness))
                 if requested_model is not None and requested_model != entry.model:
                     _logger.info(
@@ -1232,9 +1281,32 @@ class HarnessProcessManager:
             "--parent-pid",
             str(parent_pid),
         ]
+        spawn_started_at = time.monotonic()
         process = await self._spawn_harness_process(runner_argv, effective_env)
         try:
             await _wait_for_bind(process, endpoint, harness, conversation_id)
+            # The harness process has bound its socket and is ready to serve —
+            # the observable "harness started" edge. Report the spawn->ready
+            # latency; on a cold runner the first spawn's manager-relative
+            # latency is the runner_start -> harness_started interval.
+            _now = time.monotonic()
+            _logger.info(
+                "harness started for conversation %s (harness=%s)",
+                conversation_id,
+                harness,
+                extra=debug_event(
+                    "harness_started",
+                    session_id=conversation_id,
+                    harness=harness,
+                    pid=process.pid,
+                    spawn_ms=int((_now - spawn_started_at) * 1000),
+                    since_manager_start_ms=(
+                        int((_now - self._started_at) * 1000)
+                        if self._started_at is not None
+                        else None
+                    ),
+                ),
+            )
 
             # ``base_url`` is required for relative-URL routing; the
             # actual host portion is irrelevant under uds transport,
@@ -1268,6 +1340,7 @@ class HarnessProcessManager:
                 # triggers a respawn in ``get_client`` — the model is a fixed
                 # process env var, not re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
+                acp_config=_acp_startup_config(env) if harness == "acp" else None,
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:
@@ -1465,103 +1538,74 @@ class HarnessProcessManager:
                         conv_id,
                     )
 
-    async def _sweep_orphans(self) -> None:
-        """
-        Kill runner processes left behind by crashed prior AP
-        instances and remove their per-instance directories.
 
-        Iterates every ``ap-*`` subdir under ``_tmp_parent``. For
-        each, reads the ``AP_PID`` sentinel; if the recorded PID
-        is not a live process, the dir belongs to a crashed AP
-        and gets cleaned. Sibling dirs whose PIDs are still live
-        are left alone (zero-downtime restart, multi-tenant
-        same-host case).
+async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) -> None:
+    """Clean harness processes left behind by crashed prior instances.
 
-        Best-effort throughout — a permission error or unreadable
-        sentinel logs and skips the dir rather than aborting boot.
-        """
-        if not self._tmp_parent.exists():
-            return
-        for child in self._tmp_parent.iterdir():
-            if not child.is_dir() or not child.name.startswith("ap-"):
-                continue
-            sentinel = child / _AP_PID_FILE
-            if not sentinel.exists():
-                # No sentinel — directory either pre-dates the
-                # convention or is mid-creation. Leave alone.
-                continue
-            try:
-                pid_str = sentinel.read_text(encoding="utf-8").strip()
-                pid = int(pid_str)
-            except (OSError, ValueError) as exc:
-                _logger.warning(
-                    "could not read AP_PID sentinel at %s: %s; skipping",
-                    sentinel,
-                    exc,
-                )
-                continue
-            if _pid_alive(pid):
-                # Sibling Omnigent is still running — leave it alone.
-                continue
-            _logger.info(
-                "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
-                child,
-                pid,
-            )
-            await self._kill_orphan_runners(child)
-            shutil.rmtree(child, ignore_errors=True)
+    Host-spawned runners delegate this machine-global work to the host. The
+    standalone server keeps calling it from :meth:`HarnessProcessManager.start`.
 
-    async def _kill_orphan_runners(self, instance_dir: Path) -> None:
-        """
-        Send SIGTERM to runner processes whose socket lives under
-        ``instance_dir``, then escalate to SIGKILL for survivors.
-
-        Identification works by listing the socket files in the
-        dir — every active runner binds one. We don't have the
-        runner PIDs because they're orphans of a crashed AP, so
-        we shell out to ``lsof`` to find which PIDs hold each
-        socket. ``lsof`` failures fall through silently (best
-        effort).
-
-        After SIGTERM, waits :data:`_ORPHAN_SIGTERM_GRACE_S`
-        seconds, then sends SIGKILL to any runner that is still
-        alive. Prior to this escalation, orphaned
-        runners with stuck SIGTERM handlers survived the sweep
-        indefinitely.
-
-        :param instance_dir: The orphaned AP's per-instance dir
-            whose runner subprocesses to terminate.
-        """
-        all_pids: set[int] = set()
-        for socket_file in instance_dir.glob("conv-*.sock"):
-            pids = await _pids_holding_socket(socket_file)
-            for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    all_pids.add(pid)
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    _logger.warning(
-                        "cannot signal orphan runner pid %d (permission denied)",
-                        pid,
-                    )
-                    continue
-
-        if not all_pids:
-            return
-
-        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
-
-        for pid in all_pids:
-            if not _pid_alive(pid):
-                continue
+    :param tmp_parent: Harness socket root to scan. Defaults to the configured
+        machine-global root.
+    :returns: None.
+    """
+    root = tmp_parent if tmp_parent is not None else _default_tmp_parent()
+    if not root.exists():
+        return
+    for child in root.iterdir():
+        if not child.is_dir() or not child.name.startswith("ap-"):
+            continue
+        sentinel = child / _AP_PID_FILE
+        if not sentinel.exists():
+            continue
+        try:
+            pid = int(sentinel.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError) as exc:
             _logger.warning(
-                "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
-                pid,
+                "could not read AP_PID sentinel at %s: %s; skipping",
+                sentinel,
+                exc,
             )
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            continue
+        if _pid_alive(pid):
+            continue
+        _logger.info(
+            "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
+            child,
+            pid,
+        )
+        await _kill_orphan_runners(child)
+        shutil.rmtree(child, ignore_errors=True)
+
+
+async def _kill_orphan_runners(instance_dir: Path) -> None:
+    """Terminate runner processes whose sockets live under *instance_dir*."""
+    all_pids: set[int] = set()
+    for socket_file in instance_dir.glob("conv-*.sock"):
+        for pid in await _pids_holding_socket(socket_file):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                all_pids.add(pid)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                _logger.warning(
+                    "cannot signal orphan runner pid %d (permission denied)",
+                    pid,
+                )
+
+    if not all_pids:
+        return
+    await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
+    for pid in all_pids:
+        if not _pid_alive(pid):
+            continue
+        _logger.warning(
+            "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
+            pid,
+        )
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _pid_alive(pid: int) -> bool:

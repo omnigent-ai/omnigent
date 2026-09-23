@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,10 +17,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
 
-from omnigent.json_types import JsonValue
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+from omnigent.util.json_types import JsonValue
 
-from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
+from .agent_env import DESKTOP_SESSION_ENV_VARS
+from .datamodel import CredentialProxySpec, CredentialSourceSpec, OSEnvSandboxSpec, OSEnvSpec
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,9 @@ class SandboxPolicy:
     :param write_files: Per-file write grants for non-directory paths
         that can't live in :attr:`write_roots` (bwrap treats these as
         additional ``--bind-try`` mounts).
+    :param credential_source_paths: Canonical private credential paths that
+        must remain unreadable and unreachable, including through implicit
+        runtime mounts. Carried through launcher serialization and policy clones.
     :param allow_network: ``True`` to share the host network namespace,
         ``False`` to isolate (bwrap adds ``--unshare-net``).
     :param cwd_allow_hidden: List of dotfile / dotdir basenames that
@@ -173,6 +178,7 @@ class SandboxPolicy:
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
     deny_unix_socket_paths: list[Path] | None = None
+    credential_source_paths: list[Path] | None = None
     # Parent-side only: the resolved credential-proxy policy. Read in
     # ``_HelperProcessClient._start_locked`` (parent) to mint synthetic
     # placeholders and proxy rewrite rules. Intentionally NOT carried in
@@ -232,6 +238,11 @@ class SandboxPolicy:
                 if self.deny_unix_socket_paths is not None
                 else None
             ),
+            "credential_source_paths": (
+                _json_string_list(self.credential_source_paths)
+                if self.credential_source_paths is not None
+                else None
+            ),
         }
         return result
 
@@ -286,6 +297,12 @@ class SandboxPolicy:
         deny_unix_socket_paths: list[Path] | None = None
         if isinstance(deny_unix_socket_paths_data, list):
             deny_unix_socket_paths = [Path(str(path)) for path in deny_unix_socket_paths_data]
+        credential_source_paths_data = data.get("credential_source_paths")
+        credential_source_paths = (
+            [Path(str(path)) for path in credential_source_paths_data]
+            if isinstance(credential_source_paths_data, list)
+            else None
+        )
         return cls(
             backend_type=str(data.get("backend_type", "none")),
             active=bool(data.get("active", False)),
@@ -303,6 +320,7 @@ class SandboxPolicy:
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
             deny_unix_socket_paths=deny_unix_socket_paths,
+            credential_source_paths=credential_source_paths,
         )
 
 
@@ -486,7 +504,50 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
             write_files=write_files,
             allow_network=True,
         )
-    return _get_backend(sandbox_spec.type).resolve(spec, cwd)
+    policy = _get_backend(sandbox_spec.type).resolve(spec, cwd)
+    if policy.credential_proxy is not None:
+        for entry in policy.credential_proxy.entries:
+            if (
+                entry.source.kind == "unix_socket"
+                or entry.source.refresh_interval_seconds is not None
+            ):
+                protect_credential_source(entry.source, policy, cwd=cwd)
+    return policy
+
+
+def protect_credential_source(
+    source: CredentialSourceSpec, sandbox: SandboxPolicy | None, *, cwd: Path | None = None
+) -> Path:
+    """Validate private source placement and carry its canonical path into every launcher."""
+    if sandbox is None or not sandbox.active:
+        raise ValueError("credential refresh requires an active sandbox policy")
+    if source.kind not in ("file", "unix_socket") or not source.path:
+        raise ValueError("credential refresh requires a file or unix_socket source")
+    if sandbox.backend_type not in _SPAWN_WRAP_BACKENDS:
+        raise ValueError("credential refresh requires a filesystem-confined sandbox")
+    path = Path(source.path).expanduser()
+    if not path.is_absolute():
+        raise ValueError("refresh source must use an absolute path")
+    roots = tuple(root.resolve() for root in sandbox.write_roots)
+    files = tuple(allowed.resolve() for allowed in sandbox.write_files)
+    read_roots = (
+        *(root.resolve() for root in (sandbox.read_roots or [])),
+        (cwd or Path.cwd()).resolve(),
+    )
+    for component in (path, *path.parents):
+        for candidate in (component.absolute(), component.resolve()):
+            if any(candidate.is_relative_to(root) for root in roots) or candidate in files:
+                raise ValueError("refresh source must stay outside sandbox-writable paths")
+            if any(candidate.is_relative_to(root) for root in read_roots):
+                raise ValueError("refresh source must stay outside sandbox-readable paths")
+    if path.exists() and path.stat().st_nlink != 1:
+        raise ValueError("refresh source must not be hard-linked")
+    canonical = path.resolve()
+    if sandbox.credential_source_paths is None:
+        sandbox.credential_source_paths = []
+    if canonical not in sandbox.credential_source_paths:
+        sandbox.credential_source_paths.append(canonical)
+    return canonical
 
 
 def containment_prefix(root: str | Path) -> str:
@@ -726,6 +787,11 @@ def _clone_policy_with(
             if policy.deny_unix_socket_paths is not None
             else None
         ),
+        credential_source_paths=(
+            list(policy.credential_source_paths)
+            if policy.credential_source_paths is not None
+            else None
+        ),
         # Preserve the credential-proxy policy across clones: the
         # ``with_additional_*`` helpers run before the parent reads it in
         # ``_start_locked``, so dropping it here would silently disable
@@ -909,6 +975,14 @@ def create_private_tmpdir() -> Path:
     return Path(tempfile.mkdtemp(prefix="omnigent-osenv-"))
 
 
+def set_sandbox_env(env: MutableMapping[str, str], tmpdir: Path) -> None:
+    """Give sandboxed tools private scratch/runtime storage and no host desktop bus."""
+    for key in DESKTOP_SESSION_ENV_VARS:
+        env.pop(key, None)
+    set_temp_env(env, tmpdir)
+    env["XDG_RUNTIME_DIR"] = str(tmpdir)
+
+
 def set_temp_env(env: MutableMapping[str, str], tmpdir: Path) -> None:
     tmp_value = str(tmpdir)
     for key in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
@@ -994,7 +1068,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         host_tmpdir = create_private_tmpdir()
         try:
             sandbox = with_additional_write_roots(sandbox, [host_tmpdir])
-            set_temp_env(os.environ, host_tmpdir)
+            set_sandbox_env(os.environ, host_tmpdir)
             encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
             # Name the dir for the in-wrap pass: it adopts this exact
             # path (no second mint) and owns the cleanup on exit.
@@ -1002,7 +1076,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # Re-invoke run_launcher via an INLINE python -c script
             # rather than re-running the launcher tempfile. Reason:
             # bwrap mounts ``/tmp`` as a fresh tmpfs, so the host's
-            # ``/tmp/omnigent-sandbox-*.py`` written by
+            # ``/tmp/omnigent-sandbox-*`` script written by
             # ``create_exec_launcher`` is invisible inside the wrap.
             # ``python -c '<inline>'`` doesn't need a script file in
             # the sandbox view — the inline string travels through
@@ -1055,13 +1129,13 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # case the env prune stripped it; do NOT mint a second dir
             # (that one wouldn't be in the baked profile).
             tmpdir = Path(inherited)
-            set_temp_env(os.environ, tmpdir)
+            set_sandbox_env(os.environ, tmpdir)
         else:
             # Single-pass active backends (no spawn-time re-exec, e.g.
             # ``windows_jobobject``): mint + grant + surface here.
             tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [tmpdir])
-            set_temp_env(os.environ, tmpdir)
+            set_sandbox_env(os.environ, tmpdir)
     # Checkpoints around activate + spawn so a hang in either step is
     # visible in the wrapper's stderr (the wrapper template enables INFO).
     logger.info(
@@ -1105,23 +1179,60 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         cleanup_private_tmpdir(tmpdir)
 
 
-def create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+def _launcher_inline_source(target_path: str, sandbox: SandboxPolicy) -> str:
+    """Build the ``python -c`` program the exec launcher runs.
+
+    basicConfig so ``run_launcher``'s INFO records reach stderr; the
+    project root goes on ``sys.path`` so the import works from any cwd.
+    """
     encoded = _encode_json_arg(sandbox.to_jsonable())
-    fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py")
-    project_root = repr(str(_project_root()))
-    encoded_literal = repr(encoded)
-    target_literal = repr(target_path)
-    # basicConfig so ``run_launcher``'s INFO records reach stderr.
-    script = (
-        f"#!{sys.executable}\n"
-        "import logging\n"
-        "import sys\n"
-        f"sys.path.insert(0, {project_root})\n"
-        "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr)\n"
-        "from omnigent.inner.sandbox import run_launcher\n"
-        "if __name__ == '__main__':\n"
-        f"    raise SystemExit(run_launcher({encoded_literal}, {target_literal}, sys.argv[1:]))\n"
+    return (
+        "import logging, sys; "
+        f"sys.path.insert(0, {str(_project_root())!r}); "
+        "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr); "
+        "from omnigent.inner.sandbox import run_launcher; "
+        f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:]))"
     )
+
+
+def create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+    """Write an executable launcher that runs ``target_path`` inside ``sandbox``.
+
+    Callers hand the returned path to spawners that ``execve`` it
+    directly (the Claude Agent SDK, tmux, the ACP/qwen/kimi/goose/pi
+    executors), so the file must be executable by the kernel on its
+    own.
+
+    :param target_path: The real binary the launcher ultimately spawns.
+    :param sandbox: Policy baked into the launcher and applied before the spawn.
+    :returns: Path to the launcher script; the caller owns deleting it.
+    :raises OSError: If the running interpreter cannot be named in the
+        launcher, which would produce an unrunnable script.
+    """
+    inline = _launcher_inline_source(target_path, sandbox)
+    interpreter = sys.executable
+    if not interpreter:
+        raise OSError(
+            "Cannot build the sandbox exec launcher: sys.executable is empty, so "
+            "the launcher has no interpreter to invoke. Run omnigent under a "
+            "regular Python installation, or disable the CLI sandbox wrap."
+        )
+
+    if os.name == "nt":
+        # Windows resolves ``.py`` through PATHEXT; keep the ``#!`` line so
+        # the ``py`` launcher (a common .py association) picks the *current*
+        # interpreter rather than the machine default.
+        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py")
+        script = f"#!{interpreter}\n{inline}\n"
+    else:
+        # ``/bin/sh`` is the only interpreter guaranteed to be a native
+        # executable. Naming ``sys.executable`` in a shebang instead
+        # breaks whenever it is a wrapper script, sits behind a path
+        # too long for the kernel's shebang buffer, or contains spaces —
+        # each of which surfaces as an opaque ENOEXEC from the spawner.
+        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".sh")
+        script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -c {shlex.quote(inline)} "$@"\n'
+
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(script)
     os.chmod(path, 0o755)

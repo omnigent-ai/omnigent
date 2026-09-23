@@ -42,7 +42,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import (
     _BRIDGE_ROOT,
     inject_interrupt,
     write_tmux_target,

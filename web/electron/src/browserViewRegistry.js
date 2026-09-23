@@ -65,6 +65,7 @@ function createBrowserViewRegistry({
   openUrlExternal = () => {}, // (url) => shell.openExternal(url)
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
+  onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
   cap = DEFAULT_CAP,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
@@ -93,6 +94,7 @@ function createBrowserViewRegistry({
   function setSuppressed(suppressed) {
     overlaySuppressed = !!suppressed;
     applyActiveVisibility();
+    onSuppressionChange(overlaySuppressed);
     return { ok: true };
   }
 

@@ -174,6 +174,33 @@ def test_server_background_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "log: ~/.omnigent/logs/server/server-ab12.log" in result.output
 
 
+def test_server_background_with_base_path_sets_env_before_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--base-path`` combined with ``--background`` still folds the env var.
+
+    ``--background`` returns early (before running uvicorn in-process), so
+    the env-var fold must happen ahead of that branch — otherwise the
+    detached server (which inherits this process's environ) spawns without
+    ever seeing the configured base path.
+    """
+    monkeypatch.delenv("OMNIGENT_WEB_BASE_PATH", raising=False)
+    seen_env: dict[str, str | None] = {}
+
+    def _fake_ensure() -> LocalServerStartup:
+        import os
+
+        seen_env["OMNIGENT_WEB_BASE_PATH"] = os.environ.get("OMNIGENT_WEB_BASE_PATH")
+        return LocalServerStartup(url="http://127.0.0.1:8123", spawned=True, log_path=None)
+
+    monkeypatch.setattr("omnigent.cli.ensure_local_omnigent_server", _fake_ensure)
+
+    result = CliRunner().invoke(cli, ["server", "--background", "--base-path", "/proxy/6767"])
+
+    assert result.exit_code == 0, result.output
+    assert seen_env["OMNIGENT_WEB_BASE_PATH"] == "/proxy/6767"
+
+
 def test_server_background_reuses(monkeypatch: pytest.MonkeyPatch) -> None:
     """``server --background`` reports reuse and the reused server's log file."""
     monkeypatch.setattr(

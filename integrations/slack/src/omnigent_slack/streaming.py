@@ -226,10 +226,12 @@ class _AnswerReply:
         # stable id, and emit several per turn (narration between tool calls). The
         # deltas arrive back to back, so without a boundary the last sentence of one
         # message butts directly against the first of the next ("…once more.The
-        # credentials…"). We insert a paragraph break when the id changes. ``None``
-        # (ordinary in-process streaming, where deltas already group by the active
-        # response) never triggers one — the behavior there is unchanged.
+        # credentials…"). We insert a paragraph break when the id changes.
         self._last_message_id: str | None = None
+        # Whether an assistant message committed since the last delta. The boundary
+        # signal for an id-LESS stream: the in-process harness (claude-sdk) leaves
+        # ``message_id`` None for every message, so the id above never changes.
+        self._message_ended = False
         # Text put on screen in each sealed segment this turn. Unlike
         # ``_streamed``/``_final`` (which reset at each seal), this survives
         # interruptions, so the no-delta fallback can tell whether the server's
@@ -256,24 +258,30 @@ class _AnswerReply:
     def streamed_len(self) -> int:
         return len(self._streamed)
 
+    def mark_message_end(self) -> None:
+        """Record that the assistant message being streamed just committed.
+
+        The boundary signal for a harness whose deltas carry no ``message_id``:
+        the in-process harness (claude-sdk) puts every message of a turn in one
+        id-less bucket, so nothing else marks the boundary. The next delta opens
+        a new message and gets the paragraph break an id change would have given
+        it.
+        """
+        self._message_ended = True
+
     async def add_delta(self, delta: str, message_id: str | None = None) -> None:
         # Append the delta; the SDK buffers and only flushes to Slack once the
         # buffer fills. Clear the placeholder only on the flush that actually
         # puts content on screen — never while still buffering — so there's no
         # empty gap.
         #
-        # A change in ``message_id`` (native terminal harnesses tag each assistant
-        # message item) marks a new message: insert a paragraph break so
+        # A new assistant message starts here → insert a paragraph break so
         # back-to-back messages don't run together ("…once more.The credentials…").
-        # Only between messages, never before the first, and never for id-less
-        # in-process streaming (its id stays None, so this branch never fires).
-        if (
-            message_id is not None
-            and self._last_message_id is not None
-            and message_id != self._last_message_id
-            and self._streamed
-            and not self._streamed.endswith("\n")
-        ):
+        # Only between messages, never before the first, never after a newline.
+        starts_new_message = self._starts_new_message(message_id)
+        self._last_message_id = message_id
+        self._message_ended = False
+        if starts_new_message and self._streamed and not self._streamed.endswith("\n"):
             self._streamed += "\n\n"
             # Honor the separator's flush too: if the 2-char append is the one
             # that crosses the SDK buffer threshold (and the following delta only
@@ -281,10 +289,21 @@ class _AnswerReply:
             # placeholder now rather than leaving it up until the next flush.
             if await self._reply.append("\n\n"):
                 await self._clear_ack()
-        self._last_message_id = message_id
         self._streamed += delta
         if await self._reply.append(delta):
             await self._clear_ack()
+
+    def _starts_new_message(self, message_id: str | None) -> bool:
+        # Which boundary signal to trust. An id-bearing stream is authoritative —
+        # the id changing IS the new message, and an unchanged id IS the same one
+        # continuing. An id-less stream has only the committed-message event.
+        if message_id is None and self._last_message_id is None:
+            return self._message_ended
+        return (
+            message_id is not None
+            and self._last_message_id is not None
+            and message_id != self._last_message_id
+        )
 
     async def flush_if_buffered(self) -> None:
         """Force buffered-but-unflushed text onto the screen NOW.

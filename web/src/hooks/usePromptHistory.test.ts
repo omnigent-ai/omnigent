@@ -2,6 +2,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { appendPromptHistoryEntry, usePromptHistory } from "./usePromptHistory";
+import { serializeReplyDraft, type ComposerDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 
 const STORAGE_PREFIX = "omnigent:prompt-history";
 
@@ -25,7 +26,7 @@ describe("appendPromptHistoryEntry", () => {
     // recall returns the prompt the way it was composed, not with stray
     // padding — and the return value is what the hook syncs its ref to.
     const result = appendPromptHistoryEntry("  read the README  ", "conv_a");
-    expect(result).toEqual(["read the README"]);
+    expect(result).toEqual([{ text: "read the README" }]);
     expect(storedHistory("conv_a")).toEqual(["read the README"]);
   });
 
@@ -55,7 +56,7 @@ describe("appendPromptHistoryEntry", () => {
     // call returns the unchanged history so the caller still syncs correctly.
     appendPromptHistoryEntry("hello", "conv_a");
     const result = appendPromptHistoryEntry("hello", "conv_a");
-    expect(result).toEqual(["hello"]);
+    expect(result).toEqual([{ text: "hello" }]);
     expect(storedHistory("conv_a")).toEqual(["hello"]);
   });
 
@@ -96,11 +97,11 @@ describe("usePromptHistory — per-conversation recall", () => {
     // the chat composer mounts bound to that id and hydrates from the same key.
     appendPromptHistoryEntry("the prompt I just sent", "conv_a");
     const { result } = renderHook(() => usePromptHistory("conv_a"));
-    let recalled: string | null = null;
+    let recalled: ComposerDraft | null = null;
     act(() => {
       recalled = result.current.recallPrevious("");
     });
-    expect(recalled).toBe("the prompt I just sent");
+    expect(recalled).toEqual({ text: "the prompt I just sent" });
   });
 
   it("does not recall a prompt that belongs to a different conversation", () => {
@@ -108,7 +109,7 @@ describe("usePromptHistory — per-conversation recall", () => {
     // be invisible to a composer bound to conv_b.
     appendPromptHistoryEntry("typed in conv_a", "conv_a");
     const { result } = renderHook(() => usePromptHistory("conv_b"));
-    let recalled: string | null = "sentinel";
+    let recalled: ComposerDraft | null = { text: "sentinel" };
     act(() => {
       recalled = result.current.recallPrevious("");
     });
@@ -125,11 +126,11 @@ describe("usePromptHistory — per-conversation recall", () => {
     const { result, rerender } = renderHook(({ scope }) => usePromptHistory(scope), {
       initialProps: { scope: "conv_a" },
     });
-    let recalled: string | null = null;
+    let recalled: ComposerDraft | null = null;
     act(() => {
       recalled = result.current.recallPrevious("");
     });
-    expect(recalled).toBe("a-prompt");
+    expect(recalled).toEqual({ text: "a-prompt" });
 
     rerender({ scope: "conv_b" });
     act(() => {
@@ -137,18 +138,71 @@ describe("usePromptHistory — per-conversation recall", () => {
     });
     // After the scope change the hook re-read conv_b's key and dropped the
     // conv_a cursor, so the first ArrowUp lands on b's prompt, not a's.
-    expect(recalled).toBe("b-prompt");
+    expect(recalled).toEqual({ text: "b-prompt" });
   });
 
   it("appendEntry from the chat composer is itself recallable in that conversation", () => {
     const { result } = renderHook(() => usePromptHistory("conv_a"));
     act(() => result.current.appendEntry("typed in chat"));
-    let recalled: string | null = null;
+    let recalled: ComposerDraft | null = null;
     act(() => {
       recalled = result.current.recallPrevious("");
     });
-    expect(recalled).toBe("typed in chat");
+    expect(recalled).toEqual({ text: "typed in chat" });
     // appendEntry routed the write to conv_a's scoped key, not the global one.
     expect(storedHistory("conv_a")).toEqual(["typed in chat"]);
+  });
+
+  it("keeps per-entry quote provenance even when adjacent entries have identical text", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "A passage" }],
+      text: "Answer",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    appendPromptHistoryEntry(text, "conv_a", replyDraft);
+    appendPromptHistoryEntry(text, "conv_a", replyDraft);
+    appendPromptHistoryEntry(text, "conv_a");
+    expect(storedHistory("conv_a")).toHaveLength(2);
+
+    const { result } = renderHook(() => usePromptHistory("conv_a"));
+    expect(result.current.recallPrevious("in progress")).toEqual({ text });
+    expect(result.current.recallPrevious("unused")).toEqual({ text, replyDraft });
+    expect(result.current.recallPrevious("unused")).toBeNull();
+    expect(result.current.recallNext()).toEqual({ text });
+    expect(result.current.recallNext()).toEqual({ text: "in progress" });
+    expect(result.current.recallNext()).toBeNull();
+  });
+
+  it("captures the structured current draft literally while navigating history", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "\n> authored\ncontinued\n\n", text: "A real quote" }],
+      text: "~~~markdown\n> example\n",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    appendPromptHistoryEntry("earlier", "conv_a");
+    const { result } = renderHook(() => usePromptHistory("conv_a"));
+    expect(result.current.recallPrevious(text, replyDraft)).toEqual({ text: "earlier" });
+    expect(result.current.recallNext()).toEqual({ text, replyDraft });
+  });
+
+  it("keeps authored blockquotes literal in legacy and unsupported history entries", () => {
+    const legacy = "intro\n> quote\nreply\n\n";
+    const unsupported = "> quoted\ncontinued\n";
+    localStorage.setItem(
+      scopedKey("conv_a"),
+      JSON.stringify([
+        legacy,
+        { text: unsupported, replyDraft: { version: 9, quotes: [], text: "" } },
+        { text: 42 },
+        null,
+      ]),
+    );
+    const { result } = renderHook(() => usePromptHistory("conv_a"));
+    expect(result.current.recallPrevious("\nunsent\n")).toEqual({ text: unsupported });
+    expect(result.current.recallPrevious("")).toEqual({ text: legacy });
+    expect(result.current.recallNext()).toEqual({ text: unsupported });
+    expect(result.current.recallNext()).toEqual({ text: "\nunsent\n" });
   });
 });

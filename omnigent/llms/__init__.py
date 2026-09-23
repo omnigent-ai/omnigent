@@ -28,7 +28,7 @@ def __getattr__(name: str) -> Any:
     """Lazy attribute access to avoid a circular import.
 
     Eager top-level imports here pull in ``omnigent.llms.client``,
-    which imports ``omnigent.reasoning_effort``, which imports
+    which imports ``omnigent.util.reasoning_effort``, which imports
     ``omnigent.llms.errors`` -- a submodule load that re-triggers
     this ``__init__`` mid-initialisation and explodes with
     ``cannot import name 'OPENAI_EFFORTS' from partially initialized

@@ -1,3 +1,5 @@
+import { appConfig } from "./appConfig";
+import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -8,12 +10,14 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
+import { prefetchSessionHostChain } from "./hooks/useSession";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
+import { getBasePath, withBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
-import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
+import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
@@ -51,6 +55,11 @@ const queryClient = new QueryClient({
 // invalidate cached queries (e.g. the conversations list when a new
 // conversation is created server-side).
 initChatStore(queryClient);
+
+// Let a host-scoped request resolve its session's routing host on demand,
+// walking a hostless sub-agent child up to its host-bound ancestor (a cold
+// /c/<child> open) before the request is keyed.
+setSessionHostResolver((sessionId) => prefetchSessionHostChain(queryClient, sessionId));
 
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
@@ -108,8 +117,8 @@ const bootServerInfo = createBootServerInfo(resolveServerInfo());
 // exactly as it did before this gate existed.
 const bootIdentityGate = withBootTimeout<string | null>(bootIdentity, null);
 
-function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
-  const [info, setInfo] = useState(initialInfo);
+function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
+  const [info, setInfo] = useState<ServerInfo | "loading">(initialInfo);
   useEffect(() => {
     let alive = true;
     void bootServerInfo.settled.then((resolved) => {
@@ -120,6 +129,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
     };
   }, []);
   useEffect(() => {
+    if (info === "loading") return;
     if (info.branding?.app_name) document.title = info.branding.app_name;
     const faviconUrl = info.branding?.logos.favicon;
     if (!faviconUrl) return;
@@ -130,7 +140,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
       document.head.appendChild(link);
     }
     link.removeAttribute("type");
-    link.href = faviconUrl;
+    link.href = withBasePath(faviconUrl);
   }, [info]);
   return (
     <CapabilitiesProvider info={info}>
@@ -139,14 +149,16 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
           <ThemeProvider>
             <TooltipProvider>
               <ImageLightboxProvider>
-                <BrowserRouter>
-                  <SessionUpdatesProvider>
-                    <RunnerHealthProvider>
-                      <QueueFlushProvider>
-                        <App />
-                      </QueueFlushProvider>
-                    </RunnerHealthProvider>
-                  </SessionUpdatesProvider>
+                <BrowserRouter basename={getBasePath() || undefined}>
+                  <IdentityAwareSidebarDataProvider config={appConfig.sidebar}>
+                    <SessionUpdatesProvider>
+                      <RunnerHealthProvider>
+                        <QueueFlushProvider>
+                          <App />
+                        </QueueFlushProvider>
+                      </RunnerHealthProvider>
+                    </SessionUpdatesProvider>
+                  </IdentityAwareSidebarDataProvider>
                 </BrowserRouter>
               </ImageLightboxProvider>
             </TooltipProvider>
@@ -157,16 +169,20 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
   );
 }
 
-void Promise.all([bootServerInfo.initial, bootIdentityGate]).then(([initialInfo]) => {
-  // `/v1/me` came back 401 with a login page and we're already on our way
-  // there. Mounting now would start a navigation race we lose either way:
-  // the shell's queries fire against a session we know is invalid, 401,
-  // and get torn down mid-flight when the login page commits. Header mode
-  // never lands here (no login page), so a proxy-less deploy still renders.
-  if (isLoginRedirectPending()) return;
-  createRoot(document.getElementById("root")!).render(
-    <StrictMode>
-      <RootApp initialInfo={initialInfo} />
-    </StrictMode>,
-  );
+// Mount immediately so the shell renders before the server probes settle.
+// The CapabilitiesProvider starts with "loading"; bootServerInfo.settled
+// updates it once /v1/info returns (see RootApp's useEffect above).
+const root = createRoot(document.getElementById("root")!);
+root.render(
+  <StrictMode>
+    <RootApp initialInfo="loading" />
+  </StrictMode>,
+);
+
+// `/v1/me` came back 401 with a login page and we're already on our way
+// there. Unmount to stop the shell's queries firing against an invalid
+// session mid-redirect. Header mode never lands here (no login page), so
+// a proxy-less deploy is unaffected.
+void bootIdentityGate.then(() => {
+  if (isLoginRedirectPending()) root.unmount();
 });

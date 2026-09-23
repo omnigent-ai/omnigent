@@ -274,6 +274,79 @@ def test_search_exclude_glob_prunes_results(tmp_path: Path) -> None:
     assert paths == {"keep.py"}
 
 
+def test_search_returns_matching_directories(tmp_path: Path) -> None:
+    """A query matching a directory name surfaces it as a directory entry.
+
+    Mirrors the runner's ``/search`` so a folder can be revealed from the
+    Explore tab whether the runner or the host answers.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("src")
+
+    by_path = {e["path"]: e for e in result["data"]}
+    assert by_path["src"]["type"] == "directory"
+    # A directory has no byte size.
+    assert by_path["src"]["bytes"] is None
+
+
+def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep dependency subtree must not starve a later-sorted real directory.
+
+    ``aaa/node_modules/<many>`` sorts before ``zzz/target``; without globally
+    deferring the noise subtree, a tight budget is exhausted inside
+    node_modules before the walk reaches the real match. Mirrors the runner.
+    """
+    noise = tmp_path / "aaa" / "node_modules"
+    noise.mkdir(parents=True)
+    for i in range(40):
+        (noise / f"dep{i}.js").write_text("x")
+    target = tmp_path / "zzz" / "target"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("y")
+
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 20)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target")
+
+    paths = {e["path"] for e in result["data"]}
+    assert "zzz/target" in paths, (
+        f"the real 'zzz/target' directory must be reached despite the earlier "
+        f"aaa/node_modules subtree, got {paths}"
+    )
+
+
+def test_search_does_not_follow_symlinked_deprioritized_dir(tmp_path: Path) -> None:
+    """A symlinked noise dir must not let the walk escape the workspace root.
+
+    Mirrors the runner: the deferred second pass walks each noise root directly,
+    and ``os.walk`` follows a top-level symlink, so a committed ``node_modules``
+    symlink pointing outside the workspace would disclose the target's contents.
+    Deferring only real directories preserves the ``followlinks=False`` boundary.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("leaked")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "node_modules").symlink_to(outside, target_is_directory=True)
+    reader = WorkspaceReader(ws)
+
+    result = reader.search("secret")
+
+    paths = {e["path"] for e in result["data"]}
+    assert not any("secret" in p for p in paths), (
+        f"search must not descend a symlinked node_modules and leak the target's "
+        f"contents, got {paths}"
+    )
+
+
 # ── changes / diff (git mode) ─────────────────────────────────────────
 
 
@@ -397,7 +470,7 @@ def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
 
     _git_branch_repo(tmp_path)
 
-    def fake_gh(argv, *, cwd):
+    def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
             return (0, '{"number": 3}', "")
         if tuple(argv[:1]) == ("api",):
@@ -434,7 +507,7 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
 
     _git_branch_repo(tmp_path)
 
-    def fake_gh(argv, *, cwd):
+    def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
             return (0, '{"number": 3}', "")
         if tuple(argv[:2]) == ("pr", "diff"):

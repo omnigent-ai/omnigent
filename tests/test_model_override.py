@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.model_override import (
+from omnigent.models.model_override import (
     MODEL_OVERRIDE_MAX_LEN,
     canonical_model_spelling,
     harness_supports_model_override,

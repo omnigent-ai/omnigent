@@ -103,6 +103,13 @@ def test_pin_moves_session_to_pinned_section(
     row.hover()
     pin_button = row.get_by_test_id("quick-pin-conversation")
     expect(pin_button).to_have_attribute("aria-label", "Pin conversation")
+    pin_button.hover()
+    expect(page.get_by_role("tooltip", name="Pin", exact=True)).to_be_visible()
+
+    archive_button = row.get_by_test_id("quick-archive-conversation")
+    archive_button.hover()
+    expect(page.get_by_role("tooltip", name="Archive", exact=True)).to_be_visible()
+
     pin_button.click()
 
     # The row now lives under "Pinned" and out of "Sessions", and the
@@ -177,7 +184,7 @@ def _pinned_session_order(page: Page) -> list[str]:
 
 def _updated_at(base_url: str, session_id: str) -> int:
     """Read a session's server-side ``updated_at`` from ``GET /v1/sessions``."""
-    resp = httpx.get(f"{base_url}/v1/sessions", timeout=10.0)
+    resp = httpx.get(f"{base_url}/v1/sessions", params={"visibility": "all"}, timeout=10.0)
     resp.raise_for_status()
     for item in resp.json()["data"]:
         if item["id"] == session_id:

@@ -98,10 +98,15 @@ let toggle: ((args: { id: string; pinned: boolean }) => void) | null = null;
 
 // Minimal harness wiring the real hooks exactly as the Sidebar does, exposing
 // the union pinned set so assertions read "what the user sees as pinned".
-function Harness() {
+function Harness({ ownedIds }: { ownedIds?: ReadonlySet<string> }) {
   const { data, isSuccess } = usePinnedConversations();
   const serverIds = (data?.conversations ?? []).map((c) => c.id);
-  useMigrateLocalPinsToServer(new Set(serverIds), isSuccess, data?.filterHonored ?? false);
+  useMigrateLocalPinsToServer(
+    new Set(serverIds),
+    isSuccess,
+    data?.filterHonored ?? false,
+    ownedIds,
+  );
   const toggleMutation = useTogglePinnedConversation();
   toggle = toggleMutation.mutate;
   const union = new Set(serverIds);
@@ -226,4 +231,22 @@ describe("pin survives a UI-before-server upgrade", () => {
     );
     await waitFor(() => expect(stage3.getByTestId("pinned").textContent).toBe("chat_2"));
   });
+});
+
+it("migrates only known owned legacy pins and preserves excluded ids", async () => {
+  server.mode = "new";
+  localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["chat_1", "chat_2"]));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+  const { rerender } = render(createElement(Harness, { ownedIds: new Set(["chat_1"]) }), {
+    wrapper,
+  });
+  await waitFor(() => expect(server.perUserPins.has("chat_1")).toBe(true));
+  expect(server.perUserPins.has("chat_2")).toBe(false);
+  expect(readLegacyPins()).toEqual(["chat_2"]);
+  rerender(createElement(Harness, { ownedIds: new Set(["chat_1", "chat_2"]) }));
+  await waitFor(() => expect(server.perUserPins.has("chat_2")).toBe(true));
+  expect(readLegacyPins()).toEqual([]);
+  client.clear();
 });

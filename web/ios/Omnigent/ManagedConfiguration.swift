@@ -1,7 +1,7 @@
 import Foundation
 import ManagedApp
 
-/// Server URLs an administrator preset for a managed install.
+/// Server URLs and feature flags an administrator sets for a managed install.
 ///
 /// Arrives on either of two channels, both carrying the same flat dictionary:
 /// the `AppConfig` payload of a `com.apple.configuration.app.managed`
@@ -15,6 +15,7 @@ import ManagedApp
 /// code below, so treat them as API.
 struct OmnigentManagedConfiguration: Decodable, Equatable {
   private(set) var serverURLs: [URL]
+  private(set) var databricksInternalFeaturesEnabled: Bool
 
   static let empty = OmnigentManagedConfiguration(serverURLs: [])
 
@@ -24,14 +25,19 @@ struct OmnigentManagedConfiguration: Decodable, Equatable {
 
   enum CodingKeys: String, CodingKey {
     case serverURLs = "serverUrls"
+    case databricksInternalFeaturesEnabled
   }
 
-  init(serverURLs: [URL]) {
+  init(serverURLs: [URL], databricksInternalFeaturesEnabled: Bool = false) {
     self.serverURLs = serverURLs
+    self.databricksInternalFeaturesEnabled = databricksInternalFeaturesEnabled
   }
 
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
+    // Only a boolean true opts in; malformed flags must not discard valid servers.
+    databricksInternalFeaturesEnabled =
+      (try? values.decode(Bool.self, forKey: .databricksInternalFeaturesEnabled)) ?? false
 
     // The key is optional: a configuration that sets nothing is valid and
     // simply offers no servers.
@@ -69,6 +75,16 @@ struct OmnigentManagedConfiguration: Decodable, Equatable {
       }
     }
     serverURLs = urls
+  }
+
+  /// Preserve the server-list fallback, but never let legacy true override a
+  /// declarative configuration's disabled or omitted feature flag.
+  static func resolve(declarative: Self?, legacy: Self) -> Self {
+    Self(
+      serverURLs: ManagedServers.resolve(
+        declarative: declarative?.serverURLs ?? [], legacy: legacy.serverURLs),
+      databricksInternalFeaturesEnabled: (declarative ?? legacy).databricksInternalFeaturesEnabled
+    )
   }
 
   /// Reuses the shell's own URL rules so a preset server and a typed one are

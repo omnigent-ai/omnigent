@@ -14,6 +14,7 @@ const h = vi.hoisted(() => ({
     modified?: string;
     options?: {
       renderSideBySide?: boolean;
+      scrollBeyondLastLine?: boolean;
       readOnly?: boolean;
       hideUnchangedRegions?: { enabled?: boolean };
       ignoreTrimWhitespace?: boolean;
@@ -56,8 +57,10 @@ vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
 import { MonacoDiffViewer } from "./MonacoDiffViewer";
 import { codeFontFamilyForEditor, writeCodeFontSizePx } from "@/lib/codeFontPreferences";
 import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
+import { stopFilePosition } from "./filePositionState";
 
-function renderDiff(props: {
+function diffTree(props: {
+  position?: { line: number; column?: number };
   before: string | null;
   after: string | null;
   layout: "unified" | "split";
@@ -66,8 +69,9 @@ function renderDiff(props: {
   searchOpen?: boolean;
   onSearchHandled?: () => void;
 }) {
-  return render(
+  return (
     <MonacoDiffViewer
+      position={props.position}
       before={props.before}
       after={props.after}
       path="src/a.ts"
@@ -80,8 +84,12 @@ function renderDiff(props: {
       onSetActiveSelection={() => {}}
       searchOpen={props.searchOpen}
       onSearchHandled={props.onSearchHandled}
-    />,
+    />
   );
+}
+
+function renderDiff(props: Parameters<typeof diffTree>[0]) {
+  return render(diffTree(props));
 }
 
 // Fake modified-side editor with the find slice the search wiring drives:
@@ -443,4 +451,154 @@ describe("MonacoDiffViewer", () => {
     expect(props.keepCurrentOriginalModel).toBe(true);
     expect(props.keepCurrentModifiedModel).toBe(true);
   });
+});
+
+describe("diff file position navigation", () => {
+  function navigationEditors() {
+    const container = document.createElement("div");
+    const layouts = new Set<() => void>();
+    const updates = new Set<() => void>();
+    let computed = false;
+    const modified = {
+      ...scrollStubs(),
+      getModel: () => ({
+        setEOL: vi.fn(),
+        validatePosition: (p: { lineNumber: number; column: number }) => p,
+      }),
+      getLayoutInfo: () => ({ width: 600, height: 800 }),
+      getDomNode: () => container,
+      setPosition: vi.fn(),
+      revealPositionInCenter: vi.fn(),
+      onDidLayoutChange: (fn: () => void) => {
+        layouts.add(fn);
+        return {
+          dispose: () => {
+            layouts.delete(fn);
+          },
+        };
+      },
+    };
+    const original = {
+      getModel: () => null,
+      setPosition: vi.fn(),
+      revealPositionInCenter: vi.fn(),
+    };
+    const diff = {
+      getOriginalEditor: () => original,
+      getModifiedEditor: () => modified,
+      getContainerDomNode: () => container,
+      getLineChanges: () => (computed ? [] : null),
+      onDidUpdateDiff: (fn: () => void) => {
+        updates.add(fn);
+        return {
+          dispose: () => {
+            updates.delete(fn);
+          },
+        };
+      },
+    };
+    return {
+      modified,
+      original,
+      container,
+      diff,
+      finishDiff: () => {
+        computed = true;
+        for (const fn of updates) fn();
+      },
+      resize: () => {
+        for (const fn of layouts) fn();
+      },
+    };
+  }
+
+  it.each(["split", "unified"] as const)(
+    "centers repeated citations and stops after a handled wheel event in %s mode",
+    async (layout) => {
+      const editors = navigationEditors();
+      const props = { before: "old", after: "new", layout, position: { line: 40, column: 7 } };
+      const { rerender, unmount } = renderDiff(props);
+      await waitFor(() => expect(h.onMount).not.toBeNull());
+      act(() =>
+        h.onMount?.(
+          editors.diff as unknown as Parameters<DiffOnMount>[0],
+          {
+            editor: { EndOfLineSequence: { LF: 0, CRLF: 1 } },
+          } as unknown as Parameters<DiffOnMount>[1],
+        ),
+      );
+      expect(h.diffProps?.options?.scrollBeyondLastLine).toBe(true);
+      expect(editors.modified.revealPositionInCenter).not.toHaveBeenCalled();
+      act(editors.finishDiff);
+      await waitFor(() =>
+        expect(editors.modified.revealPositionInCenter).toHaveBeenLastCalledWith(
+          { lineNumber: 40, column: 7 },
+          1,
+        ),
+      );
+      expect(editors.original.setPosition).not.toHaveBeenCalled();
+      expect(editors.original.revealPositionInCenter).not.toHaveBeenCalled();
+      rerender(diffTree({ ...props, position: { line: 115 } }));
+      expect(editors.modified.revealPositionInCenter).toHaveBeenLastCalledWith(
+        { lineNumber: 115, column: 1 },
+        1,
+      );
+      rerender(diffTree({ ...props, position: { line: 115 } }));
+      expect(editors.modified.revealPositionInCenter).toHaveBeenCalledTimes(3);
+      act(editors.resize);
+      expect(editors.modified.revealPositionInCenter).toHaveBeenCalledTimes(4);
+      const childEditor = document.createElement("div");
+      editors.container.append(childEditor);
+      // Monaco consumes handled wheel events inside the child editor.
+      childEditor.addEventListener("wheel", (event) => event.stopPropagation());
+      vi.useFakeTimers();
+      try {
+        act(editors.finishDiff);
+        childEditor.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 100 }));
+        act(editors.resize);
+        act(editors.finishDiff);
+        act(() => vi.advanceTimersToNextFrame());
+        expect(editors.modified.revealPositionInCenter).toHaveBeenCalledTimes(4);
+      } finally {
+        vi.useRealTimers();
+      }
+      unmount();
+    },
+  );
+
+  it.each(["interaction", "unmount", "external navigation"] as const)(
+    "cancels a queued diff jump on %s",
+    async (reason) => {
+      const editors = navigationEditors();
+      const position = { line: 100 };
+      const { unmount } = renderDiff({
+        before: "old",
+        after: "new",
+        layout: "split",
+        position,
+      });
+      await waitFor(() => expect(h.onMount).not.toBeNull());
+      act(() =>
+        h.onMount?.(
+          editors.diff as unknown as Parameters<DiffOnMount>[0],
+          {
+            editor: { EndOfLineSequence: { LF: 0, CRLF: 1 } },
+          } as unknown as Parameters<DiffOnMount>[1],
+        ),
+      );
+      vi.useFakeTimers();
+      try {
+        act(editors.finishDiff);
+        if (reason === "unmount") unmount();
+        else if (reason === "external navigation") stopFilePosition(position);
+        else editors.container.dispatchEvent(new Event("pointerdown"));
+        act(editors.resize);
+        act(() => vi.advanceTimersToNextFrame());
+        expect(editors.modified.setPosition).not.toHaveBeenCalled();
+        expect(editors.modified.revealPositionInCenter).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 });

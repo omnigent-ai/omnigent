@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
 
@@ -71,6 +71,52 @@ def test_register_and_get() -> None:
     assert fetched.host_id == "host_aaa"
     assert fetched.owner == "alice"
     assert fetched.hello.name == "test-host"
+
+
+def test_host_supports_codex_side_chat_by_capability() -> None:
+    """The gate refuses only a connected host that didn't advertise the capability.
+
+    A newer build advertises ``CAP_CODEX_SIDE_CHAT``; an older host omits it
+    (empty capabilities) and is gated out. An offline/unknown host fails OPEN so
+    a host we can't see isn't wrongly declared too old.
+    """
+    registry = HostRegistry()
+
+    def hello_caps(caps: list[str]) -> HostHelloFrame:
+        return HostHelloFrame(
+            version="0.1.0", frame_protocol_version=1, name="h", capabilities=caps
+        )
+
+    registry.register("host_new", FakeWebSocket(), hello_caps([CAP_CODEX_SIDE_CHAT]), owner="a")
+    registry.register("host_old", FakeWebSocket(), hello_caps([]), owner="a")
+
+    assert registry.host_supports_codex_side_chat("host_new") is True
+    assert registry.host_supports_codex_side_chat("host_old") is False
+    # Fail-open: an unknown/offline host isn't declared too old.
+    assert registry.host_supports_codex_side_chat("host_absent") is True
+
+
+def test_interactive_shells_survive_disconnect() -> None:
+    """A runner can outlive its host tunnel without losing the shell snapshot."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.interactive_shells = ["zsh", "invalid", "zsh", "bash"]
+    registry.register("host_shells", FakeWebSocket(), hello, owner="alice")
+    registry.deregister("host_shells")
+
+    assert registry.interactive_shells("host_shells") == ["zsh", "bash"]
+
+
+def test_reconnect_without_shell_inventory_clears_snapshot() -> None:
+    """An older reconnecting host cannot retain a newer host's inventory."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.interactive_shells = ["zsh", "bash"]
+    registry.register("host_shells", FakeWebSocket(), hello, owner="alice")
+
+    registry.register("host_shells", FakeWebSocket(), _make_hello(), owner="alice")
+
+    assert registry.interactive_shells("host_shells") is None
 
 
 def test_deregister() -> None:

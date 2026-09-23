@@ -2,9 +2,9 @@
 # requested changes on an existing Resolve-managed PR.
 #
 # This is the step AFTER repro-agent. It consumes repro-agent's handoff (the
-# live-confirmed reproduction and its e2e test). It first checks whether an open
-# PR already fixes the bug: if so, it REVIEWS that PR — running the repro test
-# against it and checking the diff — instead of writing a competing fix. If none
+# reported reproduction and its e2e test). It audits the patch and behavioral
+# baseline before looking for an open PR: if found, it REVIEWS that PR using the
+# audited test and diff — instead of writing a competing fix. If none
 # exists, it finds the root cause, implements a fix in a fresh worktree, adds
 # targeted unit/regression tests at the layer it changed, proves the whole set
 # goes fail→pass, then commits, pushes, and opens a ready-for-review PR. It then
@@ -41,15 +41,16 @@
 spec_version: 1
 name: resolve_agent
 description: >-
-  Takes a bug that repro-agent has already reproduced to resolution, and proves
+  Takes a bug that repro-agent reports as reproduced to resolution, and proves
   it with a fail→pass test transition. Given a pointer to a completed repro run —
   a session link (local) or a CI run URL (ci_link) — it recovers the reproduction
-  (verdict, per-facet breakdown, journey) and the authored e2e test. It then
-  checks whether an open PR already fixes the bug: if so it REVIEWS that PR by
-  running the repro test against it and checking the diff; if not it audits the
-  test against the unfixed tree (a test that PASSES there means main has since
-  fixed the bug — outcome nothing_to_fix with the fixing commit named, not a
-  manufactured fix), root-causes and implements the fix, adds targeted
+  (verdict, per-facet breakdown, journey) and the authored e2e test. Before both
+  authoring and reviewing, it independently audits the patch, assertions, and
+  behavioral failure on the unfixed base. It repairs or rejects unreliable tests
+  with preserved evidence in test_audit, rather than trusting artifact delivery
+  or a green test alone. It then looks for an open fix PR: if found it REVIEWS
+  that PR with the same audited test, journey, and diff review; otherwise it
+  root-causes and implements the fix, adds targeted
   unit/regression tests at the layer it changed, re-runs the set to confirm every
   live facet goes fail→pass, re-records the repro drivers on the fixed tree so
   the before/after footage pair lands in the PR's Demo section (and on the
