@@ -233,6 +233,8 @@ export interface ResponseStartBlock {
 export interface UserMessageBlock {
   type: "user_message";
   ctx: BlockContext;
+  /** Original web submission identity retained across native transcript forwarding. */
+  clientSubmissionId?: string;
   /** Same shape as `MessageItem.content` from the items API. */
   content: MessageContentBlock[];
   /**

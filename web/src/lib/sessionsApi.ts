@@ -213,6 +213,7 @@ interface SessionResponseWire {
    */
   pending_inputs?: {
     pending_id: string;
+    stable_id?: string;
     content: MessageContentBlock[];
     created_by?: string;
   }[];
@@ -349,6 +350,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     pendingElicitations: wire.pending_elicitations ?? [],
     pendingInputs: (wire.pending_inputs ?? []).map((p) => ({
       pendingId: p.pending_id,
+      ...(p.stable_id !== undefined ? { stableId: p.stable_id } : {}),
       content: p.content,
       ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
     })),

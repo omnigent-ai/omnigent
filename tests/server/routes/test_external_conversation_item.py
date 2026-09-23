@@ -5,6 +5,24 @@ from omnigent.server.routes.sessions import _parse_external_conversation_item
 from omnigent.server.schemas import SessionEventInput
 
 
+def test_external_item_cannot_claim_another_client_submission() -> None:
+    parsed = _parse_external_conversation_item(
+        SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "different message"}],
+                    "client_submission_id": "a" * 32,
+                },
+            },
+        )
+    )
+    assert isinstance(parsed.data, MessageData)
+    assert parsed.data.client_submission_id is None
+
+
 def test_native_message_stream_id_survives_snapshot_serialization() -> None:
     """The completed item durably identifies the preview stream it replaces."""
     parsed = _parse_external_conversation_item(

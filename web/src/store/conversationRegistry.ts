@@ -240,9 +240,19 @@ export class ConversationRegistry {
       const missingPending = old
         .getState()
         .pendingUserMessages.filter((item) => !existingPendingIds.has(item.tempId));
-      if (missingPending.length > 0) {
+      const existingFailedIds = new Set(existingState.failedUserMessages.map((m) => m.stableId));
+      const missingFailed = old
+        .getState()
+        .failedUserMessages.filter((m) => !existingFailedIds.has(m.stableId))
+        .map((m) => ({
+          ...m,
+          conversationId: newId,
+          status: m.status === "checking" ? ("unknown" as const) : m.status,
+        }));
+      if (missingPending.length > 0 || missingFailed.length > 0) {
         existing.setState({
           pendingUserMessages: [...missingPending, ...existingState.pendingUserMessages],
+          failedUserMessages: [...missingFailed, ...existingState.failedUserMessages],
         });
       }
       this.release(oldId);
@@ -250,7 +260,14 @@ export class ConversationRegistry {
       return;
     }
     const next = this.createEntry(newId);
-    next.setState(old.getState());
+    next.setState({
+      ...old.getState(),
+      failedUserMessages: old.getState().failedUserMessages.map((m) => ({
+        ...m,
+        conversationId: newId,
+        status: m.status === "checking" ? "unknown" : m.status,
+      })),
+    });
     this.entries.set(newId, next);
     this.entries.delete(oldId);
     old.dispose();
@@ -337,21 +354,13 @@ export class ConversationRegistry {
   }
 }
 
-/**
- * Whether an entry holds work the server has no record of.
- *
- * Two shapes of client-only work, each existing nowhere but this tab, so
- * evicting the entry would lose it outright — the cases where dropping an entry
- * is NOT equivalent to a cold load (the hazard `pendingByConversation` was built
- * to survive; pinning replaces that stash):
- *
- *   - an unsettled optimistic bubble (`send`'s POST hasn't returned); and
- *   - a `failedSendDraft` — a send that failed AND rolled its bubble back, so
- *     the draft is the sole surviving copy of the user's text and files. It is
- *     held until the composer restores it on return; evicting first drops it.
- */
+/** Keep client-only submissions and their files alive across navigation. */
 function hasUnsentWork(state: ConversationState): boolean {
-  return state.pendingUserMessages.some((m) => m.posted !== true) || state.failedSendDraft !== null;
+  return (
+    state.pendingUserMessages.some((m) => m.posted !== true) ||
+    state.failedUserMessages.length > 0 ||
+    state.failedSendDraft !== null
+  );
 }
 
 /** The app's registry. Module-scope, like the store it backs. */

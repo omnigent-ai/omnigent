@@ -161,8 +161,8 @@ export interface SendOptions {
   onConversationCreated?: (conversationId: string) => void;
   /**
    * Stable id to reuse for this send instead of generating a fresh one.
-   * Set by ChatPage when retrying a `failedSendDraft` so the server-side
-   * dedup recognises the retry and does not re-dispatch to the runner.
+   * Reuse only for a submission known not to have reached the message POST.
+   * Transcript deduplication does not guarantee dispatch deduplication.
    */
   stableId?: string;
   /**
@@ -482,6 +482,7 @@ export function removeLocalConversation(tempConvId: string): boolean {
  */
 export interface PendingUserMessage {
   tempId: string;
+  stableId?: string;
   content: MessageContentBlock[];
   /** Client epoch seconds stamped ONCE at send time — the optimistic
    *  bubble's display timestamp. Stamping here (not at render or
@@ -502,6 +503,20 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+}
+
+/** A retained submission whose delivery failed or could not be confirmed. */
+export interface FailedUserMessage {
+  stableId: string;
+  conversationId: string;
+  text: string;
+  files: File[];
+  content: MessageContentBlock[];
+  agentId: string;
+  createdAtS: number;
+  status: "not_sent" | "unknown" | "checking";
+  message?: string;
+  replyDraft?: StoredReplyDraft;
 }
 
 /**
@@ -590,6 +605,8 @@ export interface ConversationState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /** Retained independently of the composer until sent or acceptance is confirmed. */
+  failedUserMessages: FailedUserMessage[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -751,22 +768,7 @@ export interface ConversationState {
    * fetch. `null` until the first snapshot is hydrated.
    */
   oldestItemId: string | null;
-  /**
-   * The text + attachments of a send that failed before the server took
-   * ownership of it, handed back so the composer can restore them for a
-   * retry. Without this the message is simply gone: `submit` clears the
-   * composer optimistically, and a first message carried in from the
-   * landing screen has already had its draft dropped and its pending
-   * prompt destructively consumed — so an upload 415 or a runner 503 left
-   * the user with an error and nothing to resend. The composer drains this
-   * (matching on conversation id) and clears it.
-   *
-   * Single-slot: a second failure in the same session replaces the first's
-   * retained draft (last failure wins). A send that fails before any session
-   * id resolves isn't captured — there is no composer keyed to restore it
-   * into — but the landing path binds a session first, so the reported flow
-   * is covered.
-   */
+  /** Legacy composer restore slot; regular failures live in failedUserMessages. */
   failedSendDraft: {
     conversationId: string;
     text: string;
@@ -775,9 +777,8 @@ export interface ConversationState {
     replyDraft?: StoredReplyDraft;
   } | null;
   /**
-   * Stable id set by the failedSendDraft restore path so the next send()
-   * call can reuse it instead of generating a fresh UUID, preventing a
-   * duplicate dispatch on retry.
+   * Legacy composer retry id. New recovery only retries submissions whose
+   * message POST never started.
    */
   pendingRetryStableId: string | null;
   /**
@@ -1027,6 +1028,9 @@ export interface AppChatState {
 /** Actions exposed on the root store. */
 export interface ChatActions {
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  retryFailedMessage: (stableId: string, editedText?: string) => Promise<void>;
+  updateFailedMessage: (stableId: string, text: string, files?: File[]) => void;
+  checkFailedMessage: (stableId: string) => Promise<void>;
   clearSideChatToOpen: () => void;
   /** Open a generic side chat as a rail tab under `parentId`, seeding its
    *  composer with `draft` (the typed `/side` question) so it isn't lost while
@@ -1335,6 +1339,24 @@ interface SendChain {
   tail: Promise<void>;
 }
 const sendChains = new Map<string | symbol, SendChain>();
+const failedMessageRetries = new Set<string>();
+const failedMessagePendingIds = new Map<string, string>();
+
+function assertOnlineForSend(): void {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    throw new Error("You're offline. Your message is saved in this tab.");
+  }
+}
+
+function findFailedMessage(
+  stableId: string,
+): { entry: ConversationEntry; message: FailedUserMessage } | undefined {
+  for (const entry of conversationRegistry.all()) {
+    const message = entry.getState().failedUserMessages.find((m) => m.stableId === stableId);
+    if (message !== undefined) return { entry, message };
+  }
+  return undefined;
+}
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -1576,6 +1598,8 @@ export function initChatStore(client: QueryClient): void {
   // the next one (production calls this once at boot; tests call it per case).
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
+  failedMessageRetries.clear();
+  failedMessagePendingIds.clear();
   queryClient = client;
 }
 
@@ -1687,6 +1711,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  failedUserMessages: [],
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -2005,6 +2030,126 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       };
     });
   },
+  updateFailedMessage: (stableId, text, files) => {
+    const found = findFailedMessage(stableId);
+    if (
+      found === undefined ||
+      found.message.status !== "not_sent" ||
+      failedMessageRetries.has(stableId)
+    )
+      return;
+    const retainedFiles = files ?? found.message.files;
+    if (retainedFiles.some((file) => !found.message.files.includes(file))) return;
+    if (!text.trim() && retainedFiles.length === 0) return;
+    found.entry.setState((s) => ({
+      failedUserMessages: s.failedUserMessages.map((m) =>
+        m.stableId === stableId
+          ? {
+              ...m,
+              text,
+              files: retainedFiles,
+              content: [
+                ...retainedFiles.map((file): MessageContentBlock => ({
+                  type: file.type.startsWith("image/") ? "input_image" : "input_file",
+                  file_id: `${PENDING_FILE_PREFIX}${attachmentKey(file)}`,
+                  filename: file.name || "image.png",
+                })),
+                ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
+              ],
+              ...(text !== m.text ? { replyDraft: undefined } : {}),
+            }
+          : m,
+      ),
+    }));
+  },
+  retryFailedMessage: async (stableId, editedText) => {
+    if (failedMessageRetries.has(stableId)) return;
+    const found = findFailedMessage(stableId);
+    if (found === undefined || found.message.status !== "not_sent") return;
+    const text = editedText ?? found.message.text;
+    if (!text.trim() && found.message.files.length === 0) return;
+    failedMessageRetries.add(stableId);
+    const { message, entry } = found;
+    entry.setState((s) => ({
+      failedUserMessages: s.failedUserMessages.filter((m) => m.stableId !== stableId),
+    }));
+    try {
+      await get().send(text, message.agentId, message.files, {
+        pinnedConversationId: entry.id,
+        stableId,
+        ...(text === message.text && message.replyDraft ? { replyDraft: message.replyDraft } : {}),
+      });
+    } finally {
+      failedMessageRetries.delete(stableId);
+    }
+  },
+  checkFailedMessage: async (stableId) => {
+    const found = findFailedMessage(stableId);
+    if (found === undefined || found.message.status !== "unknown") return;
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+    const { entry } = found;
+    entry.setState((s) => ({
+      failedUserMessages: s.failedUserMessages.map((m) =>
+        m.stableId === stableId ? { ...m, status: "checking" } : m,
+      ),
+    }));
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const [sessionResult, pageResult] = await Promise.allSettled([
+        getSessionSlim(entry.id, { signal: controller.signal }),
+        fetchSessionItemsPage(entry.id, { limit: INITIAL_WINDOW_ITEMS, signal: controller.signal }),
+      ]);
+      if (entry.disposed) return;
+      const session = sessionResult.status === "fulfilled" ? sessionResult.value : undefined;
+      const items = pageResult.status === "fulfilled" ? pageResult.value.items : [];
+      const pending = session?.pendingInputs?.find((p) => p.stableId === stableId);
+      if (pending !== undefined) failedMessagePendingIds.set(stableId, pending.pendingId);
+      const committed = items.find(
+        (item) =>
+          isMessageItem(item) &&
+          item.role === "user" &&
+          (item.id === stableId || item.client_submission_id === stableId),
+      );
+      entry.setState((s) => {
+        const alreadyCommitted = hasCommittedSubmission(s.blocks, stableId);
+        if (committed === undefined && !alreadyCommitted) {
+          // A missing snapshot entry cannot distinguish rejection, TTL expiry,
+          // and a request still in flight. Never turn absence into safe retry.
+          return {
+            failedUserMessages: s.failedUserMessages.map((m) =>
+              m.stableId === stableId
+                ? {
+                    ...m,
+                    status: "unknown",
+                    ...(pending !== undefined
+                      ? {
+                          message:
+                            "Your message reached the server. Waiting for delivery confirmation.",
+                        }
+                      : {}),
+                  }
+                : m,
+            ),
+          };
+        }
+        failedMessagePendingIds.delete(stableId);
+        const blocks =
+          committed !== undefined && !alreadyCommitted && !hasCommittedItem(s.blocks, committed.id)
+            ? [...s.blocks, ...itemsToBlocks([committed])]
+            : s.blocks;
+        return {
+          failedUserMessages: s.failedUserMessages.filter((m) => m.stableId !== stableId),
+          blocks,
+          pendingUserMessages: s.pendingUserMessages.filter(
+            (p) => p.stableId !== stableId && p.tempId !== pending?.pendingId,
+          ),
+        };
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  },
   send: async (text, agentId, files, opts) => {
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
@@ -2089,6 +2234,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       ...pendingFileBlocks,
       ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
     ];
+    const createdAtS = Math.floor(Date.now() / 1000);
     const selfAuthor = getCurrentAuthorId();
     if (reuseTempId === null) {
       pinnedSetter((s) => ({
@@ -2098,8 +2244,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               ...s.pendingUserMessages,
               {
                 tempId,
+                stableId,
                 content,
-                createdAtS: Math.floor(Date.now() / 1000),
+                createdAtS,
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
               },
             ],
@@ -2111,6 +2258,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // authoritatively. Only the parked-dialog reason clears — a fresh send is
         // not parked on a dialog.
         blockedOn: null,
+      }));
+    } else {
+      pinnedSetter((s) => ({
+        pendingUserMessages: s.pendingUserMessages.map((p) =>
+          p.tempId === tempId ? { ...p, stableId } : p,
+        ),
       }));
     }
 
@@ -2125,19 +2278,32 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // finally below. This serializes POSTs in submission order without delaying
     // the optimistic bubble rendered above. The wait is bounded (see
     // `enterSendChain`), so a stalled prior send can't queue this one forever.
-    const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
+    let releaseSend: () => void = () => {};
 
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    let messagePostStarted = false;
+    let retainedContent = content;
 
     try {
-      await waitForPrior();
+      assertOnlineForSend();
+      const chain = enterSendChain(submitConversationId);
+      releaseSend = chain.releaseSend;
+      await chain.waitForPrior();
+      assertOnlineForSend();
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
+      const sessionId = await ensureBoundSession(
+        agentId,
+        get,
+        opts,
+        submitConversationId,
+        chain.rekey,
+      );
       postedSessionId = sessionId;
+      assertOnlineForSend();
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -2149,6 +2315,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
       ];
+      retainedContent = serverContent;
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -2167,6 +2334,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
       }
 
+      assertOnlineForSend();
+      messagePostStarted = true;
       const postResult = await postEvent(sessionId, {
         type: "message",
         data: {
@@ -2222,89 +2391,51 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const { message, code } = describeSendFailure(err);
-      // A codex `/side` that armed the side-chat latch (line ~2103) but then
-      // failed — e.g. the host is too old and the server refused — must disarm
-      // it, or the next sub-agent created under this parent would wrongly open
-      // as a side-chat tab. Clear only our own arm: a newer `/side` re-arm or a
-      // `session_created` that already consumed the latch must not be clobbered.
       if (opensSideChat && get().awaitingSideChatFor === submitConversationId) {
         useChatStore.setState({ awaitingSideChatFor: null });
       }
-      // A caller that owns its own failure UX (e.g. a codex `/side`, whose error
-      // belongs to the side-chat tab, not the parent chat) takes the message and
-      // suppresses the default surfacing below — no restored draft, no error
-      // block in the parent transcript. The bubble rollback + status settle still
-      // run so the parent isn't left mid-send.
       const callerHandlesError = opts?.onError !== undefined;
       opts?.onError?.(message);
-      // Hand the failed message back to the composer so the user can retry it —
-      // a failed send has no server-side record, so nothing else would restore
-      // it. Keyed by the session it was meant for, so it lands in the right
-      // composer even after a switch away. Written to that conversation's entry
-      // (`failedSendDraft` is conversation-scoped); the composer reads whichever
-      // conversation is active and guards on the id before restoring.
-      const draftSessionId = postedSessionId ?? submitConversationId;
-      if (
-        !callerHandlesError &&
-        draftSessionId !== null &&
-        (text.trim() !== "" || (files?.length ?? 0) > 0)
-      ) {
-        setterFor(draftSessionId)({
-          failedSendDraft: {
-            conversationId: draftSessionId,
-            text,
-            files: files ?? [],
-            stableId,
-            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
-          },
-        });
-      }
-      // Settle the conversation this send targeted, wherever the user is now:
-      // its bubble must roll back and its status must not stay "streaming"
-      // forever. Target `postedSessionId ?? submitConversationId` (mirroring the
-      // draft restore above): a bind failure throws before `postedSessionId` is
-      // assigned, but the pin/submit id already names the session — so a failed
-      // navigate-first first turn settles the REAL new session, not whatever
-      // chat the user has since switched to. Null id (the landing composer's own
-      // failure) falls back to the active conversation.
       const failTarget = postedSessionId ?? submitConversationId;
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
-      const failGet = (): ChatState =>
-        failTarget === null ? get() : (setterForState(failTarget) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
-      failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-      }));
-      if (!alreadyStreaming) {
-        if (failGet().activeResponse !== null) {
-          // A response bubble already exists (the turn started, then failed)
-          // — mark it failed so the error rides on that bubble.
-          finalizeActive(failSet, "failed", message, null);
-        } else if (!callerHandlesError) {
-          // No response bubble to carry the failure — the turn never started
-          // (e.g. the runner never came online, so POST /events 503'd). Append
-          // a standalone error block so the user sees WHY nothing happened
-          // instead of being left on a silent, empty composer. Skipped when the
-          // caller owns the error UX (it surfaces the failure elsewhere).
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+      failSet((s) => {
+        const patch: Partial<ChatState> = {
+          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        };
+        if (
+          !callerHandlesError &&
+          failTarget !== null &&
+          !hasCommittedSubmission(s.blocks, stableId) &&
+          (text.trim() || (files?.length ?? 0) > 0)
+        ) {
+          const failed: FailedUserMessage = {
+            stableId,
+            conversationId: failTarget,
+            text,
+            files: files ?? [],
+            content: retainedContent,
+            agentId,
+            createdAtS,
+            status: messagePostStarted ? "unknown" : "not_sent",
+            ...(!messagePostStarted && err instanceof ApiError ? { message } : {}),
+            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          };
+          patch.failedUserMessages = [
+            ...s.failedUserMessages.filter((m) => m.stableId !== stableId),
+            failed,
+          ];
+        } else if (!callerHandlesError && failTarget === null) {
+          // The legacy direct-create path has no conversation to own a card.
+          patch.blocks = [...s.blocks, makeClientErrorBlock(message, code)];
         }
-        failSet({
-          status: "idle",
-          sessionStatus: "idle",
-          backgroundTaskCount: 0,
-          backgroundTasks: [],
-        });
-      } else {
-        // Sent alongside an already-streaming turn (or a stranded latch): the
-        // bubble is rolled back above, so without a block the message vanishes
-        // with no trace — the failure mode that makes this class of bug so hard
-        // to see. Surface it WITHOUT touching the turn lifecycle: finalizeActive
-        // would fail a live response, and settling status would end a turn that
-        // is still running. Skipped when the caller owns the error UX.
-        if (!callerHandlesError) {
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+        // A lost POST response says nothing about a turn that already started.
+        // Only release our local send latch; never fail the agent's response.
+        if (!alreadyStreaming && s.activeResponse === null) {
+          patch.status = "idle";
+          patch.sendLatchedAt = null;
         }
-      }
+        return patch;
+      });
     } finally {
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -2537,6 +2668,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // Sends the server hasn't acknowledged, carried across the re-bind below.
     let unsentOnRebind: PendingUserMessage[] = [];
+    let failedOnRebind: FailedUserMessage[] = [];
     if (!wasLive) {
       // Drop any retained-but-dead entry so `acquire` builds a fresh one. A
       // re-bind has to start from the initial state: `bindStream` PREPENDS its
@@ -2549,6 +2681,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           .peek(conversationId)
           ?.getState()
           .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+      failedOnRebind = failedMessagesForRebind(conversationRegistry.peek(conversationId));
       conversationRegistry.release(conversationId);
     }
     const entry = conversationRegistry.acquire(conversationId);
@@ -2562,6 +2695,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       entry.setState({
         loadingConversation: true,
         ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
+        failedUserMessages: failedOnRebind,
       });
     }
     // Paint whatever the entry already holds. For a live entry that is the
@@ -3301,6 +3435,7 @@ function mirrorActiveEntry(): void {
 export async function ensureConversationStreamed(id: string): Promise<void> {
   if (id === "" || isTempConvId(id)) return;
   const existing = conversationRegistry.peek(id);
+  const failedOnRebind = failedMessagesForRebind(existing);
   if (existing !== undefined) {
     // Reuse only while a load is in flight (guards a double-bind) or the stream
     // is actually live. A non-reconnectable `server_closed` tears down the
@@ -3312,8 +3447,21 @@ export async function ensureConversationStreamed(id: string): Promise<void> {
     conversationRegistry.release(id);
   }
   const entry = conversationRegistry.acquire(id);
-  entry.setState({ loadingConversation: true, conversationLoadError: null });
+  entry.setState({
+    loadingConversation: true,
+    conversationLoadError: null,
+    failedUserMessages: failedOnRebind,
+  });
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
+}
+
+function failedMessagesForRebind(entry: ConversationEntry | undefined): FailedUserMessage[] {
+  return (
+    entry
+      ?.getState()
+      .failedUserMessages.map((m) => (m.status === "checking" ? { ...m, status: "unknown" } : m)) ??
+    []
+  );
 }
 
 // Route `useChatStore.setState` so a conversation-scoped write reaches the
@@ -3944,6 +4092,7 @@ async function bindStream(
       // keeping both would double-render and strand one of them.
       const toPending = (p: PendingInput): PendingUserMessage => ({
         tempId: p.pendingId,
+        ...(p.stableId ? { stableId: p.stableId } : {}),
         content: p.content,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
@@ -3951,7 +4100,16 @@ async function bindStream(
       if (!hydratePending) {
         candidatePending = state.pendingUserMessages;
       } else {
-        const serverPending = (session.pendingInputs ?? []).map(toPending);
+        const failedIds = new Set(state.failedUserMessages.map((m) => m.stableId));
+        const serverPending = (session.pendingInputs ?? [])
+          .filter((p) => {
+            if (p.stableId && failedIds.has(p.stableId)) {
+              failedMessagePendingIds.set(p.stableId, p.pendingId);
+              return false;
+            }
+            return true;
+          })
+          .map(toPending);
         // One-to-one consumption so two identical queued sends still match
         // pairwise. Content (not text) equality so image-only messages
         // correlate too.
@@ -4007,6 +4165,7 @@ async function bindStream(
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
+        failedUserMessages: unconfirmedFailedMessages(state.failedUserMessages, allBlocks),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
@@ -4583,6 +4742,7 @@ async function rehydrateWindowOnReconnect(
     );
     return {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      failedUserMessages: unconfirmedFailedMessages(s.failedUserMessages, merged),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -4766,6 +4926,7 @@ async function reconcileOnReconnect(
     );
     if (reconciled !== null) nextBlocks = reconciled;
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
+    patch.failedUserMessages = unconfirmedFailedMessages(s.failedUserMessages, nextBlocks);
     return patch;
   });
 }
@@ -5833,6 +5994,25 @@ function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
 }
 
+function hasCommittedSubmission(blocks: AnyBlock[], stableId: string): boolean {
+  return blocks.some(
+    (block) =>
+      block.type === "user_message" &&
+      (block.ctx.itemId === stableId || block.clientSubmissionId === stableId),
+  );
+}
+
+function unconfirmedFailedMessages(
+  messages: FailedUserMessage[],
+  blocks: AnyBlock[],
+): FailedUserMessage[] {
+  return messages.filter((message) => {
+    if (!hasCommittedSubmission(blocks, message.stableId)) return true;
+    failedMessagePendingIds.delete(message.stableId);
+    return false;
+  });
+}
+
 /**
  * Build the committed user-message content from a consumed event,
  * preserving optimistic file blocks the native transcript drops.
@@ -5881,6 +6061,7 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  clientSubmissionId?: string,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -5901,6 +6082,7 @@ function committedUserBlock(
     },
     content,
     stableKey,
+    ...(clientSubmissionId !== undefined ? { clientSubmissionId } : {}),
   };
 }
 
@@ -6617,6 +6799,49 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
       applyToConversation((s) => {
+        const clientSubmissionId =
+          typeof event.data.client_submission_id === "string"
+            ? event.data.client_submission_id
+            : undefined;
+        const committedBlocks =
+          clientSubmissionId === undefined
+            ? s.blocks
+            : s.blocks.map((block) =>
+                block.type === "user_message" && block.ctx.itemId === event.itemId
+                  ? { ...block, clientSubmissionId }
+                  : block,
+              );
+        const failed = s.failedUserMessages.find(
+          (m) =>
+            m.stableId === event.itemId ||
+            m.stableId === clientSubmissionId ||
+            (event.clearedPendingId != null &&
+              failedMessagePendingIds.get(m.stableId) === event.clearedPendingId),
+        );
+        if (failed !== undefined) {
+          const content = committedContentFor(event, failed.content);
+          if (content === null) return {};
+          failedMessagePendingIds.delete(failed.stableId);
+          return {
+            failedUserMessages: s.failedUserMessages.filter((m) => m.stableId !== failed.stableId),
+            pendingUserMessages: s.pendingUserMessages.filter(
+              (p) => p.stableId !== failed.stableId && p.tempId !== event.clearedPendingId,
+            ),
+            blocks: hasCommittedItem(s.blocks, event.itemId)
+              ? committedBlocks
+              : [
+                  ...committedBlocks,
+                  committedUserBlock(
+                    event.itemId,
+                    content,
+                    failed.stableId,
+                    event.createdBy,
+                    failed.createdAtS,
+                    failed.stableId,
+                  ),
+                ],
+          };
+        }
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
@@ -6625,9 +6850,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // Same precision order as below (named entry, then FIFO head), minus
           // the append.
           const cleared = event.clearedPendingId;
-          const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
+          const at = s.pendingUserMessages.findIndex(
+            (p) =>
+              (clientSubmissionId !== undefined && p.stableId === clientSubmissionId) ||
+              (cleared != null && p.tempId === cleared),
+          );
           if (at >= 0) {
             return {
+              blocks: committedBlocks,
               pendingUserMessages: [
                 ...s.pendingUserMessages.slice(0, at),
                 ...s.pendingUserMessages.slice(at + 1),
@@ -6640,15 +6870,23 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
-          if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          if (s.pendingUserMessages.length === 0) return {};
-          return { pendingUserMessages: s.pendingUserMessages.slice(1) };
+          if (
+            clientSubmissionId !== undefined ||
+            (eventContent !== null && isSystemUserContent(eventContent)) ||
+            s.pendingUserMessages.length === 0
+          )
+            return { blocks: committedBlocks };
+          return { blocks: committedBlocks, pendingUserMessages: s.pendingUserMessages.slice(1) };
         }
 
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;
-        if (cleared) {
-          const idx = s.pendingUserMessages.findIndex((p) => p.tempId === cleared);
+        if (cleared || clientSubmissionId !== undefined) {
+          const idx = s.pendingUserMessages.findIndex(
+            (p) =>
+              (clientSubmissionId !== undefined && p.stableId === clientSubmissionId) ||
+              (cleared != null && p.tempId === cleared),
+          );
           if (idx >= 0) {
             const matched = s.pendingUserMessages[idx]!;
             const content = committedContentFor(event, matched.content);
@@ -6668,6 +6906,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  clientSubmissionId ?? matched.stableId,
                 ),
               ],
             };
@@ -6684,7 +6923,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    branch 1 and never reaches this fallback.
         const eventContent = userContentFromEvent(event);
         const head =
-          eventContent !== null && isSystemUserContent(eventContent)
+          clientSubmissionId !== undefined ||
+          (eventContent !== null && isSystemUserContent(eventContent))
             ? undefined
             : s.pendingUserMessages[0];
         if (head) {
@@ -6713,7 +6953,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              clientSubmissionId,
+            ),
           ],
         };
       });

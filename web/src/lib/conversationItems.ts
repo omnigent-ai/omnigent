@@ -32,6 +32,8 @@ export interface MessageItem extends BaseItem {
   model?: string;
   /** Human author email; omitted for agent/tool/system items. */
   created_by?: string;
+  /** Original web submission identity, independent of the transcript item ID. */
+  client_submission_id?: string;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */

@@ -61,6 +61,7 @@ import {
   ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
   beginLocalConversation,
   consumePendingInitialPrompt,
+  ensureConversationStreamed,
   handleSessionEvent,
   hydrateLocalConversation,
   isStaleCompletedResponse,
@@ -503,6 +504,7 @@ beforeEach(() => {
     conversationId: null,
     blocks: [],
     pendingUserMessages: [],
+    failedUserMessages: [],
     queuedMessages: [],
     activeResponse: null,
     status: "idle",
@@ -568,7 +570,7 @@ function seedPendingElicitations(id: string, events: Record<string, unknown>[]):
 
 function seedPendingInputs(
   id: string,
-  inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
+  inputs: { pending_id: string; stable_id?: string; content: unknown[]; created_by?: string }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
 }
@@ -2851,11 +2853,7 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
-  it("surfaces a visible error block with friendly copy when the runner is unavailable (503)", async () => {
-    // The fresh-send failure mode: POST /events 503s because a host-bound
-    // runner never came online. Before this, finalizeActive was a no-op (no
-    // activeResponse) so the user was left on a silent, empty composer. Now
-    // the failure must render as an error block explaining what happened.
+  it("retains a runner-unavailable failure beside the message without a generic error banner", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -2882,22 +2880,17 @@ describe("chatStore — send (first-send ordering)", () => {
     // Optimistic bubble rolled back, turn settled to idle.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
-    expect(state.sessionStatus).toBe("idle");
-    // A standalone error block is appended carrying the friendly, retryable
-    // copy — NOT the server's terse "No runner bound for session" — and no
-    // raw code in the banner (code "" → clean "Error" title).
-    const errorBlocks = state.blocks.filter((b) => b.type === "error");
-    expect(errorBlocks).toHaveLength(1);
-    expect(errorBlocks[0]).toMatchObject({
-      type: "error",
-      message: "The runner didn't come online in time. Please try again.",
-      code: "",
-    });
+    expect(state.sessionStatus).toBe("running");
+    expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
+    expect(state.failedUserMessages).toMatchObject([
+      {
+        text: "hi",
+        status: "unknown",
+      },
+    ]);
   });
 
-  it("carries a non-runner send failure's own message into the error block", async () => {
-    // A generic failure (not runner_unavailable) must still become visible,
-    // using the server-provided message and code so it isn't swallowed.
+  it("keeps a server POST error uncertain without displaying retry instructions", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -2918,13 +2911,14 @@ describe("chatStore — send (first-send ordering)", () => {
 
     await useChatStore.getState().send("hi", "agent_xyz");
 
-    const errorBlocks = useChatStore.getState().blocks.filter((b) => b.type === "error");
-    expect(errorBlocks).toHaveLength(1);
-    expect(errorBlocks[0]).toMatchObject({
-      type: "error",
-      message: "boom on the server",
-      code: "internal_error",
-    });
+    expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toHaveLength(0);
+    expect(useChatStore.getState().failedUserMessages).toMatchObject([
+      {
+        text: "hi",
+        status: "unknown",
+      },
+    ]);
+    expect(useChatStore.getState().failedUserMessages[0]!.message).toBeUndefined();
   });
 
   it("routes a send failure to opts.onError and suppresses the default error block + draft", async () => {
@@ -2962,6 +2956,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // Default surfacing suppressed: no error block, no restored draft.
     expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
     expect(state.failedSendDraft).toBeNull();
+    expect(state.failedUserMessages).toEqual([]);
     // Bubble still rolled back and status still settled.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
@@ -3188,7 +3183,8 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(real.status).toBe("idle");
     expect(real.pendingUserMessages).toEqual([]);
     // The failure is surfaced, not swallowed.
-    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(1);
+    expect(real.failedUserMessages).toHaveLength(1);
+    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
 
   it("B1: a policy-denied first message settles to idle", async () => {
@@ -3265,7 +3261,8 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     const real = conversationRegistry.peek("conv_real")!.getState();
     expect(real.status).toBe("idle");
     expect(real.pendingUserMessages).toEqual([]);
-    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(1);
+    expect(real.failedUserMessages).toHaveLength(1);
+    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
 
   it("does not promote the visible store when the route already left the temp chat", () => {
@@ -3867,8 +3864,8 @@ describe("chatStore — send while streaming (queueing)", () => {
 
     const state = useChatStore.getState();
     const errorBlocks = state.blocks.filter((b) => b.type === "error");
-    expect(errorBlocks).toHaveLength(1);
-    expect(errorBlocks[0]).toMatchObject({ type: "error", message: "network down" });
+    expect(errorBlocks).toHaveLength(0);
+    expect(state.failedUserMessages).toMatchObject([{ status: "unknown" }]);
     // The optimistic bubble rolls back — no server record will reconcile it.
     expect(state.pendingUserMessages).toHaveLength(0);
     // The in-flight turn keeps its lifecycle: not failed, not settled.
@@ -4635,9 +4632,7 @@ describe("chatStore — send (file attachments)", () => {
   });
 
   it("hands the message back for retry when the upload is rejected", async () => {
-    // A 415 on an unsupported attachment must not swallow the typed text: the
-    // optimistic bubble rolls back, so `failedSendDraft` is the only thing
-    // left holding it. The banner carries the server's reason, not "415".
+    // The submission retains its files and text independently of the composer.
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -4663,15 +4658,18 @@ describe("chatStore — send (file attachments)", () => {
     const state = useChatStore.getState();
     // Optimistic bubble rolled back — the send never reached the server.
     expect(state.pendingUserMessages).toEqual([]);
-    expect(state.failedSendDraft).toEqual({
-      conversationId: "conv_existing",
-      text: "summarize these photos",
-      files: [zip],
-      stableId: expect.any(String),
-    });
-    const error = state.blocks.at(-1) as { type: string; message: string };
-    expect(error.type).toBe("error");
-    expect(error.message).toContain("Unsupported attachment type 'application/zip'");
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.failedUserMessages).toMatchObject([
+      {
+        conversationId: "conv_existing",
+        text: "summarize these photos",
+        files: [zip],
+        stableId: expect.any(String),
+        status: "not_sent",
+        message: expect.stringContaining("Unsupported attachment type 'application/zip'"),
+      },
+    ]);
+    expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
 
   it("keeps quote provenance client-side and returns it with a failed send", async () => {
@@ -4702,7 +4700,441 @@ describe("chatStore — send (file attachments)", () => {
         stable_id: expect.any(String),
       },
     });
-    expect(useChatStore.getState().failedSendDraft).toMatchObject({ text, replyDraft, files: [] });
+    expect(useChatStore.getState().failedUserMessages).toMatchObject([
+      { text, replyDraft, files: [] },
+    ]);
+  });
+});
+
+describe("chatStore — failed submission recovery", () => {
+  function existingConversation(id = "conv_existing") {
+    bindConversationForTest(id, {
+      abortController: new AbortController(),
+      boundAgentId: "agent_xyz",
+    });
+  }
+
+  function eventPosts() {
+    return fetchMock.mock.calls.filter(
+      ([url, init]) => String(url).endsWith("/events") && init?.method === "POST",
+    );
+  }
+
+  it("keeps multiple offline submissions and attachments without binding, uploading, or posting", async () => {
+    bindConversationForTest("conv_offline");
+    vi.stubGlobal("navigator", { onLine: false });
+    const file = new File(["report"], "report.txt", { type: "text/plain" });
+
+    await useChatStore.getState().send("first draft", "agent_xyz", [file]);
+    await useChatStore.getState().send("newer draft", "agent_xyz");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.failedUserMessages).toMatchObject([
+      { text: "first draft", files: [file], status: "not_sent", conversationId: "conv_offline" },
+      { text: "newer draft", files: [], status: "not_sent", conversationId: "conv_offline" },
+    ]);
+    expect(state.failedUserMessages[0]!.stableId).not.toBe(state.failedUserMessages[1]!.stableId);
+    expect(state.failedUserMessages[0]!.message).toBeUndefined();
+    expect(state.blocks.filter((b) => b.type === "error")).toEqual([]);
+    bindConversationForTest("conv_other");
+    expect(useChatStore.getState().failedUserMessages).toEqual([]);
+    expect(conversationRegistry.peek("conv_offline")!.getState().failedUserMessages).toHaveLength(
+      2,
+    );
+  });
+
+  it("edits only a definitely unsent submission without dispatching or losing its attachments", async () => {
+    existingConversation();
+    vi.stubGlobal("navigator", { onLine: false });
+    const file = new File(["report"], "report.txt", { type: "text/plain" });
+    await useChatStore.getState().send("original", "agent_xyz", [file]);
+    const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+    useChatStore.getState().updateFailedMessage(stableId, "edited");
+    expect(useChatStore.getState().failedUserMessages[0]).toMatchObject({
+      stableId,
+      text: "edited",
+      files: [file],
+      status: "not_sent",
+      content: [
+        expect.objectContaining({ type: "input_file" }),
+        { type: "input_text", text: "edited" },
+      ],
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("retries an unsent message once with the same ID and its original conversation", async () => {
+    existingConversation();
+    vi.stubGlobal("navigator", { onLine: false });
+    await useChatStore.getState().send("retry this", "agent_xyz");
+    const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+    vi.stubGlobal("navigator", { onLine: true });
+    bindConversationForTest("conv_other", { abortController: new AbortController() });
+    let accept: () => void = () => {};
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input) === "/v1/sessions/conv_existing/events" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          accept = () => resolve(mockResponse({ queued: true }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const first = useChatStore.getState().retryFailedMessage(stableId);
+    const second = useChatStore.getState().retryFailedMessage(stableId);
+    await tick();
+    expect(eventPosts()).toHaveLength(1);
+    expect(JSON.parse(String(eventPosts()[0]![1]!.body)).data.stable_id).toBe(stableId);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    accept();
+    await Promise.all([first, second]);
+    const state = conversationRegistry.peek("conv_existing")!.getState();
+    expect(state.failedUserMessages).toEqual([]);
+    expect(state.pendingUserMessages).toMatchObject([{ posted: true, stableId }]);
+  });
+
+  it("can remove a rejected attachment before retrying the saved text", async () => {
+    existingConversation();
+    const file = new File(["unsupported"], "photos.zip", { type: "application/zip" });
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/resources/files")) {
+        return mockResponse({ detail: "Unsupported attachment" }, { ok: false, status: 415 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("Review this request", "agent_xyz", [file]);
+    const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+    useChatStore.getState().updateFailedMessage(stableId, "Review this request", []);
+    expect(useChatStore.getState().failedUserMessages).toMatchObject([
+      { files: [], content: [{ type: "input_text", text: "Review this request" }] },
+    ]);
+
+    await useChatStore.getState().retryFailedMessage(stableId);
+    expect(useChatStore.getState().failedUserMessages).toEqual([]);
+    expect(eventPosts()).toHaveLength(1);
+    expect(JSON.parse(String(eventPosts()[0]![1]!.body)).data.content).toEqual([
+      { type: "input_text", text: "Review this request" },
+    ]);
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/resources/files")),
+    ).toHaveLength(1);
+  });
+
+  it("rejects an empty attachment-only edit and files outside the retained submission", async () => {
+    existingConversation();
+    vi.stubGlobal("navigator", { onLine: false });
+    const file = new File(["report"], "report.txt", { type: "text/plain" });
+    await useChatStore.getState().send("", "agent_xyz", [file]);
+    const retained = useChatStore.getState().failedUserMessages[0]!;
+    useChatStore.getState().updateFailedMessage(retained.stableId, "", []);
+    useChatStore
+      .getState()
+      .updateFailedMessage(retained.stableId, "replacement", [new File(["other"], "other.txt")]);
+    expect(useChatStore.getState().failedUserMessages).toEqual([retained]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps an ambiguous POST failure unknown when snapshots lack its exact ID and blocks blind retries", async () => {
+    existingConversation();
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST")
+        throw new TypeError("Failed to fetch");
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("same text", "agent_xyz");
+    const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+    seedPendingInputs("conv_existing", [
+      {
+        pending_id: "someone_else",
+        stable_id: "different_id",
+        content: [{ type: "input_text", text: "same text" }],
+      },
+    ]);
+    seedSessionItems("conv_existing", [userMessage("other", "same text")]);
+    await useChatStore.getState().checkFailedMessage(stableId);
+    await useChatStore.getState().retryFailedMessage(stableId);
+    useChatStore.getState().updateFailedMessage(stableId, "must not edit uncertain delivery");
+    expect(eventPosts()).toHaveLength(1);
+    expect(useChatStore.getState().failedUserMessages).toMatchObject([
+      { stableId, text: "same text", status: "unknown" },
+    ]);
+    expect(useChatStore.getState().failedUserMessages[0]!.message).toBeUndefined();
+  });
+
+  it("retains a provisional pending submission until its consumed event confirms delivery", async () => {
+    existingConversation();
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST")
+        throw new TypeError("Failed to fetch");
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("accepted once", "agent_xyz");
+    const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+    seedPendingInputs("conv_existing", [
+      {
+        pending_id: "pending_accepted",
+        stable_id: stableId,
+        content: [{ type: "input_text", text: "accepted once" }],
+      },
+    ]);
+    await useChatStore.getState().checkFailedMessage(stableId);
+    expect(eventPosts()).toHaveLength(1);
+    expect(useChatStore.getState().failedUserMessages).toMatchObject([
+      {
+        stableId,
+        status: "unknown",
+        message: "Your message reached the server. Waiting for delivery confirmation.",
+      },
+    ]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    useChatStore.setState({
+      pendingUserMessages: [
+        {
+          tempId: "newer_unrelated",
+          stableId: "newer_stable",
+          content: [{ type: "input_text", text: "newer draft" }],
+        },
+      ],
+    });
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemType: "message",
+      itemId: "native_transcript_id",
+      clearedPendingId: "pending_accepted",
+      data: { role: "user", content: [{ type: "input_text", text: "accepted once" }] },
+    });
+    expect(useChatStore.getState().failedUserMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+      { tempId: "newer_unrelated" },
+    ]);
+    expect(useChatStore.getState().blocks).toMatchObject([
+      { type: "user_message", ctx: { itemId: "native_transcript_id" } },
+    ]);
+  });
+
+  it.each(["switchTo", "ensureConversationStreamed"] as const)(
+    "preserves retained files and resets checks when %s replaces a dead entry",
+    async (mode) => {
+      bindConversationForTest("conv_rebind");
+      vi.stubGlobal("navigator", { onLine: false });
+      const file = new File(["report"], "report.txt", { type: "text/plain" });
+      await useChatStore.getState().send("keep my message", "agent_xyz", [file]);
+      const old = conversationRegistry.peek("conv_rebind")!;
+      const retained = old.getState().failedUserMessages[0]!;
+      old.setState({ failedUserMessages: [{ ...retained, status: "checking" }] });
+      bindConversationForTest("conv_other");
+      vi.stubGlobal("navigator", { onLine: true });
+      if (mode === "switchTo") await useChatStore.getState().switchTo("conv_rebind");
+      else await ensureConversationStreamed("conv_rebind");
+      expect(old.disposed).toBe(true);
+      const recovered = conversationRegistry.peek("conv_rebind")!.getState().failedUserMessages;
+      expect(recovered).toMatchObject([
+        { stableId: retained.stableId, text: "keep my message", files: [file], status: "unknown" },
+      ]);
+    },
+  );
+
+  it("does not replay a second pending bubble beside a retained uncertain message on rebind", async () => {
+    existingConversation();
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST")
+        throw new TypeError("Failed to fetch");
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("pending once", "agent_xyz");
+    const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+    useChatStore.setState({ abortController: null });
+    seedPendingInputs("conv_existing", [
+      {
+        pending_id: "pending_rebind",
+        stable_id: stableId,
+        content: [{ type: "input_text", text: "pending once" }],
+      },
+    ]);
+    bindConversationForTest("conv_other");
+    await useChatStore.getState().switchTo("conv_existing");
+    expect(useChatStore.getState().failedUserMessages).toMatchObject([
+      { stableId, status: "unknown" },
+    ]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it("does not retry runner_unavailable when forwarding may already have accepted the message", async () => {
+    existingConversation();
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST") {
+        return mockResponse(
+          {
+            error: {
+              code: "runner_unavailable",
+              message:
+                "Runner is unreachable; message was persisted but could not be delivered. The runner may be restarting — retry or spawn a new session.",
+            },
+          },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("possibly delivered", "agent_xyz");
+    const failure = useChatStore.getState().failedUserMessages[0]!;
+    expect(failure.status).toBe("unknown");
+    await useChatStore.getState().retryFailedMessage(failure.stableId);
+    expect(eventPosts()).toHaveLength(1);
+  });
+
+  it("recovers an already committed submission by exact item ID", async () => {
+    existingConversation();
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST")
+        throw new TypeError("Failed to fetch");
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("committed once", "agent_xyz");
+    const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+    seedSessionItems("conv_existing", [
+      { ...userMessage("accepted", "committed once"), id: stableId },
+    ]);
+    await useChatStore.getState().checkFailedMessage(stableId);
+    expect(eventPosts()).toHaveLength(1);
+    expect(useChatStore.getState().failedUserMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().blocks).toMatchObject([
+      { type: "user_message", ctx: { itemId: stableId } },
+    ]);
+  });
+
+  it.each(["check", "rebind"])(
+    "recovers native history by durable submission identity on %s after pending input was consumed",
+    async (mode) => {
+      existingConversation();
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/events") && init?.method === "POST")
+          throw new TypeError("Failed to fetch");
+        return defaultFetchHandler(input, init);
+      });
+      await useChatStore.getState().send("already received", "agent_xyz");
+      const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+      seedSessionItems("conv_existing", [
+        {
+          ...userMessage("native_source", "already received"),
+          client_submission_id: stableId,
+        },
+      ]);
+      if (mode === "check") {
+        await useChatStore.getState().checkFailedMessage(stableId);
+      } else {
+        useChatStore.setState({ abortController: null });
+        bindConversationForTest("conv_other");
+        await useChatStore.getState().switchTo("conv_existing");
+      }
+      expect(useChatStore.getState().failedUserMessages).toEqual([]);
+      expect(useChatStore.getState().blocks).toMatchObject([
+        {
+          type: "user_message",
+          ctx: { itemId: "msg_native_source_user" },
+          clientSubmissionId: stableId,
+        },
+      ]);
+      expect(eventPosts()).toHaveLength(1);
+    },
+  );
+
+  it("clears a native failure on a consumed event without first reading a pending snapshot", async () => {
+    existingConversation();
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST")
+        throw new TypeError("Failed to fetch");
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("received once", "agent_xyz");
+    const stableId = useChatStore.getState().failedUserMessages[0]!.stableId;
+    const newer = {
+      tempId: "newer",
+      stableId: "newer_submission",
+      content: [{ type: "input_text" as const, text: "next request" }],
+    };
+    useChatStore.setState({ pendingUserMessages: [newer] });
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemType: "message",
+      itemId: "native_source_item",
+      clearedPendingId: "unseen_pending_id",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "received once" }],
+        client_submission_id: stableId,
+      },
+    });
+    expect(useChatStore.getState().failedUserMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([newer]);
+    expect(useChatStore.getState().blocks).toMatchObject([
+      { ctx: { itemId: "native_source_item" }, clientSubmissionId: stableId },
+    ]);
+    expect(eventPosts()).toHaveLength(1);
+  });
+
+  it("does not resurrect a failure when native consumption beats POST rejection", async () => {
+    existingConversation();
+    let rejectPost: (error: unknown) => void = () => {};
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST") {
+        return new Promise<Response>((_, reject) => {
+          rejectPost = reject;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const sending = useChatStore.getState().send("confirmed before failure", "agent_xyz");
+    await tick();
+    const stableId = useChatStore.getState().pendingUserMessages[0]!.stableId;
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemType: "message",
+      itemId: "native_source_item",
+      clearedPendingId: "unseen_pending_id",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "confirmed before failure" }],
+        client_submission_id: stableId,
+      },
+    });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    rejectPost(new TypeError("Failed to fetch"));
+    await sending;
+    expect(useChatStore.getState().failedUserMessages).toEqual([]);
+    expect(useChatStore.getState().blocks).toMatchObject([
+      { ctx: { itemId: "native_source_item" }, clientSubmissionId: stableId },
+    ]);
+    expect(eventPosts()).toHaveLength(1);
+  });
+
+  it("does not mark a response that started during the POST as failed when its response is lost", async () => {
+    existingConversation();
+    let rejectPost: (error: unknown) => void = () => {};
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST") {
+        return new Promise<Response>((_, reject) => {
+          rejectPost = reject;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const sending = useChatStore.getState().send("already running", "agent_xyz");
+    await tick();
+    const activeResponse = {
+      responseId: "running_response",
+      state: "streaming" as const,
+      error: null,
+    };
+    useChatStore.setState({ activeResponse, status: "streaming", sessionStatus: "running" });
+    rejectPost(new TypeError("Failed to fetch"));
+    await sending;
+    expect(useChatStore.getState().activeResponse).toEqual(activeResponse);
+    expect(useChatStore.getState().status).toBe("streaming");
+    expect(useChatStore.getState().failedUserMessages).toMatchObject([{ status: "unknown" }]);
   });
 });
 

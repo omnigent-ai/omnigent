@@ -318,6 +318,9 @@ function userMessageToBlock(item: MessageItem): UserMessageBlock {
   return {
     type: "user_message",
     ctx: ctxFor(item),
+    ...(item.client_submission_id !== undefined
+      ? { clientSubmissionId: item.client_submission_id }
+      : {}),
     // Forward the full content array verbatim so the renderer can
     // pluck text, images, and files without the translator imposing
     // an interpretation. Cast restricts to the user-input subset

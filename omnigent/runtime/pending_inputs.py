@@ -427,7 +427,8 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
         "created_by": "alice@example.com"}]``.  ``"created_by"`` is
         omitted (not ``null``) when unknown, keeping the wire shape
         backward-compatible with older clients.  Empty list when the
-        session has no un-consumed messages.
+        session has no un-consumed messages. ``"stable_id"`` is included
+        when provided by the client, so reconnects can identify the submission.
     """
     with _lock:
         _evict_stale_locked(conversation_id, _now())
@@ -439,6 +440,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 "pending_id": entry.pending_id,
                 "content": copy.deepcopy(entry.content),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
+                **({"stable_id": entry.stable_id} if entry.stable_id is not None else {}),
             }
             for entry in entries.values()
         ]

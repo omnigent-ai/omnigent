@@ -310,7 +310,7 @@ describe("createSession", () => {
     expect(session.queuedItems).toEqual(queued);
   });
 
-  it("maps pending_inputs (snake) to pendingInputs (camel) with content", async () => {
+  it("maps pending_inputs with optional client submission identity", async () => {
     // The snapshot replays un-consumed native web messages here so the
     // store re-hydrates the optimistic bubble on rebind. Each entry's
     // pending_id becomes the bubble's stable key and the content is
@@ -324,6 +324,11 @@ describe("createSession", () => {
         items: [],
         pending_inputs: [
           { pending_id: "pending_1", content: [{ type: "input_text", text: "queued" }] },
+          {
+            pending_id: "pending_2",
+            stable_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            content: [{ type: "input_text", text: "queued" }],
+          },
         ],
       }),
     );
@@ -331,6 +336,11 @@ describe("createSession", () => {
     const session = await createSession("agent_xyz");
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
+      {
+        pendingId: "pending_2",
+        stableId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        content: [{ type: "input_text", text: "queued" }],
+      },
     ]);
   });
 

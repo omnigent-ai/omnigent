@@ -311,6 +311,8 @@ class MessageData(BaseModel):
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
+    # Original web submission, independent of a native forwarder's item ID.
+    client_submission_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("content")
     @classmethod

@@ -204,6 +204,34 @@ describe("ConversationRegistry", () => {
     expect(a.disposed).toBe(true);
   });
 
+  it("pins failed submissions through navigation and updates their owner when rekeyed", () => {
+    const entry = registry.acquire("temp:failed");
+    entry.setState({
+      failedUserMessages: [
+        {
+          stableId: "submit_1",
+          conversationId: "temp:failed",
+          text: "keep me",
+          files: [],
+          content: [{ type: "input_text", text: "keep me" }],
+          agentId: "agent_1",
+          createdAtS: 1,
+          status: "unknown",
+        },
+      ],
+    });
+    registry.acquire("visible");
+    registry.setActive("visible");
+    expect(registry.evictLruEvictable()).toBeNull();
+    registry.rekey("temp:failed", "real_session");
+    expect(registry.peek("real_session")!.getState().failedUserMessages[0]!.conversationId).toBe(
+      "real_session",
+    );
+    expect(registry.evictLruEvictable()).toBeNull();
+    registry.peek("real_session")!.setState({ failedUserMessages: [] });
+    expect(registry.evictLruEvictable()).toBe("real_session");
+  });
+
   it("returns null when every entry is protected rather than destroying unsent work", () => {
     // The slot layer reads this null as "origin saturated, nothing of mine to
     // reclaim" and opens the active conversation over budget with the

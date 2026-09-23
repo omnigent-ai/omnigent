@@ -77,6 +77,19 @@ def test_record_then_snapshot_preserves_order_and_content() -> None:
     assert snap[1]["content"] == [_text_block("second")]
 
 
+def test_snapshot_preserves_client_submission_ids_when_present() -> None:
+    """Reconnects can distinguish identical messages by their submission ids."""
+    content = [_text_block("same message")]
+    pending_inputs.record("conv_a", content, stable_id="a" * 32)
+    pending_inputs.record("conv_a", content, stable_id="b" * 32)
+    pending_inputs.record("conv_a", content)
+
+    snapshot = pending_inputs.snapshot_for("conv_a")
+
+    assert [entry.get("stable_id") for entry in snapshot] == ["a" * 32, "b" * 32, None]
+    assert "stable_id" not in snapshot[2]
+
+
 def test_snapshot_returns_deep_copies() -> None:
     """
     Mutating a snapshot entry must not corrupt the stored content.
