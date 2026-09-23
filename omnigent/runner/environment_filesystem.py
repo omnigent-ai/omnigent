@@ -874,60 +874,51 @@ deferred = deque()
 scanned = 0
 truncated = False
 stop = False
+# os.walk is handed absolute roots, so an entry's path relative to `start` is
+# a slice of dirpath -- no per-entry relpath(), whose getcwd() calls used to
+# dominate the walk's runtime.
+root = os.path.abspath(start)
+cut = len(root) + 1
 
 
-def match_dir(dirpath, dname):
-    dfull = os.path.join(dirpath, dname)
-    dp = os.path.relpath(dfull, start)
-    # Every dir reaching here already passed the exc filter in scan()'s kept
-    # loop; re-checking keeps match_dir/match_file symmetric so a future
-    # refactor of that pre-filter can't silently leak excluded dirs.
-    if exc and any(r.match(dp) for r in exc):
-        return
-    if inc and not any(r.match(dp) for r in inc):
-        return
-    if q not in dname.lower() and q not in dp.lower():
-        return
-    try:
-        st = os.stat(dfull)
-        results.append({'n': dname, 'p': dp, 's': None, 'm': int(st.st_mtime), 'd': True})
-    except OSError:
-        results.append({'n': dname, 'p': dp, 's': None, 'm': None, 'd': True})
+def rel(dirpath, name):
+    dp = dirpath[cut:]
+    return dp + '/' + name if dp else name
 
 
-def match_file(dirpath, fname):
-    # stat the FULL path: p is relative to `start`, but the helper's cwd is the
-    # workspace root, so stat(p) would miss -- or worse, stat a same-named file.
-    full = os.path.join(dirpath, fname)
-    p = os.path.relpath(full, start)
+def match(dirpath, name, is_dir):
+    # A directory carries no byte size; a file stats for size + mtime. Every
+    # dir reaching here already passed the exc filter in scan()'s kept loop;
+    # re-checking keeps the two entry kinds symmetric so a future refactor of
+    # that pre-filter can't silently leak excluded dirs.
+    p = rel(dirpath, name)
     if exc and any(r.match(p) for r in exc):
         return
     if inc and not any(r.match(p) for r in inc):
         return
-    if q not in fname.lower() and q not in p.lower():
+    if q not in p.lower():
         return
     try:
-        st = os.stat(full)
-        results.append({'n': fname, 'p': p, 's': st.st_size, 'm': int(st.st_mtime), 'd': False})
+        st = os.stat(dirpath + '/' + name)
+        results.append({'n': name, 'p': p, 's': None if is_dir else st.st_size,
+                        'm': int(st.st_mtime), 'd': is_dir})
     except OSError:
-        results.append({'n': fname, 'p': p, 's': None, 'm': None, 'd': False})
+        results.append({'n': name, 'p': p, 's': None, 'm': None, 'd': is_dir})
 
 
-def scan(root, defer):
+def scan(walk_root, defer):
     # A query matching little or nothing never trips the result cap, so the walk
     # needs its own bound. Counted per entry: per-directory would let one huge
     # directory overshoot it.
     global scanned, truncated, stop
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(walk_root):
         kept = []
         for d in sorted(dirnames):
             if d == '.git':
                 # Git's own store is never a search target, and in a plain
                 # clone its reflogs alone can outnumber the source tree.
                 continue
-            full = os.path.join(dirpath, d)
-            dp = os.path.relpath(full, start)
-            if any(r.match(dp) for r in exc):
+            if any(r.match(rel(dirpath, d)) for r in exc):
                 continue
             if defer and d in depri:
                 # Match the dir itself now, but walk its subtree later (pass 2)
@@ -936,6 +927,7 @@ def scan(root, defer):
                 # committed 'node_modules -> ..' would let pass 2 escape the
                 # workspace. os.walk(followlinks=False) never crosses symlinks
                 # mid-tree; deferring only real dirs keeps that boundary intact.
+                full = dirpath + '/' + d
                 if not os.path.islink(full):
                     deferred.append(full)
             kept.append(d)
@@ -948,7 +940,7 @@ def scan(root, defer):
                 truncated = True
                 stop = True
                 return
-            match_dir(dirpath, dname)
+            match(dirpath, dname, True)
             if len(results) >= limit:
                 stop = True
                 return
@@ -958,13 +950,13 @@ def scan(root, defer):
                 truncated = True
                 stop = True
                 return
-            match_file(dirpath, fname)
+            match(dirpath, fname, False)
             if len(results) >= limit:
                 stop = True
                 return
 
 
-scan(start, True)
+scan(root, True)
 while deferred and not stop:
     scan(deferred.popleft(), False)
 # When the walk stops early it is always because scan() tripped the budget

@@ -358,9 +358,14 @@ class WorkspaceReader:
         truncated = False
         stop = False
 
+        # os.walk is handed the absolute root, so an entry's path relative to
+        # it is a slice of dirpath -- no per-entry relpath(), whose abspath()
+        # work used to dominate the walk's runtime.
+        cut = len(str(self._root)) + 1
+
         def rel(dirpath: str, name: str) -> str:
-            rel_dir = os.path.relpath(dirpath, self._root)
-            return os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, name))
+            rel_dir = dirpath[cut:]
+            return f"{rel_dir}/{name}" if rel_dir else name
 
         def match(dirpath: str, name: str, *, is_dir: bool) -> None:
             # A directory carries no byte size; a file stats for size + mtime.
