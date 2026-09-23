@@ -235,6 +235,7 @@ async def _drive_install(base_url: str) -> None:
             picker = page.get_by_test_id("new-chat-landing-agent-select")
             await expect(picker).to_have_attribute("aria-label", re.compile(r"^Claude Code,"))
             await picker.click()
+            await page.get_by_test_id("new-chat-landing-harness-more").click()
             codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
             await expect(codex_option).to_be_visible(timeout=60_000)
             await expect(codex_option).to_have_attribute("aria-disabled", "true")
