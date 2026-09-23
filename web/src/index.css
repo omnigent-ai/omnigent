@@ -1371,21 +1371,18 @@ aside[aria-label="Workspace"][data-maximized] {
   vertical-align: -0.075em;
 }
 
-/* Message highlights must match FLASH_DURATION_MS in chatStore.ts. */
+/* Message highlights must match FLASH_DURATION_MS in chatStore.ts.
+   Omit the final keyframe to fade back to the bubble's own background. */
 @keyframes message-highlight {
   0%,
   40% {
     background-color: var(--message-highlight);
-  }
-  100% {
-    background-color: transparent;
   }
 }
 
 .animate-message-highlight {
   --message-highlight: color-mix(in oklch, var(--warning) 16%, transparent);
   animation: message-highlight 1500ms ease-out;
-  border-radius: var(--radius-lg);
 }
 
 .dark .animate-message-highlight {
