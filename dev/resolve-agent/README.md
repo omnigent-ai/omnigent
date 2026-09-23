@@ -178,10 +178,13 @@ It does **not** merge. See `AGENTS.md` for the full operating procedure.
 ### Verification limits
 
 The shared audit is an instruction-level requirement, not an execution gate.
-The CI handoff parser and checkpoint delivery-readiness check can accept a
-`fixed` claim without test evidence when their identity and publication-shape
-checks pass. Neither test restoration nor a `test_audit` narrative proves that
-the agent executed the same assertions before and after the fix.
+The external `omnigent-ai/omnigent-internal` repository owns those CI checks:
+`.github/workflows/resolve-agent.yml` uses `validate_handoff` in
+`.github/scripts/resolve_handoff.py` and `checkpoint_delivery_ready` in
+`.github/scripts/restore_resolve_retry.py`. They can accept a `fixed` claim
+without test evidence when their identity and publication-shape checks pass.
+Neither test restoration nor a `test_audit` narrative proves that the agent
+executed the same assertions before and after the fix.
 
 Mechanically checking that requirement needs a separate change: retain actual
 verification executions, identify the tested code/assertions and environment,

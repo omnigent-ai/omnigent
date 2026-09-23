@@ -118,7 +118,8 @@ def test_repro_audit_repeats_baseline_when_assertions_or_retry_context_change() 
 
 def test_output_outcomes_include_repro_audit_blockers() -> None:
     output = _normalized_resolve_instructions().split("## Output —", 1)[1]
-    outcomes = output.split("- `outcome`", 1)[1].split("- `problem_summary`", 1)[0]
+    fields = output.split("Field meanings:", 1)[1]
+    outcomes = fields.split("- `outcome`", 1)[1].split("- `problem_summary`", 1)[0]
     for requirement in (
         "`needs_more_info`",
         "reliable reproduction",
