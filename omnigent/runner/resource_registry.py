@@ -1139,6 +1139,8 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
         if not getattr(instance, "running", False) or not await instance.is_alive():
+            from omnigent.terminals.registry import TerminalExitedDuringLaunch
+
             await self._finalize_terminal_exit(
                 session_id=session_id,
                 terminal_name=terminal_name,
@@ -1148,10 +1150,7 @@ class SessionResourceRegistry:
                 resource_role=resource_role,
                 before_observation=True,
             )
-            raise RuntimeError(
-                f"terminal {terminal_name}:{session_key} is not running for session {session_id} "
-                f"(exit status {instance.last_exit_status()})"
-            )
+            raise TerminalExitedDuringLaunch(instance)
 
         from omnigent.terminals.registry import TerminalListEntry
 

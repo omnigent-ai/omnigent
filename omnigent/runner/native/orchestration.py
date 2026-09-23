@@ -5328,15 +5328,31 @@ async def _auto_create_codex_terminal(
     return terminal_view
 
 
+def _codex_terminal_exit_summary(instance: TerminalInstance, *, before_thread: bool) -> str:
+    """Describe a TUI startup exit without inventing an unavailable status."""
+    exit_status = instance.last_exit_status()
+    status_text = f" with status {exit_status}" if exit_status is not None else ""
+    stage = "before starting a thread" if before_thread else "before becoming available"
+    return f"Codex terminal exited{status_text} {stage}."
+
+
+def _codex_startup_terminal_output(instance: TerminalInstance) -> str | None:
+    """Apply the same capture gate and bounds to both startup-error paths."""
+    from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+    from omnigent.process_logging import harness_stderr_capture_enabled
+    from omnigent.runner.resource_registry import trim_terminal_output
+
+    if not harness_stderr_capture_enabled():
+        return None
+    return trim_terminal_output(sanitize_diagnostic_text(instance.last_exit_text() or ""))
+
+
 class _CodexTerminalExited(RuntimeError):
-    """The exact TUI being launched stopped before creating its thread."""
+    """The exact TUI stopped before its thread could be discovered."""
 
     def __init__(self, instance: TerminalInstance) -> None:
         self.instance = instance
-        super().__init__(
-            f"Codex terminal exited with status {instance.last_exit_status()} "
-            "before starting a thread"
-        )
+        super().__init__(_codex_terminal_exit_summary(instance, before_thread=True))
 
 
 async def _wait_for_codex_thread_or_terminal_exit(
@@ -5355,11 +5371,15 @@ async def _wait_for_codex_thread_or_terminal_exit(
     exit_task = asyncio.create_task(wait_for_exit())
     try:
         done, _ = await asyncio.wait((thread_task, exit_task), return_when=asyncio.FIRST_COMPLETED)
-        # A created thread remains usable through the app-server after TUI exit.
+        # A discovered thread remains usable through the app-server after TUI exit.
         if thread_task in done:
             return await thread_task
         # Propagate probe failures instead of reporting a normal terminal exit.
         await exit_task
+        # Let an already-queued notification reach the discovery waiter.
+        await asyncio.sleep(0)
+        if thread_task.done():
+            return await thread_task
         raise _CodexTerminalExited(instance)
     finally:
         for task in (thread_task, exit_task):
@@ -5506,17 +5526,15 @@ async def _codex_discover_thread_and_forward(
             try:
                 diagnostics = collect_codex_startup_diagnostics(app_server)
                 if isinstance(exc, _CodexTerminalExited):
-                    from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
                     from omnigent.process_logging import harness_stderr_capture_enabled
-                    from omnigent.runner.resource_registry import trim_terminal_output
 
                     diagnostics.update(
                         terminal_instance_id=exc.instance.diagnostic_id,
                         terminal_exit_status=exc.instance.last_exit_status(),
                     )
                     if harness_stderr_capture_enabled():
-                        diagnostics["terminal_last_output"] = trim_terminal_output(
-                            sanitize_diagnostic_text(exc.instance.last_exit_text() or "")
+                        diagnostics["terminal_last_output"] = _codex_startup_terminal_output(
+                            exc.instance
                         )
             except Exception as diagnostics_error:  # noqa: BLE001
                 # Diagnostics must not replace the startup error or prevent cleanup.
@@ -5564,9 +5582,7 @@ async def _codex_discover_thread_and_forward(
             if isinstance(exc, _CodexTerminalExited):
                 # The app-server stayed healthy; lead with the TUI's actual
                 # failure instead of the generic thread-discovery wrapper.
-                exit_status = exc.instance.last_exit_status()
-                status_text = f" with status {exit_status}" if exit_status is not None else ""
-                summary = f"Codex terminal exited{status_text} before starting a thread."
+                summary = _codex_terminal_exit_summary(exc.instance, before_thread=True)
             else:
                 if isinstance(exc, TimeoutError):
                     timeout_seconds = (
@@ -7107,8 +7123,15 @@ def _native_terminal_start_error_payload(
         extra=extra,
     )
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
+    from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
-    if isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
+    if runtime_name == "Codex" and isinstance(exc, TerminalExitedDuringLaunch):
+        message = _codex_terminal_exit_summary(exc.instance, before_thread=False)
+        # A failed diagnostic read must not hide the known terminal-exit cause.
+        with contextlib.suppress(Exception):
+            if output := _codex_startup_terminal_output(exc.instance):
+                message += f"\nCodex startup terminal output:\n{output}"
+    elif isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
         message = (
             "Claude Code is Windows-native, but Omnigent is running under WSL. "
             "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "

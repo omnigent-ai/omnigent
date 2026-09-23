@@ -15,7 +15,7 @@ import pytest
 
 from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, record_to_row
 from omnigent.harnesses.codex_native import forwarder
-from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
+from omnigent.harnesses.codex_native.app_server import CodexAppServerClient, CodexNativeAppServer
 from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_error,
     read_bridge_state,
@@ -352,6 +352,108 @@ async def test_thread_creation_wins_simultaneous_terminal_exit(tmp_path: Path) -
     assert await orchestration._wait_for_codex_thread_or_terminal_exit(ready(), terminal) == (
         "usable-thread"
     )
+
+
+@pytest.mark.parametrize("queued_before_decision", [True, False])
+async def test_thread_notification_queue_boundary_at_terminal_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    queued_before_decision: bool,
+) -> None:
+    terminal = _exited_terminal(tmp_path)
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:1")
+    loop = asyncio.get_running_loop()
+    delivered = asyncio.Event()
+    discovery_task: asyncio.Future[object] | None = None
+
+    def deliver_after_turns(remaining: int) -> None:
+        if remaining:
+            loop.call_soon(deliver_after_turns, remaining - 1)
+            return
+        client._events.put_nowait(
+            {"method": "thread/started", "params": {"thread": {"id": "usable-thread"}}}
+        )
+        delivered.set()
+
+    async def exited_probe() -> bool:
+        deliver_after_turns(2 if queued_before_decision else 3)
+        return False
+
+    async def observe_wait(
+        tasks: tuple[asyncio.Future[object], ...], *, return_when: str
+    ) -> tuple[set[asyncio.Future[object]], set[asyncio.Future[object]]]:
+        nonlocal discovery_task
+        done, pending = await asyncio.wait(tasks, return_when=return_when)
+        discovery_task = tasks[0]
+        # Inspect the real scheduling outcome without delaying or injecting events.
+        assert tasks[1] in done
+        assert discovery_task not in done and not discovery_task.done()
+        assert client._events.qsize() == int(queued_before_decision)
+        return done, pending
+
+    asyncio_facade = SimpleNamespace(**vars(asyncio))
+    asyncio_facade.wait = observe_wait
+    monkeypatch.setattr(orchestration, "asyncio", asyncio_facade)
+    monkeypatch.setattr(terminal, "is_alive", exited_probe)
+
+    try:
+        discovery = orchestration._wait_for_codex_thread_or_terminal_exit(
+            forwarder.wait_for_thread_started(client, timeout=None), terminal
+        )
+        if queued_before_decision:
+            assert await discovery == "usable-thread"
+            assert client._events.empty()
+        else:
+            # The handoff serves an already-ready consumer, not later notifications.
+            with pytest.raises(orchestration._CodexTerminalExited):
+                await discovery
+            assert discovery_task is not None and discovery_task.cancelled()
+            assert client._events.qsize() == 1
+    finally:
+        await asyncio.wait_for(delivered.wait(), timeout=1)
+        await client.close()
+
+
+async def test_startup_race_cancellation_at_ready_task_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    terminal = _exited_terminal(tmp_path)
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:1")
+    handoff_started = asyncio.Event()
+    handoff_cancelled = asyncio.Event()
+    discovery_cancelled = asyncio.Event()
+
+    async def waiting_thread() -> str:
+        try:
+            return await forwarder.wait_for_thread_started(client, timeout=None)
+        finally:
+            discovery_cancelled.set()
+
+    async def handoff_sleep(delay: float) -> None:
+        assert delay == 0
+        handoff_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            handoff_cancelled.set()
+
+    asyncio_facade = SimpleNamespace(**vars(asyncio))
+    asyncio_facade.sleep = handoff_sleep
+    monkeypatch.setattr(orchestration, "asyncio", asyncio_facade)
+    task = asyncio.create_task(
+        orchestration._wait_for_codex_thread_or_terminal_exit(waiting_thread(), terminal)
+    )
+    try:
+        await asyncio.wait_for(handoff_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert handoff_cancelled.is_set()
+        assert discovery_cancelled.is_set()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.close()
 
 
 @pytest.mark.parametrize(("login_required", "expected_interval"), [(False, 0.15), (True, 1.0)])

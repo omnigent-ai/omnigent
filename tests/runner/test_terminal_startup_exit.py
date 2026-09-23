@@ -11,6 +11,7 @@ import pytest
 from omnigent.debug_logging import record_to_row
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.inner.terminal import TerminalCreateResult
+from omnigent.runner.native import orchestration
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
@@ -79,7 +80,7 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
     )
 
     with caplog.at_level(logging.INFO, logger="omnigent.runner.resource_registry"):
-        with pytest.raises(RuntimeError, match="exit status 2"):
+        with pytest.raises(RuntimeError, match="exit status 2") as exited:
             await launch(
                 "failed-child",
                 "native",
@@ -117,3 +118,35 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
     assert "failed-child" in resources._active_session_turns
     assert resources._published_session_status["failed-child"] == ("running", None)
     close_mock.assert_awaited_once()
+
+    events: list[object] = []
+    runtime_name = {
+        CODEX_NATIVE_TERMINAL_ROLE: "Codex",
+        CLAUDE_NATIVE_TERMINAL_ROLE: "Claude",
+        PI_NATIVE_TERMINAL_ROLE: "Pi",
+    }[role]
+    error = orchestration._publish_native_terminal_start_error(
+        lambda session_id, event: events.append((session_id, event)),
+        "failed-child",
+        runtime_name,
+        exited.value,
+    )
+    assert events == [
+        ("failed-child", {"type": "session.status", "status": "failed", "error": error})
+    ]
+    assert error["code"] == "native_terminal_start_failed"
+    message = error["message"]
+    if role == CODEX_NATIVE_TERMINAL_ROLE:
+        assert "Codex terminal exited with status 2 before becoming available." in message
+        assert "see the runner log" not in message
+    else:
+        assert f"Native {runtime_name} terminal failed to start" in message
+    if role == CODEX_NATIVE_TERMINAL_ROLE and capture == "1":
+        assert "unexpected argument '--invalid'" in message
+        assert "[REDACTED]" in message
+    else:
+        assert "unexpected argument" not in message
+        assert "Codex startup terminal output:" not in message
+    assert "private-startup-token" not in message
+    assert "thread discovery timed out" not in message
+    assert len(message) < 4500

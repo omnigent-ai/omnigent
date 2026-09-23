@@ -254,7 +254,10 @@ def test_codex_early_tui_startup_failure_reports_cause_not_timeout(
     startup_errors = [
         message
         for message in error_messages
-        if "Codex terminal exited with status 2 before starting a thread." in message
+        if any(
+            f"Codex terminal exited with status 2 {stage}." in message
+            for stage in ("before starting a thread", "before becoming available")
+        )
     ]
     assert startup_errors, f"Expected the TUI exit status in the error: {error_messages!r}"
     if capture_enabled:

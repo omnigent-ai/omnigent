@@ -169,6 +169,9 @@ before registration also emits `terminal_exit_observed`, with
 `before_observation=True`. These early records always include available exit
 metadata; only opted-in Codex launches include a sanitized recent-output tail.
 They do not publish lifecycle changes for a resource that was never observed.
+The canonical Codex startup error also reports the available exit status and,
+with capture enabled, the sanitized excerpt, even when the first liveness probe
+detects the exit before thread discovery starts.
 
 On exit, the terminal abstraction attempts to retain up to 100 rows of recent
 scrollback plus the visible screen in memory, regardless of the flag. This can
@@ -237,11 +240,16 @@ startup-error marker for chat execution. A late failure cannot overwrite a
 replacement launch's marker or close its app-server. Successful discovery and
 cancellation do not emit this failure event; a discovered thread remains usable
 through its app-server even if the auxiliary TUI exits simultaneously.
+Before finalizing an exit, discovery gives an already-ready notification
+consumer one scheduling turn to finish. This is not a grace period for later
+app-server notifications or reconciliation of threads after cleanup.
 
 This event covers fresh-thread discovery. A terminal that dies before
 registration uses the `terminal_exit_observed` path described above, since no
-discovery task exists yet. Earlier app-server process-launch failures, resume
-failures, and errors after a thread starts keep their existing logging.
+discovery task exists yet; its cause reaches the session's
+`native_terminal_start_failed` error instead of a bridge startup-error marker.
+Earlier app-server process-launch failures, resume failures, and errors after a
+thread starts keep their existing logging.
 
 ## Claude continuous diagnostics
 
