@@ -3440,6 +3440,9 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_text(
+                "Choose"
+            )
 
             # Open the worktree chip and name a branch + base branch.
             await page.get_by_test_id("new-chat-landing-branch-chip").click()

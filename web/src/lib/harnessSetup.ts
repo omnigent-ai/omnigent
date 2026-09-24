@@ -118,6 +118,20 @@ export function harnessReadinessOnHost(
     });
   }
   if (availability === "needs-auth") {
+    if (isSdkHarness(harness)) {
+      // Advisory only for the in-process SDK harnesses: the host daemon
+      // cannot see agent-level credentials (an agent spec's `executor.auth`),
+      // and the daemon's launch gate stays ungated for them, so a
+      // `needs-auth` SDK agent may still authenticate successfully. Keep the
+      // row selectable; the picker badge and composer notice (driven by
+      // harnessUnavailableReasonOnHost) still warn before launch.
+      return harnessReadinessResult("available", "needs-auth", false, {
+        label: "Authentication may be required",
+        description:
+          "The selected host reports no credentials for this harness. " +
+          "Launching may fail unless the agent supplies its own.",
+      });
+    }
     return harnessReadinessResult("setup-required", "needs-auth", true, {
       label: "Authentication required",
       description: "Sign in or add credentials on the selected host before using this harness.",
@@ -133,6 +147,28 @@ export function harnessReadinessOnHost(
     label: "Harness is not working",
     description: "The selected host reported a harness readiness error.",
   });
+}
+
+/** The in-process SDK harness spellings the daemon reports readiness for
+ *  (mirrors `_SDK_HARNESSES` + its alias spellings in
+ *  `omnigent/onboarding/harness_readiness.py`). Their launch gate is never
+ *  blocked host-side — agent-level credentials are invisible to the daemon —
+ *  so their `needs-auth` readiness is an advisory warning, not a gate. */
+const SDK_HARNESSES = new Set([
+  "claude-sdk",
+  "claude_sdk",
+  "claude",
+  "openai-agents",
+  "openai-agents-sdk",
+  "agents_sdk",
+  "antigravity",
+  "agy",
+  "google-antigravity",
+]);
+
+/** Whether *harness* is an in-process SDK harness spelling. */
+export function isSdkHarness(harness: string): boolean {
+  return SDK_HARNESSES.has(harness);
 }
 
 /** Whether *harness* is a Codex spelling (bare or native). Codex is the only

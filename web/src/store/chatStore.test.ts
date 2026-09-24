@@ -2889,15 +2889,49 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
     expect(state.sessionStatus).toBe("idle");
-    // A standalone error block is appended carrying the friendly, retryable
-    // copy — NOT the server's terse "No runner bound for session" — and no
-    // raw code in the banner (code "" → clean "Error" title).
+    // Use friendly copy for the no-context fallback, but retain its code.
     const errorBlocks = state.blocks.filter((b) => b.type === "error");
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0]).toMatchObject({
       type: "error",
       message: "The runner didn't come online in time. Please try again.",
-      code: "",
+      code: "runner_unavailable",
+    });
+  });
+
+  it("surfaces the server's runner-unavailable cause verbatim when it names one", async () => {
+    // Preserve the server's phase-specific detail in the error block.
+    const causefulDetail =
+      "The host launched runner runner_token_abc123 for this session, but it " +
+      "never connected to the server within 30s — the runner process may be " +
+      "hung or unable to reach the server. Check the runner log on the host.";
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "running",
+      blocks: [],
+      pendingUserMessages: [],
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: causefulDetail } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("hi", "agent_xyz");
+
+    const errorBlocks = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(errorBlocks).toHaveLength(1);
+    expect(errorBlocks[0]).toMatchObject({
+      type: "error",
+      message: causefulDetail,
+      code: "runner_unavailable",
     });
   });
 
