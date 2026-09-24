@@ -1381,7 +1381,7 @@ async def test_cross_agent_picker_lists_everything_when_owner_unknown() -> None:
 async def test_wrapper_picker_includes_owned_children_on_the_invoking_host(
     wrapper_value: str,
 ) -> None:
-    """The SDK list request makes local native children selectable, retaining scope."""
+    """Children resolve their host through listed ancestors; unresolved ones are dropped."""
     import httpx
     from omnigent_client._sessions import SessionsNamespace
 
@@ -1412,6 +1412,24 @@ async def test_wrapper_picker_includes_owned_children_on_the_invoking_host(
             "title": "other native wrapper",
             "kind": "sub_agent",
             "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+        },
+        {
+            "id": "conv_local_grandchild",
+            "title": "local native grandchild",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_child",
+        },
+        {
+            "id": "conv_remote_grandchild",
+            "title": "remote native grandchild",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_remote_child",
+        },
+        {
+            "id": "conv_orphan_child",
+            "title": "child of an unlisted parent",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_off_page_parent",
         },
         {
             "id": "conv_parent",
@@ -1472,8 +1490,11 @@ async def test_wrapper_picker_includes_owned_children_on_the_invoking_host(
     assert selected == "conv_child"
     rendered = out.getvalue()
     assert "standalone native session" in rendered
+    assert "local native grandchild" in rendered
     assert "remote native child" not in rendered
+    assert "remote native grandchild" not in rendered
     assert "remote native session" not in rendered
+    assert "child of an unlisted parent" not in rendered
     assert "another owner's child" not in rendered
     assert "other native wrapper" not in rendered
 

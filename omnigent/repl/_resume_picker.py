@@ -1016,8 +1016,9 @@ async def pick_conversation_by_wrapper_label_from_sdk(
         invoking machine). Native transcript and workspace state are
         host-local, so a wrapper session bound to another host is a
         dead end in this picker — resuming it cannot work here. A native
-        child inherits its parent's host when the parent row is listed. Rows
-        without a recorded host (never bound, or an older
+        child inherits the host of its nearest bound ancestor; a child whose
+        ancestry is not fully listed is dropped because its host is unknown.
+        Rows without a recorded host (never bound, or an older
         server that predates the field) are kept: dropping them would
         hide resumable local sessions. ``None`` disables host
         filtering (explicit ``--resume <id>`` stays unrestricted for
@@ -1027,20 +1028,29 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     all_convos = await _list_sessions_with_retry(
         client, limit=200, agent_id=None, order="desc", kind="any"
     )
-    # A native child carries no host of its own: it runs on its parent's runner,
-    # so its resumable host is the parent's (when the parent is in this page).
-    hosts_by_id = {c.id: getattr(c, "host_id", None) for c in all_convos}
+    rows_by_id = {c.id: c for c in all_convos}
 
-    def _host_of(c: SessionListItem) -> str | None:
-        parent_id = getattr(c, "parent_session_id", None)
-        return getattr(c, "host_id", None) or (hosts_by_id.get(parent_id) if parent_id else None)
+    def _resumable_here(c: SessionListItem) -> bool:
+        # A native child runs on the host of its nearest bound ancestor. The walk
+        # is bounded by the page size, so a corrupt parent cycle cannot hang it.
+        node: SessionListItem | None = c
+        for _ in range(len(rows_by_id)):
+            if node is None:
+                return False  # an ancestor is off-page, so ownership is unknown
+            if getattr(node, "host_id", None) is not None:
+                return node.host_id == host_id
+            parent_id = getattr(node, "parent_session_id", None)
+            if parent_id is None:
+                return True  # unbound root: never bound, or an older server
+            node = rows_by_id.get(parent_id)
+        return False
 
     convos = [
         c
         for c in all_convos
         if getattr(c, "labels", None)
         and c.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == wrapper_value
-        and (host_id is None or _host_of(c) in (None, host_id))
+        and (host_id is None or _resumable_here(c))
     ]
     previews = await _collect_previews_async(client, convos)
     return pick_conversation(
