@@ -36,6 +36,7 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import {
   buildDesignModePrompt,
   dataUrlToFile,
@@ -883,19 +884,28 @@ export function AppShell() {
     resyncBrowserSuppression();
   }, []);
 
-  // Auto-surface the Browser tab on a `navigate` action, so a browser_navigate
-  // fired while another tab is selected doesn't load into a hidden pane.
-  // Browser-capable shells only; no-op elsewhere (the bus never fires without a relay).
+  // Auto-surface the Browser tab on a `navigate` action — agent-issued
+  // (browser_navigate) or a chat link the user routed in-app — so the load
+  // never lands in a hidden pane. Browser-capable shells only; no-op
+  // elsewhere (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
-    return onBrowserActionRequest((evt, sourceConversationId) => {
-      if (evt.action !== "navigate" || !sourceConversationId) return;
+    const surfaceBrowserTab = (sourceConversationId: string) => {
       writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
       if (sourceConversationId === conversationId) {
         setRightRailTab("browser");
         setRightPanelOpen(true);
       }
+    };
+    const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
+    const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
+      if (evt.action !== "navigate" || !sourceConversationId) return;
+      surfaceBrowserTab(sourceConversationId);
     });
+    return () => {
+      unsubscribeLink();
+      unsubscribeAction();
+    };
   }, [conversationId]);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
