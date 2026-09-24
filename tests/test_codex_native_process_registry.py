@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -433,3 +434,48 @@ def test_reap_state_dir_kills_matching_app_server_and_spares_others(tmp_path: Pa
 def test_reap_state_dir_without_matches_is_a_noop(tmp_path: Path) -> None:
     """A state dir no live process references reaps nothing."""
     assert registry.reap_codex_native_processes_for_state_dir(tmp_path / "no-match") == 0
+
+
+def test_liveness_probe_maps_listing_outcomes(monkeypatch, tmp_path: Path) -> None:
+    """The state-dir liveness probe reads matches as alive and an unknown listing as alive."""
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(registry, "_live_codex_app_server_processes", lambda _d: {123: 456})
+    assert registry.codex_native_process_alive_for_state_dir(state_dir) is True
+    monkeypatch.setattr(registry, "_live_codex_app_server_processes", lambda _d: {})
+    assert registry.codex_native_process_alive_for_state_dir(state_dir) is False
+    monkeypatch.setattr(registry, "_live_codex_app_server_processes", lambda _d: None)
+    assert registry.codex_native_process_alive_for_state_dir(state_dir) is True
+
+
+def test_live_app_server_listing_matches_only_state_dir_app_servers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Only foreign live app-servers naming the state dir count as lease owners."""
+    state_dir = tmp_path / "codex-native" / "abc123"
+    own_pgid = os.getpgid(0)
+    listing = "\n".join(
+        [
+            f"111 222 codex app-server --listen ws://127.0.0.1:1 -c foo={state_dir}",
+            "333 444 codex app-server --listen ws://127.0.0.1:2 -c foo=/other/dir",
+            f"555 666 sqlite3 {state_dir}/state_5.sqlite",
+            f"{os.getpid()} 777 codex app-server {state_dir}",
+            f"888 {own_pgid} codex app-server {state_dir}",
+            "malformed",
+        ]
+    )
+    monkeypatch.setattr(
+        registry.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=listing)
+    )
+
+    assert registry._live_codex_app_server_processes(state_dir) == {111: 222}
+
+
+def test_live_app_server_listing_unavailable_reads_unknown(monkeypatch, tmp_path: Path) -> None:
+    """A failed process listing reads as unknown (None), never as empty."""
+
+    def _raise(*_args, **_kwargs):
+        raise OSError("no ps")
+
+    monkeypatch.setattr(registry.subprocess, "run", _raise)
+
+    assert registry._live_codex_app_server_processes(tmp_path) is None

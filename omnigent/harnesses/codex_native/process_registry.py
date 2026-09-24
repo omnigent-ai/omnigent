@@ -490,37 +490,25 @@ def _kill_tmux_session(tmux_session_name: str) -> None:
         )
 
 
-def reap_codex_native_processes_for_state_dir(
-    state_dir: Path,
-    *,
-    grace_s: float = 1.5,
-) -> int:
+def _live_codex_app_server_processes(state_dir: Path) -> dict[int, int] | None:
     """
-    Kill any live Codex app-server still bound to *state_dir*'s session.
+    Map live Codex app-server pids to pgids for *state_dir*'s session.
 
-    A runner that dies without finishing graceful shutdown (host restart,
-    hard exit) strands its app-server: the process runs in its own
-    session, survives, and keeps holding the codex thread's writer lock —
-    so every later ``thread/resume`` for the session is refused with
-    "already has an active writer". Launch time is when that matters, so
-    the launch path calls this first. Identity is the session state dir
-    baked into the app-server command line (its ``-c`` config overrides
-    name the bridge dir), which — unlike the argv0 crash tag — survives
-    the npm shim's ``exec``. Matches are killed by process group, taking
-    their bridge/hook children with them.
+    Identity is the session state dir baked into the app-server command
+    line (its ``-c`` config overrides name the bridge dir), which — unlike
+    the argv0 crash tag — survives the npm shim's ``exec``.
 
     :param state_dir: The session's codex-native state dir, e.g.
         ``~/.omnigent/codex-native/<sha256(session)[:32]>``.
-    :param grace_s: Seconds to wait after SIGTERM before escalating the
-        survivors to SIGKILL, e.g. ``1.5``.
-    :returns: Number of matched processes signalled.
+    :returns: ``pid -> pgid`` for matching live processes, or ``None`` when
+        the process table could not be listed (non-posix, or ``ps`` failed).
     """
     if os.name != "posix":
-        return 0
+        return None
     needle = str(state_dir)
     try:
         # macOS ps passes raw argv bytes through, so decode leniently: one
-        # foreign process with non-UTF-8 argv must not crash the reaper.
+        # foreign process with non-UTF-8 argv must not crash the caller.
         listing = subprocess.run(
             ["ps", "-axww", "-o", "pid=,pgid=,command="],
             check=False,
@@ -530,9 +518,9 @@ def reap_codex_native_processes_for_state_dir(
             timeout=5.0,
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return 0
+        return None
     own_pgid = os.getpgid(0)
-    victims: dict[int, int] = {}
+    matches: dict[int, int] = {}
     for line in listing.splitlines():
         parts = line.split(None, 2)
         if len(parts) != 3:
@@ -549,7 +537,47 @@ def reap_codex_native_processes_for_state_dir(
             continue
         if pid == os.getpid() or pgid <= 0 or pgid == own_pgid:
             continue
-        victims[pid] = pgid
+        matches[pid] = pgid
+    return matches
+
+
+def codex_native_process_alive_for_state_dir(state_dir: Path) -> bool:
+    """
+    Report whether a live Codex app-server is still bound to *state_dir*.
+
+    :param state_dir: The session's codex-native state dir.
+    :returns: ``True`` when a matching process is live — or when liveness
+        could not be determined, so callers that need proof of death treat
+        the unknown case as alive.
+    """
+    live = _live_codex_app_server_processes(state_dir)
+    return live is None or bool(live)
+
+
+def reap_codex_native_processes_for_state_dir(
+    state_dir: Path,
+    *,
+    grace_s: float = 1.5,
+) -> int:
+    """
+    Kill any live Codex app-server still bound to *state_dir*'s session.
+
+    A runner that dies without finishing graceful shutdown (host restart,
+    hard exit) strands its app-server: the process runs in its own
+    session, survives, and keeps holding the codex thread's writer lock —
+    so every later ``thread/resume`` for the session is refused with
+    "already has an active writer". Launch time is when that matters, so
+    the launch path calls this first. Matches (see
+    :func:`_live_codex_app_server_processes` for the identity) are killed
+    by process group, taking their bridge/hook children with them.
+
+    :param state_dir: The session's codex-native state dir, e.g.
+        ``~/.omnigent/codex-native/<sha256(session)[:32]>``.
+    :param grace_s: Seconds to wait after SIGTERM before escalating the
+        survivors to SIGKILL, e.g. ``1.5``.
+    :returns: Number of matched processes signalled.
+    """
+    victims = _live_codex_app_server_processes(state_dir)
     if not victims:
         return 0
     for pgid in sorted(set(victims.values())):

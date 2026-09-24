@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import socket
+import sqlite3
 import sys
 import tempfile
 import uuid
@@ -47,6 +48,7 @@ from omnigent.harnesses.codex_native.launch_args import (
 from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
+    codex_native_process_alive_for_state_dir,
     codex_native_session_tag_cmdline_arg,
     reconcile_codex_native_process_registry,
     register_codex_native_process,
@@ -114,6 +116,8 @@ _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
 _MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
 _STDERR_CHUNK_LIMIT = 65536
+# Codex state dbs in a CODEX_HOME (the suffix is codex's schema generation).
+_CODEX_STATE_DB_GLOB = "state_*.sqlite"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -1727,6 +1731,84 @@ async def codex_launch_catalog_is_stale(
     )
 
 
+def _backfill_lease_is_running(db_path: Path) -> bool:
+    """
+    Report whether *db_path*'s backfill row holds a ``running`` lease.
+
+    :param db_path: Codex state db, e.g. ``.../codex-home/state_5.sqlite``.
+    :returns: ``True`` only when a ``running`` lease is confirmed; an
+        unreadable db or a missing table reads ``False`` so startup
+        proceeds unchanged.
+    """
+    try:
+        with contextlib.closing(sqlite3.connect(db_path, timeout=1.0)) as conn:
+            row = conn.execute(
+                "select count(*) from backfill_state where status = 'running'"
+            ).fetchone()
+    except sqlite3.Error:
+        _logger.warning(
+            "Could not inspect the codex state db %s for a backfill lease",
+            db_path,
+            exc_info=True,
+        )
+        return False
+    return bool(row and row[0])
+
+
+def _recover_orphaned_codex_backfill_lease(codex_home: Path, state_dir: Path) -> bool:
+    """
+    Expire a dead-owner ``running`` state-db backfill lease before launch.
+
+    Codex's app-server refuses to start while the state db's backfill
+    lease reads ``running``: it waits ~30s for the holder to finish, then
+    exits 1 — inside the readiness budget, so the session terminal never
+    comes up, and every relaunch fails the same way until the lease
+    expires on its own (~15 minutes). A launch killed mid-backfill leaves
+    exactly that lease behind. The CODEX_HOME here is private to one
+    session, so once no live codex app-server is bound to the session's
+    state dir the lease is provably orphaned; aging it past expiry makes
+    codex's own reclaim path resume the backfill from its persisted
+    watermark — no history is deleted.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param state_dir: Session state dir named on any live app-server's
+        command line, e.g. ``~/.omnigent/codex-native/<hash>``.
+    :returns: Whether an orphaned lease was expired.
+    """
+    try:
+        leased = [
+            db_path
+            for db_path in sorted(codex_home.glob(_CODEX_STATE_DB_GLOB))
+            if _backfill_lease_is_running(db_path)
+        ]
+    except OSError:
+        return False
+    if not leased:
+        return False
+    if codex_native_process_alive_for_state_dir(state_dir):
+        _logger.info(
+            "Codex state-db backfill lease in %s is held by a live app-server; leaving it",
+            codex_home,
+        )
+        return False
+    expired = False
+    for db_path in leased:
+        try:
+            with contextlib.closing(sqlite3.connect(db_path, timeout=1.0)) as conn, conn:
+                # updated_at=0 reads as expired under any lease length codex picks.
+                conn.execute("update backfill_state set updated_at = 0 where status = 'running'")
+        except sqlite3.Error:
+            _logger.warning(
+                "Could not expire the orphaned codex backfill lease in %s",
+                db_path,
+                exc_info=True,
+            )
+            continue
+        expired = True
+        _logger.warning("Expired an orphaned codex state-db backfill lease in %s", db_path)
+    return expired
+
+
 def _build_native_codex_app_server_argv(
     *,
     tagged_argv0: str,
@@ -1984,6 +2066,13 @@ class CodexNativeAppServer:
                 )
         if self.reconcile_process_registry:
             reconcile_codex_native_process_registry()
+        # Off the loop: sqlite reads plus, only when a lease is found, one
+        # machine-wide ps scan.
+        await asyncio.to_thread(
+            _recover_orphaned_codex_backfill_lease,
+            self.codex_home,
+            self.bridge_dir,
+        )
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
