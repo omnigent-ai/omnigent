@@ -1271,6 +1271,134 @@ async def _relaunch_then_report_exit(
             await responder
 
 
+async def test_message_relaunch_host_failure_uncategorized_reports_startup_failure(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncategorized host launch failure is reported as a failed start.
+
+    When the host answers ``failed`` without a safe categorical refusal,
+    no runner process ever started — the 503 must say the host could not
+    start the runner (with the host's reason, visible here because no
+    owner scoping applies) instead of claiming a launch that never
+    connected.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+    launch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error="failed to spawn runner: boom",
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await launch_responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "could not start runner" in error["message"], error["message"]
+    assert "failed to spawn runner: boom" in error["message"], error["message"]
+    assert "The host launched" not in error["message"], error["message"]
+    assert "never connected" not in error["message"], error["message"]
+
+
+async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch the host never acknowledged is not reported as launched.
+
+    The host answers the workspace stat but never the launch request, so
+    the server cannot prove a runner process exists. The 503 must say the
+    launch was never confirmed instead of "The host launched runner…".
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+
+    async def _serve_stat_only() -> None:
+        """Answer the relaunch's stat and swallow the launch frame."""
+        deadline = Deadline(20.0)
+        for _ in range(40):
+            output = await comm.receive_output(timeout=deadline.next_wait(5.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostStatFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostStatResultFrame(
+                                request_id=frame.request_id,
+                                status="ok",
+                                exists=True,
+                                type="directory",
+                                canonical_path=frame.path,
+                            )
+                        ),
+                    }
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                return
+
+    responder = asyncio.create_task(_serve_stat_only())
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "never confirmed the launch" in error["message"], error["message"]
+    assert "The host was asked to launch runner" in error["message"], error["message"]
+    assert "The host launched" not in error["message"], error["message"]
+
+
 async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(
     client: httpx.AsyncClient,
     app: FastAPI,

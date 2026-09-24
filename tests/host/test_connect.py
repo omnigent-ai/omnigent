@@ -1623,13 +1623,76 @@ async def test_watch_runner_silent_on_clean_exit(
         result = await host._handle_launch(frame)
     assert result.status == "launched", result.error
 
+    # The runner connected before exiting — the graceful idle-reaper shape.
+    marker = host._runners[token_bound_runner_id("tok_clean")].connect_marker
+    assert marker is not None
+    marker.touch()
+
     # Let the watcher observe the clean exit and finish.
     await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
-    # A clean (code 0) exit is graceful, not a crash: no report, nothing parked.
+    # A clean (code 0) exit after connecting is graceful, not a crash:
+    # no report, nothing parked.
     assert tunnel.sent == []
     assert host._unreported_exits == {}
     assert maintenance_reasons == ["runner_exited"]
+
+
+async def test_watch_runner_reports_clean_exit_before_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean exit that never connected IS reported with its cause.
+
+    A runner that self-exits with code 0 before ever dialing its tunnel
+    is a failed launch, not an idle-reaper shutdown: staying silent
+    would leave the session's send to fail with a cause-free timeout.
+    The exit watcher must send ``host.runner_exited`` so the server can
+    name the failed phase.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that lives briefly, then exits 0 pre-connect.
+
+        :param args: Command args (ignored).
+        :param kwargs: Popen kwargs from production, including log handles.
+        :returns: A live subprocess handle.
+        """
+        return original_popen(
+            ["sh", "-c", "echo 'boot aborted: nothing to do' >&2; sleep 0.2; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_clean_preconn",
+        binding_token="tok_clean_preconn",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    assert len(tunnel.sent) == 1
+    report = decode_host_frame(tunnel.sent[0])
+    assert isinstance(report, HostRunnerExitedFrame)
+    assert report.runner_id == token_bound_runner_id("tok_clean_preconn")
+    assert "code 0" in report.error
+    assert "boot aborted: nothing to do" in report.error
 
 
 async def _wait_for_error_record(

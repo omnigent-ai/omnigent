@@ -2363,13 +2363,29 @@ class HostProcess:
         self._runners.pop(runner_id)
         self._trigger_maintenance("runner_exited")
         if handle.proc.returncode == 0:
-            # A clean exit (code 0) is a graceful shutdown, not a crash — the
-            # idle reaper shutting an inactive runner down, or any orderly
-            # self-exit. Reporting it as host.runner_exited would attach a
-            # scary "runner process exited" error to a session the user only
-            # has to message to reactivate, so stay silent. A non-zero exit
-            # below is a genuine crash and still reports its cause.
-            _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+            never_connected = handle.connect_marker is not None and not await asyncio.to_thread(
+                handle.connect_marker.exists
+            )
+            if not never_connected:
+                # A clean exit (code 0) after connecting is a graceful
+                # shutdown, not a crash — the idle reaper shutting an
+                # inactive runner down, or any orderly self-exit. Reporting
+                # it as host.runner_exited would attach a scary "runner
+                # process exited" error to a session the user only has to
+                # message to reactivate, so stay silent. A non-zero exit
+                # below is a genuine crash and still reports its cause.
+                _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+                return
+            # A clean exit BEFORE ever connecting is a failed launch, not a
+            # graceful shutdown: without a report the session's send fails
+            # with a cause-free timeout. The connect watchdog owns the
+            # host-side ERROR; this report carries the cause to the server.
+            error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+            _logger.info(
+                "Runner %s exited cleanly (code 0) before connecting; reporting exit",
+                runner_id,
+            )
+            await self._report_runner_exit(runner_id, error)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         # A non-zero runner exit is a runner-process fault that blocks the
