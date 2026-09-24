@@ -1,5 +1,8 @@
 """Browser-only contracts for native slash-menu interaction."""
 
+import time
+
+import pytest
 from playwright.sync_api import Page, expect
 
 _ROWS = "[data-testid^='slash-menu-item-']"
@@ -43,7 +46,15 @@ def test_enter_executes_a_substring_matched_builtin(page: Page, chat_session_con
     expect(page.get_by_text("No usage data yet — send a message first.")).to_be_visible()
 
 
-def test_open_menu_accepts_an_async_skill_catalog(page: Page, chat_session_contract) -> None:
+@pytest.mark.parametrize("phase", ["discovery", "runner-starting", "sandbox-starting"])
+def test_open_menu_accepts_an_async_skill_catalog(
+    page: Page, chat_session_contract, phase: str
+) -> None:
+    if phase != "discovery":
+        chat_session_contract.set_health(runner_online=False, host_online=True)
+        chat_session_contract.update_session(created_at=time.time())
+    if phase == "sandbox-starting":
+        chat_session_contract.update_session(sandbox_status={"stage": "provisioning"})
     chat_session_contract.set_skills(
         [{"name": "code-review", "description": "Review the current change"}]
     )
@@ -68,6 +79,47 @@ def test_open_menu_accepts_an_async_skill_catalog(page: Page, chat_session_contr
     expect(skill).to_have_attribute("data-active", "true")
     composer.press("Tab")
     expect(composer).to_have_value("/code-review ")
+
+
+def test_slash_menu_stops_loading_when_sandbox_launch_fails(
+    page: Page, chat_session_contract
+) -> None:
+    chat_session_contract.set_health(runner_online=False, host_online=True)
+    chat_session_contract.update_session(
+        created_at=time.time(),
+        host_id=None,
+        workspace=None,
+        sandbox_status={"stage": "provisioning"},
+    )
+    page.goto(chat_session_contract.url)
+    chat_session_contract.wait_for_stream()
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("/")
+    expect(page.get_by_text("Loading skills…", exact=True)).to_be_visible()
+
+    chat_session_contract.emit(
+        {
+            "event": "session.sandbox_status",
+            "data": {
+                "type": "session.sandbox_status",
+                "conversation_id": chat_session_contract.session_id,
+                "stage": "failed",
+                "error": "Test sandbox could not start",
+            },
+        }
+    )
+
+    expect(page.get_by_text("Loading skills…", exact=True)).not_to_be_visible()
+    expect(page.get_by_text("Skills unavailable while disconnected.", exact=True)).to_be_visible()
+
+
+def test_read_only_composer_skips_skill_discovery(page: Page, chat_session_contract) -> None:
+    chat_session_contract.update_session(permission_level=1)
+    page.goto(chat_session_contract.url)
+
+    expect(_composer(page)).to_be_disabled()
+    assert chat_session_contract.skill_requests == []
 
 
 def test_native_file_paste_closes_the_slash_menu(page: Page, chat_session_contract) -> None:
