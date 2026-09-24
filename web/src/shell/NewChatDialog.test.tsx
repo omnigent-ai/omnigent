@@ -811,7 +811,7 @@ describe("sandbox repository helpers", () => {
       autoSeededBranch: "",
       expected: {
         repositoryLabel: "alpha",
-        branchLabel: "New",
+        branchLabel: "Choose",
         branchDescription: "Create or select a worktree from main repository branch: main",
       },
     },
@@ -2756,7 +2756,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(readNewChatWorkspaceCache(key)).toMatchObject({
       workspace: "/work/second",
       repositoryLabel: "second",
-      branchLabel: "New",
+      branchLabel: "Choose",
     });
   });
 });
@@ -3314,7 +3314,7 @@ describe("NewChatLandingScreen", () => {
       "title",
       "Create or select a worktree from main repository branch: main",
     );
-    expect(worktree).toHaveTextContent("New");
+    expect(worktree).toHaveTextContent("Choose");
     expect(worktree.querySelectorAll("svg")[0]).toHaveClass("size-3.5");
     expect(worktree.querySelectorAll("svg")[1]).toHaveClass("size-3");
     expect(harness).toHaveClass(
@@ -3526,7 +3526,7 @@ describe("NewChatLandingScreen", () => {
       renderLanding();
       const worktree = screen.getByTestId("new-chat-landing-branch-chip");
       await waitFor(() =>
-        expect(worktree).toHaveTextContent(autoSeeded ? /^worktree-[0-9a-f]{8}$/ : /^New$/),
+        expect(worktree).toHaveTextContent(autoSeeded ? /^worktree-[0-9a-f]{8}$/ : /^Choose$/),
       );
       fireEvent.click(worktree);
       if (!autoSeeded) {
