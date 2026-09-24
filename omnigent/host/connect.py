@@ -1053,12 +1053,18 @@ class _RunnerHandle:
         connect (see :data:`RUNNER_CONNECT_MARKER_ENV_VAR`). Checked by
         :meth:`HostProcess._watch_runner_connect` at the connect
         deadline. ``None`` disables that watchdog for this handle.
+    :param stop_requested: Set when the runner is stopped or superseded
+        on purpose, so :meth:`HostProcess._watch_runner_connect` does
+        not report the resulting pre-connect exit as a launch failure.
+        (``self._runners`` membership can't discriminate: the exit
+        watcher also pops genuinely dead runners.)
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
     session_id: str | None = None
     connect_marker: Path | None = None
+    stop_requested: bool = False
 
 
 class HostRetryableConnectionError(Exception):
@@ -1928,6 +1934,7 @@ class HostProcess:
             ]
             for rid, handle in superseded:
                 self._runners.pop(rid, None)
+                handle.stop_requested = True
                 self._spawn_superseded_stop(rid, handle, frame.session_id)
         self._runners[runner_id] = _RunnerHandle(
             proc=proc,
@@ -2153,6 +2160,7 @@ class HostProcess:
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
+        handle.stop_requested = True
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
@@ -2389,10 +2397,13 @@ class HostProcess:
         if handle is None or handle.connect_marker is None:  # pragma: no cover
             return
         await asyncio.wait({exit_watcher}, timeout=_RUNNER_CONNECT_DEADLINE_S)
-        if self._runners.get(runner_id) is not handle:
+        if handle.stop_requested:
             # Stopped or superseded on purpose — nothing to report.
             return
         if await asyncio.to_thread(handle.connect_marker.exists):
+            return
+        if handle.stop_requested:
+            # Stopped while the marker check ran off-loop — still intent.
             return
         _logger.error(
             "Runner %s for session %s never connected its tunnel within "
