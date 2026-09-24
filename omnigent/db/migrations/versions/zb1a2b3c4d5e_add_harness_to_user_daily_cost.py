@@ -33,6 +33,16 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+def _existing_pk_name(table: str) -> str | None:
+    """Reflect the current primary-key constraint name."""
+    constraint = sa.inspect(op.get_bind()).get_pk_constraint(table)
+    return constraint.get("name") if constraint else None
+
+
+def _is_sqlite() -> bool:
+    return op.get_bind().dialect.name == "sqlite"
+
+
 def upgrade() -> None:
     """
     Add harness column to user_daily_cost and rebuild primary key.
@@ -40,18 +50,17 @@ def upgrade() -> None:
     Uses ALTER TABLE for better performance and less downtime. The new
     harness column defaults to "__all__" for existing rows.
     """
-    # Get the actual primary key name (may vary across database states)
-    inspector = sa.inspect(op.get_bind())
-    pk_constraint = inspector.get_pk_constraint("user_daily_cost")
-    old_pk_name = pk_constraint.get("name") if pk_constraint else None
+    sqlite = _is_sqlite()
+    # On PostgreSQL/MySQL, get the current PK name; on SQLite, let batch recreate handle it
+    old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
 
-    with op.batch_alter_table("user_daily_cost") as batch_op:
+    with op.batch_alter_table("user_daily_cost", recreate="always" if sqlite else "auto") as batch_op:
         # Add harness column with default value
         batch_op.add_column(
             sa.Column("harness", sa.String(64), nullable=False, server_default="__all__")
         )
         # Drop old primary key if it exists
-        if old_pk_name:
+        if old_pk_name is not None:
             batch_op.drop_constraint(old_pk_name, type_="primary")
         # Add new primary key including harness
         batch_op.create_primary_key(
@@ -69,14 +78,13 @@ def downgrade() -> None:
     # Delete per-harness rows before removing the column
     op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
 
-    # Get the actual primary key name
-    inspector = sa.inspect(op.get_bind())
-    pk_constraint = inspector.get_pk_constraint("user_daily_cost")
-    old_pk_name = pk_constraint.get("name") if pk_constraint else None
+    sqlite = _is_sqlite()
+    # On PostgreSQL/MySQL, get the current PK name; on SQLite, let batch recreate handle it
+    old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
 
-    with op.batch_alter_table("user_daily_cost") as batch_op:
+    with op.batch_alter_table("user_daily_cost", recreate="always" if sqlite else "auto") as batch_op:
         # Drop current primary key if it exists
-        if old_pk_name:
+        if old_pk_name is not None:
             batch_op.drop_constraint(old_pk_name, type_="primary")
         # Recreate original primary key without harness
         batch_op.create_primary_key("pk_user_daily_cost", ["workspace_id", "user_id", "day_utc"])
