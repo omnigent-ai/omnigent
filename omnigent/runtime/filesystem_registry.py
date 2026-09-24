@@ -960,8 +960,11 @@ class GitFilesystemRegistry(FilesystemRegistry):
         probe_started_at = time.perf_counter()
         try:
             probe = subprocess.run(
-                ["git", "update-index", "--test-untracked-cache"],
+                # A hook-based fsmonitor would run here with this process's
+                # privileges; the probe does not need it.
+                ["git", "-c", "core.fsmonitor=false", "update-index", "--test-untracked-cache"],
                 cwd=str(self._git_root),
+                env=_anchored_git_env(),
                 capture_output=True,
                 timeout=_git_timeout_seconds(),
             )

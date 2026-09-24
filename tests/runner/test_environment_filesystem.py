@@ -21,6 +21,7 @@ from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests.runner.helpers import NullServerClient
 
 
@@ -2244,7 +2245,9 @@ async def test_search_picks_up_a_repo_created_mid_session(
 ) -> None:
     """A workspace that becomes a git repository after its first search (an
     agent cloning into it) must gain index coverage on the next search rather
-    than staying pinned to the walk-only answer."""
+    than staying pinned to the walk-only answer — and since the agent made that
+    repository, search must never start a registry on it (startup probes the
+    repository with git, which would run its ``core.fsmonitor`` here)."""
     ws = tmp_path / "session-ws"
     ws.mkdir()
     _seed_budget_busting_repo(ws, commit=False)
@@ -2266,6 +2269,10 @@ async def test_search_picks_up_a_repo_created_mid_session(
             ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
         )
 
+        def forbid_start(self: GitFilesystemRegistry) -> None:
+            raise AssertionError("search must not start a registry on an agent-created repo")
+
+        monkeypatch.setattr(GitFilesystemRegistry, "start", forbid_start)
         resp = await client.get(f"{base}/search", params={"q": "target"})
         body = resp.json()
         assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body

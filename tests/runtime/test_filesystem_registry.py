@@ -789,7 +789,19 @@ def test_untracked_cache_enable_helper_sets_repo_config(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
 
     registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    # The probe runs git in this process; a repository's fsmonitor hook (which
+    # an agent can configure) must not run with it.
+    marker = tmp_path / "hook_ran"
+    hook = tmp_path / "hook.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    subprocess.run(
+        ["git", "config", "core.fsmonitor", str(hook)], cwd=tmp_path, check=True, env=_git_env()
+    )
+
     registry._enable_untracked_cache()
+
+    assert not marker.exists(), "the untracked-cache probe ran the repository's fsmonitor hook"
 
     result = subprocess.run(
         ["git", "config", "--get", "core.untrackedCache"],
@@ -990,7 +1002,7 @@ def test_untracked_cache_not_enabled_when_probe_fails(tmp_path: Path, monkeypatc
     real_run = subprocess.run
 
     def _probe_fails_run(args, *a, **kw):
-        if args[:2] == ["git", "update-index"]:
+        if "update-index" in args:
             return subprocess.CompletedProcess(
                 args=args, returncode=1, stdout=b"", stderr=b"mtime unreliable"
             )

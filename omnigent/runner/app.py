@@ -3560,7 +3560,10 @@ def create_runner_app(
         walks — runner-managed sessions get a generated per-session workspace
         no other registry covers. Non-git roots are re-detected on every call,
         so a repository cloned into the workspace mid-session gains index
-        coverage on the next search.
+        coverage on the next search. The registry is never started: startup
+        runs ``git update-index`` inside the repository, and a repository at a
+        generated workspace root may be the agent's own. Search needs only
+        the anchored index read.
 
         :param root: Absolute directory the search walks.
         :returns: A registry whose workspace root is *root*.
@@ -3569,7 +3572,6 @@ def create_runner_app(
         registry = _search_fs_registries.get(key)
         if registry is None or not isinstance(registry, GitFilesystemRegistry):
             registry = create_filesystem_registry(watch_path=root)
-            registry.start()
             _search_fs_registries[key] = registry
             while len(_search_fs_registries) > _search_registry_cache_size:
                 _search_fs_registries.popitem(last=False)
