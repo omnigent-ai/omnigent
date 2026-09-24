@@ -497,4 +497,18 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
     ipcRenderer.on("omnigent:local-server-setup-log", listener);
     return () => ipcRenderer.removeListener("omnigent:local-server-setup-log", listener);
   },
+  /**
+   * Install the omnigent CLI (macOS). Resolves `{ok, error?, installed}` once
+   * the installer finishes; output streams via onCliInstallLog.
+   */
+  installCli: () => ipcRenderer.invoke("omnigent:cli-install"),
+  /**
+   * Subscribe to the CLI installer's output lines. Returns an unsubscribe fn.
+   * @param {(line: string) => void} callback
+   */
+  onCliInstallLog: (callback) => {
+    const listener = (_event, payload) => callback(payload?.line ?? "");
+    ipcRenderer.on("omnigent:cli-install-log", listener);
+    return () => ipcRenderer.removeListener("omnigent:cli-install-log", listener);
+  },
 });

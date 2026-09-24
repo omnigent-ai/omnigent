@@ -30,6 +30,8 @@ interface OmnigentSetup {
   getCliStatus: () => Promise<{ installed?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
+  installCli?: () => Promise<{ ok?: boolean; error?: string; installed?: boolean }>;
+  onCliInstallLog?: (cb: (line: string) => void) => () => void;
 }
 
 function setupBridge(): OmnigentSetup | undefined {
@@ -62,10 +64,20 @@ function BridgeSetupApp() {
   const [initialUrl, setInitialUrl] = useState(failedUrl ?? DEFAULT_URL);
   const [recentServers, setRecentServers] = useState<string[]>([]);
   const [managedServers, setManagedServers] = useState<string[]>([]);
+  // Whether the `omnigent` CLI is installed — decides "Install" vs "Open" and
+  // the returning-user start step. Undefined until the probe resolves.
+  const [installed, setInstalled] = useState<boolean | undefined>(undefined);
+  // Hold the initial paint until the CLI probe resolves, so the wizard opens on
+  // the correct step (welcome vs server list) instead of flashing the wrong one.
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
     const bridge = setupBridge();
-    if (!bridge) return;
+    // No shell bridge (browser preview): nothing to probe, render immediately.
+    if (!bridge) {
+      setReady(true);
+      return;
+    }
     if (!failedUrl && !isEphemeral) {
       bridge
         .getServerUrl()
@@ -80,6 +92,13 @@ function BridgeSetupApp() {
       .getManagedServers()
       .then(setManagedServers)
       .catch(() => {});
+    // The CLI probe gates the first render (see `ready`); a failed probe just
+    // means "not installed" — never block the wizard on it.
+    bridge
+      .getCliStatus()
+      .then((status) => setInstalled(status?.installed === true))
+      .catch(() => setInstalled(false))
+      .finally(() => setReady(true));
   }, [failedUrl, isEphemeral]);
 
   const setup: ServerSelectorV2Setup = {
@@ -88,6 +107,7 @@ function BridgeSetupApp() {
     error,
     recentServers,
     managedServers,
+    installed,
     onConnect: async (url, force) => {
       // setServerUrl persists the URL and navigates the window to it; on success
       // the server's SPA takes over and this page goes away. It resolves
@@ -128,6 +148,25 @@ function BridgeSetupApp() {
     // shells / browser preview omit it → the terminal step shows phases only).
     onSetupLog: setupBridge()?.onLocalServerSetupLog
       ? (cb) => setupBridge()?.onLocalServerSetupLog?.(cb) ?? (() => {})
+      : undefined,
+    // Install the CLI, if the shell supports it. Offered only when NOT already
+    // installed — a returning user opens rather than installs.
+    onInstallCli:
+      installed === false && setupBridge()?.installCli
+        ? async () => {
+            const bridge = setupBridge();
+            if (!bridge?.installCli) return { ok: false, error: "Install is unavailable." };
+            try {
+              const result = await bridge.installCli();
+              if (result?.ok) setInstalled(result.installed === true);
+              return { ok: result?.ok === true, error: result?.error };
+            } catch (e) {
+              return { ok: false, error: e instanceof Error ? e.message : String(e) };
+            }
+          }
+        : undefined,
+    onInstallLog: setupBridge()?.onCliInstallLog
+      ? (cb) => setupBridge()?.onCliInstallLog?.(cb) ?? (() => {})
       : undefined,
     // Only offered when the shell exposes the forget method (newer shells).
     onRemoveServer: setupBridge()?.forgetRecentServer
@@ -187,7 +226,16 @@ function BridgeSetupApp() {
           } as CSSProperties
         }
       />
-      <ServerSelectorV2 setup={setup} />
+      {ready ? (
+        <ServerSelectorV2 setup={setup} />
+      ) : (
+        // Hold on the wizard background until the CLI probe resolves, so the
+        // flow opens on the correct step rather than flashing the wrong one.
+        <div
+          className="min-h-screen"
+          style={{ background: "var(--onboarding-wizard-background)" }}
+        />
+      )}
     </>
   );
 }

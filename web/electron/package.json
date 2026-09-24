@@ -80,6 +80,10 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "../../scripts/install_oss.sh",
+        "to": "install_oss.sh"
       }
     ],
     "mac": {
