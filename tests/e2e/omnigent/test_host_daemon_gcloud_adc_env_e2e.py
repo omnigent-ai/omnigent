@@ -346,7 +346,9 @@ def test_daemon_spawned_runner_receives_gcloud_adc_selectors(
             )
             create.raise_for_status()
 
-        runner_env = _wait_for_runner_env(workspace, timeout=_RUNNER_APPEAR_TIMEOUT)
+        runner_env = _wait_for_runner_env(
+            workspace, daemon_pid=daemon_pid, timeout=_RUNNER_APPEAR_TIMEOUT
+        )
         runner_pid = int(runner_env["_OMNI_TEST_RUNNER_PID"])
         assert runner_env.get(RUNNER_PARENT_PID_ENV_VAR) == str(daemon_pid)
         assert runner_env.get("HOME") == str(home)
@@ -381,16 +383,41 @@ def _online_host_id(client: httpx.Client, *, host_id: str, timeout: float) -> st
     raise AssertionError(f"host {host_id} did not come online within {timeout}s")
 
 
-def _wait_for_runner_env(workspace: Path, *, timeout: float) -> dict[str, str]:
+def _proc_ppid(pid: int) -> int | None:
+    """Return *pid*'s parent pid, or ``None`` if it can't be read.
+
+    :param pid: Target process id.
+    :returns: The parent pid from ``/proc/<pid>/status``, or ``None`` if the
+        process is gone or the field is unreadable.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("PPid:"):
+            with contextlib.suppress(ValueError):
+                return int(line.split(":", 1)[1].strip())
+    return None
+
+
+def _wait_for_runner_env(workspace: Path, *, daemon_pid: int, timeout: float) -> dict[str, str]:
     """Find the daemon-spawned runner for *workspace* and return its environ.
 
     The runner env is built by ``_build_runner_env``, which always stamps
     ``OMNIGENT_RUNNER_WORKSPACE`` with the session workspace -- a per-test
     unique tmp path, so the match cannot pick up another test's runner. The
-    matching pid is returned under the synthetic ``_OMNI_TEST_RUNNER_PID`` key
-    so the caller can reap it even after the process exits.
+    ``ppid == daemon_pid`` check additionally rules out a same-workspace
+    process the runner itself later forks (a harness/tool child inherits
+    ``OMNIGENT_RUNNER_WORKSPACE`` and ``RUNNER_SERVER_URL`` from the runner's
+    environment, but its OS parent is the runner, not the daemon): with
+    ``OMNIGENT_RUNNER_ZYGOTE=0`` the daemon spawns the runner directly, so the
+    runner's own ppid is always the daemon. The matching pid is returned under
+    the synthetic ``_OMNI_TEST_RUNNER_PID`` key so the caller can reap it even
+    after the process exits.
 
     :param workspace: The session workspace passed at session create.
+    :param daemon_pid: This test's daemon pid — the runner's expected OS parent.
     :param timeout: Max seconds to poll for the runner process.
     :returns: The runner's environment plus ``_OMNI_TEST_RUNNER_PID``.
     :raises AssertionError: If no runner appears within *timeout*.
@@ -401,8 +428,11 @@ def _wait_for_runner_env(workspace: Path, *, timeout: float) -> dict[str, str]:
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
                 continue
+            pid = int(entry.name)
+            if _proc_ppid(pid) != daemon_pid:
+                continue
             try:
-                env = _proc_environ(int(entry.name))
+                env = _proc_environ(pid)
             except (OSError, PermissionError):
                 continue
             if env.get("OMNIGENT_RUNNER_WORKSPACE") == needle and "RUNNER_SERVER_URL" in env:
@@ -410,4 +440,7 @@ def _wait_for_runner_env(workspace: Path, *, timeout: float) -> dict[str, str]:
                 return env
         _POLL_PAUSE.wait(0.5)
         elapsed += 0.5
-    raise AssertionError(f"no runner with OMNIGENT_RUNNER_WORKSPACE={needle} within {timeout}s")
+    raise AssertionError(
+        f"no runner with OMNIGENT_RUNNER_WORKSPACE={needle} and ppid={daemon_pid} "
+        f"within {timeout}s"
+    )

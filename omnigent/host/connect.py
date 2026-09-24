@@ -3650,7 +3650,11 @@ class HostProcess:
         while True:
             await asyncio.sleep(_LIFECYCLE_POLL_INTERVAL_S)
             if await asyncio.to_thread(lock.still_owner):
-                confirmed = True
+                if not confirmed:
+                    confirmed = True
+                    # Marks when the startup-grace latch above opens: any
+                    # record mutation from this point on retires the daemon.
+                    _logger.debug("Host daemon confirmed registry ownership of %s.", lock.target)
                 continue
             if not confirmed:
                 continue
