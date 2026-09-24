@@ -3152,6 +3152,122 @@ def test_resolve_pi_skill_args_no_bundle() -> None:
     assert _resolve_pi_skill_args(["alpha"], None) == ["--no-skills"]
 
 
+def test_resolve_pi_bundle_resource_args_extension_entries(tmp_path: Path) -> None:
+    """Each bundled extension entry point is passed via ``--extension``
+    so bundled extensions load regardless of Pi's cwd.
+
+    Pi only auto-discovers ``.pi/extensions`` from its process cwd (the
+    session workspace), never from the bundle's on-disk location, so
+    without the explicit flags bundled extensions silently never load.
+    Entry *files* are passed, not the directory: Pi treats a directory
+    ``--extension`` source as a package root, not an extensions dir.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_resource_args
+
+    bundle = tmp_path / "bundle"
+    ext_root = bundle / ".pi" / "extensions"
+    marker_dir = ext_root / "marker"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "index.js").write_text("module.exports = function () {};\n")
+
+    args = _resolve_pi_bundle_resource_args(bundle)
+
+    assert args == ["--extension", str(marker_dir / "index.js")], (
+        f"expected the subdir extension's index.js as a --extension source, got {args}"
+    )
+
+
+def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) -> None:
+    """Entry discovery mirrors Pi's own: top-level ``*.js``/``*.ts``
+    files, subdir ``index.ts`` over ``index.js``, ``package.json``
+    ``pi.extensions`` manifests over index files, dotfiles and
+    ``node_modules`` skipped.
+    """
+    import json as jsonlib
+
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
+
+    ext_root = tmp_path / ".pi" / "extensions"
+    ext_root.mkdir(parents=True)
+    (ext_root / "flat.js").write_text("module.exports = function () {};\n")
+    (ext_root / ".hidden.js").write_text("skip me\n")
+    (ext_root / "node_modules").mkdir()
+    (ext_root / "node_modules" / "index.js").write_text("skip me\n")
+    ts_dir = ext_root / "a-ts-ext"
+    ts_dir.mkdir()
+    (ts_dir / "index.ts").write_text("export default function () {}\n")
+    (ts_dir / "index.js").write_text("compiled; index.ts must win\n")
+    manifest_dir = ext_root / "b-manifest-ext"
+    manifest_dir.mkdir()
+    (manifest_dir / "main.js").write_text("module.exports = function () {};\n")
+    (manifest_dir / "index.js").write_text("manifest entry must win\n")
+    (manifest_dir / "package.json").write_text(jsonlib.dumps({"pi": {"extensions": ["main.js"]}}))
+    (ext_root / "empty-dir").mkdir()
+
+    entries = _resolve_pi_bundle_extension_entries(ext_root)
+
+    assert entries == [
+        ts_dir / "index.ts",
+        manifest_dir / "main.js",
+        ext_root / "flat.js",
+    ], f"got {entries}"
+
+
+def test_resolve_pi_bundle_resource_args_context_file(tmp_path: Path) -> None:
+    """A bundle-root ``AGENTS.md`` is appended to the system prompt by
+    content, honoring Pi's own candidate precedence order.
+
+    Content, not path: a sandboxed Pi that cannot read the bundle would
+    otherwise append the literal path string to the prompt.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_resource_args
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
+
+    args = _resolve_pi_bundle_resource_args(bundle)
+    assert args == ["--append-system-prompt", "Bundle guidance marker.\n"]
+
+    # AGENTS.override.md outranks AGENTS.md, matching Pi's loader.
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    args = _resolve_pi_bundle_resource_args(bundle)
+    assert args == ["--append-system-prompt", "Override guidance.\n"], (
+        f"AGENTS.override.md must win over AGENTS.md; got {args}"
+    )
+
+
+def test_resolve_pi_bundle_resource_args_combined_and_empty(tmp_path: Path) -> None:
+    """Extensions and context file combine; bundles without either (or no
+    bundle at all) emit nothing.
+
+    A blank context file emits no ``--append-system-prompt`` — appending
+    empty text would only add prompt noise.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_resource_args
+
+    assert _resolve_pi_bundle_resource_args(None) == []
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    assert _resolve_pi_bundle_resource_args(bundle) == []
+
+    (bundle / "AGENTS.md").write_text("   \n")
+    assert _resolve_pi_bundle_resource_args(bundle) == []
+
+    (bundle / "AGENTS.md").write_text("Guidance.\n")
+    ext_dir = bundle / ".pi" / "extensions" / "marker"
+    ext_dir.mkdir(parents=True)
+    (ext_dir / "index.js").write_text("module.exports = function () {};\n")
+    args = _resolve_pi_bundle_resource_args(bundle)
+    assert args == [
+        "--extension",
+        str(ext_dir / "index.js"),
+        "--append-system-prompt",
+        "Guidance.\n",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Databricks gateway default-model + models.json parity tests — the pi
 # mirror of the claude-sdk default plumbing. The ucode-cached
