@@ -57,10 +57,18 @@ def _built_spa(request: pytest.FixtureRequest) -> None:
 class _SpaHandler(SimpleHTTPRequestHandler):
     """Serve static files and return index.html for client-side routes."""
 
+    def __init__(
+        self,
+        *args: Any,
+        static_paths: frozenset[str],
+        **kwargs: Any,
+    ) -> None:
+        self._static_paths = static_paths
+        super().__init__(*args, **kwargs)
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
-        requested = Path(self.directory, path.lstrip("/"))
-        if requested.is_file():
+        if path in self._static_paths:
             super().do_GET()
             return
         if _API_PATH.match(self.path):
@@ -75,7 +83,16 @@ class _SpaHandler(SimpleHTTPRequestHandler):
 
 @pytest.fixture(scope="session")
 def browser_base_url(_built_spa: None) -> Iterator[str]:
-    handler = partial(_SpaHandler, directory=str(_BUILD_OUTPUT))
+    static_paths = frozenset(
+        f"/{path.relative_to(_BUILD_OUTPUT).as_posix()}"
+        for path in _BUILD_OUTPUT.rglob("*")
+        if path.is_file()
+    )
+    handler = partial(
+        _SpaHandler,
+        directory=str(_BUILD_OUTPUT),
+        static_paths=static_paths,
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
