@@ -115,12 +115,14 @@ Terminal 4 — Docker execution host:
 docker compose -f examples/mcp-registry/compose.yaml --profile sandbox up --build sandbox
 ```
 
-1. Open **http://localhost:18780/settings/integrations**. Connect **Demo work
-   tracker**, approve `alice@example.test`, then click **Test connection**.
-   Expect `whoami, read_ticket`.
-2. Create a session on the Docker host, using workspace `/tmp`, harness
-   **OpenAI Agents**, and model `gpt-4o-mini`. Open **Agent tools and policies**
-   (the information button), click **+** beside **Tools**, then **Add Demo work tracker**.
+1. Create a session on the Docker host at **http://localhost:18780**, using
+   workspace `/tmp`, harness **OpenAI Agents**, and model `gpt-4o-mini`.
+2. Open **Agent tools and policies** (the information button), then **+** beside
+   **Tools**. Check **Demo work tracker**. Approve `alice@example.test` in the OAuth
+   popup: it closes and the service becomes checked. Cancelling leaves it unchecked.
+   The dialog shows the administrator’s catalog; URL/header/command configuration
+   is under **Advanced: custom MCP servers**. You can also connect and test accounts
+   separately in **Settings → Sandbox Integrations**.
 3. Queue a deterministic model turn with the command below, then send
    `Show my tracker account and read TEST-123` in the chat. Expand **Called 2 tools**
    to see the actual upstream account and ticket results.
@@ -141,6 +143,10 @@ Repeat after 45 seconds: `whoami.refresh_count` increases. Recreate the sandbox
 with `docker compose -f examples/mcp-registry/compose.yaml --profile sandbox up -d --force-recreate sandbox`,
 create a session on the new host and add the same service. It works without
 connecting the account again. Requeue the model response before each turn.
+
+Uncheck a service to remove it from this session; its saved account stays connected.
+Selection is per session, not a sandbox-wide default. A running session must restart
+to load changes, as indicated in the dialog.
 
 Disconnect in Settings: subsequent service tests and calls fail until reconnected.
 `delete_ticket` exists upstream but is excluded by the registry and never appears
@@ -230,6 +236,18 @@ sequenceDiagram
   G->>P: Existing tool-result policy
   G-->>H: Policy-checked result
 ```
+
+## Embedding and downstream compatibility
+
+The registry and gateway are enabled only when `OMNIGENT_MCP_REGISTRY` is configured.
+The picker appears only when the server advertises the `mcp` connection capability.
+Existing HTTP/stdio configurations keep their existing routing and behavior.
+
+An embedding application can retain its own catalog, OAuth UI, session-selection
+metadata and remote gateway. This prototype does not replace embed host capabilities,
+rewrite session labels or require a hosted provider to adopt the OSS credential store.
+The `registry` transport is specific to services selected from this server's catalog;
+existing hosted connections must not be reinterpreted as registry IDs.
 
 ## Prototype boundaries and tests
 
