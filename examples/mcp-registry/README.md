@@ -8,6 +8,9 @@ The **registry** is administrator-owned configuration: service IDs, destinations
 authentication and allowed tools/users. The **gateway** executes requests through
 the existing session MCP endpoint and its authentication and tool policies.
 
+See the [architecture overview](../../designs/MCP_REGISTRY_GATEWAY.md) for component
+ownership and the OAuth, launch, tool-call, refresh and credential-broker diagrams.
+
 ```mermaid
 flowchart LR
   subgraph browser[Browser]
@@ -48,6 +51,61 @@ flowchart LR
 The upstream MCP server lives at the administrator's URL. It is an outbound
 request from the Omnigent server. A `transport: registry` entry does not start a
 local MCP subprocess. Existing direct HTTP and stdio entries retain their behavior.
+
+## Choose tools before launch
+
+On **New session**, open **MCPs** in the composer footer and check the services
+to add. The list comes from the administrator's registry. An unconnected OAuth
+service opens a sign-in popup and is selected only after authorization succeeds;
+launch is disabled while sign-in is pending. Connected accounts are reused.
+Bearer-token services must first be connected in Settings. Unchecking a service
+does not disconnect the account.
+
+Choose a host or a new sandbox, an agent, and your first message, then launch.
+The server saves the references before scheduling the runner, so the first turn
+can use the tools without a second attach/restart step. Selection stays in the
+current in-memory launch draft across navigation; a fresh draft defaults to none.
+The picker is absent when the server does not advertise the `mcp` connection
+capability.
+
+Both JSON `POST /v1/sessions` and multipart creation metadata accept the optional
+field `mcp_registry_services`, for example `["tracker"]`. These IDs **add to**
+the agent's authored tools. A JSON create with selections gets a session-scoped
+copy of the agent bundle; other sessions and the template are unchanged. Existing
+registry tool restrictions are preserved, custom-name collisions are rejected,
+and unknown or disallowed services fail before session persistence. Named
+sub-agent creates use their authored MCP configuration rather than this picker.
+
+The field is specific to the OSS registry. It does not reinterpret hosted
+connection names or labels, and does not change the store interface. Deployments
+without the registry continue through the existing creation path.
+
+Native harnesses discover selected MCP tools through the session gateway and
+advertise them alongside built-in tools in their existing relay. Calls still
+use the gateway's authorization and tool policies; upstream credentials stay
+on the server.
+
+```mermaid
+sequenceDiagram
+  participant UI as Browser / New session
+  participant Server as Omnigent server
+  participant Store as Agent + session stores
+  participant Sandbox as Sandbox / harness
+  participant MCP as Remote MCP service
+  UI->>Server: GET registry catalog
+  Server-->>UI: Allowed services + connection status (no tokens)
+  UI->>Server: Create session + selected registry IDs
+  Server->>Server: Authorize IDs; prepare session bundle
+  Server->>Store: Persist session-scoped agent + session
+  Server->>Sandbox: Launch with session identity
+  UI->>Server: First message
+  Server->>Sandbox: Dispatch first turn
+  Sandbox->>Server: Session MCP tools/call
+  Server->>Server: Validate tool + policies; resolve/refresh credential
+  Server->>MCP: Call with server-held access token
+  MCP-->>Server: Result
+  Server-->>Sandbox: Policy-checked result
+```
 
 ## Local Docker / Colima walkthrough
 
