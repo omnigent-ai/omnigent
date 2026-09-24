@@ -33,14 +33,16 @@ _INVALID_MERMAID = (
 
 
 def _seed_assistant_message(chat: ChatSessionContract, text: str) -> None:
-    chat._items = [
-        message_item(
-            "transcript-rendering-assistant",
-            "assistant",
-            text,
-            response_id="transcript-rendering-response",
-        )
-    ]
+    chat.set_items(
+        [
+            message_item(
+                "transcript-rendering-assistant",
+                "assistant",
+                text,
+                response_id="transcript-rendering-response",
+            )
+        ]
+    )
 
 
 def _position_code_block(block: Locator) -> None:
