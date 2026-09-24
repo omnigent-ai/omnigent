@@ -34,11 +34,45 @@ _ASK_DEMO_YAML = _REPO_ROOT / "tests" / "resources" / "agents" / "ask-demo" / "a
 _FIXTURES_DIR = _REPO_ROOT / "tests" / "_fixtures" / "agents"
 _TOOL_GATE_DIR = _FIXTURES_DIR / "e2e-tool-gate"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# Braille spinner frames the REPL repaints while a turn is in flight.
+_SPINNER_ONLY_RE = re.compile(r"[\u2800-\u28ff\s]+")
+
+# Matches the CLI's own cold-start budget: daemon spawn + host-online + runner-online.
+_LAUNCH_TIMEOUT = 120
 
 
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences before substring search."""
     return _ANSI_RE.sub("", text)
+
+
+def _meaningful_tail(raw: str, limit: int = 1500) -> str:
+    """Return the tail of PTY output with spinner repaints collapsed.
+
+    A stalled REPL repaints its braille spinner many times a second, so a raw
+    tail is all spinner frames and the content that explains the stall is gone.
+    """
+    kept: list[str] = []
+    spinners = 0
+    for line in _strip_ansi(raw).splitlines():
+        if not line.strip() or _SPINNER_ONLY_RE.fullmatch(line.strip()):
+            spinners += 1
+            continue
+        kept.append(line)
+    body = "\n".join(kept)[-limit:]
+    return f"{body}\n[{spinners} spinner/blank repaint lines omitted]"
+
+
+def _expect(child: Any, pattern: Any, *, timeout: float) -> None:
+    """Wrap child.expect, surfacing buffered PTY output when a TIMEOUT fires."""
+    try:
+        child.expect(pattern, timeout=timeout)
+    except pexpect.TIMEOUT:
+        raise pexpect.TIMEOUT(
+            f"Timeout waiting for {pattern!r}.\n"
+            f"PTY tail (ANSI-stripped, spinners collapsed):\n"
+            f"{_meaningful_tail(child.before or '')}"
+        ) from None
 
 
 def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
@@ -139,9 +173,17 @@ def _spawn_repl_with_args(
     )
 
 
-def _wait_for_prompt_ready(child: Any, timeout: float = 60.0) -> None:
-    """Wait for the REPL prompt (``❯``) to appear."""
-    child.expect("❯", timeout=timeout)
+def _wait_for_prompt_ready(
+    child: Any,
+    timeout: float = _LAUNCH_TIMEOUT,
+    welcome_pattern: str = "ask.demo",
+) -> None:
+    """Wait for the REPL toolbar idle marker.
+
+    ``❯`` can appear during startup before the event loop accepts input.
+    """
+    _expect(child, welcome_pattern, timeout=timeout)
+    _expect(child, r"·\s*ready", timeout=timeout)
 
 
 def _read_pending(child: Any, seconds: float = 0.3) -> str:
@@ -213,9 +255,9 @@ def test_sessions_single_approval_allows_llm_response(
     try:
         _wait_for_prompt_ready(child)
         child.send("Hello\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=30)
         child.send("y\r")
-        child.expect("approved", timeout=10)
+        _expect(child, "approved", timeout=10)
 
         buffered = _read_pending(child, seconds=5.0)
         buffered += _read_pending(child, seconds=3.0)
@@ -246,9 +288,9 @@ def test_sessions_refusal_shows_deny_sentinel(
     try:
         _wait_for_prompt_ready(child)
         child.send("Hello\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=30)
         child.send("n\r")
-        child.expect("refused", timeout=10)
+        _expect(child, "refused", timeout=10)
 
         buffered = _read_pending(child, seconds=5.0)
         assert "DENIED" in buffered.upper() or "refused" in buffered.lower(), (
@@ -277,16 +319,16 @@ def test_sessions_two_turns_fires_one_approval_per_turn(
 
         # Turn 1.
         child.send("First message\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=30)
         child.send("y\r")
-        child.expect("approved", timeout=10)
+        _expect(child, "approved", timeout=10)
         _read_pending(child, seconds=5.0)
 
         # Turn 2.
         child.send("Second message\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=30)
         child.send("y\r")
-        child.expect("approved", timeout=10)
+        _expect(child, "approved", timeout=10)
         buffered = _read_pending(child, seconds=5.0)
         assert re.search(r"[A-Za-z]{3,}", buffered), (
             f"No reply after second-turn approval.\nBuffer:\n{buffered[:800]}"
@@ -314,9 +356,9 @@ def test_sessions_approve_always_caches_for_later_turns(
 
         # Turn 1: approve always.
         child.send("First\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=30)
         child.send("a\r")
-        child.expect("approved always", timeout=10)
+        _expect(child, "approved always", timeout=10)
         _read_pending(child, seconds=5.0)
 
         # Turn 2: should auto-approve (no prompt).
@@ -371,11 +413,11 @@ def test_sessions_tool_call_approval_allows_tool(
 
     child = _spawn_sessions_repl(tool_gate_yaml, repl_env)
     try:
-        _wait_for_prompt_ready(child, timeout=60)
+        _wait_for_prompt_ready(child, welcome_pattern="e2e.tool.gate")
         child.send("Use the tool\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=30)
         child.send("y\r")
-        child.expect("approved", timeout=10)
+        _expect(child, "approved", timeout=10)
         buffered = _read_pending(child, seconds=8.0)
         assert re.search(r"[A-Za-z]{3,}", buffered), (
             f"No response after tool approval.\nBuffer:\n{buffered[:800]}"
@@ -419,7 +461,7 @@ def test_sessions_default_flag_works(
 
     child = _spawn_repl_with_args(yaml_path, repl_env)
     try:
-        _wait_for_prompt_ready(child, timeout=60)
+        _wait_for_prompt_ready(child, welcome_pattern="simple.hello")
         child.send("Say hello in exactly five words\r")
 
         buffered = _read_pending(child, seconds=10.0)
