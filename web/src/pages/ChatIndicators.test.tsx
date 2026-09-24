@@ -69,7 +69,7 @@ describe("McpStartupIndicator lifecycle", () => {
       });
     });
     expect(screen.queryByTestId("mcp-startup-indicator")).toBeNull();
-    expect(screen.queryByText("MCP startup incomplete")).toBeNull();
+    expect(screen.queryByText(/MCP startup incomplete/i)).toBeNull();
   });
 
   it("hides a Stop-cancelled single-server round without adding a notice", () => {
@@ -93,6 +93,6 @@ describe("McpStartupIndicator lifecycle", () => {
       });
     });
     expect(screen.queryByTestId("mcp-startup-indicator")).toBeNull();
-    expect(screen.queryByText("MCP startup incomplete")).toBeNull();
+    expect(screen.queryByText(/MCP startup incomplete/i)).toBeNull();
   });
 });

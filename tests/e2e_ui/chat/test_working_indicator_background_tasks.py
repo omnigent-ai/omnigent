@@ -25,14 +25,18 @@ def _pill_badge(page: Page, count: int) -> Locator:
 def _publish_status(
     base_url: str,
     session_id: str,
+    status: str = "idle",
     *,
-    background_task_count: int,
+    response_id: str | None = None,
+    background_task_count: int | None = None,
     background_tasks: list[dict[str, str]] | None = None,
 ) -> None:
-    data: dict[str, object] = {
-        "status": "idle",
-        "background_task_count": background_task_count,
-    }
+    """Publish a status edge; an omitted count preserves the sticky tally."""
+    data: dict[str, object] = {"status": status}
+    if response_id is not None:
+        data["response_id"] = response_id
+    if background_task_count is not None:
+        data["background_task_count"] = background_task_count
     if background_tasks is not None:
         data["background_tasks"] = background_tasks
     response = httpx.post(
