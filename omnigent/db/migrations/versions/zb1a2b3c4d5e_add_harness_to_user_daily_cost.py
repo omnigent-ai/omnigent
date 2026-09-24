@@ -130,9 +130,10 @@ def downgrade() -> None:
             )
         )
     elif dialect == "cockroachdb":
-        # CockroachDB: use separate statements to ensure table always has a PK
+        # CockroachDB: publish schema changes via commit, then drop column
         # Get the actual PK name (may vary across database states)
         old_pk_name = _existing_pk_name("user_daily_cost")
+        bind = op.get_bind()
         if old_pk_name:
             # First rebuild the PK without harness
             op.execute(
@@ -142,6 +143,9 @@ def downgrade() -> None:
                     f"ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc)"
                 )
             )
+            # CRDB publishes schema changes at commit
+            bind.commit()
+            bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
             # Then drop the harness column
             op.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
         else:
