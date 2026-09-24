@@ -154,7 +154,8 @@ def downgrade() -> None:
                     sa.text(
                         f"ALTER TABLE user_daily_cost "
                         f'DROP CONSTRAINT "{old_pk_name}", '
-                        f"ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc)"
+                        f"ADD CONSTRAINT pk_user_daily_cost "
+                        f"PRIMARY KEY (workspace_id, user_id, day_utc)"
                     )
                 )
                 # CRDB publishes schema changes at commit
