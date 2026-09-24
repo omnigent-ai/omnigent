@@ -88,7 +88,7 @@ actual routing/configuration conflicts in the supported sandbox.
 | --- | --- | --- |
 | Claude-native chat/terminal | `native_claude_mock_session`; `tests/e2e_ui/messages/test_native_claude_render_parity.py` | Real Claude CLI; drive the reported composer or terminal action. A synthetic hook is not native tool execution. |
 | Codex-native chat/terminal | `native_codex_mock_session`; `tests/e2e_ui/messages/test_native_codex_render_parity.py` | Real Codex CLI; native slash commands must be typed into the terminal. An SDK call does not exercise that path. |
-| Pi-native terminal | Product session terminal resources; existing Terminal-view helpers in `tests/e2e_ui/messages/test_native_claude_render_parity.py`; Pi discovery in `omnigent/harnesses/pi_native/main.py` | Adapt browser navigation/typing to the actual Pi session. CLI/fixture absence or a failed local socket search does not establish that the web terminal is unavailable. |
+| Pi-native terminal | `omnigent/harnesses/pi_native/main.py`; shared Terminal-view helpers in `tests/e2e_ui/messages/test_native_claude_render_parity.py` | Real Pi CLI; use the reported entry point and actual session terminal. |
 | OpenAI Agents web journey | `custom_agent_session`; `tests/e2e_ui/messages/test_message_render_parity.py` | Real web composer and executor; a direct Python helper bypasses the user journey. |
 
 Adapt the relevant driver to the ticket; these existing tests are references,
@@ -103,27 +103,16 @@ IDs and evidence before mock resets/session deletion, and follow
 show the reported symptom. The existing workflow owns shutdown and bundling.
 Independent execution collection and claim verification remain separate work.
 
-## Pi terminal discovery and driving
+## Drive the reported native terminal
 
-Use the existing session and host from the reported setup. Inspect
-`GET /v1/sessions/{session_id}/resources/terminals` and the matching resource's
-`metadata.running`, `metadata.tmux_socket`, and `metadata.tmux_target`; follow
-the Pi native CLI's resource lookup instead of scanning local socket directories.
-The socket belongs to the runner and may not be visible in this shell.
+Use the product's terminal resources to find the actual session terminal, then
+follow the existing driver for that harness and the reported entry point. A
+runner's local socket may be inaccessible from the agent's shell; that alone
+does not establish that the product's terminal connection is unavailable.
 
-For a web-terminal journey, open that session in the real SPA, switch via the
-`view-mode-toggle` to Terminal, and wait for `[data-testid="terminal-view"]`
-to have `data-state="connected"`. Focus its `.xterm-helper-textarea` and type
-the reported keys, following the existing native render-parity helpers. The SPA
-attaches through `/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach`
-over WebSocket; it does not need the runner's tmux socket mounted locally.
-Capture the rendered terminal outcome, including autocomplete before Enter when
-that is the reported symptom. Do not send slash commands through chat-message
-APIs and treat them as terminal input. Leave relevant responses and terminal
-traffic unstubbed.
-
-For a CLI journey, use `omnigent pi --server <prepared-server-url> --resume <id>`
-in a PTY when the runner's socket is reachable. A web-terminal alternative is a
-different entry point and needs a disclosed plan revision. If resource lookup
-or attachment fails, keep the exact response/connection diagnostic and mark the
-interaction unverified; a generated `models.json` does not prove `/model` ran.
+Send the reported keys through the real terminal connection and capture its
+visible response. Chat-message APIs and generated configuration files do not
+prove terminal input occurred. Keep relevant terminal traffic unstubbed. If the
+reported entry point cannot be driven, preserve the diagnostic, mark the action
+unverified, and register a plan revision before trying a different entry point.
+The ticket and accepted plan determine the commands and outcomes to observe.
