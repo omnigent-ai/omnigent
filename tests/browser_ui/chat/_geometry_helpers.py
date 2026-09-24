@@ -72,6 +72,7 @@ def open_live(
 ) -> None:
     page.set_viewport_size(viewport)
     page.goto(chat.url)
+    chat.wait_for_stream()
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=15_000)
     expect(page.get_by_test_id("composer-action-row")).to_be_visible(timeout=15_000)
 
