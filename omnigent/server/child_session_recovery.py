@@ -106,6 +106,7 @@ async def restore_active_children(
 ) -> None:
     """Rebind and initialize interrupted descendants on their recovered parent's runner."""
     from omnigent.runtime import get_runner_router
+    from omnigent.server.routes._sessions.common import _RUNNER_SESSION_INIT_TIMEOUT
     from omnigent.server.routes.sessions import _ensure_runner_relay
 
     if parent.runner_id is None or not _restorable(parent):
@@ -198,7 +199,7 @@ async def restore_active_children(
                     response = await initializer.initialize(
                         child,
                         client,
-                        timeout=10.0,
+                        timeout=_RUNNER_SESSION_INIT_TIMEOUT,
                         suppress_recovery_turn=not _interrupted(child),
                         resume_interrupted_turn=_interrupted(child),
                     )

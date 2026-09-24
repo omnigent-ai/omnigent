@@ -834,7 +834,11 @@ _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
 
 
-_RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
+# The runner's create_session awaits initialization inline: SDK readiness
+# alone permits 30s and a native terminal launch runs longer, so a finite
+# read deadline fails healthy session starts. The runner's own readiness
+# budgets bound the wait; a dropped tunnel still fails the request.
+_RUNNER_SESSION_INIT_TIMEOUT = httpx.Timeout(5.0, read=None)
 
 
 _STOP_RUNNER_RESULT_TIMEOUT_S = 10.0
@@ -1119,7 +1123,7 @@ __all__ = [
     "_RUNNER_CONVICTION_POLL_S",
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
-    "_RUNNER_SESSION_INIT_TIMEOUT_S",
+    "_RUNNER_SESSION_INIT_TIMEOUT",
     "_SERVER_STREAM_EVENT_ADAPTER",
     "_SESSION_STREAM_HEARTBEAT_INTERVAL_S",
     "_SESSION_UPDATES_HEARTBEAT_INTERVAL_S",

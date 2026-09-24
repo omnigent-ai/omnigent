@@ -22,8 +22,10 @@ abort propagates as a ``ConnectionError`` from the body iterator.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
+from typing import TypeVar
 
 import httpx
 
@@ -37,6 +39,59 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
 
+_T = TypeVar("_T")
+
+
+def _read_timeout(request: httpx.Request) -> float | None:
+    """
+    Return the request's httpx ``read`` timeout, or ``None`` for no bound.
+
+    httpx records the merged client and per-call timeout on
+    ``request.extensions["timeout"]``. Over the tunnel, ``read`` bounds the
+    wait for the response head and for each body frame.
+
+    :param request: The outgoing request.
+    :returns: Seconds, e.g. ``10.0``, or ``None``.
+    """
+    timeout = request.extensions.get("timeout") or {}
+    read = timeout.get("read")
+    return float(read) if read is not None else None
+
+
+async def _wait_for_read(awaitable: Awaitable[_T], read_timeout: float | None) -> _T:
+    """
+    Await response bytes within the read budget.
+
+    :param awaitable: The head future or a body-queue read.
+    :param read_timeout: Seconds, or ``None`` to wait without bound.
+    :returns: The awaited value.
+    :raises asyncio.TimeoutError: When the budget elapses first.
+    """
+    if read_timeout is None:
+        return await awaitable
+    return await asyncio.wait_for(awaitable, read_timeout)
+
+
+async def _cancel_request(
+    registry: TunnelRegistry, state: RequestState, req_id: str, reason: str
+) -> None:
+    """
+    Tell the runner to stop a request the server has given up on.
+
+    :param registry: Registry owning the runner's tunnel.
+    :param state: The request's reassembly state.
+    :param req_id: The request id, e.g. ``"3f2a..."``.
+    :param reason: Cancel reason for the runner log, e.g. ``"read_timeout"``.
+    """
+    if not registry.request_is_open(state.session, req_id):
+        return
+    try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
+        await registry.send_text(
+            state.session, encode_frame(RequestCancelFrame(id=req_id, reason=reason))
+        )
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        pass
+
 
 class _TunneledByteStream(httpx.AsyncByteStream):
     """Adapts the registry's body queue into an ``httpx.AsyncByteStream``."""
@@ -47,17 +102,28 @@ class _TunneledByteStream(httpx.AsyncByteStream):
         runner_id: str,
         req_id: str,
         state: RequestState,
+        request: httpx.Request | None = None,
     ) -> None:
         self._registry = registry
         self._runner_id = runner_id
         self._req_id = req_id
         self._state = state
+        self._request = request
+        self._read_timeout = _read_timeout(request) if request is not None else None
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         state = self._state
         try:
             while True:
-                item = await state.body_queue.get()
+                try:
+                    item = await _wait_for_read(state.body_queue.get(), self._read_timeout)
+                except asyncio.TimeoutError:
+                    await _cancel_request(self._registry, state, self._req_id, "read_timeout")
+                    raise httpx.ReadTimeout(
+                        f"runner {self._runner_id!r} sent no response body within "
+                        f"{self._read_timeout:g}s",
+                        request=self._request,
+                    ) from None
                 if state.aborted_with is not None:
                     raise state.aborted_with
                 if item is None:
@@ -79,19 +145,7 @@ class _TunneledByteStream(httpx.AsyncByteStream):
         # client disconnect). The transport translates this into a
         # request.cancel frame so the runner aborts.
         state = self._state
-        if self._registry.request_is_open(state.session, self._req_id):
-            try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
-                await self._registry.send_text(
-                    state.session,
-                    encode_frame(
-                        RequestCancelFrame(
-                            id=self._req_id,
-                            reason="client_disconnected",
-                        )
-                    ),
-                )
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
+        await _cancel_request(self._registry, state, self._req_id, "client_disconnected")
         self._registry.close_request(
             self._runner_id,
             self._req_id,
@@ -105,6 +159,15 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
     Construct one transport per (registry, runner_id) pair (or share
     one via a thin lookup that resolves runner_id per request — that's
     a higher-level routing concern, not this transport's).
+
+    The httpx ``read`` timeout is honored: waiting for the response head or
+    for a body frame past it raises :class:`httpx.ReadTimeout` and frees the
+    request slot; ``read=None`` waits without bound. A body-frame timeout
+    also cancels the runner-side dispatch, as a consumer that stops reading
+    does; a head timeout leaves the handler to finish and drops its late
+    response, as a caller that gives up before the head always has.
+    ``connect``, ``pool`` and ``write`` do not apply: the tunnel is already
+    connected and a request is a single frame.
 
     :param registry: The :class:`TunnelRegistry` that owns the runner's
         live WebSocket and reassembly state.
@@ -132,6 +195,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         body = await request.aread() if request.content else b""
         content_type = request.headers.get("content-type", "application/json")
         body_str, encoding = encode_body(body, content_type) if body else (None, "utf-8")
+        read_timeout = _read_timeout(request)
 
         try:
             state = self._registry.open_request(self._runner_id, req_id)
@@ -155,9 +219,23 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                     )
                 ),
             )
-            # Block until the response head arrives (or the tunnel
-            # aborts the request).
-            head = await state.head_future
+            # Block until the response head arrives, the tunnel aborts the
+            # request, or the read budget runs out. The future belongs to
+            # the registry, so shield it from wait_for's cancellation. The
+            # runner keeps processing and its late response is dropped with
+            # the slot: like a caller that gives up before the head, this
+            # does not cancel a handler mid-request.
+            try:
+                head = await _wait_for_read(asyncio.shield(state.head_future), read_timeout)
+            except asyncio.TimeoutError:
+                # Disarm the abandoned future: an abort that captured this
+                # state before cleanup would otherwise set an exception on
+                # it that no waiter ever retrieves.
+                state.head_future.cancel()
+                raise httpx.ReadTimeout(
+                    f"runner {self._runner_id!r} did not answer within {read_timeout:g}s",
+                    request=request,
+                ) from None
         except BaseException:
             # If we failed before getting head, clean up the slot so
             # we don't leak in_flight state.
@@ -167,7 +245,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         # Wrap the body queue as an httpx AsyncByteStream. The stream
         # owns close_request() — cleanup happens when the response
         # iterator finishes or the consumer's `async with` exits.
-        stream = _TunneledByteStream(self._registry, self._runner_id, req_id, state)
+        stream = _TunneledByteStream(self._registry, self._runner_id, req_id, state, request)
         return httpx.Response(
             status_code=head.status,
             headers=[(k, v) for k, v in head.headers],

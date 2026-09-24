@@ -385,3 +385,51 @@ async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
     assert all(row["session_id"] == conversation.id for row in events)
     assert all(row["attributes"]["runner_id"] == conversation.runner_id for row in events)
     assert events[1]["attributes"]["status_code"] == "503"
+
+
+class _TimeoutCaptureClient:
+    """Records each init POST's timeout, then fails the handshake."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[Any] = []
+
+    async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+        self.timeouts.append(kwargs.get("timeout"))
+        return httpx.Response(500, request=httpx.Request("POST", path))
+
+
+@pytest.mark.asyncio
+async def test_session_init_handshake_posts_carry_no_read_deadline() -> None:
+    """The runner's create_session awaits initialization inline — SDK readiness
+    alone permits 30s and a native terminal launch runs longer — so the
+    handshake POST must not carry a finite read deadline."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _ensure_runner_session_initialized,
+    )
+
+    conversation = _conversation()
+    client = _TimeoutCaptureClient()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(),
+        server_version="0.6.0.dev0",
+    )
+
+    await _ensure_runner_session_initialized(
+        "conv_init",
+        conversation,
+        client,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+    )
+    await _ensure_runner_session_initialized(
+        "conv_init",
+        conversation,
+        client,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        initializer,
+    )
+
+    assert len(client.timeouts) == 2
+    for timeout in client.timeouts:
+        assert httpx.Timeout(timeout).read is None, (
+            f"session-init POST carried a finite read deadline: {timeout!r}"
+        )

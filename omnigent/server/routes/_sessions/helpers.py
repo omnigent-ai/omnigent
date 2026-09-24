@@ -191,6 +191,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RUNNER_CONVICTION_POLL_S,
     _RUNNER_FORWARD_TIMEOUT,
+    _RUNNER_SESSION_INIT_TIMEOUT,
     _SERVER_STREAM_EVENT_ADAPTER,
     _SESSION_STREAM_HEARTBEAT_INTERVAL_S,
     _SHARED_DISCOVERY_KEY,
@@ -10139,7 +10140,7 @@ async def _notify_runner_of_bundled_child(
                 "agent_id": agent_id,
                 "sub_agent_name": None,
             },
-            timeout=10.0,
+            timeout=_RUNNER_SESSION_INIT_TIMEOUT,
         )
     except (httpx.HTTPError, ConnectionError):
         _logger.warning(

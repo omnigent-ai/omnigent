@@ -61,7 +61,7 @@ class RunnerSessionInitializer:
         conversation: Conversation,
         runner_client: httpx.AsyncClient,
         *,
-        timeout: float,
+        timeout: httpx.Timeout | float,
         suppress_recovery_turn: bool = False,
         resume_interrupted_turn: bool = False,
     ) -> httpx.Response:
