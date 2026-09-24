@@ -342,7 +342,7 @@ def test_mention_chips_follow_the_row_grid(
         list_payload([]),
     )
     chat.contract.json(
-        re.compile(r"/v1/sessions/[^/]+/resources/environments/[^/]+/filesystem[?].*"),
+        f"/v1/sessions/{chat.session_id}/resources/environments/default/filesystem",
         {
             "available": True,
             "data": [
@@ -734,6 +734,7 @@ def test_composer_growth_reflows_without_covering_output(
 
     page.set_viewport_size({"width": 500, "height": 713})
     page.reload()
+    expect(page.get_by_text("Turn 20 response", exact=False).first).to_be_visible()
     expect(page.get_by_label("Message the agent")).to_be_visible()
     composer = page.get_by_label("Message the agent")
     composer.click()
@@ -939,9 +940,7 @@ def test_panel_resize_does_not_summon_a_ghost_scrollbar(
         list_payload([]),
     )
     chat.contract.json(
-        re.compile(
-            rf"/v1/sessions/{chat.session_id}/resources/environments/default/filesystem(?:\?.*)?$"
-        ),
+        f"/v1/sessions/{chat.session_id}/resources/environments/default/filesystem",
         list_payload([]),
     )
     open_live(page, chat, {"width": 1600, "height": 1000})

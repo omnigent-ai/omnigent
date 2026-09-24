@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 from itertools import pairwise
 
@@ -92,7 +91,7 @@ def open_landing(
     viewport: dict[str, int] = DESKTOP,
 ) -> None:
     chat.contract.json(
-        re.compile(r"/v1/hosts/[^/]+/filesystem(?:[/?].*)?$"),
+        f"/v1/hosts/{chat.host_id}/filesystem",
         {"available": True, "data": [], "has_more": False},
     )
     page.set_viewport_size(viewport)
