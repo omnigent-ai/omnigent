@@ -12,6 +12,10 @@ import json
 import pytest
 
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventBatchFrame,
+    EventReadyFrame,
     FrameKind,
     HelloFrame,
     PingFrame,
@@ -29,6 +33,45 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 
 # ── Round-trip per frame kind ────────────────────────────
+
+
+@pytest.mark.parametrize("events", [[], [{}], [{"type": 123}]])
+def test_event_batch_encoder_rejects_invalid_events(events: list[dict[str, object]]) -> None:
+    with pytest.raises(ValueError, match=r"event\.batch requires"):
+        encode_frame(EventBatchFrame(id="batch-1", session_id="session-1", events=events))
+
+
+def test_event_ingest_frames_round_trip() -> None:
+    hello = HelloFrame(
+        runner_version="0.1.2",
+        frame_protocol_version=1,
+        capabilities=[EVENT_INGEST_CAPABILITY],
+    )
+    assert decode_frame(encode_frame(hello)) == hello
+    ready = EventReadyFrame()
+    batch = EventBatchFrame(
+        id="batch-1",
+        session_id="session-1",
+        events=[{"type": "external_output_text_delta", "data": {"delta": "hi"}}],
+    )
+    ack = EventAckFrame(id="batch-1", applied=0, error="busy", retryable=True)
+    for frame in (ready, batch, ack, EventAckFrame(id="batch-1", applied=1)):
+        assert decode_frame(encode_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"kind": "event.batch", "id": "b", "session_id": "s", "events": []},
+        {"kind": "event.batch", "id": "b", "session_id": "s", "events": [{}]},
+        {"kind": "event.ack", "id": "b", "applied": -1},
+        {"kind": "event.ack", "id": "b", "applied": True},
+        {"kind": "event.ack", "id": "b", "applied": 0, "error": 123},
+    ],
+)
+def test_event_ingest_rejects_malformed_frames(frame: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        decode_frame(json.dumps(frame))
 
 
 def test_hello_round_trip() -> None:
@@ -335,6 +378,14 @@ def test_encoded_kind_uses_canonical_string() -> None:
     assert json.loads(encode_frame(PingFrame(ts=1)))["kind"] == "ping"
     assert json.loads(encode_frame(PongFrame(ts=1)))["kind"] == "pong"
     assert json.loads(encode_frame(ResponseEndFrame(id="x")))["kind"] == "response.end"
+    assert json.loads(encode_frame(EventReadyFrame()))["kind"] == "event.ready"
+    assert (
+        json.loads(encode_frame(EventBatchFrame(id="x", session_id="s", events=[{"type": "x"}])))[
+            "kind"
+        ]
+        == "event.batch"
+    )
+    assert json.loads(encode_frame(EventAckFrame(id="x", applied=1)))["kind"] == "event.ack"
     # The dot-separated kinds are the load-bearing assertion — a
     # refactor that flipped them to "responseEnd" or "RESPONSE_END"
     # would break wire compat with any client outside the test suite.
