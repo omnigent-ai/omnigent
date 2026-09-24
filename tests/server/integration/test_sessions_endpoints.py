@@ -4686,6 +4686,41 @@ async def test_post_external_session_status_failed_surfaces_output_and_reauth(
     assert "401 Unauthorized" in error["message"]
 
 
+async def test_post_external_session_status_failure_detail_keeps_native_code(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A harness ``failure_detail`` names the failure without the Codex wire label.
+
+    Claude-native reports its ``StopFailure`` reason this way; the edge must not
+    fall back to the turn's last assistant prose or report no detail at all.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "failure_detail": "API Error: 500 Overloaded"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert published[0][1]["status"] == "failed"
+    error = published[0][1]["error"]
+    assert error is not None
+    assert error["code"] == "native_turn_error"
+    assert error["message"] == "API Error: 500 Overloaded"
+
+
 async def test_post_external_session_status_carries_response_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

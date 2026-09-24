@@ -3440,6 +3440,24 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
+def _stop_failure_detail(record: ClaudeHookRecord) -> str | None:
+    """
+    Return the reason a ``StopFailure`` hook gives for its failed turn.
+
+    The hook carries the error text Claude Code rendered, which the transcript
+    mirror can deliver after the failed edge or not at all; without it the
+    server borrows the turn's last prose or reports no detail.
+
+    :param record: ``StopFailure`` hook record.
+    :returns: The error text, a category-only fallback, or ``None``.
+    """
+    if record.failure_message is not None:
+        return record.failure_message
+    if record.failure_category is not None:
+        return f"Claude Code ended the turn with an API error ({record.failure_category})."
+    return None
+
+
 def _is_subagent_hook_record(
     record: ClaudeHookRecord,
     *,
@@ -4018,6 +4036,7 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
+                failure_detail=_stop_failure_detail(record) if status == "failed" else None,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
