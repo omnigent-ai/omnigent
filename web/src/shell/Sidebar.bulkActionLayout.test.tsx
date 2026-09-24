@@ -230,7 +230,7 @@ describe("bulk-action bar layout", () => {
     expect(screen.getByText("1 selected")).toBeInTheDocument();
   });
 
-  it("renders the row checkbox to the LEFT of the session title", () => {
+  it("renders the row checkbox to the LEFT of the title and removes it on exit", () => {
     renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
 
@@ -241,5 +241,14 @@ describe("bulk-action bar layout", () => {
     const marker = li.querySelector("svg.lucide-square")?.parentElement as HTMLElement;
     expect(marker.className).toMatch(/\bleft-2\b/);
     expect(marker.className).not.toMatch(/\bright-/);
+
+    fireEvent.click(row);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Exit selection mode" }));
+
+    expect(screen.getByRole("button", { name: "Select sessions" })).toBeInTheDocument();
+    expect(li.querySelector("svg.lucide-square")).toBeNull();
+    expect(li.querySelector("svg.lucide-square-check")).toBeNull();
+    expect(screen.queryByText(/\d+ selected/)).toBeNull();
   });
 });
