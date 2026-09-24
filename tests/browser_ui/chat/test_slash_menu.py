@@ -42,6 +42,26 @@ def test_enter_executes_a_substring_matched_builtin(page: Page, chat_session_con
     expect(page.get_by_text("No usage data yet — send a message first.")).to_be_visible()
 
 
+def test_open_menu_accepts_an_async_skill_catalog(page: Page, chat_session_contract) -> None:
+    chat_session_contract.set_skills(
+        [{"name": "code-review", "description": "Review the current change"}]
+    )
+    release_skills = chat_session_contract.hold_skills()
+    page.goto(chat_session_contract.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+
+    composer.fill("/review")
+    expect(page.get_by_text("Loading skills…", exact=True)).to_be_visible()
+    expect(composer).to_have_value("/review")
+
+    release_skills()
+    skill = page.get_by_test_id("slash-menu-item-code-review")
+    expect(skill).to_have_attribute("data-active", "true")
+    composer.press("Tab")
+    expect(composer).to_have_value("/code-review ")
+
+
 def test_native_file_paste_closes_the_slash_menu(page: Page, chat_session_contract) -> None:
     page.goto(chat_session_contract.url)
     composer = _composer(page)
