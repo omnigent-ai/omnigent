@@ -1324,6 +1324,16 @@ async def test_message_relaunch_host_failure_uncategorized_reports_startup_failu
     assert "The host launched" not in error["message"], error["message"]
     assert "never connected" not in error["message"], error["message"]
 
+    # The refusal text must never enter RunnerExitReports: the session
+    # snapshot reads that store UNscoped (last_task_error), so a record
+    # here would hand any read-level collaborator the raw host text the
+    # 503 above deliberately owner-scopes.
+    snap = await client.get(f"/v1/sessions/{session_id}")
+    assert snap.status_code == 200, snap.text
+    assert "failed to spawn runner: boom" not in snap.text, (
+        "host launch-refusal text leaked into the session snapshot"
+    )
+
 
 async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched(
     client: httpx.AsyncClient,

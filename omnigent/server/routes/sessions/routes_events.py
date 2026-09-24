@@ -1945,6 +1945,13 @@ def register_events_routes(
         relaunched_runner_id: str | None = None
         relaunched_launch_acknowledged = False
         relaunched_launch_refused = False
+        # The host's launch-refusal reason and whether THIS requester may
+        # see it verbatim. Kept out of runner_exit_reports on purpose: that
+        # store also feeds the unscoped session-snapshot path
+        # (last_task_error), which would hand every read-level collaborator
+        # the raw host text the 503 below deliberately owner-scopes.
+        relaunch_refusal_reason: str | None = None
+        relaunch_refusal_visible = False
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = cast(
@@ -2050,16 +2057,21 @@ def register_events_routes(
                     relaunched_launch_acknowledged = launch_attempt.acknowledged
                     if launch_attempt.error or launch_attempt.error_code:
                         # The host answered "failed" without a recognized
-                        # category: no runner is coming. Record the host's
-                        # reason owner-scoped (read back at the raise below)
-                        # and skip the pointless connect wait.
+                        # category: no runner is coming. Keep the host's
+                        # reason in locals for the raise below — recording it
+                        # in runner_exit_reports would leak it to non-owners
+                        # via the unscoped snapshot read — and skip the
+                        # pointless connect wait. Visibility mirrors
+                        # RunnerExitReports.get_visible: unauthenticated
+                        # deployments and the host owner see the reason;
+                        # other session viewers get the phase-level cause.
                         relaunched_launch_refused = True
-                        if runner_exit_reports is not None and launch_attempt.error:
-                            runner_exit_reports.record(
-                                relaunched_runner_id,
-                                launch_attempt.error,
-                                owner=_host_conn.owner,
-                            )
+                        relaunch_refusal_reason = launch_attempt.error
+                        relaunch_refusal_visible = (
+                            user_id is None
+                            or _host_conn.owner is None
+                            or _host_conn.owner == user_id
+                        )
                 else:
                     # The host tunnel is gone entirely. A managed
                     # host's sandbox is relaunchable — provision a new
@@ -2172,10 +2184,12 @@ def register_events_routes(
                     # The host answered "failed": no runner process started.
                     event_name = "runner_launch_failed"
                     log_detail = "the host reported the launch failed" + (
-                        f": {exit_report}" if exit_report else ""
+                        f": {relaunch_refusal_reason}" if relaunch_refusal_reason else ""
                     )
-                    if visible_report:
-                        launch_detail = f"the host reported the launch failed: {visible_report}"
+                    if relaunch_refusal_reason and relaunch_refusal_visible:
+                        launch_detail = (
+                            f"the host reported the launch failed: {relaunch_refusal_reason}"
+                        )
                     else:
                         launch_detail = (
                             "the host reported the launch failed. The reason "
