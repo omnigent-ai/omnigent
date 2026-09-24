@@ -40,13 +40,19 @@ def upgrade() -> None:
     Uses ALTER TABLE for better performance and less downtime. The new
     harness column defaults to "__all__" for existing rows.
     """
+    # Get the actual primary key name (may vary across database states)
+    inspector = sa.inspect(op.get_bind())
+    pk_constraint = inspector.get_pk_constraint("user_daily_cost")
+    old_pk_name = pk_constraint.get("name") if pk_constraint else None
+
     with op.batch_alter_table("user_daily_cost") as batch_op:
         # Add harness column with default value
         batch_op.add_column(
             sa.Column("harness", sa.String(64), nullable=False, server_default="__all__")
         )
-        # Drop old primary key
-        batch_op.drop_constraint("pk_user_daily_cost", type_="primary")
+        # Drop old primary key if it exists
+        if old_pk_name:
+            batch_op.drop_constraint(old_pk_name, type_="primary")
         # Add new primary key including harness
         batch_op.create_primary_key(
             "pk_user_daily_cost", ["workspace_id", "user_id", "day_utc", "harness"]
@@ -61,11 +67,17 @@ def downgrade() -> None:
     Only cross-harness data will be preserved.
     """
     # Delete per-harness rows before removing the column
-    op.execute("DELETE FROM user_daily_cost WHERE harness != '__all__'")
+    op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
+
+    # Get the actual primary key name
+    inspector = sa.inspect(op.get_bind())
+    pk_constraint = inspector.get_pk_constraint("user_daily_cost")
+    old_pk_name = pk_constraint.get("name") if pk_constraint else None
 
     with op.batch_alter_table("user_daily_cost") as batch_op:
-        # Drop current primary key
-        batch_op.drop_constraint("pk_user_daily_cost", type_="primary")
+        # Drop current primary key if it exists
+        if old_pk_name:
+            batch_op.drop_constraint(old_pk_name, type_="primary")
         # Recreate original primary key without harness
         batch_op.create_primary_key("pk_user_daily_cost", ["workspace_id", "user_id", "day_utc"])
         # Drop harness column
