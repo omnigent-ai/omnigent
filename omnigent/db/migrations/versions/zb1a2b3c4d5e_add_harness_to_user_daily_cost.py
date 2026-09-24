@@ -90,7 +90,7 @@ def downgrade() -> None:
         # Drop current primary key if it exists
         if old_pk_name is not None:
             batch_op.drop_constraint(old_pk_name, type_="primary")
-        # Recreate original primary key without harness
-        batch_op.create_primary_key("pk_user_daily_cost", ["workspace_id", "user_id", "day_utc"])
         # Drop harness column
         batch_op.drop_column("harness")
+        # Recreate original primary key without harness
+        batch_op.create_primary_key("pk_user_daily_cost", ["workspace_id", "user_id", "day_utc"])
