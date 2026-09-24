@@ -492,6 +492,26 @@ def pi_own_login_model_arg(selection: str) -> str | None:
     return None if "/" in split[1] else split[1]
 
 
+def pi_own_login_serves_reference(reference: str | None, agent_dir: Path | None = None) -> bool:
+    """Return whether Pi's own logged-in catalog serves *reference*."""
+    if not reference:
+        return False
+    provider_id, separator, model_id = reference.partition("/")
+    if not (separator and provider_id and model_id):
+        return False
+    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    if provider_id not in _read_json_object(root / "auth.json"):
+        return False
+    payload = _read_json_object(root / "models-store.json").get(provider_id)
+    if not _is_str_object_dict(payload):
+        return False
+    models = payload.get("models")
+    return any(
+        _is_str_object_dict(model) and model.get("id") == model_id
+        for model in (models if isinstance(models, list) else [])
+    )
+
+
 def pi_native_model_options(
     *,
     config_loader: Callable[[], dict[str, object]] | None = None,
@@ -1573,6 +1593,21 @@ def resolve_pi_native_provider(
     if selection is not None:
         _, model = selection
     try:
+        if selection is None and model and "/" in model:
+            prefix, _, bare = model.partition("/")
+            providers = config.get("providers")
+            names_configured_provider = (
+                bool(bare) and isinstance(providers, dict) and prefix in providers
+            )
+            # Preserve Pi-login references unless they name a configured provider.
+            if not names_configured_provider and pi_own_login_serves_reference(model):
+                _LOGGER.info(
+                    "pi-native: model %r is served by Pi's own %r login; "
+                    "Pi will use its own login.",
+                    model,
+                    prefix,
+                )
+                return None
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its
         # default exactly like the rest of the codebase — an explicit pi default
