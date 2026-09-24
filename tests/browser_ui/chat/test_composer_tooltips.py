@@ -1,11 +1,14 @@
 """Browser-only pointer contracts for the composer configuration tooltip."""
 
+import pytest
 from playwright.sync_api import Page, expect
 
 
+@pytest.mark.parametrize("turns", [0, 1], ids=["new-session", "existing-session"])
 def test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open(
-    page: Page, chat_session_contract
+    page: Page, chat_session_contract, turns: int
 ) -> None:
+    chat_session_contract.seed_transcript(turns)
     chat_session_contract.set_catalog(
         harness="claude-native",
         models=[
@@ -40,6 +43,7 @@ def test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open(
     picker = page.get_by_test_id("composer-agent-menu")
     expect(picker).to_be_visible()
     expect(tooltip).not_to_be_visible()
+    expect(page.locator('[data-slot="tooltip-content"]')).to_have_count(0)
 
     page.keyboard.press("Escape")
     expect(picker).not_to_be_visible()

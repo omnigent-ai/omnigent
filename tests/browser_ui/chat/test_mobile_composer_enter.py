@@ -32,6 +32,9 @@ def test_mobile_enter_inserts_newline_and_send_submits_once(
 
     page.get_by_role("button", name="Send", exact=True).click()
     expect(composer).to_have_value("")
+    expect(
+        page.locator('[data-testid="message-bubble"][data-role="user"]', has_text="first line")
+    ).to_have_count(1)
     assert len(chat_session_contract.event_posts) == 1
     event = chat_session_contract.event_posts[0]["body"]
     assert event["type"] == "message"

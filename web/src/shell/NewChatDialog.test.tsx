@@ -7493,6 +7493,25 @@ describe("NewChatLandingScreen skills menu", () => {
     typeMessage("/");
     expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
   });
+
+  it("uses the dollar prefix for Codex native skills", () => {
+    mockAgents([
+      {
+        id: "codex-native",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [{ name: "allowed", description: "Run an allowed workflow" }],
+      },
+    ]);
+    renderLanding();
+    typeMessage("/allow");
+
+    expect(screen.getByTestId("slash-menu-item-allowed")).toHaveTextContent("$allowed");
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Tab" });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("$allowed ");
+  });
 });
 
 // Always-visible skill pills under the landing composer for allowlisted

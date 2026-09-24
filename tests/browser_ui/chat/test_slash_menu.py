@@ -18,6 +18,7 @@ def test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation(
     composer.fill("/")
 
     rows = page.locator(_ROWS)
+    assert rows.count() >= 2, "wrap navigation needs at least two matches"
     expect(rows.first).to_have_attribute("data-active", "true")
     composer.press("ArrowUp")
     expect(rows.last).to_have_attribute("data-active", "true")
@@ -51,11 +52,18 @@ def test_open_menu_accepts_an_async_skill_catalog(page: Page, chat_session_contr
     composer = _composer(page)
     expect(composer).to_be_visible()
 
-    composer.fill("/review")
+    composer.fill("/")
+    expect(page.get_by_test_id("slash-menu-item-help")).to_be_visible()
     expect(page.get_by_text("Loading skills…", exact=True)).to_be_visible()
+    expect(
+        page.get_by_text("Skills unavailable while disconnected.", exact=True)
+    ).not_to_be_visible()
+    composer.fill("/review")
     expect(composer).to_have_value("/review")
+    assert len(chat_session_contract.skill_requests) == 1
 
     release_skills()
+    expect(page.get_by_text("Loading skills…", exact=True)).not_to_be_visible()
     skill = page.get_by_test_id("slash-menu-item-code-review")
     expect(skill).to_have_attribute("data-active", "true")
     composer.press("Tab")
