@@ -2046,7 +2046,7 @@ def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, boo
     return remaining, debug_logging, log_to_stderr
 
 
-@click.group(cls=_OmnigentCLI)
+@click.group(cls=_OmnigentCLI, context_settings={"help_option_names": ["-h", "--help"]})
 @click.option(
     "--profiling",
     is_flag=True,
@@ -2076,6 +2076,7 @@ def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, boo
     help="Mirror process logs to the terminal when stderr is interactive.",
 )
 @click.option(
+    "-v",
     "--version",
     is_flag=True,
     callback=_print_version_callback,
@@ -2158,6 +2159,7 @@ def _should_skip_update_check(argv: list[str]) -> bool:
         "--help",
         "-h",
         "--version",
+        "-v",
         "version",
         "update",
         "upgrade",
@@ -2338,6 +2340,7 @@ def main() -> None:
             "--help",
             "-h",
             "--version",
+            "-v",
             "--profiling",
         }
     ):
@@ -2371,7 +2374,7 @@ def main() -> None:
     # (conversation JSON) and --debug-events (SSE tape) are off.
     # Skip for pure help/version so quick invocations don't create
     # log litter.
-    if argv[0] in {"--help", "-h", "--version"}:
+    if argv[0] in {"--help", "-h", "--version", "-v"}:
         cli(args=argv)
         return
 
@@ -2509,14 +2512,14 @@ def _is_removed_ad_hoc_invocation(argv: list[str]) -> bool:
     """
     if not argv:
         return False
-    # Top-level click flags (``--help`` / ``-h`` / ``--version``)
+    # Top-level click flags (``--help`` / ``-h`` / ``--version`` / ``-v``)
     # should go through click so the user sees the click group's
     # help listing subcommands, not the legacy argparse help.
-    if argv[0] in {"--help", "-h", "--version"}:
+    if argv[0] in {"--help", "-h", "--version", "-v"}:
         return False
     # A root profiling flag may precede an eager help/version flag or stand
     # alone. These are valid Click invocations, not removed ad-hoc chat.
-    if all(token in {"--profiling", "--help", "-h", "--version"} for token in argv):
+    if all(token in {"--profiling", "--help", "-h", "--version", "-v"} for token in argv):
         return False
     # Skip leading flags to find the first positional. If all
     # tokens are flags (e.g. ``omnigent --system-prompt "..."``),
@@ -5069,7 +5072,7 @@ def _write_uninstall_manifest(ledger: InstallLedger) -> Path:
 
 def _maybe_fast_backfill_install_ledger(argv: Sequence[str]) -> None:
     """Create a cheap backfill ledger on first user-facing CLI run."""
-    if argv[0] in {"--help", "-h", "--version", "version", "_internal", "uninstall"}:
+    if argv[0] in {"--help", "-h", "--version", "-v", "version", "_internal", "uninstall"}:
         return
     with contextlib.suppress(Exception):
         from omnigent.install_ledger import backfill_install_ledger
@@ -12635,7 +12638,7 @@ def _accounts_login(server: str) -> None:
 _PANE_SPLIT_DIRECTIONS = ("v", "h", "w")
 
 
-@cli.command("pane-split", hidden=True)
+@cli.command("pane-split", hidden=True, context_settings={"help_option_names": ["--help"]})
 @click.option("-v", "direction", flag_value="v", help="Vertical split (new pane below)")
 @click.option(
     "-h",
@@ -13106,8 +13109,8 @@ def _bundled_brain_fallback_applies(run_args: tuple[str, ...]) -> bool:
     # A real --help never launches, so keep the fallback (and its notice)
     # out. A "--help" consumed as an option VALUE (e.g. ``-p --help``) is
     # prompt text, not a help request — the parse above resolves which.
-    if "--help" in run_args and all(
-        value != "--help" for value in params.values() if isinstance(value, str)
+    if ("--help" in run_args or "-h" in run_args) and all(
+        value not in {"--help", "-h"} for value in params.values() if isinstance(value, str)
     ):
         return False
     if params.get("harness") is not None or params.get("model") is not None:

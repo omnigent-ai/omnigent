@@ -161,7 +161,7 @@ def _print_ready_banner(provider: str, sandbox_id: str, server_url: str) -> None
     )
 
 
-@click.group("sandbox")
+@click.group("sandbox", context_settings={"help_option_names": ["-h", "--help"]})
 def sandbox() -> None:
     """
     Run an Omnigent host inside a remote sandbox.
@@ -426,7 +426,7 @@ def sandbox_connect(
 
 # Internal lakebox alias — hidden from the top-level --help pending
 # removal; still fully invocable.
-@click.group("lakebox", hidden=True)
+@click.group("lakebox", hidden=True, context_settings={"help_option_names": ["-h", "--help"]})
 @click.pass_context
 def lakebox(ctx: click.Context) -> None:
     """
