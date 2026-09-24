@@ -3047,6 +3047,154 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
+def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
+    """A routed web turn runs on the routed model, not the old one.
+
+    The executor queues ``model_change`` then ``user_message``; the poller
+    fires the switch without awaiting it, and Pi's ``setModel`` only commits
+    after an async auth check. The ``input`` handler must hold the message's
+    turn until that switch settles.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let committed = null;
+  pi.setModel = async (model) => {
+    setModelCalls.push(model);
+    await sleep(150); // Pi's checkAuth before agent.state.model is set
+    committed = model.id;
+    return true;
+  };
+  await handlers.session_start({}, ctx);
+  const file = path.join(inboxDir, "000-model.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ id: "m1", type: "model_change", model: "databricks-claude-opus-4-1" }),
+  );
+  while (fs.existsSync(file)) await sleep(10);
+  assert.equal(committed, null); // still in flight
+  await handlers.input({ text: "routed turn", source: "extension" }, ctx);
+  assert.equal(committed, "databricks-claude-opus-4-1");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_routes_once_via_route_turn(tmp_path: Path) -> None:
+    """A prompt typed in the Pi TUI asks route-turn once and applies the pick.
+
+    Web messages (``source: "extension"``) were routed server-side and must
+    not be routed again; slash commands are not prompts; and once the server
+    answered, later prompts skip the round trip.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  const routeCalls = [];
+  global.fetch = async (url, request) => {
+    const body = JSON.parse(request.body);
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls.push({ url, body });
+      return {
+        ok: true,
+        json: async () => ({
+          action: "route",
+          model: "omnigent/databricks-claude-opus-4-1",
+          terminal: false,
+        }),
+      };
+    }
+    posted.push(body);
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  await handlers.input({ text: "from the web", source: "extension" }, ctx);
+  await handlers.input({ text: "/model", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 0);
+
+  await handlers.input({ text: "fix the bug", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 1);
+  assert.equal(
+    routeCalls[0].url,
+    "http://omnigent.test/v1/sessions/session-1/hooks/route-turn",
+  );
+  assert.deepEqual(routeCalls[0].body, {
+    harness: "pi-native",
+    prompt: "fix the bug",
+    model: "omnigent/databricks-claude-sonnet-4-6",
+  });
+  assert.deepEqual(setModelCalls.map((m) => m.id), ["databricks-claude-opus-4-1"]);
+
+  await handlers.input({ text: "next prompt", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 1);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_route_turn_failure_fails_open(tmp_path: Path) -> None:
+    """An unreachable route-turn leaves the model alone and is not retried."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let routeCalls = 0;
+  global.fetch = async (url, request) => {
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls += 1;
+      throw new Error("ECONNREFUSED");
+    }
+    posted.push(JSON.parse(request.body));
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  await handlers.input({ text: "one", source: "interactive" }, ctx);
+  await handlers.input({ text: "two", source: "interactive" }, ctx);
+  assert.equal(routeCalls, 1);
+  assert.equal(setModelCalls.length, 0);
+  // The user's prompt is still mirrored to Omnigent.
+  assert.ok(
+    posted.some(
+      (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
+    ),
+  );
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_bound_models_use_literal_ids_and_only_managed_providers() -> None:
     """A raw gateway selection cannot switch to an ambient vendor provider."""
     node = shutil.which("node")

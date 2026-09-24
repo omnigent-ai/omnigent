@@ -5146,14 +5146,22 @@ async def _native_turn_catalog(
     :param runner_client: HTTP client pointed at the bound runner, used to
         replace a stale pre-launch catalog with the launch-exact one.
         ``None`` serves whatever is cached.
+    A pi-native pane is the same story: ``setModel`` resolves only its own
+    registry's ``provider/id`` spellings (what the extension pushed as
+    ``external_model_options``), never the runner's ``databricks-*`` catalog.
+
     :returns: Model ids, or ``None`` when the session is not a native
         terminal with a known vocabulary (the caller keeps its own
         candidate resolution).
     """
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
+        options = _pushed_model_options_cache.get(session_id)
+    elif wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+        await _refresh_stale_native_model_options(session_id, runner_client)
+        options = _model_options_cache.get(session_id)
+    else:
         return None
-    await _refresh_stale_native_model_options(session_id, runner_client)
-    options = _model_options_cache.get(session_id)
     if not options:
         return None
     # ``model`` is optional on a picker row and ``model_dump(exclude_none=True)``
