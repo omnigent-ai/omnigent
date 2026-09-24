@@ -37,6 +37,25 @@ describe("installCli", () => {
     assert.match(res.error, /installer script was not found/);
   });
 
+  it("rejects a relative path or a wrong basename (never spawns)", async () => {
+    const calls = [];
+    const tryBad = (bad) =>
+      installCli({
+        platform: "darwin",
+        resolveInstallScript: () => bad,
+        ensureUv: async () => ({ ok: true }),
+        spawn: spawnStub([0], calls),
+      });
+    // Relative path, wrong basename, and a look-alike suffix are all refused.
+    const results = await Promise.all([
+      tryBad("install_oss.sh"),
+      tryBad("/tmp/evil.sh"),
+      tryBad("/tmp/install_oss.sh.bak"),
+    ]);
+    for (const res of results) assert.equal(res.ok, false);
+    assert.equal(calls.length, 0, "must never spawn for an unexpected script path");
+  });
+
   it("runs the script (uv already present) and reports success", async () => {
     const calls = [];
     const res = await installCli({

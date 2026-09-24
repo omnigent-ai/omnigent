@@ -29,6 +29,9 @@ const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 /** uv's official installer — the same command install_oss.sh would offer. */
 const UV_INSTALLER = "curl -LsSf https://astral.sh/uv/install.sh | sh";
 
+/** The only script name we ever run — never taken from external input. */
+const INSTALL_SCRIPT_NAME = "install_oss.sh";
+
 /**
  * Locate the bundled `install_oss.sh`. Packaged builds ship it under the app's
  * resources (electron-builder `extraResources`); an unpackaged dev run reads it
@@ -41,9 +44,9 @@ function resolveInstallScript(deps = {}) {
   const resourcesPath = deps.resourcesPath ?? process.resourcesPath;
   const dirname = deps.dirname ?? __dirname;
   const candidates = [
-    resourcesPath ? path.join(resourcesPath, "install_oss.sh") : null,
+    resourcesPath ? path.join(resourcesPath, INSTALL_SCRIPT_NAME) : null,
     // Dev: web/electron/src -> repo root scripts/install_oss.sh
-    path.join(dirname, "..", "..", "..", "scripts", "install_oss.sh"),
+    path.join(dirname, "..", "..", "..", "scripts", INSTALL_SCRIPT_NAME),
   ].filter(Boolean);
   for (const candidate of candidates) {
     try {
@@ -179,14 +182,18 @@ async function installCli(deps = {}) {
     };
   }
   const script = (deps.resolveInstallScript || resolveInstallScript)();
-  if (!script) {
+  // Only ever run our own bundled script: require an absolute path whose
+  // basename is exactly INSTALL_SCRIPT_NAME, then rebuild the argument from that
+  // constant so no free-form path string reaches the spawn.
+  if (!script || !path.isAbsolute(script) || path.basename(script) !== INSTALL_SCRIPT_NAME) {
     return { ok: false, error: "The bundled installer script was not found." };
   }
+  const scriptArg = path.join(path.dirname(script), INSTALL_SCRIPT_NAME);
   const uv = await (deps.ensureUv || ensureUv)({ spawn: deps.spawn, onOutput });
   if (!uv.ok) return uv;
 
   onOutput("Installing the Omnigent CLI…\n");
-  const run = await runStreaming("sh", [script, "--non-interactive"], {
+  const run = await runStreaming("sh", [scriptArg, "--non-interactive"], {
     spawn: deps.spawn,
     onOutput,
     timeoutMs: deps.timeoutMs,
