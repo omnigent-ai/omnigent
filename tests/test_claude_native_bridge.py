@@ -2250,6 +2250,59 @@ def test_read_transcript_items_since_parses_interruption_queued_prompt(tmp_path:
     assert current_response_id == items[5].response_id
 
 
+def test_read_transcript_items_since_skips_subagent_handback_queued_prompt(tmp_path: Path) -> None:
+    """
+    Subagent hand-backs queued as prompts are not shown as user messages.
+
+    Claude records a subagent's final report as a prompt-mode
+    ``queued_command`` marked ``isMeta``. Rendering it as a user
+    bubble attributes the subagent's words to the user and splits
+    the active assistant response.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-waiting",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Waiting on the subagent."}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "attachment",
+                        "uuid": "queued-handback",
+                        "attachment": {
+                            "type": "queued_command",
+                            "prompt": '<agent-message from="a1">\n[Subagent hand-back] report',
+                            "commandMode": "prompt",
+                            "origin": {"kind": "peer", "from": "a1", "handback": True},
+                            "isMeta": True,
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert cursor == 2
+    assert [item.data["role"] for item in items] == ["assistant"]
+    assert current_response_id == items[0].response_id
+
+
 def test_read_hook_events_from_offset_skips_existing_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

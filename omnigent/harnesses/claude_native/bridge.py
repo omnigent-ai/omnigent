@@ -7649,6 +7649,8 @@ def _attachment_transcript_items_from_entry(
     ``role=user`` message. Treat prompt-mode queued commands as user
     messages so interruption inputs such as ``"STOP"`` appear in the
     Omnigent transcript and reset the active assistant response.
+    ``isMeta`` queued commands, such as subagent hand-backs, were not
+    typed by the user and are skipped.
 
     :param entry: Decoded Claude transcript record.
     :param line_number: One-based transcript line number.
@@ -7663,7 +7665,7 @@ def _attachment_transcript_items_from_entry(
         return current_response_id, []
     if attachment.get("type") != "queued_command":
         return current_response_id, []
-    if attachment.get("commandMode") != "prompt":
+    if attachment.get("commandMode") != "prompt" or attachment.get("isMeta") is True:
         return current_response_id, []
     prompt = attachment.get("prompt")
     if not isinstance(prompt, str) or not prompt:
