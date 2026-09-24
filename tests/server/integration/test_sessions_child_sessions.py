@@ -1043,6 +1043,43 @@ async def test_closed_child_session_display_is_sanitized_and_read_only(
     assert "Session is closed" in message_resp.text
 
 
+async def test_a_user_title_containing_closed_does_not_close_the_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """Renaming a session must not read as the internal closed marker.
+
+    The marker is ``":closed:<the row's own id>"``, appended by
+    ``sys_session_close``. Matching the bare substring let a rename to
+    ``"release:closed:beta"`` truncate the title, synthesize the closed label,
+    and make every later message 409, with nothing said at rename time.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    renamed = await client.patch(
+        f"/v1/sessions/{session_id}", json={"title": "release:closed:beta"}
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["title"] == "release:closed:beta"
+    assert CLOSED_LABEL_KEY not in renamed.json()["labels"]
+
+    message_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still usable"}],
+            },
+        },
+    )
+    assert message_resp.status_code != 409, message_resp.text
+
+
 # ── Per-child attribution across a 5-10 fan-out ───────────
 
 

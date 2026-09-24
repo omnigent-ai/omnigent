@@ -1056,10 +1056,58 @@ def test_close_then_peek_by_id_still_resolves_tombstoned_row(
     payload = json.loads(raw)
     assert "error" not in payload
     # The agent/title fields come from the post-tombstone title
-    # (``"researcher:auth:closed:<id>"``); the helper splits at
-    # ``_CLOSED_TITLE_INFIX`` so the bare ``"auth"`` is recovered.
+    # (``"researcher:auth:closed:<id>"``); the helper strips the row's
+    # own ``:closed:<id>`` suffix so the bare ``"auth"`` is recovered.
     assert payload["agent"] == "researcher"
     assert payload["title"] == "auth"
+
+
+def test_peek_keeps_user_title_text_containing_closed_infix(
+    session_fixture: _Fixture,
+) -> None:
+    """
+    Peek must not truncate an open child's title at ``:closed:`` text.
+
+    A user can rename any session, so ``:closed:`` may appear inside a
+    title as ordinary text. Only the row's own ``:closed:<id>`` suffix
+    is the internal tombstone; anything else must round-trip verbatim.
+    """
+    session_fixture.conv_store.update_conversation(
+        session_fixture.child_conv_id, title="researcher:my :closed: notes"
+    )
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps({"conversation_id": session_fixture.child_conv_id}),
+        session_fixture.ctx,
+    )
+    payload = json.loads(raw)
+    assert "error" not in payload
+    assert payload["agent"] == "researcher"
+    assert payload["title"] == "my :closed: notes"
+
+
+def test_close_keeps_user_title_text_containing_closed_infix(
+    session_fixture: _Fixture,
+) -> None:
+    """
+    Close appends the tombstone after ``:closed:`` text, not inside it.
+
+    The rebuilt title must keep the user's text whole, so the
+    tombstoned row still shows the title as written once the
+    row's own suffix is stripped for display.
+    """
+    user_title = "researcher:my :closed: notes"
+    session_fixture.conv_store.update_conversation(session_fixture.child_conv_id, title=user_title)
+    raw = SysSessionCloseTool().invoke(
+        json.dumps({"conversation_id": session_fixture.child_conv_id}),
+        session_fixture.ctx,
+    )
+    payload = json.loads(raw)
+    assert payload["closed"] is True
+    assert payload["title"] == "my :closed: notes"
+
+    refreshed = session_fixture.conv_store.get_conversation(session_fixture.child_conv_id)
+    assert refreshed is not None
+    assert refreshed.title == (f"{user_title}{_CLOSED_TITLE_INFIX}{session_fixture.child_conv_id}")
 
 
 def test_close_succeeds_regardless_of_session_state(session_fixture: _Fixture) -> None:

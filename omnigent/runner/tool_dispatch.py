@@ -1461,7 +1461,7 @@ async def _find_existing_child_session(
         )
         title_value = child.get("title")
         session_title = title_value if isinstance(title_value, str) else None
-        if is_session_closed(labels, session_title):
+        if is_session_closed(labels, session_title, _optional_string(child.get("id"))):
             continue
         return child
     return None
@@ -3146,7 +3146,7 @@ async def _send_to_existing_session(
                 ),
             }
         )
-    if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
+    if is_session_closed(snap_data.get("labels"), snap_data.get("title"), target_session_id):
         return json.dumps(
             {
                 "error": "session_closed",
@@ -3154,8 +3154,10 @@ async def _send_to_existing_session(
                 "message": "target sub-agent session is closed; create a new session to continue.",
             }
         )
-    display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
-    parsed = _parse_session_title(display_title)
+    display_title = title_without_closed_marker(
+        _optional_string(snap_data.get("title")), target_session_id
+    )
+    parsed = _parse_session_title(display_title, target_session_id)
     # A sys_session_create child keeps its verbatim title and has no
     # sub_agent_name, so when the title does not parse as "<agent>:<title>"
     # the identity comes from the snapshot's agent fields instead.
@@ -4597,7 +4599,9 @@ class _ParsedTitle:
     title: str | None
 
 
-def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
+def _parse_session_title(
+    raw_title: str | None, conversation_id: str | None = None
+) -> _ParsedTitle:
     """
     Split a child-session title into agent + instance label.
 
@@ -4612,9 +4616,11 @@ def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
     :param raw_title: The conversation ``title``, e.g.
         ``"researcher:auth"`` or ``"ui:claude-native-ui:1"``; may be
         ``None``.
+    :param conversation_id: The row's own id, which the legacy closed marker
+        ends with, so the suffix is stripped for display.
     :returns: The parsed agent/title pair.
     """
-    display_title = title_without_closed_marker(raw_title)
+    display_title = title_without_closed_marker(raw_title, conversation_id)
     if not display_title or ":" not in display_title:
         return _ParsedTitle(agent=None, title=None)
     head, _, tail = display_title.partition(":")
@@ -5987,7 +5993,11 @@ def _child_rows_to_entries(
     for row in rows:
         title = _optional_string(row.get("title"))
         labels = _string_mapping(row.get("labels"))
-        if not title or ":" not in title or is_session_closed(labels, title):
+        if (
+            not title
+            or ":" not in title
+            or is_session_closed(labels, title, _optional_string(row.get("id")))
+        ):
             continue
         entries.append(
             {
@@ -6233,7 +6243,7 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
+    parsed = _parse_session_title(_optional_string(target_snap.get("title")), target_id)
     if parsed.agent is None or parsed.title is None:
         return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
     new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
@@ -6312,7 +6322,7 @@ async def _fetch_peek_meta(
     body = _string_object_dict(snap.json())
     if body is None:
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
-    parsed = _parse_session_title(_optional_string(body.get("title")))
+    parsed = _parse_session_title(_optional_string(body.get("title")), target_id)
     raw_pending = body.get("pending_elicitations")
     pending = _json_object_list(raw_pending)
     return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)

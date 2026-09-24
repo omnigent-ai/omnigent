@@ -1019,10 +1019,12 @@ def _build_session_list_item(
         ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        title=title_without_closed_marker(conv.title),
+        title=title_without_closed_marker(conv.title, conv.id),
         # Collapse per-user pin keys to the canonical bare key for this viewer
         # (never leak another user's pin key), then add the closed marker.
-        labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
+        labels=labels_with_closed_status(
+            _labels_for_viewer(conv.labels, user_id), conv.title, conv.id
+        ),
         runner_id=conv.runner_id,
         host_id=conv.host_id,
         reasoning_effort=conv.reasoning_effort,
@@ -1235,7 +1237,9 @@ def _build_session_response(
     # stored value is missing or stale. Idempotent: a no-op when already present.
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
-    labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
+    labels = labels_with_closed_status(
+        _labels_for_viewer(conv.labels, viewer_id), conv.title, conv.id
+    )
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     # A codex /side child whose ephemeral fork's runner is gone (parent resumed
@@ -1253,7 +1257,7 @@ def _build_session_response(
         background_tasks=background_tasks,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        title=title_without_closed_marker(conv.title),
+        title=title_without_closed_marker(conv.title, conv.id),
         labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,

@@ -10308,13 +10308,13 @@ def _child_session_summary_from_conversation(
         edge instead of the latest status repeated.
     :returns: A populated :class:`ChildSessionSummary`.
     """
-    display_title = title_without_closed_marker(conv.title)
+    display_title = title_without_closed_marker(conv.title, conv.id)
     # Child sessions aren't pinnable (the pin affordance lives on top-level
     # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
     # defensively so a shared child's summary can never expose another viewer's
     # pin key. No collapse-to-canonical here: there's no pin to surface.
     raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
-    labels = labels_with_closed_status(raw_labels, conv.title)
+    labels = labels_with_closed_status(raw_labels, conv.title, conv.id)
     tool: str | None
     session_name: str | None
     if _is_codex_native_subagent(conv):
