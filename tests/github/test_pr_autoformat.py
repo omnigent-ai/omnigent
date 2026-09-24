@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ def test_wraps_existing_description_in_summary_without_deleting_it() -> None:
     assert "- [ ] Unit tests added / updated" in formatted
 
 
-def test_preserves_existing_sections_and_adds_missing_optional_context() -> None:
+def test_preserves_existing_sections_without_adding_explanation_scaffolds() -> None:
     original = "## Summary\n\nExisting summary.\n\n## Type of change\n\n- [x] Feature\n"
     formatted = pr_autoformat.format_body(original)
 
@@ -30,11 +31,40 @@ def test_preserves_existing_sections_and_adds_missing_optional_context() -> None
     assert "- [x] Feature" in formatted
     assert formatted.count("## Summary") == 1
     assert formatted.count("## Type of change") == 1
-    assert "## ELI5" in formatted
-    assert "## Diagram" in formatted
+    assert "## ELI5" not in formatted
+    assert "## Diagram" not in formatted
     assert "## Test Plan" in formatted
     assert "## Coverage notes" in formatted
     assert "## Changelog" in formatted
+
+
+def test_preserves_an_authored_diagram() -> None:
+    original = "## Summary\n\nClear summary.\n\n## Diagram\n\nA -> B\n"
+
+    formatted = pr_autoformat.format_body(original)
+
+    assert formatted.count("## Diagram") == 1
+    assert "A -> B" in formatted
+
+
+def test_cli_adds_template_without_unrequested_explanation(tmp_path: Path) -> None:
+    source = tmp_path / "body.md"
+    destination = tmp_path / "formatted.md"
+    source.write_text("A short, plain-language fix.\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT), str(source), str(destination)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    body = destination.read_text(encoding="utf-8")
+    assert "## Summary\n\nA short, plain-language fix." in body
+    assert "## Test Plan" in body
+    assert "## ELI5" not in body
+    assert "## Diagram" not in body
 
 
 def test_scaffolds_changelog_section_with_delete_placeholder() -> None:

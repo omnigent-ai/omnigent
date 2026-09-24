@@ -79,7 +79,10 @@ Default to no added comments. Add one only to explain a non-obvious constraint
 or reason the code cannot express clearly. Use one short sentence, normally one
 line and at most two. Do not narrate setup, operations, or assertions; repeat
 test names; or duplicate nearby explanations. Keep investigation history in the
-handoff or PR description. Apply the same standard to test docstrings.
+handoff, not in code comments or the PR narrative. Apply the same standard to
+test docstrings. If a safety constraint needs more than two lines, first look
+for a clearer abstraction or focused docstring; keep the minimum explanation
+that makes the constraint clear.
 
 Code changes rapidly. Omit comments likely to become misleading as the
 implementation evolves. Keep necessary comments next to the code they describe,
@@ -908,7 +911,13 @@ Once the set is genuinely green:
    explicitly, and run `git status` / `git diff --cached --stat` before committing
    to confirm the staged set is only the fix + test. If a recording or handoff
    file already landed in an earlier commit on this branch, remove it (e.g.
-   `git rm --cached`) so it never reaches the PR.
+   `git rm --cached`) so it never reaches the PR. Read the staged diff once more
+   for redundant comments and docstrings. After committing, if the target has
+   `.github/scripts/pr-template/hygiene.py`, run
+   `python .github/scripts/pr-template/hygiene.py --base origin/main` (replace
+   `main` with the target's default branch) before any push. Its warnings are
+   advisory: remove unnecessary comment blocks, but retain explanations needed
+   for safety or correctness. If the checker is absent, inspect the diff by hand.
 2. **If the input has `skip_push: true`, stop here** — the fix is committed
    locally; do **not** push and do **not** open a PR. Report the branch name in
    your output (`pushed_branch`) so a human can inspect, push, and PR it. The
@@ -942,8 +951,9 @@ Once the set is genuinely green:
      sections.
    - In **Summary**, lead with the user-visible problem and result, then explain
      the cause and implementation in 1–3 short bullets or paragraphs. Use
-     complete sentences. For a non-trivial change, include the template's ELI5
-     explanation and a small diagram.
+     complete sentences and plain language. Add a small diagram only when the
+     relationships or sequence are hard to follow in prose; do not add ELI5 or
+     diagram sections just to fill a template.
    - In **Test Plan**, group the proof into short, scannable bullets. Name the
      command or test, what failed before the fix, and what passes now. Do not
      paste `facets`, `test_transition`, other handoff fields, or a long comma-
@@ -951,9 +961,13 @@ Once the set is genuinely green:
    - Keep workflow/session URLs and machine-oriented publication details out of
      the narrative. The internal workflow links those separately. Never paste
      the JSON handoff into the PR description.
+   - Aim to stay under 600 visible words, including the template. This is a
+     review prompt, not a hard cap: keep necessary safety or migration details,
+     but move investigation history and repeated proof to the handoff.
    - Read the finished Markdown once as rendered prose. Split run-on sentences,
      expand unexplained internal shorthand, and remove repeated evidence before
-     opening the PR.
+     opening the PR. Compare its Test Plan and Demo claims with the actual diff,
+     test output, and available footage.
 
    If the target repository provides the template validator, validate the body
    locally before publishing it:
@@ -984,6 +998,23 @@ Once the set is genuinely green:
    was blocked, explain why and include the available evidence. When the bug
    is a Linear ticket and a Linear key is available, also attach both recordings
    to the ticket (GraphQL `fileUpload` + `attachmentCreate`).
+
+   If `.github/scripts/pr-template/hygiene.py` exists, run it on the finished
+   body and committed diff before publication:
+
+   ```bash
+   python .github/scripts/pr-template/hygiene.py \
+     --base origin/main --body-file .omnigent/pr-body.md
+   ```
+
+   Use the target's default branch instead of `main` when different. Review
+   every warning for long comments, body length, or repeated prose; trim what
+   is redundant and keep justified safety explanations. The warning check does
+   not replace the template validator or block publication on its own. If the
+   target checkout lacks the checker or it cannot run, do the same review
+   manually; the internal workflow publisher runs its own copy before creating
+   the PR.
+
 5. **Emit an interim handoff now — the moment the PR is open.** As soon as
    `gh pr create` succeeds, print the full handoff json block (the Output schema)
    with `pr_url` set and `outcome` at its current best assessment, *before* you
@@ -1386,6 +1417,15 @@ Put it where it belongs for the path you're on, and carry the same text in the
 - **Review path (someone else's PR):** don't rewrite their PR body — post the
   **"Validate the fix live"** block as a PR comment (`gh pr comment <pr>`) so the
   reviewer and author get the command without you editing their description.
+
+Before syncing an authored PR body or writing the final handoff, refresh its
+Test Plan and Demo against the current authored commit (the final pushed head
+on direct runs): distinguish tests actually rerun on that commit from earlier
+evidence, and remove stale preview or footage claims. Keep the live-validation
+prompt short enough not to restate the whole Test Plan. Re-run the template
+validator and hygiene checker (when available) after editing the saved body.
+If a later push changes the evidence, repeat this review before the final
+handoff.
 
 **Lead with the one command that runs it — and pick it by `validation_surface`
 (4.1).** The command shape differs by which side your fix runs on:
