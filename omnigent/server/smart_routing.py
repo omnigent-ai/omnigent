@@ -791,6 +791,30 @@ DEFAULT_ROUTER_NAME = "task_v1"
 _MODEL_ROUTE_PREFIX = "system.ai."
 MODEL_ID_PREFIXES: tuple[str, ...] = ("databricks-", _MODEL_ROUTE_PREFIX)
 
+# The gateway router names harnesses by their canonical names, not Omnigent's
+# harness ids. task_v3 validates each option's harness and rejects any other
+# spelling ("no eligible model+harness option"); task_v0 through task_v2 accept
+# the canonical names as well, so the tag is translated for every router.
+_ROUTER_HARNESS_NAMES: Mapping[str, str] = MappingProxyType(
+    {
+        "claude-native": "claude",
+        "codex-native": "codex",
+    }
+)
+
+
+def to_router_harness(harness: str | None) -> str | None:
+    """Map an Omnigent harness id to the name the gateway router expects.
+
+    :param harness: An Omnigent harness id, e.g. ``"codex-native"``, or
+        ``None`` for an untagged option.
+    :returns: The router's name for it (``"codex"``), or *harness* unchanged
+        when the router has no other name for it.
+    """
+    if harness is None:
+        return None
+    return _ROUTER_HARNESS_NAMES.get(harness, harness)
+
 
 def strip_catalog_prefix(model: str, prefixes: Sequence[str]) -> str:
     """Strip the first matching *prefixes* entry from a catalog model id.
@@ -1426,10 +1450,11 @@ class TaskV1RouteOptionSource:
         """Translate *pick* into a servable (harness, model) pair.
 
         :param pick: The router's selection as received; its ``harness`` is
-            ignored because the router echoes the tag verbatim without ever
-            reading it. An id that already carries a catalog prefix is mapped
-            back to router vocabulary first, so re-resolving an id this seam
-            already resolved is a no-op rather than a miss.
+            ignored because it is the router's echo of the tag it was sent
+            (renamed by :func:`to_router_harness`), not an Omnigent harness
+            id. An id that already carries a catalog prefix is mapped back to
+            router vocabulary first, so re-resolving an id this seam already
+            resolved is a no-op rather than a miss.
         :param harnesses: Harnesses the decision may land on.
         :param catalog: Harness → servable model ids.
         :returns: A :class:`ResolvedRoute`, or ``None`` when the pick was
@@ -1824,7 +1849,9 @@ class ExternalRoutingClient:
         specs = self._source.build_route_options(harnesses, available_models)
         if not specs:
             return None
-        options = [pb.RouteOption(model=s.model, harness=s.harness) for s in specs]
+        options = [
+            pb.RouteOption(model=s.model, harness=to_router_harness(s.harness)) for s in specs
+        ]
         selector = pb.RouteSelector(router_name=self._router_name)
         if self._selection_model:
             # The router makes its own extraction call; ``config.model`` pins

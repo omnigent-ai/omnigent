@@ -801,6 +801,50 @@ async def test_external_routing_client_sends_snake_case_and_parses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_external_routing_client_sends_router_harness_names() -> None:
+    """Omnigent harness ids go out as the router's canonical harness names.
+
+    task_v3 rejects ``claude-native`` / ``codex-native`` outright, so they are
+    sent as ``claude`` / ``codex``; a harness with no other name passes through.
+    The pick still resolves to the Omnigent harness it came from.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "gpt-5-5", "harness": "codex"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/ai-gateway/routing/v1", router_name="task_v3"
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "rename a variable in one file",
+            {
+                "claude-native": ["claude-opus-4-8"],
+                "codex-native": ["gpt-5-5"],
+                "pi": ["kimi-k3"],
+            },
+        )
+
+    assert captured["body"]["route_options"] == [
+        {"model": "claude-opus-4-8", "harness": "claude"},
+        {"model": "gpt-5-5", "harness": "codex"},
+        {"model": "kimi-k3", "harness": "pi"},
+    ]
+    assert result is not None
+    assert result.model == "gpt-5-5"
+    assert result.harness == "codex-native"
+
+
+@pytest.mark.asyncio
 async def test_external_routing_client_roundtrips_provider_prefix() -> None:
     """Send bare ids out; recover the exact catalog id from the bare answer.
 
