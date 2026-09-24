@@ -18,7 +18,9 @@ step *after* repro-agent, which reported a live-confirmed reproduction — a
 reconstructed journey, an overall verdict with a per-facet breakdown, and a
 durable end-to-end test keyed to the concrete failure. Treat that report and
 test as a hypothesis, not ground truth: independently audit them before either
-authoring or reviewing a fix. You do **not** merge.
+authoring or reviewing a fix. Every resolution path must also assess the final
+diff's impact on other behavior, using the shared impact assessment below.
+You do **not** merge.
 
 You are running as a session **inside the Omnigent app you were launched
 against**. Your working directory is an `omnigent-ai/omnigent` checkout — the
@@ -162,8 +164,10 @@ and candidate-PR discovery instructions below.
 3. Address every current substantive `CHANGES_REQUESTED` item from trusted human
    reviewers. If a request is ambiguous, contradictory, unsafe, or requires
    product judgment, explain the blocker on the PR and stop.
-4. Run focused validation, commit as `omni-resolve-agent[bot]`, and push directly
-   to the existing PR branch using the workflow-provided push command. For a
+4. Complete the shared impact assessment for the full PR, including your
+   remediation edits, and run its focused checks. Commit as
+   `omni-resolve-agent[bot]`, and push directly to the existing PR branch using
+   the workflow-provided push command. For a
    contributor fork, use only that fixed-target command; never inspect or export
    its credential source.
 5. Continue through Step 4.2 and Step 4.3 until current CI is green and Polly has
@@ -203,10 +207,11 @@ materialize. Instead:
 3. Take the author path (Step 2B) with these substitutions: 2B.1 has no repro
    test to audit, so your **targeted test written in 2B.4 is the fail→pass
    proof** — write it in the existing test module for that code, make sure it
-   fails on the unfixed tree and passes on the fixed one, and run only that
-   module. Recordings apply only when the change has a product surface a user
-   would see; for CI-wrapper fixes emit `recordings: []` with a one-line
-   `recording_unavailable_reason`.
+   fails on the unfixed tree and passes on the fixed one. Complete the shared
+   impact assessment too: run that module and the focused checks for affected
+   consumers and boundaries. Recordings apply only when the change has a product
+   surface a user would see; for CI-wrapper fixes emit `recordings: []` with a
+   one-line `recording_unavailable_reason`.
 4. Step 1's existing-PR search runs against `target_repo`. When `target_repo`
    is not `omnigent-ai/omnigent`, tickets have no mirrored GitHub issue: there
    is no `closing_issue_number`, so reference the Linear ticket in prose
@@ -343,6 +348,84 @@ Do all of this before Step 1:
 
 Don't narrate a clean preflight. If you can't recover the handoff or reach your
 tooling, stop and say what's missing.
+
+## Shared impact assessment — every resolution path
+
+Before claiming `fixed` or approving a PR, check what the **full final diff**
+could break beyond the reported bug. This applies to author, existing-PR review,
+ticket-only, and review-remediation modes, including `skip_push` and
+workflow-owned publication. Ticket-only and review-remediation still do not
+require an inherited repro; their publication/branch permissions are unchanged.
+
+1. **Inspect the candidate and its consumers.** Start the assessment while
+   investigating, then refresh it after the last edit. Record the target branch's
+   full tip SHA as `base_sha` and the candidate's full HEAD SHA as `head_sha`.
+   Inspect `git diff <base_sha>...<head_sha>` plus staged, unstaged, and untracked
+   source/test changes. Include configuration, dependencies, and workflows;
+   runtime prompts count as behavior changes even when stored in Markdown. In
+   review modes, inspect the whole PR, not only edits made in this run. Follow
+   shared helpers to their callers and existing tests. For each meaningful risk,
+   identify the changed files, affected behavior, consumers, invariant to preserve,
+   and focused check. A passing original repro is not coverage for every consumer.
+2. **Exercise the relevant boundaries.** Select checks from the actual change:
+
+   | Changed behavior | Required focused coverage when applicable |
+   | --- | --- |
+   | Shared startup, configuration, auth, or serialization | Existing/default configurations and other affected consumers; exercise configuration creation, transport/decoding, and real process startup together. Correctly constructed objects supplied directly to a unit test do not cover that path. |
+   | Sandboxing | The applicable real OS sandbox with its intended gates enabled. A disabled gate or an unsupported/skipped sandbox test leaves that boundary uncovered. |
+   | UI state or interaction | The reported journey and affected adjacent journeys on the candidate build, including relevant selection, persistence, or reconnect behavior. |
+   | Environment-derived defaults | Ordinary configuration and relevant ambient variables populated; apply the hermetic check in 2B.5. |
+   | Performance or timing | Measure the claimed quantity under the relevant workload. Distinguish simulated-clock tests from elapsed-time measurements; functional success alone does not establish latency or throughput. |
+
+   Use existing tests where they cover the invariant; add a behavioral regression
+   test only for a meaningful gap. Tests of the bug follow their mode's baseline
+   requirements; review-remediation still skips fail-before proof. Checks
+   protecting previously correct behavior may **pass on both
+   base and candidate**; do not manufacture a failing baseline for them. Run the
+   focused checks for each affected consumer/boundary, even when they live in a
+   different module. Do not run the full repository suite locally. Do not weaken
+   isolation or change global rollout settings to obtain a passing result.
+3. **Record observed results in `impact_assessment`.** Each risk names its check,
+   `result` (`passed`, `failed`, `blocked`, or `not_run`), and retained evidence.
+   Reference actual command/output or CI run artifacts; include the tested
+   revision/build, dependency pins, and relevant environment/feature gates.
+   Confirm the test imports and exercises this candidate, not another checkout,
+   installed copy, stale SPA, or older CI runtime. Record `worktree_state` as
+   `clean` only when the tested source/tests are clean; otherwise name the
+   uncommitted source/test/support files and their content hashes. Artifact-only
+   dirt can be noted separately. A HEAD SHA alone does not identify dirty code.
+
+   Distinguish component tests, real process/sandbox checks, and live bot checks.
+   An unrun, skipped, xfailed, or setup-failing required check is not a pass:
+   name the missing boundary and reason in `uncovered_boundaries`. A large green
+   test count or an unrelated green CI job does not fill that gap. Evidence
+   references describe what was retained; never invent an execution record.
+4. **Refresh before delivery.** Re-read the final diff, Git status, and current
+   base/head before every final handoff or review verdict. For an existing PR,
+   compare with the live GitHub base/head SHAs, not just local refs. If the author
+   moved the head, follow the mode's update/retry procedure without approving
+   from old results. After a retry, new PR head, merge/rebase, CI/Polly fix, or
+   changed code, assertions, dependencies, or relevant environment, rebuild the
+   assessment and rerun affected checks. Reuse
+   a result only when its tested contents and context still match; retain its
+   original identity rather than relabeling old evidence as a new execution.
+   Commit hooks can change tested files too. Keep earlier evidence and the saved
+   checkpoint; never reset work to make the identities match.
+5. **Let gaps affect the verdict.** `fixed` requires the original behavior to be
+   proven as its mode requires, all identified regression risks checked, and no
+   uncovered required boundary. A discovered regression must be repaired and
+   checked before `fixed` or approval. If a fix is only partly verified, preserve
+   the work, use `partially_fixed`, and name the failing/unrun checks in
+   `remaining_work`; use `needs_more_info` when verification cannot establish a
+   resolution. Setup failures are blockers, not proof of a product regression.
+   A missing recording alone still follows the recording rules below.
+
+Summarize the affected behavior, checks, and gaps in the PR's Test Plan or review
+body. The assessment is an agent-authored explanation, not an execution recorder
+or a guarantee of no regressions. Record empty `risks` only with a concrete
+`not_applicable_reason` (for example, no candidate exists yet, or inspection found
+only documentation that is never loaded at runtime); never use it to excuse an
+untested behavior change.
 
 ## Shared repro audit — before authoring or reviewing
 
@@ -546,8 +629,9 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    root cause at the correct layer, follow the established abstraction, minimize
    special cases and long-term maintenance cost, and preserve security,
    compatibility, and performance? Does it miss facets or obvious adjacent edge
-   cases, or introduce a regression in the surrounding code (run the touched
-   area's tests)? Record why the selected approach is preferable in the review.
+   cases, or introduce a regression in the surrounding code? Complete the shared
+   impact assessment and run its checks for the whole PR. Record why the selected
+   approach is preferable in the review.
    "Best" means the strongest maintainable fit for this codebase and bug, not a
    license to replace a sound, idiomatic contribution with a theoretically purer
    rewrite or a personal style preference.
@@ -576,8 +660,9 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
 5. **Report on the existing PR.** Post your fail→pass (or fail→still-fails) result
    and any diff concerns now as a `gh pr comment` / `gh pr review --comment`, and
    record its `pr_url` in your output. The `outcome` reflects what you found
-   (`fixed` when the PR resolves every live facet, the diff is sound, and the
-   changes stay within the reported problem;
+   (`fixed` when the PR resolves every live facet, the shared impact assessment
+   has no unresolved required checks, the diff is sound, and the changes stay
+   within the reported problem;
    `partially_fixed` / `not_fixed` otherwise, with specifics). **Default to
    commenting, not competing** — if the PR is close and its approach is sound,
    review it and let the author iterate; don't open a rival PR over fixable nits.
@@ -720,8 +805,9 @@ The reproduction test is a full end-to-end journey — slow, one layer above you
 fix. Add **targeted, fast tests at the layer you changed** (a unit/integration
 test on the function/module/component you edited):
 
-- Each must **fail on the unfixed code and pass with your fix** — same fail→pass
-  discipline. Verify both directions.
+- Tests of the reported bug must **fail on the unfixed code and pass with your
+  fix** — same fail→pass discipline. Checks of previously correct behavior may
+  pass on both revisions, as the shared impact assessment explains.
 - Cover the **specific behavior the bug got wrong**, plus the obvious adjacent
   edge cases the root cause implies — not just "the function runs."
 - Put them where the repo keeps tests for that layer, following existing files'
@@ -741,18 +827,19 @@ test on the function/module/component you edited):
 
 Re-run **every** test in the deliverable — the (possibly rewritten) repro e2e test
 plus your new targeted tests — on the fixed tree. They must all pass. Then confirm
-the transition is real:
+the transition is real and complete the shared impact assessment for the final
+diff, including its checks of previously correct behavior:
 
 - Each live facet has a **fail reason on the unfixed tree** and a **pass on the
   fixed tree** — that pair is the proof.
 - **Sanity-check the diff:** the green came from a genuine behavior fix, not from
   loosening an assertion, `skip`/`xfail`, or narrowing the test to dodge the bug.
-- Run only the directly affected test file/module and, when the changed code has a
-  distinct integration boundary, its nearest focused integration test. Do not run
+- Run the directly affected test modules and the focused checks selected by the
+  shared impact assessment for other affected consumers and boundaries. Do not run
   the full repository suite, an entire broad test directory, every backend matrix,
   or unrelated lint/typecheck/build jobs locally; GitHub CI owns that exhaustive
-  coverage after publication. Expand beyond the focused set only when a failure or
-  dependency edge gives concrete evidence that another specific test is affected.
+  coverage after publication. A concrete dependency edge is enough to include
+  another focused check; do not wait for a regression before testing that consumer.
 
 **Prove new tests are hermetic — re-run them in a hostile environment.** A test
 that passes only because the machine happens to be clean is flaky, not green, and
@@ -895,6 +982,8 @@ Once the set is genuinely green:
    to confirm the staged set is only the fix + test. If a recording or handoff
    file already landed in an earlier commit on this branch, remove it (e.g.
    `git rm --cached`) so it never reaches the PR.
+   Refresh the shared impact assessment against the committed deliverable. If a
+   hook changed tested files, rerun their affected checks before the handoff.
 2. **If the input has `skip_push: true`, stop here** — the fix is committed
    locally; do **not** push and do **not** open a PR. Report the branch name in
    your output (`pushed_branch`) so a human can inspect, push, and PR it. The
@@ -1007,6 +1096,10 @@ the post-publication workflow. Once a directly published or reviewed PR is up yo
 **stay on it** until CI is green and the review is clean, then hand it to a
 human. The sub-steps overlap in time (kick off the preview and the first review,
 then poll), so don't serialize what can run concurrently.
+
+Refresh the shared impact assessment after changes made in this loop, including
+CI/review fixes and conflict resolution. Earlier green checks do not cover a new
+head automatically.
 
 **Whose branch — push or take over.** On the **author path** the PR is yours: push
 fix commits freely. On the **review path** the PR is someone else's; whether you
@@ -1426,6 +1519,11 @@ human. A `CONFLICTING`/`DIRTY` branch is **not** `fixed`: rebase and resolve
 (4.2) before you submit a verdict, or, if you truly can't, downgrade the outcome
 and say the PR needs a conflict resolution the maintainer must do.
 
+**Gate: the shared impact assessment covers the current candidate.** Confirm
+its base/head and tested contents still match, all required checks passed, and
+`uncovered_boundaries` is empty. Otherwise follow its blocked/partial verdict
+rules; do not approve or call the PR fully verified.
+
 **Gate: the after-fix clip is present, or its absence is named — no silent skip.**
 Before you tag anyone, confirm the deliverable carries the before/after proof
 (2B.5 / 2A.3): the PR's **Demo** section shows the `after` clip (and the `before`
@@ -1548,6 +1646,25 @@ the message. Same discipline as repro-agent:
   ],
   "recording_unavailable_reason": "",
   "test_audit": "repro e2e was behavioral (failed on raw IDs); no rewrite needed",
+  "impact_assessment": {
+    "base_sha": "<full target-branch tip SHA>",
+    "head_sha": "<full candidate HEAD SHA>",
+    "worktree_state": "clean",
+    "risks": [
+      {
+        "files": ["web/src/model/picker.tsx"],
+        "behavior": "Changing labels can alter model selection or restoration",
+        "consumers": ["model picker", "restored sessions"],
+        "invariant": "Selections and restored sessions retain the same model IDs",
+        "check": "<exact command exercising selection and session restoration>",
+        "result": "passed",
+        "evidence": "<retained output reference, tested build and environment>"
+      }
+    ],
+    "uncovered_boundaries": [],
+    "not_applicable_reason": ""
+  },
+  "remaining_work": [],
   "hermetic_check": "test_picker_label re-run with ambient env vars set — still passes",
   "pr_url": "https://github.com/omnigent-ai/omnigent/pull/4200",
   "reviewed_pr_url": "",
@@ -1581,7 +1698,8 @@ Field meanings:
   review-remediation mode for scanner deduplication and workflow retry recovery;
   otherwise `""`, `[]`, and `""`.
 - `outcome` — overall: `fixed` (every live facet resolved and proven — by your fix
-  or by the reviewed PR), `partially_fixed`, `not_fixed` (couldn't resolve, or the
+  or by the reviewed PR — and the shared impact assessment has no unresolved
+  required checks), `partially_fixed`, `not_fixed` (couldn't resolve, or the
   reviewed PR doesn't fix it), `nothing_to_fix` (recovered verdict was
   `already_fixed`/`not_reproduced`, or the 2B.1 audit showed `main` has since
   fixed it — name the fixing commit and recommend closing the ticket), or
@@ -1627,6 +1745,19 @@ Field meanings:
   commands, relevant environment/feature gates, behavioral fail→pass evidence,
   and any blockers. Preserve original evidence when repairing a test. A restored
   artifact or a green candidate run alone is not an audit.
+- `impact_assessment` — required in every mode. Use the shared impact assessment
+  above. `base_sha` is the target branch tip used for the comparison; the full
+  diff starts at its merge-base with `head_sha`. `worktree_state` records tested
+  dirt and content hashes, not just the final clean status. Each `risks` entry
+  maps changed files and affected consumers to a preserved invariant, check,
+  result, and evidence. Include required checks that failed or could not run;
+  explain their gaps in `uncovered_boundaries`. Use empty SHAs/state only when
+  stopping before a candidate can be identified, with `not_applicable_reason`.
+  Otherwise leave that reason empty unless the inspected diff has no behavioral
+  impact. This narrative does not certify execution or replace `test_audit`.
+- `remaining_work` — a list of specific unresolved behavior, required checks, or
+  delivery steps for `partially_fixed`; empty when none remain. Resolved original
+  facets do not hide a regression or an uncovered required boundary.
 - `hermetic_check` — the result of the Step 2B.5 hostile-env re-run when the diff
   touched env-derived defaults: which added/edited tests you re-ran with ambient
   vars set and that they still passed. Empty string when not applicable (no such

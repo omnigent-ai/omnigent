@@ -127,7 +127,8 @@ is the review gate after the fact.
      setup/import failure is a verification blocker, not a product regression.
    - **No fix PR** → the author path below, using the same baseline proof.
 4. *(author path)* Root-causes, implements the fix, and adds targeted
-   unit/integration tests at the layer it changed, each fail→pass on the bug.
+   unit/integration tests at the layer it changed. Tests of the bug go fail→pass;
+   checks protecting previously correct behavior can pass on both revisions.
 5. *(author path)* Re-runs the whole set to prove every live facet goes fail→pass
    (not just a loosened test), and — when the fix touches env-derived defaults —
    **re-runs new tests with ambient vars set** to prove the fixtures are hermetic,
@@ -175,19 +176,42 @@ is the review gate after the fact.
 
 It does **not** merge. See `AGENTS.md` for the full operating procedure.
 
+### Change-impact assessment
+
+Every resolution path checks the full final diff for regression risks, including
+existing-PR reviews, ticket-only fixes, review remediation, local-only commits,
+and workflow-owned publication. The `impact_assessment` handoff maps changed
+behavior and affected consumers to an invariant, a focused check, its observed
+result, and retained evidence. It records base/head revisions, tested worktree
+changes, and uncovered boundaries. For example, a fix to a shared configuration
+decoder needs coverage of its startup consumers, not just a passing repro or a
+unit test supplied with an already-decoded object.
+
+Checks follow concrete risks across module boundaries while broad validation
+stays in CI. A new head, retry, changed assertions, or changed dependencies or
+environment requires reassessment and rerunning affected checks. An unrun or
+skipped required check remains a gap; it cannot support `fixed` or approval.
+Partly verified fixes preserve their work and explain what remains in
+`remaining_work`. This does not require an inherited repro in ticket-only or
+review-remediation mode or change who may publish.
+
 ### Verification limits
 
-The shared audit is an instruction-level requirement, not an execution gate.
+The shared audit and impact assessment are instruction-level requirements, not
+execution gates.
 The external `omnigent-ai/omnigent-internal` repository owns those CI checks:
 `.github/workflows/resolve-agent.yml` uses `validate_handoff` in
 `.github/scripts/resolve_handoff.py` and `checkpoint_delivery_ready` in
 `.github/scripts/restore_resolve_retry.py`. They can accept a `fixed` claim
 without test evidence when their identity and publication-shape checks pass.
-Neither test restoration nor a `test_audit` narrative proves that the agent
-executed the same assertions before and after the fix.
+Neither test restoration nor a `test_audit` or `impact_assessment` narrative
+proves that the agent executed the claimed checks against the claimed candidate.
 
 Mechanically checking that requirement needs a separate change: retain actual
 verification executions, identify the tested code/assertions and environment,
 carry results through retries, and detect missing or stale proof before delivery.
+This includes changes made after the agent exits, such as the publisher replaying
+a checkpoint onto a newer base; an assessment of the old head cannot certify
+that replay.
 Until then, inspect retained tool output as well as the handoff when assessing
 a run; configuration and prompt tests do not establish model compliance.
