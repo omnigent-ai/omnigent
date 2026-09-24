@@ -65,25 +65,27 @@ def upgrade() -> None:
             )
         )
     elif dialect == "cockroachdb":
-        # CockroachDB: add column first, then rebuild PK
-        # Get the actual PK name (may vary across database states)
+        # CockroachDB: cannot do PK change with other schema changes in same transaction
+        # First add the column
+        bind = op.get_bind()
+        op.execute(
+            sa.text(
+                "ALTER TABLE user_daily_cost "
+                "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__'"
+            )
+        )
+        # Publish schema changes at commit
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        # Then rebuild PK with the new column
         old_pk_name = _existing_pk_name("user_daily_cost")
         if old_pk_name:
             op.execute(
                 sa.text(
                     f"ALTER TABLE user_daily_cost "
-                    f"ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__', "
                     f'DROP CONSTRAINT "{old_pk_name}", '
                     f"ADD CONSTRAINT pk_user_daily_cost "
                     f"PRIMARY KEY (workspace_id, user_id, day_utc, harness)"
-                )
-            )
-        else:
-            # No PK exists, just add the column
-            op.execute(
-                sa.text(
-                    "ALTER TABLE user_daily_cost "
-                    "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__'"
                 )
             )
     else:
@@ -112,11 +114,19 @@ def downgrade() -> None:
     WARNING: This will DELETE all per-harness rows (harness != "__all__").
     Only cross-harness data will be preserved.
     """
-    # Delete per-harness rows before removing the column
-    op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
-
     sqlite = _is_sqlite()
     dialect = op.get_bind().dialect.name
+
+    # Delete per-harness rows before removing the column (if column exists)
+    # For CockroachDB, check if column exists first
+    if dialect == "cockroachdb":
+        bind = op.get_bind()
+        columns = {col["name"] for col in sa.inspect(bind).get_columns("user_daily_cost")}
+        if "harness" in columns:
+            op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
+    else:
+        # Other databases: assume column exists
+        op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
 
     if dialect == "mysql":
         # MySQL: use raw DDL
@@ -131,25 +141,26 @@ def downgrade() -> None:
         )
     elif dialect == "cockroachdb":
         # CockroachDB: publish schema changes via commit, then drop column
-        # Get the actual PK name (may vary across database states)
-        old_pk_name = _existing_pk_name("user_daily_cost")
         bind = op.get_bind()
-        if old_pk_name:
-            # First rebuild the PK without harness
-            op.execute(
-                sa.text(
-                    f"ALTER TABLE user_daily_cost "
-                    f'DROP CONSTRAINT "{old_pk_name}", '
-                    f"ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc)"
+        columns = {col["name"] for col in sa.inspect(bind).get_columns("user_daily_cost")}
+
+        # Only proceed if harness column exists
+        if "harness" in columns:
+            # Get the actual PK name (may vary across database states)
+            old_pk_name = _existing_pk_name("user_daily_cost")
+            if old_pk_name:
+                # First rebuild the PK without harness
+                op.execute(
+                    sa.text(
+                        f"ALTER TABLE user_daily_cost "
+                        f'DROP CONSTRAINT "{old_pk_name}", '
+                        f"ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc)"
+                    )
                 )
-            )
-            # CRDB publishes schema changes at commit
-            bind.commit()
-            bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                # CRDB publishes schema changes at commit
+                bind.commit()
+                bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
             # Then drop the harness column
-            op.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
-        else:
-            # No PK exists (shouldn't happen), just drop the column
             op.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
     else:
         # PostgreSQL/SQLite: use batch_alter_table
