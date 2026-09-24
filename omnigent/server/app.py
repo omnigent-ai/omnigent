@@ -3244,7 +3244,9 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
-    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
+    async def _mark_disconnected_runner_failed(
+        runner_id: str, reference_stamp: int | None
+    ) -> None:
         """Reconcile a dropped runner's sessions once the grace expires.
 
         A runner that re-registered inside the grace makes this a no-op
@@ -3258,11 +3260,21 @@ def create_app(
         process that stopped listening — the replacement server re-adopts
         it on reconnect (:mod:`omnigent.server.shutdown_state`).
 
+        A runner confirmed live on another replica (via
+        :func:`_runner_live_on_another_replica`) skips it too: that
+        replica's tunnel is authoritative now, and this one's registry
+        only ever knew about its own connections.
+
         :param runner_id: The disconnected runner's id.
+        :param reference_stamp: This replica's own last liveness stamp for
+            *runner_id*, captured in :func:`_on_runner_disconnect` before
+            the clear — the reference the cross-replica check compares
+            against.
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
+            _runner_live_on_another_replica,
         )
         from omnigent.server.schemas import ErrorDetail
 
@@ -3289,6 +3301,14 @@ def create_app(
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        if await _runner_live_on_another_replica(
+            conversation_store, [conv.id for conv in affected], runner_id, reference_stamp
+        ):
+            _logger.info(
+                "Runner %s is live on another replica; skipping offline-marking",
+                runner_id,
+            )
+            return
         _logger.warning(
             "Runner %s disconnected; reconciling %d bound session(s)",
             runner_id,
@@ -3348,6 +3368,10 @@ def create_app(
             extra=debug_event("runner_disconnected", runner_id=runner_id),
         )
         runner_session_initializer.invalidate_runner(runner_id)
+        # Capture this replica's own last stamp before clearing, so the grace
+        # timer can tell a fresher stamp another replica writes later from
+        # one we wrote ourselves (the clear itself never erases this record).
+        reference_stamp = session_live_state.last_liveness_stamp(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
         # flip offline at once. Not on our own shutdown: the runner is alive and
         # re-tunnels to the replacement, which must not settle its turns to idle.
@@ -3360,7 +3384,7 @@ def create_app(
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id),
+            _mark_disconnected_runner_failed(runner_id, reference_stamp),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task

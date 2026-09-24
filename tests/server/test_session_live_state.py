@@ -54,7 +54,7 @@ class _RecordingStore:
         self.status_writes: list[tuple[str, str]] = []
         self.pending_writes: list[tuple[str, int]] = []
         self.touches: list[list[str]] = []
-        self.clears: list[str] = []
+        self.clears: list[tuple[str, int | None]] = []
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -66,8 +66,8 @@ class _RecordingStore:
         del now
         self.touches.append(runner_ids)
 
-    def clear_runner_liveness(self, runner_id: str) -> None:
-        self.clears.append(runner_id)
+    def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
+        self.clears.append((runner_id, not_after))
 
 
 @pytest.fixture()
@@ -137,7 +137,33 @@ def test_runner_liveness_touch_and_clear_pass_through(
     session_live_state.clear_runner_liveness("runner_a")
     _wait_until(lambda: recording_store.touches and recording_store.clears)
     assert recording_store.touches == [["runner_a", "runner_b"]]
-    assert recording_store.clears == ["runner_a"]
+    stamp = session_live_state.last_liveness_stamp("runner_a")
+    assert recording_store.clears == [("runner_a", stamp)]
+
+
+def test_touch_records_stamp_and_clear_forwards_it_as_not_after(
+    recording_store: _RecordingStore,
+) -> None:
+    """``touch`` remembers its own stamp; ``clear`` forwards it as ``not_after``.
+
+    The disconnect handler relies on this stamp surviving the clear itself
+    (never erased here — only :func:`session_live_state.configure` resets
+    it), so a later cross-replica check still has something to compare
+    against.
+    """
+    assert session_live_state.last_liveness_stamp("runner_c") is None
+
+    before = int(time.time())
+    session_live_state.touch_runner_liveness(["runner_c"])
+    stamp = session_live_state.last_liveness_stamp("runner_c")
+    assert stamp is not None and stamp >= before
+
+    session_live_state.clear_runner_liveness("runner_c")
+    _wait_until(lambda: bool(recording_store.clears))
+    assert recording_store.clears == [("runner_c", stamp)]
+
+    # The clear call itself never erases the process's own record of it.
+    assert session_live_state.last_liveness_stamp("runner_c") == stamp
 
 
 def test_unconfigured_module_is_a_no_op() -> None:

@@ -6721,6 +6721,60 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store.touch_runner_liveness([], now=1)
 
 
+def test_clear_runner_liveness_not_after_spares_a_newer_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A ``not_after`` guard keeps a stamp another replica wrote after ours.
+
+    The cross-replica disconnect check compares against THIS replica's own
+    last stamp, so a clear scheduled before it learns of a reconnect
+    elsewhere must never erase that replica's fresher write.
+    """
+    conv = conversation_store.create_conversation(title="newer-elsewhere")
+    assert conversation_store.set_runner_id(conv.id, "runner_newer_elsewhere")
+
+    conversation_store.touch_runner_liveness(["runner_newer_elsewhere"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_newer_elsewhere", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen == 2_000_000
+
+
+def test_clear_runner_liveness_not_after_clears_an_equal_or_older_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A stamp at or before ``not_after`` still clears — the runner is really gone."""
+    equal = conversation_store.create_conversation(title="equal-stamp")
+    older = conversation_store.create_conversation(title="older-stamp")
+    assert conversation_store.set_runner_id(equal.id, "runner_equal_stamp")
+    assert conversation_store.set_runner_id(older.id, "runner_older_stamp")
+
+    conversation_store.touch_runner_liveness(["runner_equal_stamp"], now=1_000_000)
+    conversation_store.clear_runner_liveness("runner_equal_stamp", not_after=1_000_000)
+
+    conversation_store.touch_runner_liveness(["runner_older_stamp"], now=999_000)
+    conversation_store.clear_runner_liveness("runner_older_stamp", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([equal.id, older.id])
+    assert connectivity[equal.id].runner_last_seen is None
+    assert connectivity[older.id].runner_last_seen is None
+
+
+def test_clear_runner_liveness_without_not_after_still_clears_unconditionally(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Omitting ``not_after`` preserves the pre-cross-replica unconditional clear."""
+    conv = conversation_store.create_conversation(title="unconditional-clear")
+    assert conversation_store.set_runner_id(conv.id, "runner_unconditional_clear")
+
+    conversation_store.touch_runner_liveness(["runner_unconditional_clear"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_unconditional_clear")
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen is None
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

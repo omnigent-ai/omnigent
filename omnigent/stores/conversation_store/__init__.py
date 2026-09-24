@@ -1347,7 +1347,7 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def clear_runner_liveness(self, runner_id: str) -> None:
+    def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
         """
         Clear ``runner_last_seen`` for every session bound to a runner.
 
@@ -1356,6 +1356,11 @@ class ConversationStore(ABC):
         :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
 
         :param runner_id: The disconnected runner's id.
+        :param not_after: When given, only clear a row whose
+            ``runner_last_seen`` is ``NULL`` or ``<= not_after`` — the
+            runner may have re-tunnelled to another replica, which
+            stamps a newer value this clear must not erase. ``None``
+            clears unconditionally (the pre-cross-replica behavior).
         """
         ...
 

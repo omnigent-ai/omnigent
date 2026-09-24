@@ -1586,6 +1586,71 @@ async def test_runner_disconnect_grace_defers_failed_marking(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped runner that re-tunnelled to another replica is not failed.
+
+    This replica's registry only knows its own tunnels. When the runner's
+    row carries a fresh ``runner_last_seen`` newer than this replica's own
+    last stamp, another replica wrote it — the runner is live there, so the
+    grace timer must leave the mid-turn session alone.
+    """
+    import time
+
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.4
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-live-elsewhere"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    # Pin this replica's own last stamp a minute in the past, so the row
+    # stamp written below can only have come from another replica.
+    now = int(time.time())
+    monkeypatch.setattr(session_live_state, "last_liveness_stamp", lambda _runner_id: now - 60)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+        # Let this replica's own disconnect-time liveness write land first,
+        # then stamp the row the way the replica now holding the tunnel does.
+        await asyncio.sleep(0.1)
+        store.touch_runner_liveness([runner_id], now)
+        await asyncio.sleep(grace * 3)
+        assert sessions_module._session_status_cache.get(session_id) != "failed", (
+            "a runner live on another replica was failed by this replica's grace timer"
+        )
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_server_initiated_close_never_fails_the_turn(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,

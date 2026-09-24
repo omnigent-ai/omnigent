@@ -73,6 +73,10 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# This process's own last touch_runner_liveness() stamp per runner id.
+# Never erased by clear_runner_liveness — only configure() resets it.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
+_last_liveness_stamp: dict[str, int] = {}
 
 
 def configure(
@@ -93,6 +97,7 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+    _last_liveness_stamp.clear()
 
 
 def conversation_store() -> ConversationStore | None:
@@ -290,11 +295,34 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     the owning workspace on a multi-tenant replica. It mirrors how the
     host tunnel refreshes ``host_store.heartbeat`` from its ping loop.
 
+    Also records the stamp in :func:`last_liveness_stamp`, so a later
+    disconnect on this same replica can tell its own writes apart from a
+    fresher one another replica made after the runner re-tunnelled there.
+
     :param runner_ids: Runner ids with a live tunnel. Empty = no-op.
     """
     if _store is None or not runner_ids:
         return
-    submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), int(time.time()))
+    now = int(time.time())
+    for runner_id in runner_ids:
+        _last_liveness_stamp[runner_id] = now
+    submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), now)
+
+
+def last_liveness_stamp(runner_id: str) -> int | None:
+    """
+    Return the last ``runner_last_seen`` value THIS process itself stamped.
+
+    Lets a disconnect handler distinguish a stamp another replica wrote
+    after the runner re-tunnelled there from one this replica wrote
+    itself, without racing the best-effort write's own executor.
+
+    :param runner_id: Runner id to look up.
+    :returns: The epoch-second value from this process's most recent
+        :func:`touch_runner_liveness` call naming *runner_id*, or
+        ``None`` if it never stamped one.
+    """
+    return _last_liveness_stamp.get(runner_id)
 
 
 def clear_runner_liveness(runner_id: str) -> None:
@@ -303,10 +331,18 @@ def clear_runner_liveness(runner_id: str) -> None:
 
     Flips the sidebar offline immediately instead of waiting out the
     freshness TTL. An ungraceful death (host / replica crash) never
-    reaches this — the TTL self-corrects it.
+    reaches this — the TTL self-corrects it. Passes this process's own
+    last stamp as ``not_after``, so the clear can never erase a fresher
+    stamp another replica already wrote for a runner that re-tunnelled
+    there before this disconnect was processed.
 
     :param runner_id: The disconnected runner's id.
     """
     if _store is None:
         return
-    submit("runner_liveness_clear", _store.clear_runner_liveness, runner_id)
+    submit(
+        "runner_liveness_clear",
+        _store.clear_runner_liveness,
+        runner_id,
+        last_liveness_stamp(runner_id),
+    )

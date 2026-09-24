@@ -3565,7 +3565,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "touch_runner_liveness", write)
 
-    def clear_runner_liveness(self, runner_id: str) -> None:
+    def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
         """
         Clear ``runner_last_seen`` for sessions bound to a runner.
 
@@ -3573,18 +3573,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         (sidebar ordering) is untouched by construction. See the abstract method.
 
         :param runner_id: The disconnected runner's id.
+        :param not_after: When given, skip a row whose stamp is newer —
+            another replica already re-stamped it after the runner
+            reconnected there.
         """
         from sqlalchemy import update
 
         def write(session: Session) -> None:
-            session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.runner_id == runner_id,
-                )
-                .values(runner_last_seen=None)
+            stmt = update(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.runner_id == runner_id,
             )
+            if not_after is not None:
+                stmt = stmt.where(
+                    or_(
+                        SqlConversationMetadata.runner_last_seen.is_(None),
+                        SqlConversationMetadata.runner_last_seen <= not_after,
+                    )
+                )
+            session.execute(stmt.values(runner_last_seen=None))
 
         run_write_transaction(self._session_immediate, "clear_runner_liveness", write)
 
