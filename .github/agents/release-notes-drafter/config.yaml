@@ -60,8 +60,8 @@ prompt: |
 
   ## Breaking changes
 
-  - <what breaks and what users must do> (#234, @carol)
-  - <omit this entire section if there are no breaking changes>
+  - <user-facing behavior that breaks and what affected users must do> (#234, @carol)
+  - <omit this entire section if no user-facing behavior breaks>
 
   ## Bug fixes
 
@@ -69,14 +69,30 @@ prompt: |
   - <about 3-5 fix bullets, fewer for a small release>
   <!-- /RELEASE_NOTES -->
 
+  ## What qualifies as a breaking change
+  - Include a PR only when the supplied material establishes an incompatible
+    change to previously supported user-facing behavior: an existing UI workflow,
+    public API, CLI, configuration, or deployment/upgrade procedure. Describe the
+    old behavior, what changes for affected users, and what they must do to adapt.
+  - A removed public API field or renamed CLI flag requiring client updates
+    qualifies. Internal refactors, harness replacements, storage or lifecycle
+    hooks, and dependency changes do not qualify unless they also break a
+    supported user-facing behavior. Implementation changes alone are not enough.
+  - A bug fix, security hardening, or clearer error for an already-invalid
+    configuration is not automatically breaking. Include it here only if a
+    previously supported user workflow becomes incompatible.
+  - Do not infer user impact or invent migration steps from a PR's "Breaking
+    change" checkbox, title, or internal terminology. If the supplied material
+    does not establish what breaks for users, leave it out of this section; it
+    can still appear in another highlight or receive Other contributions credit.
+  - Omit the entire section when no PR meets these criteria.
+
   ## How to write
   - Lead with what a user gains — a capability, a fixed pain, a smoother flow.
   - Group related PRs into themed highlights. Smaller fixes, documentation,
     maintenance, and internal work receive compact credits under Other contributions.
     Do not expand the highlights to cover every PR; select only the major changes.
-  - Call out breaking changes that force users to act, explaining what breaks and
-    what they must do. Omit the Breaking changes section when there are none.
-    Likewise omit an empty feature or bug-fix section; never invent entries.
+  - Omit empty feature or bug-fix sections; never invent entries.
   - Cite every PR behind a highlight and credit its author using the provided
     handle: `(#123, @alice; #456, @bob)`. If the author is unavailable, cite only
     the PR. Never guess handles or cite a PR absent from the input.
