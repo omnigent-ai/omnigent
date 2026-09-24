@@ -31,7 +31,6 @@ import os
 import secrets
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -148,6 +147,14 @@ def clone_hermes_session(
     :param target_session_id: New session id for the cloned rows.
     :param workspace: If provided, overrides ``cwd`` on the cloned session row.
     """
+    # Deferred import: keeps this module importable on interpreters built
+    # without the _sqlite3 C extension (the startup orphan sweep imports it).
+    try:
+        import sqlite3
+    except ImportError:
+        _logger.warning("sqlite3 unavailable on this interpreter; skipping hermes session clone")
+        return 0
+
     # Validate the source DB before copying: it must have a sessions table
     # and contain the requested session. If not, skip the clone silently so
     # Hermes starts fresh rather than crashing on a broken state.db.
@@ -710,6 +717,11 @@ def _max_message_id(db_path: Path) -> int:
     needs a monotonically-increasing high-water mark, and a freshly-created
     session legitimately starts at ``0``.
     """
+    try:
+        # Deferred: interpreters without the _sqlite3 C extension collapse to 0.
+        import sqlite3
+    except ImportError:
+        return 0
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     except sqlite3.Error:

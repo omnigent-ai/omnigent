@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import json
+import logging
 import sqlite3
 import sys
 import uuid
@@ -526,3 +529,78 @@ def test_inject_relay_into_policy_hook_returns_false_when_wrapper_absent(
     from omnigent.harnesses.hermes_native.bridge import inject_relay_into_policy_hook
 
     assert inject_relay_into_policy_hook(tmp_path, "http://x", "tok", "http://ap", "sid") is False
+
+
+# --- interpreter built without the _sqlite3 C extension ---------------------
+
+_BRIDGE_MODULE = "omnigent.harnesses.hermes_native.bridge"
+
+
+@contextlib.contextmanager
+def _sqlite3_blocked():
+    """Simulate an interpreter built without the ``_sqlite3`` C extension.
+
+    Evicts the cached ``sqlite3`` modules and blocks ``_sqlite3`` so any
+    ``import sqlite3`` inside the context fails, then restores the real
+    modules on exit.
+    """
+    saved = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name in ("_sqlite3", "sqlite3") or name.startswith("sqlite3.")
+    }
+    sys.modules["_sqlite3"] = None  # import _sqlite3 -> ModuleNotFoundError
+    try:
+        yield
+    finally:
+        sys.modules.pop("_sqlite3", None)
+        for name in list(sys.modules):
+            if name == "sqlite3" or name.startswith("sqlite3."):
+                del sys.modules[name]
+        sys.modules.update(saved)
+
+
+def test_bridge_module_imports_without_sqlite3() -> None:
+    """The startup orphan sweep imports every native bridge module, so this
+    module must import cleanly on an interpreter without ``_sqlite3``."""
+    saved_bridge = sys.modules.pop(_BRIDGE_MODULE, None)
+    try:
+        with _sqlite3_blocked():
+            importlib.import_module(_BRIDGE_MODULE)
+    finally:
+        sys.modules.pop(_BRIDGE_MODULE, None)
+        if saved_bridge is not None:
+            sys.modules[_BRIDGE_MODULE] = saved_bridge
+
+
+def test_max_message_id_zero_without_sqlite3(tmp_path: Path) -> None:
+    """Without sqlite3 the high-water mark degrades to 0 instead of raising."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(str(db))
+    con.executescript(b._MESSAGES_DDL)
+    con.execute(
+        "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?,?,?,?,?)",
+        (7, "s1", "user", "hi", 0.0),
+    )
+    con.commit()
+    con.close()
+    with _sqlite3_blocked():
+        assert b._max_message_id(db) == 0
+    # With sqlite3 restored the real high-water mark is read again.
+    assert b._max_message_id(db) == 7
+
+
+def test_clone_hermes_session_skips_without_sqlite3(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without sqlite3 the clone is skipped (warn + return 0), not a crash."""
+    source_db = tmp_path / "source" / "state.db"
+    source_db.parent.mkdir()
+    target_db = tmp_path / "target" / "state.db"
+    _create_source_db(source_db, "src-nosqlite")
+
+    with _sqlite3_blocked(), caplog.at_level(logging.WARNING, logger=b.__name__):
+        assert b.clone_hermes_session(source_db, target_db, "src-nosqlite", "tgt") == 0
+
+    assert not target_db.exists()
+    assert any("sqlite3 unavailable" in r.getMessage() for r in caplog.records)
