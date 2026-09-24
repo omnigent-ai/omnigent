@@ -397,7 +397,7 @@ describe("directory and permission previews", () => {
     hostId: "host_1",
     workspace: "/work/repo",
     repositoryLabel: "repo",
-    branchLabel: "New",
+    branchLabel: "Choose",
     branchDescription: "Create or select a worktree from main repository branch: main",
   };
 
