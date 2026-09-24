@@ -1918,8 +1918,9 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The bounded discovery wait preserves the existing degraded registration."""
+    """A timed-out probe leaves the connected host's readiness unknown."""
     host = _make_host_process()
+    monkeypatch.setattr(host, "_prewarm_model_options", AsyncMock(return_value=None))
     never = asyncio.Event()
 
     async def _blocked(*, startup: bool) -> None:
@@ -1930,9 +1931,17 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
     monkeypatch.setattr(host, "_probe_gateway_inference", _blocked)
     monkeypatch.setattr("omnigent.host.connect._HOST_CAPABILITY_INIT_TIMEOUT_S", 0.01)
 
-    tunnel = _FakeTunnel()
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+        task = host._capability_init_task
+        assert task is not None
+        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+    finally:
+        tunnel.disconnect.set()
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await asyncio.wait_for(serve_task, timeout=1.0)
 
     hello = decode_host_frame(tunnel.sent[0])
     assert isinstance(hello, HostHelloFrame)
@@ -1944,10 +1953,10 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
     assert "capability discovery timed out" in capsys.readouterr().err
 
 
-async def test_fast_capability_discovery_is_included_in_hello(
+async def test_completed_capability_discovery_is_included_in_hello(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The first hello carries both readiness and gateway backing."""
+    """A completed discovery task supplies both fields in hello."""
     host = _make_host_process()
 
     async def _discover() -> None:
@@ -1956,6 +1965,9 @@ async def test_fast_capability_discovery_is_included_in_hello(
         host._capabilities_initialized = True
 
     monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    host._start_capability_discovery()
+    assert host._capability_init_task is not None
+    await host._capability_init_task
     tunnel = _BlockingTunnel()
     serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
     try:
@@ -1970,10 +1982,10 @@ async def test_fast_capability_discovery_is_included_in_hello(
     assert hello.gateway_inference == {"codex-native": True}
 
 
-async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
+async def test_slow_capability_discovery_does_not_block_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No host registration or launch handling occurs until discovery finishes."""
+    """Hello is sent before discovery finishes; readiness follows it."""
     host = _make_host_process()
     discovery_release = asyncio.Event()
     discovery_started = asyncio.Event()
@@ -1990,22 +2002,65 @@ async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
     serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
     try:
         await asyncio.wait_for(discovery_started.wait(), timeout=1.0)
-        assert tunnel.sent == []
-        assert host._ws is None
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+        hello = decode_host_frame(tunnel.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        assert hello.configured_harnesses is None
+        assert hello.gateway_inference is None
+        assert host._ws is tunnel
         assert host._frame_tasks == set()
 
         discovery_release.set()
-        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+        await asyncio.wait_for(tunnel.second_send.wait(), timeout=1.0)
+        readiness = decode_host_frame(tunnel.sent[1])
+        assert isinstance(readiness, HostHarnessReadinessFrame)
+        assert readiness.configured_harnesses == {"claude-native": True}
+        assert readiness.gateway_inference == {"claude-native": True}
     finally:
-        await _cancel(serve_task)
+        discovery_release.set()
+        tunnel.disconnect.set()
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await asyncio.wait_for(serve_task, timeout=1.0)
         if host._capability_init_task is not None:
-            await _cancel(host._capability_init_task)
+            await host._capability_init_task
 
-    assert discovery_started.is_set()
-    hello = decode_host_frame(tunnel.sent[0])
-    assert isinstance(hello, HostHelloFrame)
-    assert hello.configured_harnesses == {"claude-native": True}
-    assert hello.gateway_inference == {"claude-native": True}
+
+async def test_readiness_refresh_does_not_duplicate_startup_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pending startup probe owns discovery through several refresh ticks."""
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_prewarm_model_options", AsyncMock(return_value=None))
+    release = asyncio.Event()
+    calls: list[bool] = []
+
+    async def _configured(*, startup: bool) -> dict[str, bool]:
+        calls.append(startup)
+        if startup:
+            await release.wait()
+        return {"pi": True}
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _configured)
+    monkeypatch.setattr(
+        host,
+        "_probe_gateway_inference",
+        lambda *, startup: asyncio.sleep(0, result={"codex": True}),
+    )
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S", 0.01)
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+        await asyncio.sleep(0.05)
+        assert calls == [True]
+        release.set()
+        await asyncio.wait_for(tunnel.second_send.wait(), timeout=5.0)
+        assert calls == [True]
+    finally:
+        release.set()
+        tunnel.disconnect.set()
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await asyncio.wait_for(serve_task, timeout=1.0)
 
 
 async def test_connection_auth_overlaps_capability_discovery(
@@ -2086,7 +2141,7 @@ async def test_cancelled_readiness_probe_keeps_orphan_reaper_paused(
 async def test_owner_lookup_overlaps_capability_discovery_after_websocket_upgrade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Owner attribution adds no serial wait before host registration."""
+    """Owner lookup runs after upgrade while capability discovery continues."""
     host = _make_host_process()
     capability_started = asyncio.Event()
     capability_release = asyncio.Event()
@@ -2134,16 +2189,18 @@ async def test_owner_lookup_overlaps_capability_discovery_after_websocket_upgrad
         assert tunnel.sent == []
 
         owner_release.set()
-        await asyncio.sleep(0)
-        assert tunnel.sent == []
-
-        capability_release.set()
         await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
-        assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+        hello = decode_host_frame(tunnel.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        assert hello.configured_harnesses is None
+        assert host._capability_init_task is not None
+        assert not host._capability_init_task.done()
     finally:
+        owner_release.set()
+        capability_release.set()
         await _cancel(connect_task)
         if host._capability_init_task is not None:
-            await _cancel(host._capability_init_task)
+            await host._capability_init_task
 
 
 async def test_rejected_websocket_upgrade_skips_owner_lookup(
@@ -2198,6 +2255,9 @@ async def test_incomplete_startup_capabilities_preserve_registration_fallback(
         "_probe_gateway_inference",
         lambda *, startup: asyncio.sleep(0, result=gateway),
     )
+    host._start_capability_discovery()
+    assert host._capability_init_task is not None
+    await host._capability_init_task
     tunnel = _FakeTunnel()
 
     with pytest.raises(ConnectionError, match="test disconnect"):
@@ -2230,6 +2290,9 @@ async def test_incomplete_startup_discovery_is_reused_across_reconnects(
         lambda *, startup: asyncio.sleep(0, result={"codex-native": True}),
     )
     monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
+    host._start_capability_discovery()
+    assert host._capability_init_task is not None
+    await host._capability_init_task
     first = _FakeTunnel()
     with pytest.raises(ConnectionError, match="test disconnect"):
         await host._serve_frames(first)  # type: ignore[arg-type]
@@ -2419,34 +2482,61 @@ async def test_capability_result_publishes_without_full_refresh(
             await _cancel(host._capability_init_task)
 
 
-async def test_failed_startup_discovery_can_retry_before_registration(
+async def test_failed_startup_discovery_retries_after_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Failed startup discovery retries without advertising an incomplete host."""
+    """An unexpected discovery error is retried on the next connection."""
     host = _make_host_process()
     calls = 0
+    second_started = asyncio.Event()
+    second_release = asyncio.Event()
 
     async def _discover() -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("probe exploded")
+        second_started.set()
+        await second_release.wait()
         host._configured_harnesses = {"codex-native": True}
         host._gateway_inference = {"codex-native": True}
         host._capabilities_initialized = True
 
     monkeypatch.setattr(host, "_initialize_capabilities", _discover)
-    first = _FakeTunnel()
-    with pytest.raises(RuntimeError, match="probe exploded"):
-        await host._serve_frames(first)  # type: ignore[arg-type]
-    assert first.sent == []
+    first = _BlockingTunnel()
+    first_serve = asyncio.create_task(host._serve_frames(first))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(first.first_send.wait(), timeout=1.0)
+        task = host._capability_init_task
+        assert task is not None
+        with pytest.raises(RuntimeError, match="probe exploded"):
+            await task
+        first_hello = decode_host_frame(first.sent[0])
+        assert isinstance(first_hello, HostHelloFrame)
+        assert first_hello.configured_harnesses is None
+    finally:
+        first.disconnect.set()
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await asyncio.wait_for(first_serve, timeout=1.0)
 
-    second = _FakeTunnel()
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(second)  # type: ignore[arg-type]
-    hello = decode_host_frame(second.sent[0])
-    assert isinstance(hello, HostHelloFrame)
-    assert hello.configured_harnesses == {"codex-native": True}
+    second = _BlockingTunnel()
+    second_serve = asyncio.create_task(host._serve_frames(second))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        await asyncio.wait_for(second.first_send.wait(), timeout=1.0)
+        hello = decode_host_frame(second.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        assert hello.configured_harnesses is None
+        second_release.set()
+        await asyncio.wait_for(second.second_send.wait(), timeout=1.0)
+        readiness = decode_host_frame(second.sent[1])
+        assert isinstance(readiness, HostHarnessReadinessFrame)
+        assert readiness.configured_harnesses == {"codex-native": True}
+    finally:
+        second_release.set()
+        second.disconnect.set()
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await asyncio.wait_for(second_serve, timeout=1.0)
     assert calls == 2
 
 
@@ -2500,11 +2590,14 @@ async def test_reconnect_does_not_cancel_or_repeat_startup_capability_discovery(
         host._capabilities_initialized = True
 
     monkeypatch.setattr(host, "_initialize_capabilities", _discover)
-    first = _FakeTunnel()
+    first = _BlockingTunnel()
     serve_task = asyncio.create_task(host._serve_frames(first))  # type: ignore[arg-type]
     await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(first.first_send.wait(), timeout=1.0)
     await _cancel(serve_task)
-    assert first.sent == []
+    hello = decode_host_frame(first.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses is None
 
     task = host._capability_init_task
     assert task is not None
@@ -7623,6 +7716,57 @@ async def test_github_pr_update_reports_lock_contention_on_host(
     assert registry.path.read_bytes() == before
     assert host._handle_fs_write(frame).status == "ok"
     assert (target in {entry.url for entry in registry.list()}) == (action == "attach")
+
+
+async def test_disconnect_during_startup_probe_allows_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel disconnect cannot cancel or strand shared discovery."""
+    host = _make_host_process()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def _discover() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        host._replace_capabilities({"pi": True}, {"codex": True})
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    first = _BlockingTunnel()
+    first_serve = asyncio.create_task(host._serve_frames(first))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await asyncio.wait_for(first.first_send.wait(), timeout=1.0)
+        hello = decode_host_frame(first.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        assert hello.configured_harnesses is None
+
+        first.disconnect.set()
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await asyncio.wait_for(first_serve, timeout=1.0)
+
+        task = host._capability_init_task
+        assert task is not None and not task.done()
+        release.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        second = _FakeTunnel()
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await host._serve_frames(second)  # type: ignore[arg-type]
+        hello = decode_host_frame(second.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        assert hello.configured_harnesses == {"pi": True}
+        assert hello.gateway_inference == {"codex": True}
+        assert calls == 1
+    finally:
+        release.set()
+        if not first_serve.done():
+            await _cancel(first_serve)
+        _cleanup_host(host)
 
 
 def test_fs_search_reuses_the_changed_files_snapshot_across_requests(

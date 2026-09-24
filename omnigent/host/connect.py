@@ -1221,7 +1221,7 @@ class HostProcess:
         # its one-time import; see run().
         self._zygote_prestart_task: asyncio.Task[ZygoteManager | None] | None = None
         # Discovery belongs to the daemon so connection retries share one
-        # in-flight probe and registration waits for bounded discovery.
+        # in-flight probe.
         self._capability_init_task: asyncio.Task[None] | None = None
         # Inbound frames are handled on their own tasks (see
         # _start_frame_task) so one slow handler — a model-options CLI exec,
@@ -3665,7 +3665,7 @@ class HostProcess:
             return None
 
     async def _initialize_capabilities(self) -> None:
-        """Collect startup metadata before registration, with bounded fallback."""
+        """Collect advisory startup metadata with a bounded fallback."""
         if self._capabilities_initialized:
             return
         generation = self._capability_generation
@@ -4304,10 +4304,8 @@ class HostProcess:
         return None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
-        """Wait for bounded startup discovery, register, then service the connection."""
+        """Register, then service frames while advisory discovery completes."""
         self._start_capability_discovery()
-        if self._capability_init_task is not None:
-            await asyncio.shield(self._capability_init_task)
         _tel_opt_out = False
         try:
             from omnigent.telemetry.client import is_disabled as _tel_disabled
@@ -4341,7 +4339,12 @@ class HostProcess:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
         self._ws = ws
-        readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        readiness_task = asyncio.create_task(
+            self._harness_readiness_loop(
+                ws,
+                startup_snapshot=(hello.configured_harnesses, hello.gateway_inference),
+            )
+        )
         # Warm the pre-launch model listings once a server can actually ask
         # for them, so the first picker open is served from cache instead of
         # waiting on a harness probe. Cache-fresh reconnects are a no-op.
@@ -4395,21 +4398,47 @@ class HostProcess:
     async def _harness_readiness_loop(
         self,
         ws: websockets.asyncio.client.ClientConnection,
+        startup_snapshot: tuple[dict[str, HarnessAvailability] | None, dict[str, bool] | None]
+        | None = None,
     ) -> None:
         """Refresh advisory capabilities without endangering the tunnel."""
-        published_configured = self._configured_harnesses
-        published_gateway = self._gateway_inference
+        if startup_snapshot is None:
+            published_configured = self._configured_harnesses
+            published_gateway = self._gateway_inference
+            startup_task = None
+        else:
+            published_configured, published_gateway = startup_snapshot
+            startup_task = self._capability_init_task
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
         while True:
-            await asyncio.sleep(max(0.0, min(next_quick, next_full) - loop.time()))
+            delay = max(0.0, min(next_quick, next_full) - loop.time())
+            if startup_task is None:
+                await asyncio.sleep(delay)
+            else:
+                try:
+                    await asyncio.wait_for(asyncio.shield(startup_task), timeout=delay)
+                except TimeoutError:
+                    pass
+                except Exception:
+                    _logger.exception("Host startup capability discovery failed")
+            startup_completed = startup_task is not None and startup_task.done()
+            if startup_completed:
+                startup_task = None
             now = loop.time()
             generation = self._capability_generation
             configured = self._configured_harnesses
             gateway = self._gateway_inference
-            refresh_full = configured is None or now >= next_full
-            if now >= next_quick:
+            if startup_completed:
+                next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
+                next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+            refresh_full = (
+                not startup_completed
+                and startup_task is None
+                and (configured is None or now >= next_full)
+            )
+            if not startup_completed and now >= next_quick:
                 next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
                 if not refresh_full and configured is not None:
                     try:
@@ -4430,9 +4459,7 @@ class HostProcess:
                     self._replace_capabilities(new_configured, new_gateway)
             configured = self._configured_harnesses
             gateway = self._gateway_inference
-            if configured is not None and (
-                configured != published_configured or gateway != published_gateway
-            ):
+            if configured and (configured != published_configured or gateway != published_gateway):
                 await ws.send(
                     encode_host_frame(
                         HostHarnessReadinessFrame(
