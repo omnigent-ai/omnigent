@@ -3765,8 +3765,6 @@ function ComposerImpl(
                   onRetrySkills={() => void refreshSkills()}
                 />
               )}
-              {/* /help, /context, and command errors share the composer popover
-                  band so they cannot grow into the ChatHeader overlay. */}
               {commandError !== null && (
                 <div
                   data-testid="composer-command-output"

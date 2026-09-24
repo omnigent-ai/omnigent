@@ -1056,9 +1056,6 @@ describe("Composer slash-command submit routing", () => {
   });
 
   it("floats /help output above the composer in a capped scroll panel", () => {
-    // Long skill blurbs used to dump into the composer card and grow it
-    // under the ChatHeader overlay. The listing must float, stay capped,
-    // and scroll leftovers instead of stretching the card.
     render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "/help" } });
@@ -1073,8 +1070,6 @@ describe("Composer slash-command submit routing", () => {
   });
 
   it("floats the bare /model hint in the popover band and clears the draft", () => {
-    // Same band as /help — the "/model" draft must not linger in the
-    // textarea under the floating usage hint (matches /help and /context).
     render(<Composer {...composerProps()} />);
     const ta = textarea();
     // Trailing space closes the slash menu so Enter submits (see /model tests).

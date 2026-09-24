@@ -1,17 +1,4 @@
-"""Composer popovers and command output must stay below the session header.
-
-The ChatHeader is a transparent ``z-30`` overlay pinned to ``top-0``. When the
-composer's command feedback (``/help`` and other slash output) grows upward, or
-a floating suggestion menu (the ``/`` slash menu, the ``@`` mention list) opens
-on a short window without a viewport cap, the surface reaches into the header
-band and the session title and header icons paint on top of the command text.
-A bare ``/model`` additionally leaves the typed draft in the composer instead
-of clearing it before showing its usage hint.
-
-Each test drives the real journey and asserts the *correct* (post-fix) outcome,
-so it fails on the buggy build and passes once the popovers are confined to a
-band below the header.
-"""
+"""Browser regressions for composer popovers below the session header."""
 
 from __future__ import annotations
 
@@ -22,8 +9,6 @@ from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.chat.test_model_flows_contract import _install_stream_controller
 
-# A long installed-skill catalog so /help output grows the card tall enough to
-# reach the header band, and the slash menu has many rows on a short window.
 _SKILLS = [
     {"name": f"repro-skill-{i:02d}", "description": f"Reproduction skill number {i:02d}"}
     for i in range(40)
@@ -165,9 +150,6 @@ def test_help_command_output_stays_below_header(
     # The header overlay paints on top of anything beneath it.
     assert geom["headerZ"] in {"30", "auto"} or int(geom["headerZ"]) >= 30
 
-    # Correct behaviour: the /help output is confined below the header band.
-    # The bug lets it grow up under the transparent header, which then paints
-    # the session title/icons over the listing.
     assert geom["card"]["top"] >= geom["header"]["bottom"] - 1, (
         f"composer card top {geom['card']['top']} crosses under header bottom "
         f"{geom['header']['bottom']} — header paints over the /help output"
@@ -266,7 +248,5 @@ def test_bare_model_command_clears_the_draft(
     page.keyboard.press("Enter")
     page.keyboard.press("Enter")
 
-    # The usage hint appears (command recognised)...
     expect(page.get_by_text(re.compile(r"Usage: /model"))).to_be_visible(timeout=15_000)
-    # ...and the typed draft must be gone, matching /help and /context.
     expect(composer).to_have_value("")
