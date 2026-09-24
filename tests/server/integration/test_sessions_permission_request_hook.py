@@ -4096,6 +4096,11 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
             json=_CODEX_REPARK_PAYLOAD,
         )
         assert second.status_code == 200, second.text
+        assert second.content, (
+            "expected the codex JSON-RPC verdict body, got an empty response — "
+            "the retry re-parked instead of consuming the gap tombstone "
+            "(status=200, empty body means fail-ask fired again)"
+        )
         assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
     finally:
         release_grace.set()
