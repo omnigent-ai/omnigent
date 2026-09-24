@@ -1,29 +1,38 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { PlugIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { withBasePath } from "@/lib/basePath";
-import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
+import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 
 function useCatalog() {
   const [services, setServices] = useState<RegistryService[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const refresh = useCallback(async () => {
     try {
       const result = await registryRequest<{ data: RegistryService[] }>();
       setServices(result.data);
       setError(null);
+      return result.data;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not load MCP services");
+      return undefined;
+    } finally {
+      setLoading(false);
     }
   }, []);
   useEffect(() => {
     void refresh();
+    const onFocus = () => void refresh();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, [refresh]);
-  return { services, error, refresh };
+  return { services, error, loading, refresh };
 }
 
 export function McpRegistryConnections() {
-  const { services, error, refresh } = useCatalog();
+  const { services, error, loading, refresh } = useCatalog();
   const callbackFailed = [...new URLSearchParams(window.location.search)].some(
     ([key, value]) => key.startsWith("mcp-") && value === "error",
   );
@@ -47,9 +56,16 @@ export function McpRegistryConnections() {
         </p>
       )}
       {services.map((service) => (
-        <ServiceConnection key={service.id} service={service} onChanged={refresh} />
+        <ServiceConnection
+          key={service.id}
+          service={service}
+          onChanged={async () => {
+            await refresh();
+          }}
+        />
       ))}
-      {!services.length && !error && (
+      {loading && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
+      {!loading && !services.length && !error && (
         <p className="text-sm text-muted-foreground">
           No managed services are available for your account.
         </p>
@@ -201,37 +217,149 @@ function ServiceConnection({
 
 export function McpRegistryPicker({
   attached,
-  onAdd,
+  reservedNames,
+  onToggle,
   busy,
 }: {
   attached: string[];
-  onAdd: (id: string) => void;
+  reservedNames?: string[];
+  onToggle: (id: string, enabled: boolean) => void;
   busy: boolean;
 }) {
-  const { services, error } = useCatalog();
+  const { services, error, loading, refresh } = useCatalog();
+  const [authorizing, setAuthorizing] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<{ id: string; message: string } | null>(
+    null,
+  );
+  const authorization = useRef<AbortController | null>(null);
+  useEffect(() => () => authorization.current?.abort(), []);
+
+  async function enable(service: RegistryService) {
+    setConnectionError(null);
+    if (service.connected) {
+      onToggle(service.id, true);
+      return;
+    }
+    const controller = new AbortController();
+    authorization.current = controller;
+    setAuthorizing(service.id);
+    try {
+      await authorizeRegistryService(service, controller.signal);
+      const updated = await refresh();
+      if (!updated?.find((s) => s.id === service.id)?.connected) {
+        throw new Error("Account is not connected. Please try again.");
+      }
+      if (!controller.signal.aborted && !attached.includes(service.id)) onToggle(service.id, true);
+    } catch (e) {
+      if (!controller.signal.aborted) {
+        setConnectionError({
+          id: service.id,
+          message: e instanceof Error ? e.message : "Sign-in failed",
+        });
+      }
+    } finally {
+      if (!controller.signal.aborted) setAuthorizing(null);
+    }
+  }
+
+  const unavailable = attached.filter((id) => !services.some((s) => s.id === id));
   return (
-    <div className="space-y-2 rounded-md border border-border p-3">
-      <p className="text-sm font-medium">Add a managed MCP service</p>
+    <div className="space-y-3">
+      <p className="text-sm text-muted-foreground">
+        Choose the services this session can use. Your administrator manages the catalog. You’ll be
+        asked to sign in when needed.
+      </p>
       {error && (
         <p role="alert" className="text-sm text-destructive">
           {error}
         </p>
       )}
-      {services
-        .filter((s) => !attached.includes(s.id))
-        .map((service) => (
-          <div key={service.id} className="flex items-center justify-between gap-2">
-            <span className="text-sm">{service.title}</span>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={busy || !service.connected}
-              onClick={() => onAdd(service.id)}
-            >
-              {service.connected ? `Add ${service.title}` : "Connect in settings"}
-            </Button>
-          </div>
-        ))}
+      {loading && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
+      {!loading && !error && !services.length && (
+        <p className="text-sm text-muted-foreground">
+          No managed services are available for your account.
+        </p>
+      )}
+      <div className="divide-y divide-border rounded-lg border border-border empty:hidden">
+        {services.map((service) => {
+          const selected = attached.includes(service.id);
+          const tokenNeeded = service.auth === "bearer" && !service.connected;
+          const conflict = reservedNames?.includes(service.id);
+          return (
+            <div key={service.id} className="px-4 py-3">
+              <label className="flex items-center gap-3">
+                <PlugIcon className="size-4 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium">{service.title}</span>
+                  {service.description && (
+                    <span className="block text-xs text-muted-foreground">
+                      {service.description}
+                    </span>
+                  )}
+                  <span className="mt-1 block text-xs text-muted-foreground">
+                    {conflict
+                      ? "A custom server already uses this name"
+                      : authorizing === service.id
+                        ? "Waiting for sign-in…"
+                        : service.connected
+                          ? service.auth === "none"
+                            ? "Ready"
+                            : "Connected"
+                          : tokenNeeded
+                            ? "Connect your account in settings"
+                            : "Sign in to connect"}
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  aria-label={service.title}
+                  className="size-4 shrink-0 cursor-pointer accent-primary disabled:cursor-not-allowed disabled:opacity-50"
+                  checked={selected}
+                  disabled={busy || authorizing !== null || conflict || (tokenNeeded && !selected)}
+                  onChange={(e) =>
+                    e.target.checked ? void enable(service) : onToggle(service.id, false)
+                  }
+                />
+              </label>
+              {selected && !service.connected && !tokenNeeded && (
+                <Button
+                  size="sm"
+                  variant="link"
+                  disabled={busy || authorizing !== null}
+                  onClick={() => void enable(service)}
+                >
+                  Reconnect
+                </Button>
+              )}
+              {connectionError?.id === service.id && (
+                <p role="alert" className="mt-2 text-sm text-destructive">
+                  {connectionError.message}
+                </p>
+              )}
+            </div>
+          );
+        })}
+        {!loading &&
+          !error &&
+          unavailable.map((id) => (
+            <label key={id} className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
+              <span>
+                {id}
+                <span className="block text-xs text-muted-foreground">
+                  No longer available · uncheck to remove
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                aria-label={id}
+                checked
+                disabled={busy || authorizing !== null}
+                onChange={() => onToggle(id, false)}
+                className="size-4 accent-primary"
+              />
+            </label>
+          ))}
+      </div>
       <a className="text-xs underline" href={withBasePath("/settings/integrations")}>
         Manage account connections
       </a>
