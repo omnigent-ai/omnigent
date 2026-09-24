@@ -64,8 +64,8 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
     managedServers,
     installed,
     mockInstall: true,
-    onConnect: async (url, force) => {
-      log("onConnect", { url, force });
+    onConnect: async (url) => {
+      log("onConnect", url);
       return {};
     },
     onStartLocal: async () => {

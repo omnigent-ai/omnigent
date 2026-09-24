@@ -17,10 +17,7 @@ const CLOUD_DOCS_URL = "https://omnigent.ai/docs/deploy/overview";
 /** The `omnigentSetup` preload bridge (see electron/src/preload.js). */
 interface OmnigentSetup {
   getServerUrl: () => Promise<string | null>;
-  setServerUrl: (
-    url: string,
-    opts?: { force?: boolean },
-  ) => Promise<{ needsConfirm?: boolean } | unknown>;
+  setServerUrl: (url: string) => Promise<unknown>;
   getManagedServers: () => Promise<string[]>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
@@ -108,20 +105,17 @@ function BridgeSetupApp() {
     recentServers,
     managedServers,
     installed,
-    onConnect: async (url, force) => {
+    onConnect: async (url) => {
       // setServerUrl persists the URL and navigates the window to it; on success
-      // the server's SPA takes over and this page goes away. It resolves
-      // {needsConfirm} when a remote URL doesn't look like an Omnigent server —
-      // pass that back so the step can warn and let the user proceed anyway. A
-      // rejection (e.g. main-side normalizeUrl rejects an input the renderer
-      // accepted) is surfaced as {error} so the step can show it, rather than
-      // a click that silently does nothing.
+      // the server's SPA takes over and this page goes away. A rejection (e.g.
+      // main-side normalizeUrl rejects an input the renderer accepted) is
+      // surfaced as {error} so the step can show it, rather than a click that
+      // silently does nothing.
       const bridge = setupBridge();
       if (!bridge) return { error: "The desktop shell is unavailable." };
       try {
-        const result = (await bridge.setServerUrl(url, force ? { force: true } : undefined)) as
-          { needsConfirm?: boolean } | undefined;
-        return { needsConfirm: result?.needsConfirm === true };
+        await bridge.setServerUrl(url);
+        return {};
       } catch (e) {
         return { error: e instanceof Error ? e.message : "Could not connect to that server." };
       }

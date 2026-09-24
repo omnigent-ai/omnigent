@@ -22,12 +22,10 @@ import { ServerHeroIcons, ServerSelectStep } from "@/pages/onboarding/ServerSele
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
 /**
- * Outcome of a connect attempt. `needsConfirm` → the URL doesn't look like an
- * Omnigent server (re-try with force); `error` → the connect was rejected and
- * the message should be shown; neither → navigation is underway.
+ * Outcome of a connect attempt. `error` → the connect was rejected and the
+ * message should be shown; otherwise navigation is underway.
  */
 export interface ConnectResult {
-  needsConfirm?: boolean;
   error?: string;
 }
 
@@ -51,11 +49,10 @@ export interface ServerSelectorV2Setup {
    *  the mocked local-server flow) instead of the no-op connect, so the install
    *  screen is reachable from every path. Never set by the real shell. */
   mockInstall?: boolean;
-  /** Persist + navigate to a server URL. Resolves `{needsConfirm}` when the URL
-   *  doesn't look like an Omnigent server (call again with force), or `{error}`
-   *  when the connect was rejected — so the step can show it rather than
-   *  silently doing nothing. Navigation on success replaces this page. */
-  onConnect: (url: string, force?: boolean) => Promise<ConnectResult>;
+  /** Persist + navigate to a server URL. Resolves `{error}` when the connect
+   *  was rejected — so the step can show it rather than silently doing nothing.
+   *  Navigation on success replaces this page. */
+  onConnect: (url: string) => Promise<ConnectResult>;
   /** Start (or reuse) the local server, then connect to it. Resolves the
    *  outcome so the terminal step can show ready/failed (on success the window
    *  navigates away, so it resolves only on failure in practice). */
@@ -121,15 +118,15 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
 
   // A server pick (list Join / preset detail): install-then-connect when the CLI
   // is missing (route via terminal), else connect straight away. Resolves the
-  // ConnectResult so the list can still show needsConfirm/error when connecting
+  // ConnectResult so the list can still show a connect error when connecting
   // directly.
-  const connect = async (url: string, force?: boolean): Promise<ConnectResult> => {
+  const connect = async (url: string): Promise<ConnectResult> => {
     if (needsInstall) {
       setTerminalTarget({ kind: "connect", url });
       setStep("terminal");
       return {};
     }
-    return setup.onConnect(url, force);
+    return setup.onConnect(url);
   };
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
@@ -230,11 +227,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
                 ? async () => {
                     const url = terminalTarget.url;
                     const result = await setup.onConnect(url);
-                    // Success navigates the window away; a rejection/confirm
-                    // surfaces as an error here (the detail/list confirm UI is
-                    // bypassed once we're mid-install).
-                    if (result.needsConfirm)
-                      return { ok: false, error: "This server needs confirmation to connect." };
+                    // Success navigates the window away; a rejection surfaces as
+                    // an error here.
                     return { ok: result.error === undefined, error: result.error };
                   }
                 : setup.onStartLocal

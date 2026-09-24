@@ -141,9 +141,8 @@ export function ServerSelectStep({
    *  swap the panel band (hero icons) for it. */
   onAddModeChange?: (addMode: boolean) => void;
   onBack: () => void;
-  /** Connect to a URL; resolves `{needsConfirm}` (call again with force) or
-   *  `{error}` to show, else navigation is underway. */
-  onConnect: (url: string, force?: boolean) => Promise<ConnectResult>;
+  /** Connect to a URL; resolves `{error}` to show, else navigation is underway. */
+  onConnect: (url: string) => Promise<ConnectResult>;
   /** Remove a recent server from the list, if the shell supports it. */
   onRemove?: (url: string) => void;
   /** Copy text to the clipboard (native shell bridge — file:// blocks navigator.clipboard). */
@@ -167,9 +166,6 @@ export function ServerSelectStep({
     error && initialUrl && initialUrl !== DEFAULT_LOCAL ? initialUrl : "",
   );
   const [invalid, setInvalid] = useState(false);
-  // The URL the shell flagged as "doesn't look like Omnigent" — a second
-  // connect on the same URL proceeds (force); editing the input clears it.
-  const [unconfirmedUrl, setUnconfirmedUrl] = useState<string | null>(null);
   // Message from a rejected connect, so a failed Join shows something.
   const [connectError, setConnectError] = useState<string | null>(null);
   // Advisory per-server reachability status (added servers only).
@@ -198,7 +194,6 @@ export function ServerSelectStep({
 
   const clearInputState = () => {
     setInvalid(false);
-    setUnconfirmedUrl(null);
     setConnectError(null);
   };
 
@@ -229,13 +224,11 @@ export function ServerSelectStep({
       .catch(() => setChecks((prev) => ({ ...prev, [url]: "unreachable" })));
   };
 
-  // Connect to the selected server. Second click on an unconfirmed URL forces.
+  // Connect to the selected server.
   const join = async () => {
     if (selected === null) return;
     setConnectError(null);
-    const force = unconfirmedUrl === selected;
-    const result = await onConnect(selected, force);
-    setUnconfirmedUrl(result.needsConfirm ? selected : null);
+    const result = await onConnect(selected);
     setConnectError(result.error ?? null);
   };
 
@@ -355,21 +348,14 @@ export function ServerSelectStep({
         <OnboardingHeading>Join your team</OnboardingHeading>
       </div>
 
-      {(error || invalid || unconfirmedUrl || connectError) && (
+      {(error || invalid || connectError) && (
         <div role="alert" className="mb-2 text-base text-destructive">
           {invalid ? (
             "Enter a valid http(s) server URL."
-          ) : connectError ? (
-            <>
-              <span className="font-medium">Couldn&apos;t connect to the server: </span>
-              {connectError}
-            </>
-          ) : unconfirmedUrl ? (
-            "This doesn't look like an Omnigent server. Click Join again to connect anyway."
           ) : (
             <>
               <span className="font-medium">Couldn&apos;t connect to the server: </span>
-              {error}
+              {connectError ?? error}
             </>
           )}
         </div>
