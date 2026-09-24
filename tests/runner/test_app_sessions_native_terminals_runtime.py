@@ -11,6 +11,7 @@ import shutil
 import threading
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -2679,9 +2680,12 @@ async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_st
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initial_auth_status", [None, 401, 403])
 async def test_cold_start_agy_conversation_waits_for_model_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    initial_auth_status: int | None,
 ) -> None:
     """StartCascade runs only after models appear and the settling delay passes."""
     import omnigent.harnesses.antigravity_native.rpc as rpc_mod
@@ -2718,6 +2722,12 @@ async def test_cold_start_agy_conversation_waits_for_model_readiness(
 
     def _models(port: int) -> dict[str, object]:
         events.append(("models", port))
+        if initial_auth_status is not None and len(events) == 1:
+            next(catalogs)
+            response = httpx.Response(
+                initial_auth_status, request=httpx.Request("GET", "http://localhost/models")
+            )
+            response.raise_for_status()
         return next(catalogs)
 
     monkeypatch.setattr(rpc_mod, "get_available_models", _models)
@@ -2751,12 +2761,32 @@ async def test_cold_start_agy_conversation_waits_for_model_readiness(
         ("sleep", 4.0),
     ]
     assert events[-1] == ("start", (52548, result))
+    assert not any(
+        record.levelno >= logging.WARNING and "Antigravity cold-start:" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_results", "expected_auth_status"),
+    [
+        ([401, 401], 401),
+        ([403, 403], 403),
+        ([500, 500], None),
+        (["connection", "connection"], None),
+        (["timeout", "timeout"], None),
+        (["invalid_json", "invalid_json"], None),
+        (["empty", "empty"], None),
+        ([401, "empty"], None),
+    ],
+)
 async def test_cold_start_agy_conversation_model_timeout_keeps_placeholder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    probe_results: list[int | str],
+    expected_auth_status: int | None,
 ) -> None:
     """A bound RPC port without models never receives StartCascade."""
     import omnigent.harnesses.antigravity_native.rpc as rpc_mod
@@ -2779,7 +2809,37 @@ async def test_cold_start_agy_conversation_model_timeout_keeps_placeholder(
         "resolve_cold_start_agy_rpc_port",
         lambda *_args: 52548,
     )
-    monkeypatch.setattr(rpc_mod, "get_available_models", lambda _port: {"models": {}})
+    results = iter(probe_results)
+    calls: list[int] = []
+
+    def _models(port: int) -> dict[str, object]:
+        calls.append(port)
+        result = next(results)
+        if isinstance(result, int):
+            response = httpx.Response(
+                result,
+                request=httpx.Request("GET", "http://localhost/models?token=private-token"),
+                text="private-response-body",
+            )
+            response.raise_for_status()
+        if result == "connection":
+            raise httpx.ConnectError("private-connection-details")
+        if result == "timeout":
+            raise httpx.ReadTimeout("private-timeout-details")
+        if result == "invalid_json":
+            raise ValueError("private-invalid-body")
+        return {"models": {}}
+
+    monkeypatch.setattr(rpc_mod, "get_available_models", _models)
+    now = 0.0
+    monkeypatch.setattr(runner_app_mod, "time", SimpleNamespace(monotonic=lambda: now))
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal now
+        assert "Antigravity cold-start:" not in caplog.text
+        now += seconds
+
+    monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _sleep)
 
     def _unexpected_start(_port: int, _cascade_id: str) -> None:
         raise AssertionError("StartCascade must wait for a non-empty model catalog")
@@ -2789,13 +2849,25 @@ async def test_cold_start_agy_conversation_model_timeout_keeps_placeholder(
     result = await runner_app_mod._cold_start_agy_conversation(
         bridge_dir,
         session_id,
-        timeout_s=0.0,
+        timeout_s=runner_app_mod._AGY_COLD_START_PORT_POLL_INTERVAL_S,
     )
 
     assert result is None
     state = bridge_mod.read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == placeholder
+    assert calls == [52548, 52548]
+    warnings = [
+        r.getMessage() for r in caplog.records if "Antigravity cold-start:" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "private-" not in warnings[0]
+    if expected_auth_status is not None:
+        assert f"HTTP {expected_auth_status}" in warnings[0]
+        assert "authentication or authorization" in warnings[0]
+    else:
+        assert "authentication or authorization" not in warnings[0]
+        assert "did not expose a ready model catalog" in warnings[0]
 
 
 @pytest.mark.asyncio
