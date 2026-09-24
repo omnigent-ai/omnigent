@@ -73,7 +73,7 @@ executor:
     harness: claude-sdk
     permission_mode: bypassPermissions
 
-# The full operating procedure lives in AGENTS.md, read at startup.
+# AGENTS.md routes phases to bundled skills; detailed procedures load on demand.
 instructions: AGENTS.md
 
 # Grant sys_session_share authority to grant the __public__ sentinel (anonymous

@@ -174,7 +174,24 @@ is the review gate after the fact.
    (`ci_status`, `polly_review`, `ui_preview`, `validation_prompt`,
    `maintainer_review`).
 
-It does **not** merge. See `AGENTS.md` for the full operating procedure.
+It does **not** merge. [AGENTS.md](AGENTS.md) contains the role, mode selection,
+essential constraints, and completion contract. Detailed procedures live in
+[skills/](skills/) and load only for the current phase:
+
+| Phase | Skill |
+| --- | --- |
+| Input, preflight, and existing-fix discovery | `resolve-inputs` (mode-specific resources) |
+| Inherited repro and behavioral baseline | `resolve-repro-audit` |
+| Final diff, consumers, focused checks, and evidence | `resolve-impact-assessment` |
+| Author or review | `resolve-author-fix` / `resolve-review-pr` |
+| Commit and selected publication mode | `resolve-publish` |
+| Open PR: CI, Polly, preview, and human validation | `resolve-drive-pr` (substep resources) |
+| Complete output contract | `resolve-handoff` |
+
+The CLI transports these files with the agent bundle. They need not exist in
+the target checkout. Claude loads them through its native Skill tool; other
+tool paths use `load_skill` and `read_skill_file`. The main prompt lists the
+required phase order without expanding all the procedures at startup.
 
 ### Change-impact assessment
 

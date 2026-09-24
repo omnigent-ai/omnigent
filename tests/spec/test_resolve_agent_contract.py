@@ -7,9 +7,45 @@ from omnigent.spec import load
 _RESOLVE_AGENT = Path(__file__).resolve().parents[2] / "dev" / "resolve-agent"
 
 
+def _resolve_procedures() -> str:
+    spec = load(_RESOLVE_AGENT)
+    skills = {skill.name: skill.content for skill in spec.skills}
+
+    def resource(skill: str, name: str) -> str:
+        return (_RESOLVE_AGENT / "skills" / skill / name).read_text(encoding="utf-8")
+
+    return "\n".join(
+        [
+            build_instructions(spec, None, []),
+            skills["resolve-inputs"],
+            resource("resolve-inputs", "review-remediation.md"),
+            resource("resolve-inputs", "ticket-only.md"),
+            resource("resolve-inputs", "reproduction.md"),
+            skills["resolve-impact-assessment"],
+            skills["resolve-repro-audit"],
+            resource("resolve-inputs", "existing-fix.md"),
+            skills["resolve-review-pr"],
+            skills["resolve-author-fix"],
+            skills["resolve-publish"],
+            skills["resolve-drive-pr"],
+            *(
+                resource("resolve-drive-pr", name)
+                for name in (
+                    "preview.md",
+                    "ci.md",
+                    "polly.md",
+                    "validation-prompt.md",
+                    "final-review.md",
+                )
+            ),
+            skills["resolve-handoff"],
+        ]
+    )
+
+
 def test_resolve_agent_delegates_independent_review_to_polly() -> None:
     spec = load(_RESOLVE_AGENT)
-    instructions = (_RESOLVE_AGENT / "AGENTS.md").read_text(encoding="utf-8")
+    instructions = _resolve_procedures()
 
     assert spec.spawn is False
     assert "cross_review" not in instructions
@@ -17,7 +53,7 @@ def test_resolve_agent_delegates_independent_review_to_polly() -> None:
 
 
 def test_resolve_agent_bounds_local_validation() -> None:
-    instructions = (_RESOLVE_AGENT / "AGENTS.md").read_text(encoding="utf-8")
+    instructions = _resolve_procedures()
     normalized = " ".join(instructions.split())
 
     assert "Run the directly affected test modules and the focused checks" in normalized
@@ -33,7 +69,7 @@ def test_resolve_agent_stages_the_ci_bundle_inside_the_worktree() -> None:
     /tmp or $RUNNER_TEMP errors every file-tool read and forces shell
     fallbacks; the instructions must point the download inside the worktree.
     """
-    instructions = (_RESOLVE_AGENT / "AGENTS.md").read_text(encoding="utf-8")
+    instructions = _resolve_procedures()
     normalized = " ".join(instructions.split())
 
     assert ".omnigent/repro-bundle" in normalized
@@ -42,7 +78,7 @@ def test_resolve_agent_stages_the_ci_bundle_inside_the_worktree() -> None:
 
 
 def _normalized_resolve_instructions() -> str:
-    text = build_instructions(load(_RESOLVE_AGENT), None, [])
+    text = _resolve_procedures()
     return " ".join(text.split())
 
 
@@ -101,8 +137,8 @@ def test_impact_assessment_requires_current_boundary_evidence_before_fixed() -> 
         assert requirement in assessment
 
 
-def test_loaded_handoff_example_includes_impact_assessment_and_remaining_work() -> None:
-    instructions = build_instructions(load(_RESOLVE_AGENT), None, [])
+def test_handoff_skill_includes_impact_assessment_and_remaining_work() -> None:
+    instructions = _resolve_procedures()
     output = instructions.split("## Output —", 1)[1]
     handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
     assessment = handoff["impact_assessment"]
@@ -125,7 +161,7 @@ def test_loaded_handoff_example_includes_impact_assessment_and_remaining_work() 
     assert "shared impact assessment has no unresolved required checks" in fields
 
 
-def test_repro_audit_precedes_author_and_reviewer_paths_in_loaded_prompt() -> None:
+def test_repro_audit_precedes_author_and_reviewer_procedures() -> None:
     instructions = _normalized_resolve_instructions()
     assert instructions.index("## Shared repro audit") < instructions.index("## Step 1")
     assert instructions.index("## Step 1") < instructions.index("## Step 2A")
