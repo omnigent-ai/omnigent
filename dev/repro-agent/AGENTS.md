@@ -563,6 +563,12 @@ Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
+- End the clip on the product's visible outcome, and caption only what the
+  footage shows. When the outcome is an assistant reply to a marker prompt, the
+  user's own bubble echoes the marker, so a page-wide text check passes before
+  any reply renders: scope the wait to the assistant's message and wait for the
+  working indicator to clear before stopping. Never cite such a vacuous check
+  as proof the reply arrived.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.

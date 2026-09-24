@@ -783,6 +783,14 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
   assertions, debug logs, or test source.
+- End the clip on the corrected outcome actually rendering, and check the
+  caption against the footage before declaring it. When the outcome is an
+  assistant reply to a marker prompt, the user's own bubble echoes the marker,
+  so a page-wide text check passes before any reply renders: scope the reply
+  check to the assistant's message and wait for the working indicator to clear
+  before stopping the recording. A reply that is not visible in the clip means
+  the recording attempt failed — re-record, or caption the clip to what it
+  shows; never cite the vacuous check as proof the answer arrived.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.
