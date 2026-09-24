@@ -1636,8 +1636,7 @@ describe("right-click context menu", () => {
       clientX: 20,
       clientY: 100,
     });
-    // The production browser follows pointerup with touchend; dnd-kit's
-    // TouchSensor detaches from that native touch event.
+    // Mirror the browser's touchend after pointerup.
     fireEvent.touchEnd(link, { touches: [] });
 
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
@@ -1646,10 +1645,7 @@ describe("right-click context menu", () => {
   });
 
   it("ends an active drag on a pointer-only release (no touch events)", () => {
-    // In a Pointer-Events-only environment the release emits only pointerup —
-    // no touchend. A TouchSensor-based drag sensor never saw it, so dnd-kit
-    // stayed active forever: row dimmed, later drags blocked. The sensor now
-    // ends on the document's pointerup.
+    // A pointer-only release must end the drag; TouchSensor misses it.
     vi.useFakeTimers();
     try {
       mocks.anyCoarse = true;
@@ -1952,18 +1948,14 @@ function expectNothingCommitted() {
 }
 
 describe("touch swipe actions", () => {
-  // jsdom has no real touch, so drive the gesture with pointer events. The row
-  // handlers gate on a primary, non-mouse pointer (see useRowSwipe); default
-  // jsdom PointerEvents omit those, so set them explicitly. A swipe is a
-  // down → horizontal move past the commit threshold → up on the row's <li>.
+  // jsdom needs primary touch pointer events; its defaults omit these fields.
   const POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
 
   beforeEach(() => {
     mocks.anyCoarse = true;
   });
 
-  // Drag the row and hold at `dx`, so a test can inspect the reveal mid-gesture.
-  // `release` finishes it, carrying the same dx the drag ended on.
+  // Keep the row mid-swipe so tests can inspect the reveal before release.
   function pointerEventAt(
     type: "pointerDown" | "pointerMove" | "pointerUp",
     target: Element,
@@ -2161,11 +2153,8 @@ describe("touch swipe actions", () => {
   });
 
   it("lets a click through once the suppression window elapses (AT activation)", () => {
-    // An assistive-technology activation dispatches ONLY a click — no pointer
-    // events, no keydown, and (unlike a real swipe release) no browser
-    // trailing click before it to consume the armed flag. It arrives on a
-    // human timescale, long after the gesture, and must not be consumed as
-    // the swipe's "trailing" click: the suppression is time-bounded.
+    // An assistive-technology click may arrive after the swipe's suppression
+    // window, without a preceding pointer event; it must still navigate.
     renderSidebar();
     vi.useFakeTimers();
     try {
@@ -2206,17 +2195,9 @@ describe("touch swipe actions", () => {
   });
 
   it("claims the horizontal touch axis only while a swipe action is configured", () => {
-    // A single configured direction cedes only the INERT direction to the
-    // browser: Chrome samples touch-action at pointerdown, so offering the
-    // actionable pan would let native panning cancel the swipe mid-stream.
-    // CSS pan directions name the scroll direction (reverse of finger travel):
-    // a left action fires on a leftward finger = a rightward pan, so pan-left
-    // is the inert grant for it.
-    //
-    // Assert the effective touch-action VALUE, not class names: Tailwind's
-    // touch-pan-* utilities all set the same property and don't compose, so a
-    // "touch-pan-y touch-pan-left" class pair never reached the browser as
-    // `pan-y pan-left` — the composed value must be a single inline style.
+    // Chrome samples touch-action at pointerdown, so only an inert swipe
+    // direction can pan. CSS pan directions oppose finger travel.
+    // Check the computed value: Tailwind touch-pan-* utilities do not compose.
     const touchAction = () => getComputedStyle(li()).touchAction;
     const first = renderSidebar();
     const li = conversationRow;

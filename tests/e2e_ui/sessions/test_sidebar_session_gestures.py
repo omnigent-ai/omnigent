@@ -1,8 +1,6 @@
-"""Browser e2e coverage for touch gestures on draggable session rows.
+"""Chromium touch journeys for session-row swipe, menu, scroll, and drag.
 
-The sidebar uses dnd-kit for touch dragging and Radix for its context menu.
-These tests drive Chromium through CDP so the page receives a genuine touch
-sequence; synthetic pointer events do not arm dnd-kit's ``TouchSensor``.
+CDP input exercises the browser's pointer, touch, and synthesized-click events.
 """
 
 from __future__ import annotations
