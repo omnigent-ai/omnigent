@@ -370,6 +370,7 @@ export function FolderTree({
   isSearching = false,
   isSearchError = false,
   searchError = null,
+  searchTruncated = false,
   browseLocation = "",
   onNavigateDir,
   onExitSearch,
@@ -403,6 +404,11 @@ export function FolderTree({
   isSearchError?: boolean;
   /** Error from a failed search request. */
   searchError?: Error | null;
+  /**
+   * True when the server stopped scanning before covering the workspace, so
+   * a miss is not proof of absence and the results must say so.
+   */
+  searchTruncated?: boolean;
   /**
    * Absolute path currently browsed, or "" for the workspace root. Lazy
    * directory expansion resolves node paths against it.
@@ -628,6 +634,7 @@ export function FolderTree({
       return (
         <p className="px-2 py-1 text-muted-foreground text-sm">
           No files match "{searchQuery.trim()}"
+          {searchTruncated && " — the search stopped early, so results may be incomplete"}
         </p>
       );
     }
@@ -648,6 +655,7 @@ export function FolderTree({
           >
             Show hidden files
           </button>
+          {searchTruncated && " Search stopped early — results may be incomplete."}
         </p>
       );
     }
@@ -674,6 +682,11 @@ export function FolderTree({
             />
           ))}
         </ul>
+        {searchTruncated && (
+          <p className="px-2 py-1 text-muted-foreground text-xs">
+            Search stopped early — results may be incomplete.
+          </p>
+        )}
       </TooltipProvider>
     );
   }

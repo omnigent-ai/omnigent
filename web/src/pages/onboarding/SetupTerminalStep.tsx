@@ -73,7 +73,7 @@ export function SetupTerminalStep({
         : "Starting Omnigent";
 
   return (
-    <div className="flex h-full flex-col px-2 pb-1 pt-1">
+    <div className="flex h-full flex-col px-2 pb-1 pt-4">
       <div className="mb-2 text-sm font-medium text-foreground">{phaseLabel}</div>
       <div className="mb-3 h-[6px] w-full overflow-hidden rounded-full bg-foreground/[0.06]">
         <div

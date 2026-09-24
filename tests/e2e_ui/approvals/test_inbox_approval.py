@@ -11,16 +11,10 @@ count drops to zero, so it falls out of the inbox).
 Driven by the same ``approval_session`` fixture as the in-chat card test;
 real LLM → nightly + generous timeout.
 
-The second test
-(:func:`test_reparked_elicitation_reliably_resurfaces_in_inbox`) covers
-omnigent#927: when a hook retry re-parks the *same* elicitation id after the
-user already approved it, the inbox card must drop its stale optimistic
-verdict and resurface as an actionable pending card — not stay frozen on
-"Approved" with no buttons. It drives the real claude-native permission hook
-(``POST /v1/sessions/{id}/hooks/permission-request``) so the re-park is a
-genuine server round-trip, and repeats the approve→re-park cycle with
-randomized timing to walk the 4s websocket rescan window the bug raced
-against.
+The second test verifies approval reuse through the real permission hook:
+identical retries receive the saved verdict without another inbox card, while
+a different command reusing the same elicitation id requires fresh approval.
+
 """
 
 from __future__ import annotations
@@ -41,7 +35,7 @@ _APPROVAL_CARD = '[data-testid="approval-card"]'
 _INBOX_ITEM = '[data-testid="inbox-item"]'
 _AGENT_TURN_TIMEOUT_MS = 120_000
 
-# Re-park stress knobs (test_reparked_elicitation_reliably_resurfaces_in_inbox).
+# Re-park stress knobs (test_reused_elicitation_id_requires_approval_only_for_new_request).
 # Several cycles, each with a randomized re-park delay, so the regression is
 # exercised across the rescan window rather than at one lucky interleaving.
 _REPARK_CYCLES = 3
@@ -74,7 +68,7 @@ def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) ->
     raise AssertionError("condition not met within timeout")
 
 
-def _permission_hook_payload(elicitation_id: str) -> dict:
+def _permission_hook_payload(elicitation_id: str, command: str) -> dict:
     """Build a Claude PermissionRequest hook body that pins a stable id.
 
     Mirrors the ``omnigent claude`` wrapper's hook subprocess: the
@@ -84,6 +78,7 @@ def _permission_hook_payload(elicitation_id: str) -> dict:
     Approve/Reject ``ApprovalCard`` (not a form / plan / question card).
 
     :param elicitation_id: ``elicit_claude_`` + 32 hex chars.
+    :param command: The command whose approval is requested.
     :returns: JSON-serializable PermissionRequest payload.
     """
     return {
@@ -93,7 +88,7 @@ def _permission_hook_payload(elicitation_id: str) -> dict:
         "permission_mode": "default",
         "hook_event_name": "PermissionRequest",
         "tool_name": "Bash",
-        "tool_input": {"command": "git push origin main"},
+        "tool_input": {"command": command},
         "tool_use_id": "tool_use_e2e",
         "_omnigent_elicitation_id": elicitation_id,
     }
@@ -104,6 +99,7 @@ def _park_permission_hook(
     session_id: str,
     elicitation_id: str,
     sink: dict,
+    command: str,
 ) -> None:
     """Long-poll the permission hook in a worker thread; stash the verdict.
 
@@ -119,11 +115,12 @@ def _park_permission_hook(
     :param elicitation_id: Stable id to (re-)park.
     :param sink: Mutable dict; gets ``"resp"`` (httpx.Response) or
         ``"error"`` (Exception).
+    :param command: The command whose approval is requested.
     """
     try:
         sink["resp"] = httpx.post(
             f"{base_url}/v1/sessions/{session_id}/hooks/permission-request",
-            json=_permission_hook_payload(elicitation_id),
+            json=_permission_hook_payload(elicitation_id, command),
             timeout=120.0,
         )
     except Exception as exc:
@@ -175,6 +172,9 @@ def _park_in_thread(
     session_id: str,
     elicitation_id: str,
     workers: list[threading.Thread],
+    *,
+    command: str = "git push origin main",
+    expect_pending: bool = True,
 ) -> dict:
     """Start a hook long-poll for *elicitation_id* and wait until it parks.
 
@@ -182,19 +182,22 @@ def _park_in_thread(
     :param session_id: Owning session id.
     :param elicitation_id: Stable id to (re-)park.
     :param workers: Thread registry the test drains on teardown.
+    :param command: The command whose approval is requested.
+    :param expect_pending: Wait for a new card; false for an already-approved retry.
     :returns: The sink dict the worker writes its verdict/error into; it also
         carries the worker thread under ``"thread"`` for the later join.
     """
     sink: dict = {}
     worker = threading.Thread(
         target=_park_permission_hook,
-        args=(base_url, session_id, elicitation_id, sink),
+        args=(base_url, session_id, elicitation_id, sink, command),
         daemon=True,
     )
     sink["thread"] = worker
     workers.append(worker)
     worker.start()
-    _wait_for(partial(_is_parked, base_url, session_id, elicitation_id), timeout_s=30.0)
+    if expect_pending:
+        _wait_for(partial(_is_parked, base_url, session_id, elicitation_id), timeout_s=30.0)
     return sink
 
 
@@ -251,43 +254,15 @@ def test_pending_approval_surfaces_and_resolves_in_inbox(
 
 @pytest.mark.nightly
 @pytest.mark.timeout(600)
-def test_reparked_elicitation_reliably_resurfaces_in_inbox(
+def test_reused_elicitation_id_requires_approval_only_for_new_request(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A re-parked, already-approved elicitation resurfaces as an actionable card.
+    """Identical retries reuse approval; a changed request with the same id resurfaces.
 
-    Regression for omnigent#927. When the user approves an inbox approval, the
-    page flips it to "Approved" optimistically (``responded`` keyed by
-    elicitation id). When a hook retry later re-parks the SAME id (the server
-    re-parks after its disconnect/grace window), the session snapshot lists it
-    as pending again — but the stale ``responded`` entry pinned the card to
-    "Approved" with no buttons, leaving a headless sub-agent invisibly blocked.
-    The fix sweeps verdicts whose id is pending again whenever a snapshot
-    refresh lands (``dataUpdatedAt`` advances).
-
-    Recreated end to end against the live server: one elicitation id is parked,
-    approved in a real browser, then re-parked again and again through the real
-    claude-native permission hook (``POST .../hooks/permission-request``) — the
-    omnigent#927 shape of a single prompt whose hook keeps re-parking the same
-    id. Each retry must bring the card back as a *pending* card
-    (``data-state="pending"`` with an Approve button), never a frozen
-    "Approved" one. Several retries with randomized delays prove the resurface
-    is robust, not a one-off interleaving.
-
-    Timing note: each retry is issued only after the inbox has observed the
-    approval drain the count to zero (card gone) plus one ``_WS_RESCAN_S``
-    window, so the session-list socket registers the drop before the bump —
-    exactly the real flow where the retry arrives seconds later. Issuing it
-    inside a single rescan tick is a *separate* coalescing gap (the socket
-    never reports the bounce, and the row's ``updated_at`` does not move on a
-    re-park) that this fix does not address; this test stays on the path the
-    fix governs.
-
-    No real LLM: the hook endpoint parks elicitations directly, which is also
-    the only way to deterministically re-park the *same* id (a model-driven
-    gate mints a fresh id per call). Nightly + generous timeout to match the
-    other live-server UI suites.
+    Keep the inbox mounted so its optimistic verdict cache survives. A changed
+    command must render a pending card with an Approve button despite sharing
+    its id with the previously approved request.
     """
     base_url, session_id = seeded_session
 
@@ -297,10 +272,10 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
     page.goto(f"{base_url}/inbox")
     expect(page.get_by_text("Nothing waiting on you")).to_be_visible(timeout=_REPARK_TIMEOUT_MS)
 
-    # A single elicitation id, re-parked repeatedly — the omnigent#927 scenario
-    # is one prompt whose hook keeps re-parking the SAME id after each approval.
+    # Reuse one harness id for both retries and later, different requests.
     eid = f"elicit_claude_{secrets.token_hex(16)}"
     rng = random.Random()
+    command = "git push origin main"
     workers: list[threading.Thread] = []
     try:
         # Initial park + approve: surfaces the card and sets the optimistic
@@ -313,15 +288,9 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
         _settle_after_drain(page, base_url, session_id, rng)
 
         for cycle in range(_REPARK_CYCLES):
-            # A hook retry re-parks the SAME id.
-            sink = _park_in_thread(base_url, session_id, eid, workers)
-
-            # ── REGRESSION: the re-parked prompt must be actionable again. ──
-            # The card returns either way; the bug is its STATE. Pre-fix the
-            # stale verdict freezes it at data-state="responded" with no
-            # buttons (the data-state assertion below times out); post-fix the
-            # snapshot refresh sweeps the verdict and it reverts to pending with
-            # Approve restored.
+            # A different command must not inherit the saved approval for this id.
+            command = f"git push origin review-branch-{cycle}"
+            sink = _park_in_thread(base_url, session_id, eid, workers, command=command)
             resurfaced = page.locator(_APPROVAL_CARD)
             expect(resurfaced).to_have_count(1, timeout=_REPARK_TIMEOUT_MS)
             expect(resurfaced).to_have_attribute(
@@ -329,11 +298,17 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
             )
             expect(resurfaced.get_by_role("button", name="Approve", exact=True)).to_be_visible()
 
-            # Approve again (re-arming the stale verdict), then settle so the
-            # next retry is a clean 0→1 diff the socket won't coalesce.
+            # Resolve the new request, then wait for the inbox count to drain.
             resurfaced.get_by_role("button", name="Approve", exact=True).click()
             _assert_allow(sink, f"re-park {cycle}")
             _settle_after_drain(page, base_url, session_id, rng)
+
+        retry = _park_in_thread(
+            base_url, session_id, eid, workers, command=command, expect_pending=False
+        )
+        _assert_allow(retry, "identical retry")
+        assert not _pending_elicitations(base_url, session_id)
+        expect(page.locator(_APPROVAL_CARD)).to_have_count(0)
     finally:
         # Release any still-parked long-poll so its worker thread exits even if
         # an assertion above failed mid-cycle (e.g. the regression timed out

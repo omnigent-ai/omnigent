@@ -68,6 +68,75 @@ final class ManagedConfigurationTests: XCTestCase {
     XCTAssertEqual(try decode(["serverUrls": entries]).serverURLs.count, entries.count)
   }
 
+  // MARK: Databricks-internal features
+
+  func testInternalFeaturesDefaultToDisabled() throws {
+    XCTAssertFalse(try decode([:]).databricksInternalFeaturesEnabled)
+    XCTAssertFalse(
+      try decode(["serverUrls": ["https://corp.example.com"]]).databricksInternalFeaturesEnabled)
+  }
+
+  func testInternalFeaturesAcceptBooleansWithoutPresetServers() throws {
+    for enabled in [true, false] {
+      let config = try decode(["databricksInternalFeaturesEnabled": enabled])
+      XCTAssertEqual(config.databricksInternalFeaturesEnabled, enabled)
+      XCTAssertTrue(config.serverURLs.isEmpty)
+    }
+  }
+
+  func testMalformedInternalFeaturesFlagFailsClosedWithoutDroppingServers() throws {
+    for value: Any in ["true", "false", "1", 1, 0, [true], ["enabled": true]] {
+      let config = try decode([
+        "serverUrls": ["https://corp.example.com"],
+        "databricksInternalFeaturesEnabled": value,
+      ])
+      XCTAssertFalse(config.databricksInternalFeaturesEnabled, "Unexpected opt-in for \(value)")
+      XCTAssertEqual(config.serverURLs.count, 1)
+    }
+  }
+
+  func testLegacyInternalFeaturesFlagUpdatesAndCanBeRemoved() {
+    let defaults = makeDefaults()
+    let key = OmnigentManagedConfiguration.legacyDefaultsKey
+    for value: Any in [true, false, "true", 1] {
+      defaults.set(["databricksInternalFeaturesEnabled": value], forKey: key)
+      let config = OmnigentManagedConfiguration.read(legacyFrom: defaults)
+      XCTAssertEqual(config.databricksInternalFeaturesEnabled, (value as? Bool) == true)
+    }
+    defaults.removeObject(forKey: key)
+    XCTAssertFalse(
+      OmnigentManagedConfiguration.read(legacyFrom: defaults).databricksInternalFeaturesEnabled)
+  }
+
+  func testDeclarativeDisabledOrOmittedFlagOverridesLegacyEnabledFlag() throws {
+    let legacy = try decode(["databricksInternalFeaturesEnabled": true])
+    for declarative in [
+      try decode([:]),
+      try decode(["databricksInternalFeaturesEnabled": false]),
+      try decode(["databricksInternalFeaturesEnabled": "true"]),
+    ] {
+      XCTAssertFalse(
+        OmnigentManagedConfiguration.resolve(declarative: declarative, legacy: legacy)
+          .databricksInternalFeaturesEnabled)
+    }
+  }
+
+  func testFlagOnlyDeclarativeConfigurationWinsWhileKeepingServerFallback() throws {
+    let declarative = try decode(["databricksInternalFeaturesEnabled": true])
+    let legacy = try decode(["serverUrls": ["https://corp.example.com"]])
+    let resolved = OmnigentManagedConfiguration.resolve(declarative: declarative, legacy: legacy)
+    XCTAssertTrue(resolved.databricksInternalFeaturesEnabled)
+    XCTAssertEqual(resolved.serverURLs, legacy.serverURLs)
+  }
+
+  func testInternalFeaturesFallBackToLegacyOnlyWhenDeclarativeIsAbsent() throws {
+    let legacy = try decode(["databricksInternalFeaturesEnabled": true])
+    XCTAssertTrue(
+      OmnigentManagedConfiguration.resolve(declarative: nil, legacy: legacy)
+        .databricksInternalFeaturesEnabled)
+    XCTAssertEqual(OmnigentManagedConfiguration.resolve(declarative: nil, legacy: .empty), .empty)
+  }
+
   // MARK: Rejected configurations
   //
   // Each case must surface OUR documented code, because that code is what the

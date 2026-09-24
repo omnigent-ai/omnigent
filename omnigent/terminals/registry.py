@@ -101,6 +101,17 @@ class TerminalListEntry:
     instance: TerminalInstance
 
 
+class TerminalExitedDuringLaunch(RuntimeError):
+    """Retain a dead launch's captured evidence after its private server is closed."""
+
+    def __init__(self, instance: TerminalInstance) -> None:
+        self.instance = instance
+        super().__init__(
+            f"terminal {instance.name}:{instance.session_key} exited before it became available "
+            f"(exit status {instance.last_exit_status()})"
+        )
+
+
 class TerminalRegistry:
     """The single registry of per-conversation tmux terminal instances.
 
@@ -238,9 +249,7 @@ class TerminalRegistry:
                     session_key,
                     conversation_id,
                 )
-            raise RuntimeError(
-                f"terminal {terminal_name}:{session_key} exited before it became available"
-            )
+            raise TerminalExitedDuringLaunch(created.instance)
 
         with self._lock:
             slot = self._by_conversation.setdefault(conversation_id, {})

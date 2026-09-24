@@ -19,8 +19,9 @@ from omnigent.entities.environment_filesystem import FilesystemPathNotFound
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests.runner.helpers import NullServerClient
 
 
@@ -723,11 +724,18 @@ async def test_filesystem_session_without_agent_id_returns_typed_404(
 
 
 @pytest.mark.asyncio
-async def test_filesystem_missing_session_agent_returns_typed_404(
+async def test_filesystem_missing_session_agent_returns_typed_410(
     registry: SessionResourceRegistry,
 ) -> None:
     """
-    Missing session agent spec returns a typed 404.
+    Missing session agent spec returns a typed 410 ``session_agent_missing``.
+
+    A session that still references an ``agent_id`` whose bundle no longer
+    resolves is a session-lifecycle condition (the agent was deleted or
+    rebound), not a plain ``not_found``. The shared session spec resolver
+    raises ``SESSION_AGENT_MISSING`` (HTTP 410 Gone), so every endpoint that
+    lets the resolver error propagate — including this filesystem read —
+    reports 410 rather than 404: retrying cannot recreate the deleted agent.
 
     :param registry: Registry with a real caller-process environment.
     """
@@ -774,9 +782,9 @@ async def test_filesystem_missing_session_agent_returns_typed_404(
             f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt"
         )
 
-    assert resp.status_code == 404
+    assert resp.status_code == 410
     body = resp.json()
-    assert body["error"]["code"] == "not_found"
+    assert body["error"]["code"] == "session_agent_missing"
     assert body["error"]["message"] == (
         "session spec resolver: agent 'ag_missing' for session 'conv_test' was not found"
     )
@@ -2035,3 +2043,347 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
         assert "error" in resp.json()
     finally:
         locked.chmod(0o700)
+
+
+def _git_runner_client(
+    ws: Path, session_id: str, *, runner_workspace: Path | None = None
+) -> httpx.AsyncClient:
+    """Runner app serving *ws* as the session's environment, for the search tests.
+
+    :param ws: The session environment's working tree.
+    :param session_id: Session to register the OS environment under.
+    :param runner_workspace: The runner's own workspace; defaults to *ws*.
+    :returns: An httpx client bound to the runner app.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+    reg = SessionResourceRegistry()
+    reg._primary_envs[session_id] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=runner_workspace if runner_workspace is not None else ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://runner")
+
+
+@pytest.mark.asyncio
+async def test_search_finds_tracked_files_past_the_scan_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported failure: a repo far larger than the walk budget, so the walk
+    quit in the first directories and the panel said the file did not exist.
+    Tracked files must come from git's index whatever the budget; untracked
+    ones ride on the Changed tab's ``git status`` once it has run; and the
+    walk keeps running regardless, because ignored files live nowhere else."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "target.jsonnet").write_text("y")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_git/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_git") as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        # No git status has run yet, so untracked coverage is still the walk's
+        # — and the walk ran out of budget in aaa/.
+        assert body["truncated"] is True
+
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search", params={"q": "zzz"})
+        body = resp.json()
+        assert [(e["path"], e["type"]) for e in body["data"]] == [
+            ("zzz", "directory"),
+            ("zzz/scratch.txt", "file"),
+            ("zzz/target.jsonnet", "file"),
+        ], body
+        # The walk still ran (only it can find ignored files) and still ran out
+        # of budget in aaa/, so the answer stays flagged as possibly incomplete.
+        assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``.git`` sorts first and in a clone holds more entries than the whole
+    budget; the walk used to spend all of it there and miss every real file."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "zz.txt").write_text("x")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+
+    entries, truncated = await fs.search_files("zz")
+
+    assert [e.path for e in entries] == ["zz.txt"]
+    assert truncated is False
+
+
+@pytest.mark.asyncio
+async def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Path) -> None:
+    """Ignored files are in neither git's index nor ``git status``, so only the
+    walk can find them — it must keep running once a status snapshot exists."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / ".gitignore").write_text("build/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "build").mkdir()
+    (ws / "build" / "out.log").write_text("ignored")
+    base = f"/v1/sessions/conv_ignored/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_ignored") as client:
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search", params={"q": "out.log"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["build/out.log"], body
+        assert body["truncated"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX filesystem root")
+@pytest.mark.asyncio
+async def test_search_from_filesystem_root_keeps_paths_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Browsing ``/`` is allowed for an unconfined environment. The walk builds
+    result paths by slicing off the root, and a root of ``/`` already ends in
+    the separator — slicing one more character used to turn ``etc`` into ``tc``."""
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 60)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+
+    entries, _truncated = await fs.search_files("etc", path="/")
+
+    paths = [e.path for e in entries]
+    assert "etc" in paths, paths
+    assert all((Path("/") / p).exists() for p in paths), paths
+
+
+def _seed_budget_busting_repo(ws: Path, *, commit: bool = True) -> None:
+    """Fill *ws* so an alphabetical walk exhausts a small budget before ``zzz/``.
+
+    :param ws: Directory to seed.
+    :param commit: Whether to also ``git init`` + commit the tree.
+    """
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "target.jsonnet").write_text("y")
+    if commit:
+        env = _git_env()
+        subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_indexes_the_walked_workspace_not_the_runners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner-managed session searches its own generated workspace, which is
+    neither the session's stored workspace nor the runner's. The index consulted
+    must belong to the walked tree, or tracked files past the walk budget stay
+    unfindable there while the runner's registry answers for the wrong files."""
+    ws = tmp_path / "session-ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws)
+    runner_ws = tmp_path / "runner-ws"
+    runner_ws.mkdir()
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_env_ws/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_env_ws", runner_workspace=runner_ws) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_picks_up_a_repo_created_mid_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that becomes a git repository after its first search (an
+    agent cloning into it) must gain index coverage on the next search rather
+    than staying pinned to the walk-only answer — and since the agent made that
+    repository, search must never start a registry on it (startup probes the
+    repository with git, which would run its ``core.fsmonitor`` here)."""
+    ws = tmp_path / "session-ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws, commit=False)
+    runner_ws = tmp_path / "runner-ws"
+    runner_ws.mkdir()
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_late_git/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_late_git", runner_workspace=runner_ws) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert body["data"] == [], body
+        assert body["truncated"] is True
+
+        env = _git_env()
+        subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+        )
+
+        def forbid_start(self: GitFilesystemRegistry) -> None:
+            raise AssertionError("search must not start a registry on an agent-created repo")
+
+        monkeypatch.setattr(GitFilesystemRegistry, "start", forbid_start)
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        assert body["truncated"] is True
+
+
+def test_search_indexed_paths_never_describes_a_symlink(tmp_path: Path) -> None:
+    """Index paths are stat'ed in the unsandboxed runner, so a symlink — as the
+    leaf or as any parent, wherever it points, and even if swapped mid-search —
+    must never be followed: the sandboxed walk is the only thing that describes
+    links. Regular files beneath real directories are described as before."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-link").symlink_to(outside / "b.txt")
+    (root / "a").symlink_to(outside)
+    (root / "real").mkdir()
+    (root / "real" / "b.md").write_text("md")
+    (root / "b-docs").symlink_to(root / "real")
+
+    entries = search_indexed_paths(root, ["b-link", "a/b.txt", "b-docs", "real/b.md"], "b")
+
+    assert [(e.path, e.type, e.bytes) for e in entries] == [("real/b.md", "file", 2)]
+
+
+@pytest.mark.asyncio
+async def test_search_follows_a_repository_created_inside_an_outer_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that starts inside an outer repository and later becomes its
+    own must be searched through its own index — the outer index never lists a
+    nested repository's files — so the cached registry has to be replaced when
+    the repository boundary moves."""
+    env = _git_env()
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "init"], cwd=outer, check=True, capture_output=True, env=env)
+    ws = outer / "ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws, commit=False)
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_nested/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_nested", runner_workspace=outer) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        assert resp.json()["data"] == [], resp.json()
+
+        for args in (["init"], ["add", "-A"], ["commit", "-m", "init"]):
+            subprocess.run(["git", *args], cwd=ws, check=True, capture_output=True, env=env)
+
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        assert [e["path"] for e in resp.json()["data"]] == ["zzz/target.jsonnet"], resp.json()
+
+
+@pytest.mark.asyncio
+async def test_search_keeps_a_tracked_directory_symlink_a_folder(tmp_path: Path) -> None:
+    """A tracked symlink to an in-workspace directory must come back as a
+    folder row. The index leaves symlinks to the sandboxed walk, whose
+    classification is the one shown; describing them from the index once
+    turned this reveal into a broken file open."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "real").mkdir()
+    (ws / "real" / "x.txt").write_text("x")
+    (ws / "docs").symlink_to(ws / "real")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    base = f"/v1/sessions/conv_dirlink/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_dirlink") as client:
+        resp = await client.get(f"{base}/search", params={"q": "docs"})
+        body = resp.json()
+
+    assert [(e["path"], e["type"]) for e in body["data"]] == [("docs", "directory")], body
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_reaches_snapshot_files_past_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inside a nested scope, an untracked file the scoped walk cannot reach
+    must still come from the Changed tab's snapshot, re-rooted at the scope.
+    (On Windows the scope arrives with native separators while snapshot paths
+    are normalized to '/'; the two must be compared alike.)"""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    filler = ws / "src" / "app" / "aaa"
+    filler.mkdir(parents=True)
+    for i in range(60):
+        (filler / f"f{i:02d}.txt").write_text("x")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "src" / "app" / "zzz").mkdir()
+    (ws / "src" / "app" / "zzz" / "new.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_scoped/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_scoped") as client:
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search/src/app", params={"q": "new"})
+        body = resp.json()
+
+    assert [e["path"] for e in body["data"]] == ["zzz/new.txt"], body
+    assert body["truncated"] is True

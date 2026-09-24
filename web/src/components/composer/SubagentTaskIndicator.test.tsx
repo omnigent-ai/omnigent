@@ -1,0 +1,155 @@
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+import { SubagentTaskIndicator } from "./SubagentTaskIndicator";
+
+const useChildSessionsMock = vi.fn();
+vi.mock("@/hooks/useChildSessions", () => ({
+  useChildSessions: (conversationId: string | null) => useChildSessionsMock(conversationId),
+}));
+
+function child(overrides: Partial<ChildSessionInfo>): ChildSessionInfo {
+  return {
+    id: overrides.id ?? "child-1",
+    title: overrides.title ?? null,
+    task_summary: overrides.task_summary ?? null,
+    tool: overrides.tool ?? null,
+    session_name: overrides.session_name ?? null,
+    labels: overrides.labels ?? {},
+    current_task_status: overrides.current_task_status ?? null,
+    last_task_error: overrides.last_task_error ?? null,
+    busy: overrides.busy ?? false,
+    last_message_preview: overrides.last_message_preview ?? null,
+    pending_elicitations_count: overrides.pending_elicitations_count ?? 0,
+    routed_model: overrides.routed_model ?? null,
+  };
+}
+
+function setChildren(children: ChildSessionInfo[]) {
+  useChildSessionsMock.mockReturnValue({ children, isLoading: false, error: null });
+}
+
+function renderIndicator(conversationId: string | null = "conv-1", route = "/") {
+  return render(
+    <MemoryRouter initialEntries={[route]}>
+      <SubagentTaskIndicator conversationId={conversationId} />
+    </MemoryRouter>,
+  );
+}
+
+beforeEach(() => setChildren([]));
+afterEach(() => {
+  cleanup();
+  useChildSessionsMock.mockReset();
+});
+
+describe("SubagentTaskIndicator", () => {
+  it("self-hides without requiring a router", () => {
+    const { container } = render(<SubagentTaskIndicator conversationId={null} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing without a conversation", () => {
+    const { container } = renderIndicator(null);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing when every sub-agent is settled", () => {
+    setChildren([child({ id: "done", current_task_status: "completed" })]);
+    const { container } = renderIndicator();
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("counts direct children needing attention while excluding settled rows", () => {
+    setChildren([
+      child({ id: "working", busy: true }),
+      child({ id: "parked", busy: true, pending_elicitations_count: 1 }),
+      child({
+        id: "disconnected",
+        current_task_status: "failed",
+        last_task_error: { code: "runner_disconnected", message: "Runner tunnel dropped" },
+      }),
+      child({ id: "failed", current_task_status: "failed" }),
+      child({ id: "done", current_task_status: "completed" }),
+    ]);
+    renderIndicator();
+
+    const pill = screen.getByTestId("subagent-task-pill");
+    expect(pill).toHaveTextContent("4");
+    expect(pill).toHaveClass("px-1", "md:px-2", "font-normal", "tabular-nums", "text-destructive");
+    expect(pill).toHaveAttribute("data-state", "error");
+    expect(pill).toHaveAccessibleName(
+      "4 sub-agents: 1 active, 1 awaiting input, 1 disconnected, 1 needs attention",
+    );
+    expect(pill.querySelector("svg")).toHaveAttribute("stroke-width", "1.5");
+    expect(useChildSessionsMock).toHaveBeenCalledWith("conv-1");
+  });
+
+  it("shows state labels and honest navigation targets in the popover", () => {
+    setChildren([
+      child({ id: "working", busy: true, task_summary: "Investigate auth", tool: "researcher" }),
+      child({ id: "parked", pending_elicitations_count: 1, session_name: "docs" }),
+      child({
+        id: "failed",
+        current_task_status: "failed",
+        last_task_error: { code: "tool_error", message: "Tool failed" },
+        title: "Review failure",
+      }),
+    ]);
+    renderIndicator(
+      "conv-1",
+      "/c/conv-1?file=README.md&diff=1&comment=c1&view=changed&message=msg-1&debug=1",
+    );
+    fireEvent.click(screen.getByTestId("subagent-task-pill"));
+
+    const workingStatus = screen
+      .getAllByRole("status")
+      .find((status) => status.textContent === "Working");
+    expect(workingStatus).toBeDefined();
+    expect(workingStatus).toHaveTextContent("Working");
+    expect(workingStatus?.querySelector('[aria-hidden="true"]')).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("status").some((status) => status.textContent === "Needs response"),
+    ).toBe(true);
+    expect(screen.getAllByRole("status").some((status) => status.textContent === "Failed")).toBe(
+      true,
+    );
+    expect(
+      screen.getByRole("link", { name: /Investigate auth.*Working.*researcher/ }),
+    ).toHaveAttribute("href", "/c/working?debug=1");
+  });
+
+  it("renders disconnected sub-agents as a quiet non-destructive state", () => {
+    setChildren([
+      child({
+        id: "disconnected",
+        current_task_status: "failed",
+        last_task_error: { code: "runner_disconnected", message: "Runner tunnel dropped" },
+      }),
+    ]);
+    renderIndicator();
+
+    const pill = screen.getByTestId("subagent-task-pill");
+    expect(pill).toHaveAttribute("data-state", "quiet");
+    expect(pill).not.toHaveClass("text-destructive", "text-warning");
+    expect(pill).toHaveAccessibleName("1 sub-agent: 1 disconnected");
+
+    fireEvent.click(pill);
+    const disconnectedStatus = screen
+      .getAllByRole("status")
+      .find((status) => status.textContent === "Disconnected");
+    expect(disconnectedStatus).toHaveClass("text-muted-foreground");
+    expect(screen.getByRole("link", { name: /Sub-agent.*Disconnected/ })).toBeInTheDocument();
+  });
+
+  it("uses the parked trigger treatment when no child has an error", () => {
+    setChildren([child({ id: "parked", busy: true, pending_elicitations_count: 1 })]);
+    renderIndicator();
+    const pill = screen.getByTestId("subagent-task-pill");
+    expect(pill).toHaveAttribute("data-state", "parked");
+    expect(pill).toHaveClass("text-warning");
+    expect(pill).toHaveAccessibleName("1 sub-agent: 1 awaiting input");
+  });
+});

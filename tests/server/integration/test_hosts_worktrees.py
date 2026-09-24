@@ -181,19 +181,30 @@ async def wt_setup(
             await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
+@pytest.mark.parametrize("legacy_provider", [False, True])
 async def test_list_worktrees_returns_data(
+    legacy_provider: bool,
     wt_setup: tuple[FastAPI, HostRegistry, ApplicationCommunicator, dict[str, dict[str, Any]]],
 ) -> None:
     """The endpoint returns ``{"object": "list", "data": [...]}`` from the host."""
     app, _reg, _comm, replies = wt_setup
     replies["/Users/corey/repo"] = {
         "worktrees": [
-            {"path": "/Users/corey/repo", "branch": "main", "is_main": True, "detached": False},
+            {
+                "path": "/Users/corey/repo",
+                "branch": "main",
+                "is_main": True,
+                "detached": False,
+                **({"remote_provider": "github"} if legacy_provider else {}),
+                "updated_at": 1_700_000_000,
+            },
             {
                 "path": "/Users/corey/repo-worktrees/feature-x",
                 "branch": "feature/x",
                 "is_main": False,
                 "detached": False,
+                **({"remote_provider": "github"} if legacy_provider else {}),
+                "updated_at": 1_700_000_100,
             },
         ],
     }
@@ -208,6 +219,35 @@ async def test_list_worktrees_returns_data(
     branches = [w["branch"] for w in payload["data"]]
     assert branches == ["main", "feature/x"]
     assert payload["data"][1]["is_main"] is False
+    assert payload["data"] == replies["/Users/corey/repo"]["worktrees"]
+    assert [worktree["updated_at"] for worktree in payload["data"]] == [
+        1_700_000_000,
+        1_700_000_100,
+    ]
+
+
+async def test_list_worktrees_passes_through_legacy_entries_without_metadata(
+    wt_setup: tuple[FastAPI, HostRegistry, ApplicationCommunicator, dict[str, dict[str, Any]]],
+) -> None:
+    """An older host response remains valid without optional metadata."""
+    app, _reg, _comm, replies = wt_setup
+    replies["/Users/corey/legacy"] = {
+        "worktrees": [
+            {
+                "path": "/Users/corey/legacy",
+                "branch": "main",
+                "is_main": True,
+                "detached": False,
+            }
+        ],
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/worktrees",
+            params={"path": "/Users/corey/legacy"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == replies["/Users/corey/legacy"]["worktrees"]
 
 
 async def test_list_worktrees_non_git_path_400(

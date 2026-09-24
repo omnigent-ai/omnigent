@@ -5,6 +5,7 @@ import {
   harnessCredentialAdoptFamilies,
   harnessCredentialFamily,
   harnessInstallableOnHost,
+  harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   resolveSetupSteps,
@@ -115,7 +116,7 @@ describe("harnessUnavailableReasonOnHost", () => {
     );
   });
 
-  it("returns null when ready, unknown, or no host", () => {
+  it("returns null when ready or no host", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: true }))).toBe(null);
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future" }))).toBe(
       "unconfigured",
@@ -123,12 +124,100 @@ describe("harnessUnavailableReasonOnHost", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith(null))).toBe(null);
     expect(harnessUnavailableReasonOnHost(null, hostWith({ codex: false }))).toBe(null);
   });
+
+  it("treats a missing key on a readiness-reporting host as unconfigured", () => {
+    // Version skew: a host predating a harness reports the harnesses it knows but
+    // omits the new one. It can't launch what it never lists, so a missing key on
+    // a non-empty map is unconfigured — not silently "available". Regression for
+    // jcode showing on a pre-jcode host that only reports devin/grok.
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith({ devin: false, grok: false }))).toBe(
+      "unconfigured",
+    );
+    // An absent or empty map still fails open (readiness genuinely unknown), so a
+    // host that reports nothing is never emptied out.
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith(null))).toBe(null);
+    expect(harnessUnavailableReasonOnHost("jcode", hostWith({}))).toBe(null);
+  });
+
+  it("never treats the Smart Routing auto sentinel as unconfigured", () => {
+    // "auto" is a client-only sentinel — the daemon never reports a readiness key
+    // for it, so the missing-key branch must not sweep it in (else Smart Routing
+    // gets a spurious "needs setup" badge and is hidden under the toggle).
+    expect(harnessUnavailableReasonOnHost("auto", hostWith({ codex: false }))).toBe(null);
+  });
 });
 
 describe("harnessUnconfiguredOnHost", () => {
   it("is true exactly when there's an unavailable reason", () => {
     expect(harnessUnconfiguredOnHost("codex", hostWith({ codex: false }))).toBe(true);
     expect(harnessUnconfiguredOnHost("codex", hostWith({ codex: true }))).toBe(false);
+  });
+});
+
+describe("harnessReadinessOnHost", () => {
+  it("keeps ready and legacy-unknown harnesses selectable", () => {
+    expect(harnessReadinessOnHost("codex-native", hostWith({ "codex-native": true }))).toEqual({
+      state: "available",
+      reason: "ready",
+      selectable: true,
+      fallbackRelevant: false,
+      explanation: null,
+    });
+    expect(harnessReadinessOnHost("codex-native", hostWith(null))).toMatchObject({
+      state: "available",
+      reason: "readiness-unknown",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+  });
+
+  it("separates setup-required from broken conditions", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "needs-auth" })),
+    ).toMatchObject({
+      state: "setup-required",
+      reason: "needs-auth",
+      selectable: false,
+      fallbackRelevant: true,
+    });
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "version-too-low" })),
+    ).toMatchObject({
+      state: "broken",
+      reason: "version-too-low",
+      selectable: false,
+      fallbackRelevant: true,
+    });
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "probe-failed" })),
+    ).toMatchObject({
+      state: "broken",
+      reason: "readiness-error",
+    });
+  });
+
+  it("marks host-wide unavailability as irrelevant to harness fallback", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", {
+        ...hostWith({ "codex-native": true }),
+        status: "offline",
+      }),
+    ).toMatchObject({
+      state: "unavailable",
+      reason: "host-unavailable",
+      selectable: false,
+      fallbackRelevant: false,
+    });
+  });
+
+  it("provides explanation copy for disabled selection", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "binary-missing" }))
+        .explanation,
+    ).toEqual({
+      label: "Harness is not installed",
+      description: "Install this harness on the selected host before using it.",
+    });
   });
 });
 
