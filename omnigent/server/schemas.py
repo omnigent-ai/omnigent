@@ -34,6 +34,8 @@ from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
 
+McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
+
 
 class PaginatedList(BaseModel):
     """
@@ -1522,6 +1524,7 @@ class _SessionCreateRequestBase(BaseModel):
     agent_id: Any
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
@@ -1722,6 +1725,8 @@ class SessionCreateMetadata(BaseModel):
     """
 
     inference_configuration_revision: str | None = None
+
+    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None

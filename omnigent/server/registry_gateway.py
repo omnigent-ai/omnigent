@@ -9,7 +9,7 @@ from fastapi import Request
 
 from omnigent.entities import Conversation
 from omnigent.server.auth import RESERVED_USER_LOCAL, local_single_user_enabled
-from omnigent.server.mcp_registry import McpRegistry
+from omnigent.server.mcp_registry import McpRegistry, McpUpstreamError
 from omnigent.server.routes.connections_base import ConnectionError
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 
@@ -82,6 +82,16 @@ async def execute_registry_tool(
             result.isError,
         )
         return {"result": {"output": output}, "isError": result.isError}
+    except McpUpstreamError as exc:
+        _logger.warning(
+            "Registry MCP call failed service=%s tool=%s session=%s failure=%s http_status=%s",
+            config.name,
+            name,
+            conv.id,
+            exc.kind,
+            exc.status_code,
+        )
+        return {"error": {"code": -32000, "message": str(exc)}}
     except ConnectionError as exc:
         return {"error": {"code": -32000, "message": str(exc)}}
     except Exception:  # noqa: BLE001 — do not expose upstream exception details

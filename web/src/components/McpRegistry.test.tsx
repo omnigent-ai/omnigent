@@ -46,7 +46,7 @@ describe("MCP account connections", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
     expect(await screen.findByRole("status")).toHaveTextContent(
-      "Connection works. Tools: read_ticket",
+      "Tool discovery succeeded. Tools: read_ticket. Individual calls may require additional permissions.",
     );
   });
 

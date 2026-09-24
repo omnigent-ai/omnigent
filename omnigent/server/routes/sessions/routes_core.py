@@ -961,6 +961,16 @@ def register_core_routes(
             )
 
         bundle_bytes = await bundle.read()
+        if parsed_metadata.mcp_registry_services:
+            from omnigent.server.routes.session_mcp_servers import prepare_registry_launch_bundle
+
+            bundle_bytes = await asyncio.to_thread(
+                prepare_registry_launch_bundle,
+                request,
+                bundle_bytes,
+                parsed_metadata.mcp_registry_services,
+                user_id,
+            )
         # Validate the bundle BEFORE any row exists: the external-host
         # branch below needs the spec's os_env.cwd for workspace
         # validation, and _create_session_from_bundle reuses the parsed

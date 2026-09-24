@@ -9358,13 +9358,29 @@ async def _create_session_from_existing_agent(
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
 
-    # Workspace validation: if the caller is binding to a host,
-    # they must also pass a workspace, and the workspace must
-    # satisfy the agent's os_env.cwd boundary on that host (per
-    # designs/SESSION_WORKSPACE_SELECTION.md). Done before
-    # create_conversation so a bad workspace never produces a row.
-    # With git worktree creation, the validated path is the source
-    # repo; the worktree it produces becomes the stored workspace.
+    registry_bundle: bytes | None = None
+    if body.mcp_registry_services:
+        from omnigent.server.routes.session_mcp_servers import prepare_registry_launch_bundle
+
+        if body.sub_agent_name:
+            raise OmnigentError(
+                "Named sub-agents use their authored MCP services",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if artifact_store is None:
+            raise OmnigentError("Artifact store unavailable", code=ErrorCode.INTERNAL_ERROR)
+        source_bundle = await asyncio.to_thread(artifact_store.get, agent.bundle_location)
+        if source_bundle is None:
+            raise OmnigentError("Agent bundle not found", code=ErrorCode.INTERNAL_ERROR)
+        registry_bundle = await asyncio.to_thread(
+            prepare_registry_launch_bundle,
+            request,
+            source_bundle,
+            body.mcp_registry_services,
+            user_id,
+        )
+
+    # Validate the host workspace before creating a session or worktree.
     canonical_workspace: str | None = body.workspace
     if body.host_id is not None:
         canonical_workspace = await _validate_session_workspace(
@@ -9546,26 +9562,78 @@ async def _create_session_from_existing_agent(
             }
         )
         with creation_stage("create_persistence_ms"):
-            conv = conversation_store.create_conversation(
-                agent_id=agent.id,
-                title=body.title,
-                parent_conversation_id=body.parent_session_id,
-                runner_id=inherited_runner_id,
-                kind="sub_agent" if body.parent_session_id else "default",
-                sub_agent_name=body.sub_agent_name,
-                host_id=body.host_id,
-                workspace=canonical_workspace,
-                git_branch=git_branch,
-                terminal_launch_args=validated_launch_args,
-                project_id=project_resolution.project_id,
-                labels=initial_labels or None,
-                model_override=model_override,
-                reasoning_effort=reasoning_effort,
-                cost_control_mode_override=cost_control_mode_override,
-                subagent_routing_override=subagent_routing_override,
-                harness_override=harness_override,
-                **snapshot_kwargs,
-            )
+            if registry_bundle is not None:
+                assert artifact_store is not None
+                # Reuse session+agent persistence, including hosted store overrides.
+                created = await asyncio.to_thread(
+                    _create_session_from_bundle,
+                    conversation_store,
+                    artifact_store,
+                    SessionCreateMetadata(
+                        title=body.title,
+                        labels=initial_labels,
+                        parent_session_id=body.parent_session_id,
+                        host_id=body.host_id,
+                        workspace=canonical_workspace,
+                        terminal_launch_args=validated_launch_args,
+                        project_id=project_resolution.project_id,
+                        reasoning_effort=reasoning_effort,
+                    ),
+                    registry_bundle,
+                    runner_id=inherited_runner_id,
+                    inference_snapshot=inference_snapshot,
+                    inference_model=model_override,
+                    created_by=user_id,
+                )
+                conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, created.session_id
+                )
+                agent = await asyncio.to_thread(agent_store.get, created.agent_id)
+                assert conv is not None and agent is not None
+                if any(
+                    value is not None
+                    for value in (
+                        cost_control_mode_override,
+                        subagent_routing_override,
+                        harness_override,
+                    )
+                ):
+                    conv = await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        conv.id,
+                        cost_control_mode_override=cost_control_mode_override,
+                        subagent_routing_override=subagent_routing_override,
+                        harness_override=harness_override,
+                    )
+                if git_branch is not None:
+                    assert body.host_id is not None
+                    conv = await asyncio.to_thread(
+                        conversation_store.set_host_id,
+                        conv.id,
+                        body.host_id,
+                        git_branch=git_branch,
+                    )
+            else:
+                conv = conversation_store.create_conversation(
+                    agent_id=agent.id,
+                    title=body.title,
+                    parent_conversation_id=body.parent_session_id,
+                    runner_id=inherited_runner_id,
+                    kind="sub_agent" if body.parent_session_id else "default",
+                    sub_agent_name=body.sub_agent_name,
+                    host_id=body.host_id,
+                    workspace=canonical_workspace,
+                    git_branch=git_branch,
+                    terminal_launch_args=validated_launch_args,
+                    project_id=project_resolution.project_id,
+                    labels=initial_labels or None,
+                    model_override=model_override,
+                    reasoning_effort=reasoning_effort,
+                    cost_control_mode_override=cost_control_mode_override,
+                    subagent_routing_override=subagent_routing_override,
+                    harness_override=harness_override,
+                    **snapshot_kwargs,
+                )
     except NameAlreadyExistsError as exc:
         if (
             created_worktree_path is not None

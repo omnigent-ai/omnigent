@@ -740,6 +740,7 @@ export async function createBundledSession(
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
+    mcp_registry_services?: string[];
   } = {},
 ): Promise<{ id: string }> {
   const form = new FormData();

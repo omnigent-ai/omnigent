@@ -21,7 +21,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -35,7 +35,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app
-from omnigent.spec.types import AgentSpec, ToolsConfig
+from omnigent.spec.types import AgentSpec, MCPServerConfig, ToolsConfig
 from omnigent.terminals import TerminalListEntry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -1085,6 +1085,85 @@ async def _reset_state(client: httpx.AsyncClient, session_id: str) -> None:
     """
     resp = await client.post(f"/v1/sessions/{session_id}/reset-state")
     assert resp.status_code == 200, f"reset-state failed: {resp.text}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["registry", "http"])
+@pytest.mark.parametrize("unavailable", [False, True])
+async def test_native_relay_discovers_session_mcp_tools_through_gateway(
+    tmp_path: Path,
+    transport: Literal["registry", "http"],
+    unavailable: bool,
+) -> None:
+    """Native relays advertise gateway schemas and withdraw them on agent changes."""
+    requests: list[str] = []
+
+    class GatewayClient(_SwitchableServerClient):
+        """Return external tool schemas only through the session gateway."""
+
+        async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            """Simulate discovery success or a temporary gateway outage."""
+            if kwargs.get("json", {}).get("method") != "tools/list":
+                return self._Response({})
+            requests.append(url)
+            if unavailable:
+                raise httpx.ConnectError("gateway unavailable")
+            return self._Response(
+                {
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "github__get_me",
+                                "description": "Read the connected profile",
+                                "inputSchema": {"type": "object", "properties": {}},
+                            }
+                        ]
+                    }
+                }
+            )
+
+    server_client = GatewayClient("with-mcp")
+    spec = AgentSpec(
+        spec_version=1,
+        mcp_servers=[
+            MCPServerConfig(
+                name="github",
+                transport=transport,
+                url="https://mcp.example.com" if transport == "http" else None,
+            )
+        ],
+    )
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {"with-mcp": spec, "without-mcp": _spec_without_terminals()},
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                await _launch_bridged(client, session_id)
+                names = _relay_tool_names(relay_file)
+                assert ("github__get_me" in names) is not unavailable
+                assert "list_comments" in names
+                assert requests == [f"/v1/sessions/{session_id}/mcp"]
+
+                await _launch_bridged(client, session_id)
+                assert len(requests) == 1
+
+                server_client.agent_id = "without-mcp"
+                await _reset_state(client, session_id)
+                await _launch_bridged(client, session_id)
+                assert "github__get_me" not in _relay_tool_names(relay_file)
+                assert len(requests) == 1
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio

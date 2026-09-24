@@ -278,9 +278,12 @@ async def test_create_with_invalid_base_branch_fails_400(
     assert "base branch does not exist" in body["error"]["message"]
 
 
+@pytest.mark.parametrize("select_registry", [False, True])
 async def test_create_with_existing_worktree_persists_without_creating(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
+    app: FastAPI,
+    select_registry: bool,
 ) -> None:
     """Starting in an existing worktree persists its branch, creates nothing.
 
@@ -291,6 +294,23 @@ async def test_create_with_existing_worktree_persists_without_creating(
     """
     cap = register_worktree_host()
     agent = await create_test_agent(client, name="wt-existing-agent")
+    if select_registry:
+        from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+
+        app.state.mcp_registry = McpRegistry(
+            McpRegistryConfig(
+                services=[
+                    McpService(
+                        id="tracker",
+                        title="Tracker",
+                        url="https://example.test/mcp",
+                        auth="none",
+                        tools=["read_ticket"],
+                    )
+                ]
+            ),
+            None,
+        )
 
     resp = await client.post(
         "/v1/sessions",
@@ -299,6 +319,7 @@ async def test_create_with_existing_worktree_persists_without_creating(
             "host_id": _HOST_ID,
             "workspace": _SOURCE_REPO,
             "git": {"branch_name": "feature/existing", "existing_worktree": True},
+            **({"mcp_registry_services": ["tracker"]} if select_registry else {}),
         },
     )
     assert resp.status_code == 201, resp.text
@@ -311,6 +332,10 @@ async def test_create_with_existing_worktree_persists_without_creating(
     body = resp.json()
     assert body["git_branch"] == "feature/existing"
     assert body["workspace"] == _SOURCE_REPO
+    if select_registry:
+        assert body["agent_id"] != agent["id"]
+        selected = await client.get(f"/v1/sessions/{body['id']}/agent")
+        assert selected.json()["mcp_servers"][0]["name"] == "tracker"
 
 
 async def test_create_with_invalid_existing_worktree_branch_fails_400(

@@ -432,6 +432,49 @@ def _write_new_mcp_server(root: Path, body: UpsertMCPServerRequest) -> None:
     path.write_text(yaml.safe_dump(_body_to_file_yaml(body, {}), sort_keys=False))
 
 
+def prepare_registry_launch_bundle(
+    request: Request,
+    bundle_bytes: bytes,
+    service_ids: list[str],
+    user_id: str | None,
+) -> bytes:
+    """Add authorized catalog references without changing the shared source agent."""
+    if not service_ids:
+        return bundle_bytes
+    for service_id in service_ids:
+        _require_registry_service(request, service_id, user_id)
+    spec = validate_agent_bundle(
+        bundle_bytes, enforce_handler_allowlist=not local_single_user_enabled()
+    )
+    existing = {server.name: server for server in spec.mcp_servers}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "agent"
+        extract_safe(bundle_bytes, root)
+        inline_path = _single_yaml_path(root)
+        inline_tools = _read_yaml_mapping(inline_path).get("tools", {}) if inline_path else {}
+        for service_id in dict.fromkeys(service_ids):
+            if service_id in existing:
+                if existing[service_id].transport == "registry":
+                    # Preserve authored tool restrictions on existing references.
+                    continue
+                raise OmnigentError(
+                    f"MCP server {service_id!r} already uses a custom transport",
+                    code=ErrorCode.CONFLICT,
+                )
+            if (isinstance(inline_tools, dict) and service_id in inline_tools) or (
+                root / "tools" / "mcp" / f"{service_id}.yaml"
+            ).exists():
+                raise OmnigentError(
+                    f"Tool declaration {service_id!r} already exists", code=ErrorCode.CONFLICT
+                )
+            _write_new_mcp_server(
+                root, UpsertMCPServerRequest(name=service_id, transport="registry")
+            )
+        result = _tar_gz_dir(root)
+    validate_agent_bundle(result, enforce_handler_allowlist=not local_single_user_enabled())
+    return result
+
+
 def _replace_mcp_server(
     location: _McpLocation,
     target_name: str,
