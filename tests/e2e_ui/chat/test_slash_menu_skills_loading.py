@@ -90,7 +90,9 @@ def test_open_slash_menu_resolves_skills_from_host(
             else [{"name": "code-review", "description": "Review the current change"}]
         }
     )
-    expect(page.get_by_text("Loading skills…", exact=True)).not_to_be_visible(timeout=3_000)
+    # No SSE/fallback race to out-wait here since the host-discovery unification
+    # (the menu settles directly from this fetch) — the repo default timeout applies.
+    expect(page.get_by_text("Loading skills…", exact=True)).not_to_be_visible()
     expect(composer).to_have_value("/review")
     if empty:
         expect(page.get_by_text("No matching skills", exact=True)).to_be_visible()
