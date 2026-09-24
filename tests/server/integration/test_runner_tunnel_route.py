@@ -1075,6 +1075,63 @@ async def test_event_ingest_does_not_block_tunnel_receive_loop() -> None:
             await comm.wait(timeout=budget(1.0))
 
 
+async def test_event_ingest_preserves_order_per_session() -> None:
+    route = _tunnel_route_app()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    entered: list[str] = []
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        entered.append(batch.id)
+        if batch.id == "first":
+            first_started.set()
+            await release_first.wait()
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        hello = HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[EVENT_INGEST_CAPABILITY],
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_frame(hello)})
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        for batch_id in ("first", "second"):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=batch_id,
+                            session_id="same-session",
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(first_started.wait(), timeout=budget(1.0))
+        await asyncio.sleep(0)
+        assert entered == ["first"]
+        release_first.set()
+        acks = [
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+            for _ in range(2)
+        ]
+        assert [ack.id for ack in acks if isinstance(ack, EventAckFrame)] == ["first", "second"]
+    finally:
+        release_first.set()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+
+
 # ── Managed-runner token mint endpoint (POST /v1/runners/{id}/token) ──
 
 

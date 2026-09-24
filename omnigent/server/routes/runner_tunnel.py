@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
 from typing import cast
@@ -715,19 +716,26 @@ async def _receive_loop(
     if slots is None:
         slots = asyncio.Semaphore(16)
         ws.app.state.runner_event_ingest_slots = slots
+    session_locks = getattr(ws.app.state, "runner_event_ingest_locks", None)
+    if session_locks is None:
+        session_locks = weakref.WeakValueDictionary()
+        ws.app.state.runner_event_ingest_locks = session_locks
     active: set[asyncio.Task[None]] = set()
 
     async def process(batch: EventBatchFrame) -> None:
         try:
             if registry.get(runner_id) is not session or not callable(ingest):
                 return
-            ack = await ingest(
-                app=ws.app,
-                headers=ws.headers,
-                owner=session.owner,
-                runner_id=runner_id,
-                batch=batch,
-            )
+            # A malicious/buggy runner may send multiple frames for the same
+            # session despite the client-side FIFO. Preserve apply order here.
+            async with session_locks.setdefault(batch.session_id, asyncio.Lock()):
+                ack = await ingest(
+                    app=ws.app,
+                    headers=ws.headers,
+                    owner=session.owner,
+                    runner_id=runner_id,
+                    batch=batch,
+                )
         except Exception:
             _logger.exception("Runner %s event ingestion failed", runner_id)
             ack = EventAckFrame(batch.id, 0, "ingest failed", retryable=True)
