@@ -51,16 +51,27 @@ def upgrade() -> None:
     harness column defaults to "__all__" for existing rows.
     """
     sqlite = _is_sqlite()
-    is_mysql = op.get_bind().dialect.name == "mysql"
+    dialect = op.get_bind().dialect.name
 
-    if is_mysql:
-        # MySQL: use raw DDL to avoid batch_alter_table complexities
+    if dialect == "mysql":
+        # MySQL: use raw DDL
         op.execute(
             sa.text(
                 "ALTER TABLE `user_daily_cost` "
                 "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__' AFTER day_utc, "
                 "DROP PRIMARY KEY, "
                 "ADD CONSTRAINT `pk_user_daily_cost` "
+                "PRIMARY KEY (workspace_id, user_id, day_utc, harness)"
+            )
+        )
+    elif dialect == "cockroachdb":
+        # CockroachDB: add column first, then rebuild PK
+        op.execute(
+            sa.text(
+                "ALTER TABLE user_daily_cost "
+                "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__', "
+                "DROP CONSTRAINT pk_user_daily_cost, "
+                "ADD CONSTRAINT pk_user_daily_cost "
                 "PRIMARY KEY (workspace_id, user_id, day_utc, harness)"
             )
         )
@@ -94,10 +105,10 @@ def downgrade() -> None:
     op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
 
     sqlite = _is_sqlite()
-    is_mysql = op.get_bind().dialect.name == "mysql"
+    dialect = op.get_bind().dialect.name
 
-    if is_mysql:
-        # MySQL: use raw DDL to avoid batch_alter_table complexities
+    if dialect == "mysql":
+        # MySQL: use raw DDL
         op.execute(
             sa.text(
                 "ALTER TABLE `user_daily_cost` "
@@ -105,6 +116,17 @@ def downgrade() -> None:
                 "DROP COLUMN harness, "
                 "ADD CONSTRAINT `pk_user_daily_cost` "
                 "PRIMARY KEY (workspace_id, user_id, day_utc)"
+            )
+        )
+    elif dialect == "cockroachdb":
+        # CockroachDB: use raw DDL to ensure table always has a PK
+        # Add new PK first, then drop column
+        op.execute(
+            sa.text(
+                "ALTER TABLE user_daily_cost "
+                "DROP CONSTRAINT pk_user_daily_cost, "
+                "ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc), "
+                "DROP COLUMN harness"
             )
         )
     else:
