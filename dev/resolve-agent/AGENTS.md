@@ -618,6 +618,17 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
      do **not** approve: that's self-approval of your own commits (branch
      protection rejects it anyway). Leave a `--comment` review and let a human
      approve.
+
+   Write the final review for someone scanning the PR timeline. Lead with a
+   plain-English verdict and next action, then use short bullets with labels
+   such as **Cause and fix**, **Verified**, and **Needs attention**. Aim for about
+   100 words when the fix is clean; name every blocking finding even if that
+   takes more space.
+   Say when a check was unavailable. Keep investigation history, branch
+   bookkeeping, and full test details in the handoff fields instead of copying
+   them into the review. In workflow-owned publication, put this exact Markdown
+   in `review_body`; the publisher adds the tested commit and its marker.
+
 6. **Then drive it to landable — go to Step 4.** Once you've kept the PR as the
    fix (the sound-PR default), it gets the **same landing treatment as a PR you
    authored**: `ui-preview`, green CI, a clean Polly review, a copy-paste
@@ -1543,6 +1554,7 @@ the message. Same discipline as repro-agent:
   "solution_summary": "The model picker now shows a friendly name for every model.",
   "root_cause": "picker rendered raw catalog IDs because format_label() was never called on the option list",
   "fix_summary": "call format_label() when building picker options in web/src/model/picker.tsx",
+  "review_body": "",
   "files_changed": ["web/src/model/picker.tsx"],
   "facets": [
     {"symptom": "picker display", "outcome": "fixed", "test_transition": "test_1234 failed: raw IDs shown → passes: friendly labels"},
@@ -1609,11 +1621,19 @@ Field meanings:
   Keep implementation symbols, filenames, commit/merge bookkeeping, test lists,
   and CI details out of both fields; those belong in the technical fields below.
   Include both fields even for review mode and no-change outcomes.
-- `root_cause` / `fix_summary` / `files_changed` — the cause and the change. In
+- `root_cause` / `fix_summary` / `files_changed` — the cause and the change.
   These are the technical details shown under **Additional notes** and used by
   publication/review fallbacks, so concrete symbols and filenames are welcome.
   In review mode, describe the reviewed PR's approach and leave `files_changed`
   empty (you changed nothing).
+- `review_body` — the PR-facing review text from Step 2A. Fill it in for
+  `reviewed_existing_pr`, including workflow-owned publication; use `""` in
+  other modes. State the verdict and reason first, then separate the proof and
+  any remaining action into short bullets. Do not paste `root_cause`,
+  `fix_summary`, `ci_status`, or `polly_review` wholesale. The workflow publisher
+  posts this field verbatim before adding the tested commit and marker, so it
+  must stand alone as a useful review. Encode paragraph and bullet breaks as
+  `\n` within the JSON string.
 - `facets` — per-facet, mirroring the recovered breakdown: each with its own
   `outcome` and a `test_transition` (the fail→pass proof, or why it was skipped).
 - `tests` — `e2e` is the (possibly rewritten) repro test path; `added` is the list

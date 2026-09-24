@@ -168,8 +168,9 @@ is the review gate after the fact.
    (`reviewed_existing_pr` / `authored_fix`), `outcome` (`fixed` /
    `partially_fixed` / `not_fixed` / `nothing_to_fix` / `needs_more_info`), the
    plain-English `problem_summary` and `solution_summary` used for the Linear
-   update, the per-facet fail→pass proof, the PR URL (opened or reviewed, or empty
-   until the workflow-owned publisher opens it), and the publication state
+   update, the per-facet fail→pass proof, the compact PR-facing `review_body` in
+   review mode, the PR URL (opened or reviewed, or empty until the workflow-owned
+   publisher opens it), and the publication state
    (`ci_status`, `polly_review`, `ui_preview`, `validation_prompt`,
    `maintainer_review`).
 
