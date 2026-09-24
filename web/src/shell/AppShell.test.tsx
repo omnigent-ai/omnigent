@@ -575,6 +575,9 @@ beforeEach(() => {
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
+    sessionConfigPhase: null,
+    sessionConfigError: null,
+    pendingModelChange: null,
   });
 });
 
@@ -894,6 +897,159 @@ describe("AppShell header", () => {
     renderShell("/c/conv_terminal");
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("shows model/effort recovery despite stale failed and offline state", () => {
+    mockConversations([
+      {
+        id: "conv_terminal",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" },
+      },
+    ]);
+    runnerHealthState.runnerOnline = false;
+    useChatStore.setState({
+      conversationId: "conv_terminal",
+      sessionStatus: "failed",
+      sessionConfigPhase: "starting",
+    });
+
+    renderShell("/c/conv_terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+    expect(useTerminalsMock).toHaveBeenCalledWith("conv_terminal", {
+      reconcileWhilePending: true,
+    });
+
+    act(() => useChatStore.setState({ sessionConfigPhase: "applying" }));
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+    expect(useTerminalsMock).toHaveBeenCalledWith("conv_terminal", {
+      reconcileWhilePending: true,
+    });
+
+    act(() => useChatStore.setState({ sessionConfigPhase: null, pendingModelChange: "sonnet" }));
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+    expect(useTerminalsMock).toHaveBeenCalledWith("conv_terminal", {
+      reconcileWhilePending: true,
+    });
+
+    act(() => useChatStore.setState({ pendingModelChange: null }));
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
+    expect(useTerminalsMock).toHaveBeenCalledWith("conv_terminal", {
+      reconcileWhilePending: false,
+    });
+  });
+
+  it("clears model/effort startup after recovery fails", () => {
+    mockConversations([
+      {
+        id: "conv_terminal",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" },
+      },
+    ]);
+    runnerHealthState.runnerOnline = false;
+    useChatStore.setState({
+      conversationId: "conv_terminal",
+      sessionStatus: "failed",
+      sessionConfigPhase: "starting",
+    });
+
+    renderShell("/c/conv_terminal");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+
+    act(() =>
+      useChatStore.setState({
+        sessionConfigPhase: null,
+        sessionConfigError: "Terminal failed to start",
+      }),
+    );
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
+    expect(useTerminalsMock).toHaveBeenCalledWith("conv_terminal", {
+      reconcileWhilePending: false,
+    });
+  });
+
+  it.each(["starting", "applying", "confirming"] as const)(
+    "does not show another conversation's %s model/effort operation",
+    (phase) => {
+      mockConversations([
+        {
+          id: "conv_stopped",
+          permission_level: null,
+          labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" },
+        },
+      ]);
+      runnerHealthState.runnerOnline = false;
+      useChatStore.setState({
+        conversationId: "conv_other",
+        sessionStatus: "failed",
+        sessionConfigPhase: phase === "confirming" ? null : phase,
+        pendingModelChange: phase === "confirming" ? "sonnet" : null,
+      });
+
+      renderShell("/c/conv_stopped");
+
+      expect(screen.getByTestId("view-probe")).toHaveAttribute(
+        "data-terminal-starting-up",
+        "false",
+      );
+      expect(useTerminalsMock).toHaveBeenCalledWith("conv_stopped", {
+        reconcileWhilePending: false,
+      });
+    },
+  );
+
+  it("stops showing model/effort startup once an agent terminal is available", () => {
+    mockConversations([
+      {
+        id: "conv_terminal",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" },
+      },
+    ]);
+    runnerHealthState.runnerOnline = false;
+    useChatStore.setState({
+      conversationId: "conv_terminal",
+      sessionStatus: "failed",
+      sessionConfigPhase: "applying",
+    });
+
+    renderShell("/c/conv_terminal");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    act(() => useChatStore.setState({ sessionStatus: "idle" }));
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminals-available", "true");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
+    expect(useChatStore.getState().sessionConfigPhase).toBe("applying");
+  });
+
+  it("does not show native startup for an SDK configuration change", () => {
+    mockConversations([
+      { id: "conv_terminal", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    runnerHealthState.runnerOnline = false;
+    useChatStore.setState({
+      conversationId: "conv_terminal",
+      sessionConfigPhase: "applying",
+    });
+
+    renderShell("/c/conv_terminal");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
+
+    act(() => useChatStore.setState({ sessionConfigPhase: null, pendingModelChange: "sonnet" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
 
   it("treats an unhydrated session row as startup so a fresh session never looks stopped", () => {

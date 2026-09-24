@@ -30,7 +30,11 @@ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-import { RunnerStartingIndicator, McpStartupIndicator } from "@/pages/ChatIndicators";
+import {
+  RunnerStartingIndicator,
+  McpStartupIndicator,
+  useSessionConfigStarting,
+} from "@/pages/ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import {
   type ConversationScroller,
@@ -124,6 +128,7 @@ function TranscriptImpl({
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
+  const sessionConfigStarting = useSessionConfigStarting();
   const hasTasks = useChatStore((s) => s.todos.length > 0);
   const conversationId = useChatStore((s) => s.conversationId);
 
@@ -339,7 +344,7 @@ function TranscriptImpl({
               rowCount={display.streamBubbles.length}
             />
             {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
-              sandboxLaunching ? (
+              sandboxLaunching || sessionConfigStarting ? (
                 <RunnerStartingIndicator variant="hero" />
               ) : (
                 <ConversationEmptyState>
@@ -388,7 +393,7 @@ function TranscriptImpl({
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
                 {showWorkingIndicator && <WorkingIndicator />}
-                {/* Managed-sandbox stage cue; only when Working is absent. */}
+                {/* Startup cue; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the
                 round settles (failures stay in host logs, not the chat). */}

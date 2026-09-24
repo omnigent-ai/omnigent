@@ -142,19 +142,23 @@ export function ConnectionIndicator({
   return null;
 }
 
-/**
- * Main-pane managed-sandbox launch indicator. Shows the current pipeline
- * stage ("Provisioning sandbox…", "Cloning repository…", …) for any session
- * type. Ordinary terminal startup uses the standard Working indicator.
- *
- * Self-gates to null when neither applies. `hero` is the centered
- * empty-state placeholder (no bubbles yet); `row` is the in-thread
- * spinner beneath the user's first message (the create-then-send path
- * renders that bubble immediately, so the empty state never shows
- * there).
- */
+/** Configuration recovery stays visible until the native terminal is discovered. */
+export function useSessionConfigStarting(): boolean {
+  const terminalFirst = useTerminalFirst();
+  const phase = useChatStore((s) => s.sessionConfigPhase);
+  const modelPending = useChatStore((s) => s.pendingModelChange !== null);
+  return (
+    phase === "starting" ||
+    ((phase !== null || modelPending) &&
+      terminalFirst?.isNativeWrapper === true &&
+      !terminalFirst.terminalsAvailable)
+  );
+}
+
+/** Main-pane sandbox or model/effort recovery cue; ordinary startup uses Working. */
 export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+  const sessionConfigStarting = useSessionConfigStarting();
   // `ready` never reaches the store (cleared) and `failed` renders the
   // destructive band in ConnectionIndicator — only in-flight stages
   // with known copy show here.
@@ -162,8 +166,8 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
     sandboxStatus !== null && sandboxStatus.stage !== "failed"
       ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
       : undefined;
-  if (sandboxLabel === undefined) return null;
-  const line = `${sandboxLabel}…`;
+  if (sandboxLabel === undefined && !sessionConfigStarting) return null;
+  const line = sandboxLabel === undefined ? "Starting up…" : `${sandboxLabel}…`;
   // role=status + aria-live so assistive tech announces the transient wait;
   // the spinner glyph itself is decorative (aria-hidden).
   if (variant === "hero") {
@@ -174,7 +178,11 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         aria-live="polite"
         icon={<Loader2Icon className="size-7 animate-spin" aria-hidden />}
         title={line}
-        description="Setting up your sandbox — this can take a minute."
+        description={
+          sandboxLabel === undefined
+            ? "The terminal will connect automatically."
+            : "Setting up your sandbox — this can take a minute."
+        }
       />
     );
   }

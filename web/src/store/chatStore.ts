@@ -72,6 +72,7 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
+  retrySession,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -832,6 +833,9 @@ export interface ConversationState {
    * chip itself (the chip keeps showing ``llmModel`` — the truth).
    */
   pendingModelChange: string | null;
+  /** Configuration work survives Chat/Terminal view changes and session navigation. */
+  sessionConfigPhase: "starting" | "applying" | null;
+  sessionConfigError: string | null;
   /**
    * Effective brain harness for the active session (override-aware),
    * e.g. ``"claude-sdk"`` or ``"pi"``. Populated from the session
@@ -1149,7 +1153,7 @@ export interface ChatActions {
   /**
    * Set the active session's effort. ``null`` clears the override.
    */
-  setEffort: (effort: string | null) => Promise<void>;
+  setEffort: (effort: string | null, conversationId?: string | null) => Promise<void>;
   /**
    * Set the active session's model. For claude-native, the server also injects
    * ``/model`` into the tmux pane so the in-binary picker tracks the change.
@@ -1158,14 +1162,23 @@ export interface ChatActions {
    * report (or a not-applied error) settles it — pass it for sessions
    * whose chip renders the reported model (claude-/codex-native).
    */
-  setModel: (model: string | null, opts?: { expectConfirmation?: boolean }) => Promise<void>;
+  setModel: (
+    model: string | null,
+    opts?: { expectConfirmation?: boolean },
+    conversationId?: string | null,
+  ) => Promise<void>;
+  /** Apply a selection to its original session, optionally recovering its native terminal first. */
+  applySessionConfig: (
+    change: (conversationId: string | null) => Promise<unknown>,
+    opts?: { startTerminal?: boolean },
+  ) => Promise<void>;
   /**
    * Set the active session's cost-control switch — optimistic local
    * flip, then PATCH; the server's canonical value (or a rollback on
    * failure) settles the state. ``null`` clears back to the spec
    * default. No-ops when there is no active conversation.
    */
-  setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
+  setCostControlMode: (mode: "on" | "off" | null, conversationId?: string | null) => Promise<void>;
   /**
    * Set the active session's sub-agent routing switch — optimistic local
    * write, then PATCH; the server's canonical value (or a rollback on
@@ -1801,6 +1814,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
+  sessionConfigPhase: null,
+  sessionConfigError: null,
   sessionHarness: null,
   awaitingSideChatFor: null,
   sideChatToOpen: null,
@@ -2667,20 +2682,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return;
     }
 
-    // Sends the server hasn't acknowledged, carried across the re-bind below.
+    // Client-only work cannot be restored from the server's snapshot.
     let unsentOnRebind: PendingUserMessage[] = [];
+    let configOnRebind: Partial<ConversationState> = {};
     if (!wasLive) {
-      // Drop any retained-but-dead entry so `acquire` builds a fresh one. A
-      // re-bind has to start from the initial state: `bindStream` PREPENDS its
-      // snapshot to whatever `blocks` already holds, so re-binding onto a dead
-      // entry's stale transcript would duplicate and mis-order it. Unsent
-      // bubbles are the one thing worth keeping — the server can't replay what
-      // it was never told about.
-      unsentOnRebind =
-        conversationRegistry
-          .peek(conversationId)
-          ?.getState()
-          .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+      // Rebind from an empty transcript: prepending a snapshot to stale blocks
+      // would duplicate and mis-order them. Keep client-only configuration work.
+      const retainedState = conversationRegistry.peek(conversationId)?.getState();
+      unsentOnRebind = retainedState?.pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+      if (retainedState) {
+        configOnRebind = {
+          sessionConfigPhase: retainedState.sessionConfigPhase,
+          sessionConfigError: retainedState.sessionConfigError,
+          pendingModelChange: retainedState.pendingModelChange,
+        };
+      }
       conversationRegistry.release(conversationId);
     }
     const entry = conversationRegistry.acquire(conversationId);
@@ -2693,6 +2709,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // placeholder, is the whole point of keeping streams open.
       entry.setState({
         loadingConversation: true,
+        ...configOnRebind,
         ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
       });
     }
@@ -2851,9 +2868,53 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
   },
 
-  setEffort: async (effort) => {
-    setActive({ sessionReasoningEffort: effort });
-    const { conversationId } = get();
+  applySessionConfig: async (change, opts) => {
+    const { conversationId, sessionConfigPhase, pendingModelChange } = get();
+    if (sessionConfigPhase !== null || pendingModelChange !== null) return;
+    const patchSet: Setter =
+      conversationId === null
+        ? (patch) => {
+            if (get().conversationId === null) setActive(patch);
+          }
+        : (patch) => setterFor(conversationId)(patch);
+    const startTerminal =
+      opts?.startTerminal === true && conversationId !== null && !isTempConvId(conversationId);
+    patchSet({
+      sessionConfigPhase: startTerminal ? "starting" : "applying",
+      sessionConfigError: null,
+    });
+    try {
+      if (startTerminal) {
+        const result = await retrySession(conversationId);
+        if (!result.recovered && result.recovery !== "already_connected") {
+          throw new Error("Unable to start the session terminal");
+        }
+        // Recovery can finish before its resource event reaches this browser.
+        await queryClient?.invalidateQueries({
+          queryKey: terminalsQueryKey(conversationId),
+          refetchType: "all",
+        });
+        patchSet({ sessionConfigPhase: "applying" });
+      }
+      await change(conversationId);
+    } catch (error) {
+      patchSet({
+        sessionConfigError:
+          error instanceof Error ? error.message : "Unable to update session configuration",
+      });
+    } finally {
+      patchSet({ sessionConfigPhase: null });
+    }
+  },
+
+  setEffort: async (effort, targetConversationId) => {
+    const conversationId =
+      targetConversationId === undefined ? get().conversationId : targetConversationId;
+    const patchSet =
+      conversationId === null && get().conversationId === null
+        ? setActive
+        : setterFor(conversationId);
+    patchSet({ sessionReasoningEffort: effort });
     if (conversationId) {
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
@@ -2870,13 +2931,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         setterFor(conversationId)({ sessionReasoningEffort: null });
         return;
       }
-      await updateSession(conversationId, { reasoningEffort: effort });
+      const updated = await updateSession(conversationId, { reasoningEffort: effort });
+      setterFor(conversationId)({
+        sessionReasoningEffort:
+          updated.reasoningEffort === undefined ? effort : updated.reasoningEffort,
+      });
     }
   },
 
-  setModel: async (model, opts) => {
-    setActive({ sessionModelOverride: model });
-    const { conversationId } = get();
+  setModel: async (model, opts, targetConversationId) => {
+    const conversationId =
+      targetConversationId === undefined ? get().conversationId : targetConversationId;
+    const patchSet =
+      conversationId === null && get().conversationId === null
+        ? setActive
+        : setterFor(conversationId);
+    patchSet({ sessionModelOverride: model });
     if (conversationId) {
       const expectConfirmation = opts?.expectConfirmation === true && model !== null;
       if (expectConfirmation) {
@@ -2918,10 +2988,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setCostControlMode: async (mode) => {
-    const { conversationId } = get();
+  setCostControlMode: async (mode, targetConversationId) => {
+    const conversationId =
+      targetConversationId === undefined ? get().conversationId : targetConversationId;
     if (!conversationId) return;
-    const previous = get().costControlModeOverride;
+    const state = conversationId === get().conversationId ? get() : setterForState(conversationId);
+    const previous = state?.costControlModeOverride ?? null;
     // Routing and a pinned model are mutually exclusive: the server's routing
     // guard skips whenever model_override is set, so turning routing ON must
     // also clear this session's pinned model (in the SAME PATCH) — otherwise
@@ -2929,13 +3001,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // would never run. Mirrors the new-chat dialog's mutual exclusion. Only
     // clear when a model is actually pinned, so toggling routing on a
     // model-less (e.g. SDK) session doesn't emit a spurious model-cleared change.
-    const previousModel = get().sessionModelOverride;
+    const previousModel = state?.sessionModelOverride ?? null;
     const clearModel = mode === "on" && previousModel != null;
-    // Pin the target: these are this conversation's switches, and the PATCH can
-    // outlive a switch away. Resolving the target afterwards would leave a
-    // backgrounded conversation showing an optimistic value the server rejected,
-    // with no re-bind on return to correct it.
-    const patchSet = setterFor(conversationId);
+    // Keep the original session ID, but resolve its entry again after a rebind.
+    const patchSet: Setter = (patch) => setterFor(conversationId)(patch);
     // Optimistic flip so the pill responds instantly; the PATCH
     // response (or the rollback below) is the settled truth.
     patchSet({
@@ -2952,9 +3021,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
       });
     } catch (err) {
-      // Roll back so neither control claims a state the server never persisted.
-      // A disposed entry makes this a no-op, which is the only case worth
-      // skipping — there is no state left to correct.
+      // Roll back the original session; removed sessions have no state to correct.
       patchSet({
         costControlModeOverride: previous,
         ...(clearModel ? { sessionModelOverride: previousModel } : {}),
@@ -3778,7 +3845,11 @@ function sessionBindingPatch(
   session: Session,
   state: Pick<
     ConversationState,
-    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+    | "mcpStartupLaunch"
+    | "sessionModelSeeded"
+    | "llmModel"
+    | "sessionModelOverride"
+    | "pendingModelChange"
   >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Pick<
@@ -3818,7 +3889,7 @@ function sessionBindingPatch(
     boundAgentName: session.agentName,
     llmModel: retainModelSeed ? state.llmModel : (session.llmModel ?? null),
     sessionModelSeeded: retainModelSeed,
-    pendingModelChange: null,
+    pendingModelChange: state.pendingModelChange,
     sessionModelOverride: retainModelSeed
       ? state.sessionModelOverride
       : (session.modelOverride ?? null),

@@ -450,13 +450,18 @@ export function AppShell() {
   // the runner is auto-creating the terminal. Surfaced via
   // TerminalFirstContext below.
   const terminalPending = useChatStore((s) => s.terminalPending);
+  const sessionConfigPending = useChatStore(
+    (s) =>
+      s.conversationId === serverConversationId &&
+      (s.sessionConfigPhase !== null || s.pendingModelChange !== null),
+  );
   // Read the conversation's terminals here too so the FAB's dropdown
   // can show/hide its "Terminals" entry and route a click to the first
   // terminal. The hook is react-query-backed and dedup'd with the rail.
   // reconcileWhilePending: self-heals if the live resource.created SSE was
   // missed (see UseTerminalsOptions for the why).
   const { terminals } = useTerminals(serverConversationId ?? null, {
-    reconcileWhilePending: terminalPending,
+    reconcileWhilePending: terminalPending || sessionConfigPending,
   });
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
@@ -1894,7 +1899,8 @@ export function AppShell() {
   // `failed` before the new one connects — so a just-requested launch lifts
   // the failed-suppression exactly like an in-flight send does.
   const launchPending =
-    runnerLaunchedAt !== null && Date.now() - runnerLaunchedAt < STARTING_GRACE_S * 1000;
+    (isNativeWrapper && sessionConfigPending) ||
+    (runnerLaunchedAt !== null && Date.now() - runnerLaunchedAt < STARTING_GRACE_S * 1000);
   // Until the liveness row or session snapshot hydrates, a brand-new
   // session is indistinguishable from a stopped one — treat the unobserved
   // window as starting so the stopped UI can't flash during startup.
