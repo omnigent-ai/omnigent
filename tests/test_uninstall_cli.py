@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -122,3 +123,81 @@ def test_uninstall_cli_uses_exclusive_manifest_and_cleans_temp_script(
     assert result.exit_code == 0, result.output
     assert manifest_paths and not manifest_paths[0].exists()
     assert not temp_script_dir.exists()
+
+
+def test_uninstall_cli_manifest_carries_keychain_secrets_and_python_helper(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runner = CliRunner()
+    script = tmp_path / "uninstall_oss.sh"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    anthropic:\n"
+        "      api_key_ref: keychain:anthropic\n"
+        "  openai:\n"
+        "    kind: key\n"
+        "    openai:\n"
+        "      api_key_ref: env:OPENAI_API_KEY\n"
+        "cursor:\n"
+        "  api_key_ref: keychain:cursor\n"
+    )
+    ledger = new_ledger(source="installer", strategy="install", deep=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setattr(cli_module, "_uninstall_script_path", lambda: script)
+    monkeypatch.setattr("omnigent.install_ledger.resolve_uninstall_ledger", lambda: ledger)
+    seen: dict[str, object] = {}
+
+    def _run(args, *, env, check):
+        del args, check
+        manifest = Path(env["OMNIGENT_UNINSTALL_LEDGER_MANIFEST"]).read_text()
+        seen["rows"] = [line.split("\t") for line in manifest.splitlines()]
+        seen["python"] = env.get("OMNIGENT_UNINSTALL_PYTHON")
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    result = runner.invoke(cli_module.cli, ["uninstall", "state", "--purge", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["python"] == sys.executable
+    rows = seen["rows"]
+    assert isinstance(rows, list)
+    assert [row for row in rows if row[0] == "keychain_secret"] == [
+        ["keychain_secret", "anthropic"],
+        ["keychain_secret", "cursor"],
+    ]
+
+
+def test_internal_delete_keychain_secret_deletes_stored_secret(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    from omnigent.onboarding import secrets
+
+    secrets.store_secret("anthropic", "test-key-value")
+    runner = CliRunner()
+
+    result = runner.invoke(cli_module.cli, ["_internal", "delete-keychain-secret", "anthropic"])
+
+    assert result.exit_code == 0, result.output
+    assert secrets.load_secret("anthropic") is None
+
+
+def test_internal_delete_keychain_secret_reports_failure(monkeypatch) -> None:
+    def _boom(name: str) -> None:
+        raise RuntimeError("keyring exploded")
+
+    monkeypatch.setattr("omnigent.onboarding.secrets.delete_secret", _boom)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_module.cli, ["_internal", "delete-keychain-secret", "anthropic"])
+
+    assert result.exit_code == 1
+    assert "could not delete secret" in result.output

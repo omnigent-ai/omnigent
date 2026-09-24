@@ -659,3 +659,167 @@ def test_uninstall_script_rerun_is_idempotent(tmp_path: Path) -> None:
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
     assert "Omnigent installer" not in profile.read_text()
+
+
+def _state_with_install_signal(home: Path) -> Path:
+    state = home / ".omnigent"
+    state.mkdir(parents=True)
+    (state / "installation_id").write_text("install-123\n")
+    return state
+
+
+def _fake_secret_helper(tmp_path: Path, *, exit_code: int = 0) -> tuple[Path, Path]:
+    """A stand-in for OMNIGENT_UNINSTALL_PYTHON that logs its arguments."""
+    log = tmp_path / "helper.log"
+    helper = tmp_path / "fake-python"
+    helper.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >>{log}\nexit {exit_code}\n")
+    helper.chmod(0o755)
+    return helper, log
+
+
+def _keychain_actions(payload: dict) -> list[tuple[str, str, str]]:
+    return [
+        (action["path"], action["status"], action["detail"])
+        for action in payload["actions"]
+        if action["artifact"] == "keychain_secret"
+    ]
+
+
+def test_uninstall_script_purge_deletes_keychain_secrets_from_manifest(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    state = _state_with_install_signal(home)
+    manifest = tmp_path / "manifest.tsv"
+    manifest.write_text("keychain_secret\tanthropic\nkeychain_secret\topenrouter\n")
+    helper, log = _fake_secret_helper(tmp_path)
+
+    result = _run_uninstall(
+        home,
+        "state",
+        "--purge",
+        "--yes",
+        "--json",
+        env_updates={
+            "OMNIGENT_UNINSTALL_LEDGER_MANIFEST": str(manifest),
+            "OMNIGENT_UNINSTALL_PYTHON": str(helper),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert [(name, status) for name, status, _ in _keychain_actions(payload)] == [
+        ("anthropic", "done"),
+        ("openrouter", "done"),
+    ]
+    assert log.read_text().splitlines() == [
+        "-m omnigent _internal delete-keychain-secret anthropic",
+        "-m omnigent _internal delete-keychain-secret openrouter",
+    ]
+    assert not state.exists()
+
+
+def test_uninstall_script_purge_reports_keychain_secrets_without_helper(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _state_with_install_signal(home)
+    manifest = tmp_path / "manifest.tsv"
+    manifest.write_text("keychain_secret\tanthropic\n")
+
+    result = _run_uninstall(
+        home,
+        "state",
+        "--purge",
+        "--yes",
+        "--json",
+        env_updates={
+            "OMNIGENT_UNINSTALL_LEDGER_MANIFEST": str(manifest),
+            "OMNIGENT_UNINSTALL_PYTHON": "",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    actions = _keychain_actions(json.loads(result.stdout))
+    assert [(name, status) for name, status, _ in actions] == [("anthropic", "reported")]
+    assert "left in the OS keychain" in actions[0][2]
+
+
+def test_uninstall_script_purge_records_failed_keychain_secret_delete(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _state_with_install_signal(home)
+    manifest = tmp_path / "manifest.tsv"
+    manifest.write_text("keychain_secret\tanthropic\n")
+    helper, _ = _fake_secret_helper(tmp_path, exit_code=1)
+
+    result = _run_uninstall(
+        home,
+        "state",
+        "--purge",
+        "--yes",
+        "--json",
+        env_updates={
+            "OMNIGENT_UNINSTALL_LEDGER_MANIFEST": str(manifest),
+            "OMNIGENT_UNINSTALL_PYTHON": str(helper),
+        },
+    )
+
+    assert result.returncode == 1
+    actions = _keychain_actions(json.loads(result.stdout))
+    assert [(name, status) for name, status, _ in actions] == [("anthropic", "failed")]
+
+
+def test_uninstall_script_purge_dry_run_previews_keychain_secrets(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    state = _state_with_install_signal(home)
+    manifest = tmp_path / "manifest.tsv"
+    manifest.write_text("keychain_secret\tanthropic\n")
+    helper, log = _fake_secret_helper(tmp_path)
+
+    result = _run_uninstall(
+        home,
+        "state",
+        "--purge",
+        "--dry-run",
+        "--json",
+        env_updates={
+            "OMNIGENT_UNINSTALL_LEDGER_MANIFEST": str(manifest),
+            "OMNIGENT_UNINSTALL_PYTHON": str(helper),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    actions = _keychain_actions(json.loads(result.stdout))
+    assert [(name, status) for name, status, _ in actions] == [("anthropic", "reported")]
+    assert "would remove" in actions[0][2]
+    assert not log.exists()
+    assert state.exists()
+
+
+def test_uninstall_script_standalone_purge_reports_config_keychain_refs(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    state = _state_with_install_signal(home)
+    (state / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    anthropic:\n"
+        "      api_key_ref: keychain:anthropic\n"
+        "cursor:\n"
+        "  api_key_ref: keychain:cursor\n"
+    )
+
+    result = _run_uninstall(
+        home,
+        "state",
+        "--purge",
+        "--yes",
+        "--json",
+        env_updates={
+            "OMNIGENT_UNINSTALL_LEDGER_MANIFEST": "",
+            "OMNIGENT_UNINSTALL_PYTHON": "",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    actions = _keychain_actions(json.loads(result.stdout))
+    assert [(name, status) for name, status, _ in actions] == [
+        ("anthropic", "reported"),
+        ("cursor", "reported"),
+    ]
+    assert not state.exists()

@@ -5040,8 +5040,37 @@ def _uninstall_script_path() -> Path:
     raise click.ClickException("uninstall script is missing from this installation")
 
 
+def _keychain_secret_names() -> list[str]:
+    """Collect the secret names the global config references as ``keychain:<name>``.
+
+    Those secrets live in the OS keychain (keyring service ``omnigent``),
+    outside the state dir, so ``uninstall --purge`` must delete or report
+    them explicitly — removing ``~/.omnigent`` alone leaves them behind.
+
+    :returns: Sorted unique secret names, e.g. ``["anthropic", "cursor"]``.
+    """
+    from omnigent.onboarding.provider_config import load_config
+
+    names: set[str] = set()
+
+    def _walk(node: object) -> None:
+        if isinstance(node, str):
+            name = node.removeprefix("keychain:")
+            if name != node and name:
+                names.add(name)
+        elif isinstance(node, dict):
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                _walk(value)
+
+    _walk(load_config())
+    return sorted(names)
+
+
 def _write_uninstall_manifest(ledger: InstallLedger) -> Path:
-    """Write the ledger fields the POSIX uninstaller needs as tab records."""
+    """Write the ledger fields and keychain secret names the uninstaller needs."""
     fd, manifest_name = tempfile.mkstemp(prefix="omnigent-uninstall-ledger-", suffix=".tsv")
     manifest = Path(manifest_name)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -5087,6 +5116,8 @@ def _write_uninstall_manifest(ledger: InstallLedger) -> Path:
                 )
                 + "\n"
             )
+        for name in _keychain_secret_names():
+            handle.write("\t".join(["keychain_secret", name]) + "\n")
     manifest.chmod(0o600)
     return manifest
 
@@ -5115,6 +5146,18 @@ def _internal_write_ledger(from_env: bool) -> None:
 
     ledger = write_install_ledger_from_env()
     click.echo(json.dumps({"path": str(ledger_path()), "source": ledger.ledger_source}))
+
+
+@_internal.command("delete-keychain-secret")
+@click.argument("name")
+def _internal_delete_keychain_secret(name: str) -> None:
+    """Delete one Omnigent-stored secret; called by uninstall_oss.sh --purge."""
+    from omnigent.onboarding import secrets
+
+    try:
+        secrets.delete_secret(name)
+    except Exception as exc:
+        raise click.ClickException(f"could not delete secret {name!r}: {exc}") from exc
 
 
 @cli.group("extensions")
@@ -5270,7 +5313,11 @@ def doctor(
     nargs=-1,
     type=click.Choice(["cli", "state", "desktop-data", "all"]),
 )
-@click.option("--purge", is_flag=True, help="Remove state data after writing a backup.")
+@click.option(
+    "--purge",
+    is_flag=True,
+    help="Remove state data and Omnigent's OS-keychain secrets after writing a backup.",
+)
 @click.option("--purge-workspace", is_flag=True, help="Also remove ~/omnigent with --purge.")
 @click.option("--dry-run", is_flag=True, help="Print planned actions only.")
 @click.option("--yes", is_flag=True, help="Run non-interactively for auto-removable artifacts.")
@@ -5348,6 +5395,9 @@ def uninstall(
     env["OMNIGENT_UNINSTALL_LEDGER_SOURCE"] = ledger.ledger_source
     manifest = _write_uninstall_manifest(ledger)
     env["OMNIGENT_UNINSTALL_LEDGER_MANIFEST"] = str(manifest)
+    # The script deletes OS-keychain secrets through this interpreter; a
+    # standalone script run (no wrapper) can only report them instead.
+    env["OMNIGENT_UNINSTALL_PYTHON"] = sys.executable
     try:
         result = subprocess.run(args, env=env, check=False)
     finally:
