@@ -1729,11 +1729,14 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        context_files: bool = True,
         preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
         :param cwd: Working directory for the Pi subprocess.
+        :param context_files: Allow Pi to automatically load context files such
+            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
@@ -1833,6 +1836,8 @@ class PiExecutor(Executor):
         from omnigent.harnesses.pi_native.main import pi_supports_approve
 
         self._extra_args: list[str] = ["--no-tools"]
+        if not context_files:
+            self._extra_args.append("--no-context-files")
         if pi_supports_approve(self._pi_path):
             # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
             # blocking TUI prompt on first launch in a directory with .pi/

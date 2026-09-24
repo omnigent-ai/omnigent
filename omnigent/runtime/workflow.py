@@ -1484,6 +1484,7 @@ def _build_pi_spawn_env(
     # Always set so the harness wrap doesn't fall back to ``"all"``
     # and override an explicit ``skills: none`` from the spec.
     env["HARNESS_PI_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    env["HARNESS_PI_CONTEXT_FILES"] = json.dumps(spec.executor.config.get("context_files", True))
     if spec.name:
         env["HARNESS_PI_AGENT_NAME"] = spec.name
     if cwd is not None:
