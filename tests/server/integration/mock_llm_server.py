@@ -80,15 +80,23 @@ _evidence_journals = {}
 _evidence_journals_lock = threading.Lock()
 
 
-def _record_evidence(kind: str, body=None, accepted_at_ns=None) -> None:
+def _evidence_directory() -> Path | None:
     attempt = os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR")
+    if attempt:
+        return Path(attempt)
     runtime = os.environ.get("OMNIGENT_REPRO_EVIDENCE_ROOT")
+    if runtime and (Path(runtime) / "execution-context.json").is_file():
+        return Path(runtime) / "execution/service"
+    return None
+
+
+def _record_evidence(kind: str, body=None, accepted_at_ns=None, *, directory=None) -> None:
     try:
-        if not attempt and not (runtime and (Path(runtime) / "execution-context.json").is_file()):
+        directory = directory if directory is not None else _evidence_directory()
+        if directory is None:
             return
         from dev.repro_env.execution import Journal
 
-        directory = Path(attempt) if attempt else Path(runtime) / "execution/service"
         with _evidence_journals_lock:
             if directory not in _evidence_journals:
                 _evidence_journals[directory] = Journal(directory)
@@ -108,11 +116,11 @@ def _record_evidence(kind: str, body=None, accepted_at_ns=None) -> None:
 
 async def _record_evidence_async(kind: str, body=None, accepted_at_ns=None) -> None:
     try:
-        runtime = os.environ.get("OMNIGENT_REPRO_EVIDENCE_ROOT")
-        if os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR") or (
-            runtime and (Path(runtime) / "execution-context.json").is_file()
-        ):
-            await asyncio.to_thread(_record_evidence, kind, body, accepted_at_ns)
+        directory = _evidence_directory()
+        if directory is not None:
+            await asyncio.to_thread(
+                _record_evidence, kind, body, accepted_at_ns, directory=directory
+            )
     except Exception as exc:
         with contextlib.suppress(Exception):
             print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)

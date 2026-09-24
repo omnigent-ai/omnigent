@@ -34,9 +34,9 @@ If a driver starts its own trace, the collector saves its initial trace and yiel
 ownership. Later tracing belongs to that driver; a `trace_owner` event records this
 coverage limit. An abruptly killed browser or unclosed context can leave artifacts
 unavailable; collection errors remain explicit.
-If trace redaction fails, the raw trace is deliberately removed from this automatically
-uploaded directory; renaming it here would still upload it. The collector records the
-failure without advertising a saved trace. Other observations remain available.
+Raw traces are sanitized in a private temporary directory outside the retained
+evidence tree. Only sanitized copies enter the bundle. If redaction fails, cleanup
+is attempted and the collector records the failure without advertising a saved trace. Other observations remain available.
 
 Output is redacted after complete lines are assembled. Lines exceeding the 8 MiB
 redaction buffer are omitted with an explicit incomplete-output record; fragments

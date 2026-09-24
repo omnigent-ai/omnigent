@@ -205,3 +205,31 @@ def test_pytest_trace_and_evidence_can_share_a_context(tmp_path, browser, new_co
         assert not [e for e in events(tmp_path / "saved") if e["kind"] == "collection_error"]
     finally:
         collector.patch.undo()
+
+
+def test_raw_trace_never_enters_bundle_when_redaction_fails(tmp_path, browser, monkeypatch):
+    from dev.repro_env import pytest_evidence
+
+    collector = Evidence(tmp_path / "saved")
+    seen = []
+
+    def fail(path, secrets):
+        assert path.is_file()
+        assert not path.is_relative_to(collector.directory)
+        seen.append(path)
+        raise PermissionError("cannot sanitize or remove raw trace")
+
+    monkeypatch.setattr(pytest_evidence, "sanitize_trace", fail)
+    try:
+        collector.install_browser()
+        with browser.new_context() as context:
+            context.new_page().set_content("<p>observed</p>")
+        assert seen
+        assert not list(collector.directory.glob("*.zip"))
+        saved = events(collector.directory)
+        assert any(
+            e["kind"] == "collection_error" and e["operation"] == "trace_stop" for e in saved
+        )
+        assert not any(e.get("kind_of_artifact") == "playwright_trace" for e in saved)
+    finally:
+        collector.patch.undo()

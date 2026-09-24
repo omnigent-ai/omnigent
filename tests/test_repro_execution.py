@@ -563,7 +563,7 @@ def test_mock_recording_runs_off_event_loop_and_outside_state_lock(tmp_path, mon
     async def check():
         owner = threading.get_ident()
 
-        def record(*args):
+        def record(*args, **kwargs):
             assert threading.get_ident() != owner
             assert not mock._state._lock.locked()
             observed.append(args)
@@ -832,11 +832,11 @@ def test_mock_acceptance_order_survives_reordered_writes(tmp_path, monkeypatch):
     reset_written = threading.Event()
     record = mock._record_evidence
 
-    def reordered(kind, body, accepted_at_ns):
+    def reordered(kind, body, accepted_at_ns, **kwargs):
         if kind == "request":
             request_waiting.set()
             assert reset_written.wait(timeout=5)
-        record(kind, body, accepted_at_ns)
+        record(kind, body, accepted_at_ns, **kwargs)
         if kind == "reset":
             reset_written.set()
 
@@ -1116,3 +1116,38 @@ def test_disabled_mock_evidence_does_not_schedule_worker(tmp_path, monkeypatch):
     )
     asyncio.run(mock._record_evidence_async("request", {}))
     assert not list(tmp_path.glob("**/events-*.jsonl"))
+
+
+def test_output_byte_limit_preserves_valid_utf8(tmp_path, monkeypatch):
+    from dev.repro_env import execution
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(execution, "MAX_OUTPUT", 7)
+    (tmp_path / "execution-context.json").write_text("{}")
+    assert run(tmp_path, [sys.executable, "-c", "print(chr(0x2603) * 10)"]) == 0
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    data = (attempt / "stdout.txt").read_bytes()
+    assert data.decode("utf-8") == "\u2603\u2603"
+    assert len(data) <= 7
+    event = next(e for e in events(attempt) if e["kind"] == "output_truncated")
+    assert event["saved_bytes"] == len(data)
+
+
+def test_trace_cleanup_attempts_both_paths_and_preserves_original_error(tmp_path, monkeypatch):
+    import zipfile
+    from pathlib import Path
+
+    from dev.repro_env.execution import sanitize_trace
+
+    path = tmp_path / "trace.zip"
+    path.write_bytes(b"invalid zip")
+    attempts = []
+
+    def denied(path, **kwargs):
+        attempts.append(path)
+        raise PermissionError("cannot remove")
+
+    monkeypatch.setattr(Path, "unlink", denied)
+    with pytest.raises(zipfile.BadZipFile):
+        sanitize_trace(path)
+    assert attempts == [path, path.with_suffix(".tmp")]

@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
+import tempfile
 import threading
 import tokenize
 import uuid
@@ -206,8 +208,12 @@ class Evidence:
             path = self.directory / f"trace-{state['id']}.zip"
 
             def save():
-                context.tracing.stop(path=str(path))
-                sanitize_trace(path, self.journal.secrets)
+                # Raw traces never enter the directory retained by the workflow.
+                with tempfile.TemporaryDirectory(prefix="repro-raw-trace-") as temporary:
+                    raw = Path(temporary) / "trace.zip"
+                    context.tracing.stop(path=str(raw))
+                    sanitize_trace(raw, self.journal.secrets)
+                    shutil.copyfile(raw, path)
 
             self.artifact(
                 "trace_stop",

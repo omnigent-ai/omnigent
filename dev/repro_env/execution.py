@@ -215,8 +215,9 @@ def sanitize_trace(path: Path, secrets=None) -> None:
         temporary.replace(path)
     except BaseException:
         # Never retain raw credential-bearing traces in the automatically uploaded tree.
-        path.unlink(missing_ok=True)
-        temporary.unlink(missing_ok=True)
+        for candidate in (path, temporary):
+            with contextlib.suppress(OSError):
+                candidate.unlink(missing_ok=True)
         raise
 
 
@@ -359,7 +360,7 @@ def run(
             process.wait(timeout=PROCESS_CLEANUP_TIMEOUT)
 
     def copy(stream, destination, name):
-        saved = journal.capture("output_open", lambda: (directory / name).open("w"))
+        saved = journal.capture("output_open", lambda: (directory / name).open("wb"))
         if saved is None:
             output_errors.append(name)
         total = 0
@@ -373,10 +374,12 @@ def run(
             if saved is not None:
                 try:
                     available = max(0, MAX_OUTPUT - total)
-                    saved.write(text[:available])
+                    encoded = text.encode("utf-8", errors="backslashreplace")
+                    retained = encoded[:available].decode("utf-8", errors="ignore").encode("utf-8")
+                    saved.write(retained)
                     saved.flush()
-                    truncated |= len(text) > available
-                    total += min(len(text), available)
+                    truncated |= len(encoded) > len(retained)
+                    total += len(retained)
                 except Exception as exc:  # noqa: BLE001 — keep draining even if storage fails.
                     journal.failure("saved_output", exc)
                     output_errors.append(name)
@@ -427,7 +430,7 @@ def run(
             journal.capture("pipe_close", stream.close)
         if truncated:
             output_errors.append(name)
-            journal.emit("output_truncated", stream=name, saved_characters=total)
+            journal.emit("output_truncated", stream=name, saved_bytes=total)
 
     try:
         if prepare is not None:
