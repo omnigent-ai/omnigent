@@ -60,7 +60,8 @@ def upgrade() -> None:
                 "ALTER TABLE `user_daily_cost` "
                 "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__' AFTER day_utc, "
                 "DROP PRIMARY KEY, "
-                "ADD CONSTRAINT `pk_user_daily_cost` PRIMARY KEY (workspace_id, user_id, day_utc, harness)"
+                "ADD CONSTRAINT `pk_user_daily_cost` "
+                "PRIMARY KEY (workspace_id, user_id, day_utc, harness)"
             )
         )
     else:
@@ -102,7 +103,8 @@ def downgrade() -> None:
                 "ALTER TABLE `user_daily_cost` "
                 "DROP PRIMARY KEY, "
                 "DROP COLUMN harness, "
-                "ADD CONSTRAINT `pk_user_daily_cost` PRIMARY KEY (workspace_id, user_id, day_utc)"
+                "ADD CONSTRAINT `pk_user_daily_cost` "
+                "PRIMARY KEY (workspace_id, user_id, day_utc)"
             )
         )
     else:
@@ -117,4 +119,6 @@ def downgrade() -> None:
             # Drop harness column
             batch_op.drop_column("harness")
             # Recreate original primary key without harness
-            batch_op.create_primary_key("pk_user_daily_cost", ["workspace_id", "user_id", "day_utc"])
+            batch_op.create_primary_key(
+                "pk_user_daily_cost", ["workspace_id", "user_id", "day_utc"]
+            )
