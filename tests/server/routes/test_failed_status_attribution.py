@@ -42,6 +42,7 @@ def _publish_failed(
     origin: str | None = None,
     response_id: str | None = None,
     previous: str | None = "running",
+    failure_context: dict[str, str | int | None] | None = None,
 ) -> logging.LogRecord:
     """Publish one failed edge and return the ERROR record it logged."""
     if previous is not None:
@@ -53,6 +54,7 @@ def _publish_failed(
             error,
             response_id=response_id,
             failure_origin=origin,
+            failure_context=failure_context,
         )
     records = [r for r in caplog.records if "session turn failed" in r.getMessage()]
     assert len(records) == 1, [r.getMessage() for r in caplog.records]
@@ -118,6 +120,64 @@ def test_unattributed_failure_is_labelled_not_blank(
     assert "origin=unattributed" in record.getMessage()
     assert "prev=unknown" in record.getMessage()
     assert record.attributes["origin"] == "unattributed"
+
+
+def test_failure_context_rides_alongside_the_canonical_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Extra diagnostics (runner/host id, staleness) land on the same row."""
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(source="execution", code="runner_disconnected", message="boom"),
+        origin="runner_offline_sweep",
+        failure_context={"runner_id": "runner_abc", "host_id": "host_xyz", "idle_s": 42},
+    )
+    assert record.attributes["runner_id"] == "runner_abc"
+    assert record.attributes["host_id"] == "host_xyz"
+    assert record.attributes["idle_s"] == 42
+    # The message text/format is dashboard-regexed and must not change.
+    assert record.getMessage().startswith(
+        "session turn failed for conv_attr1 (origin=runner_offline_sweep "
+        "code=runner_disconnected prev=running): boom"
+    )
+
+
+def test_failure_context_none_values_are_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A context entry with no value is omitted, not shipped as null."""
+    record = _publish_failed(
+        caplog,
+        origin="runner_offline_sweep",
+        failure_context={"runner_id": None, "host_id": "host_xyz"},
+    )
+    assert "runner_id" not in record.attributes
+    assert record.attributes["host_id"] == "host_xyz"
+
+
+def test_failure_context_cannot_override_canonical_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A context value can never mask the fields the dashboard groups by."""
+    record = _publish_failed(
+        caplog,
+        session_id="conv_attr1",
+        error=ErrorDetail(source="execution", code="runner_disconnected", message="boom"),
+        origin="runner_offline_sweep",
+        response_id="resp_real",
+        failure_context={
+            "session_id": "conv_spoofed",
+            "origin": "spoofed_origin",
+            "code": "spoofed_code",
+            "previous_status": "spoofed_status",
+            "response_id": "resp_spoofed",
+        },
+    )
+    assert record.session_id == "conv_attr1"
+    assert record.attributes["origin"] == "runner_offline_sweep"
+    assert record.attributes["code"] == "runner_disconnected"
+    assert record.attributes["previous_status"] == "running"
+    assert record.attributes["response_id"] == "resp_real"
 
 
 def _failure_publish_calls(source: str) -> list[ast.Call]:

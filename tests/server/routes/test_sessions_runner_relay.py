@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.entities.conversation import Conversation
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -644,9 +645,23 @@ class _RecordingLabelStore:
     persisted disconnect code, so both are implemented here.
     """
 
-    def __init__(self, *, live_status: str = "idle") -> None:
+    def __init__(
+        self,
+        *,
+        live_status: str = "idle",
+        runner_id: str | None = None,
+        host_id: str | None = None,
+        kind: str = "default",
+        parent_conversation_id: str | None = None,
+        updated_at: int = 0,
+    ) -> None:
         self.labels: dict[str, dict[str, str]] = {}
         self.live_status = live_status
+        self.runner_id = runner_id
+        self.host_id = host_id
+        self.kind = kind
+        self.parent_conversation_id = parent_conversation_id
+        self.updated_at = updated_at
 
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
@@ -654,13 +669,18 @@ class _RecordingLabelStore:
     def get_conversation(self, conversation_id: str) -> Any:
         """Return a conversation-shaped object exposing the read fields.
 
-        ``.labels`` is read by the recovery guard and ``.live_status`` by
-        the mid-turn check when the in-memory status cache is cold, so a
-        lightweight namespace over both is enough.
+        ``.labels`` is read by the recovery guard, ``.live_status`` by the
+        mid-turn check when the in-memory status cache is cold, and the
+        remaining fields by the runner-disconnect failure-context helper.
         """
         return SimpleNamespace(
             labels=dict(self.labels.get(conversation_id, {})),
             live_status=self.live_status,
+            runner_id=self.runner_id,
+            host_id=self.host_id,
+            kind=self.kind,
+            parent_conversation_id=self.parent_conversation_id,
+            updated_at=self.updated_at,
         )
 
 
@@ -763,6 +783,74 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
             "code": "runner_disconnected",
             "message": "Runner disconnected unexpectedly.",
         }
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_disconnect_failure_context_carries_runner_and_idle_s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A mid-turn tunnel close carries runner/host/staleness on its ERROR row.
+
+    Same diagnostics as the offline sweep, but from the relay's own
+    disconnect path (``runner_disconnected_mid_turn``): which runner/host
+    the session was on, and how stale the "running" status looked.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    now = 6_000_000
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.now_epoch",
+        lambda: now,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore(
+        runner_id="runner_relay1",
+        host_id="host_relay1",
+        kind="default",
+        updated_at=now - 42,
+    )
+    session_id = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
+    # Only an interrupted turn is failed by the drop, so put one in flight —
+    # this also makes the mid-turn decision read the cache, not the row.
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        with capture_debug_rows("server") as rows:
+            handle = await sessions_module._ensure_runner_relay_ready(
+                session_id,
+                "runner_relay_context",
+                fake_runner,  # type: ignore[arg-type]
+                conversation_store=store,  # type: ignore[arg-type]
+            )
+            assert handle is not None
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        row = next(r for r in rows if r["event_name"] == "session_turn_failed")
+        attrs = row["attributes"]
+        assert attrs["runner_id"] == "runner_relay1"
+        assert attrs["host_id"] == "host_relay1"
+        assert attrs["session_kind"] == "default"
+        assert attrs["status_source"] == "cache"
+        assert attrs["idle_s"] == "42"
     finally:
         gate.set()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -1261,16 +1349,17 @@ async def test_relay_reports_the_drop_when_the_live_status_read_fails(
     try:
         assert sessions_module._session_status_cache.get(session_id) is None
 
-        handle = await sessions_module._ensure_runner_relay_ready(
-            session_id,
-            "runner_unreadable_row",
-            fake_runner,  # type: ignore[arg-type]
-            conversation_store=store,  # type: ignore[arg-type]
-        )
-        assert handle is not None
+        with capture_debug_rows("server") as rows:
+            handle = await sessions_module._ensure_runner_relay_ready(
+                session_id,
+                "runner_unreadable_row",
+                fake_runner,  # type: ignore[arg-type]
+                conversation_store=store,  # type: ignore[arg-type]
+            )
+            assert handle is not None
 
-        gate.set()
-        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         # The relay survived the store error and still reported the cause.
         assert handle.task.exception() is None
@@ -1278,6 +1367,16 @@ async def test_relay_reports_the_drop_when_the_live_status_read_fails(
         persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
         assert persisted is not None
         assert persisted["code"] == "runner_disconnected"
+
+        # The same unreadable row also drops the best-effort failure context
+        # (runner/host id, staleness) — the failure still publishes, with
+        # only the source of the mid-turn decision surviving.
+        row = next(r for r in rows if r["event_name"] == "session_turn_failed")
+        attrs = row["attributes"]
+        assert attrs["status_source"] == "row"
+        assert "host_id" not in attrs
+        assert "session_kind" not in attrs
+        assert "idle_s" not in attrs
     finally:
         gate.set()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -1370,19 +1469,39 @@ def _bound_conv(
     *,
     kind: str = "default",
     live_status: str | None = None,
-) -> Any:
+    runner_id: str | None = None,
+    host_id: str | None = None,
+    parent_conversation_id: str | None = None,
+    updated_at: int = 0,
+) -> Conversation:
     """
-    Build a conversation-shaped row for the offline-reconciliation helper.
+    Build a conversation row for the offline-reconciliation helper.
 
-    ``_mark_runner_sessions_offline`` reads only ``id``, ``kind`` and
-    ``live_status`` off each row, so a namespace is enough.
+    A real :class:`Conversation` rather than a namespace, so the
+    runner-disconnect failure-context helper (``runner_id``, ``host_id``,
+    ``kind``, ``parent_conversation_id``, ``updated_at``) reads honest
+    values instead of missing attributes.
 
     :param session_id: Conversation identifier.
     :param kind: ``"default"`` (top-level) or ``"sub_agent"``.
     :param live_status: Persisted live status, read only on a cache miss.
-    :returns: A conversation-shaped namespace.
+    :param runner_id: Runner the conversation is bound to.
+    :param host_id: Host that launched the runner.
+    :param parent_conversation_id: Parent session id for a sub-agent.
+    :param updated_at: Epoch seconds of the row's last update.
+    :returns: A conversation row.
     """
-    return SimpleNamespace(id=session_id, kind=kind, live_status=live_status)
+    return Conversation(
+        id=session_id,
+        created_at=0,
+        updated_at=updated_at,
+        root_conversation_id=session_id,
+        kind=kind,
+        live_status=live_status,
+        runner_id=runner_id,
+        host_id=host_id,
+        parent_conversation_id=parent_conversation_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -1471,6 +1590,62 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
             assert persisted is None
     finally:
         sessions_module._intentional_stop_sessions.discard(session_id)
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_mark_runner_sessions_offline_failure_context_carries_lineage_and_staleness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The sweep's failed-turn record carries what a production join needs.
+
+    A ``runner_offline_sweep`` failure alone can't say which runner/host the
+    session was on, whether it was a sub-agent child, or how stale the
+    "running" status looked — this asserts those fields ride on the same
+    ERROR the dashboard groups by.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    session_id = "f1e2d3c4b5a697887766554433221100"
+    store = _RecordingLabelStore()
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+    sessions_module._session_status_cache[session_id] = "running"
+    now = 5_000_000
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.now_epoch",
+        lambda: now,
+    )
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [
+                    _bound_conv(
+                        session_id,
+                        kind="sub_agent",
+                        runner_id="runner_abc",
+                        host_id="host_xyz",
+                        parent_conversation_id="conv_parent1",
+                        updated_at=now - 7200,
+                    )
+                ],
+                error,
+                store,  # type: ignore[arg-type]
+            )
+
+        row = next(r for r in rows if r["event_name"] == "session_turn_failed")
+        attrs = row["attributes"]
+        assert attrs["runner_id"] == "runner_abc"
+        assert attrs["host_id"] == "host_xyz"
+        assert attrs["session_kind"] == "sub_agent"
+        assert attrs["parent_session_id"] == "conv_parent1"
+        assert attrs["status_source"] == "cache"
+        assert attrs["idle_s"] == "7200"
+    finally:
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 

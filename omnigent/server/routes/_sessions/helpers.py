@@ -4628,6 +4628,11 @@ def _require_codex_approval_mode_forward(
 # runner-exit diagnostics within the limit.
 _FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 4500
 
+# Fields a ``failure_context`` may not set on the ``session_turn_failed`` row.
+_FAILURE_LOG_RESERVED_KEYS: Final[frozenset[str]] = frozenset(
+    {"session_id", "turn_id", "user_id", "origin", "code", "previous_status", "response_id"}
+)
+
 
 def _failure_log_detail(error: ErrorDetail | None) -> str:
     """Render a turn failure's reason for the log, bounded in length.
@@ -4658,6 +4663,7 @@ def _publish_status(
     persist_live_status: bool = True,
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
+    failure_context: Mapping[str, str | int | None] | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4690,6 +4696,11 @@ def _publish_status(
         server-side failure logs one ERROR from here, so without it the
         dozen unrelated causes that reach this function are one
         undifferentiated signature. Ignored for non-failed edges.
+    :param failure_context: Extra debug attributes for a ``"failed"`` edge,
+        e.g. ``{"runner_id": "runner_token_ab12", "idle_s": 5400}``. Merged
+        into the ``session_turn_failed`` event; ``None`` entries and
+        :data:`_FAILURE_LOG_RESERVED_KEYS` are dropped so the canonical
+        fields always win. Ignored for non-failed edges.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -4750,6 +4761,23 @@ def _publish_status(
         # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
+        extra = debug_event(
+            "session_turn_failed",
+            session_id=session_id,
+            origin=origin,
+            code=failure_code,
+            previous_status=previous_status or "unknown",
+            response_id=response_id,
+        )
+        # Extra context (runner/host, sub-agent lineage, staleness) never
+        # replaces the canonical fields the dashboard groups by.
+        attributes = extra["attributes"]
+        if failure_context and isinstance(attributes, dict):
+            attributes.update(
+                (key, value)
+                for key, value in failure_context.items()
+                if value is not None and key not in _FAILURE_LOG_RESERVED_KEYS
+            )
         _logger.error(
             "session turn failed for %s (origin=%s code=%s prev=%s): %s",
             session_id,
@@ -4757,14 +4785,7 @@ def _publish_status(
             failure_code,
             previous_status or "unknown",
             _failure_log_detail(error),
-            extra=debug_event(
-                "session_turn_failed",
-                session_id=session_id,
-                origin=origin,
-                code=failure_code,
-                previous_status=previous_status or "unknown",
-                response_id=response_id,
-            ),
+            extra=extra,
         )
         session_live_state.persist_scheduled_run_completion(
             session_id,

@@ -28,7 +28,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.utils import generate_agent_id, generate_task_id, now_epoch
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
@@ -3048,6 +3048,34 @@ async def _publish_runner_recovered_status_impl(
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
+def _runner_disconnect_failure_context(
+    conv: Conversation | None, *, status_source: str
+) -> dict[str, str | int]:
+    """
+    Diagnostics for a runner-disconnect ``failed`` edge: which runner/host
+    the session was on, whether it was a sub-agent, and how stale the
+    "running" status looked, so a production join doesn't need to guess.
+
+    :param conv: The conversation the disconnect failed, or ``None`` if it
+        could not be read.
+    :param status_source: ``"cache"`` if the mid-turn decision came from
+        the in-memory status cache, ``"row"`` if it fell back to the
+        persisted conversation row.
+    :returns: Attribute map with ``None`` fields omitted.
+    """
+    if conv is None:
+        return {"status_source": status_source}
+    context: dict[str, str | int | None] = {
+        "runner_id": conv.runner_id,
+        "host_id": conv.host_id,
+        "session_kind": conv.kind,
+        "parent_session_id": conv.parent_conversation_id,
+        "status_source": status_source,
+        "idle_s": max(0, now_epoch() - conv.updated_at),
+    }
+    return {key: value for key, value in context.items() if value is not None}
+
+
 async def _mark_runner_sessions_offline_impl(
     convs: list[Conversation],
     error: ErrorDetail,
@@ -3096,12 +3124,19 @@ async def _mark_runner_sessions_offline_impl(
         # Cache first (this replica holds the runner's tunnel, so it saw the
         # turn edges), falling back to the row for a session whose live state
         # was published before a restart.
+        status_source = "cache" if conv.id in _session_status_cache else "row"
         live = _session_status_cache.get(conv.id, conv.live_status)
         interrupted = live in _MID_TURN_STATUSES
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
         if not interrupted and not dead_on_arrival:
             continue
-        _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
+        _publish_status(
+            conv.id,
+            "failed",
+            error,
+            failure_origin="runner_offline_sweep",
+            failure_context=_runner_disconnect_failure_context(conv, status_source=status_source),
+        )
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
 
 
@@ -6771,6 +6806,10 @@ async def _relay_runner_stream(
                     },
                 },
             )
+            # Snapshot before the disconnect decision below so a later cache
+            # write (e.g. a racing status edge) can't relabel which source
+            # actually backed this decision.
+            status_source = "cache" if session_id in _session_status_cache else "row"
             if lost.intentional:
                 # User clicked Stop: the Stop handler brought this runner's
                 # tunnel down on purpose (see _stop_session_host_runner), so
@@ -6818,11 +6857,22 @@ async def _relay_runner_stream(
                     code="runner_disconnected",
                     message="Runner disconnected unexpectedly.",
                 )
+                # Best-effort: the failure is published either way, so a
+                # broken read only loses the extra context, not the edge.
+                try:
+                    disconnect_conv = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                except Exception:  # noqa: BLE001 — context is best-effort here
+                    disconnect_conv = None
                 _publish_status(
                     session_id,
                     "failed",
                     disconnect_error,
                     failure_origin="runner_disconnected_mid_turn",
+                    failure_context=_runner_disconnect_failure_context(
+                        disconnect_conv, status_source=status_source
+                    ),
                 )
                 # Persist the disconnect cause as durable labels so the
                 # distinction survives into snapshots and child-session
