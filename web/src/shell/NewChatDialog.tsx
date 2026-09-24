@@ -32,10 +32,10 @@ import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
-  ComposerChipRow,
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
+import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
@@ -46,7 +46,6 @@ import {
   ChevronsUpDownIcon,
   GitBranchIcon,
   LockIcon,
-  FileTextIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
@@ -300,7 +299,6 @@ import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
   detectMentionAt,
-  mentionItemPath,
   type MentionState,
   parseMentionToken,
   rankMentionEntries,
@@ -6412,34 +6410,7 @@ export function NewChatLandingScreen() {
                     {/* "@"-mention chips — one per tagged workspace file/folder. Each is
                 delivered as an "[Attached: <path>]" marker prepended to the
                 first message at create time. */}
-                    {mentionedItems.length > 0 && (
-                      <ComposerChipRow className="gap-1.5">
-                        {mentionedItems.map((item, i) => (
-                          <span
-                            key={mentionItemPath(item)}
-                            className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                          >
-                            {item.isDir ? (
-                              <FolderIcon className="size-3 shrink-0" />
-                            ) : (
-                              <FileTextIcon className="size-3 shrink-0" />
-                            )}
-                            <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
-                              @{item.path}
-                              {item.isDir ? "/" : ""}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => removeMentionedItem(i)}
-                              className="ml-0.5 rounded-full hover:text-foreground"
-                              aria-label={`Remove ${item.path}`}
-                            >
-                              <XIcon className="size-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </ComposerChipRow>
-                    )}
+                    <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments files={files} onRemove={removeFile} />
                     {/* Rejected-attachment feedback: unsupported type or too large */}

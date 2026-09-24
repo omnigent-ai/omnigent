@@ -1,14 +1,19 @@
 ## Step 1 — Look for an existing fix PR (this decides your path)
 
 Before writing any code, find out whether someone is **already fixing this bug**.
-When `bug_url` is a GitHub issue, search for an open PR that fixes it:
+For GitHub issues and Linear tickets (with or without a GitHub mirror), search
+linked PRs and use `gh pr list --repo <repo> --state open --search "<query>"`
+with the issue/ticket identifier, symptom keywords, and affected component.
+Use `target_repo` when supplied; otherwise use `omnigent-ai/omnigent`.
 
-- `gh issue view <bug_url> --json ...` to see linked/closing PRs, and
-  `gh pr list --search "<issue-number>"` (and a keyword search on the bug title)
-  to catch PRs that reference the issue without a formal link.
-- Consider a PR a **candidate fix** only if it is **open** and actually targets
-  this bug's behavior. Ignore merged/closed PRs (if a merged PR were the fix,
-  repro-agent would have returned `already_fixed`) and unrelated PRs.
+- Before dismissing a plausible match, read its **full description and relevant
+  diff**, not just its title or a truncated summary. Broader fixes may cover the
+  reported symptoms even when linked to a different issue.
+- Compare its coverage with each reported symptom. If it may fix the bug, use
+  Step 2A to validate it; prefer reviewing or extending a sound existing fix.
+  If you still author a separate PR, name the candidate and explain what it
+  misses or why its approach is unsuitable in `fix_summary` and the PR body.
+- An open PR does not mean the bug is already fixed; validate its behavior.
 
 Branch on what you find:
 

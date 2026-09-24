@@ -34,6 +34,7 @@ export function ServerDetailStep({
   onBack,
   onConnect,
   onCopy,
+  onShowAll,
 }: {
   url: string;
   /** Returning user (CLI installed) → "Open Omnigent"; new → "Install Omnigent". */
@@ -41,6 +42,8 @@ export function ServerDetailStep({
   onBack: () => void;
   onConnect: (url: string) => void;
   onCopy: (text: string) => void;
+  /** Navigate to the full server list (presets + recents). Omitted → no link. */
+  onShowAll?: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const name = displayName(url);
@@ -73,6 +76,15 @@ export function ServerDetailStep({
             <span>{b.label}</span>
           </span>
         ))}
+        {onShowAll && (
+          <button
+            type="button"
+            onClick={onShowAll}
+            className="mt-1 self-start text-base text-muted-foreground underline underline-offset-2 hover:text-foreground"
+          >
+            Show all servers
+          </button>
+        )}
       </div>
 
       <div className="mt-3 flex justify-between gap-2">

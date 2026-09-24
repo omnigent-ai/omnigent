@@ -31,8 +31,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
-from omnigent._platform import resolve_cli_binary
-from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES, canonicalize_harness
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
@@ -222,6 +222,9 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         ``False`` or a reason string otherwise.
     """
     canonical = _canonical_harness(harness)
+    if IS_WINDOWS and canonical in NATIVE_HARNESSES:
+        # Native harnesses require tmux/PTY, which the runner does not support on Windows.
+        return False
     if canonical == "acp":
         # The generic ACP harness has no fixed binary — "configured" means at
         # least one agent is registered in the ``acp:`` config block. Each
@@ -476,6 +479,8 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
+    if IS_WINDOWS and canonical in NATIVE_HARNESSES:
+        return False
     if _is_codex_family_harness(canonical):
         from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
@@ -584,7 +589,13 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     cache_key_by_spelling: dict[str, tuple[str, ...]] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
-        cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
+        # Windows-native Codex must not share plain Codex's readiness cache entry.
+        if _is_codex_family_harness(canonical) and not (
+            IS_WINDOWS and canonical in NATIVE_HARNESSES
+        ):
+            cache_key: tuple[str, ...] = ("codex",)
+        else:
+            cache_key = ("harness", canonical)
         canonical_by_cache_key.setdefault(cache_key, canonical)
         cache_key_by_spelling[spelling] = cache_key
 

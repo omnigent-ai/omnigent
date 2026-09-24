@@ -9,6 +9,15 @@ This step applies **only when you authored a fix in Step 2B** — it's about
 *opening* a PR. (The review path 2A adopts the existing PR instead of opening one,
 then goes straight to Step 4 to land it.) Once the set is genuinely green:
 
+**Check again before publishing.** Once the fix and PR body are ready, repeat
+Step 1's search immediately before creating a new PR, or before the final
+handoff to a CI publisher. Inspect only new or changed candidates, using Step 2A
+if one may cover the bug; preserve your work while evaluating it. Recheck the
+state of earlier candidates too: if one merged, use the shared repro audit on
+updated main before deciding whether your fix is still needed. Record the check
+and decision in `fix_summary`. Skip this refresh for `skip_push` and updates to
+an existing PR.
+
 ### Choose the publication mode before proceeding
 
 - **Local-only (`skip_push: true`)** — commit the fix and stop at Step 3.2. No PR
