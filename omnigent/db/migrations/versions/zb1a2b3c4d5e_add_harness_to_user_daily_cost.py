@@ -66,15 +66,26 @@ def upgrade() -> None:
         )
     elif dialect == "cockroachdb":
         # CockroachDB: add column first, then rebuild PK
-        op.execute(
-            sa.text(
-                "ALTER TABLE user_daily_cost "
-                "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__', "
-                "DROP CONSTRAINT pk_user_daily_cost, "
-                "ADD CONSTRAINT pk_user_daily_cost "
-                "PRIMARY KEY (workspace_id, user_id, day_utc, harness)"
+        # Get the actual PK name (may vary across database states)
+        old_pk_name = _existing_pk_name("user_daily_cost")
+        if old_pk_name:
+            op.execute(
+                sa.text(
+                    f"ALTER TABLE user_daily_cost "
+                    f"ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__', "
+                    f'DROP CONSTRAINT "{old_pk_name}", '
+                    f"ADD CONSTRAINT pk_user_daily_cost "
+                    f"PRIMARY KEY (workspace_id, user_id, day_utc, harness)"
+                )
             )
-        )
+        else:
+            # No PK exists, just add the column
+            op.execute(
+                sa.text(
+                    "ALTER TABLE user_daily_cost "
+                    "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__'"
+                )
+            )
     else:
         # PostgreSQL/SQLite: use batch_alter_table
         old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
@@ -120,16 +131,22 @@ def downgrade() -> None:
         )
     elif dialect == "cockroachdb":
         # CockroachDB: use separate statements to ensure table always has a PK
-        # First rebuild the PK without harness
-        op.execute(
-            sa.text(
-                "ALTER TABLE user_daily_cost "
-                "DROP CONSTRAINT pk_user_daily_cost, "
-                "ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc)"
+        # Get the actual PK name (may vary across database states)
+        old_pk_name = _existing_pk_name("user_daily_cost")
+        if old_pk_name:
+            # First rebuild the PK without harness
+            op.execute(
+                sa.text(
+                    f"ALTER TABLE user_daily_cost "
+                    f'DROP CONSTRAINT "{old_pk_name}", '
+                    f"ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc)"
+                )
             )
-        )
-        # Then drop the harness column
-        op.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
+            # Then drop the harness column
+            op.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
+        else:
+            # No PK exists (shouldn't happen), just drop the column
+            op.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
     else:
         # PostgreSQL/SQLite: use batch_alter_table
         old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
