@@ -100,9 +100,25 @@ describe("GoalControl", () => {
     expect(onStartGoal).toHaveBeenCalledWith("All tests pass");
   });
 
-  it("renders the status pill", () => {
-    render(<GoalStatusPill goal={{ ...GOAL, status: "blocked" }} />);
+  it("renders a working icon while the goal is in progress", () => {
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={{ ...GOAL, status: "active" }} />
+      </TooltipProvider>,
+    );
 
-    expect(screen.getByTestId("composer-goal-mode")).toHaveTextContent("Goal blocked");
+    const pill = screen.getByTestId("composer-goal-mode");
+    expect(pill).toHaveAttribute("data-state", "working");
+    expect(pill).toHaveAccessibleName(`Goal active: ${GOAL.objective}`);
+  });
+
+  it("renders a done icon once the goal completes", () => {
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={{ ...GOAL, status: "complete" }} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByTestId("composer-goal-mode")).toHaveAttribute("data-state", "done");
   });
 });

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { TargetIcon } from "lucide-react";
+import { CircleCheckIcon, GoalIcon, TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Goal } from "@/lib/goalApi";
@@ -91,15 +91,28 @@ export function GoalControl(props: GoalControlProps) {
   );
 }
 
-/** Compact status-line indicator for the current goal. */
+/** Icon-only workspace-bar indicator for the current goal; details on hover. */
 export function GoalStatusPill({ goal }: { goal: Goal }) {
+  const done = goal.status === "complete";
+  const Icon = done ? CircleCheckIcon : GoalIcon;
+  const label = `Goal ${formatGoalStatus(goal.status)}`;
   return (
-    <span
-      data-testid="composer-goal-mode"
-      className="inline-flex items-center gap-1 text-sm font-medium text-foreground"
-    >
-      <TargetIcon className="size-3.5 shrink-0" />
-      <span>Goal {formatGoalStatus(goal.status)}</span>
-    </span>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          data-testid="composer-goal-mode"
+          data-state={done ? "done" : "working"}
+          aria-label={`${label}: ${goal.objective}`}
+          className="flex shrink-0 items-center rounded-full bg-transparent px-1 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 md:px-2"
+        >
+          <Icon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="end" className="max-w-xs">
+        <div className="font-medium">{label}</div>
+        <div className="line-clamp-3">{goal.objective}</div>
+      </TooltipContent>
+    </Tooltip>
   );
 }
