@@ -73,6 +73,13 @@ def test_sdk_harnesses_remain_available_on_windows(
 
     monkeypatch.setattr(_plat, "IS_WINDOWS", True)
     monkeypatch.setattr(readiness, "IS_WINDOWS", True)
+    # SDK readiness is credential-based (True only when a locally visible
+    # credential source could serve the harness, else "needs-auth"), so give
+    # each family an ambient key: this test asserts the *Windows gate* never
+    # knocks the in-process SDK harnesses out, not that they are ready on a
+    # credential-less host.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-windows-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-windows-test")
 
     result = readiness.configured_harness_map()
 
