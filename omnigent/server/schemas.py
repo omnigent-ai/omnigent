@@ -3557,6 +3557,10 @@ class SessionInputConsumedPayload(BaseModel):
     data: dict[str, Any]
     created_by: str | None = None
     cleared_pending_id: str | None = None
+    # The web client's own submission id for this message, when it came from
+    # one, so a client can match the receipt to its bubble by identity even
+    # when the persisted item carries a forwarder-derived id.
+    stable_id: str | None = None
 
     model_config = ConfigDict(extra="ignore")
 

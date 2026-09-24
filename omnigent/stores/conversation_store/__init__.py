@@ -587,6 +587,22 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
+        """
+        Fetch one persisted item by id, or ``None`` when absent.
+
+        Used to recognise a web re-send of a message whose committed copy has
+        left the process-local caches (server restart, cache expiry), and to
+        check that the item a client-chosen id names really is that
+        submission. Must be a bounded read: a point lookup on the item's key,
+        never a scan.
+
+        :param conversation_id: The conversation to look in.
+        :param item_id: The item id, e.g. a web client's ``stable_id``.
+        :returns: The item, or ``None``.
+        """
+
+    @abstractmethod
     def list_items(
         self,
         conversation_id: str,

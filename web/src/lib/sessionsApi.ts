@@ -215,6 +215,7 @@ interface SessionResponseWire {
     pending_id: string;
     content: MessageContentBlock[];
     created_by?: string;
+    stable_id?: string;
   }[];
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
@@ -351,6 +352,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       pendingId: p.pending_id,
       content: p.content,
       ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
+      ...(p.stable_id !== undefined ? { stableId: p.stable_id } : {}),
     })),
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,

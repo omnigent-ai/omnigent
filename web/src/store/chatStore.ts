@@ -84,6 +84,7 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
+import { forgetPendingSend, persistPendingSend, readPendingSends } from "@/lib/pendingSends";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -529,6 +530,18 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /** The submit's 32-hex stable id, re-sent verbatim on every retry so the
+   *  server can recognise a duplicate delivery. Set for sends from `send()`. */
+  stableId?: string;
+  /**
+   * The send failed: the fetch threw (nothing reached the browser, so whether
+   * the server has the message is unknown) or the server refused it, in which
+   * case `reason` carries its message. `attempts` counts failed deliveries;
+   * a thrown fetch is re-sent once automatically to learn whether it landed,
+   * so the footer shows "Failed" only after that check also failed. The bubble
+   * stays in the transcript with Retry and Cancel; nothing goes to the composer.
+   */
+  failed?: { reason?: string; attempts: number };
 }
 
 /**
@@ -1054,6 +1067,13 @@ export interface AppChatState {
 /** Actions exposed on the root store. */
 export interface ChatActions {
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  /**
+   * Re-send a stalled or refused pending message now, with its original
+   * stable id. No-op when the bubble is gone or already accepted.
+   */
+  retryPendingSend: (tempId: string) => Promise<void>;
+  /** Stop retrying a pending message and drop its bubble. */
+  cancelPendingSend: (tempId: string) => void;
   clearSideChatToOpen: () => void;
   /** Open a generic side chat as a rail tab under `parentId`, seeding its
    *  composer with `draft` (the typed `/side` question) so it isn't lost while
@@ -1283,6 +1303,294 @@ export function releaseConversation(id: string): void {
 // Catalogs that resolved while their bind snapshot was still hydrating.
 const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
 let pendingSeq = 0;
+
+/**
+ * Delay before the one automatic re-send that follows a thrown fetch. Its job
+ * is to learn whether the message landed: the server dedupes on the stable id
+ * and answers with the committed copy if it did. It runs inside `send()`,
+ * which still holds the conversation's send chain, so a message sent
+ * meanwhile cannot overtake the one being checked.
+ */
+const SEND_CHECK_DELAY_MS = 1_000;
+
+/**
+ * How long a failed send stays re-sendable, matching the server's memory of
+ * delivered submissions: re-sending the same stable id is only safe while the
+ * server can still recognise it.
+ */
+const SEND_RETRY_WINDOW_S = 24 * 3600;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+interface FailedSend {
+  sessionId: string;
+  /** Re-runs upload + POST with the original stable id; throws on failure. */
+  deliver: () => Promise<void>;
+  inFlight: boolean;
+  /** Failed delivery attempts so far, mirrored onto the bubble. */
+  attempts: number;
+  /** The send owned the turn latch (`status: "streaming"`), so a successful
+   *  re-send re-arms it; a send alongside a live turn never touches it. */
+  latchOnSuccess: boolean;
+}
+
+/**
+ * Sends that failed and can be re-sent, keyed by bubble temp id in send order.
+ * Re-sending the same stable id is always safe: the server dedupes on it and
+ * answers a duplicate with the committed item or the live pending entry, which
+ * is also how a message that did land but lost its response gets confirmed.
+ */
+const failedSends = new Map<string, FailedSend>();
+
+/**
+ * A failure that says nothing about whether the server took the message: a
+ * fetch that produced no HTTP response at all (network down, connection reset),
+ * or a server-side 5xx without a definitive code — the request may have been
+ * persisted before the error. Only 4xx and the runner-unavailable 503 are
+ * definitive refusals.
+ */
+function isTransportError(err: unknown): boolean {
+  if (err instanceof ApiError) return err.status >= 500 && err.code !== RUNNER_UNAVAILABLE_CODE;
+  return err instanceof TypeError;
+}
+
+function settleSendIdle(set: Setter): void {
+  set({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0, backgroundTasks: [] });
+}
+
+function setSendFailed(
+  sessionId: string,
+  tempId: string,
+  failed: PendingUserMessage["failed"],
+): void {
+  setterFor(sessionId)((s) => ({
+    pendingUserMessages: s.pendingUserMessages.map((p) =>
+      p.tempId === tempId ? { ...p, failed } : p,
+    ),
+  }));
+}
+
+/**
+ * Keep a failed bubble across a reload. Attachments that never uploaded (still
+ * on `pending:` placeholder ids) have no server copy to re-send, so such a
+ * bubble stays in tab memory only.
+ */
+function persistFailedBubble(sessionId: string, tempId: string): void {
+  const bubble = setterForState(sessionId)?.pendingUserMessages.find((p) => p.tempId === tempId);
+  if (bubble?.stableId === undefined) return;
+  const unuploaded = bubble.content.some(
+    (b) =>
+      (b.type === "input_image" || b.type === "input_file") &&
+      b.file_id?.startsWith(PENDING_FILE_PREFIX) === true,
+  );
+  if (unuploaded) return;
+  persistPendingSend(sessionId, {
+    stableId: bubble.stableId,
+    content: bubble.content,
+    ...(bubble.createdAtS !== undefined ? { createdAtS: bubble.createdAtS } : {}),
+    ...(bubble.author !== undefined ? { author: bubble.author } : {}),
+  });
+}
+
+function forgetFailedBubble(sessionId: string, tempId: string): void {
+  const bubble = setterForState(sessionId)?.pendingUserMessages.find((p) => p.tempId === tempId);
+  if (bubble?.stableId !== undefined) forgetPendingSend(sessionId, bubble.stableId);
+}
+
+/**
+ * The server accepted a send (first attempt or re-send): the message is now
+ * the server's. Drop the optimistic bubble when the response names a copy
+ * already on screen — a committed item the stream delivered, or a
+ * snapshot-replayed pending entry — otherwise mark it posted and let its
+ * consumed event pop it as usual.
+ */
+function settleAcceptedSend(
+  sessionId: string,
+  tempId: string,
+  postResult: Awaited<ReturnType<typeof postEvent>>,
+): void {
+  forgetFailedBubble(sessionId, tempId);
+  setterFor(sessionId)((s) => {
+    const duplicateOnScreen =
+      (postResult.itemId !== undefined && hasCommittedItem(s.blocks, postResult.itemId)) ||
+      (postResult.pendingId !== undefined &&
+        s.pendingUserMessages.some(
+          (p) => p.tempId === postResult.pendingId && p.tempId !== tempId,
+        ));
+    if (duplicateOnScreen) {
+      return { pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId) };
+    }
+    return {
+      pendingUserMessages: s.pendingUserMessages.map((p) =>
+        p.tempId === tempId ? { ...p, posted: true, failed: undefined } : p,
+      ),
+    };
+  });
+}
+
+async function deliverRevivedSend(
+  sessionId: string,
+  tempId: string,
+  content: MessageContentBlock[],
+  stableId: string,
+): Promise<void> {
+  const postResult = await postEvent(sessionId, {
+    type: "message",
+    data: { role: "user", content, stable_id: stableId },
+  });
+  if (postResult.denied) {
+    forgetPendingSend(sessionId, stableId);
+    setterFor(sessionId)((s) => ({
+      pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+    }));
+    return;
+  }
+  settleAcceptedSend(sessionId, tempId, postResult);
+  queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+}
+
+/**
+ * Revive sends this tab left failed before a reload. Called on a cold load
+ * once the snapshot's pending entries and history are in place: a record whose
+ * stable id the server already shows (a replayed pending entry, or a committed
+ * item persisted under it) is dropped; the rest come back as failed bubbles
+ * and are re-sent once with their original stable id.
+ */
+export function rehydratePersistedSends(conversationId: string): void {
+  const records = readPendingSends(conversationId);
+  if (records.length === 0) return;
+  const state = setterForState(conversationId);
+  if (state === null) return;
+  const nowS = Date.now() / 1000;
+  const revived: PendingUserMessage[] = [];
+  for (const record of records) {
+    // Past the retry window the server no longer remembers the delivery, so a
+    // re-send could run the message twice. The record is dropped instead.
+    if (record.createdAtS !== undefined && nowS - record.createdAtS > SEND_RETRY_WINDOW_S) {
+      forgetPendingSend(conversationId, record.stableId);
+      continue;
+    }
+    // Identity only: a snapshot pending entry or a committed item carrying
+    // this stable id means the server has it. Matching wording is not
+    // evidence — two identical messages are two messages.
+    const serverHasIt =
+      state.pendingUserMessages.some((p) => p.stableId === record.stableId) ||
+      hasCommittedItem(state.blocks, record.stableId);
+    if (serverHasIt) {
+      forgetPendingSend(conversationId, record.stableId);
+      continue;
+    }
+    pendingSeq += 1;
+    const tempId = `pend_${pendingSeq}`;
+    revived.push({
+      tempId,
+      content: record.content,
+      stableId: record.stableId,
+      failed: { attempts: 1 },
+      ...(record.createdAtS !== undefined ? { createdAtS: record.createdAtS } : {}),
+      ...(record.author !== undefined ? { author: record.author } : {}),
+    });
+    failedSends.set(tempId, {
+      sessionId: conversationId,
+      deliver: () => deliverRevivedSend(conversationId, tempId, record.content, record.stableId),
+      inFlight: false,
+      attempts: 1,
+      latchOnSuccess: true,
+    });
+  }
+  if (revived.length === 0) return;
+  setterFor(conversationId)((s) => ({
+    pendingUserMessages: [...s.pendingUserMessages, ...revived],
+  }));
+  void resendFailedSends(conversationId);
+}
+
+/**
+ * Mark a send failed and make it re-sendable: the bubble stays in the
+ * transcript with Retry and Cancel, is remembered across a reload, and is
+ * re-sent once when the stream reconnects or the browser comes back online.
+ * `reason` is the server's message when it refused the send; a thrown fetch
+ * has none. `attempts` counts the deliveries that have failed so far.
+ */
+function registerFailedSend(
+  tempId: string,
+  sessionId: string,
+  deliver: () => Promise<void>,
+  latchOnSuccess: boolean,
+  reason: string | undefined,
+  attempts: number,
+): void {
+  setSendFailed(sessionId, tempId, reason === undefined ? { attempts } : { reason, attempts });
+  persistFailedBubble(sessionId, tempId);
+  failedSends.set(tempId, { sessionId, deliver, inFlight: false, attempts, latchOnSuccess });
+}
+
+async function resendFailedSend(tempId: string): Promise<void> {
+  const entry = failedSends.get(tempId);
+  if (entry === undefined || entry.inFlight) return;
+  const bubble = setterForState(entry.sessionId)?.pendingUserMessages.find(
+    (p) => p.tempId === tempId,
+  );
+  // Cancelled, consumed, or accepted meanwhile: nothing left to deliver.
+  if (bubble === undefined || bubble.posted === true) {
+    failedSends.delete(tempId);
+    return;
+  }
+  entry.inFlight = true;
+  // Take the conversation's send chain so this re-send is ordered with fresh
+  // sends instead of racing one the user typed meanwhile.
+  const chain = enterSendChain(entry.sessionId);
+  try {
+    await chain.waitForPrior();
+    setSendFailed(entry.sessionId, tempId, undefined);
+    await entry.deliver();
+    failedSends.delete(tempId);
+    // Accepted: a bubble still here (not dropped as a duplicate of a committed
+    // copy) starts a fresh turn, so re-arm the working shimmer.
+    const state = setterForState(entry.sessionId);
+    if (
+      entry.latchOnSuccess &&
+      state !== null &&
+      state.status !== "streaming" &&
+      state.pendingUserMessages.some((p) => p.tempId === tempId)
+    ) {
+      setterFor(entry.sessionId)({
+        status: "streaming",
+        activeResponse: null,
+        sendLatchedAt: Date.now(),
+      });
+    }
+  } catch (err) {
+    entry.inFlight = false;
+    entry.attempts += 1;
+    setSendFailed(
+      entry.sessionId,
+      tempId,
+      isTransportError(err)
+        ? { attempts: entry.attempts }
+        : { reason: describeSendFailure(err).message, attempts: entry.attempts },
+    );
+  } finally {
+    chain.releaseSend();
+  }
+}
+
+/**
+ * Re-send every failed message once, oldest first, optionally for one session.
+ * Sequential so a reconnect delivers them in the order they were sent.
+ */
+async function resendFailedSends(sessionId?: string): Promise<void> {
+  /* oxlint-disable no-await-in-loop */
+  for (const [tempId, entry] of [...failedSends]) {
+    if (sessionId !== undefined && entry.sessionId !== sessionId) continue;
+    await resendFailedSend(tempId);
+  }
+  /* oxlint-enable no-await-in-loop */
+}
 let queueSeq = 0;
 // When a send last latched local `status` to "streaming". Stamped on the way in
 // and never cleared on the way out: after a normal turn `status` settles to
@@ -2188,6 +2496,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               {
                 tempId,
                 content,
+                stableId,
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
@@ -2220,6 +2529,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    // Upload + POST for this send, defined once the session is bound. A retry
+    // re-runs it with the same stable id; null while still binding.
+    let deliver: (() => Promise<void>) | null = null;
+    // Native model startup failed or timed out while the draft was still held
+    // locally: that path restores the draft itself, so the send is not retained.
+    let modelGateFailed = false;
+    // Deliveries that have failed for this send: one, or two once the
+    // automatic check also failed.
+    let checkAttempts = 1;
+    // An attachment failed to upload: the message is handed back to the
+    // composer with its files, not retained as a bubble.
+    let uploadFailed = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -2233,103 +2554,185 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
-      postedSessionId = sessionId;
-      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
-
-      // Upload any attached files and build the real content blocks with
-      // server-assigned file_ids (input_image for images, input_file
-      // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
-      // a prior successful upload of the same File so a retry after a
-      // post-phase failure doesn't re-upload — and orphan — blobs that landed.
-      const fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
-      const serverContent: ContentBlock[] = [
-        ...fileBlocks,
-        ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
-      ];
-      if (initialDraft && !initialSendPending()) return;
-
-      // Promote "pending:<filename>" to real file_ids. Claude-native's
-      // session.input.consumed is text-only (transcript round-trip
-      // drops input_image blocks), so the consumed handler falls back
-      // to the pending file blocks — they must already carry real ids.
-      //
-      // Targets the session this send posted to, not the visible one: the
-      // upload can outlive a switch away, and leaving the bubble on
-      // `pending:<filename>` ids means the consumed fallback commits those
-      // placeholders as if they were real attachments.
-      if (fileBlocks.length > 0) {
-        setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, content: serverContent } : p,
-          ),
-        }));
-      }
-
-      if (initialDraft) {
-        // From this point Interrupt belongs to the runner, not the local draft.
-        setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
-          ),
-          status: "streaming",
-          sendLatchedAt: Date.now(),
-        }));
-        initialDispatched = true;
-      }
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
-          stable_id: stableId,
-        },
-      });
-      // Policy denied the input — the server returned immediately
-      // without starting a turn or persisting the user message, so
-      // no session.input.consumed will reconcile this exact optimistic
-      // bubble. Settle local state from the POST response instead of
-      // depending on the live stream being connected.
-      if (postResult.denied) {
-        // Target the session this send posted to: the user may have navigated
-        // away while the POST was open, and settling the VISIBLE conversation
-        // would clobber an unrelated chat's composer state.
-        setterFor(sessionId)((s) => {
-          const patch: Partial<ChatState> = {
-            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-          };
-          if (!alreadyStreaming) {
-            patch.status = "idle";
-            patch.sessionStatus = "idle";
-            patch.backgroundTaskCount = 0;
-            patch.backgroundTasks = [];
+      // Everything from the session bind on, so a re-send repeats exactly these
+      // steps with the same stable id: going offline drops the stream and the
+      // bind re-establishes it before the POST, the upload cache skips blobs
+      // that already landed, and the server dedupes the POST.
+      let boundSessionId: string | null = null;
+      deliver = async () => {
+        if (boundSessionId === null) {
+          boundSessionId = await ensureBoundSession(
+            agentId,
+            get,
+            opts,
+            submitConversationId,
+            rekey,
+          );
+          postedSessionId = boundSessionId;
+          if (initialDraft) {
+            let ready: boolean;
+            try {
+              ready = await waitForModelSelection(boundSessionId, tempId);
+            } catch (gateErr) {
+              modelGateFailed = true;
+              throw gateErr;
+            }
+            if (!ready) return;
           }
-          return patch;
+        }
+        const sessionId = boundSessionId;
+        // Upload any attached files and build the real content blocks with
+        // server-assigned file_ids (input_image for images, input_file
+        // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
+        // a prior successful upload of the same File so a retry after a
+        // post-phase failure doesn't re-upload — and orphan — blobs that landed.
+        let fileBlocks: ContentBlock[];
+        try {
+          fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
+        } catch (uploadErr) {
+          // An attachment never made it up, whether refused or lost to the
+          // network: there is no server copy to re-send, so the message goes
+          // back to the composer with its files, whose draft persistence also
+          // keeps the text across a reload.
+          uploadFailed = true;
+          throw uploadErr;
+        }
+        // Cancelled while the upload was in flight: don't post it. A codex
+        // `/side` has no bubble of its own to check.
+        if (
+          !opensSideChat &&
+          !setterForState(sessionId)?.pendingUserMessages.some((p) => p.tempId === tempId)
+        ) {
+          if (!alreadyStreaming) settleSendIdle(setterFor(sessionId));
+          return;
+        }
+        const serverContent: ContentBlock[] = [
+          ...fileBlocks,
+          ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
+        ];
+        if (initialDraft && !initialSendPending()) return;
+
+        // Promote "pending:<filename>" to real file_ids. Claude-native's
+        // session.input.consumed is text-only (transcript round-trip
+        // drops input_image blocks), so the consumed handler falls back
+        // to the pending file blocks — they must already carry real ids.
+        //
+        // Targets the session this send posted to, not the visible one: the
+        // upload can outlive a switch away, and leaving the bubble on
+        // `pending:<filename>` ids means the consumed fallback commits those
+        // placeholders as if they were real attachments.
+        if (fileBlocks.length > 0) {
+          setterFor(sessionId)((s) => ({
+            pendingUserMessages: s.pendingUserMessages.map((p) =>
+              p.tempId === tempId ? { ...p, content: serverContent } : p,
+            ),
+          }));
+        }
+
+        if (initialDraft) {
+          // From this point Interrupt belongs to the runner, not the local draft.
+          setterFor(sessionId)((s) => ({
+            pendingUserMessages: s.pendingUserMessages.map((p) =>
+              p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
+            ),
+            status: "streaming",
+            sendLatchedAt: Date.now(),
+          }));
+          initialDispatched = true;
+        }
+        const postResult = await postEvent(sessionId, {
+          type: "message",
+          data: {
+            role: "user",
+            content: serverContent,
+            stable_id: stableId,
+          },
         });
-      } else {
-        // POST accepted: the server can now account for this message
-        // (native: pending_inputs replay until the round-trip commits it;
-        // non-native: already persisted). Mark the bubble settled — that is
-        // what releases this conversation's entry for eviction, since the
-        // server can now replay it. The bubble keeps rendering until its
-        // consumed event pops it.
-        setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, posted: true } : p,
-          ),
-        }));
+        // Policy denied the input — the server returned immediately
+        // without starting a turn or persisting the user message, so
+        // no session.input.consumed will reconcile this exact optimistic
+        // bubble. Settle local state from the POST response instead of
+        // depending on the live stream being connected.
+        if (postResult.denied) {
+          forgetFailedBubble(sessionId, tempId);
+          // Target the session this send posted to: the user may have navigated
+          // away while the POST was open, and settling the VISIBLE conversation
+          // would clobber an unrelated chat's composer state.
+          setterFor(sessionId)((s) => {
+            const patch: Partial<ChatState> = {
+              pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+            };
+            if (!alreadyStreaming) {
+              patch.status = "idle";
+              patch.sessionStatus = "idle";
+              patch.backgroundTaskCount = 0;
+              patch.backgroundTasks = [];
+            }
+            return patch;
+          });
+        } else {
+          // POST accepted: the server can now account for this message
+          // (native: pending_inputs replay until the round-trip commits it;
+          // non-native: already persisted). Mark the bubble settled — that is
+          // what releases this conversation's entry for eviction, since the
+          // server can now replay it. The bubble keeps rendering until its
+          // consumed event pops it.
+          settleAcceptedSend(sessionId, tempId, postResult);
+        }
+        // Note: native-terminal messages return a `pending_id`, but the
+        // optimistic bubble deliberately keeps its client temp id as its
+        // stable React key — swapping it to the server id mid-send forces
+        // a bubble remount (a visible flink). The eventual
+        // `session.input.consumed` clears this bubble by FIFO order (its
+        // `clearedPendingId` matches only snapshot-hydrated bubbles, which
+        // already carry the server id); see the consumed handler.
+        // Refresh the sidebar without waiting for the 4 s `useConversations`
+        // poll — picks up server-side title auto-gen and any runner_id /
+        // status transitions that happen during the turn.
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      };
+      try {
+        await deliver();
+      } catch (firstErr) {
+        // A thrown fetch says nothing about whether the server took the
+        // message. Ask once, a second later, with the same stable id: the
+        // server dedupes it and answers with the committed copy if it landed.
+        // This runs while the send still holds the chain, so a message typed
+        // meanwhile cannot overtake the one being checked.
+        // Nothing to check when the attachment never uploaded (no server copy),
+        // when the caller runs its own recovery (the queue flush), or when the
+        // session never bound (a navigate-first first send). A failed re-bind
+        // of a dropped stream on an existing conversation is checked like a
+        // failed POST: the re-attempt binds again.
+        const checkTarget = postedSessionId ?? submitConversationId;
+        if (
+          uploadFailed ||
+          modelGateFailed ||
+          opts?.onError !== undefined ||
+          !isTransportError(firstErr) ||
+          checkTarget === null ||
+          (postedSessionId === null && opts?.reusePendingTempId !== undefined)
+        ) {
+          throw firstErr;
+        }
+        const stillPending = (): boolean =>
+          setterForState(checkTarget)?.pendingUserMessages.some((p) => p.tempId === tempId) ??
+          false;
+        if (!stillPending()) throw firstErr;
+        setSendFailed(checkTarget, tempId, { attempts: 1 });
+        // Remembered now, not after the check: a reload during the wait must
+        // bring the message back with its stable id. Confirmation forgets it.
+        persistFailedBubble(checkTarget, tempId);
+        await sleep(SEND_CHECK_DELAY_MS);
+        if (!stillPending()) throw firstErr;
+        setSendFailed(checkTarget, tempId, undefined);
+        try {
+          await deliver();
+        } catch (checkErr) {
+          checkAttempts = 2;
+          throw checkErr;
+        }
       }
-      // Note: native-terminal messages return a `pending_id`, but the
-      // optimistic bubble deliberately keeps its client temp id as its
-      // stable React key — swapping it to the server id mid-send forces
-      // a bubble remount (a visible flink). The eventual
-      // `session.input.consumed` clears this bubble by FIFO order (its
-      // `clearedPendingId` matches only snapshot-hydrated bubbles, which
-      // already carry the server id); see the consumed handler.
-      // Refresh the sidebar without waiting for the 4 s `useConversations`
-      // poll — picks up server-side title auto-gen and any runner_id /
-      // status transitions that happen during the turn.
-      queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
@@ -2348,79 +2751,116 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // run so the parent isn't left mid-send.
       const callerHandlesError = opts?.onError !== undefined;
       opts?.onError?.(message);
-      // Hand the failed message back to the composer so the user can retry it —
-      // a failed send has no server-side record, so nothing else would restore
-      // it. Keyed by the session it was meant for, so it lands in the right
-      // composer even after a switch away. Written to that conversation's entry
-      // (`failedSendDraft` is conversation-scoped); the composer reads whichever
-      // conversation is active and guards on the id before restoring.
-      const draftSessionId = postedSessionId ?? submitConversationId;
-      if (
-        !callerHandlesError &&
-        draftSessionId !== null &&
-        (text.trim() !== "" || (files?.length ?? 0) > 0)
-      ) {
-        setterFor(draftSessionId)({
-          failedSendDraft: {
-            conversationId: draftSessionId,
-            text,
-            files: files ?? [],
-            stableId,
-            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
-          },
-        });
-      }
-      // Settle the conversation this send targeted, wherever the user is now:
-      // its bubble must roll back and its status must not stay "streaming"
-      // forever. Target `postedSessionId ?? submitConversationId` (mirroring the
-      // draft restore above): a bind failure throws before `postedSessionId` is
-      // assigned, but the pin/submit id already names the session — so a failed
-      // navigate-first first turn settles the REAL new session, not whatever
-      // chat the user has since switched to. Null id (the landing composer's own
-      // failure) falls back to the active conversation.
+      // Settle the conversation this send targeted, wherever the user is now.
+      // Target `postedSessionId ?? submitConversationId`: a bind failure throws
+      // before `postedSessionId` is assigned, but the pin/submit id already
+      // names the session — so a failed navigate-first first turn settles the
+      // REAL new session, not whatever chat the user has since switched to.
+      // Null id (the landing composer's own failure) falls back to the active
+      // conversation.
       const failTarget = postedSessionId ?? submitConversationId;
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
-      failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-      }));
+      // Any failure after the session was bound keeps the bubble in the
+      // transcript as "Failed · Retry · Cancel", with the server's reason when
+      // it gave one, and leaves the composer alone. A bind failure has no
+      // session to retry against, and a caller with its own error UX wants
+      // the rollback, so those still hand the text back as a draft.
+      // Three cases keep their own recovery: a draft the native model gate
+      // turned away (startup failed or timed out) restores itself, a message
+      // whose attachment never uploaded goes back to the composer with its
+      // files, and a navigate-first send whose session never bound has nothing
+      // to retry against. Everything else, including a failed re-bind of a
+      // dropped stream on an existing conversation, is re-sendable.
+      let retained = false;
+      if (
+        deliver !== null &&
+        failTarget !== null &&
+        !callerHandlesError &&
+        !modelGateFailed &&
+        !uploadFailed &&
+        (postedSessionId !== null || opts?.reusePendingTempId === undefined)
+      ) {
+        retained = true;
+        const stillPending =
+          setterForState(failTarget)?.pendingUserMessages.some((p) => p.tempId === tempId) ?? false;
+        // Cancelled while the request was in flight: nothing left to keep.
+        if (stillPending) {
+          registerFailedSend(
+            tempId,
+            failTarget,
+            deliver,
+            !alreadyStreaming,
+            isTransportError(err) ? undefined : message,
+            checkAttempts,
+          );
+        }
+      } else {
+        // Hand the failed message back to the composer so the user can retry
+        // it — nothing else would restore it. Keyed by the session it was
+        // meant for, so it lands in the right composer even after a switch
+        // away (`failedSendDraft` is conversation-scoped).
+        if (
+          !callerHandlesError &&
+          failTarget !== null &&
+          (text.trim() !== "" || (files?.length ?? 0) > 0)
+        ) {
+          setterFor(failTarget)({
+            failedSendDraft: {
+              conversationId: failTarget,
+              text,
+              files: files ?? [],
+              stableId,
+              ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+            },
+          });
+        }
+        // Roll back the optimistic bubble — no server idle will fire.
+        failSet((s) => ({
+          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        }));
+      }
       if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
           finalizeActive(failSet, "failed", message, null);
-        } else if (!callerHandlesError) {
-          // No response bubble to carry the failure — the turn never started
-          // (e.g. the runner never came online, so POST /events 503'd). Append
-          // a standalone error block so the user sees WHY nothing happened
-          // instead of being left on a silent, empty composer. Skipped when the
-          // caller owns the error UX (it surfaces the failure elsewhere).
+        } else if (!callerHandlesError && !retained) {
+          // No bubble carries the failure — append a standalone error block so
+          // the user sees WHY nothing happened. A retained bubble shows the
+          // reason itself.
           failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
         }
-        failSet({
-          status: "idle",
-          sessionStatus: "idle",
-          backgroundTaskCount: 0,
-          backgroundTasks: [],
-        });
-      } else {
-        // Sent alongside an already-streaming turn (or a stranded latch): the
-        // bubble is rolled back above, so without a block the message vanishes
-        // with no trace — the failure mode that makes this class of bug so hard
-        // to see. Surface it WITHOUT touching the turn lifecycle: finalizeActive
-        // would fail a live response, and settling status would end a turn that
-        // is still running. Skipped when the caller owns the error UX.
-        if (!callerHandlesError) {
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
-        }
+        settleSendIdle(failSet);
+      } else if (!callerHandlesError && !retained) {
+        // Sent alongside an already-streaming turn: surface the failure
+        // WITHOUT touching the turn lifecycle — finalizeActive would fail a
+        // live response, and settling status would end a running turn.
+        failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
       }
     } finally {
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
     }
+  },
+
+  retryPendingSend: async (tempId) => {
+    await resendFailedSend(tempId);
+  },
+
+  cancelPendingSend: (tempId) => {
+    const entry = failedSends.get(tempId);
+    const sessionId = entry?.sessionId ?? get().conversationId;
+    failedSends.delete(tempId);
+    if (sessionId === null) return;
+    forgetFailedBubble(sessionId, tempId);
+    // A bubble whose first POST is still in flight is dropped here too; its
+    // send notices on failure and releases the turn latch.
+    setterFor(sessionId)((s) => ({
+      pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+    }));
   },
 
   sendSlashCommand: async (name, args, agentId, opts) => {
@@ -4078,6 +4518,7 @@ async function bindStream(
         tempId: p.pendingId,
         content: p.content,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
+        ...(p.stableId !== undefined ? { stableId: p.stableId } : {}),
       });
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
@@ -4191,6 +4632,9 @@ async function bindStream(
       };
     });
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
+    // Sends this tab parked before a reload come back and are re-sent now that
+    // the snapshot shows what the server already has.
+    if (hydratePending) rehydratePersistedSends(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
     if (isConversationDisposed(id)) return;
@@ -4765,6 +5209,10 @@ async function reconcileOnReconnect(
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
 ): Promise<void> {
   if (queryClient === null) return;
+  // Re-send parked messages BEFORE fetching the backfill: each 2xx names the
+  // committed item (or the still-live pending id), so a bubble is swapped for
+  // its own committed copy instead of flashing next to a duplicate.
+  await resendFailedSends(id);
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
@@ -4960,7 +5408,10 @@ if (typeof document !== "undefined") {
   });
 }
 if (typeof window !== "undefined") {
-  window.addEventListener("online", () => recycleStreamIfStale());
+  window.addEventListener("online", () => {
+    recycleStreamIfStale();
+    void resendFailedSends();
+  });
 }
 
 /**
@@ -6007,6 +6458,31 @@ function committedContentFor(
  *   across the swap (no remount/flink). Omit for foreign/TUI messages
  *   that had no optimistic predecessor — they mount fresh.
  */
+/**
+ * Which optimistic bubble a consumed event acknowledges. In-flight and posted
+ * bubbles are matched by queue position: per-session ordering makes the oldest
+ * the right one. A failed bubble has left the queue, so it is matched only by
+ * identity — the receipt's `stable_id` (the submission it acknowledges), or the
+ * committed item id when that is the stable id, as on the SDK path — and only
+ * when the queue head does not match that receipt itself. Wording is never
+ * evidence. Returns -1 when nothing should be acknowledged (an unsent draft at
+ * the head, or nothing waits).
+ */
+function pickPendingForConsumed(
+  pending: PendingUserMessage[],
+  itemId: string,
+  stableId: string | undefined,
+): number {
+  const submissionId = stableId ?? itemId;
+  const matches = (p: PendingUserMessage): boolean =>
+    p.stableId !== undefined && p.stableId === submissionId;
+  const firstLive = pending.findIndex((p) => p.failed === undefined);
+  const head = firstLive >= 0 && !pending[firstLive]!.initialDraft ? firstLive : -1;
+  const failedIdx = pending.findIndex((p) => p.failed !== undefined && matches(p));
+  if (failedIdx >= 0 && (head < 0 || !matches(pending[head]!))) return failedIdx;
+  return head;
+}
+
 function committedUserBlock(
   itemId: string,
   content: MessageContentBlock[],
@@ -6748,6 +7224,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //   3. No pending entry — render the event payload as a fresh
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
+      // A failed bubble acknowledged by its receipt is delivered: release its
+      // re-send registration and the reload record too, or a later reload could
+      // revive a message the server already has.
+      let acknowledgedFailed: PendingUserMessage | undefined;
+      const noteAcknowledged = (
+        pending: PendingUserMessage[],
+        index: number,
+      ): PendingUserMessage[] => {
+        const bubble = pending[index];
+        if (bubble?.failed !== undefined) acknowledgedFailed = bubble;
+        return pending.filter((_, i) => i !== index);
+      };
       applyToConversation((s) => {
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
@@ -6773,9 +7261,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
-            return {};
-          return { pendingUserMessages: s.pendingUserMessages.slice(1) };
+          const ack = pickPendingForConsumed(s.pendingUserMessages, event.itemId, event.stableId);
+          if (ack < 0) return {};
+          return { pendingUserMessages: noteAcknowledged(s.pendingUserMessages, ack) };
         }
 
         // 1. Drop by id when the server names the drained entry.
@@ -6814,18 +7302,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    uploads to the marker and leave the real message empty. A
         //    `[System: …]` notice DOES have a pending entry, but the server
         //    drains it and names it via `clearedPendingId`, so it lands on
-        //    branch 1 and never reaches this fallback.
+        //    branch 1 and never reaches this fallback. A failed bubble is out
+        //    of the queue and is acknowledged only by identity (see
+        //    `pickPendingForConsumed`).
         const eventContent = userContentFromEvent(event);
-        const head =
-          (eventContent !== null && isSystemUserContent(eventContent)) ||
-          s.pendingUserMessages[0]?.initialDraft
-            ? undefined
-            : s.pendingUserMessages[0];
+        const headIdx =
+          eventContent !== null && isSystemUserContent(eventContent)
+            ? -1
+            : pickPendingForConsumed(s.pendingUserMessages, event.itemId, event.stableId);
+        const head = headIdx >= 0 ? s.pendingUserMessages[headIdx] : undefined;
         if (head) {
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
           return {
-            pendingUserMessages: s.pendingUserMessages.slice(1),
+            pendingUserMessages: noteAcknowledged(s.pendingUserMessages, headIdx),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
             blocks: [
@@ -6851,6 +7341,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           ],
         };
       });
+      if (acknowledgedFailed !== undefined) {
+        failedSends.delete(acknowledgedFailed.tempId);
+        const conversationId = streamConversationId ?? useChatStore.getState().conversationId;
+        if (conversationId !== null && acknowledgedFailed.stableId !== undefined) {
+          forgetPendingSend(conversationId, acknowledgedFailed.stableId);
+        }
+      }
       return;
     case "slash_command":
       // Claude-native: a `/skill-name` or surfaced CLI command typed

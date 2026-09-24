@@ -7782,3 +7782,30 @@ def test_get_conversation_keeps_distinct_query_names(
         "omnigent.conversation_store.select_conversation_metadata_by_id",
         "omnigent.conversation_store.select_conversation_labels",
     ], names
+
+
+def test_get_item_is_a_point_lookup_scoped_to_the_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A web re-send is matched to its stored item by id only within its own conversation."""
+    conv = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+    stable = "cd" * 16
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_x",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+                stable_id=stable,
+            )
+        ],
+    )
+    found = conversation_store.get_item(conv.id, stable)
+    assert found is not None
+    assert found.id == stable
+    assert isinstance(found.data, MessageData)
+    assert found.data.content == [{"type": "input_text", "text": "hi"}]
+    assert conversation_store.get_item(other.id, stable) is None
+    assert conversation_store.get_item(conv.id, "ef" * 16) is None

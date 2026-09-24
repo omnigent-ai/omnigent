@@ -1628,6 +1628,7 @@ def _publish_input_consumed(
     session_id: str,
     item: ConversationItem,
     cleared_pending_id: str | None = None,
+    stable_id: str | None = None,
 ) -> None:
     """
     Publish a ``session.input.consumed`` event for a just-persisted
@@ -1646,6 +1647,9 @@ def _publish_input_consumed(
         web message mirrored back from the transcript), that entry's
         id, e.g. ``"pending_a1b2c3"`` — so clients drop the optimistic
         bubble by id. ``None`` when nothing was drained.
+    :param stable_id: The web client's own submission id for this message,
+        when it came from one, so the client can match the receipt to its
+        bubble by identity even when the item id is forwarder-derived.
 
     Hidden context items (``is_meta``, e.g. injected skill text or a
     Claude background-task notification) are published too, flagged in
@@ -1661,6 +1665,7 @@ def _publish_input_consumed(
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
+            stable_id=stable_id,
         ),
     )
     session_stream.publish(session_id, event.model_dump())
@@ -2896,6 +2901,7 @@ def _publish_external_conversation_item(
     item: ConversationItem,
     cleared_pending_id: str | None = None,
     message_id: str | None = None,
+    stable_id: str | None = None,
 ) -> None:
     """
     Broadcast a terminal-observed conversation item.
@@ -2919,7 +2925,9 @@ def _publish_external_conversation_item(
     """
     if item.type == "message" and isinstance(item.data, MessageData):
         if item.data.role == "user":
-            _publish_input_consumed(session_id, item, cleared_pending_id=cleared_pending_id)
+            _publish_input_consumed(
+                session_id, item, cleared_pending_id=cleared_pending_id, stable_id=stable_id
+            )
             return
         if item.data.is_meta:
             # Hidden context on a non-user message has no live rendering

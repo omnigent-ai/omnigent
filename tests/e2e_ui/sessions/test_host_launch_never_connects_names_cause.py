@@ -28,7 +28,6 @@ from tests.e2e_ui.conftest import _register_extra_agent
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # The error code determines the banner headline.
-_EXPECTED_HEADLINE = "The session's runner isn't connected to the server."
 # The expanded body names the failed connection phase.
 _EXPECTED_CAUSE_SUBSTRING = "never connected to the server"
 _RUNNER_TOKEN_PATTERN = re.compile(r"runner_token_[0-9a-f]+")
@@ -191,16 +190,15 @@ def test_host_session_that_never_connects_names_the_cause(
         # The send relaunches; the wedger freezes that runner too.
         composer.fill("hello? is anything happening?")
         composer.press("Enter")
-        error_pill = page.get_by_test_id("error-pill")
-        expect(error_pill).to_be_visible(timeout=150_000)
-        expect(page.get_by_test_id("error-headline")).to_have_text(
-            _EXPECTED_HEADLINE, timeout=15_000
-        )
-
-        # Keep the named runner and phase visible for the recording.
-        error_pill.click()
-        expect(page.get_by_text(_EXPECTED_CAUSE_SUBSTRING)).to_be_visible(timeout=15_000)
+        # The refused send stays in the transcript as "Failed · Retry · Cancel";
+        # the server's phase-specific cause is the footer's reason line.
+        footer = page.locator('[data-testid="send-delivery"][data-state="failed"]')
+        expect(footer).to_be_visible(timeout=150_000)
+        expect(footer).to_contain_text("Failed")
+        expect(footer).to_contain_text(_EXPECTED_CAUSE_SUBSTRING, timeout=15_000)
         expect(page.get_by_text(_RUNNER_TOKEN_PATTERN)).to_be_visible()
+        expect(page.get_by_role("button", name="Retry")).to_be_visible()
+        # Keep the named runner and phase visible for the recording.
         page.wait_for_timeout(2_500)
 
         assert not _runner_online(live_server, gen1_id), (

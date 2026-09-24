@@ -421,3 +421,192 @@ def test_stable_id_dedup_scoped_per_conversation() -> None:
     id_a = pending_inputs.record("conv_scope_a", [_text_block("x")], stable_id=stable)
     id_b = pending_inputs.record("conv_scope_b", [_text_block("x")], stable_id=stable)
     assert id_a != id_b
+
+
+def test_submission_for_resolves_a_live_entry_with_its_identity() -> None:
+    """
+    A client re-send resolves to the live entry recorded under its stable id.
+
+    The route answers a duplicate POST with the first delivery's pending id
+    instead of forwarding again, and needs the content and author the entry
+    was posted with to refuse a different message reusing the id. The lookup
+    matches the stable id exactly and returns nothing for an unknown or
+    discarded one.
+    """
+    stable = "a" * 32
+    pid = pending_inputs.record(
+        "conv_a", [_text_block("hi")], created_by="alice@example.com", stable_id=stable
+    )
+
+    assert pending_inputs.submission_for("conv_a", stable) == pending_inputs.RecordedSubmission(
+        content=[_text_block("hi")], created_by="alice@example.com", pending_id=pid
+    )
+    assert pending_inputs.submission_for("conv_a", "b" * 32) is None
+    assert pending_inputs.submission_for("conv_other", stable) is None
+
+    pending_inputs.resolve_oldest("conv_a")  # discarded (/clear), not persisted
+    assert pending_inputs.submission_for("conv_a", stable) is None
+
+
+def test_committed_submission_is_remembered_until_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A drained submission resolves to its committed item until the TTL passes.
+
+    After the forwarder drains the entry, a client retry of the same stable
+    id must find the persisted item (so the prompt is not pasted twice) for
+    as long as a still-open tab could plausibly retry, and no longer. The
+    posted content and author travel with it.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    stable = "c" * 32
+    drained = pending_inputs.DrainedInput(
+        pending_id="pending_x",
+        content=[_text_block("hi")],
+        created_by="alice@example.com",
+        stable_id=stable,
+    )
+
+    assert pending_inputs.submission_for("conv_a", stable) is None
+    pending_inputs.remember_committed("conv_a", drained, "item_1")
+    assert pending_inputs.submission_for("conv_a", stable) == pending_inputs.RecordedSubmission(
+        content=[_text_block("hi")], created_by="alice@example.com", item_id="item_1"
+    )
+    assert pending_inputs.submission_for("conv_other", stable) is None
+
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S - 0.1
+    assert pending_inputs.submission_for("conv_a", stable).item_id == "item_1"
+
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S + 0.1
+    assert pending_inputs.submission_for("conv_a", stable) is None
+
+
+def test_persisting_submission_resolves_to_its_pending_id_until_settled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Between drain and commit a submission is still known — by its pending id.
+
+    Draining the entry and appending the mirrored item are separated by an
+    await. A re-send in that window must not be told the message is committed
+    (the append may still fail), so it gets the pending id; a failed append
+    restores the entry to the queue, a successful one commits it. A marker
+    nobody settles is dropped with the pending-input TTL.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    stable = "d" * 32
+    pid = pending_inputs.record("conv_a", [_text_block("hi")], stable_id=stable)
+
+    drained = pending_inputs.resolve_oldest("conv_a")
+    assert drained is not None
+    pending_inputs.begin_persist("conv_a", drained)
+    known = pending_inputs.submission_for("conv_a", stable)
+    assert known is not None and (known.pending_id, known.item_id) == (pid, None)
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+    pending_inputs.restore("conv_a", drained)  # the append failed
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [pid]
+    assert pending_inputs.submission_for("conv_a", stable).pending_id == pid
+
+    drained = pending_inputs.resolve_oldest("conv_a")
+    assert drained is not None
+    pending_inputs.begin_persist("conv_a", drained)
+    pending_inputs.remember_committed("conv_a", drained, "item_1")  # the retry landed
+    assert pending_inputs.submission_for("conv_a", stable).item_id == "item_1"
+    assert pending_inputs._persisting.get("conv_a") is None
+
+    pending_inputs.begin_persist(
+        "conv_b", pending_inputs.DrainedInput(pending_id="pending_y", content=[], stable_id=stable)
+    )
+    clock["t"] += pending_inputs._TTL_S + 1
+    assert pending_inputs.submission_for("conv_b", stable) is None
+
+
+def test_committed_memory_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Committed submissions are swept on write: by age and by a per-conversation cap.
+
+    The cap is a memory bound far above a day of one conversation's messages;
+    within it, only age evicts, so a retry inside the window always resolves.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    def drained(stable: str) -> pending_inputs.DrainedInput:
+        return pending_inputs.DrainedInput(pending_id="p", content=[], stable_id=stable)
+
+    pending_inputs.remember_committed("conv_a", drained("a" * 32), "item_a")
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S + 1
+    pending_inputs.remember_committed(
+        "conv_a", drained("b" * 32), "item_b"
+    )  # sweeps the stale one
+    assert pending_inputs.submission_for("conv_a", "a" * 32) is None
+    assert pending_inputs.submission_for("conv_a", "b" * 32).item_id == "item_b"
+
+    cap = pending_inputs._COMMITTED_MAX_PER_CONVERSATION
+    assert cap >= 4096
+    for i in range(cap):
+        pending_inputs.remember_committed("conv_cap", drained(f"{i:032x}"), f"item_{i}")
+    assert pending_inputs.submission_for("conv_cap", f"{0:032x}").item_id == "item_0"
+    pending_inputs.remember_committed("conv_cap", drained(f"{cap:032x}"), "item_over")
+    assert pending_inputs.submission_for("conv_cap", f"{0:032x}") is None
+    assert pending_inputs.submission_for("conv_cap", f"{1:032x}").item_id == "item_1"
+
+
+def test_dispatched_memory_tracks_delivery_not_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Only a forward the runner accepted counts as done, and only until the TTL.
+
+    The SDK path persists the item before forwarding, so the store's dedup
+    alone would answer a retry of a rejected forward with success. Nothing is
+    recorded for a failed forward, so that retry dispatches again.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    stable = "b" * 32
+
+    assert pending_inputs.dispatch_done("conv_a", stable) is False
+    pending_inputs.mark_dispatched("conv_a", stable)
+    assert pending_inputs.dispatch_done("conv_a", stable) is True
+    assert pending_inputs.dispatch_done("conv_other", stable) is False
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S + 1
+    assert pending_inputs.dispatch_done("conv_a", stable) is False
+
+
+def test_snapshot_carries_the_web_stable_id() -> None:
+    """A reloading client matches its un-acked send to the snapshot entry by identity."""
+    pending_inputs.record("conv_a", [_text_block("mine")], stable_id="a" * 32)
+    pending_inputs.record("conv_a", [_text_block("typed in the terminal")])
+    snapshot = pending_inputs.snapshot_for("conv_a")
+    assert [entry.get("stable_id") for entry in snapshot] == ["a" * 32, None]
+    assert "stable_id" not in snapshot[1]
+
+
+def test_dispatched_memory_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Successful sends are swept on write: by age and by a per-conversation cap.
+
+    Ordinary sends are never queried again, so eviction cannot rely on reads.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    pending_inputs.mark_dispatched("conv_a", "a" * 32)
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S + 1
+    pending_inputs.mark_dispatched("conv_a", "b" * 32)  # the write sweeps the stale one
+    assert pending_inputs.dispatch_done("conv_a", "a" * 32) is False
+    assert pending_inputs.dispatch_done("conv_a", "b" * 32) is True
+
+    for i in range(pending_inputs._COMMITTED_MAX_PER_CONVERSATION + 5):
+        pending_inputs.mark_dispatched("conv_cap", f"{i:032x}")
+    assert pending_inputs.dispatch_done("conv_cap", f"{0:032x}") is False
+    assert pending_inputs.dispatch_done("conv_cap", f"{5:032x}") is True
+    assert (
+        pending_inputs.dispatch_done(
+            "conv_cap", f"{pending_inputs._COMMITTED_MAX_PER_CONVERSATION + 4:032x}"
+        )
+        is True
+    )

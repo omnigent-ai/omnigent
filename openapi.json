@@ -5609,6 +5609,18 @@
             "title": "Item Id",
             "type": "string"
           },
+          "stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Stable Id"
+          },
           "type": {
             "description": "The item type discriminator \u2014 `\"message\"` for user messages, `\"function_call_output\"` for tool results, etc. Mirrors `omnigent.server.schemas.SessionEventInput`'s `type` field.",
             "title": "Type",

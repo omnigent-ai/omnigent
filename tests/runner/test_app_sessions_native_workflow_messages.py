@@ -2289,3 +2289,114 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         f"interrupt must forward to the harness then finalize the turn with one "
         f"marker; got {len(markers)}."
     )
+
+
+async def test_forwarded_message_with_a_known_persisted_item_id_does_not_run_twice() -> None:
+    """A re-forward of a message this runner already started is acknowledged, not re-run.
+
+    The server dedupes web re-sends of one ``stable_id``, but its memory is
+    process-local: after a server restart the retry of a message whose reply
+    was lost arrives here as a fresh forward with the same
+    ``persisted_item_id``. The runner outlives the server, so it must not
+    start (or buffer) a second turn for it.
+    """
+    import asyncio as _aio
+
+    gate = _aio.Event()
+    app, _pm, _hc = _build_blocking_app(gate)
+    conv = "3fa2b0c1d4e5f60718293a4b5c6d7e8f"
+    body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "run me once"}],
+        "harness": "openai-agents",
+        "persisted_item_id": "a" * 32,
+    }
+
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": conv, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+
+        async def _run_first_turn() -> None:
+            resp = await client.post(f"/v1/sessions/{conv}/events", json=body)
+            async for _ in resp.aiter_text():
+                pass
+
+        turn_task = _aio.create_task(_run_first_turn())
+        await _aio.sleep(0.05)
+
+        duplicate = await client.post(f"/v1/sessions/{conv}/events", json=body)
+        assert duplicate.status_code == 202, duplicate.text
+        assert duplicate.json()["status"] == "duplicate"
+
+        gate.set()
+        await _aio.wait_for(turn_task, timeout=10)
+        # Not buffered for later either: a buffered copy would be delivered to
+        # the harness as a second turn once the first one finished.
+        await _aio.sleep(0.2)
+        assert len(_hc.posted_bodies) == 1
+
+
+async def test_forwarded_message_that_failed_before_acceptance_is_not_treated_as_a_duplicate() -> (
+    None
+):
+    """A message whose first forward died before it was taken is delivered by its retry.
+
+    The runner records a ``persisted_item_id`` only when it actually buffers or
+    starts the message. A forward that fails while resolving attachments (or is
+    cancelled by the server's timeout) leaves no record, so the server's retry
+    of the same id is a fresh delivery and the harness sees it exactly once.
+    """
+    import asyncio as _aio
+
+    from omnigent.runner import app as runner_app
+
+    gate = _aio.Event()
+    app, _pm, _hc = _build_blocking_app(gate)
+    conv = "5b6c7d8e9f0a1b2c3d4e5f6071829304"
+    body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "deliver me once"}],
+        "harness": "openai-agents",
+        "persisted_item_id": "b" * 32,
+    }
+    real_resolve = runner_app._resolve_forwarded_message_content
+    calls = {"n": 0}
+
+    async def flaky_resolve(*args: object, **kwargs: object) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("attachment store unreachable")
+        return await real_resolve(*args, **kwargs)  # type: ignore[arg-type]
+
+    runner_app._resolve_forwarded_message_content = flaky_resolve  # type: ignore[assignment]
+    try:
+        async with _runner_client(app) as client:
+            await client.post(
+                "/v1/sessions",
+                json={"session_id": conv, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+            )
+            # The test transport re-raises app exceptions: the first forward dies
+            # while resolving attachments, before the message is taken.
+            with pytest.raises(RuntimeError, match="attachment store unreachable"):
+                await client.post(f"/v1/sessions/{conv}/events", json=body)
+
+            # The retry is a fresh delivery: accepted (queued for a background
+            # turn), not answered as a duplicate.
+            retry = await client.post(f"/v1/sessions/{conv}/events", json=body)
+            assert retry.status_code == 202, retry.text
+            assert retry.json().get("status") != "duplicate", retry.text
+            gate.set()
+            for _ in range(100):
+                if len(_hc.posted_bodies) >= 1:
+                    break
+                await _aio.sleep(0.05)
+            await _aio.sleep(0.2)
+            assert len(_hc.posted_bodies) == 1
+    finally:
+        runner_app._resolve_forwarded_message_content = real_resolve  # type: ignore[assignment]

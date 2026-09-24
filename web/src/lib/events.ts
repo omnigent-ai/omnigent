@@ -760,6 +760,10 @@ export interface SessionInputConsumedEvent {
   createdBy?: string;
   /** Decoded item payload — heterogeneous, `itemType`-specific. */
   data: Record<string, unknown>;
+  /** The web client's own submission id for this message, when the server
+   *  knows it, so a failed bubble can be acknowledged by identity even when
+   *  the persisted item carries a forwarder-derived id. */
+  stableId?: string;
   /**
    * When this consumed message drained a server pending-input entry
    * (a native-terminal web message round-tripping back from the

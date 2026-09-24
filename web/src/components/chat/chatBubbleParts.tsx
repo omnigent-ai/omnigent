@@ -15,6 +15,7 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  CircleAlertIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
@@ -60,7 +61,12 @@ import {
   isTextBlock,
   keyedAttachments,
 } from "@/lib/blocks";
-import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+import {
+  type Bubble,
+  type RenderItem,
+  bubblesEqual,
+  type PendingDelivery,
+} from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
@@ -209,6 +215,16 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
+      // A local first draft awaiting model selection is not in flight yet, so
+      // it gets no delivery footer.
+      ...(p.initialDraft === undefined
+        ? {
+            delivery: {
+              posted: p.posted === true,
+              ...(p.failed !== undefined ? { failed: p.failed } : {}),
+            },
+          }
+        : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -673,6 +689,98 @@ function useCopyMessageLink(messageId: string | null): {
   return { isLinkCopied, handleCopyLink };
 }
 
+/** A send unconfirmed this long shows its spinner; most sends confirm sooner. */
+/** Unconfirmed for this long: show the spinner. */
+const SEND_SPINNER_DELAY_MS = 5_000;
+/** Unconfirmed for this long, and the automatic check re-send also failed: show "Failed". */
+const SEND_FAILED_AFTER_MS = 20_000;
+
+/** Flips to true once `sinceMs` have passed since `sentAtMs` (immediately when already past). */
+function useElapsed(sentAtMs: number, sinceMs: number): boolean {
+  const [elapsed, setElapsed] = useState(() => Date.now() - sentAtMs >= sinceMs);
+  useEffect(() => {
+    if (elapsed) return;
+    const timer = setTimeout(() => setElapsed(true), sentAtMs + sinceMs - Date.now());
+    return () => clearTimeout(timer);
+  }, [elapsed, sentAtMs, sinceMs]);
+  return elapsed;
+}
+
+/**
+ * Delivery state under an optimistic user bubble. Nothing for a send that
+ * confirms quickly; a spinner once it has been unconfirmed for a few seconds.
+ * A thrown fetch keeps the spinner: the store re-sends once to learn whether
+ * the message landed (the server dedupes on the stable id), and only when that
+ * check also failed and the message has been unconfirmed for a while does the
+ * footer read "Failed · Retry · Cancel". A server refusal reads "Failed" at
+ * once, with its reason.
+ */
+function PendingDeliveryFooter({
+  tempId,
+  delivery,
+  sentAtMs,
+}: {
+  tempId: string;
+  delivery: PendingDelivery;
+  /** Client send time; a revived bubble without one counts as long past. */
+  sentAtMs: number;
+}) {
+  const accepted = delivery.posted && delivery.failed === undefined;
+  const slow = useElapsed(sentAtMs, SEND_SPINNER_DELAY_MS);
+  const matured = useElapsed(sentAtMs, SEND_FAILED_AFTER_MS);
+  if (accepted) return null;
+  const failed =
+    delivery.failed !== undefined &&
+    (delivery.failed.reason !== undefined || (delivery.failed.attempts >= 2 && matured));
+  if (!failed && !slow) return null;
+  const actionClass =
+    "rounded-sm font-medium text-foreground underline decoration-foreground/30 underline-offset-[3px] hover:decoration-foreground focus-visible:outline-2 focus-visible:outline-ring";
+  return (
+    <div
+      className="flex flex-col items-end gap-0.5 pt-1 pr-1"
+      data-testid="send-delivery"
+      data-state={failed ? "failed" : "sending"}
+    >
+      <div
+        className={cn(
+          "flex items-center gap-2 text-xs leading-none",
+          failed ? "text-destructive" : "text-muted-foreground",
+        )}
+      >
+        {failed ? (
+          <CircleAlertIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        ) : (
+          <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
+        )}
+        <span>{failed ? "Failed" : "Sending"}</span>
+        {failed && (
+          <>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              className={actionClass}
+              onClick={() => void useChatStore.getState().retryPendingSend(tempId)}
+            >
+              Retry
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              className={actionClass}
+              onClick={() => useChatStore.getState().cancelPendingSend(tempId)}
+            >
+              Cancel
+            </button>
+          </>
+        )}
+      </div>
+      {delivery.failed?.reason !== undefined && (
+        <span className="text-xs text-muted-foreground">{delivery.failed.reason}</span>
+      )}
+    </div>
+  );
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
@@ -866,6 +974,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </MessageContent>
         </div>
+        {bubble.pending && bubble.delivery !== undefined && (
+          <PendingDeliveryFooter
+            tempId={bubble.itemId}
+            delivery={bubble.delivery}
+            sentAtMs={bubble.createdAtS !== undefined ? bubble.createdAtS * 1000 : 0}
+          />
+        )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           {ts && (

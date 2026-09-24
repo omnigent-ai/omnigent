@@ -1082,6 +1082,20 @@ dedupe; the first-party web client deliberately does NOT (it keeps a
 client temp id for React-key stability and relies on a stable key +
 FIFO matching), so adoption is optional, not required.
 
+**Re-sending a `message` with the same `stable_id` is safe.** A client
+that never received the POST response (the browser reports a thrown
+fetch) cannot know whether the server took the message, so it re-POSTs
+the identical body. `data.stable_id` (32-char lowercase hex, chosen by
+the client per submit) makes that idempotent on both dispatch paths:
+the server answers with the outcome of the first delivery and does not
+dispatch again. On the SDK path the store appends idempotently on the
+id, so the duplicate returns the committed `item_id`. On the native path
+a duplicate is answered with the still-live `pending_id`, or — once the
+transcript forwarder has mirrored the prompt back — with the committed
+`item_id`, and the prompt is never pasted into the terminal twice. The
+first-party web client relies on this: a send whose fetch threw stays in
+the transcript as pending and is re-sent until a 2xx arrives.
+
 **Interrupt is dual-path on purpose.** Posting `{"type": "interrupt"}`
 is exposed as an event for API uniformity, but it does NOT enter the
 queue — the route invokes the loop's `cancel_loop` directly so the
