@@ -44,6 +44,39 @@ describe("SetupTerminalStep", () => {
     expect(calls).toEqual(["install", "run"]);
   });
 
+  it("installs once even when re-rendered with fresh callbacks mid-install", async () => {
+    let releaseInstall: ((r: { ok: boolean }) => void) | undefined;
+    const installStarts = vi.fn();
+    // Stable identity for the assertion, but a NEW wrapper each render (mirrors
+    // the parent recreating onInstallCli/onRun) to prove we don't re-fire.
+    const installImpl = () => {
+      installStarts();
+      return new Promise<{ ok: boolean }>((res) => {
+        releaseInstall = res;
+      });
+    };
+    const onRun = vi.fn().mockResolvedValue({ ok: true });
+    const { rerender } = render(
+      <SetupTerminalStep
+        onInstallCli={() => installImpl()}
+        onRun={() => onRun()}
+        onBack={vi.fn()}
+      />,
+    );
+    // A parent re-render (e.g. deferred server list resolved) with new callbacks.
+    rerender(
+      <SetupTerminalStep
+        onInstallCli={() => installImpl()}
+        onRun={() => onRun()}
+        onBack={vi.fn()}
+      />,
+    );
+    releaseInstall?.({ ok: true });
+    expect(await screen.findByText("Server ready")).toBeInTheDocument();
+    expect(installStarts).toHaveBeenCalledTimes(1);
+    expect(onRun).toHaveBeenCalledTimes(1);
+  });
+
   it("stops at the install failure and does not run the action", async () => {
     const onInstallCli = vi.fn().mockResolvedValue({ ok: false, error: "install broke" });
     const onRun = vi.fn().mockResolvedValue({ ok: true });

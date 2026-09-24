@@ -3301,10 +3301,14 @@ function registerIpc() {
   // Setup page → install the omnigent CLI (macOS). Runs the bundled
   // install_oss.sh (ensuring uv first) and streams its output to the page, then
   // re-probes status so the caller learns whether the binary is now resolvable.
+  // Single-flight guard: a duplicate cli-install (e.g. a renderer effect that
+  // re-fired) joins the in-flight install instead of spawning a second one.
+  let cliInstallInFlight = null;
   ipcMain.handle("omnigent:cli-install", async (event) => {
     if (!isSetupPageSender(event)) {
       throw new Error("cli-install is only available to the setup page");
     }
+    if (cliInstallInFlight) return cliInstallInFlight;
     const onOutput = (text) => {
       try {
         event.sender.send("omnigent:cli-install-log", { line: text });
@@ -3312,9 +3316,14 @@ function registerIpc() {
         /* window torn down mid-install */
       }
     };
-    const result = await cliInstall.installCli({ onOutput });
-    const status = await omnigentCli.getCliStatus(loadSettings().omnigent_path);
-    return { ...result, installed: status.installed === true };
+    cliInstallInFlight = (async () => {
+      const result = await cliInstall.installCli({ onOutput });
+      const status = await omnigentCli.getCliStatus(loadSettings().omnigent_path);
+      return { ...result, installed: status.installed === true };
+    })().finally(() => {
+      cliInstallInFlight = null;
+    });
+    return cliInstallInFlight;
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both

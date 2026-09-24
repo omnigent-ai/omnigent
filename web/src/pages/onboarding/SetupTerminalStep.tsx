@@ -65,15 +65,25 @@ export function SetupTerminalStep({
     if (logBox.current) logBox.current.scrollTop = logBox.current.scrollHeight;
   }, [lines]);
 
-  // Install (if needed) → run. Re-runs from the top on retry.
+  // Read the latest callbacks without keying the sequence effect on their
+  // identity: the parent re-creates onInstallCli/onRun every render, and a
+  // deferred server-list update landing mid-install would otherwise restart the
+  // effect and launch a SECOND install. The sequence runs once per attempt.
+  const onInstallCliRef = useRef(onInstallCli);
+  const onRunRef = useRef(onRun);
+  onInstallCliRef.current = onInstallCli;
+  onRunRef.current = onRun;
+
+  // Install (if needed) → run, once per attempt (retry bumps `attempt`).
   useEffect(() => {
     let canceled = false;
     setError(undefined);
     setLines([]);
     (async () => {
-      if (onInstallCli) {
+      const install = onInstallCliRef.current;
+      if (install) {
         setPhase("installing");
-        const res = await onInstallCli();
+        const res = await install();
         if (canceled || !alive.current) return;
         if (!res.ok) {
           setPhase("failed");
@@ -83,7 +93,7 @@ export function SetupTerminalStep({
         setLines([]);
       }
       setPhase("running");
-      const result = await onRun();
+      const result = await onRunRef.current();
       if (canceled || !alive.current) return;
       if (result.ok) setPhase("ready");
       else {
@@ -94,7 +104,7 @@ export function SetupTerminalStep({
     return () => {
       canceled = true;
     };
-  }, [onInstallCli, onRun, attempt]);
+  }, [attempt]);
 
   // Cycle "." → ".." → "..." on the in-progress title so a slow install/start
   // still reads as alive.

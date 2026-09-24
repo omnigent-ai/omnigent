@@ -78,30 +78,26 @@ function BridgeSetupApp() {
       setReady(true);
       return;
     }
-    if (!failedUrl && !isEphemeral) {
-      bridge
-        .getServerUrl()
-        .then((saved) => setInitialUrl(saved || DEFAULT_URL))
-        .catch(() => {});
-    }
-    bridge
-      .getRecentServers()
-      .then(setRecentServers)
-      .catch(() => {});
-    bridge
-      .getManagedServers()
-      .then(setManagedServers)
-      .catch(() => {});
-    // The CLI probe gates the first render (see `ready`); a failed probe just
-    // means "not installed" — never block the wizard on it.
-    bridge
-      .getCliStatus()
-      .then((status) => {
-        setInstalled(status?.installed === true);
-        setInstallSupported(status?.installSupported === true);
-      })
-      .catch(() => setInstalled(false))
-      .finally(() => setReady(true));
+    // Load ALL setup data before the first paint — not just CLI status. The
+    // initial step depends on recents/managed too (a returning user starts on
+    // the server list), so mounting before those resolve would open the empty
+    // "add" view and never switch when the lists arrive. allSettled: a single
+    // failed probe degrades to its default, never blocks the wizard.
+    const savedUrl =
+      !failedUrl && !isEphemeral
+        ? bridge.getServerUrl().then((saved) => setInitialUrl(saved || DEFAULT_URL))
+        : Promise.resolve();
+    const recents = bridge.getRecentServers().then(setRecentServers);
+    const managed = bridge.getManagedServers().then(setManagedServers);
+    const cli = bridge.getCliStatus().then((status) => {
+      setInstalled(status?.installed === true);
+      setInstallSupported(status?.installSupported === true);
+    });
+    Promise.allSettled([savedUrl, recents, managed, cli]).then(() => {
+      // A failed CLI probe means "not installed" rather than unknown.
+      setInstalled((prev) => prev ?? false);
+      setReady(true);
+    });
   }, [failedUrl, isEphemeral]);
 
   const setup: ServerSelectorV2Setup = {
@@ -158,7 +154,18 @@ function BridgeSetupApp() {
             if (!bridge?.installCli) return { ok: false, error: "Install is unavailable." };
             try {
               const result = await bridge.installCli();
-              if (result?.ok) setInstalled(result.installed === true);
+              setInstalled(result?.installed === true);
+              // The installer can exit 0 yet leave the binary unresolvable (PATH
+              // issue). Treat "installed:false after a successful run" as a
+              // failure rather than proceeding to start/connect with no CLI.
+              if (result?.ok && result.installed !== true) {
+                return {
+                  ok: false,
+                  error:
+                    "The installer finished but the omnigent CLI still isn't detected. " +
+                    "Try opening a new terminal, or install it from https://omnigent.ai/.",
+                };
+              }
               return { ok: result?.ok === true, error: result?.error };
             } catch (e) {
               return { ok: false, error: e instanceof Error ? e.message : String(e) };
