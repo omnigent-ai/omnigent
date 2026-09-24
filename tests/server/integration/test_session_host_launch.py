@@ -1268,7 +1268,7 @@ async def _relaunch_then_report_exit(
         )
     finally:
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await responder
+            _ = await responder
 
 
 async def test_message_relaunch_host_failure_uncategorized_reports_startup_failure(
@@ -1389,7 +1389,7 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
         )
     finally:
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await responder
+            _ = await responder
 
     assert msg_resp.status_code == 503, msg_resp.text
     error = msg_resp.json()["error"]
@@ -2513,7 +2513,7 @@ async def test_offline_runner_serves_file_content_and_changes_from_host(
         set_runner_router(prior_router)
         responder.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await responder
+            _ = await responder
 
 
 async def test_offline_runner_no_host_still_returns_503(
