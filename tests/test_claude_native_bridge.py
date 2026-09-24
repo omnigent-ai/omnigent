@@ -4054,6 +4054,59 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
     assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
 
 
+@pytest.mark.parametrize("invisible", ["\ufeff", "\u200b"], ids=["bom", "zero-width-space"])
+def test_inject_user_message_confirms_after_claude_removes_invisible_characters(
+    invisible: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A draft pasted with an embedded format character still gets a verified submit."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.05)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    visible_draft = "fix the flaky test"
+    enters = {"count": 0}
+    # Claude Code renders the draft without the format character and keeps it
+    # in the box through the first Enter (its invisible-character review);
+    # only the second Enter submits.
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane(visible_draft)
+        if cmd[-1] == "Enter":
+            enters["count"] += 1
+            if enters["count"] > 1:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content=f"fix the{invisible} flaky test")
+
+    assert enters["count"] == 2
+
+
+def test_draft_detection_ignores_format_characters_claude_hides() -> None:
+    """A needle keeping a pasted format character matches the rendered draft."""
+    needle = "fix the\ufeff flaky test"
+    assert claude_native_bridge._draft_in_input_box(_composer_pane("fix the flaky test"), needle)
+    # An all-invisible needle stays unidentifiable instead of matching everything.
+    assert not claude_native_bridge._draft_in_input_box(_composer_pane("anything"), "\ufeff")
+
+
 def _rejection_pane(name: str, draft: str = "") -> str:
     """
     Render a pane where Claude Code has rejected an unknown command.

@@ -46,6 +46,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
@@ -5655,6 +5656,13 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
     collapses large pastes).
 
+    Both sides are compared without Unicode format characters
+    (:func:`_visible_draft_text`): Claude Code omits them (U+FEFF,
+    U+200B, …) from the rendered composer, so a needle that kept them
+    could never match — the draft would fall to the unverified
+    blind-submit path, whose single Enter Claude's "Removed N invisible
+    characters" review swallows, leaving the message stuck unsent.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :param needle: Marker from :func:`_submit_needle`, e.g.
         ``"fix the bug"``. Empty means the draft can't be identified;
@@ -5667,7 +5675,13 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
-    return bool(needle) and needle in tail
+    visible_needle = _visible_draft_text(needle)
+    return bool(visible_needle) and visible_needle in _visible_draft_text(tail)
+
+
+def _visible_draft_text(text: str) -> str:
+    """Drop Unicode format characters, which Claude Code never renders in the composer."""
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
