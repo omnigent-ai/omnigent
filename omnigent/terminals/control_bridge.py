@@ -114,10 +114,16 @@ _WEB_TERMINAL_TERM: Final[str] = "xterm-256color"
 _WS_CLOSE_EXPECTED_ERRORS: Final = (RuntimeError, WebSocketDisconnect)
 
 # When the control reader ends with a send backlog still queued (a
-# burst-then-exit program), how long to let the forwarder finish draining that
-# sentinel-terminated backlog before teardown cancels it. Bounds teardown so a
-# stuck-slow client can't hang the close; a normal drain completes well within.
-_FORWARD_DRAIN_TIMEOUT_S: Final[float] = 5.0
+# burst-then-exit program), how long the forwarder may go with NO frame
+# actually sent before teardown gives up on it. This is an idle timeout, not a
+# total-drain deadline: the backlog is finite (the reader already queued the
+# EOF sentinel), so a forwarder that keeps sending frames must be allowed to
+# finish however long the whole drain takes under load or a slow client —
+# only a forwarder that stops moving bytes altogether is genuinely wedged.
+# Measuring total elapsed time instead of idle time would cancel a forwarder
+# that is still actively draining, silently dropping whatever backlog it
+# hadn't reached yet.
+_FORWARD_DRAIN_IDLE_TIMEOUT_S: Final[float] = 5.0
 
 # tmux emits this control notification after copy-mode stores a selection in a
 # paste buffer. Only default-style, shell-safe names are accepted; copy-mode's
@@ -782,6 +788,36 @@ async def bridge_tmux_control_to_websocket(
     # matches the current window size, so a re-attach at an unchanged size emits
     # no resize at all.
 
+    # Last time the forwarder actually sent a frame, used to distinguish a
+    # slow-but-still-draining backlog from a genuinely wedged send (see
+    # _await_forward_drain).
+    last_forward_activity = _monotonic()
+
+    def _mark_forward_activity() -> None:
+        nonlocal last_forward_activity
+        last_forward_activity = _monotonic()
+
+    async def _await_forward_drain() -> None:
+        """Wait for the forwarder, giving up only once it stops making progress.
+
+        The backlog is finite (the reader already queued the EOF sentinel), so
+        bound the wait by IDLE time rather than total elapsed time — a forwarder
+        that keeps sending frames, however slowly, must be allowed to finish;
+        only one that stalls for the full window is actually wedged.
+        """
+        while not forward_task.done():
+            remaining = _FORWARD_DRAIN_IDLE_TIMEOUT_S - (_monotonic() - last_forward_activity)
+            if remaining <= 0:
+                _logger.warning(
+                    "control-attach: forwarder stalled with %d chunk(s) still queued; "
+                    "giving up after %.1fs with no frame sent",
+                    output_chunks.qsize(),
+                    _FORWARD_DRAIN_IDLE_TIMEOUT_S,
+                )
+                return
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(forward_task), timeout=remaining)
+
     # Reader parses the control stream and queues %output; forwarder coalesces
     # queued payloads into bounded WebSocket frames; ws task drives input.
     read_task = asyncio.create_task(_read_control(), name="tmux-control-read")
@@ -791,6 +827,7 @@ async def bridge_tmux_control_to_websocket(
             output_chunks,
             max_coalesce_bytes=_current_ws_coalesce_limit,
             send_lock=ws_send_lock,
+            on_frame_sent=_mark_forward_activity,
         ),
         name="tmux-control-forward",
     )
@@ -814,28 +851,25 @@ async def bridge_tmux_control_to_websocket(
         control_ended_first = read_task in done
         # When the reader finished first it already queued every remaining
         # %output plus the None EOF sentinel, so the forwarder will drain the
-        # backlog and exit on its own. Await it (bounded) BEFORE cancelling so a
-        # burst-then-exit program's tail isn't dropped mid-drain — the exact
-        # loss the old inline-send loop couldn't have (it flushed each frame
-        # before reading the next line). Bounded so a wedged/stuck-slow send
-        # can't hang teardown; the timeout then falls through to cancel.
+        # backlog and exit on its own. Await it (idle-bounded) BEFORE cancelling
+        # so a burst-then-exit program's tail isn't dropped mid-drain — the
+        # exact loss the old inline-send loop couldn't have (it flushed each
+        # frame before reading the next line). ``_await_forward_drain`` only
+        # gives up once the forwarder stops moving bytes, not on total elapsed
+        # time, so a slow-but-progressing drain (contention, a slow client)
+        # isn't truncated; the timeout then falls through to cancel.
         if control_ended_first and not forward_task.done():
-            # Suppress everything here (TimeoutError → drain took too long, fall
-            # through to cancel; any other error → the forwarder itself raised,
-            # which asyncio.shield propagates out of wait_for instead of
-            # TimeoutError). Letting either escape would skip the cancel/log
-            # bookkeeping below (the finally still runs). A real forwarder error
-            # is still surfaced by the exception-logging loop, since forward_task
-            # is then done() with it stored. ``Exception`` (not BaseException)
-            # so a CancelledError of the outer bridge still propagates.
+            # Suppress everything here (any error the forwarder itself raised is
+            # still surfaced by the exception-logging loop below, since
+            # forward_task is then done() with it stored). ``Exception`` (not
+            # BaseException) so a CancelledError of the outer bridge still
+            # propagates.
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(
-                    asyncio.shield(forward_task), timeout=_FORWARD_DRAIN_TIMEOUT_S
-                )
+                await _await_forward_drain()
         if control_ended_first and not clipboard_task.done():
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(
-                    asyncio.shield(clipboard_task), timeout=_FORWARD_DRAIN_TIMEOUT_S
+                    asyncio.shield(clipboard_task), timeout=_FORWARD_DRAIN_IDLE_TIMEOUT_S
                 )
         for task in {*pending, clipboard_task}:
             if task.done():
