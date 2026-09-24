@@ -40,6 +40,7 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
+    HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
     HostStatFrame,
@@ -1225,6 +1226,155 @@ async def test_message_relaunch_never_connected_names_phase_and_logs_error(
     assert any(session_id in r.getMessage() for r in correlated_errors), (
         "the never-connected ERROR must also carry the session id"
     )
+
+
+async def _relaunch_then_report_exit(
+    client: httpx.AsyncClient,
+    comm: ApplicationCommunicator,
+    session_id: str,
+    daemon_report: str,
+) -> httpx.Response:
+    """Send a message that relaunches, then report the runner dead pre-connect.
+
+    Answers the host's stat + launch round-trips with ``launched`` and
+    immediately follows with a ``host.runner_exited`` frame carrying
+    *daemon_report*, so the pending send's connect wait ends on the
+    crash report rather than the timeout.
+
+    :param client: Test HTTP client bound to the host-wired app.
+    :param comm: Connected host communicator.
+    :param session_id: Session to message, e.g. ``"conv_abc123"``.
+    :param daemon_report: Exit-report text the fake daemon sends, e.g.
+        including a log tail.
+    :returns: The settled ``POST /events`` response (expected 503).
+    """
+
+    async def _launch_then_report() -> None:
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        frame = HostRunnerExitedFrame(
+            runner_id=token_bound_runner_id(launch.binding_token),
+            error=daemon_report,
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(frame)})
+
+    responder = asyncio.create_task(_launch_then_report())
+    try:
+        return await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await responder
+
+
+async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-connect runner exit surfaces the daemon's report in the 503.
+
+    The host accepts the relaunch, then reports the runner dead before
+    it ever connects. With no owner scoping in play (single-user mode:
+    unauthenticated requester, unowned report), the 503 detail must
+    carry the daemon's actual cause — exit code and log tail — instead
+    of the generic never-connected copy.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # Generous: the crash report, not this timeout, ends the connect wait.
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+    daemon_report = (
+        "runner process exited with code 1 (log on host: ~/logs/runner-ab.log)\n"
+        "--- runner log tail ---\n"
+        "ValueError: bad tunnel token"
+    )
+    msg_resp = await _relaunch_then_report_exit(client, comm, session_id, daemon_report)
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "exited before connecting" in error["message"], error["message"]
+    assert "ValueError: bad tunnel token" in error["message"], error["message"]
+
+
+async def test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_owner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Another user's send never sees the host owner's runner log tail.
+
+    The exit report embeds a raw runner-log tail, which only the host
+    owner may read (the same ``get_visible`` posture as the runner
+    status endpoint). A different authenticated session viewer gets the
+    phase-level cause pointing at the host log, while the server's
+    correlated ERROR keeps the full report for operators.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    # Identity seams: this fixture's tunnel and HTTP requests are
+    # unauthenticated, so pin the report's owner and the requester to two
+    # different users; the real get_visible scoping decides what surfaces.
+    real_record = RunnerExitReports.record
+
+    def _record_as_host_owner(
+        self: RunnerExitReports, runner_id: str, error: str, owner: str | None
+    ) -> None:
+        del owner
+        real_record(self, runner_id, error, owner="host-owner@example.com")
+
+    monkeypatch.setattr(RunnerExitReports, "record", _record_as_host_owner)
+    monkeypatch.setattr(
+        routes_events, "_get_user_id", lambda request, auth_provider: "viewer@example.com"
+    )
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+    daemon_report = (
+        "runner process exited with code 1 (log on host: ~/logs/runner-ab.log)\n"
+        "--- runner log tail ---\n"
+        "SECRET_TOKEN=hunter2"
+    )
+    msg_resp = await _relaunch_then_report_exit(client, comm, session_id, daemon_report)
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "exited before connecting" in error["message"], error["message"]
+    assert "visible to the host owner" in error["message"], error["message"]
+    assert "SECRET_TOKEN" not in error["message"], error["message"]
+    # The operator-facing ERROR still carries the full report.
+    assert any(
+        r.levelno == logging.ERROR and "SECRET_TOKEN=hunter2" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
 
 
 async def test_host_reports_runner_unknown_skips_connect_grace(

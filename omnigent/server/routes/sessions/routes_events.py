@@ -2142,8 +2142,25 @@ def register_events_routes(
                     if runner_exit_reports is not None
                     else None
                 )
+                # The report can embed a raw runner-log tail, so the API
+                # message only carries it verbatim for the host's owner
+                # (get_visible); other session viewers get the phase-level
+                # cause. The ERROR log keeps the full report for operators.
+                visible_report = (
+                    runner_exit_reports.get_visible(relaunched_runner_id, user_id)
+                    if runner_exit_reports is not None
+                    else None
+                )
                 if exit_report:
-                    launch_detail = f"the runner exited before connecting: {exit_report}"
+                    log_detail = f"the runner exited before connecting: {exit_report}"
+                    if visible_report:
+                        launch_detail = f"the runner exited before connecting: {visible_report}"
+                    else:
+                        launch_detail = (
+                            "the runner exited before connecting. The exit "
+                            "report is in the runner log on the host, visible "
+                            "to the host owner."
+                        )
                 else:
                     launch_detail = (
                         "it never connected to the server within "
@@ -2151,6 +2168,7 @@ def register_events_routes(
                         "runner process may be hung or unable to reach the "
                         "server. Check the runner log on the host."
                     )
+                    log_detail = launch_detail
                 launch_message = (
                     f"The host launched runner {relaunched_runner_id} for "
                     f"this session, but {launch_detail}"
@@ -2162,7 +2180,7 @@ def register_events_routes(
                     session_id,
                     conv.host_id,
                     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-                    launch_detail,
+                    log_detail,
                     extra=debug_event(
                         "runner_never_connected",
                         session_id=session_id,
