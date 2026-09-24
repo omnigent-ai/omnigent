@@ -66,6 +66,18 @@ FastAPI app in `omnigent/server/app.py` mounts it at `/`. After a build:
 # open http://localhost:6767/
 ```
 
+## Embedded session recovery
+
+When an embedded host fetcher reports `Fetch request failed due to expired user
+session`, the web UI reloads the current URL so the host can renew its session
+or show its normal sign-in flow. Failed requests are not replayed, including
+writes. Standalone login behavior and unrelated network errors are unchanged.
+
+A per-tab `sessionStorage` guard allows one reload until a subsequent page load
+successfully fetches `/v1/me`. Concurrent failures and a still-expired session
+cannot trigger a reload loop. If session storage is unavailable, the original
+error is shown instead of attempting an unguarded reload.
+
 ## Lint + format
 
 ```bash
