@@ -7903,6 +7903,95 @@ def test_ensure_trusted_refuses_malformed_config(
     assert config_path.read_text() == raw
 
 
+def test_concurrent_ensure_trusted_both_project_entries_survive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Two concurrent ensure_claude_workspace_trusted calls must not lose each
+    other's project entry.
+
+    The FileLock serialises the read-modify-write so the second caller reads
+    the post-write state of the first. Without the lock, both callers read
+    the same stale config before either writes and last-writer-wins drops one
+    workspace entry. This reproduces the concurrent-runner race: two CI
+    workers on the same host each call the helper for a different workspace.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    workspace_a = tmp_path / "ws_a"
+    workspace_b = tmp_path / "ws_b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+
+    threads = [
+        threading.Thread(target=ensure_claude_workspace_trusted, args=(workspace_a,)),
+        threading.Thread(target=ensure_claude_workspace_trusted, args=(workspace_b,)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    data = json.loads(config_path.read_text())
+    assert data.get("hasCompletedOnboarding") is True
+    # Both workspace entries must survive — without the FileLock, one is dropped.
+    assert str(workspace_a.resolve()) in data.get("projects", {})
+    assert str(workspace_b.resolve()) in data.get("projects", {})
+
+
+def test_stale_writer_clobber_detected_by_theme_picker_sentinel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When a concurrent session's Claude writes ~/.claude.json from stale
+    state (no hasCompletedOnboarding) and the new terminal reads it, the
+    theme picker blocks Claude's TUI forever. _wait_for_claude_prompt_ready
+    must detect this and raise ClaudeTerminalDialog after two consecutive
+    polls — converting a 180 s mystery hang into an instant diagnosis.
+
+    The test patches _capture_pane to return steady theme-picker text and
+    _TMUX_READY_SLOW_BOOT_TIMEOUT_S to a short cap so the test completes
+    quickly regardless of whether the fast-fail path fires.
+    Before this fix the function raised ClaudePromptTimeout instead (after
+    the full timeout), so pytest.raises(ClaudeTerminalDialog) would fail.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        _CLAUDE_THEME_PICKER_MARKER,
+        ClaudeTerminalDialog,
+        _wait_for_claude_prompt_ready,
+    )
+
+    picker_pane = (
+        "Choose your preferred theme:\n"
+        "  1. Dark mode\n"
+        "  2. Light mode\n"
+        f"  3. Dark mode ({_CLAUDE_THEME_PICKER_MARKER})\n"
+        "  4. Light mode\n"
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda *_a, **_kw: picker_pane,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda *_a, **_kw: type("S", (), {"alive": True, "exited": False, "exit_status": None})(),
+    )
+    # Shorten the slow-boot cap so the test completes in under a second even
+    # if the fast-fail path does not fire (defensive timeout, not the test goal).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._TMUX_READY_SLOW_BOOT_TIMEOUT_S",
+        1.0,
+    )
+
+    with pytest.raises(ClaudeTerminalDialog) as exc_info:
+        _wait_for_claude_prompt_ready("fake.sock", "main", timeout_s=1.0)
+
+    assert "theme picker" in str(exc_info.value).lower()
+    assert "hasCompletedOnboarding" in str(exc_info.value)
+
+
 def test_display_cost_approval_popup_builds_detached_tmux_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -290,6 +290,12 @@ _DIALOG_FOOTER_RE = re.compile(
 )
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
+# Substring unique to Claude Code's first-run theme picker. A session that
+# sees this text in its pane is stuck on the onboarding gate, not booting.
+_CLAUDE_THEME_PICKER_MARKER = "colorblind-friendly"
+# Bounded wait for the ~/.claude.json seed lock. A wedged holder must never
+# block a session launch, so a timeout falls back to seeding unlocked.
+_CLAUDE_TRUST_LOCK_TIMEOUT_S = 5.0
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
@@ -1727,13 +1733,13 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     prompts — those still route to the web UI via the ``PermissionRequest``
     hook; only the unhookable startup gates are pre-accepted.
 
-    Concurrency: this is a read-modify-write of a file Claude itself also
-    rewrites. It runs once, before the terminal is launched (so Claude is
-    not yet writing for this session), and uses an atomic replace. Two
-    runners starting on the same host within the same instant could still
-    race on last-writer-wins; the only consequence is that one session may
-    re-show the trust prompt, which a relaunch clears. Matching this to
-    Claude's own lock-free writes keeps the helper simple.
+    Concurrency: this is a read-modify-write of a file that Claude itself also
+    rewrites. A ``FileLock`` serialises concurrent calls from multiple runners
+    on the same host, preventing last-writer-wins from dropping a project-trust
+    entry. The lock does not cover an already-running Claude session that loaded
+    the config before this call and writes back without ``hasCompletedOnboarding``
+    — that window is narrowed by a second call from the readiness poller after
+    the terminal starts, and detected fast if the picker does appear.
 
     :param workspace: The runner workspace Claude will launch in, e.g.
         ``Path("/home/user/repo-worktrees/feature-x")``. Resolved to an
@@ -1748,6 +1754,29 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     """
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     config_path = (Path(config_dir).expanduser() if config_dir else Path.home()) / ".claude.json"
+    # Serialise concurrent read-modify-write calls so two runners starting
+    # simultaneously don't each read the pre-write state and overwrite each
+    # other's project-trust entry (last-writer-wins).
+    lock_path = config_path.parent / (config_path.name + ".lock")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with FileLock(str(lock_path), mode=0o600, timeout=_CLAUDE_TRUST_LOCK_TIMEOUT_S):
+            _seed_claude_startup_gates(config_path, workspace)
+        return
+    except FileLockTimeout:
+        # Losing the lock only risks a re-shown prompt; blocking the launch
+        # is worse, so fall through and seed the gates unlocked.
+        _logger.debug("claude-native: %s is busy; seeding startup gates unlocked.", lock_path)
+    _seed_claude_startup_gates(config_path, workspace)
+
+
+def _seed_claude_startup_gates(config_path: Path, workspace: Path) -> None:
+    """Idempotently set the onboarding and per-workspace trust keys.
+
+    :param config_path: Path to Claude Code's ``.claude.json``.
+    :param workspace: Workspace whose trust gate should be pre-accepted.
+    :returns: None.
+    """
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -1779,8 +1808,31 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
 
     if not changed:
         return
-    config_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_user_json(config_path, data)
+
+
+def _re_assert_onboarding_gate(bridge_dir: Path) -> None:
+    """Re-assert hasCompletedOnboarding after the tmux session exists.
+
+    Narrows the race window where a concurrent session's Claude rewrote
+    ~/.claude.json from stale state between the initial
+    ensure_claude_workspace_trusted call and the new terminal reading the
+    config at startup. Errors are swallowed so a failed re-assertion never
+    blocks message delivery.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    if not isinstance(config, dict):
+        return
+    workspace_raw = config.get("workspace")
+    if not isinstance(workspace_raw, str) or not workspace_raw:
+        return
+    try:
+        ensure_claude_workspace_trusted(Path(workspace_raw))
+    except (ValueError, json.JSONDecodeError, OSError):
+        _logger.debug(
+            "claude-native: onboarding gate re-assertion failed for %s",
+            workspace_raw,
+        )
 
 
 def _atomic_write_user_json(path: Path, payload: _JsonObject) -> None:
@@ -5768,9 +5820,9 @@ def _wait_for_claude_prompt_ready(
         distinguishable from a crash.
     :raises ClaudeTerminalDialog: If a consent or selection dialog is holding
         the terminal (see :func:`_terminal_dialog_headline`) on two
-        consecutive polls. Raised within a poll interval instead of waiting
-        out the budget, so the person can answer the dialog in the embedded
-        terminal and resend; the pane is left alive.
+        consecutive polls, or if Claude's first-run theme picker is visible
+        (``hasCompletedOnboarding`` was not set or was clobbered). Raised
+        within a poll interval instead of waiting out the budget.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -5780,6 +5832,13 @@ def _wait_for_claude_prompt_ready(
         a startup crash, a torn/empty capture under a mid-turn repaint, or
         a box that never appeared — is diagnosable from the error alone.
     """
+    # Re-assert the onboarding gate now that the tmux session exists. A
+    # concurrent session's Claude may have written ~/.claude.json from stale
+    # state between the initial ensure_claude_workspace_trusted call and this
+    # point, clobbering hasCompletedOnboarding. Writing again here narrows
+    # that window before the new terminal reads the config at startup.
+    if bridge_dir is not None:
+        _re_assert_onboarding_gate(bridge_dir)
     started = time.monotonic()
     next_liveness_probe = started + timeout_s
     hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
@@ -5795,6 +5854,7 @@ def _wait_for_claude_prompt_ready(
     exited_status: str | None = None
     pane_exited = False
     dialog_headline: str | None = None
+    theme_picker_seen = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -5813,6 +5873,20 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
+        # Two consecutive polls showing the theme picker means the onboarding
+        # gate was not set when Claude started — the terminal will not recover
+        # on its own. Fail fast rather than burning the full 180 s budget.
+        if _CLAUDE_THEME_PICKER_MARKER in pane:
+            if theme_picker_seen:
+                raise ClaudeTerminalDialog(
+                    "Claude Code's first-run theme picker is blocking startup. "
+                    "hasCompletedOnboarding was not set or was clobbered by a "
+                    "concurrent session. Relaunch the terminal to retry."
+                    + _format_terminal_failure_tail(pane)
+                )
+            theme_picker_seen = True
+        else:
+            theme_picker_seen = False
         billing_notice = auto_mode_billing_notice_visible(pane)
         if billing_notice:
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
