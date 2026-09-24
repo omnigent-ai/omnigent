@@ -10,6 +10,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
@@ -73,6 +74,10 @@ export function LandingStep({
                     {url.replace(/^https?:\/\//i, "").replace(/\/$/, "")}
                   </DropdownMenuItem>
                 ))}
+                {/* Escape hatch to the full list (presets + recents), which is
+                    otherwise unreachable from the MDM landing. */}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={onJoinServer}>Show all servers…</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>

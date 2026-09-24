@@ -71,6 +71,23 @@ describe("ServerSelectorV2", () => {
     expect(screen.queryByRole("radiogroup")).not.toBeInTheDocument();
   });
 
+  it("'Show all servers' from the preset detail reveals the full list (presets + recents)", () => {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://field-eng-omni.aws.databricksapps.com"],
+          recentServers: ["https://team.example.com/"],
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(field-eng-omni\)/i }));
+    fireEvent.click(screen.getByRole("button", { name: /show all servers/i }));
+    // Now on the full list: both sections present, so recents are reachable.
+    expect(screen.getByText(/^Recents$/)).toBeInTheDocument();
+    expect(screen.getByText(/preset \(by your organization\)/i)).toBeInTheDocument();
+    expect(screen.getByText("team.example.com")).toBeInTheDocument();
+  });
+
   it("opens directly on the server step when a connect error is present", () => {
     render(
       <ServerSelectorV2

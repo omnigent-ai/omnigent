@@ -22,12 +22,10 @@ import { ServerHeroIcons, ServerSelectStep } from "@/pages/onboarding/ServerSele
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
 /**
- * Outcome of a connect attempt. `needsConfirm` → the URL doesn't look like an
- * Omnigent server (re-try with force); `error` → the connect was rejected and
- * the message should be shown; neither → navigation is underway.
+ * Outcome of a connect attempt. `error` → the connect was rejected and the
+ * message should be shown; otherwise navigation is underway.
  */
 export interface ConnectResult {
-  needsConfirm?: boolean;
   error?: string;
 }
 
@@ -51,11 +49,10 @@ export interface ServerSelectorV2Setup {
    *  the mocked local-server flow) instead of the no-op connect, so the install
    *  screen is reachable from every path. Never set by the real shell. */
   mockInstall?: boolean;
-  /** Persist + navigate to a server URL. Resolves `{needsConfirm}` when the URL
-   *  doesn't look like an Omnigent server (call again with force), or `{error}`
-   *  when the connect was rejected — so the step can show it rather than
-   *  silently doing nothing. Navigation on success replaces this page. */
-  onConnect: (url: string, force?: boolean) => Promise<ConnectResult>;
+  /** Persist + navigate to a server URL. Resolves `{error}` when the connect
+   *  was rejected — so the step can show it rather than silently doing nothing.
+   *  Navigation on success replaces this page. */
+  onConnect: (url: string) => Promise<ConnectResult>;
   /** Start (or reuse) the local server, then connect to it. Resolves the
    *  outcome so the terminal step can show ready/failed (on success the window
    *  navigates away, so it resolves only on failure in practice). */
@@ -64,6 +61,11 @@ export interface ServerSelectorV2Setup {
    *  an unsubscribe. Absent on older shells / browser preview → the terminal
    *  step shows the coarse phases only. */
   onSetupLog?: (cb: (line: string) => void) => () => void;
+  /** Install the omnigent CLI (macOS). Present only when the CLI is missing and
+   *  the shell supports it; absent → the install step is skipped. */
+  onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
+  onInstallLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
   onRemoveServer?: (url: string) => void;
   /** Copy text to the clipboard via the shell's native bridge. */
@@ -105,15 +107,30 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   );
   // The preset server picked from the landing split button (drives the detail step).
   const [detailUrl, setDetailUrl] = useState<string | null>(null);
+  // What the terminal step should run after any install: start the local server,
+  // or connect to a remote URL. Set by whichever action routed to "terminal".
+  const [terminalTarget, setTerminalTarget] = useState<
+    { kind: "local" } | { kind: "connect"; url: string }
+  >({ kind: "local" });
+  // Install runs in the terminal step only when the CLI is missing AND in-app
+  // install is actually offered (macOS — onInstallCli is present). A returning
+  // user ("Open Omnigent"), or any platform without install support, connects
+  // directly. Mocks force the install screen to show.
+  const needsInstall =
+    setup.mockInstall === true || (setup.installed === false && setup.onInstallCli != null);
 
-  // Mocks only: Join / Install routes to the terminal step (mocked install flow)
-  // instead of the no-op connect, so the install screen is reachable everywhere.
-  const connect = setup.mockInstall
-    ? async () => {
-        setStep("terminal");
-        return {};
-      }
-    : setup.onConnect;
+  // A server pick (list Join / preset detail): install-then-connect when the CLI
+  // is missing (route via terminal), else connect straight away. Resolves the
+  // ConnectResult so the list can still show a connect error when connecting
+  // directly.
+  const connect = async (url: string): Promise<ConnectResult> => {
+    if (needsInstall) {
+      setTerminalTarget({ kind: "connect", url });
+      setStep("terminal");
+      return {};
+    }
+    return setup.onConnect(url);
+  };
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
   const [serverAddMode, setServerAddMode] = useState(false);
@@ -188,7 +205,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           <LocalIntroStep
             installed={setup.installed}
             onBack={() => setStep("landing")}
-            onInstall={() => setStep("terminal")}
+            onInstall={() => {
+              setTerminalTarget({ kind: "local" });
+              setStep("terminal");
+            }}
           />
         )}
         {step === "detail" && detailUrl !== null && (
@@ -198,13 +218,27 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onBack={() => setStep("landing")}
             onConnect={connect}
             onCopy={setup.onCopy}
+            onShowAll={() => setStep("server")}
           />
         )}
         {step === "terminal" && (
           <SetupTerminalStep
-            onStartLocal={setup.onStartLocal}
+            onInstallCli={needsInstall ? setup.onInstallCli : undefined}
+            onInstallLog={setup.onInstallLog}
+            onRun={
+              terminalTarget.kind === "connect"
+                ? async () => {
+                    const url = terminalTarget.url;
+                    const result = await setup.onConnect(url);
+                    // Success navigates the window away; a rejection surfaces as
+                    // an error here.
+                    return { ok: result.error === undefined, error: result.error };
+                  }
+                : setup.onStartLocal
+            }
             onSetupLog={setup.onSetupLog}
-            onBack={() => setStep("local")}
+            onBack={() => setStep(terminalTarget.kind === "connect" ? "server" : "local")}
+            runningLabel={terminalTarget.kind === "connect" ? "Connecting" : "Starting Omnigent"}
           />
         )}
         {step === "server" && (
