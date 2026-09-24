@@ -787,8 +787,17 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - Keep any recovered before-clip unchanged. A missing before-clip is not a
   reason to skip the after-clip; note the missing before-clip in your evidence.
 - For internal/API-only results with no visible user interaction, written
-  evidence is enough. Set `recordings: []` and describe the before/after result
-  in your evidence and the PR Demo section.
+  evidence is enough — but this carve-out is available only when the recovered
+  repro bundle carries no footage for this ticket and the fix's user-visible
+  outcome is not observable on any recording lane. Judge by the ticket's
+  outcome, not the facet's trigger: an API-gated trigger whose fix changes what
+  a user sees (a run that used to stall now completes) is filmable — record
+  that outcome. Inherited bundle footage proves the surface filmable: film the
+  after-fix counterpart on the same lane, or re-declare the inherited clip in
+  `recordings` with an explanation of why no after-clip exists. A `fixed`
+  handoff must never carry `recordings: []` while footage of the ticket sits
+  in your worktree. When both checks come up empty, set `recordings: []` and
+  describe the before/after result in your evidence and the PR Demo section.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
   `recording_unavailable_reason`. Do not block the fix or PR because footage is
@@ -966,7 +975,9 @@ Once the set is genuinely green:
    environment can attach media to the PR; otherwise link where they live (the
    CI run's artifact bundle, or the repro session) so reviewers can watch the
    failure and the fix. For internal/API-only results with no visible user
-   interaction, put the written before/after evidence in **Demo**. If recording
+   interaction, put the written before/after evidence in **Demo** (only when
+   the Step 2B.5 carve-out applies: no inherited repro footage and no filmable
+   outcome). If recording
    was blocked, explain why and include the available evidence. When the bug
    is a Linear ticket and a Linear key is available, also attach both recordings
    to the ticket (GraphQL `fileUpload` + `attachmentCreate`).
@@ -1436,7 +1447,8 @@ fix the after-clip is obtainable here; produce it (build the SPA, record via
 `OMNIGENT_E2E_RECORD_DIR` per `dev/recording-lanes.md`) rather than linking only
 the repro run and a manual "run it yourself" command. Omit the after-clip **only**
 for a genuine, named environmental blocker (recorder tooling missing, fixture
-won't come online after the SPA build, `api`-surface facet with nothing to film) —
+won't come online after the SPA build, `api`-surface facet with nothing to film
+and no inherited repro footage of its surface) —
 and when you omit it, **say which blocker, with the evidence**, in both the PR's
 Demo section and the handoff (a `recordings` prose note, or `maintainer_review`).
 A missing upstream before-clip is never that blocker. Never report an after-clip
@@ -1611,12 +1623,15 @@ Field meanings:
   captions unchanged. Each after-clip's caption lists the actions shown, ending
   with the corrected behavior. A missing before-clip is not a reason to skip
   the after-clip. Use `[]` only for internal/API-only results with no visible
-  user interaction, or when recording is blocked as described above.
+  user interaction and no inherited repro footage (the Step 2B.5 carve-out),
+  or when recording is blocked as described above.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 
-  - For internal/API-only results, say there is no visible user interaction
-    and put the written before/after evidence in the PR Demo section.
+  - For internal/API-only results, say there is no visible user interaction,
+    confirm the repro bundle carried no footage for the ticket, and put the
+    written before/after evidence in the PR Demo section. Inherited footage
+    voids this reason — film or re-declare per Step 2B.5.
   - For a recording failure, name the missing tool or the environment problem.
     Text-only CLI output is not a reason to skip recording.
   - Do not substitute a video of test output or a made-up demonstration.

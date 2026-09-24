@@ -172,3 +172,24 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "name the specific blocker in `recording_unavailable_reason`" in normalized
     assert "Text-only CLI output is not a reason to skip recording" in normalized
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
+
+
+def test_api_only_carveout_requires_no_inherited_repro_footage() -> None:
+    normalized = _normalized_resolve_instructions()
+
+    assert (
+        "this carve-out is available only when the recovered repro bundle "
+        "carries no footage for this ticket" in normalized
+    )
+    assert "Judge by the ticket's outcome, not the facet's trigger" in normalized
+    assert (
+        "film the after-fix counterpart on the same lane, or re-declare the "
+        "inherited clip in `recordings`" in normalized
+    )
+    assert (
+        "A `fixed` handoff must never carry `recordings: []` while footage of "
+        "the ticket sits in your worktree." in normalized
+    )
+    assert "Inherited footage voids this reason" in normalized
+    assert "nothing to film and no inherited repro footage" in normalized
+    assert "written evidence is enough. Set `recordings: []`" not in normalized
