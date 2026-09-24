@@ -504,3 +504,19 @@ describe("UserBubble @-mention attachment chips", () => {
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
   });
 });
+
+describe("UserBubble pending (delivered, not yet consumed) affordance", () => {
+  it("marks a pending bubble with data-pending and dims it", () => {
+    renderBubble(userBubble("steered follow-up", { pending: true, awaitingConsumption: true }));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.getAttribute("data-pending")).toBe("true");
+    expect(bubble.className).toContain("opacity-60");
+  });
+
+  it("renders a committed bubble with no pending affordance", () => {
+    renderBubble(userBubble("normal message"));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.getAttribute("data-pending")).toBeNull();
+    expect(bubble.className).not.toContain("opacity-60");
+  });
+});

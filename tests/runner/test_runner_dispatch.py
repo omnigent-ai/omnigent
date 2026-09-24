@@ -11783,6 +11783,88 @@ def test_response_failed_event_llm_source_is_preserved() -> None:
     assert payload["source"] == "llm"
 
 
+@pytest.mark.asyncio
+async def test_continuation_drain_reports_buffered_message_drained() -> None:
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _drain_session_event_queue
+
+    conv_id = "conv_steer_drain_marker"
+    started = asyncio.Event()
+    release = asyncio.Event()
+    turns = [_sse_text_turn("TURN_ONE"), _sse_text_turn("CONTINUATION")]
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="scaffold-drain-marker-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_GatedTwoTurnHarnessClient(turns, started, release)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    drained_events: list[dict[str, Any]] = []
+    try:
+        async with _runner_test_client(app) as http:
+            resp1 = await http.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_scaffold",
+                    "model": "x",
+                    "content": [{"type": "input_text", "text": "start the long turn"}],
+                },
+            )
+            assert resp1.status_code == 202
+            await asyncio.wait_for(started.wait(), timeout=10.0)
+
+            # Buffer a persisted follow-up while the first turn remains active.
+            resp2 = await http.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_scaffold",
+                    "model": "x",
+                    "content": [{"type": "input_text", "text": "steer me in"}],
+                    "persisted_item_id": "item_steered_1",
+                },
+            )
+            assert resp2.status_code == 202
+            assert resp2.json()["status"] == "buffered"
+
+            drained_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            assert all(e.get("type") != "session.input.drained" for e in drained_events)
+
+            # Release the first turn and wait for the continuation drain.
+            release.set()
+            deadline = asyncio.get_running_loop().time() + 10.0
+            while asyncio.get_running_loop().time() < deadline:
+                drained_events.extend(
+                    _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                )
+                if any(e.get("type") == "session.input.drained" for e in drained_events):
+                    break
+                await asyncio.sleep(0.02)
+    finally:
+        release.set()
+
+    markers = [e for e in drained_events if e.get("type") == "session.input.drained"]
+    assert markers == [{"type": "session.input.drained", "item_id": "item_steered_1"}], (
+        f"expected exactly one drain marker for the steered item, got {markers}; "
+        f"no marker means the server can never upgrade delivered → consumed."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Steering an in-flight sub-agent turn instead of bouncing the send.
 #

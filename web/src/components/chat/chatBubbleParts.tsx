@@ -214,6 +214,7 @@ export function buildPendingBubbles(
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
+      ...(p.deliveredItemId !== undefined ? { awaitingConsumption: true } : {}),
     };
   });
 }
@@ -719,8 +720,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
+      data-pending={bubble.awaitingConsumption ? "true" : undefined}
       data-message-id={bubble.itemId}
-      className="max-w-[640px]"
+      className={cn("max-w-[640px]", bubble.awaitingConsumption && "opacity-60")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits

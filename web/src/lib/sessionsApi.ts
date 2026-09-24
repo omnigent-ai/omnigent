@@ -216,6 +216,8 @@ interface SessionResponseWire {
     content: MessageContentBlock[];
     created_by?: string;
   }[];
+  /** Persisted user messages still buffered by a running turn. */
+  unconsumed_input_ids?: string[];
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
@@ -352,6 +354,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       content: p.content,
       ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
     })),
+    unconsumedInputIds: wire.unconsumed_input_ids ?? [],
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,

@@ -436,6 +436,8 @@ export interface Session {
    * for non-native sessions (their message is already in `items`).
    */
   pendingInputs?: PendingInput[];
+  /** Persisted user messages still buffered by a running turn. */
+  unconsumedInputIds?: string[];
   /**
    * Requesting user's numeric permission level on this session
    * (1=read, 2=edit, 3=manage, 4=owner). ``null`` when permissions

@@ -7551,6 +7551,171 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.input.delivered (steered message awaiting the harness)", () => {
+    it("stamps the oldest pending entry with the item id instead of promoting it", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_steer", content: [{ type: "input_text", text: "steer me" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toHaveLength(1);
+      const entry = state.pendingUserMessages[0]!;
+      expect(entry.tempId).toBe("pend_steer");
+      expect(entry.deliveredItemId).toBe("msg_steered_1");
+      expect(entry.posted).toBe(true);
+    });
+
+    it("creates a delivered pending bubble for viewers with no local echo", () => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_steered_2",
+        itemType: "message",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "from alice" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toEqual([
+        {
+          tempId: "delivered:msg_steered_2",
+          content: [{ type: "input_text", text: "from alice" }],
+          posted: true,
+          deliveredItemId: "msg_steered_2",
+          author: "alice@example.com",
+        },
+      ]);
+    });
+
+    it("does not stamp another author's delivered event onto a local pending entry", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          {
+            tempId: "pend_bob",
+            content: [{ type: "input_text", text: "bob's draft" }],
+            author: "bob@example.com",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_alice_1",
+        itemType: "message",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "from alice" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toHaveLength(2);
+      const bob = state.pendingUserMessages.find((p) => p.tempId === "pend_bob");
+      expect(bob?.deliveredItemId).toBeUndefined();
+      const alice = state.pendingUserMessages.find((p) => p.deliveredItemId === "msg_alice_1");
+      expect(alice?.content).toEqual([{ type: "input_text", text: "from alice" }]);
+      expect(alice?.author).toBe("alice@example.com");
+    });
+
+    it("is idempotent across an SSE replay of the same delivered event", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_steer", content: [{ type: "input_text", text: "steer me" }] },
+        ],
+      });
+      const event = {
+        type: "session_input_delivered",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      } as const;
+
+      handleSessionEvent(event);
+      handleSessionEvent(event);
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toHaveLength(1);
+      expect(state.pendingUserMessages[0]!.deliveredItemId).toBe("msg_steered_1");
+    });
+
+    it("consumed promotes the delivered entry by exact id, not FIFO position", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_other", content: [{ type: "input_text", text: "other send" }] },
+          {
+            tempId: "pend_steer",
+            content: [{ type: "input_text", text: "steer me" }],
+            posted: true,
+            deliveredItemId: "msg_steered_1",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toHaveLength(1);
+      const promoted = state.blocks[0] as UserMessageBlock;
+      expect(promoted.ctx.itemId).toBe("msg_steered_1");
+      expect(promoted.stableKey).toBe("pend_steer");
+      expect(state.pendingUserMessages).toEqual([
+        { tempId: "pend_other", content: [{ type: "input_text", text: "other send" }] },
+      ]);
+    });
+
+    it("terminal status promotes (not drops) a delivered entry whose consumed event was lost", () => {
+      useChatStore.setState({
+        blocks: [],
+        status: "idle",
+        pendingUserMessages: [
+          { tempId: "pend_plain", content: [{ type: "input_text", text: "denied maybe" }] },
+          {
+            tempId: "pend_steer",
+            content: [{ type: "input_text", text: "steer me" }],
+            posted: true,
+            deliveredItemId: "msg_steered_1",
+          },
+        ],
+      });
+
+      const statusEvent: SessionStatusEvent = {
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "idle",
+      };
+      handleSessionEvent(statusEvent);
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks).toHaveLength(1);
+      const settled = state.blocks[0] as UserMessageBlock;
+      expect(settled.type).toBe("user_message");
+      expect(settled.ctx.itemId).toBe("msg_steered_1");
+      expect(settled.content).toEqual([{ type: "input_text", text: "steer me" }]);
+    });
+  });
+
   describe("slash_command (claude-native skill / surfaced command)", () => {
     it("pops the FIFO head of pendingUserMessages so the optimistic bubble clears", () => {
       // Claude-native skips `session.input.consumed` for slash invocations;

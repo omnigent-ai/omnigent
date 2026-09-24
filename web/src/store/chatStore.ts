@@ -79,6 +79,7 @@ import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
   SessionInputConsumedEvent,
+  SessionInputDeliveredEvent,
   SessionViewer,
   StreamEvent,
 } from "@/lib/events";
@@ -529,6 +530,8 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /** Server item id for a persisted message still buffered by the running turn. */
+  deliveredItemId?: string;
 }
 
 /**
@@ -4055,6 +4058,30 @@ async function bindStream(
         ...uniquePendingElicitations,
       ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
+      // Move persisted but unconsumed messages out of the committed lane.
+      const unconsumedIds = new Set(session.unconsumedInputIds ?? []);
+      const deliveredPending: PendingUserMessage[] = [];
+      let committedBlocks = allBlocks;
+      if (unconsumedIds.size > 0) {
+        committedBlocks = [];
+        for (const b of allBlocks) {
+          if (
+            b.type === "user_message" &&
+            b.ctx.itemId !== null &&
+            unconsumedIds.has(b.ctx.itemId)
+          ) {
+            deliveredPending.push({
+              tempId: `delivered:${b.ctx.itemId}`,
+              content: b.content,
+              posted: true,
+              deliveredItemId: b.ctx.itemId,
+              ...(b.ctx.createdBy !== undefined ? { author: b.ctx.createdBy } : {}),
+            });
+          } else {
+            committedBlocks.push(b);
+          }
+        }
+      }
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
       //
@@ -4081,7 +4108,18 @@ async function bindStream(
       });
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
-        candidatePending = state.pendingUserMessages;
+        // Restore delivered events missed while disconnected.
+        const knownDelivered = new Set(
+          state.pendingUserMessages
+            .map((p) => p.deliveredItemId)
+            .filter((itemId): itemId is string => itemId !== undefined),
+        );
+        candidatePending = [
+          ...state.pendingUserMessages,
+          ...deliveredPending.filter(
+            (p) => p.deliveredItemId !== undefined && !knownDelivered.has(p.deliveredItemId),
+          ),
+        ];
       } else {
         const serverPending = (session.pendingInputs ?? []).map(toPending);
         // One-to-one consumption so two identical queued sends still match
@@ -4094,9 +4132,8 @@ async function bindStream(
           unmatchedServer.splice(i, 1);
           return false;
         });
-        // pending_inputs is FIFO-ordered and sends are serialized through
-        // the send chain, so server-known entries precede in-flight ones.
-        candidatePending = [...serverPending, ...unknownToServer];
+        // Persisted delivered entries precede queued and in-flight entries.
+        candidatePending = [...deliveredPending, ...serverPending, ...unknownToServer];
       }
       // Dedupe on a COLD LOAD only: drop any candidate whose message already
       // committed — a snapshot-replayed ghost the server never drained, or a
@@ -4114,11 +4151,12 @@ async function bindStream(
       // destroy state and restore bubbles from a stash, which could collide
       // with an older identical message in history.)
       const dedupePending = hydratePending && candidatePending.length > 0;
-      const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
+      const committedUserTexts = dedupePending ? committedUserTextsOf(committedBlocks) : [];
       const countEndsWith = (texts: string[], suffix: string): number =>
         texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
       const snapshotPending: PendingUserMessage[] = dedupePending
         ? candidatePending.filter((p) => {
+            if (p.deliveredItemId !== undefined) return true;
             const text = messageContentText(p.content);
             if (text === "") return true;
             return countEndsWith(committedUserTexts, text) === 0;
@@ -4137,7 +4175,7 @@ async function bindStream(
           : null;
       return {
         ...effectiveBindingPatch,
-        blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
+        blocks: syntheticError !== null ? [...committedBlocks, syntheticError] : committedBlocks,
         pendingUserMessages: snapshotPending,
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
@@ -5940,7 +5978,9 @@ export async function pumpStreamEvents(
  * `session.input.consumed` event whose payload is a user message.
  * Returns `null` if the event does not describe a user message.
  */
-function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentBlock[] | null {
+function userContentFromEvent(
+  event: SessionInputConsumedEvent | SessionInputDeliveredEvent,
+): MessageContentBlock[] | null {
   if (event.itemType !== "message") return null;
   if (event.data.role !== "user") return null;
   const raw = event.data.content;
@@ -6609,7 +6649,26 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // via the POST `denied` response — so the idle-clear is never
           // needed for them and only races the round-trip.
           if (!s.isNativeTerminalSession && s.pendingUserMessages.length > 0) {
+            // Settle persisted entries whose consumed event was lost.
+            const delivered = s.pendingUserMessages.filter(
+              (p) =>
+                p.deliveredItemId !== undefined && !hasCommittedItem(s.blocks, p.deliveredItemId),
+            );
             patch.pendingUserMessages = [];
+            if (delivered.length > 0) {
+              patch.blocks = [
+                ...s.blocks,
+                ...delivered.map((p) =>
+                  committedUserBlock(
+                    p.deliveredItemId ?? "",
+                    p.content,
+                    p.tempId,
+                    p.author,
+                    p.createdAtS,
+                  ),
+                ),
+              ];
+            }
           }
         }
         // Surface terminal-native failures carried only by session status.
@@ -6643,7 +6702,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           const statusAgentName =
             responseAgents.size === 1 ? responseAgents.values().next().value : undefined;
           patch.blocks = [
-            ...s.blocks,
+            ...(patch.blocks ?? s.blocks),
             {
               type: "error",
               ctx: {
@@ -6754,8 +6813,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // item beat this event through the stream, or a snapshot merge
           // inserted it. Still ack the optimistic bubble: returning without
           // dropping it strands a duplicate user bubble at the transcript tail.
-          // Same precision order as below (named entry, then FIFO head), minus
-          // the append.
+          // Prefer the delivered id, then the named entry, then FIFO.
+          const deliveredAt = s.pendingUserMessages.findIndex(
+            (p) => p.deliveredItemId === event.itemId,
+          );
+          if (deliveredAt >= 0) {
+            return {
+              pendingUserMessages: [
+                ...s.pendingUserMessages.slice(0, deliveredAt),
+                ...s.pendingUserMessages.slice(deliveredAt + 1),
+              ],
+            };
+          }
           const cleared = event.clearedPendingId;
           const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
           if (at >= 0) {
@@ -6776,6 +6845,33 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
             return {};
           return { pendingUserMessages: s.pendingUserMessages.slice(1) };
+        }
+
+        // Prefer the delivered item id over FIFO position.
+        const deliveredIdx = s.pendingUserMessages.findIndex(
+          (p) => p.deliveredItemId === event.itemId,
+        );
+        if (deliveredIdx >= 0) {
+          const matched = s.pendingUserMessages[deliveredIdx]!;
+          const content = committedContentFor(event, matched.content);
+          if (content === null) return {};
+          return {
+            pendingUserMessages: [
+              ...s.pendingUserMessages.slice(0, deliveredIdx),
+              ...s.pendingUserMessages.slice(deliveredIdx + 1),
+            ],
+            // Preserve the optimistic bubble's React key.
+            blocks: [
+              ...s.blocks,
+              committedUserBlock(
+                event.itemId,
+                content,
+                matched.tempId,
+                event.createdBy ?? matched.author,
+                matched.createdAtS,
+              ),
+            ],
+          };
         }
 
         // 1. Drop by id when the server names the drained entry.
@@ -6848,6 +6944,47 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           blocks: [
             ...s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+          ],
+        };
+      });
+      return;
+    case "session_input_delivered":
+      // Keep the persisted message pending until the runner drains it.
+      if (event.isMeta === true) return;
+      applyToConversation((s) => {
+        if (hasCommittedItem(s.blocks, event.itemId)) return {};
+        if (s.pendingUserMessages.some((p) => p.deliveredItemId === event.itemId)) return {};
+        // FIFO is safe within one author; the guard separates concurrent viewers.
+        const at = s.pendingUserMessages.findIndex(
+          (p) =>
+            p.deliveredItemId === undefined &&
+            (event.createdBy === undefined ||
+              p.author === undefined ||
+              p.author === event.createdBy),
+        );
+        if (at >= 0) {
+          const entry = s.pendingUserMessages[at]!;
+          return {
+            pendingUserMessages: [
+              ...s.pendingUserMessages.slice(0, at),
+              { ...entry, deliveredItemId: event.itemId, posted: true },
+              ...s.pendingUserMessages.slice(at + 1),
+            ],
+          };
+        }
+        // Materialize messages steered by another client.
+        const content = userContentFromEvent(event);
+        if (content === null) return {};
+        return {
+          pendingUserMessages: [
+            ...s.pendingUserMessages,
+            {
+              tempId: `delivered:${event.itemId}`,
+              content,
+              posted: true,
+              deliveredItemId: event.itemId,
+              ...(event.createdBy !== undefined ? { author: event.createdBy } : {}),
+            },
           ],
         };
       });

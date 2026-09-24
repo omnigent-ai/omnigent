@@ -159,6 +159,8 @@ export type Bubble =
       itemId: string;
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
+      /** Delivered into a running turn's buffer but not yet consumed. */
+      awaitingConsumption?: boolean;
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
@@ -1821,6 +1823,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     if (
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
+      Boolean(a.awaitingConsumption) !== Boolean(b.awaitingConsumption) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
