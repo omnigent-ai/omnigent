@@ -176,6 +176,7 @@ async def post_external_session_status(
     background_task_count: int | None = None,
     background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
+    turn_completed: bool | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -204,6 +205,11 @@ async def post_external_session_status(
         what makes native forwarded tool cards render LIVE (spinner + elapsed
         timer) rather than as static completed cards. ``None`` (the default)
         preserves status edges that don't map to a turn.
+    :param turn_completed: Whether this ``"idle"`` edge reports a turn the
+        harness knows finished (e.g. Claude's ``Stop`` hook, which never fires
+        on an interrupt). ``True`` lets the runner deliver a sub-agent
+        ``completed`` as fact; ``None`` (the default) marks a quiescence-derived
+        edge that cannot distinguish "finished" from "stopped early".
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -215,6 +221,8 @@ async def post_external_session_status(
         data["background_tasks"] = background_tasks
     if response_id is not None:
         data["response_id"] = response_id
+    if turn_completed is not None:
+        data["turn_completed"] = turn_completed
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

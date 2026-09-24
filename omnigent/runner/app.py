@@ -447,6 +447,12 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+# Native agents whose forwarder stamps ``turn_completed`` on the idle edges of
+# genuinely finished turns (claude: the ``Stop`` hook, which never fires on an
+# interrupt). For these, a bare quiescence ``idle`` is NOT a completion. Add a
+# key here only together with its forwarder's ``turn_completed`` plumbing,
+# or that harness's sub-agent completions stop reaching parent inboxes.
+_TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS = frozenset({"claude"})
 # Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
 # that has produced NO edge at all (no running/waiting/terminal status, no
 # in-flight response) within this window never started — fail it loudly
@@ -976,6 +982,9 @@ async def _complete_acp_subagent_child(
             session_id=child_id,
             status="idle" if ok else "failed",
             output=summary or None,
+            # The harness reported this sub-agent's outcome itself, so a
+            # success edge is a confirmed turn completion, not a guess.
+            turn_completed=True if ok else None,
         )
     except Exception as exc:  # noqa: BLE001 — a status edge failure must not break the turn
         _logger.warning(
@@ -2102,6 +2111,7 @@ def mark_subagent_work_terminal(
     *,
     status: str,
     output: str | None,
+    turn_confirmed: bool = False,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
@@ -2114,6 +2124,9 @@ def mark_subagent_work_terminal(
         If an earlier terminal report could not be delivered, a later
         report for the same child replaces the undelivered status and
         output before retrying parent inbox delivery.
+    :param turn_confirmed: Whether the harness itself confirmed this turn
+        outcome (e.g. Claude's ``Stop`` hook edge). A confirmed ``completed``
+        may replace a delivered ``cancelled`` guess and be re-delivered.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
@@ -2146,6 +2159,17 @@ def mark_subagent_work_terminal(
         # success before the re-delivery arrives — that window is inherent to
         # the edge race; re-delivery is the mitigation, not a prevention.
         if status == "failed" and entry.status == "completed":
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            return _deliver_subagent_completion(entry)
+        # A harness-confirmed completion outranks a delivered ``cancelled``:
+        # an interrupted agent can survive the Escape and finish, and its real
+        # result must correct the earlier guess rather than be discarded. Like
+        # the ``failed``-over-``completed`` rule above, re-delivery is the
+        # mitigation for a parent that already acted on the guess.
+        if status == "completed" and turn_confirmed and entry.status == "cancelled":
             entry.status = status
             entry.output = output
             entry.completed_at = time.time()
@@ -2205,7 +2229,11 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
         )
     output = entry.output
     if output is None:
-        output = "[System: sub-agent completed with no output]"
+        # Only a completion needs the explicit no-output marker; a cancelled
+        # dispatch legitimately has nothing to report.
+        output = (
+            "[System: sub-agent completed with no output]" if entry.status == "completed" else ""
+        )
     inbox.put_nowait(
         {
             "type": "sub_agent",
@@ -4963,6 +4991,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
+        _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -5687,6 +5716,11 @@ def create_runner_app(
             return None
         h = spec.executor.config.get("harness") or spec.executor.type
         return canonicalize_harness(h) or h
+
+    def _native_turn_outcome_is_forwarder_confirmed(conv_id: str) -> bool:
+        """Whether this session's forwarder distinguishes finished from aborted turns."""
+        agent = native_coding_agent_for_harness(_session_harness_name(conv_id))
+        return agent is not None and agent.key in _TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS
 
     def _publish_turn_status(
         conv_id: str,
@@ -7594,7 +7628,7 @@ def create_runner_app(
                 _mark_subagent_terminal_and_wake(
                     conv_id,
                     status="cancelled",
-                    output="[System: sub-agent interrupted]",
+                    output=None,
                 )
         elif error is not None:
             _mark_subagent_terminal_and_wake(
@@ -7659,7 +7693,7 @@ def create_runner_app(
                 _mark_subagent_terminal_and_wake(
                     conv_id,
                     status="cancelled",
-                    output="[System: sub-agent interrupted]",
+                    output=None,
                 )
         return True
 
@@ -8222,9 +8256,11 @@ def create_runner_app(
         _background_tasks.add(_retry_task)
 
     def _mark_subagent_terminal_and_wake(
-        child_session_id: str, *, status: str, output: str | None
+        child_session_id: str, *, status: str, output: str | None, turn_confirmed: bool = False
     ) -> _SubagentDeliveryAck:
-        ack = mark_subagent_work_terminal(child_session_id, status=status, output=output)
+        ack = mark_subagent_work_terminal(
+            child_session_id, status=status, output=output, turn_confirmed=turn_confirmed
+        )
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
         return ack
@@ -10093,20 +10129,62 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
-            if status in ("idle", "failed"):
-                recovered_entry = await _ensure_subagent_work_entry(conversation_id)
-            if status == "idle":
+            turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
+            interrupt_pending = False
+            if status == "idle" and turn_completed is not True:
+                # An unconfirmed idle following an interrupt settles the
+                # dispatch: the turn stopped early, so report ``cancelled``
+                # with whatever output the edge carried instead of guessing
+                # ``completed`` — or discarding a genuine result.
+                interrupt_pending = _native_interrupt_runner.take_pending_interrupt(
+                    conversation_id
+                )
+            ambiguous_idle = (
+                status == "idle"
+                and turn_completed is not True
+                and not interrupt_pending
+                and _native_turn_outcome_is_forwarder_confirmed(conversation_id)
+            )
+            if ambiguous_idle:
+                # This harness's forwarder marks genuine turn completions
+                # (``turn_completed``), so a bare quiescence idle proves
+                # nothing about the turn's outcome: record the pane status
+                # above but settle no outcome. Mapping it to ``completed``
+                # reported aborted turns as successes.
+                entry = get_subagent_work(conversation_id)
+                if entry is None or entry.status not in _SUBAGENT_TERMINAL_STATUSES:
+                    return Response(status_code=204)
+                # An already-settled outcome may still await parent delivery
+                # (the forwarder's 503-retry contract); re-attempt it.
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
-                    status="completed",
-                    output=output if output is not None else "",
+                    status=entry.status,
+                    output=entry.output,
                 )
-            elif status == "failed":
-                delivery_ack = _mark_subagent_terminal_and_wake(
-                    conversation_id,
-                    status="failed",
-                    output=output or "Error: native sub-agent turn failed",
-                )
+            else:
+                if status in ("idle", "failed"):
+                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                if status == "idle" and interrupt_pending:
+                    delivery_ack = _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="cancelled",
+                        output=output,
+                    )
+                elif status == "idle":
+                    _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                    delivery_ack = _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="completed",
+                        output=output if output is not None else "",
+                        turn_confirmed=turn_completed is True,
+                    )
+                elif status == "failed":
+                    _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                    delivery_ack = _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="failed",
+                        output=output or "Error: native sub-agent turn failed",
+                    )
             if delivery_ack is not None:
                 if (
                     delivery_ack.entry is not None

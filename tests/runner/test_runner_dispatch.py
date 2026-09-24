@@ -5521,7 +5521,7 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
                 runner_app.mark_subagent_work_terminal(
                     "conv_child_cancel",
                     status="cancelled",
-                    output="[System: sub-agent stopped]",
+                    output=None,
                 )
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})

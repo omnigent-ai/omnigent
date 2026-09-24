@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import importlib
 import logging
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -308,6 +309,14 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     return "best_effort"
 
 
+# How long an unresolved interrupt may wait for the harness's own terminal
+# edge before the dispatch is reported ``cancelled`` to the parent anyway.
+# An interrupted native agent usually aborts without firing any turn-end
+# hook, so this timer is the liveness floor that keeps the parent from
+# hanging; a confirmed completion that lands later still corrects the record.
+_NATIVE_INTERRUPT_CANCEL_GRACE_S = 20.0
+
+
 class NativeInterruptRunner:
     """Forward interrupt / stop events into a session's native harness bridge."""
 
@@ -331,6 +340,11 @@ class NativeInterruptRunner:
         self._codex_bridge_state_for_session = codex_bridge_state_for_session
         self._client_safe_error_detail = client_safe_error_detail
         self._logger = logger
+        # Sessions whose native interrupt was injected but whose turn outcome
+        # is still unknown; resolved by the next terminal edge or the grace
+        # timer, whichever lands first.
+        self._pending_interrupts: dict[str, float] = {}
+        self._pending_interrupt_timers: dict[str, asyncio.TimerHandle] = {}
 
     async def interrupt(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch an interrupt to the harness's bridge.
@@ -374,11 +388,52 @@ class NativeInterruptRunner:
             return None
         return await self._uniform_stop(spec, conv_id)
 
-    def _wake_parent_after_native_interrupt(self, conv_id: str) -> None:
+    def _defer_parent_wake_after_native_interrupt(self, conv_id: str) -> None:
+        """Record the interrupt instead of guessing a terminal status.
+
+        Injecting an Escape does not confirm the agent stopped: it may abort
+        mid-task or survive and finish. Reporting ``cancelled`` here locked the
+        dispatch and discarded a genuine result that landed afterwards. The
+        outcome is decided by whichever arrives first: the harness's terminal
+        edge (``external_session_status``) or the grace timer.
+        """
+        if conv_id in self._pending_interrupts:
+            return
+        self._pending_interrupts[conv_id] = time.time()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._pending_interrupt_timers[conv_id] = loop.call_later(
+            _NATIVE_INTERRUPT_CANCEL_GRACE_S,
+            self._deliver_unconfirmed_interrupt_cancel,
+            conv_id,
+        )
+
+    def take_pending_interrupt(self, conv_id: str) -> bool:
+        """Consume a recorded-but-unresolved interrupt for *conv_id*.
+
+        :returns: ``True`` when an interrupt was pending; the caller now owns
+            resolving the dispatch's terminal status.
+        """
+        pending = self._pending_interrupts.pop(conv_id, None) is not None
+        timer = self._pending_interrupt_timers.pop(conv_id, None)
+        if timer is not None:
+            timer.cancel()
+        return pending
+
+    def clear_pending_interrupt(self, conv_id: str) -> None:
+        """Drop any recorded interrupt whose outcome another path resolved."""
+        self.take_pending_interrupt(conv_id)
+
+    def _deliver_unconfirmed_interrupt_cancel(self, conv_id: str) -> None:
+        """Grace-timer fallback: no terminal edge followed the interrupt."""
+        if not self.take_pending_interrupt(conv_id):
+            return
         delivery_ack = self._mark_subagent_terminal_and_wake(
             conv_id,
             status="cancelled",
-            output="[System: sub-agent interrupted]",
+            output=None,
         )
         if not delivery_ack.delivered and (
             delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
@@ -447,7 +502,7 @@ class NativeInterruptRunner:
         # is why publishing here would double it.
         if terminal_role is not None and terminal_role not in _STATUS_EMITTING_TERMINAL_ROLES:
             self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        self._wake_parent_after_native_interrupt(conv_id)
+        self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
     async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:
@@ -471,10 +526,13 @@ class NativeInterruptRunner:
         await self._teardown_session_terminals(conv_id)
         await _cancel_auto_forwarder_task(conv_id)
         self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
         delivery_ack = self._mark_subagent_terminal_and_wake(
             conv_id,
             status="cancelled",
-            output="[System: sub-agent stopped]",
+            output=None,
         )
         if not delivery_ack.delivered and (
             delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
@@ -511,7 +569,7 @@ class NativeInterruptRunner:
                     ),
                 },
             )
-        self._wake_parent_after_native_interrupt(conv_id)
+        self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
     async def _claude_stop(self, conv_id: str) -> Response:
@@ -540,10 +598,13 @@ class NativeInterruptRunner:
             )
         await self._teardown_session_terminals(conv_id)
         self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
         delivery_ack = self._mark_subagent_terminal_and_wake(
             conv_id,
             status="cancelled",
-            output="[System: sub-agent stopped]",
+            output=None,
         )
         if not delivery_ack.delivered and (
             delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
@@ -649,5 +710,5 @@ class NativeInterruptRunner:
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        self._wake_parent_after_native_interrupt(conv_id)
+        self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)

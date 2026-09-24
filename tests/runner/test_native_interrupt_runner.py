@@ -108,10 +108,15 @@ async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_uniform_interrupt_injects_and_wakes_parent(
+async def test_uniform_interrupt_defers_parent_wake_until_outcome_known(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A uniform interrupt calls the bridge inject fn and wakes the parent."""
+    """An interrupt injects the Escape but must not report a terminal status yet.
+
+    Injecting an Escape does not confirm the agent stopped, so no ``cancelled``
+    may be delivered until the harness's terminal edge or the grace timer
+    resolves the outcome.
+    """
     import omnigent.harnesses.goose_native.bridge as goose_bridge
 
     calls: list[Any] = []
@@ -127,7 +132,56 @@ async def test_uniform_interrupt_injects_and_wakes_parent(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert calls == [("dir/conv_g", 1.0)]
-    assert captured["wakes"] == [("conv_g", "cancelled", "[System: sub-agent interrupted]")]
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_g") is True
+    # Consumed: a second take finds nothing and the grace timer is disarmed.
+    assert runner.take_pending_interrupt("conv_g") is False
+
+
+@pytest.mark.asyncio
+async def test_interrupt_grace_timer_delivers_unconfirmed_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no terminal edge after the interrupt, the grace timer reports cancelled."""
+    import asyncio
+
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.02)
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("goose-native", "conv_g")
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert captured["wakes"] == []
+
+    await asyncio.sleep(0.1)
+    assert captured["wakes"] == [("conv_g", "cancelled", None)]
+    assert runner.take_pending_interrupt("conv_g") is False
+
+
+@pytest.mark.asyncio
+async def test_resolved_interrupt_disarms_grace_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal edge that consumed the pending interrupt silences the timer."""
+    import asyncio
+
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.02)
+
+    runner, captured = _make_runner()
+    await runner.interrupt("goose-native", "conv_g")
+    assert runner.take_pending_interrupt("conv_g") is True
+
+    await asyncio.sleep(0.1)
+    assert captured["wakes"] == []
 
 
 @pytest.mark.asyncio
@@ -192,13 +246,17 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
     )
 
     runner, captured = _make_runner()
+    # A stop that follows an unresolved interrupt settles it: the kill is
+    # confirmed, so no grace-timer cancel may fire later.
+    runner._pending_interrupts["conv_c"] = 0.0
     resp = await runner.stop("cursor-native", "conv_c")
 
     assert isinstance(resp, Response) and resp.status_code == 204
+    assert runner.take_pending_interrupt("conv_c") is False
     assert killed == [("dir/conv_c", 1.0)]
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
-    assert captured["wakes"] == [("conv_c", "cancelled", "[System: sub-agent stopped]")]
+    assert captured["wakes"] == [("conv_c", "cancelled", None)]
 
 
 @pytest.mark.asyncio
@@ -277,7 +335,7 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
     resp = await runner.stop("claude-native", "conv_cn")
 
     assert isinstance(resp, Response) and resp.status_code == 204
-    assert captured["wakes"] == [("conv_cn", "cancelled", "[System: sub-agent stopped]")]
+    assert captured["wakes"] == [("conv_cn", "cancelled", None)]
 
 
 @pytest.mark.asyncio
@@ -315,7 +373,7 @@ async def test_claude_stop_kill_failure_returns_503_without_idle(
 async def test_claude_interrupt_resolves_bridge_id_and_injects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """claude interrupt resolves the bridge id, injects, and wakes the parent."""
+    """claude interrupt resolves the bridge id and injects, deferring the wake."""
     import omnigent.harnesses.claude_native.bridge as claude_bridge
     from omnigent.runner.native import interrupt as interrupt_mod
 
@@ -336,4 +394,6 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert injected == [("dir/bid-conv_cl", 1.0)]
-    assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+    # No optimistic 'cancelled': the outcome is unknown until an edge lands.
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_cl") is True

@@ -1607,7 +1607,7 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     # no background tasks) so a finished shell clears the indicator.
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 0},
+        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
     }
 
 
@@ -1768,7 +1768,7 @@ async def test_forwarder_ignores_background_subagent_stop_failure_by_session_id(
     # ``failed``; the fix ensures only the parent's ``idle`` arrives.
     assert first["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 0},
+        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
     }
 
 
@@ -1972,7 +1972,7 @@ async def test_forwarder_ignores_subagent_stop_hook(
 
     assert first["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 0},
+        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
     }
 
 
@@ -11017,6 +11017,7 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
         "type": "external_session_status",
         "data": {
             "status": "idle",
+            "turn_completed": True,
             "background_task_count": 1,
             # Per-shell detail rides alongside the count so the UI can name the
             # running shells (see BackgroundTaskInfo / _normalize_background_task).
@@ -11119,6 +11120,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
             # and background-task features share this one status edge.
             "data": {
                 "status": "idle",
+                "turn_completed": True,
                 "background_task_count": 0,
                 "response_id": "resp_turn_1",
             },
