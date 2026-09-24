@@ -20,19 +20,6 @@ test), then does one of two things:
   the PR itself, prepares a reviewer-facing body for a workflow-owned publisher,
   or stops after a local commit when `skip_push` is enabled.
 
-Before coding, resolve searches linked PRs and the affected component, including
-for Linear tickets without GitHub mirrors. It reads plausible candidates' full
-descriptions and relevant diffs, compares their coverage with the reported
-symptoms, and records why a separate fix is needed. A different title or issue
-link is not enough to dismiss a candidate.
-
-Before opening a new PR (or handing the work to the CI publisher), it refreshes
-that search and evaluates new or changed candidates. A sound existing fix goes
-through the review path; a newly merged fix is checked against current main.
-The handoff records the refresh time and result in `fix_summary`. This is an
-agent instruction, not a publisher-enforced gate: delayed publication retries
-can still race with other work. Local-only runs skip the publication refresh.
-
 ## Prerequisites
 
 - A configured Claude provider (`omnigent setup` — an Anthropic API key, a
