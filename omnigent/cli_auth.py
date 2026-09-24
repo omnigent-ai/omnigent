@@ -38,6 +38,8 @@ from omnigent.util.server_url import is_workspace_hosted_url
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+
 _logger = logging.getLogger(__name__)
 _TOKEN_FILE_NAME = "auth_tokens.json"
 
@@ -781,6 +783,7 @@ def open_server_client(
     follow_redirects: bool = False,
     transport: httpx.AsyncBaseTransport | None = None,
     host_id: str | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> httpx.AsyncClient:
     """Open an :class:`httpx.AsyncClient` to an Omnigent server, keyed for routing.
 
@@ -833,6 +836,18 @@ def open_server_client(
         kwargs["timeout"] = timeout
     if transport is not None:
         kwargs["transport"] = transport
+    if event_dispatcher is not None:
+        from omnigent.runner.transports.ws_tunnel.event_delivery import TunnelEventClient
+
+        return TunnelEventClient(
+            event_dispatcher=event_dispatcher,
+            base_url=server_url,
+            headers=pinned,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            trust_env=not is_loopback_url(server_url),
+            **kwargs,
+        )
     return httpx.AsyncClient(
         base_url=server_url,
         headers=pinned,

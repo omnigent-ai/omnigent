@@ -1649,6 +1649,10 @@ async def _run_tunnel_from_env() -> None:
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
     app = create_app(auth_token_factory=auth_token_factory)
+    from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+
+    event_dispatcher = RunnerEventDispatcher()
+    app.state.runner_event_dispatcher = event_dispatcher
     idle_timeout_s = _load_runner_idle_timeout_s_from_config()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
     _lifespan_cm = app.router.lifespan_context(app)
@@ -1708,9 +1712,7 @@ async def _run_tunnel_from_env() -> None:
         :returns: ``True`` while at least one agent turn is active.
         """
         callback = getattr(app.state, "has_active_work", None)
-        if not callable(callback):
-            return False
-        return bool(callback())
+        return event_dispatcher.has_pending or (callable(callback) and bool(callback()))
 
     # Human-readable reason for why the runner is shutting down, recorded
     # by whichever path wins the shutdown race and logged on the way out so
@@ -1781,6 +1783,7 @@ async def _run_tunnel_from_env() -> None:
             auth_token=auth_token,
             tunnel_token=binding_token,
             auth_token_factory=auth_token_factory,
+            event_dispatcher=event_dispatcher,
             on_reconnect=getattr(app.state, "catch_up_scan", None),
             on_activity=_mark_activity,
             shutdown_event=tunnel_shutdown_event,
