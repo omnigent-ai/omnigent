@@ -12,7 +12,7 @@ import importlib.metadata
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TypeVar, cast
+from typing import Literal, TypeAlias, TypeVar, cast
 
 from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
@@ -49,6 +49,9 @@ _logger = logging.getLogger(__name__)
 
 COMMUNITY_ENTRY_POINT_GROUP = "omnigent.community.harness"
 COMMUNITY_MODULE_PREFIX = "omnigent.community.harness."
+
+PaneReapPolicy: TypeAlias = Literal["reap", "exempt"]
+StatusOwner: TypeAlias = Literal["pane", "status_file", "forwarder", "runner_and_forwarder"]
 
 
 @dataclass(frozen=True)
@@ -112,10 +115,19 @@ class NativeHarnessProvider:
     # ``omnigent.runner.native.pane_probe_types``). ``None`` when the harness's
     # running/idle is pane-derived and needs no probe.
     pane_turn_probe: str | None = None
+    # Whether an idle pane may be reaped: ``"reap"`` (the next turn re-creates
+    # it and the CLI resumes), ``"exempt"`` (never; ``pane_reap_exempt_reason``
+    # says why) or ``None`` (undeclared: never reaped, logged once).
+    pane_reap: PaneReapPolicy | None = None
+    pane_reap_exempt_reason: str | None = None
     # Optional ``async (session_id: str) -> None`` releasing per-session pane
     # sidecars the runner's shared registries do not track. Called last when a
-    # pane is reaped or deleted.
+    # pane is reaped or its sidecars are swept.
     pane_teardown: str | None = None
+    # The channel that reports the agent's running/idle: its pane (PTY
+    # watcher), a vendor status file, its forwarder's relayed edges, or the
+    # runner's turn plus the forwarder's edges.
+    status_owner: StatusOwner | None = None
 
 
 @dataclass(frozen=True)
@@ -288,6 +300,29 @@ _BUILTIN_PANE_PROBE_HARNESSES: frozenset[str] = frozenset(
     {"claude", "codex", "antigravity", "opencode", "devin"}
 )
 
+# Pane-reaper policy per built-in harness: (pane_reap, exempt reason, status
+# owner). Every built-in must appear here; ``_require_full_pane_reap_coverage``
+# in the runner enforces it.
+_BUILTIN_PANE_POLICY: dict[str, tuple[PaneReapPolicy, str | None, StatusOwner]] = {
+    "claude": ("reap", None, "status_file"),
+    "codex": ("reap", None, "forwarder"),
+    "pi": ("reap", None, "pane"),
+    "opencode": ("reap", None, "runner_and_forwarder"),
+    "cursor": ("reap", None, "pane"),
+    "kiro": ("reap", None, "pane"),
+    "goose": ("reap", None, "pane"),
+    "antigravity": ("reap", None, "forwarder"),
+    "qwen": ("reap", None, "pane"),
+    "kimi": (
+        "exempt",
+        "kimi records no resumable chat id: a re-created pane starts a fresh "
+        "TUI and silently drops the conversation's context",
+        "pane",
+    ),
+    "hermes": ("reap", None, "pane"),
+    "devin": ("reap", None, "runner_and_forwarder"),
+}
+
 
 def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     """Build a built-in provider row from the ``omnigent.<key>_native`` module.
@@ -303,6 +338,7 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     """
     pkg = f"omnigent.harnesses.{key}_native"
     module = f"{pkg}.main"
+    pane_reap, exempt_reason, status_owner = _BUILTIN_PANE_POLICY.get(key, (None, None, None))
     return NativeHarnessProvider(
         key=key,
         run_native=f"{module}:run_{key}_native",
@@ -316,6 +352,9 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
         pane_turn_probe=(
             f"{pkg}.pane_probe:probe_pane_turn" if key in _BUILTIN_PANE_PROBE_HARNESSES else None
         ),
+        pane_reap=pane_reap,
+        pane_reap_exempt_reason=exempt_reason,
+        status_owner=status_owner,
     )
 
 

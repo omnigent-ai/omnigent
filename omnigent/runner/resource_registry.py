@@ -408,17 +408,9 @@ class SessionResourceRegistry:
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
         self._session_status_publisher: Callable[[str, str, str | None], None] | None = None
-        # Latest PTY-derived status (running/idle) per session. Lets
-        # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
-        # mid-turn crash. Written from the watcher thread and the turn-start
-        # hook; all access goes through the ``_*_session_status_memo`` helpers
-        # under ``self._lock``.
-        # custom-lint: disable-next=session-status-single-source -- exit memo
-        self._last_session_status: dict[str, str] = {}
-        self._session_activity_epoch: dict[str, int] = {}
-        self._active_session_turns: set[str] = set()
         # The runner's one record of each session's status. Every edge is
-        # recorded here at observation time (see ``SessionStatusBook``).
+        # recorded here at observation time (see ``SessionStatusBook``); the
+        # exit-classification memo is a projection of it.
         self.status_book = SessionStatusBook(clock=status_clock or time.monotonic)
         # What the server has heard: the last status edge delivered per session,
         # shared by the watcher and the forwarders' relayed edges so the two
@@ -525,25 +517,15 @@ class SessionResourceRegistry:
     def _set_session_status_memo(
         self, session_id: str, status: str, *, record_activity: bool = True
     ) -> None:
-        """Record the session's latest PTY status for exit classification."""
-        with self._lock:
-            if record_activity and status in {"running", "waiting"}:
-                self._active_session_turns.add(session_id)
-                self._session_activity_epoch[session_id] = (
-                    self._session_activity_epoch.get(session_id, 0) + 1
-                )
-            if status in {"idle", "failed"}:
-                self._active_session_turns.discard(session_id)
-            # custom-lint: disable-next=session-status-single-source -- exit memo
-            self._last_session_status[session_id] = status
+        """Record the session's latest status for exit classification."""
+        self.status_book.note_exit_status(session_id, status, record_activity=record_activity)
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
-        """Pop and return the session's recorded PTY status (or ``None``)."""
+        """Pop and return the session's exit-classification status (or ``None``)."""
         with self._lock:
-            self._active_session_turns.discard(session_id)
             self._server_delivery_baseline.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
-            return self._last_session_status.pop(session_id, None)
+        return self.status_book.take_exit_status(session_id)
 
     def reset_session_status(self, session_id: str, reason: str) -> None:
         """Drop a session's per-pane status state after its native pane is gone.
@@ -559,8 +541,6 @@ class SessionResourceRegistry:
         """
         with self._lock:
             self._status_pollers.pop(session_id, None)
-            self._last_session_status.pop(session_id, None)
-            self._active_session_turns.discard(session_id)
         self.status_book.reset(session_id, reason)
 
     def sidecar_home(self, session_id: str) -> str:
@@ -687,9 +667,8 @@ class SessionResourceRegistry:
         they hold their own edge/mtime baselines on the watcher thread, so
         clearing only this side would leave them silent.
 
-        Deliberately does NOT clear ``_last_session_status`` — that memo
-        classifies terminal exits (clean vs mid-turn crash) and is unrelated to
-        what the server has heard.
+        Deliberately does NOT touch ``status_book`` — it records what the panes
+        and channels reported, which is unrelated to what the server has heard.
         """
         with self._lock:
             sessions = sorted(self._server_delivery_baseline)
@@ -709,13 +688,11 @@ class SessionResourceRegistry:
 
     def session_activity_epoch(self, session_id: str) -> int:
         """Count explicit turn activity, retaining it after idle or terminal exit."""
-        with self._lock:
-            return self._session_activity_epoch.get(session_id, 0)
+        return self.status_book.activity_epoch(session_id)
 
     def session_turn_is_active(self, session_id: str) -> bool:
         """Whether an explicitly observed turn is unfinished, excluding pane repaints."""
-        with self._lock:
-            return session_id in self._active_session_turns
+        return self.status_book.turn_is_active(session_id)
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
@@ -733,7 +710,7 @@ class SessionResourceRegistry:
         """
         with self._lock:
             self._vendor_turn_homes.pop(session_id, None)
-        self._set_session_status_memo(session_id, "running")
+        self.status_book.note_turn_started(session_id)
 
     def note_external_session_status(
         self,
@@ -1973,16 +1950,6 @@ class SessionResourceRegistry:
             # target already has from its own terminal.
             self.status_book.transfer(source_session_id, target_session_id)
             with self._lock:
-                moved_status = self._last_session_status.pop(source_session_id, None)
-                if moved_status is not None and target_session_id not in self._last_session_status:
-                    # custom-lint: disable-next=session-status-single-source -- exit memo
-                    self._last_session_status[target_session_id] = moved_status
-                    if source_session_id in self._active_session_turns:
-                        self._active_session_turns.add(target_session_id)
-                        self._session_activity_epoch[target_session_id] = (
-                            self._session_activity_epoch.get(target_session_id, 0) + 1
-                        )
-                self._active_session_turns.discard(source_session_id)
                 # The watcher restart below rebuilds the poller under the
                 # target, so drop the source's entry rather than leaving a
                 # retired poller to be re-armed on every later reconnect.
@@ -2030,7 +1997,6 @@ class SessionResourceRegistry:
         self.status_book.forget(session_id)
         self.reset_statuses_kept_for(session_id, "launching_session_cleaned_up")
         with self._lock:
-            self._session_activity_epoch.pop(session_id, None)
             self._vendor_turn_homes.pop(session_id, None)
             self._sidecar_homes.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)

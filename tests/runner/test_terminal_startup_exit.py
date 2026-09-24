@@ -120,12 +120,13 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
     assert published == []
     assert terminals.get("failed-child", "native", "main") is None
     assert resources.terminal_resource_role("failed-child", "terminal_native_main") is None
-    assert resources._last_session_status["failed-child"] == "running"
-    assert "failed-child" in resources._active_session_turns
+    assert resources.session_turn_is_active("failed-child") is True
     assert resources._server_delivery_baseline["failed-child"] == ("running", None)
     # A pane that never ran keeps the session's recorded status too.
     record = resources.status_book.current("failed-child")
     assert record is not None and record.status == "running"
+    # ... and its exit memo (taking it also drops the delivery baseline).
+    assert resources._take_session_status_memo("failed-child") == "running"
     close_mock.assert_awaited_once()
 
     events: list[object] = []

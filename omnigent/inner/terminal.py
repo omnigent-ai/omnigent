@@ -308,6 +308,10 @@ _IDLE_POLL_INTERVAL_SECONDS = 1.0
 # A running tmux client can fail transiently while the server and pane remain
 # healthy. Require repeated capture + session-probe failures before exit.
 _IDLE_EXIT_FAILURE_THRESHOLD = 3
+# A watcher callback that raises is retried on the next tick; the threaded
+# watcher gives up only after this many consecutive failures of one callback,
+# so one bad tick cannot silently freeze a pane's status for good.
+_WATCH_CALLBACK_FAILURE_LIMIT = 20
 _PROBE_ERROR_MAX_CHARS = 1024
 _EXIT_DIAGNOSTIC_SCROLLBACK_LINES = 100
 _EXIT_STATUS_REFRESH_SECONDS = 0.1
@@ -1081,6 +1085,8 @@ class TerminalInstance:
     # under ``_idle_stop_event``.
     _idle_thread: threading.Thread | None = field(default=None, repr=False)
     _idle_stop_event: threading.Event | None = field(default=None, repr=False)
+    # Monotonic time the threaded watcher last completed a poll, or ``None``.
+    _watcher_heartbeat_at: float | None = field(default=None, repr=False)
     # Monotonic timestamp of the last client interaction observed on this
     # terminal's web attach (keystroke / focus / mouse / resize / connect /
     # disconnect — see :meth:`note_client_interaction`). The idle watcher
@@ -2145,7 +2151,29 @@ class TerminalInstance:
         interval = poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
         consecutive_capture_failures = 0
         self._probe_failures.clear()
+        callback_failures: dict[str, int] = {}
+
+        def _watch(callback: Callable[[], None], kind: str) -> bool:
+            # Log the first failure of a streak, then only the give-up.
+            streak = callback_failures.get(kind, 0)
+            if self._fire_watch_callback(callback, kind, log_failure=streak == 0):
+                callback_failures.pop(kind, None)
+                return True
+            callback_failures[kind] = streak + 1
+            if streak + 1 < _WATCH_CALLBACK_FAILURE_LIMIT:
+                return True
+            logger.error(
+                "%s-notification callback failed %d times in a row for terminal %s:%s; "
+                "stopping its watcher",
+                kind,
+                streak + 1,
+                self.name,
+                self.session_key,
+            )
+            return False
+
         while True:
+            self._watcher_heartbeat_at = time.monotonic()
             # ``Event.wait`` doubles as the poll-interval sleep, so
             # ``stop_event.set()`` from :meth:`close` returns within
             # one tick instead of waiting out the full interval.
@@ -2213,7 +2241,7 @@ class TerminalInstance:
             # Claude's sessions/<pid>.json). Fired after the exit checks so
             # it never runs for a dead pane, and before the pane diff so an
             # authoritative file status can preempt the PTY-derived edge.
-            if on_tick is not None and not self._fire_watch_callback(on_tick, "tick"):
+            if on_tick is not None and not _watch(on_tick, "tick"):
                 return
             # A pane change that lands within the recent-interaction window
             # is a client-driven repaint (attach/detach reflow, focus,
@@ -2230,14 +2258,10 @@ class TerminalInstance:
             if (
                 on_activity is not None
                 and detector.changed_this_tick
-                and not self._fire_watch_callback(on_activity, "activity")
+                and not _watch(on_activity, "activity")
             ):
                 return
-            if (
-                idle_fired
-                and on_idle is not None
-                and not self._fire_watch_callback(on_idle, "idle")
-            ):
+            if idle_fired and on_idle is not None and not _watch(on_idle, "idle"):
                 return
 
     def _capture_pane_for_idle_or_none(self) -> str | None:
@@ -2356,7 +2380,9 @@ class TerminalInstance:
         except ValueError:
             return None
 
-    def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
+    def _fire_watch_callback(
+        self, callback: Callable[[], None], kind: str, *, log_failure: bool = True
+    ) -> bool:
         """
         Invoke a watcher edge callback, swallow + log on failure.
 
@@ -2364,22 +2390,33 @@ class TerminalInstance:
             activity).
         :param kind: Label for logging, e.g. ``"idle"`` or
             ``"activity"``.
-        :returns: ``True`` when the callback returned cleanly so
-            the watcher continues; ``False`` when the callback
-            raised (logged) so the watcher exits per the
-            threaded-loop contract.
+        :param log_failure: Whether to log a raised exception.
+        :returns: ``True`` when the callback returned cleanly; ``False``
+            when it raised. The threaded loop retries a failing callback
+            and stops only after a long streak of failures.
         """
         try:
             callback()
         except Exception:
-            logger.exception(
-                "%s-notification callback failed for terminal %s:%s",
-                kind,
-                self.name,
-                self.session_key,
-            )
+            if log_failure:
+                logger.exception(
+                    "%s-notification callback failed for terminal %s:%s",
+                    kind,
+                    self.name,
+                    self.session_key,
+                )
             return False
         return True
+
+    def watcher_alive(self) -> bool:
+        """Whether the threaded pane watcher is still running."""
+        thread = self._idle_thread
+        return thread is not None and thread.is_alive()
+
+    @property
+    def watcher_heartbeat_at(self) -> float | None:
+        """Monotonic time the threaded watcher last polled, or ``None``."""
+        return self._watcher_heartbeat_at
 
     def _stop_idle_watcher_thread(self) -> None:
         """

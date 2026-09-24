@@ -105,37 +105,58 @@ def test_blocked_is_none_once_the_session_is_idle() -> None:
     assert book.blocked("conv") is None
 
 
-def test_reset_keeps_the_ordering_stamps() -> None:
+def test_reset_keeps_the_activity_epoch_and_the_ordering_stamps() -> None:
     book, clock = _book()
+    book.note_turn_started("conv")
     book.record("conv", "running", source=StatusSource.RUNNER)
     dispatched = book.last_dispatch_at("conv")
     clock.now += 5
     book.record("conv", "idle", source=StatusSource.CONTROL)
-    control = book.last_control_idle_at("conv")
+    control = (book.last_control_idle_at("conv"), book.last_control_idle_wall("conv"))
+    epoch = book.activity_epoch("conv")
+    assert epoch > 0
 
     book.reset("conv", "native_terminal_closed")
 
     assert book.current("conv") is None
+    assert book.turn_is_active("conv") is False
+    assert book.take_exit_status("conv") is None
+    assert book.activity_epoch("conv") == epoch
     # They order evidence that outlives the pane (a hook log on disk).
     assert book.last_dispatch_at("conv") == dispatched
-    assert book.last_control_idle_at("conv") == control
+    assert (book.last_control_idle_at("conv"), book.last_control_idle_wall("conv")) == control
+
+
+def test_taking_the_exit_status_ends_the_turn() -> None:
+    book, _ = _book()
+    book.note_turn_started("conv")
+    assert book.turn_is_active("conv") is True
+    assert book.take_exit_status("conv") == "running"
+    assert book.turn_is_active("conv") is False
+    assert book.take_exit_status("conv") is None
+    # The epoch counts turns across pane lifetimes, so taking keeps it.
+    assert book.activity_epoch("conv") == 1
 
 
 def test_forget_drops_everything() -> None:
     book, _ = _book()
+    book.note_turn_started("conv")
     book.record("conv", "idle", source=StatusSource.CONTROL)
     book.forget("conv")
     assert book.current("conv") is None
+    assert book.activity_epoch("conv") == 0
     assert book.last_control_idle_at("conv") is None
 
 
 def test_transfer_moves_status_without_clobbering_the_target() -> None:
     book, _ = _book()
     book.record("src", "running", source=StatusSource.PTY)
+    book.note_turn_started("src")
     book.transfer("src", "dst")
     moved = book.current("dst")
     assert moved is not None and moved.status == "running"
     assert book.current("src") is None
+    assert book.turn_is_active("dst") is True
 
     book.record("src2", "running", source=StatusSource.PTY)
     book.record("dst2", "idle", source=StatusSource.RELAY)

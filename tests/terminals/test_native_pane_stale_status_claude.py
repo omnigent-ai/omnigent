@@ -380,7 +380,7 @@ async def test_control_file_idle_before_relayed_idle_is_not_stuck(
 # status-emitting role whose forwarder relays a turn-end ``idle``. For
 # claude-native this is the "status file not resolved (yet)" fallback.
 # kiro-native is omitted (its forwarder relays no status); kimi-native is
-# omitted (never offered to the reaper, see NATIVE_PANE_TERMINAL_NAMES).
+# omitted (declared exempt in the harness registry, never offered to the reaper).
 # ---------------------------------------------------------------------------
 
 _PTY_ROLES = [

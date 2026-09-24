@@ -866,8 +866,8 @@ async def test_reconnect_resync_republishes_a_running_session(tmp_path: Path) ->
 async def test_reconnect_resync_keeps_the_exit_classification_memo(tmp_path: Path) -> None:
     """The resync clears published edges, not the exit memo.
 
-    ``_last_session_status`` decides whether a terminal exit reads as a clean
-    shutdown or a mid-turn crash. It tracks what the PANE last did, not what the
+    The exit-classification memo decides whether a terminal exit reads as a
+    clean shutdown or a mid-turn crash. It tracks what the PANE last did, not what the
     server has heard, so a reconnect must leave it alone — clearing it would make
     a crash right after a reconnect look like a tidy exit.
     """
@@ -1152,13 +1152,15 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     del tmp_path
     registry = SessionResourceRegistry()
     registry.note_session_turn_started("conv_cleanup")
-    assert "conv_cleanup" in registry._last_session_status
+    registry.note_external_session_status("conv_cleanup", "running")
     assert registry.session_activity_epoch("conv_cleanup") > 0
     assert registry.session_turn_is_active("conv_cleanup")
+    assert registry.status_book.current("conv_cleanup") is not None
 
     await registry.cleanup_session("conv_cleanup")
 
-    assert "conv_cleanup" not in registry._last_session_status
+    assert registry._take_session_status_memo("conv_cleanup") is None
+    assert registry.status_book.current("conv_cleanup") is None
     assert registry.session_activity_epoch("conv_cleanup") == 0
     assert not registry.session_turn_is_active("conv_cleanup")
 
@@ -1210,11 +1212,11 @@ async def test_transfer_terminal_moves_status_memo(
     moved = await registry.transfer_terminal("conv_src", "conv_dst", view.id)
 
     assert moved is not None
-    assert "conv_src" not in registry._last_session_status
-    assert registry._last_session_status.get("conv_dst") == "running"
     assert not registry.session_turn_is_active("conv_src")
     assert registry.session_turn_is_active("conv_dst")
     assert registry.session_activity_epoch("conv_dst") > 0
+    assert registry._take_session_status_memo("conv_src") is None
+    assert registry._take_session_status_memo("conv_dst") == "running"
 
 
 def test_get_resource_finds_default() -> None:

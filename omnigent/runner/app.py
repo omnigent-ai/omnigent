@@ -25,7 +25,7 @@ import urllib.parse
 import uuid
 import weakref
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
 
@@ -70,6 +70,7 @@ from omnigent.harness_aliases import (
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import InstructionDelivery
 from omnigent.harness_plugins import (
+    NativeHarnessProvider,
     harness_capabilities,
     load_object,
     model_env_keys,
@@ -2878,6 +2879,41 @@ def _require_full_native_lock_coverage(
     return dispatch
 
 
+def _require_full_pane_reap_coverage(
+    providers: Iterable[NativeHarnessProvider] | None = None,
+) -> None:
+    """Fail fast if a built-in native harness has no pane-reaper policy.
+
+    Every built-in must declare ``pane_reap`` and ``status_owner``; an exempt
+    harness must say why; a reapable harness whose idle arrives from a
+    forwarder must declare a ``pane_turn_probe`` so a lost relay cannot pin
+    its pane. Scoped to the built-in providers, like
+    :func:`_require_full_native_lock_coverage`: a community harness without a
+    declaration is simply never reaped.
+
+    :param providers: Rows to check; ``None`` checks the built-in providers.
+    :raises RuntimeError: Naming every row that is incomplete.
+    """
+    from omnigent.harness_plugins import _BUILTIN_NATIVE_PROVIDERS
+
+    problems: list[str] = []
+    for provider in _BUILTIN_NATIVE_PROVIDERS if providers is None else providers:
+        if provider.pane_reap not in ("reap", "exempt"):
+            problems.append(f"{provider.key}: pane_reap undeclared")
+        if provider.status_owner is None:
+            problems.append(f"{provider.key}: status_owner undeclared")
+        if provider.pane_reap == "exempt" and not provider.pane_reap_exempt_reason:
+            problems.append(f"{provider.key}: exempt without a reason")
+        if (
+            provider.pane_reap == "reap"
+            and provider.status_owner in ("forwarder", "runner_and_forwarder")
+            and provider.pane_turn_probe is None
+        ):
+            problems.append(f"{provider.key}: forwarder-owned status needs a pane_turn_probe")
+    if problems:
+        raise RuntimeError(f"native pane reaper policy incomplete: {sorted(problems)}")
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -2983,6 +3019,7 @@ def create_runner_app(
     # every spec-derived read (native-vs-SDK checks above all) still answers
     # with the harness the spec declared, which a routed session is not on.
     _session_harness_overrides: dict[str, str] = {}
+    app.state.session_harness_overrides = _session_harness_overrides
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
@@ -3121,6 +3158,7 @@ def create_runner_app(
         }
     )
     app.state.native_terminal_ensure_locks = _native_terminal_ensure_locks_by_key
+    _require_full_pane_reap_coverage()
 
     def _pop_terminal_ensure_locks(session_id: str) -> None:
         """Drop every per-harness ensure lock held for *session_id*."""
@@ -6802,6 +6840,40 @@ def create_runner_app(
             },
         )
 
+    def _model_change_waits_for_relaunch(conv_id: str, harness_name: str) -> bool:
+        """Whether a model change has no pane to type into and rides the relaunch.
+
+        For cursor, kiro and devin, whose launch passes the session's
+        ``model_override`` to the TUI. A pane the reaper closed, or one that
+        never started, is re-created by the next turn, and that launch reads
+        the ``model_override`` the server saved before it forwarded the change.
+        So the switch needs nothing now, and typing into the missing pane would
+        only fail. A launch or teardown in flight holds the ensure lock and may
+        have read the old value, so the change is typed then, as before.
+
+        :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        :param harness_name: Canonical harness name, e.g. ``"devin-native"``.
+        :returns: ``True`` when the handler should answer 204 without typing.
+        """
+        terminal_registry = resource_registry.terminal_registry
+        terminal_name = native_terminal_name(harness_name)
+        if terminal_registry is None or terminal_name is None:
+            return False
+        if terminal_registry.get(conv_id, terminal_name, "main") is not None:
+            return False
+        agent = native_coding_agent_for_terminal_name(terminal_name)
+        locks = _native_terminal_ensure_locks_by_key.get(agent.key) if agent is not None else None
+        in_flight = locks.get(conv_id) if locks is not None else None
+        if in_flight is not None and in_flight.locked():
+            return False
+        _logger.info(
+            "%s model change for session=%s has no pane; the next launch applies it",
+            harness_name,
+            conv_id,
+            extra={"session_id": conv_id},
+        )
+        return True
+
     async def _handle_cursor_native_model_change(
         conv_id: str,
         model: str | None,
@@ -6812,6 +6884,8 @@ def create_runner_app(
         )
 
         if model is None or not model.strip():
+            return Response(status_code=204)
+        if _model_change_waits_for_relaunch(conv_id, "cursor-native"):
             return Response(status_code=204)
         bridge_dir = bridge_dir_for_session_id(conv_id)
         selected_model = model.strip()
@@ -6845,6 +6919,8 @@ def create_runner_app(
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        if _model_change_waits_for_relaunch(conv_id, "kiro-native"):
+            return Response(status_code=204)
         bridge_dir = bridge_dir_for_session_id(conv_id)
         try:
             await asyncio.to_thread(
@@ -6874,6 +6950,8 @@ def create_runner_app(
         from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
 
         if model is None or not model.strip():
+            return Response(status_code=204)
+        if _model_change_waits_for_relaunch(conv_id, "devin-native"):
             return Response(status_code=204)
         # Devin has no separate effort flag — effort is a suffix on the model id.
         # Compose the picked family with the session's remembered effort so a
@@ -8452,8 +8530,8 @@ def create_runner_app(
     # ── Native pane teardown ────────────────────────────────────────────
     # A native pane runs beside per-session sidecars: a forwarder or bridge
     # task, the tool/comment relay, and for codex / opencode a vendor server.
-    # The idle reaper and a user's terminal DELETE release them here, under
-    # the harness's per-session ensure lock.
+    # The idle reaper, a user's terminal DELETE and the orphaned-sidecar sweep
+    # all release them here, under the harness's per-session ensure lock.
 
     def _native_ensure_lock(conv_id: str, terminal_name: str) -> asyncio.Lock:
         """The per-session lock the launch and ensure paths hold for this harness."""
@@ -8651,7 +8729,8 @@ def create_runner_app(
         Stricter than the reaper's idle test, because no idle window has been
         observed: live work, a running claim recorded before the close, or a
         probe answer other than INACTIVE keeps them. A codex thread or an
-        opencode turn keeps running after its TUI is gone.
+        opencode turn keeps running after its TUI is gone. The orphaned-sidecar
+        sweep collects what this keeps.
         """
         why = _native_session_live_work(conv_id)
         if why is not None:
@@ -8703,7 +8782,9 @@ def create_runner_app(
 
         :param reset_status: Drop the session's recorded status first, with no
             await before it, so a turn that starts during the release keeps
-            its own edges. ``False`` when a pane close already reset it.
+            its own edges. ``False`` when a pane close already reset it. A
+            status kept for another session's vendor server stays either way:
+            releasing that server resets it.
         :param decided: The relay and prompt waiter the caller's re-test saw;
             newer ones belong to a turn that started since and are kept.
             ``None`` releases whatever is registered.
@@ -8711,7 +8792,7 @@ def create_runner_app(
         from omnigent.native import prompt_parks
 
         resource_registry.reset_statuses_kept_for(conv_id, reason)
-        if reset_status:
+        if reset_status and resource_registry.vendor_turn_home(conv_id) is None:
             resource_registry.reset_session_status(conv_id, reason)
         released = list(
             await _native_runtime.teardown_native_pane_sidecars(conv_id, harness_key=harness_key)
@@ -8883,7 +8964,8 @@ def create_runner_app(
 
         Runs off the DELETE request, under the harness's ensure lock. Releasing
         them resets the session's status too, which the close keeps while a
-        codex or opencode vendor server still runs the turn.
+        codex or opencode vendor server still runs the turn. Kept sidecars are
+        collected later by the orphaned-sidecar sweep.
         """
         agent = native_coding_agent_for_terminal_name(terminal_name)
         harness_key = agent.key if agent is not None else None
@@ -8939,6 +9021,39 @@ def create_runner_app(
                 )
 
         task.add_done_callback(_done)
+
+    async def _teardown_native_runtime(conv_id: str, terminal_name: str, *, reason: str) -> bool:
+        """Release sidecars that outlived their pane; there is no pane to close.
+
+        :returns: ``True`` when the sidecars were released.
+        """
+        agent = native_coding_agent_for_terminal_name(terminal_name)
+        harness_key = agent.key if agent is not None else None
+        registry = resource_registry.terminal_registry
+        lock = _native_ensure_lock(conv_id, terminal_name)
+        if lock.locked():
+            _log_native_teardown_spared(conv_id, terminal_name, "launch_in_progress")
+            return False
+        async with lock:
+            if registry is not None and registry.get(conv_id, terminal_name, "main") is not None:
+                return False  # a launch re-created the pane
+            why = _native_session_live_work(conv_id) or _dispatched_since_reap_decision(conv_id)
+            if why is not None:
+                _log_native_teardown_spared(conv_id, terminal_name, why)
+                return False
+            released = await _release_native_session_sidecars(
+                conv_id, harness_key, reason=reason, decided=_turn_bound_sidecars(conv_id)
+            )
+            _log_native_teardown(
+                conv_id,
+                terminal_name,
+                kind="runtime",
+                reason=reason,
+                closed=False,
+                released=released,
+                kept=None,
+            )
+            return True
 
     async def _ensure_comment_relay_started(
         session_id: str,
@@ -13826,15 +13941,19 @@ def create_runner_app(
     ):
         from types import MappingProxyType
 
+        from omnigent.harness_plugins import native_agents
         from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.session_status import StatusRecord
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,
+            RUNTIME_KIND,
             ClaimPolicy,
             ConfirmVerdict,
             NativePaneReaper,
             PaneAssessment,
             PaneRef,
+            native_pane_exemptions,
+            native_pane_reap_rows,
             resolve_claim_policy,
             resolve_server_check_enabled,
             resolve_server_unreachable_grace_s,
@@ -13852,15 +13971,41 @@ def create_runner_app(
         _pane_claim_warned: dict[str, int] = {}
         _pane_parked_warned: dict[str, int] = {}
 
+        def _note_pane_skipped(conv_id: str, name: str, kind: str, detail: str) -> None:
+            reaper = getattr(app.state, "native_pane_reaper", None)
+            if isinstance(reaper, NativePaneReaper):
+                reaper.note_skipped(conv_id, name, kind, detail)
+
         def _native_panes_for_reaper() -> list[PaneRef]:
+            """Live native panes the harness registry allows reaping.
+
+            A pane is offered only when its harness declares ``pane_reap="reap"``
+            and its resource role is exactly that harness. Exempt, undeclared,
+            role-less and mismatched panes are skipped and logged once.
+            """
+            rows = native_pane_reap_rows()
+            exemptions = native_pane_exemptions()
+            names = {agent.terminal_name for agent in native_agents()}
             panes: list[PaneRef] = []
-            for conv_id, name, socket_path in _pane_reaper_registry.native_panes():
+            for conv_id, name, socket_path in _pane_reaper_registry.native_panes(names):
                 terminal_id = terminal_resource_id(name, "main")
-                if is_native_harness(
-                    resource_registry.terminal_resource_role(conv_id, terminal_id)
-                ):
+                role = resource_registry.terminal_resource_role(conv_id, terminal_id)
+                expected = rows.get(name)
+                if expected is None:
+                    reason = exemptions.get(name, "not declared reapable")
+                    _note_pane_skipped(conv_id, name, "exempt", reason)
+                elif role is None:
+                    _note_pane_skipped(
+                        conv_id, name, "roleless", "launched without a native resource role"
+                    )
+                elif role != expected:
+                    _note_pane_skipped(
+                        conv_id, name, "role_mismatch", f"role {role!r}, expected {expected!r}"
+                    )
+                else:
                     panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
             listed = {pane.conversation_id for pane in panes}
+            listed |= _pane_runtimes_listed
             for bookkeeping in (
                 _pane_claim_warned,
                 _pane_parked_warned,
@@ -13871,6 +14016,46 @@ def create_runner_app(
                     del bookkeeping[gone]
             _pane_server_unreachable_warned.intersection_update(listed)
             return panes
+
+        # Sessions offered as runtime rows by the latest orphan listing.
+        _pane_runtimes_listed: set[str] = set()
+
+        def _native_orphan_runtimes() -> list[PaneRef]:
+            """Sessions whose sidecars outlived their native pane, as runtime rows.
+
+            A session qualifies when it holds a forwarder, codex app-server,
+            opencode serve or comment relay; its harness resolves to one the
+            registry allows reaping; it has no terminal of that harness's name
+            (with or without a role); no live pane transferred from it still
+            uses its sidecars; and no launch holds its ensure lock.
+            """
+            rows = native_pane_reap_rows()
+            names = {agent.terminal_name for agent in native_agents()}
+            serving: set[str] = set()
+            for conv_id, _name, _socket in _pane_reaper_registry.native_panes(names):
+                home = resource_registry.sidecar_home(conv_id)
+                if home != conv_id:
+                    serving.add(home)
+            candidates = set(_native_runtime.native_pane_sidecar_sessions()) | set(
+                _session_comment_relays
+            )
+            runtimes: list[PaneRef] = []
+            for conv_id in sorted(candidates - serving):
+                agent = native_coding_agent_for_harness(_session_harness_name(conv_id))
+                if agent is None or agent.terminal_name not in rows:
+                    continue
+                name = agent.terminal_name
+                if _pane_reaper_registry.get(conv_id, name, "main") is not None:
+                    continue
+                launch_lock = _native_terminal_ensure_locks_by_key.get(agent.key, {}).get(conv_id)
+                if launch_lock is not None and launch_lock.locked():
+                    continue
+                runtimes.append(
+                    PaneRef(conv_id, terminal_resource_id(name, "main"), name, None, RUNTIME_KIND)
+                )
+            _pane_runtimes_listed.clear()
+            _pane_runtimes_listed.update(row.conversation_id for row in runtimes)
+            return runtimes
 
         def _pane_harness_key(pane: PaneRef) -> str | None:
             agent = native_coding_agent_for_terminal_name(pane.terminal_name)
@@ -13889,6 +14074,8 @@ def create_runner_app(
             pane emits, so a producing terminal stays busy even when the
             status pipeline has silently stalled.
             """
+            if pane.kind == RUNTIME_KIND or pane.socket_path is None:
+                return None
             activity_at = await asyncio.to_thread(
                 _tmux_window_activity_at, str(pane.socket_path), "main"
             )
@@ -13919,6 +14106,15 @@ def create_runner_app(
             ):
                 return None
             return dialog
+
+        def _status_kept_elsewhere(conv_id: str) -> bool:
+            """Whether *conv_id*'s status is kept for another session's vendor server.
+
+            A TUI a ``/clear`` rotation moved to it was lost mid-turn. Its own
+            sidecars do not run that turn, so their probe and the sweep of them
+            leave its claim alone: releasing that server ends it.
+            """
+            return resource_registry.vendor_turn_home(conv_id) is not None
 
         def _reconcile_claim(conv_id: str, claim: StatusRecord, why: str) -> bool:
             """Record that a stale ``running`` was refuted by the harness or server.
@@ -14000,14 +14196,27 @@ def create_runner_app(
                 approval_max_s=_pane_approval_max_s,
                 blocked_is_hard=file_dialog is None,
             )
-            clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
-            if clients:
-                reasons.add(SpareReason.CLIENT_ATTACHED)
-                facts["clients"] = len(clients)
-            output_age = await _pane_output_age(pane)
+            output_age: float | None = None
+            if pane.kind == RUNTIME_KIND or pane.socket_path is None:
+                # Sidecars with no pane: no clients and no output to read.
+                facts["kind"] = pane.kind
+            else:
+                clients = await asyncio.to_thread(
+                    _list_tmux_clients, str(pane.socket_path), "main"
+                )
+                if clients:
+                    reasons.add(SpareReason.CLIENT_ATTACHED)
+                    facts["clients"] = len(clients)
+                output_age = await _pane_output_age(pane)
             facts["output_age_s"] = output_age
             current = _status_book.current(conv_id)
             facts["status"] = current.status if current is not None else None
+            role = resource_registry.terminal_resource_role(conv_id, pane.terminal_id)
+            if pane.kind != RUNTIME_KIND and role in _STATUS_EMITTING_TERMINAL_ROLES:
+                instance = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+                watcher_alive = getattr(instance, "watcher_alive", None)
+                if callable(watcher_alive):
+                    facts["watcher_alive"] = watcher_alive()
             evidence_age = output_age
             dispatch_at = _status_book.last_dispatch_at(conv_id)
             if dispatch_at is not None:
@@ -14015,6 +14224,8 @@ def create_runner_app(
             claim = _status_book.claim(
                 conv_id, include_relay=_pane_claim_policy is ClaimPolicy.EVIDENCE
             )
+            if _status_kept_elsewhere(conv_id):
+                claim = None
             claim_age = silent = 0.0
             if claim is not None:
                 # A new runner dispatch restarts the claim's clock even when the
@@ -14171,6 +14382,8 @@ def create_runner_app(
             claim = _status_book.claim(
                 conv_id, include_relay=_pane_claim_policy is ClaimPolicy.EVIDENCE
             )
+            if _status_kept_elsewhere(conv_id):
+                claim = None
             # A recorded dialog (``blocked_on``) holds until its bound. One the
             # harness's status file reported is checked against the probe,
             # which re-reads that file; a relayed one is honored as is.
@@ -14249,9 +14462,14 @@ def create_runner_app(
 
         async def _reap_native_pane(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
-            reaped = await _teardown_native_pane(
-                conv_id, pane.terminal_name, reason="idle_reap", socket_path=pane.socket_path
-            )
+            if pane.kind == RUNTIME_KIND:
+                reaped = await _teardown_native_runtime(
+                    conv_id, pane.terminal_name, reason="idle_sidecar_sweep"
+                )
+            else:
+                reaped = await _teardown_native_pane(
+                    conv_id, pane.terminal_name, reason="idle_reap", socket_path=pane.socket_path
+                )
             if reaped:
                 _pane_server_unreachable_since.pop(conv_id, None)
                 _pane_server_unreachable_warned.discard(conv_id)
@@ -14261,6 +14479,7 @@ def create_runner_app(
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,
+            list_orphan_runtimes=_native_orphan_runtimes,
             assess=_native_pane_assess,
             confirm_reap=_confirm_native_pane_reap,
             reap=_reap_native_pane,

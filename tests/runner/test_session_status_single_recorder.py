@@ -61,6 +61,8 @@ _READERS = frozenset(
         "last_dispatch_at",
         "last_control_idle_at",
         "last_control_idle_wall",
+        "turn_is_active",
+        "activity_epoch",
         "session_ids",
         "status_view",
         "edge_mark",
@@ -79,6 +81,9 @@ _WRITER_CALLERS: dict[str, frozenset[tuple[Path, str]]] = {
     ),
     "forget": frozenset({(_REGISTRY_MODULE, "cleanup_session"), (_APP_MODULE, "delete_session")}),
     "transfer": frozenset({(_REGISTRY_MODULE, "transfer_terminal")}),
+    "note_turn_started": frozenset({(_REGISTRY_MODULE, "note_session_turn_started")}),
+    "note_exit_status": frozenset({(_REGISTRY_MODULE, "_set_session_status_memo")}),
+    "take_exit_status": frozenset({(_REGISTRY_MODULE, "_take_session_status_memo")}),
 }
 
 # What the server heard, kept only for the wire dedup; never a status source.
@@ -114,7 +119,16 @@ _FORBIDDEN_STATUS_SOURCES = frozenset(
 
 # Retired status stores. Nothing in the package may name them: a leftover
 # reference (say, from a merge) reads a store that no longer exists.
-_RETIRED_STATUS_NAMES = frozenset({"_native_pane_status", "_published_session_status"})
+_RETIRED_STATUS_NAMES = frozenset(
+    {
+        "_native_pane_status",
+        "_published_session_status",
+        # The registry's exit-classification memos, folded into the book.
+        "_last_session_status",
+        "_active_session_turns",
+        "_session_activity_epoch",
+    }
+)
 
 # app.py functions that decide from session status: the reaper's assessment and
 # deep check, its hold reasons and the teardown re-test, the claude /model
@@ -146,7 +160,7 @@ _STATUS_NAMED_DICTS = frozenset(
     {
         (Path("runner/github_resource.py"), "_GH_STATUS_MAP"),  # GitHub check-run labels
         (_REGISTRY_MODULE, "self._status_pollers"),  # claude status-file pollers
-        (_REGISTRY_MODULE, "self._last_session_status"),  # exit-classification memo
+        (_BOOK_MODULE, "self._exit_status"),  # inside the book
     }
 )
 _STATUS_DICT_SCOPES = ("runner", "terminals", "native")
@@ -157,6 +171,9 @@ _BOOK_INTERNALS = frozenset(
         "_dispatch_at",
         "_control_idle_at",
         "_control_idle_wall",
+        "_turn_started",
+        "_exit_status",
+        "_activity_epoch",
         "_merge_duplicate",
         "_note_projections",
         "_record_locked",
@@ -430,6 +447,9 @@ def test_no_caller_reaches_into_the_book() -> None:
             ):
                 offenders.append(f"{path}:{node.lineno}")
             if isinstance(node, ast.Attribute) and node.attr in {
+                "_last_session_status",
+                "_active_session_turns",
+                "_session_activity_epoch",
                 "_published_session_status",
             }:
                 offenders.append(f"{path}:{node.lineno} {node.attr}")

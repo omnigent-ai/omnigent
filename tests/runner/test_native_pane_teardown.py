@@ -29,7 +29,7 @@ from tests.terminals.native_pane_rig import (
     report_harness_state,
 )
 
-_REAPABLE_KEYS = [p.key for p in _BUILTIN_NATIVE_PROVIDERS if p.key != "kimi"]
+_REAPABLE_KEYS = [p.key for p in _BUILTIN_NATIVE_PROVIDERS if p.pane_reap == "reap"]
 
 
 def _deleted_events(conv_id: str) -> list[dict[str, Any]]:
@@ -295,6 +295,12 @@ async def test_a_reap_after_a_clear_rotation_releases_the_launching_sessions_sid
     assert rig.resources.sidecar_home(new_conv) == old_conv
     rig.conv_id = new_conv
     try:
+        # While the transferred pane lives, its launching session's sidecars
+        # are in use, so the orphan sweep leaves them alone.
+        listing = rig.reaper._list_orphan_runtimes
+        assert listing is not None
+        rig.app.state.session_harness_overrides[old_conv] = "claude-native"
+        assert [row.conversation_id for row in listing()] == []
         assert await rig.reaper._reap(rig.pane) is True
         assert sidecars.leftovers(rig.app) == []
         assert rig.resources.sidecar_home(new_conv) == new_conv

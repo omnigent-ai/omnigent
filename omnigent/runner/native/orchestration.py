@@ -276,6 +276,24 @@ async def teardown_all_opencode_native_servers() -> None:
             await teardown_opencode_native_server(session_id)
 
 
+def has_native_pane_sidecars(session_id: str) -> bool:
+    """Whether *session_id* holds a forwarder, codex app-server or opencode serve."""
+    return (
+        session_id in _AUTO_FORWARDER_TASKS
+        or session_id in _AUTO_CODEX_APP_SERVERS
+        or session_id in _AUTO_OPENCODE_SERVERS
+    )
+
+
+def native_pane_sidecar_sessions() -> frozenset[str]:
+    """Every session holding a forwarder, codex app-server or opencode serve."""
+    return (
+        frozenset(_AUTO_FORWARDER_TASKS)
+        | frozenset(_AUTO_CODEX_APP_SERVERS)
+        | frozenset(_AUTO_OPENCODE_SERVERS)
+    )
+
+
 async def teardown_native_pane_sidecars(
     session_id: str, *, harness_key: str | None = None
 ) -> tuple[str, ...]:

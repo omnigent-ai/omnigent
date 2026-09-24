@@ -220,11 +220,110 @@ async def test_loop_disabled_when_timeout_non_positive() -> None:
 
 def test_kimi_is_exempt_from_pane_reaping() -> None:
     # kimi records no resumable chat id, so a reaped pane cannot be re-created
-    # with its context; the name filter must never offer kimi panes to the reaper.
-    from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
+    # with its context; the registry declares it exempt, with that reason.
+    from omnigent.harness_plugins import native_provider_for_key
+    from omnigent.terminals.pane_reaper import native_pane_exemptions, native_pane_reap_rows
 
-    assert "kimi" not in NATIVE_PANE_TERMINAL_NAMES
-    assert "claude" in NATIVE_PANE_TERMINAL_NAMES
+    kimi = native_provider_for_key("kimi")
+    assert kimi is not None
+    assert kimi.pane_reap == "exempt"
+    assert "resumable chat id" in (kimi.pane_reap_exempt_reason or "")
+    assert "kimi" not in native_pane_reap_rows()
+    assert native_pane_exemptions() == {"kimi": kimi.pane_reap_exempt_reason}
+
+
+def test_reapable_rows_come_from_the_harness_registry() -> None:
+    from omnigent.harness_plugins import native_agents, native_providers
+    from omnigent.terminals.pane_reaper import native_pane_reap_rows
+
+    reap_keys = {p.key for p in native_providers() if p.pane_reap == "reap"}
+    expected = {a.terminal_name: a.harness for a in native_agents() if a.key in reap_keys}
+    rows = native_pane_reap_rows()
+    assert rows == expected
+    # devin was missing from the old hand-maintained name list.
+    assert rows["devin"] == "devin-native"
+    assert rows["claude"] == "claude-native"
+
+
+def test_the_deprecated_name_set_still_resolves() -> None:
+    from omnigent.terminals import pane_reaper
+
+    with pytest.warns(DeprecationWarning):
+        names = pane_reaper.NATIVE_PANE_TERMINAL_NAMES
+    assert names == frozenset(pane_reaper.native_pane_reap_rows())
+    assert "kimi" not in names
+    assert "devin" in names
+    with pytest.raises(AttributeError):
+        _ = pane_reaper.NOT_A_THING  # type: ignore[attr-defined]
+
+
+def test_terminal_registry_native_panes_filters_by_the_given_names(tmp_path: Path) -> None:
+    from tests.runner.helpers import make_test_terminal_instance
+
+    registry = TerminalRegistry()
+    for name in ("claude", "kimi", "bash"):
+        instance = make_test_terminal_instance(name, "main", tmp_path)
+        registry._by_conversation.setdefault("conv_a", {})[(name, "main")] = instance
+    assert {n for _c, n, _s in registry.native_panes({"kimi", "bash"})} == {"kimi", "bash"}
+    # Default: the registry's reapable harnesses only.
+    assert {n for _c, n, _s in registry.native_panes()} == {"claude"}
+
+
+@pytest.mark.parametrize(
+    ("role", "kind"),
+    [(None, "roleless"), ("codex-native", "role_mismatch"), ("claude-native", None)],
+)
+async def test_a_pane_must_carry_its_harness_role_to_be_listed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    role: str | None,
+    kind: str | None,
+) -> None:
+    from tests.runner.helpers import make_test_terminal_instance
+
+    rig = await build_pane_rig(tmp_path, monkeypatch, key="claude")
+    other = make_test_terminal_instance("claude", "main", tmp_path)
+    rig.terminal_registry._by_conversation.setdefault("conv_cli", {})[("claude", "main")] = other
+    if role is not None:
+        with rig.resources._lock:
+            rig.resources._terminal_roles[("conv_cli", terminal_resource_id("claude", "main"))] = (
+                role
+            )
+    caplog.set_level(logging.INFO, logger="omnigent.terminals.pane_reaper")
+    for _ in range(3):
+        await rig.reaper._scan_once()
+    listed = {p.conversation_id for p in rig.reaper._list_native_panes()}
+    assert rig.conv_id in listed
+    skipped = [r for r in caplog.records if "is not reaped" in r.getMessage()]
+    if kind is None:
+        assert "conv_cli" in listed
+        assert skipped == []
+    else:
+        assert "conv_cli" not in listed
+        assert len(skipped) == 1
+        assert skipped[0].attributes["kind"] == kind  # type: ignore[attr-defined]
+        assert rig.reaper.snapshot()["conv_cli#claude#skipped"]["skipped"] == kind
+
+
+async def test_an_undeclared_native_provider_is_never_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dataclasses
+
+    from omnigent import harness_plugins
+    from omnigent.terminals.pane_reaper import native_pane_exemptions, native_pane_reap_rows
+
+    rig = await build_pane_rig(tmp_path, monkeypatch, key="goose")
+    assert rig.listed()
+    real = harness_plugins.native_providers()
+    undeclared = tuple(
+        dataclasses.replace(p, pane_reap=None) if p.key == "goose" else p for p in real
+    )
+    monkeypatch.setattr(harness_plugins, "native_providers", lambda: undeclared)
+    assert "goose" not in native_pane_reap_rows()
+    assert native_pane_exemptions()["goose"] == "no pane_reap policy declared"
+    assert not rig.listed()
 
 
 async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
@@ -437,6 +536,43 @@ async def test_reason_transitions_log_once(caplog: pytest.LogCaptureFixture) -> 
         rec for rec in caplog.records if rec.__dict__.get("event_name") == "native_pane_spared"
     ]
     assert [rec.attributes["reasons"] for rec in spared] == ["runner_turn", ""]
+
+
+async def test_the_periodic_summary_counts_spares_skips_and_runtimes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.terminals import pane_reaper as module
+
+    monkeypatch.setattr(module, "_SUMMARY_EVERY_SCANS", 2)
+    f = _Fakes()
+    f.panes = [_pane("conv_a")]
+    runtime = PaneRef("conv_r", "terminal_codex_main", "codex", None, module.RUNTIME_KIND)
+    held = {"conv_a": PaneAssessment(frozenset({SpareReason.CLIENT_ATTACHED}))}
+    r = _assessing(f, held)
+    r._list_orphan_runtimes = lambda: [runtime]
+
+    def _panes_with_a_skip() -> list[PaneRef]:
+        r.note_skipped("conv_k", "kimi", "exempt", "no resumable chat id")
+        return list(f.panes)
+
+    r._list_native_panes = _panes_with_a_skip
+    with caplog.at_level(logging.INFO, logger="omnigent.terminals.pane_reaper"):
+        await r._scan_once()
+        await r._scan_once()
+    summaries = [
+        rec
+        for rec in caplog.records
+        if rec.__dict__.get("event_name") == "native_pane_reaper_summary"
+    ]
+    assert len(summaries) == 1
+    attrs = summaries[0].attributes  # type: ignore[attr-defined]
+    assert attrs["panes"] == 1
+    assert attrs["runtimes"] == 1
+    assert attrs["not_reaped"] == 1
+    assert attrs["client_attached"] == 2
+    assert attrs["skipped_exempt"] == 2
+    skips = [r for r in caplog.records if r.__dict__.get("event_name") == "native_pane_skipped"]
+    assert len(skips) == 1
 
 
 async def test_forgotten_attach_and_dead_watcher_warn_once(

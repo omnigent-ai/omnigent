@@ -403,7 +403,9 @@ async def test_stream_severed_by_required_terminal_exit_reports_the_exit(
         """The pane exits mid-delivery; the runner tears the harness down under its own read."""
         if pane_status_before_exit is not None:
             # The PTY watcher's last reading before the pane vanished.
-            state["resource_registry"]._last_session_status[conv_id] = pane_status_before_exit
+            state["resource_registry"]._set_session_status_memo(
+                conv_id, pane_status_before_exit, record_activity=False
+            )
         callbacks["on_exit"]()
         await state["resource_registry"].wait_for_terminal_exit_cleanup()
         # The release waits out the (shortened) grace for this live stream first.
@@ -574,7 +576,7 @@ async def test_required_terminal_exit_lets_the_harness_report_its_own_failure(
     async def _pane_killed_by_the_harness() -> None:
         """The exit reaches the runner before the harness's failure report does."""
         # A pane that never ran a turn reads as idle to the PTY watcher.
-        state["resource_registry"]._last_session_status[conv_id] = "idle"
+        state["resource_registry"]._set_session_status_memo(conv_id, "idle")
         callbacks["on_exit"]()
         await state["resource_registry"].wait_for_terminal_exit_cleanup()
         # The exit handler has run; give its release task a chance to (wrongly)

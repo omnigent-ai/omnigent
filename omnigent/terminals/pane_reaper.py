@@ -10,6 +10,13 @@ window — these have no idle reaper of their own, so on a shared runner memory
 grows with every idle conversation. This reaps a native pane only when it is
 genuinely unused.
 
+**Which panes.** The harness registry decides: a native agent's pane is offered
+only when its provider declares ``pane_reap="reap"`` and the pane's resource
+role is that harness (:func:`native_pane_reap_rows`). Exempt harnesses (kimi:
+no resumable chat id), undeclared ones, and role-less panes are skipped and
+logged once. Sessions whose sidecars outlived their pane (a user's terminal
+DELETE during work, a crashed pane) are offered as ``runtime`` rows.
+
 Each scan the runner *assesses* every listed pane (:class:`PaneAssessment`):
 
 * **Hard reasons** spare the pane outright (:class:`SpareReason`): a live runner
@@ -44,10 +51,10 @@ The session's primary OSEnv and server-side transcript stay intact: the next
 message re-creates the pane and its sidecars, and the vendor CLI resumes via
 its own ``--resume``.
 
-**Observability.** Spare-reason changes and every reap are logged; WARNINGs
-flag a pane held only by a status claim, a forgotten attach, long holds and a
-TUI that seems to repaint while idle; a summary line is logged every
-:data:`_SUMMARY_EVERY_SCANS` scans.
+**Observability.** Spare-reason changes, skipped panes and every reap are
+logged; WARNINGs flag a pane held only by a status claim, a forgotten attach,
+long holds, a dead watcher and a TUI that seems to repaint while idle; a
+summary line is logged every :data:`_SUMMARY_EVERY_SCANS` scans.
 """
 
 from __future__ import annotations
@@ -58,6 +65,7 @@ import logging
 import math
 import os
 import time
+import warnings
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -75,31 +83,6 @@ _logger = logging.getLogger(__name__)
 # silent stall must not get a live, producing terminal reaped. Two reaper scan
 # intervals, so any output between scans re-arms the idle clock.
 PANE_OUTPUT_BUSY_WINDOW_S = 120.0
-
-# Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
-# the terminal registry. These short names match the ``terminal_name`` the
-# per-harness ``_auto_create_<harness>_terminal`` paths launch with. This is the
-# cheap name pre-filter; the wiring additionally confirms the registry resource
-# ROLE is a native harness (so a user terminal that merely shares the name is not
-# reaped — see ``create_runner_app``).
-#
-# "kimi" is deliberately absent: kimi records no resumable chat id, so a reaped
-# pane cannot be re-created with its context — the next turn would silently
-# start a fresh TUI. Keep kimi panes alive until the session is torn down.
-NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
-    {
-        "claude",
-        "codex",
-        "cursor",
-        "goose",
-        "hermes",
-        "kiro",
-        "qwen",
-        "pi",
-        "antigravity",
-        "opencode",
-    }
-)
 
 # Default idle window before an unused native pane is reaped. Mirrors
 # ``HarnessProcessManager``'s 1-hour SDK-proxy default for consistency.
@@ -128,6 +111,50 @@ _SUMMARY_EVERY_SCANS = 60
 # A pane held by output alone this many idle windows, while its status says it
 # is not working, suggests a TUI that repaints while idle.
 _IDLE_REPAINT_WINDOWS = 3
+
+
+def native_pane_reap_rows() -> dict[str, str]:
+    """Reapable native panes by terminal name: ``{terminal_name: harness_role}``.
+
+    Built from the production harness registry: a native agent is listed only
+    when its provider declares ``pane_reap="reap"``. The runner additionally
+    requires a pane's resource role to equal the row's role, so a user terminal
+    that merely shares the name is never offered.
+    """
+    from omnigent.harness_plugins import native_agents, native_providers
+
+    policy = {provider.key: provider.pane_reap for provider in native_providers()}
+    return {
+        agent.terminal_name: agent.harness
+        for agent in native_agents()
+        if policy.get(agent.key) == "reap"
+    }
+
+
+def native_pane_exemptions() -> dict[str, str]:
+    """Native terminal names that are never reaped, with the reason for each."""
+    from omnigent.harness_plugins import native_agents, native_providers
+
+    providers = {provider.key: provider for provider in native_providers()}
+    exempt: dict[str, str] = {}
+    for agent in native_agents():
+        provider = providers.get(agent.key)
+        if provider is None or provider.pane_reap is None:
+            exempt[agent.terminal_name] = "no pane_reap policy declared"
+        elif provider.pane_reap != "reap":
+            exempt[agent.terminal_name] = provider.pane_reap_exempt_reason or "exempt"
+    return exempt
+
+
+def __getattr__(name: str) -> object:
+    if name == "NATIVE_PANE_TERMINAL_NAMES":
+        warnings.warn(
+            "NATIVE_PANE_TERMINAL_NAMES is deprecated; use native_pane_reap_rows()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return frozenset(native_pane_reap_rows())
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class SpareReason(StrEnum):
@@ -205,20 +232,35 @@ class ConfirmVerdict:
     held_s: float | None = None
 
 
+PANE_KIND = "pane"
+RUNTIME_KIND = "runtime"
+
+
 class PaneRef(NamedTuple):
-    """A live native CLI pane the reaper may reclaim.
+    """A live native CLI pane, or a pane-less runtime, the reaper may reclaim.
 
     :param conversation_id: AP-allocated conversation id, e.g. ``"conv_abc123"``.
     :param terminal_id: Resource id of the native terminal, e.g.
         ``terminal_resource_id("claude", "main")`` — used for pane-scoped close.
     :param terminal_name: Harness short-name, e.g. ``"claude"``.
-    :param socket_path: tmux socket for the attached-client probe.
+    :param socket_path: tmux socket for the attached-client probe; ``None`` for
+        a runtime row.
+    :param kind: ``"pane"``, or ``"runtime"`` for sidecars (forwarder, relay,
+        vendor server) left running with no pane.
     """
 
     conversation_id: str
     terminal_id: str
     terminal_name: str
-    socket_path: Path
+    socket_path: Path | None
+    kind: str = PANE_KIND
+
+    @property
+    def clock_key(self) -> str:
+        """The reaper's bookkeeping key: panes and runtimes never share a clock."""
+        if self.kind == RUNTIME_KIND:
+            return f"{self.conversation_id}#runtime"
+        return self.conversation_id
 
 
 def _resolve_seconds_env(name: str, default: float) -> float:
@@ -318,14 +360,18 @@ class NativePaneReaper:
 
     :param list_native_panes: Returns the currently-live native panes (already
         role-confirmed by the caller) as :class:`PaneRef` values.
-    :param reap: ``async`` teardown of one pane. May return ``False`` to report
-        that it spared the pane after all (it re-checked under a lock).
+    :param reap: ``async`` teardown of one pane or runtime row. May return
+        ``False`` to report that it spared the pane after all (it re-checked
+        under a lock).
     :param assess: ``async`` pane assessment (see :class:`PaneAssessment`).
     :param is_busy: Legacy ``async`` boolean predicate, used when *assess* is
         not given.
     :param confirm_reap: Optional ``async`` deep check run right before
         teardown (turn probe, server's pending prompts). Also used to reconcile
         panes held only by a stale claim under the ``veto``/``shadow`` policies.
+    :param list_orphan_runtimes: Optional; returns ``runtime`` rows for sessions
+        whose sidecars outlived their pane. They are assessed, confirmed and
+        timed like panes.
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
         knob; ``<= 0`` disables reaping.
     :param reaper_interval_s: Seconds between scans.
@@ -343,6 +389,7 @@ class NativePaneReaper:
         assess: Callable[[PaneRef], Awaitable[PaneAssessment]] | None = None,
         is_busy: Callable[[PaneRef], Awaitable[bool]] | None = None,
         confirm_reap: Callable[[PaneRef], Awaitable[ConfirmVerdict]] | None = None,
+        list_orphan_runtimes: Callable[[], list[PaneRef]] | None = None,
         idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
         max_turn_s: float | None = None,
@@ -351,6 +398,7 @@ class NativePaneReaper:
         if assess is None and is_busy is None:
             raise TypeError("NativePaneReaper needs assess= or is_busy=")
         self._list_native_panes = list_native_panes
+        self._list_orphan_runtimes = list_orphan_runtimes
         self._assess_fn = assess
         self._is_busy_fn = is_busy
         self._confirm_reap = confirm_reap
@@ -363,6 +411,7 @@ class NativePaneReaper:
         self._approval_max_s = (
             approval_max_s if approval_max_s is not None else resolve_approval_max_s()
         )
+        # Every map below is keyed by ``PaneRef.clock_key``.
         # Monotonic time last observed busy (or, for an idle pane, the time of
         # its last evidence of work).
         # custom-lint: disable-next=session-status-single-source -- the reaper's own idle clock
@@ -379,6 +428,10 @@ class NativePaneReaper:
         self._reconciled_at: dict[str, float] = {}
         self._output_held_since: dict[str, float] = {}
         self._warned: dict[tuple[str, str], float] = {}
+        # Panes the listing skipped, by (conversation_id, terminal_name):
+        # (kind of skip, first seen), so each is logged once.
+        self._skipped: dict[tuple[str, str], tuple[str, float]] = {}
+        self._skipped_this_scan: set[tuple[str, str]] = set()
         self._summary: Counter[str] = Counter()
         self._scans = 0
         self._task: asyncio.Task[None] | None = None
@@ -431,7 +484,7 @@ class NativePaneReaper:
         self, pane: PaneRef, assessment: PaneAssessment, now: float, *, track: bool
     ) -> PaneAssessment:
         """Drop hard reasons that have held a pane past their ceiling."""
-        key = pane.conversation_id
+        key = pane.clock_key
         since = self._reason_since.setdefault(key, {}) if track else self._reason_since.get(key)
         since = since if since is not None else {}
         if track:
@@ -474,18 +527,19 @@ class NativePaneReaper:
     ) -> list[PaneRef]:
         """Pure idle-clock decision: which panes are reapable right now.
 
-        Given the conversation ids observed busy this scan, maintain each idle
-        clock and return the panes idle for at least ``idle_timeout_s``. A busy
-        pane re-arms its clock; a newly-observed idle pane gets one full window
-        of grace before it is eligible. For an armed idle pane, *evidence_age_s*
-        moves the clock forward to its last evidence of work (``now - age``),
-        never back. No I/O, so it is unit-testable with an injected ``now``.
+        Given the clock keys observed busy this scan (a pane's key is its
+        conversation id), maintain each idle clock and return the panes idle
+        for at least ``idle_timeout_s``. A busy pane re-arms its clock; a
+        newly-observed idle pane gets one full window of grace before it is
+        eligible. For an armed idle pane, *evidence_age_s* moves the clock
+        forward to its last evidence of work (``now - age``), never back. No
+        I/O, so it is unit-testable with an injected ``now``.
         """
         live: set[str] = set()
         reapable: list[PaneRef] = []
         ages = evidence_age_s or {}
         for pane in panes:
-            key = pane.conversation_id
+            key = pane.clock_key
             live.add(key)
             if key in busy_convs:
                 self._last_busy_at[key] = now
@@ -549,15 +603,27 @@ class NativePaneReaper:
             )
             return PaneAssessment(frozenset({SpareReason.BUSY}))
 
+    def _list_rows(self) -> list[PaneRef]:
+        self._skipped_this_scan = set()
+        rows = list(self._list_native_panes())
+        if self._list_orphan_runtimes is not None:
+            try:
+                rows.extend(self._list_orphan_runtimes())
+            except Exception:
+                _logger.exception("native pane reaper: listing orphaned sidecars failed")
+        for gone in self._skipped.keys() - self._skipped_this_scan:
+            del self._skipped[gone]
+        return rows
+
     async def _scan_once(self) -> None:
-        panes = self._list_native_panes()
+        panes = self._list_rows()
         now = time.monotonic()
         self._scans += 1
         assessments: dict[str, PaneAssessment] = {}
         for pane in panes:
             raw = await self._assess_for_scan(pane)
             assessment = self._effective(pane, raw, now, track=True)
-            assessments[pane.conversation_id] = assessment
+            assessments[pane.clock_key] = assessment
             self._observe(pane, assessment, now)
         busy_keys = {key for key, a in assessments.items() if a.busy}
         for key in busy_keys:
@@ -573,7 +639,7 @@ class NativePaneReaper:
         await self._reconcile_claim_held(panes, assessments, now)
         for pane in self._classify(now, panes, busy_keys, ages):
             await self._consider_reap(pane)
-        self._maybe_log_summary(panes)
+        self._maybe_log_summary(panes, now)
 
     async def _reconcile_claim_held(
         self, panes: list[PaneRef], assessments: Mapping[str, PaneAssessment], now: float
@@ -582,7 +648,7 @@ class NativePaneReaper:
         if self._confirm_reap is None:
             return
         for pane in panes:
-            key = pane.conversation_id
+            key = pane.clock_key
             assessment = assessments[key]
             if assessment.reasons != {SpareReason.STATUS_CLAIM}:
                 continue
@@ -602,7 +668,7 @@ class NativePaneReaper:
 
     async def _consider_reap(self, pane: PaneRef) -> None:
         conv = pane.conversation_id
-        key = pane.conversation_id
+        key = pane.clock_key
         # Re-check immediately before teardown: selection happened with
         # possibly-stale signals, and a turn / client / autonomous run may have
         # started since (the select→reap race). Re-arm and skip if so.
@@ -642,7 +708,8 @@ class NativePaneReaper:
             _logger.info("native pane teardown for %s did not close it; re-arming", conv)
             return
         _logger.info(
-            "reaped idle native pane for conversation %s (%s; idle > %.0fs)",
+            "reaped idle native %s for conversation %s (%s; idle > %.0fs)",
+            "sidecars" if pane.kind == RUNTIME_KIND else "pane",
             conv,
             pane.terminal_name,
             self._idle_timeout_s,
@@ -650,17 +717,18 @@ class NativePaneReaper:
                 "native_pane_reaped",
                 session_id=conv,
                 terminal_name=pane.terminal_name,
+                kind=pane.kind,
                 idle_timeout_s=self._idle_timeout_s,
                 recent_reasons=",".join(history),
             ),
         )
         self._forget(key)
-        self._summary["reaped"] += 1
+        self._summary["reaped" if pane.kind == PANE_KIND else "reaped_runtime"] += 1
 
     def _override_spare(self, pane: PaneRef, verdict: ConfirmVerdict, now: float) -> bool:
         """Whether a deep-check spare has outlived its bound, so the reap proceeds."""
         conv = pane.conversation_id
-        key = pane.conversation_id
+        key = pane.clock_key
         if verdict.unknown:
             first = self._unknown_since.setdefault(key, now)
             if now - first < self._idle_timeout_s:
@@ -695,6 +763,37 @@ class NativePaneReaper:
 
     # ── observability ────────────────────────────────────────────────────
 
+    def note_skipped(
+        self, conversation_id: str, terminal_name: str, kind: str, detail: str
+    ) -> None:
+        """Record a native pane the listing left out; logged once per pane.
+
+        :param conversation_id: The pane's conversation, e.g. ``"conv_abc"``.
+        :param terminal_name: The pane's terminal name, e.g. ``"kimi"``.
+        :param kind: Short category for the summary, e.g. ``"exempt"``.
+        :param detail: Why, e.g. the harness's declared exemption reason.
+        """
+        pane_key = (conversation_id, terminal_name)
+        self._skipped_this_scan.add(pane_key)
+        self._summary[f"skipped:{kind}"] += 1
+        known = self._skipped.get(pane_key)
+        if known is not None and known[0] == kind:
+            return
+        self._skipped[pane_key] = (kind, time.monotonic())
+        _logger.info(
+            "native pane %s (%s) is not reaped: %s",
+            conversation_id,
+            terminal_name,
+            detail,
+            extra=_pane_event(
+                "native_pane_skipped",
+                conversation_id,
+                terminal_name=terminal_name,
+                kind=kind,
+                detail=detail,
+            ),
+        )
+
     def _log_confirm_spare(self, pane: PaneRef, verdict: ConfirmVerdict) -> None:
         self._summary[f"confirm:{verdict.reason or 'unknown'}"] += 1
         _logger.info(
@@ -706,6 +805,7 @@ class NativePaneReaper:
                 pane.conversation_id,
                 verdict.facts,
                 terminal_name=pane.terminal_name,
+                kind=pane.kind,
                 reasons=verdict.reason,
                 stage="confirm",
                 unknown=verdict.unknown,
@@ -718,7 +818,7 @@ class NativePaneReaper:
     def _observe(self, pane: PaneRef, assessment: PaneAssessment, now: float) -> None:
         """Log reason transitions and long holds for one assessed pane."""
         conv = pane.conversation_id
-        key = pane.conversation_id
+        key = pane.clock_key
         reasons = assessment.reasons
         for reason in reasons:
             self._summary[reason.value] += 1
@@ -728,7 +828,8 @@ class NativePaneReaper:
             self._last_reasons[key] = reasons
             if reasons or previous:
                 _logger.info(
-                    "native pane %s spare reasons: %s",
+                    "native %s %s spare reasons: %s",
+                    pane.kind,
                     conv,
                     ",".join(sorted(r.value for r in reasons)) or "none",
                     extra=_pane_event(
@@ -736,6 +837,7 @@ class NativePaneReaper:
                         conv,
                         assessment.facts,
                         terminal_name=pane.terminal_name,
+                        kind=pane.kind,
                         reasons=",".join(sorted(r.value for r in reasons)),
                         stage="scan",
                         evidence_age_s=assessment.evidence_age_s,
@@ -794,7 +896,7 @@ class NativePaneReaper:
             self._output_held_since.pop(key, None)
 
     def _warn_once(self, pane: PaneRef, kind: str, message: str, *args: object) -> None:
-        warned = (pane.conversation_id, kind)
+        warned = (pane.clock_key, kind)
         if warned in self._warned:
             return
         self._warned[warned] = time.monotonic()
@@ -807,7 +909,7 @@ class NativePaneReaper:
     def _warn_every(
         self, pane: PaneRef, kind: str, period_s: float, now: float, message: str, *args: object
     ) -> None:
-        warned = (pane.conversation_id, kind)
+        warned = (pane.clock_key, kind)
         last = self._warned.get(warned)
         if last is not None and now - last < period_s:
             return
@@ -818,30 +920,42 @@ class NativePaneReaper:
             extra=_pane_event("native_pane_warning", pane.conversation_id, kind=kind),
         )
 
-    def _maybe_log_summary(self, rows: list[PaneRef]) -> None:
+    def _maybe_log_summary(self, rows: list[PaneRef], now: float) -> None:
         if self._scans % _SUMMARY_EVERY_SCANS:
             return
         counts = dict(self._summary)
         self._summary.clear()
+        pane_count = sum(1 for row in rows if row.kind == PANE_KIND)
+        runtime_count = len(rows) - pane_count
+        unreaped_for = max((now - first for _kind, first in self._skipped.values()), default=0.0)
         _logger.info(
-            "native pane reaper summary: panes=%d %s",
-            len(rows),
+            "native pane reaper summary: panes=%d runtimes=%d not_reaped=%d (longest %.0fs) %s",
+            pane_count,
+            runtime_count,
+            len(self._skipped),
+            unreaped_for,
             " ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no spares",
             extra=_pane_event(
                 "native_pane_reaper_summary",
                 None,
                 {k.replace(":", "_"): v for k, v in counts.items()},
-                panes=len(rows),
+                panes=pane_count,
+                runtimes=runtime_count,
+                not_reaped=len(self._skipped),
+                longest_not_reaped_s=unreaped_for,
             ),
         )
 
     def snapshot(self) -> dict[str, dict[str, object]]:
-        """Reaper state for diagnostics: reasons and idle clock per pane."""
+        """Reaper state for diagnostics: reasons and idle clock per row, and skips."""
         now = time.monotonic()
-        return {
+        rows: dict[str, dict[str, object]] = {
             key: {
                 "reasons": sorted(r.value for r in self._last_reasons.get(key, frozenset())),
                 "idle_for_s": now - last,
             }
             for key, last in self._last_busy_at.items()
         }
+        for (conv, name), (kind, first) in self._skipped.items():
+            rows[f"{conv}#{name}#skipped"] = {"skipped": kind, "seen_for_s": now - first}
+        return rows

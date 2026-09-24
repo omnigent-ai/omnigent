@@ -3510,3 +3510,129 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+def _live_pane_watcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TerminalInstance:
+    """A TerminalInstance whose pane changes every poll and never dies."""
+    instance = TerminalInstance(
+        name="pi",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    frames = iter(range(1_000_000))
+    instance._capture_pane_for_idle_or_none = lambda: f"frame {next(frames)}"  # type: ignore[method-assign]
+    monkeypatch.setattr(instance, "_pane_is_dead", lambda: False)
+    return instance
+
+
+def test_a_raising_callback_does_not_stop_the_threaded_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    instance = _live_pane_watcher(tmp_path, monkeypatch)
+    activity_calls = 0
+    ticks = threading.Event()
+    tick_calls = 0
+
+    def _flaky_activity() -> None:
+        nonlocal activity_calls
+        activity_calls += 1
+        if activity_calls <= 3:
+            raise RuntimeError("publisher hiccup")
+
+    def _tick() -> None:
+        nonlocal tick_calls
+        tick_calls += 1
+        if tick_calls == 1:
+            raise RuntimeError("status file unreadable")
+        if activity_calls > 5:
+            ticks.set()
+
+    with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(
+            on_activity=_flaky_activity, on_tick=_tick, poll_interval_s=0.005
+        )
+        try:
+            assert ticks.wait(timeout=2.0)
+            assert instance.watcher_alive()
+            heartbeat = instance.watcher_heartbeat_at
+            assert heartbeat is not None
+            time.sleep(0.03)
+            assert instance.watcher_heartbeat_at is not None
+            assert instance.watcher_heartbeat_at > heartbeat
+        finally:
+            instance._stop_idle_watcher_thread()
+    failures = [r for r in caplog.records if "callback failed" in r.getMessage()]
+    assert len(failures) == 2  # first failure of each streak only
+
+
+def test_a_callback_failing_every_tick_stops_its_watcher_with_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    instance = _live_pane_watcher(tmp_path, monkeypatch)
+    calls = 0
+
+    def _broken() -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("always broken")
+
+    with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_activity=_broken, poll_interval_s=0.001)
+        thread = instance._idle_thread
+        assert thread is not None
+        thread.join(timeout=2.0)
+    assert not instance.watcher_alive()
+    assert calls == terminal_mod._WATCH_CALLBACK_FAILURE_LIMIT
+    assert any("times in a row" in r.getMessage() for r in caplog.records)
+
+
+def test_a_success_resets_a_callbacks_failure_streak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = _live_pane_watcher(tmp_path, monkeypatch)
+    limit = terminal_mod._WATCH_CALLBACK_FAILURE_LIMIT
+    calls = 0
+    done = threading.Event()
+
+    def _mostly_failing() -> None:
+        # One short of the limit, then one success, twice over.
+        nonlocal calls
+        calls += 1
+        if calls > 2 * limit:
+            done.set()
+        elif calls % limit:
+            raise RuntimeError("publisher hiccup")
+
+    instance.start_idle_watcher_thread(on_activity=_mostly_failing, poll_interval_s=0.001)
+    try:
+        assert done.wait(timeout=5.0)
+        assert instance.watcher_alive()
+    finally:
+        instance._stop_idle_watcher_thread()
+
+
+def test_exit_still_fires_after_callback_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = TerminalInstance(
+        name="pi",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    snapshots = iter(["a", "b", None, None, None, None])
+    instance._capture_pane_for_idle_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+    monkeypatch.setattr(instance, "_pane_is_dead", lambda: False)
+    exited = threading.Event()
+
+    def _raise() -> None:
+        raise RuntimeError("publisher hiccup")
+
+    instance.start_idle_watcher_thread(
+        on_activity=_raise, on_exit=exited.set, poll_interval_s=0.005
+    )
+    assert exited.wait(timeout=2.0)

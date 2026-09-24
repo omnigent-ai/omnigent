@@ -161,6 +161,9 @@ class SessionStatusBook:
         self._dispatch_at: dict[str, float] = {}
         self._control_idle_at: dict[str, float] = {}
         self._control_idle_wall: dict[str, float] = {}
+        self._turn_started: set[str] = set()
+        self._exit_status: dict[str, str] = {}
+        self._activity_epoch: dict[str, int] = {}
         self._seq = 0
 
     # ── writers ──────────────────────────────────────────────────────────
@@ -316,12 +319,54 @@ class SessionStatusBook:
             self._control_idle_at[session_id] = now
             self._control_idle_wall[session_id] = self._wall_clock()
 
+    def note_turn_started(self, session_id: str) -> None:
+        """Mark a runner-dispatched turn as started.
+
+        Feeds the exit-classification projections only; it is not a status
+        edge and never creates a claim.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        """
+        self.note_exit_status(session_id, "running", record_activity=True)
+
+    def note_exit_status(
+        self, session_id: str, status: str, *, record_activity: bool = True
+    ) -> None:
+        """Update the exit-classification projection for *session_id*.
+
+        ``running``/``waiting`` with *record_activity* mark an explicit turn and
+        bump the activity epoch; ``idle``/``failed`` end it. Pane repaints pass
+        ``record_activity=False`` so startup output is not counted as a turn.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        :param status: Observed status, e.g. ``"running"``.
+        :param record_activity: Whether this edge is explicit turn activity.
+        """
+        with self._lock:
+            if record_activity and status in {"running", "waiting"}:
+                self._turn_started.add(session_id)
+                self._activity_epoch[session_id] = self._activity_epoch.get(session_id, 0) + 1
+            if status in {"idle", "failed"}:
+                self._turn_started.discard(session_id)
+            self._exit_status[session_id] = status
+
+    def take_exit_status(self, session_id: str) -> str | None:
+        """Pop and return the exit-classification status, ending any turn.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        :returns: The last classification status, or ``None``.
+        """
+        with self._lock:
+            self._turn_started.discard(session_id)
+            return self._exit_status.pop(session_id, None)
+
     def reset(self, session_id: str, reason: str, *, mark: object = _UNMARKED) -> None:
         """Drop a session's status after its pane was torn down.
 
-        Keeps the dispatch and interrupt stamps: they order evidence that
-        outlives the pane, such as a hook log on disk that still shows an
-        interrupted prompt as open.
+        Keeps the activity epoch, which counts turns across pane lifetimes, and
+        the dispatch and interrupt stamps: they order evidence that outlives
+        the pane, such as a hook log on disk that still shows an interrupted
+        prompt as open.
 
         :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
         :param reason: Why, for the log, e.g. ``"native_terminal_closed"``.
@@ -335,6 +380,8 @@ class SessionStatusBook:
             spared = mark is not _UNMARKED and self._records.get(session_id) is not mark
             if not spared:
                 dropped = self._records.pop(session_id, None)
+                self._turn_started.discard(session_id)
+                self._exit_status.pop(session_id, None)
         if spared:
             _logger.debug(
                 "session status reset skipped: session=%s reason=%s (an edge landed since)",
@@ -368,6 +415,9 @@ class SessionStatusBook:
             self._dispatch_at.pop(session_id, None)
             self._control_idle_at.pop(session_id, None)
             self._control_idle_wall.pop(session_id, None)
+            self._turn_started.discard(session_id)
+            self._exit_status.pop(session_id, None)
+            self._activity_epoch.pop(session_id, None)
 
     def transfer(self, source_id: str, target_id: str) -> None:
         """Move a session's status with its pane, never clobbering the target.
@@ -383,6 +433,13 @@ class SessionStatusBook:
                 stamp = stamps.pop(source_id, None)
                 if stamp is not None and target_id not in stamps:
                     stamps[target_id] = stamp
+            moved_exit = self._exit_status.pop(source_id, None)
+            if moved_exit is not None and target_id not in self._exit_status:
+                self._exit_status[target_id] = moved_exit
+                if source_id in self._turn_started:
+                    self._turn_started.add(target_id)
+                    self._activity_epoch[target_id] = self._activity_epoch.get(target_id, 0) + 1
+            self._turn_started.discard(source_id)
 
     # ── readers ──────────────────────────────────────────────────────────
 
@@ -462,6 +519,16 @@ class SessionStatusBook:
         """
         with self._lock:
             return self._control_idle_wall.get(session_id)
+
+    def turn_is_active(self, session_id: str) -> bool:
+        """Whether an explicitly observed turn is unfinished (not pane repaints)."""
+        with self._lock:
+            return session_id in self._turn_started
+
+    def activity_epoch(self, session_id: str) -> int:
+        """Count of explicit turn activity, retained across idle and resets."""
+        with self._lock:
+            return self._activity_epoch.get(session_id, 0)
 
     def session_ids(self) -> list[str]:
         """Sessions that currently hold a record."""

@@ -1797,3 +1797,473 @@ async def test_a_refutation_ends_the_runner_hold_at_once(
                 assert record.origin is StatusSource.RECONCILE
     finally:
         rig.drain()
+
+
+def _report_rotated_codex_thread(
+    rig: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rotated: str, state: str
+) -> list[str]:
+    """Report the rotated session's codex thread through the bridge state production writes.
+
+    A ``/clear`` rotation gives the new session the launching session's
+    bridge-id label and rewrites that bridge's state for the new session: its
+    id, the launching session's app-server and the new thread. So the probe of
+    either session finds a state naming the rotated session.
+
+    :param rotated: The session the rotation created, e.g. ``"conv_x_rotated"``.
+    :param state: ``"active"`` or ``"idle"``, what ``thread/read`` answers.
+    :returns: The app-server sockets probed, appended as probes connect.
+    """
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from tests.terminals.native_pane_rig import _Codex
+
+    launching = rig.conv_id
+    rig.server.labels = {bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: launching}
+    bridge.write_bridge_state(
+        bridge.bridge_dir_for_bridge_id(launching),
+        bridge.CodexNativeBridgeState(
+            session_id=rotated,
+            socket_path="ws://127.0.0.1:1",
+            thread_id="thread_2",
+            codex_home=str(tmp_path),
+        ),
+    )
+    status = {"type": "idle"} if state == "idle" else {"type": "active", "activeFlags": []}
+    probed: list[str] = []
+
+    def _client(socket_path: str, *_args: Any, **_kwargs: Any) -> Any:
+        probed.append(socket_path)
+        return _Codex(status)
+
+    monkeypatch.setattr(app_server, "client_for_transport", _client)
+    return probed
+
+
+@pytest.mark.asyncio
+@_CLAIM_POLICIES
+@pytest.mark.parametrize("rotated", [False, True], ids=["own", "rotated"])
+@pytest.mark.parametrize("how", ["deleted", "exited"])
+@pytest.mark.parametrize("key", ["codex", "opencode"])
+async def test_the_orphan_sweep_ends_the_hold_of_a_turn_that_outlived_its_tui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    how: str,
+    rotated: bool,
+    claim_policy: str | None,
+) -> None:
+    """Releasing the sidecars a lost TUI left behind resets the status it kept.
+
+    A codex or opencode turn whose TUI went away keeps its relayed ``running``
+    while the vendor server lives, so it holds the runner (see
+    ``test_a_turn_that_outlives_its_tui_holds_the_runner``). Once the harness
+    reports its thread idle, the orphaned-sidecar sweep releases the vendor
+    server an idle window later, and that release resets the status: the
+    runner's hold ends at that scan, long before the ceiling. For a TUI a
+    ``/clear`` rotation moved to another session, the server is the launching
+    session's, and its release resets the rotated session. A rotated codex
+    thread is reported through the bridge state the rotation writes.
+
+    :param key: Native harness key, e.g. ``"codex"``.
+    :param how: How the TUI went away.
+    :param rotated: Whether a rotation moved the TUI before it was lost.
+    :param claim_policy: OMNIGENT_NATIVE_PANE_CLAIM_POLICY, or ``None`` unset.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.terminals import pane_reaper as pane_reaper_module
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig, report_harness_state
+
+    window_s, interval_s, ceiling_s = 3600.0, 60.0, 6 * 3600.0
+    _set_claim_policy(monkeypatch, claim_policy)
+    monkeypatch.setenv(_MAX_TURN_ENV, str(ceiling_s))
+    clock = _Clock()
+    monkeypatch.setattr(pane_reaper_module, "time", SimpleNamespace(monotonic=clock))
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key=key,
+        idle_timeout_s=window_s,
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec(f"{key}-native")),
+    )
+    app, launching = rig.app, rig.conv_id
+    session = f"{launching}_rotated" if rotated else launching
+    if rotated and key == "codex":
+        _report_rotated_codex_thread(rig, monkeypatch, tmp_path, session, "idle")
+    else:
+        report_harness_state(rig, monkeypatch, tmp_path, "idle")
+    name = rig.agent.terminal_name
+    terminal_id = terminal_resource_id(name, "main")
+    sidecars = await _plant_pane_sidecars(app, launching, tmp_path, key)
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, launching)
+            if rotated:
+                await _create_session(client, session)
+                resp = await client.post(
+                    f"/v1/sessions/{launching}/resources/terminals/{terminal_id}/transfer",
+                    json={"target_session_id": session},
+                )
+                assert resp.status_code == 200, resp.text
+            await _post_status(client, session, "running")
+            if how == "deleted":
+                resp = await client.delete(
+                    f"/v1/sessions/{session}/resources/terminals/{terminal_id}"
+                )
+                assert resp.status_code == 200, resp.text
+                releases = set(app.state.native_sidecar_release_tasks)
+                assert releases
+                await asyncio.wait(releases, timeout=10)
+            else:
+                await rig.fire("on_exit")
+                await rig.resources.wait_for_terminal_exit_cleanup()
+            assert rig.terminal_registry.get(session, name, "main") is None
+            assert sidecars.leftovers(app) == _kept(sidecars)
+            start = clock.now
+
+            async def _sweep() -> None:
+                while True:
+                    assert app.state.has_active_work() is True
+                    record = rig.book.current(session)
+                    assert record is not None and record.status == "running"
+                    await rig.reaper._scan_once()
+                    if sidecars.leftovers(app) == []:
+                        return
+                    clock.now += interval_s
+                    assert clock.now - start <= 2 * window_s, "the sweep never released"
+
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work,
+                release=_sweep,
+            )
+            # One idle window after the TUI went: long before the ceiling.
+            assert clock.now - start <= window_s + interval_s
+            # The release reset the status; it did not merely record an idle.
+            assert rig.book.current(session) is None
+    finally:
+        sidecars.discard()
+        rig.drain()
+        _session_event_queues_ref.pop(session, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["own", "rotated", "rotated_with_relay"])
+@pytest.mark.parametrize("how", ["deleted", "exited"])
+async def test_a_lost_tuis_active_turn_holds_the_runner_while_the_sweep_keeps_its_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str, variant: str
+) -> None:
+    """The sweep and the runner agree on a turn the vendor server still runs.
+
+    While the codex thread reports ACTIVE, the orphaned-sidecar sweep keeps
+    the app-server a lost TUI left behind, and the session keeps its
+    ``running``, so the runner stays up for that same turn. That includes a
+    session a ``/clear`` rotation moved the TUI to, whose turn runs in the
+    launching session's app-server: the rotation rewrote the shared bridge
+    state for the new session, and the launching session's probe still reads
+    that thread from its app-server, whether or not the new session holds a
+    relay of its own. The ceiling still bounds the hold.
+
+    :param how: How the TUI went away.
+    :param variant: ``own``; ``rotated`` (a rotation moved the TUI before it
+        was lost); ``rotated_with_relay`` (the rotated session also holds a
+        comment relay, as a web message's per-turn ensure starts for codex).
+    """
+    from types import SimpleNamespace
+
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.harnesses.codex_native import bridge
+    from omnigent.runner.app import _CommentRelayBinding, _session_event_queues_ref
+    from omnigent.terminals import pane_reaper as pane_reaper_module
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import _FakeRelay, build_pane_rig, report_harness_state
+
+    window_s, interval_s, ceiling_s = 3600.0, 60.0, 6 * 3600.0
+    monkeypatch.setenv(_MAX_TURN_ENV, str(ceiling_s))
+    clock = _Clock()
+    monkeypatch.setattr(pane_reaper_module, "time", SimpleNamespace(monotonic=clock))
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="codex",
+        idle_timeout_s=window_s,
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec("codex-native")),
+    )
+    app, launching = rig.app, rig.conv_id
+    rotated = variant != "own"
+    session = f"{launching}_rotated" if rotated else launching
+    probed: list[str] = []
+    if rotated:
+        probed = _report_rotated_codex_thread(rig, monkeypatch, tmp_path, session, "active")
+    else:
+        report_harness_state(rig, monkeypatch, tmp_path, "active")
+    terminal_id = terminal_resource_id("codex", "main")
+    sidecars = await _plant_pane_sidecars(app, launching, tmp_path, "codex")
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, launching)
+            if rotated:
+                await _create_session(client, session)
+                resp = await client.post(
+                    f"/v1/sessions/{launching}/resources/terminals/{terminal_id}/transfer",
+                    json={"target_session_id": session},
+                )
+                assert resp.status_code == 200, resp.text
+            if variant == "rotated_with_relay":
+                app.state.session_comment_relays[session] = _CommentRelayBinding(
+                    relay=_FakeRelay(),  # type: ignore[arg-type]
+                    spec_entry=None,
+                    bridge_dir=bridge.bridge_dir_for_bridge_id(launching),
+                )
+            start = clock.now
+            await _post_status(client, session, "running")
+            if how == "deleted":
+                resp = await client.delete(
+                    f"/v1/sessions/{session}/resources/terminals/{terminal_id}"
+                )
+                assert resp.status_code == 200, resp.text
+                releases = set(app.state.native_sidecar_release_tasks)
+                assert releases
+                await asyncio.wait(releases, timeout=10)
+            else:
+                await rig.fire("on_exit")
+                await rig.resources.wait_for_terminal_exit_cleanup()
+            assert rig.terminal_registry.get(session, "codex", "main") is None
+            if rotated:
+                assert rig.resources._vendor_turn_homes == {session: launching}
+            for _ in range(int(2 * window_s / interval_s)):
+                await rig.reaper._scan_once()
+                assert sidecars.leftovers(app) == _kept(sidecars)
+                assert app.state.has_active_work() is True
+                clock.now += interval_s
+            if rotated:
+                # The launching session's own probe asked its app-server.
+                assert set(probed) == {"ws://127.0.0.1:1"}
+            if variant == "rotated_with_relay":
+                assert session in app.state.session_comment_relays
+            # Silent since the loss: the ceiling ends the runner's hold, though
+            # the thread still reports ACTIVE and the sweep keeps the server.
+            clock.now = start + ceiling_s - 1.0
+            assert app.state.has_active_work() is True
+            clock.now += 1.0
+            assert app.state.has_active_work() is False
+    finally:
+        if variant == "rotated_with_relay":
+            app.state.session_comment_relays.pop(session, None)
+        sidecars.discard()
+        rig.drain()
+        _session_event_queues_ref.pop(session, None)
+
+
+@pytest.mark.asyncio
+@_CLAIM_POLICIES
+@pytest.mark.parametrize("how", ["deleted", "exited"])
+async def test_sweeping_a_rotated_sessions_own_idle_server_keeps_the_status_kept_for_its_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    how: str,
+    claim_policy: str | None,
+) -> None:
+    """Only the launching session's server ends a moved TUI's kept turn.
+
+    The rotated session already has a codex app-server of its own, idle, when
+    a ``/clear`` rotation moves the launching session's TUI to it; the moved
+    TUI's turn runs in the launching session's app-server, which stays ACTIVE.
+    Once the TUI is lost the sweep collects the rotated session's own idle
+    sidecars, but it does not judge the status kept for the turn: no
+    refutation, no contradiction warning and no reset. The runner stays up
+    while the launching session's server lives.
+
+    :param how: How the TUI went away.
+    :param claim_policy: OMNIGENT_NATIVE_PANE_CLAIM_POLICY, or ``None`` unset.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.native import orchestration
+    from omnigent.terminals import pane_reaper as pane_reaper_module
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import _Codex, build_pane_rig, report_harness_state
+
+    window_s, interval_s, ceiling_s = 3600.0, 60.0, 6 * 3600.0
+    _set_claim_policy(monkeypatch, claim_policy)
+    monkeypatch.setenv(_MAX_TURN_ENV, str(ceiling_s))
+    clock = _Clock()
+    monkeypatch.setattr(pane_reaper_module, "time", SimpleNamespace(monotonic=clock))
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="codex",
+        idle_timeout_s=window_s,
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec("codex-native")),
+    )
+    report_harness_state(rig, monkeypatch, tmp_path, "active")
+    app, launching = rig.app, rig.conv_id
+    rotated = f"{launching}_rotated"
+    (tmp_path / "rotated").mkdir()
+    # The rotated session's own bridge, app-server and (idle) thread.
+    bridge.write_bridge_state(
+        bridge.bridge_dir_for_bridge_id(rotated),
+        bridge.CodexNativeBridgeState(
+            session_id=rotated,
+            socket_path="ws://127.0.0.1:2",
+            thread_id="thread_own",
+            codex_home=str(tmp_path / "rotated"),
+        ),
+    )
+    threads = {
+        "ws://127.0.0.1:1": {"type": "active", "activeFlags": []},
+        "ws://127.0.0.1:2": {"type": "idle"},
+    }
+    monkeypatch.setattr(
+        app_server,
+        "client_for_transport",
+        lambda socket_path, *_a, **_k: _Codex(threads[socket_path]),
+    )
+    sidecars = await _plant_pane_sidecars(app, launching, tmp_path, "codex")
+    own = await _plant_pane_sidecars(app, rotated, tmp_path / "rotated", "codex")
+    terminal_id = terminal_resource_id("codex", "main")
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, launching)
+            await _create_session(client, rotated)
+            resp = await client.post(
+                f"/v1/sessions/{launching}/resources/terminals/{terminal_id}/transfer",
+                json={"target_session_id": rotated},
+            )
+            assert resp.status_code == 200, resp.text
+            start = clock.now
+            await _post_status(client, rotated, "running")
+            if how == "deleted":
+                resp = await client.delete(
+                    f"/v1/sessions/{rotated}/resources/terminals/{terminal_id}"
+                )
+                assert resp.status_code == 200, resp.text
+                releases = set(app.state.native_sidecar_release_tasks)
+                if releases:
+                    await asyncio.wait(releases, timeout=10)
+            else:
+                await rig.fire("on_exit")
+                await rig.resources.wait_for_terminal_exit_cleanup()
+            assert rig.resources._vendor_turn_homes == {rotated: launching}
+            with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+                for _ in range(int(2 * window_s / interval_s)):
+                    await rig.reaper._scan_once()
+                    assert sidecars.leftovers(app) == _kept(sidecars)
+                    assert app.state.has_active_work() is True
+                    record = rig.book.current(rotated)
+                    assert record is not None and record.status == "running"
+                    clock.now += interval_s
+            for event in ("native_pane_claim_refuted", "native_pane_status_contradiction"):
+                assert _events(caplog, event) == [], event
+            # The sweep still collected the rotated session's own idle server.
+            assert own.leftovers(app) == []
+            assert rotated not in orchestration._AUTO_CODEX_APP_SERVERS
+            assert rig.resources._vendor_turn_homes == {rotated: launching}
+            # The ceiling still bounds the hold.
+            clock.now = start + ceiling_s + 1.0
+            assert app.state.has_active_work() is False
+    finally:
+        sidecars.discard()
+        own.discard()
+        rig.drain()
+        _session_event_queues_ref.pop(rotated, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotated", [True, False], ids=["rotated", "own"])
+async def test_a_turn_started_before_its_pane_is_up_survives_the_sweep_of_the_old_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rotated: bool
+) -> None:
+    """A new turn owns the session's status before its pane is launched.
+
+    The TUI was lost mid-turn and the status kept for the vendor server; that
+    turn then ended and the thread went idle, so the sweep will release the
+    server. A user message starts a new turn meanwhile: the message route
+    records the turn start and the runner's ``running`` before the turn's
+    ensure launches the pane. For a session a ``/clear`` rotation moved the
+    TUI to, the sweep releases the launching session's server in that window
+    and keeps the new turn's record. The launching session itself is spared
+    by its live turn.
+
+    :param rotated: Whether a rotation moved the TUI before it was lost.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.session_status import StatusSource
+    from omnigent.terminals import pane_reaper as pane_reaper_module
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig, report_harness_state
+
+    window_s, interval_s, ceiling_s = 3600.0, 60.0, 6 * 3600.0
+    monkeypatch.setenv(_MAX_TURN_ENV, str(ceiling_s))
+    clock = _Clock()
+    monkeypatch.setattr(pane_reaper_module, "time", SimpleNamespace(monotonic=clock))
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="codex",
+        idle_timeout_s=window_s,
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec("codex-native")),
+    )
+    app, launching = rig.app, rig.conv_id
+    session = f"{launching}_rotated" if rotated else launching
+
+    def _thread(state: str) -> None:
+        if rotated:
+            _report_rotated_codex_thread(rig, monkeypatch, tmp_path, session, state)
+        else:
+            report_harness_state(rig, monkeypatch, tmp_path, state)
+
+    _thread("active")
+    sidecars = await _plant_pane_sidecars(app, launching, tmp_path, "codex")
+    terminal_id = terminal_resource_id("codex", "main")
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, launching)
+            if rotated:
+                await _create_session(client, session)
+                resp = await client.post(
+                    f"/v1/sessions/{launching}/resources/terminals/{terminal_id}/transfer",
+                    json={"target_session_id": session},
+                )
+                assert resp.status_code == 200, resp.text
+            await _post_status(client, session, "running")
+            await rig.fire("on_exit")
+            await rig.resources.wait_for_terminal_exit_cleanup()
+            record = rig.book.current(session)
+            assert record is not None and record.status == "running"
+            # The old turn ends (its idle is relayed) and the thread reads idle.
+            await _post_status(client, session, "idle")
+            _thread("idle")
+            clock.now += window_s / 2
+            # What the message route does before the turn's ensure runs.
+            app.state.active_turns[session] = None
+            rig.resources.note_session_turn_started(session)
+            rig.book.record(session, "running", source=StatusSource.RUNNER)
+            for _ in range(int(2 * window_s / interval_s)):
+                await rig.reaper._scan_once()
+                if sidecars.leftovers(app) == []:
+                    break
+                clock.now += interval_s
+            assert (sidecars.leftovers(app) == []) is rotated
+            record = rig.book.current(session)
+            assert record is not None and record.status == "running"
+            assert record.origin is StatusSource.RUNNER
+            assert rig.book.turn_is_active(session)
+            assert rig.resources._vendor_turn_homes == {}
+    finally:
+        app.state.active_turns.pop(session, None)
+        sidecars.discard()
+        rig.drain()
+        _session_event_queues_ref.pop(session, None)
