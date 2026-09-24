@@ -235,7 +235,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             }
             onSetupLog={setup.onSetupLog}
             onBack={() => setStep(terminalTarget.kind === "connect" ? "server" : "local")}
-            runningLabel={terminalTarget.kind === "connect" ? "Connecting…" : "Starting Omnigent"}
+            runningLabel={terminalTarget.kind === "connect" ? "Connecting" : "Starting Omnigent"}
           />
         )}
         {step === "server" && (

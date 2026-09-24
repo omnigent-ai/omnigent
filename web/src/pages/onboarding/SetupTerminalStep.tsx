@@ -96,8 +96,19 @@ export function SetupTerminalStep({
     };
   }, [onInstallCli, onRun, attempt]);
 
+  // Cycle "." → ".." → "..." on the in-progress title so a slow install/start
+  // still reads as alive.
+  const inProgress = phase === "installing" || phase === "running";
+  const [dots, setDots] = useState(1);
+  useEffect(() => {
+    if (!inProgress) return;
+    setDots(1);
+    const timer = setInterval(() => setDots((n) => (n % 3) + 1), 400);
+    return () => clearInterval(timer);
+  }, [inProgress]);
+
   const streamed = lines.length > 0;
-  const phaseLabel =
+  const baseLabel =
     phase === "ready"
       ? "Omnigent is ready"
       : phase === "failed"
@@ -105,6 +116,7 @@ export function SetupTerminalStep({
         : phase === "installing"
           ? "Installing the Omnigent CLI"
           : runningLabel;
+  const phaseLabel = inProgress ? `${baseLabel}${".".repeat(dots)}` : baseLabel;
   const pendingHint = phase === "installing" ? "Installing the CLI…" : "Starting the local server…";
 
   return (
