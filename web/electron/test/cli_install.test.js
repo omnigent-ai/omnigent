@@ -14,10 +14,10 @@ function fakeChild() {
   return child;
 }
 
-/** A spawn stub that records argv and exits each child with `codes.shift()`. */
+/** A spawn stub that records argv/opts and exits each child with `codes.shift()`. */
 function spawnStub(codes, calls) {
-  return (command, args) => {
-    calls.push({ command, args });
+  return (command, args, opts) => {
+    calls.push({ command, args, opts });
     const child = fakeChild();
     queueMicrotask(() => child.emit("exit", codes.shift() ?? 0));
     return child;
@@ -65,10 +65,8 @@ describe("installCli", () => {
       spawn: spawnStub([0], calls),
     });
     assert.equal(res.ok, true);
-    assert.deepEqual(calls[0], {
-      command: "sh",
-      args: ["/res/install_oss.sh", "--non-interactive"],
-    });
+    assert.equal(calls[0].command, "sh");
+    assert.deepEqual(calls[0].args, ["/res/install_oss.sh", "--non-interactive"]);
   });
 
   it("stops when uv can't be ensured", async () => {
@@ -126,5 +124,54 @@ describe("ensureUv", () => {
     });
     assert.equal(res.ok, false);
     assert.match(res.error, /uv/);
+  });
+
+  it("re-checks with ~/.local/bin added to PATH after installing uv", async () => {
+    const paths = [];
+    const res = await ensureUv({
+      home: "/home/tester",
+      env: { PATH: "/usr/bin" },
+      // uv only resolves once ~/.local/bin is on PATH (the fresh-install case).
+      hasUv: (env) => {
+        paths.push(env.PATH);
+        return env.PATH.includes("/home/tester/.local/bin");
+      },
+      spawn: spawnStub([0], []),
+    });
+    assert.equal(res.ok, true);
+    assert.match(res.env.PATH, /\/home\/tester\/\.local\/bin/);
+    // First check saw the bare PATH (miss), post-install check saw the augmented one.
+    assert.equal(paths[0], "/usr/bin");
+  });
+});
+
+describe("runStreaming timeout", () => {
+  it("kills the process group and settles even if the child never exits", async () => {
+    const signals = [];
+    const originalKill = process.kill;
+    process.kill = (pid, sig) => signals.push({ pid, sig });
+    try {
+      // A child that ignores signals and never emits exit.
+      const stubborn = fakeChild();
+      stubborn.pid = 4242;
+      const res = await installCli({
+        platform: "darwin",
+        resolveInstallScript: () => "/res/install_oss.sh",
+        ensureUv: async () => ({ ok: true }),
+        spawn: () => stubborn,
+        timeoutMs: 10,
+        killGraceMs: 10,
+      });
+      assert.equal(res.ok, false);
+      assert.match(res.error, /timed out/);
+      // SIGTERM then SIGKILL, both to the negative pid (the group).
+      assert.deepEqual(
+        signals.map((s) => s.sig),
+        ["SIGTERM", "SIGKILL"],
+      );
+      assert.ok(signals.every((s) => s.pid === -4242));
+    } finally {
+      process.kill = originalKill;
+    }
   });
 });

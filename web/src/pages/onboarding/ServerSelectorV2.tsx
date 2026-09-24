@@ -112,9 +112,12 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const [terminalTarget, setTerminalTarget] = useState<
     { kind: "local" } | { kind: "connect"; url: string }
   >({ kind: "local" });
-  // Install runs in the terminal step only when the CLI is missing; a returning
-  // user ("Open Omnigent") skips it. Mocks force the install screen to show.
-  const needsInstall = setup.mockInstall === true || setup.installed === false;
+  // Install runs in the terminal step only when the CLI is missing AND in-app
+  // install is actually offered (macOS — onInstallCli is present). A returning
+  // user ("Open Omnigent"), or any platform without install support, connects
+  // directly. Mocks force the install screen to show.
+  const needsInstall =
+    setup.mockInstall === true || (setup.installed === false && setup.onInstallCli != null);
 
   // A server pick (list Join / preset detail): install-then-connect when the CLI
   // is missing (route via terminal), else connect straight away. Resolves the

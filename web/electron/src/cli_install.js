@@ -21,6 +21,7 @@
 
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 /** Installing pulls uv + a Python toolchain + the package; give it minutes. */
@@ -75,36 +76,70 @@ function runStreaming(command, args, deps = {}) {
   const spawnFn = deps.spawn || spawn;
   const onOutput = deps.onOutput || (() => {});
   const timeoutMs = deps.timeoutMs ?? INSTALL_TIMEOUT_MS;
+  // Grace between SIGTERM and the hard SIGKILL escalation on timeout.
+  const killGraceMs = deps.killGraceMs ?? 5000;
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawnFn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+      // `detached` puts the child in its own process group so we can signal the
+      // whole tree (kill(-pid)) — the installer spawns uv/curl subprocesses that
+      // a bare child.kill() would leave running past a timeout.
+      child = spawnFn(command, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+        env: deps.env ?? process.env,
+      });
     } catch (error) {
       onOutput(`Failed to start: ${error.message}\n`);
       resolve({ code: null, timedOut: false });
       return;
     }
+    let settled = false;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    // Signal the child's whole process group; fall back to the lone child if the
+    // group send fails (e.g. no pid, or the injected fake in tests).
+    const killTree = (signal) => {
+      try {
+        if (typeof child.pid === "number") process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          // Already gone.
+        }
+      }
+    };
     let timedOut = false;
+    let killTimer;
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        child.kill();
-      } catch {
-        // Already gone.
-      }
+      killTree("SIGTERM");
+      // A signal-resistant process must not keep the operation pending: escalate
+      // to SIGKILL, then settle regardless so the caller isn't stuck past the
+      // deadline even if no exit event ever arrives.
+      // Not unref'd: this timer must fire to escalate + settle a wedged child.
+      killTimer = setTimeout(() => {
+        killTree("SIGKILL");
+        settle({ code: null, timedOut: true });
+      }, killGraceMs);
     }, timeoutMs);
-    if (typeof timer.unref === "function") timer.unref();
+    const finish = (result) => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      settle(result);
+    };
     child.stdout?.on("data", (chunk) => onOutput(String(chunk)));
     child.stderr?.on("data", (chunk) => onOutput(String(chunk)));
     child.on("error", (error) => {
-      clearTimeout(timer);
       onOutput(`Error: ${error.message}\n`);
-      resolve({ code: null, timedOut });
+      finish({ code: null, timedOut });
     });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve({ code, timedOut });
-    });
+    child.on("exit", (code) => finish({ code, timedOut }));
   });
 }
 
@@ -120,16 +155,25 @@ function runStreaming(command, args, deps = {}) {
  * @returns {Promise<{ ok: boolean, error?: string }>}
  */
 async function ensureUv(deps = {}) {
-  const hasUv = deps.hasUv || (() => commandExists("uv"));
-  if (hasUv()) return { ok: true };
   const onOutput = deps.onOutput || (() => {});
+  // Resolve uv against the env we'll actually use (PATH may have been augmented
+  // with uv's install dirs after a fresh install — the app's own PATH won't
+  // pick those up mid-run).
+  const env = deps.env ?? process.env;
+  const hasUv = deps.hasUv || ((e) => commandExists("uv", e));
+  if (hasUv(env)) return { ok: true, env };
   onOutput("Installing uv (required by the Omnigent installer)…\n");
   const run = await runStreaming("sh", ["-c", UV_INSTALLER], {
     spawn: deps.spawn,
     onOutput,
+    env,
     timeoutMs: 5 * 60 * 1000,
   });
-  if (run.code !== 0 || !hasUv()) {
+  // uv's installer drops the binary in ~/.local/bin (or ~/.cargo/bin) and wires
+  // PATH only for future shells; add those dirs to the env we hand to the
+  // re-check and the installer, mirroring scripts/install_oss.sh's recovery.
+  const augmented = withUvDirs(env, deps.home ?? os.homedir());
+  if (run.code !== 0 || !hasUv(augmented)) {
     return {
       ok: false,
       error:
@@ -137,19 +181,38 @@ async function ensureUv(deps = {}) {
         "Install it from https://docs.astral.sh/uv/getting-started/installation/ and try again.",
     };
   }
-  return { ok: true };
+  return { ok: true, env: augmented };
 }
 
 /**
- * True when `name` resolves on the current PATH.
+ * A copy of `env` with uv's well-known install dirs prepended to PATH, so a
+ * just-installed uv (and the omnigent binaries it later drops) resolve for the
+ * rest of this run even if the app's launch PATH omitted them.
+ *
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string} home
+ * @returns {NodeJS.ProcessEnv}
+ */
+function withUvDirs(env, home) {
+  const dirs = [path.join(home, ".local", "bin"), path.join(home, ".cargo", "bin")];
+  const current = env.PATH ? env.PATH.split(":") : [];
+  const merged = [...dirs.filter((d) => !current.includes(d)), ...current];
+  return { ...env, PATH: merged.join(":") };
+}
+
+/**
+ * True when `name` resolves on PATH, using `env` (so a PATH augmented with uv's
+ * install dirs is honored).
  *
  * @param {string} name
+ * @param {NodeJS.ProcessEnv} [env]
  * @returns {boolean}
  */
-function commandExists(name) {
+function commandExists(name, env = process.env) {
   try {
     require("node:child_process").execFileSync("/bin/sh", ["-c", `command -v ${name}`], {
       stdio: "ignore",
+      env,
     });
     return true;
   } catch {
@@ -196,7 +259,11 @@ async function installCli(deps = {}) {
   const run = await runStreaming("sh", [scriptArg, "--non-interactive"], {
     spawn: deps.spawn,
     onOutput,
+    // Run under the (possibly PATH-augmented) env ensureUv resolved, so a
+    // freshly-installed uv is found by the installer.
+    env: uv.env,
     timeoutMs: deps.timeoutMs,
+    killGraceMs: deps.killGraceMs,
   });
   if (run.timedOut) {
     return { ok: false, error: "The installer timed out. Check your connection and try again." };

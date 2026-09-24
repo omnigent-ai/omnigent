@@ -3237,6 +3237,9 @@ function registerIpc() {
     return {
       ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
       customizationDisabled: databricksInternalFeaturesEnabled(),
+      // In-app install is macOS-only; the renderer must not route connect/local
+      // through an install step on platforms where it can't run.
+      installSupported: process.platform === "darwin",
     };
   });
 

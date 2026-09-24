@@ -24,7 +24,7 @@ interface OmnigentSetup {
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
-  getCliStatus: () => Promise<{ installed?: boolean }>;
+  getCliStatus: () => Promise<{ installed?: boolean; installSupported?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
   installCli?: () => Promise<{ ok?: boolean; error?: string; installed?: boolean }>;
@@ -64,6 +64,9 @@ function BridgeSetupApp() {
   // Whether the `omnigent` CLI is installed — decides "Install" vs "Open" and
   // the returning-user start step. Undefined until the probe resolves.
   const [installed, setInstalled] = useState<boolean | undefined>(undefined);
+  // Whether in-app install is available on this platform (macOS only). Off →
+  // connect/local must never route through an install step.
+  const [installSupported, setInstallSupported] = useState(false);
   // Hold the initial paint until the CLI probe resolves, so the wizard opens on
   // the correct step (welcome vs server list) instead of flashing the wrong one.
   const [ready, setReady] = useState(false);
@@ -93,7 +96,10 @@ function BridgeSetupApp() {
     // means "not installed" — never block the wizard on it.
     bridge
       .getCliStatus()
-      .then((status) => setInstalled(status?.installed === true))
+      .then((status) => {
+        setInstalled(status?.installed === true);
+        setInstallSupported(status?.installSupported === true);
+      })
       .catch(() => setInstalled(false))
       .finally(() => setReady(true));
   }, [failedUrl, isEphemeral]);
@@ -146,7 +152,7 @@ function BridgeSetupApp() {
     // Install the CLI, if the shell supports it. Offered only when NOT already
     // installed — a returning user opens rather than installs.
     onInstallCli:
-      installed === false && setupBridge()?.installCli
+      installed === false && installSupported && setupBridge()?.installCli
         ? async () => {
             const bridge = setupBridge();
             if (!bridge?.installCli) return { ok: false, error: "Install is unavailable." };
