@@ -54,7 +54,9 @@ def upgrade() -> None:
     # On PostgreSQL/MySQL, get the current PK name; on SQLite, let batch recreate handle it
     old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
 
-    with op.batch_alter_table("user_daily_cost", recreate="always" if sqlite else "auto") as batch_op:
+    with op.batch_alter_table(
+        "user_daily_cost", recreate="always" if sqlite else "auto"
+    ) as batch_op:
         # Add harness column with default value
         batch_op.add_column(
             sa.Column("harness", sa.String(64), nullable=False, server_default="__all__")
@@ -82,7 +84,9 @@ def downgrade() -> None:
     # On PostgreSQL/MySQL, get the current PK name; on SQLite, let batch recreate handle it
     old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
 
-    with op.batch_alter_table("user_daily_cost", recreate="always" if sqlite else "auto") as batch_op:
+    with op.batch_alter_table(
+        "user_daily_cost", recreate="always" if sqlite else "auto"
+    ) as batch_op:
         # Drop current primary key if it exists
         if old_pk_name is not None:
             batch_op.drop_constraint(old_pk_name, type_="primary")
