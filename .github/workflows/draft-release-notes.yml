@@ -16,7 +16,7 @@ name: Draft release notes
 # malicious tagged commit can't execute anything. We keep that guarantee by
 # running the heavy work (LLM + git harvest) in this SEPARATE workflow, which
 # runs from the trusted default branch (workflow_run always does), never from the
-# tagged commit. Same "harvester runs from main" posture as autoformat-pr.yml.
+# tagged commit. Dry runs use the dispatched workflow commit to preview changes.
 #
 # The LLM machinery (creds gate, Claude Code CLI, provider config, secret-scan,
 # token-minted-after-agent, artifact redaction) mirrors doc-sync.yml. The agent
@@ -130,12 +130,12 @@ jobs:
           echo "Resolved tag=${tag} base=${base:-<none>} proceed=${proceed} dry_run=${dry_run}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # Trusted default branch, full history + tags for the range computation.
-      - name: Checkout omnigent (main)
+      # Dry runs test the selected workflow commit; release writes use main.
+      - name: Checkout omnigent
         if: steps.guard.outputs.proceed == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: main
+          ref: ${{ steps.guard.outputs.dry_run == 'true' && github.sha || 'main' }}
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
