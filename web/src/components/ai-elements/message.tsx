@@ -5,6 +5,7 @@ import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
 import { getEmbedRoot } from "@/lib/host";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
@@ -25,7 +26,7 @@ import { createPortal } from "react-dom";
 import { Streamdown, type StreamdownProps } from "streamdown";
 
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
-import { MERMAID_STREAMDOWN_OPTIONS } from "./MermaidError";
+import { mermaidOptionsForTheme } from "./MermaidError";
 
 import {
   CHAT_LINK_SAFETY,
@@ -638,12 +639,14 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
 
 export const MessageResponse = memo(
   ({ className, components, controls, markFileLinks = false, ...props }: MessageResponseProps) => {
+    const themeMode = useResolvedThemeMode();
     const messageComponents = useMemo(
       () => ({ ...components, pre: ChatCodeBlockPre }),
       [components],
     );
 
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
+    const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
 
     return (
       <MarkdownErrorBoundary source={props.children}>
@@ -660,7 +663,7 @@ export const MessageResponse = memo(
           {...props}
           components={messageComponents}
           controls={messageControls}
-          mermaid={MERMAID_STREAMDOWN_OPTIONS}
+          mermaid={mermaidOptions}
           // Block remote image fetches that can exfiltrate data through URLs.
           rehypePlugins={
             markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS

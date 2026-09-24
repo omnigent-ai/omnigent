@@ -1307,6 +1307,19 @@ aside[aria-label="Workspace"][data-maximized] {
   margin-right: calc(2rem - 1px);
 }
 
+/* Streamdown centers the SVG in a shrink-to-fit flex child. Give that child
+ * the diagram area's width so Mermaid's width="100%" does not collapse. */
+[data-streamdown="mermaid-block"] div:has(> svg[aria-roledescription]) {
+  width: 100%;
+}
+
+/* Keep Mermaid's canvas transparent so the diagram follows the surrounding
+ * chat or file surface in either theme. The SVG itself has no canvas fill. */
+[data-streamdown="mermaid-block"],
+[data-streamdown="mermaid-block"] > div:last-child {
+  background-color: transparent;
+}
+
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
