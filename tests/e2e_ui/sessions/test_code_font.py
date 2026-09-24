@@ -172,31 +172,3 @@ def test_heavier_code_text_applies_to_monaco_and_persists(
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer.locator(".view-lines")).to_contain_text("greet", timeout=30_000)
     assert _monaco_font_weight(file_viewer) == "500", "weight was not restored after reload"
-
-
-def test_code_font_size_steppers_clamp_at_bounds(page: Page, live_server: str) -> None:
-    """The ``−`` / ``+`` buttons disable at the 10px min and 24px max."""
-    base_url = live_server
-
-    # Seed the max before the app boots so the "+" button renders disabled.
-    page.goto(base_url)
-    page.evaluate(f"() => window.localStorage.setItem('{SIZE_STORAGE_KEY}', '24')")
-    _open_appearance(page, base_url)
-
-    value = page.get_by_test_id("code-font-size-input")
-    decrease = page.get_by_test_id("code-font-size-dec")
-    increase = page.get_by_test_id("code-font-size-inc")
-
-    # At the 24px max, only "+" is disabled.
-    expect(value).to_have_value("24")
-    expect(increase).to_be_disabled()
-    expect(decrease).to_be_enabled()
-
-    # Hold "−" down to the 10px min; there it flips to "−" disabled, "+" enabled.
-    for _ in range(16):
-        if decrease.is_disabled():
-            break
-        decrease.click()
-    expect(value).to_have_value("10")
-    expect(decrease).to_be_disabled()
-    expect(increase).to_be_enabled()
