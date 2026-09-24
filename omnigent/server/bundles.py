@@ -58,15 +58,17 @@ def _reject_uploaded_callable_tools(spec: AgentSpec) -> None:
 def _cwd_escapes_workspace(spec_cwd: str) -> bool:
     """Whether an agent-spec ``os_env.cwd`` would escape the session workspace.
 
-    ``True`` for an absolute path or one containing a ``..`` segment, in
-    either POSIX or Windows form (the runner is POSIX, but checking both
-    avoids a separator-style bypass). Such a cwd must be rejected for
+    ``True`` for a POSIX-absolute path, a Windows-anchored path (rooted or
+    drive-relative, e.g. ``\\Windows`` or ``C:``, which ``is_absolute()``
+    does not report), or one containing a ``..`` segment (the runner is
+    POSIX, but checking both forms avoids a separator-style bypass). Such a
+    cwd must be rejected for
     untrusted uploads (GHSA-p8rw-8qj3-hf33): on a runner without
     ``OMNIGENT_RUNNER_WORKSPACE`` it becomes the agent environment root and
     ``copytree`` source, exposing the host filesystem.
     """
     posix, win = PurePosixPath(spec_cwd), PureWindowsPath(spec_cwd)
-    return posix.is_absolute() or win.is_absolute() or ".." in posix.parts or ".." in win.parts
+    return posix.is_absolute() or bool(win.anchor) or ".." in posix.parts or ".." in win.parts
 
 
 def _reject_escaping_cwd(cwd: str | None) -> None:
