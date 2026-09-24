@@ -84,6 +84,8 @@ def assert_mcp_server_request_safe(body: UpsertMCPServerRequest) -> None:
                 code=ErrorCode.FORBIDDEN,
             )
         return
+    if body.transport == "registry":
+        return
     if body.transport == "http" and body.url:
         # A single-user / local server has no other tenant to protect and is
         # expected to reach its own loopback services, so it may target internal
@@ -168,6 +170,8 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         """Create one MCP server declaration on a session-scoped agent."""
         agent, user_id = await _editable_agent(request, session_id)
+        if body.transport == "registry":
+            _require_registry_service(request, body.name, user_id)
         await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
@@ -191,6 +195,8 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         """Replace one MCP server declaration on a session-scoped agent."""
         agent, user_id = await _editable_agent(request, session_id)
+        if body.transport == "registry":
+            _require_registry_service(request, body.name, user_id)
         await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
@@ -400,6 +406,19 @@ def _summary_from_spec(spec: AgentSpec, name: str) -> MCPServerSummary:
     raise OmnigentError("MCP server was not saved", code=ErrorCode.INTERNAL_ERROR)
 
 
+def _require_registry_service(request: Request, service_id: str, user_id: str | None) -> None:
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes.connections_base import ConnectionError
+
+    registry = getattr(request.app.state, "mcp_registry", None)
+    try:
+        if registry is None:
+            raise ConnectionError("MCP registry is not configured")
+        registry.service(service_id, user_id or RESERVED_USER_LOCAL)
+    except ConnectionError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.FORBIDDEN) from exc
+
+
 def _write_new_mcp_server(root: Path, body: UpsertMCPServerRequest) -> None:
     """Create an MCP declaration in the bundle."""
     inline_path = _single_yaml_path(root)
@@ -503,6 +522,9 @@ def _body_to_file_yaml(
     """Serialize a request body as ``tools/mcp/<name>.yaml``."""
     result: dict[str, Any] = {"name": body.name, "transport": body.transport}
     _copy_description(result, body)
+    if body.transport == "registry":
+        _preserve_keys(result, existing, ("tools",))
+        return result
     if body.transport == "http":
         result["url"] = body.url
         _apply_headers(result, body, existing)
@@ -522,6 +544,9 @@ def _body_to_inline_yaml(
     """Serialize a request body as an inline ``tools`` MCP block."""
     result: dict[str, Any] = {"type": "mcp"}
     _copy_description(result, body)
+    if body.transport == "registry":
+        _preserve_keys(result, existing, ("tools",))
+        return {**result, "transport": "registry"}
     if body.transport == "http":
         result["url"] = body.url
         _apply_headers(result, body, existing)

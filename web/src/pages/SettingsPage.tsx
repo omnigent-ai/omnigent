@@ -1,3 +1,4 @@
+import { McpRegistryConnections } from "@/components/McpRegistry";
 /**
  * Settings page (``/settings``).
  *
@@ -1147,6 +1148,7 @@ function GithubMark({ className }: { className?: string }) {
  * render each. Adding a provider is one entry here plus one string server-side.
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
+  mcp: McpRegistryConnections,
   github: GithubIntegrationControl,
   databricks: DatabricksIntegrationControl,
 };
