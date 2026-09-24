@@ -5865,6 +5865,7 @@ describe("NewChatLandingScreen", () => {
       displayName: "Codex",
       harness: "codex-native",
       readiness: "needs-auth",
+      badgeName: "needs auth",
       warning: "Codex needs Codex authentication on machine-1 — run codex login",
     },
     {
@@ -5873,6 +5874,7 @@ describe("NewChatLandingScreen", () => {
       displayName: "Cursor",
       harness: "cursor-native",
       readiness: "binary-missing",
+      badgeName: "binary missing",
       warning: "Cursor isn't configured on machine-1 — run omni setup",
     },
     {
@@ -5881,11 +5883,21 @@ describe("NewChatLandingScreen", () => {
       displayName: "Pi",
       harness: "pi-native",
       readiness: "version-too-low",
+      badgeName: "outdated",
       warning: "Pi has an outdated CLI on machine-1 — run omni setup",
+    },
+    {
+      id: "a_polly",
+      name: "polly",
+      displayName: "Polly",
+      harness: "codex",
+      readiness: "needs-auth",
+      badgeName: "needs auth",
+      warning: "Polly needs Codex authentication on machine-1 — run codex login",
     },
   ])(
     "renders the $readiness availability warning for $displayName",
-    async ({ id, name, displayName, harness, readiness, warning }) => {
+    async ({ id, name, displayName, harness, readiness, badgeName, warning }) => {
       mockAgents([
         DEFAULT_LANDING_AGENTS[0],
         {
@@ -5915,13 +5927,18 @@ describe("NewChatLandingScreen", () => {
 
       const notice = screen.getByTestId("new-chat-landing-harness-warning");
       expect(notice).toHaveTextContent(warning);
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
       fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
       if (screen.queryByTestId(`new-chat-landing-agent-${id}`) == null) {
         fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
       }
       const row = screen.getByTestId(`new-chat-landing-agent-${id}`);
       expect(row).toHaveAttribute("aria-disabled", "true");
-      expect(within(row).getByTestId(`new-chat-landing-agent-warning-${id}`)).toBeVisible();
+      const badge = within(row).getByTestId(`new-chat-landing-agent-warning-${id}`);
+      expect(badge).toBeVisible();
+      expect(badge).toHaveAccessibleName(badgeName);
+      fireEvent.focus(badge);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(warning);
     },
   );
 

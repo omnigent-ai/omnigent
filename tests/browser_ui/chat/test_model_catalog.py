@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
 
@@ -103,3 +103,40 @@ def test_selecting_a_catalog_row_patches_its_exact_id(
 
     expect(page.get_by_test_id("composer-agent-model-summary")).to_have_text("Alternate")
     assert chat.session_patches == [{"model_override": "provider/alternate"}]
+
+
+def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Opening and using preloaded rows does not trigger a click-time GET."""
+    chat = chat_session_contract
+    chat.set_catalog(
+        harness="opencode-native",
+        models=[
+            model_option("primary", display_name="Primary", is_default=True),
+            model_option("alternate", display_name="Alternate"),
+        ],
+        selected_model="primary",
+    )
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    expect(page.get_by_test_id("composer-config-gear")).to_be_visible(timeout=20_000)
+    page.wait_for_timeout(500)
+
+    unexpected_gets: list[str] = []
+    session_get = f"/v1/sessions/{chat.session_id}?"
+
+    def record_request(request: Request) -> None:
+        if request.method == "GET" and (
+            session_get in request.url or "/model-options" in request.url
+        ):
+            unexpected_gets.append(request.url)
+
+    page.on("request", record_request)
+    _open_models(page)
+    page.locator('[data-model-id="alternate"]').click()
+    expect(page.get_by_test_id("composer-agent-model-summary")).to_have_text("Alternate")
+
+    assert chat.session_patches == [{"model_override": "alternate"}]
+    assert unexpected_gets == []

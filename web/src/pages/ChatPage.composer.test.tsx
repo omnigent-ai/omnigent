@@ -1860,6 +1860,48 @@ describe("Composer model/effort label", () => {
     expect(label()).not.toHaveTextContent("Sonnet 4.6");
   });
 
+  it.each([
+    ["claude", true],
+    ["codex", true],
+    ["kiro", false],
+    ["pi", false],
+  ] as const)(
+    "shows model-change progress only for confirmation-based %s switches",
+    async (modelPickerKind, showsPending) => {
+      useChatStore.setState({
+        llmModel: "primary",
+        pendingModelChange: "alternate",
+        sessionModelSeeded: false,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showEffort: false,
+            showModels: true,
+            modelPickerKind,
+            codexModelOptions: [
+              { id: "primary", displayName: "Primary" },
+              { id: "alternate", displayName: "Alternate" },
+            ],
+          })}
+        />,
+      );
+
+      expect(label()).toHaveTextContent("Primary");
+      expect(label()).not.toHaveTextContent("Alternate");
+      if (showsPending) {
+        expect(screen.getByTestId("composer-model-pending")).toHaveAccessibleName(
+          "Model change pending",
+        );
+      } else {
+        expect(screen.queryByTestId("composer-model-pending")).toBeNull();
+      }
+
+      act(() => useChatStore.setState({ pendingModelChange: null }));
+      await waitFor(() => expect(screen.queryByTestId("composer-model-pending")).toBeNull());
+    },
+  );
+
   const CLAUDE_LIVE_OPTIONS = [
     { id: "opus", model: "system.ai.claude-opus-4-10", displayName: "Opus 4.10", isDefault: false },
     { id: "sonnet", model: "system.ai.claude-sonnet-5", displayName: "Sonnet 5", isDefault: true },
@@ -4909,6 +4951,49 @@ describe("Composer config gear", () => {
     );
     expect(setModel).toHaveBeenCalledTimes(2);
   });
+
+  it.each(["opencode", "acp"] as const)(
+    "synthesizes a resettable Default row for %s catalogs without a marked default",
+    async (modelPickerKind) => {
+      const options = [
+        { id: "primary", displayName: "Primary", isDefault: false },
+        { id: "alternate", displayName: "Alternate", isDefault: false },
+      ];
+      const setModel = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({
+        setModel,
+        codexModelOptions: options,
+        llmModel: null,
+        sessionModelOverride: null,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showEffort: false,
+            showModels: true,
+            modelPickerKind,
+            codexModelOptions: options,
+          })}
+        />,
+      );
+
+      await openSessionModels();
+      const defaultRow = screen.getByTestId("composer-agent-model-default");
+      expect(defaultRow).toHaveTextContent("Default");
+      expect(defaultRow).toHaveAttribute("aria-checked", "true");
+      fireEvent.click(defaultRow);
+      await waitFor(() => expect(setModel).toHaveBeenCalledWith(null, expect.anything()));
+
+      act(() =>
+        useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }),
+      );
+      await openSessionModels();
+      expect(screen.getByTestId("composer-agent-model-default")).toHaveAttribute(
+        "aria-checked",
+        "false",
+      );
+    },
+  );
 
   it.each([
     ["claude", "sonnet[1m]", "Sonnet 5 (1M context)"],
