@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+from omnigent_bot_core.events import HostType
 
-from omnigent_slack.events import HostType
 from omnigent_slack.models import SessionRecord, ThreadKey, UserConfig
 
 # Columns added to a table after it was first created, as

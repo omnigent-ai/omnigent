@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from omnigent_slack.events import HostType
+from omnigent_bot_core.events import HostType
 
 
 def event_is_dm(event: dict[str, object]) -> bool:

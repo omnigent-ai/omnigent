@@ -38,8 +38,8 @@ from pathlib import Path
 from typing import Any
 
 from fakes import RecordingSlackClient
+from omnigent_bot_core.omnigent import SessionActivity, SessionInfo
 from omnigent_slack.models import ThreadKey, UserConfig
-from omnigent_slack.omnigent import SessionActivity, SessionInfo
 from omnigent_slack.service import _ACK_TEXT, SlackOmnigentService
 from omnigent_slack.store import SQLiteStore
 

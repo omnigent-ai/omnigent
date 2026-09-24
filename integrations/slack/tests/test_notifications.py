@@ -1,9 +1,9 @@
+from omnigent_bot_core.omnigent import OutputFile
 from omnigent_slack.notifications import (
     format_output_file,
     format_policy_denied,
     format_todos,
 )
-from omnigent_slack.omnigent import OutputFile
 
 
 def test_format_todos_renders_marks_and_active_form() -> None:

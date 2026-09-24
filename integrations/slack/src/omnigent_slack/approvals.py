@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
-from omnigent_slack.omnigent import ElicitationRequest
+from omnigent_bot_core.omnigent import ElicitationRequest
+
 from omnigent_slack.text import truncate_for_slack, truncate_option
 
 _logger = logging.getLogger(__name__)

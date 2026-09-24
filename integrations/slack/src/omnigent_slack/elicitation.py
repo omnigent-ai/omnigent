@@ -21,6 +21,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from omnigent_bot_core.omnigent import ElicitationRequest, OmnigentClient
+
 from omnigent_slack.approvals import (
     RESOLVED_EXTERNALLY,
     ClickTarget,
@@ -32,7 +34,6 @@ from omnigent_slack.approvals import (
     resolved_card_blocks,
 )
 from omnigent_slack.models import SlackTurn, ThreadKey
-from omnigent_slack.omnigent import ElicitationRequest, OmnigentClient
 
 if TYPE_CHECKING:
     from omnigent_slack.streaming import SlackClientProtocol

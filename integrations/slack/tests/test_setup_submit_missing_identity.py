@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from omnigent_slack.omnigent import OmnigentClientPool
+from omnigent_bot_core.omnigent import OmnigentClientPool
 from omnigent_slack.setup import (
     AGENT_ACTION,
     AGENT_BLOCK,
