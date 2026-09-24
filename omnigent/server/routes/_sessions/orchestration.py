@@ -10237,45 +10237,69 @@ async def _handle_mcp_tools_call(
             runner_router=runner_router,
         )
 
-    # ── Execute on the runner via WS tunnel ──────────────────────────
-    # The runner owns stdio subprocess spawning (correct machine, cwd,
-    # and env). We call its /mcp/execute endpoint through the same WS
-    # tunnel the runner already opened to the Omnigent server at startup.
-    runner_client = await _get_runner_client(session_id, runner_router)
-    if runner_client is None:
-        from omnigent.runtime import get_runner_client
+    from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
 
-        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
-    if runner_client is None:
-        return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
-    try:
-        from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
-
-        exec_resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/mcp/execute",
-            json=_runner_execute_body(
-                {"name": namespaced_name, "arguments": arguments},
-                step="initial",
+    runner_client: httpx.AsyncClient | None = None
+    registry_config = None
+    if request is not None and getattr(request.app.state, "mcp_registry", None) is not None:
+        registry_config = next(
+            (
+                c
+                for c in spec.mcp_servers
+                if c.transport == "registry" and namespaced_name.startswith(c.name + "__")
             ),
-            # ``sys_session_send`` returns a launch handle immediately; this
-            # timeout now protects ordinary runner proxy hangs.
-            timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
+            None,
         )
-        exec_resp.raise_for_status()
-        exec_data = exec_resp.json()
-    except ConnectionError as exc:
-        _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
-        if operation_id is not None:
-            return _mcp_error_response(
-                rpc_id,
-                RUNNER_MCP_EXECUTION_DETACHED_CODE,
-                RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
-            )
-        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
-        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
+    if registry_config is not None:
+        from omnigent.server.registry_gateway import execute_registry_tool
 
+        exec_data = await execute_registry_tool(
+            request,
+            conv,
+            registry_config,
+            namespaced_name,
+            arguments,
+            actor,
+        )
+    else:
+        # ── Execute on the runner via WS tunnel ──────────────────────────
+        # The runner owns stdio subprocess spawning (correct machine, cwd,
+        # and env). We call its /mcp/execute endpoint through the same WS
+        # tunnel the runner already opened to the Omnigent server at startup.
+        runner_client = await _get_runner_client(session_id, runner_router)
+        if runner_client is None:
+            from omnigent.runtime import get_runner_client
+
+            runner_client = cast("httpx.AsyncClient | None", get_runner_client())
+        if runner_client is None:
+            return _mcp_error_response(
+                rpc_id, -32000, f"No runner bound for session {session_id!r}"
+            )
+        try:
+            exec_resp = await runner_client.post(
+                f"/v1/sessions/{session_id}/mcp/execute",
+                json=_runner_execute_body(
+                    {"name": namespaced_name, "arguments": arguments},
+                    step="initial",
+                ),
+                # ``sys_session_send`` returns a launch handle immediately; this
+                # timeout now protects ordinary runner proxy hangs.
+                timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
+            )
+            exec_resp.raise_for_status()
+            exec_data = exec_resp.json()
+        except ConnectionError as exc:
+            _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
+            if operation_id is not None:
+                return _mcp_error_response(
+                    rpc_id,
+                    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+                )
+            return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
+            return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
     if "error" in exec_data:
         err = exec_data["error"]
         return _mcp_error_response(
@@ -10322,6 +10346,9 @@ async def _handle_mcp_tools_call(
                 if elicit_result.content is not None:
                     resp_entry["content"] = elicit_result.content
                 elicitation_responses[eid] = resp_entry
+
+        if runner_client is None:
+            return _mcp_error_response(rpc_id, -32000, "Registry MCP elicitation is not supported")
 
         # Retry on the runner with the user's inputResponses.
         try:
@@ -10418,7 +10445,10 @@ async def _handle_mcp_tools_call(
 
     return _mcp_ok_response(
         rpc_id,
-        {"content": [{"type": "text", "text": output}]},
+        {
+            "content": [{"type": "text", "text": output}],
+            "isError": exec_data.get("isError", False),
+        },
     )
 
 

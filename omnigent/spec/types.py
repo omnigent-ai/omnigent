@@ -977,7 +977,7 @@ class MCPServerConfig:
     """
 
     name: str
-    transport: Literal["http", "stdio"] = "http"
+    transport: Literal["http", "stdio", "registry"] = "http"
     # HTTP-only fields.
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict, repr=False)

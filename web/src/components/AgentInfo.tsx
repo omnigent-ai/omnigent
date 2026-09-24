@@ -1,3 +1,4 @@
+import { McpRegistryPicker } from "@/components/McpRegistry";
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
@@ -751,6 +752,8 @@ function McpServerManagerDialog({
   dirty: boolean;
   onDirty: () => void;
 }) {
+  const info = useServerInfo();
+  const registryEnabled = info !== "loading" && info.enabled_connections?.includes("mcp");
   const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
   const [formError, setFormError] = useState<string | null>(null);
   const createServer = useCreateMcpServer(sessionId);
@@ -813,6 +816,15 @@ function McpServerManagerDialog({
           <DialogTitle>Manage MCP Servers</DialogTitle>
           <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
         </DialogHeader>
+        {registryEnabled && (
+          <McpRegistryPicker
+            attached={servers.map((s) => s.name)}
+            busy={saving}
+            onAdd={(name) =>
+              createServer.mutate({ name, transport: "registry" }, { onSuccess: notifyRestart })
+            }
+          />
+        )}
         {dirty && (
           <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-ui text-yellow-700 dark:text-yellow-400">
             <AlertTriangleIcon className="size-4 shrink-0" />
@@ -830,6 +842,7 @@ function McpServerManagerDialog({
                     <button
                       type="button"
                       onClick={() => {
+                        if (server.transport === "registry") return;
                         setForm(mcpFormFromServer(server));
                         setFormError(null);
                       }}
@@ -845,7 +858,9 @@ function McpServerManagerDialog({
                       variant="ghost"
                       size="icon-xs"
                       aria-label={`Edit ${server.name}`}
+                      disabled={server.transport === "registry"}
                       onClick={() => {
+                        if (server.transport === "registry") return;
                         setForm(mcpFormFromServer(server));
                         setFormError(null);
                       }}
