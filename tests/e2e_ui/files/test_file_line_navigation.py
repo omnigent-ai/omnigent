@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import re
-import shutil
-from pathlib import Path
 
 import httpx
 from playwright.sync_api import Page, expect
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _FILE_PATH = "src/citation_target.py"
 _LINES = [f"# source line {line}" for line in range(1, 501)]
 _SOURCE = "\n".join(_LINES)
@@ -36,11 +33,13 @@ def test_chat_citation_opens_real_file_resource_at_line(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/"
         f"filesystem/{_FILE_PATH}"
     )
+    created = False
     try:
         written = httpx.put(
             resource_url, json={"content": _SOURCE, "encoding": "utf-8"}, timeout=10
         )
         written.raise_for_status()
+        created = True
         served = httpx.get(resource_url, timeout=10)
         served.raise_for_status()
         assert served.json()["content"] == _SOURCE
@@ -70,4 +69,5 @@ def test_chat_citation_opens_real_file_resource_at_line(
         expect(viewer.locator(".monaco-editor")).to_be_visible(timeout=30_000)
         page.wait_for_function(_CENTERED_LINE, arg=_LINES[349], timeout=30_000)
     finally:
-        shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+        if created:
+            httpx.delete(resource_url, timeout=10).raise_for_status()
