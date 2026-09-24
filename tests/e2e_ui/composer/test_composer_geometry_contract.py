@@ -1161,7 +1161,10 @@ async def _landing_picker_grid(base_url: str, session_id: str) -> None:
                 navigation_labels = [
                     row.locator("[data-harness-menu-navigation-label]") for row in navigation_rows
                 ]
-                navigation_chevrons = [row.locator("svg").last for row in navigation_rows]
+                navigation_chevron_icons = [row.locator("svg") for row in navigation_rows]
+                for icons in navigation_chevron_icons:
+                    await async_expect(icons).to_have_count(1)
+                navigation_chevrons = [icons.first for icons in navigation_chevron_icons]
                 headers = [harness_header, agents_header]
                 for header, row, label, chevron in zip(
                     headers,
