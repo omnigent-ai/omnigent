@@ -39,6 +39,7 @@ from omnigent.inner.kimi_native_executor import (
     _content_to_text,
     _latest_user_text,
 )
+from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.llms.errors import RetryableLLMError
 
 _FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "kimi_native"
@@ -71,7 +72,7 @@ class TestContentExtraction:
         )
         out = _content_to_text([{"type": "input_image", "image_url": png}], tmp_path)
         assert out.startswith("[Attached: ")
-        assert str(tmp_path) in out
+        assert str(attachment_cache_dir(tmp_path)) in out
 
     def test_empty_and_none(self, tmp_path: Path) -> None:
         assert _content_to_text(None, tmp_path) == ""

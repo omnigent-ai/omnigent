@@ -21,6 +21,19 @@ test does — a store-call oracle cannot see a helper that issues three
 statements per call. They FAIL while the redundancy exists and pass
 once the already-fetched ``root_conversation_id`` is threaded through
 to every tree-scan call.
+
+Two shapes a point-read count alone cannot see, covered below:
+
+* A read issued by a **collaborator** the snapshot calls rather than by
+  the snapshot itself. The runner router point-reads the conversation
+  when the caller doesn't hand over the row it already holds; a test
+  app with no router wired never reaches that read, so the count stays
+  at 1 whether or not the row is passed. Asserted on the argument
+  instead of the SQL.
+* A duplicated **tree scan**. The usage report reads no extra rows per
+  listed session, yet loaded each session's tree twice — once for the
+  sums and once for the harness roll-up. Tree scans filter on
+  ``root_conversation_id``, so they need their own counter.
 """
 
 from __future__ import annotations
@@ -83,6 +96,29 @@ def _conversation_point_reads(statements: list[str]) -> list[str]:
             continue
         where = normalized.split(" WHERE ", 1)[1]
         if "conversations.id = " in where and "root_conversation_id" not in where:
+            matches.append(normalized)
+    return matches
+
+
+def _conversation_tree_scans(statements: list[str]) -> list[str]:
+    """
+    Filter to tree scans — reads of every row under one tree root.
+
+    Complement of :func:`_conversation_point_reads`: a tree page load
+    filters on ``conversations.root_conversation_id = ?``. Counting these
+    separately catches a caller that loads the same tree twice, which costs
+    no extra point read and is therefore invisible to that counter.
+
+    :param statements: Raw captured SQL statements.
+    :returns: The matching statements (normalized whitespace).
+    """
+    matches: list[str] = []
+    for raw in statements:
+        normalized = " ".join(raw.split())
+        if "FROM conversations" not in normalized or " WHERE " not in normalized:
+            continue
+        where = normalized.split(" WHERE ", 1)[1]
+        if "root_conversation_id = " in where:
             matches.append(normalized)
     return matches
 
@@ -223,4 +259,121 @@ async def test_usage_flush_reads_conversation_twice(
         f"baseline); the subtree roll-up and the ancestor publish must "
         f"reuse the access-check row's root instead of re-reading the row. "
         f"statements={point_reads}"
+    )
+
+
+async def test_snapshot_hands_its_row_to_the_runner_router(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The snapshot must pass its authorized row to the runner router.
+
+    ``client_for_session_resources`` point-reads the conversation when the
+    caller doesn't supply one — a second read of the row the snapshot is
+    already holding, and on a split-DB deployment one round trip per
+    backend. The point-read counter above cannot see it: the router is a
+    collaborator, and a test app with none wired never reaches its read.
+    So assert on what the snapshot hands over.
+
+    Every session open, every reconnect and every ``PATCH`` response builds
+    a snapshot, so this is the most frequently paid duplicate of the set.
+    """
+    from omnigent import runtime as omnigent_runtime
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    received: list[object] = []
+
+    class _RecordingRouter:
+        """Router stand-in recording the ``conversation`` it was handed."""
+
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: object | None = None,
+        ) -> object:
+            """Record the row, then decline like an unbound session does."""
+            del conversation_id
+            received.append(conversation)
+            # The snapshot treats "no runner bound" as a normal outcome, so
+            # declining here exercises the same path a real unbound session
+            # takes without needing a live runner.
+            raise OmnigentError("no runner bound", code=ErrorCode.CONFLICT)
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    # The snapshot resolves the router through ``omnigent.runtime`` at call
+    # time, so patch it there rather than on the importing module.
+    monkeypatch.setattr(omnigent_runtime, "get_runner_router", lambda: _RecordingRouter())
+    resp = await client.get(f"/v1/sessions/{sid}?include_items=false&include_liveness=false")
+
+    assert resp.status_code == 200, resp.text
+    assert len(received) == 1, f"expected one router lookup, got {len(received)}"
+    handed = received[0]
+    assert handed is not None, (
+        "the snapshot called the runner router without its conversation, so the "
+        "router re-reads the row the snapshot already holds; pass conversation=conv"
+    )
+    assert getattr(handed, "id", None) == sid
+
+
+async def test_usage_report_loads_each_session_tree_once(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``GET /v1/usage`` must load each listed session's tree once, not twice.
+
+    With the usage page enabled the report needs both the subtree sums and
+    the tree's rows (to roll up which harnesses ran in it). Asking for the
+    sums and then re-loading the tree paged every listed session's tree
+    twice — no extra point read, so the counter above stays satisfied while
+    the scan count doubles with the page size.
+
+    The page-details branch is gated on a release feature resolved when the
+    router is built, so this mounts its own usage router with the feature on
+    rather than trying to flip it after the shared app exists.
+    """
+    from fastapi import FastAPI
+
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from omnigent.server.routes.usage import create_usage_router
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent = await create_test_agent(client)
+    sessions = [await _create_session(client, agent["id"]) for _ in range(3)]
+    assert len({s["id"] for s in sessions}) == 3
+
+    detailed = FastAPI()
+    detailed.include_router(
+        create_usage_router(
+            SqlAlchemyConversationStore(db_uri),
+            feature_flags=FeatureFlags(frozenset({Feature.USAGE_PAGE})),
+        ),
+        prefix="/v1",
+    )
+    transport = httpx.ASGITransport(app=detailed)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as detailed_client:
+        # Warm any caches so the counted request is steady-state.
+        warm = await detailed_client.get("/v1/usage")
+        assert warm.status_code == 200, warm.text
+
+        with _capture_sql(db_uri) as statements:
+            resp = await detailed_client.get("/v1/usage")
+
+    assert resp.status_code == 200, resp.text
+    # Count against what the report listed, not what this test created: the
+    # report is user-scoped and the workspace may hold other rows.
+    listed = len(resp.json()["sessions"])
+    assert listed >= len(sessions)
+    scans = _conversation_tree_scans(statements)
+    assert len(scans) == listed, (
+        f"usage report issued {len(scans)} tree scans for {listed} listed sessions "
+        f"(expected one each); the harness roll-up should reuse the tree the sums "
+        f"were computed from. statements={scans}"
     )

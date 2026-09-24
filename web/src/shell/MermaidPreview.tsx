@@ -6,6 +6,7 @@
 import { mermaid } from "@streamdown/mermaid";
 import { Streamdown } from "streamdown";
 import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
+import { MERMAID_STREAMDOWN_OPTIONS } from "@/components/ai-elements/MermaidError";
 import { fenceForBody } from "./markdownFence";
 
 const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
@@ -21,7 +22,11 @@ export function MermaidPreview({ source }: { source: string }) {
       <MarkdownErrorBoundary source={source}>
         {/* key by source: mermaid renders async with no cancellation, so remount
             on each settled source to discard a superseded in-flight render. */}
-        <Streamdown key={trimmed} plugins={MERMAID_STREAMDOWN_PLUGINS}>
+        <Streamdown
+          key={trimmed}
+          plugins={MERMAID_STREAMDOWN_PLUGINS}
+          mermaid={MERMAID_STREAMDOWN_OPTIONS}
+        >
           {`${fence}mermaid\n${trimmed}\n${fence}`}
         </Streamdown>
       </MarkdownErrorBoundary>

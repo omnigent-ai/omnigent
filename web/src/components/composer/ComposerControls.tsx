@@ -12,16 +12,27 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { permissionModeConcept } from "@/lib/nativeHarnessModes";
 import {
   COMPOSER_COLLAPSED_LABEL_CLASS,
+  COMPOSER_CONTENT_INSET_CLASS,
+  COMPOSER_TRAY_INSET_CLASS,
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
   useCollapsedWorkspaceLabels,
 } from "./ChatComposer";
 
+/**
+ * The workspace tray docked above the composer card. A tray nests inside the
+ * card's outer edges by the shared inset rather than sharing its border box
+ * (see the layout contract in ChatComposer); its chips sit on the card's
+ * content inset line via the shared content inset; a chip's box starts there, and its
+ * own px-1 keeps the glyph off the edge.
+ */
 export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   const barRef = useRef<HTMLDivElement>(null);
   useCollapsedWorkspaceLabels(barRef);
@@ -29,7 +40,9 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
     <div
       ref={barRef}
       className={cn(
-        "composer-workspace-surface group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border px-2 py-1.5 md:gap-2",
+        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-1.5 md:gap-2",
+        COMPOSER_CONTENT_INSET_CLASS,
+        COMPOSER_TRAY_INSET_CLASS,
         className,
       )}
       {...props}
@@ -39,8 +52,12 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
 
 export const ComposerWorkspaceTrigger = forwardRef<
   HTMLButtonElement,
-  ComponentPropsWithoutRef<"button"> & { kind: "directory" | "worktree"; label: string }
->(function ComposerWorkspaceTrigger({ kind, label, className, ...props }, ref) {
+  ComponentPropsWithoutRef<"button"> & {
+    kind: "directory" | "worktree";
+    label: string;
+    icon?: ReactNode;
+  }
+>(function ComposerWorkspaceTrigger({ kind, label, icon, className, ...props }, ref) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
   return (
     <button
@@ -49,12 +66,12 @@ export const ComposerWorkspaceTrigger = forwardRef<
       // Icon-only while the bar is collapsed, so the label is the name.
       aria-label={label}
       className={cn(
-        "relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-0.5 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11 md:px-1",
+        "relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
         className,
       )}
       {...props}
     >
-      <Icon className="size-3.5 shrink-0" />
+      {icon ?? <Icon className="size-3.5 shrink-0" />}
       <span
         data-workspace-collapse-label=""
         className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
@@ -111,6 +128,8 @@ export const ComposerHostTrigger = forwardRef<
 export function ComposerPermissionPicker({
   label,
   value,
+  harness,
+  selectedValue,
   options,
   disabled = false,
   loading = false,
@@ -120,6 +139,8 @@ export function ComposerPermissionPicker({
 }: {
   label: string;
   value: string;
+  harness?: string | null;
+  selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
   loading?: boolean;
@@ -141,6 +162,7 @@ export function ComposerPermissionPicker({
           aria-label={`${label}: ${value}`}
           title={`${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
+          data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
           <HandIcon className="size-3 shrink-0" />
           <span
@@ -163,16 +185,19 @@ export function ComposerPermissionPicker({
         }}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
-        {options.map((option) => (
-          <DropdownMenuItem
-            key={option.value}
-            onSelect={() => onSelect(option.value)}
-            data-testid={`${testIdPrefix}-permission-option-${option.value}`}
-            className="whitespace-normal break-words"
-          >
-            {option.label}
-          </DropdownMenuItem>
-        ))}
+        <DropdownMenuRadioGroup value={selectedValue ?? undefined} onValueChange={onSelect}>
+          {options.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.value}
+              value={option.value}
+              data-testid={`${testIdPrefix}-permission-option-${option.value}`}
+              data-permission-concept={permissionModeConcept(harness, option.value)}
+              className="whitespace-normal break-words"
+            >
+              {option.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );

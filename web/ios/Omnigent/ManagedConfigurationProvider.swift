@@ -3,41 +3,41 @@ import ManagedApp
 import UIKit
 
 /// Subscribes to the managed app configuration a management service pushes to
-/// this install and publishes the server URLs it presets.
+/// this install and publishes its server URLs and feature flags.
 ///
 /// Watches both channels a service can use — a `com.apple.configuration.app.managed`
 /// declaration via the ManagedApp framework, and the classic
 /// `com.apple.configuration.managed` defaults key — because a service that
-/// doesn't send declarations would otherwise configure nothing. Exposes only
-/// `[URL]`, never a framework type, so views stay unaware of how the list
-/// arrived.
+/// doesn't send declarations would otherwise configure nothing. Views stay
+/// unaware of which channel supplied the configuration.
 @MainActor
 final class ManagedConfigurationProvider: ObservableObject {
-  /// Preset server URLs in the order the administrator listed them. Empty when
-  /// the app is unmanaged, no configuration is set, or one failed to decode.
-  @Published private(set) var serverURLs: [URL]
+  /// Publish servers and flags together so views see a consistent configuration.
+  @Published private var configuration: OmnigentManagedConfiguration = .empty
+
+  var serverURLs: [URL] { configuration.serverURLs }
+  var databricksInternalFeaturesEnabled: Bool { configuration.databricksInternalFeaturesEnabled }
 
   private let defaults: UserDefaults
-  private var declarativeURLs: [URL] = []
-  private var legacyURLs: [URL] = []
+  private var declarativeConfiguration: OmnigentManagedConfiguration?
+  private var legacyConfiguration: OmnigentManagedConfiguration = .empty
   private var subscription: Task<Void, Never>?
   private var legacyObservers: [NSObjectProtocol] = []
 
   /// Test and preview seam: a fixed list, no subscriptions.
   init(serverURLs: [URL]) {
-    self.serverURLs = serverURLs
+    configuration = OmnigentManagedConfiguration(serverURLs: serverURLs)
     defaults = .standard
   }
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
-    serverURLs = []
 
     #if DEBUG
       // Wins over both channels: this is the local test seam, and neither
       // channel can be faked in the Simulator's declarative form.
       if let injected = ProcessInfo.processInfo.omnigentManagedServers {
-        serverURLs = injected
+        configuration = OmnigentManagedConfiguration(serverURLs: injected)
         return
       }
     #endif
@@ -60,9 +60,8 @@ final class ManagedConfigurationProvider: ObservableObject {
     subscription = Task { [weak self] in
       let provider = ManagedAppConfigurationProvider()
       for await configuration in await provider.configurations(OmnigentManagedConfiguration.self) {
-        // nil means unmanaged, unset, or a decode failure — in every case the
-        // right answer is to offer nothing rather than a stale list.
-        self?.declarativeURLs = (configuration ?? .empty).serverURLs
+        // nil clears stale declarative values and falls back to classic configuration.
+        self?.declarativeConfiguration = configuration
         self?.republish()
       }
     }
@@ -91,14 +90,15 @@ final class ManagedConfigurationProvider: ObservableObject {
     // Drop the in-process cache first: the value was written by another process,
     // so a plain read can return the snapshot this process already had.
     defaults.synchronize()
-    let urls = OmnigentManagedConfiguration.read(legacyFrom: defaults).serverURLs
-    guard urls != legacyURLs else { return }
-    legacyURLs = urls
+    let configuration = OmnigentManagedConfiguration.read(legacyFrom: defaults)
+    guard configuration != legacyConfiguration else { return }
+    legacyConfiguration = configuration
     republish()
   }
 
   private func republish() {
-    serverURLs = ManagedServers.resolve(declarative: declarativeURLs, legacy: legacyURLs)
+    configuration = OmnigentManagedConfiguration.resolve(
+      declarative: declarativeConfiguration, legacy: legacyConfiguration)
   }
 }
 

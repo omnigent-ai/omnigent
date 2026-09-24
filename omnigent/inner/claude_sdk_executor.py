@@ -81,7 +81,7 @@ from .executor import (
     classify_tool_result,
     describe_exception,
 )
-from .native_attachments import unresolved_attachment_marker
+from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
     create_exec_launcher,
     get_backend,
@@ -1012,6 +1012,15 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
         for tier in ("opus", "sonnet", "haiku", "fable"):
             servable = families.get(tier)
             if servable:
+                logger.warning(
+                    "claude-sdk: no model pinned for this session; resolved %r "
+                    "from the %r workspace catalog (%s precedence). Pin a model "
+                    "in the agent spec or dispatch to control which endpoint "
+                    "is billed.",
+                    servable,
+                    profile or "DEFAULT",
+                    " > ".join(("opus", "sonnet", "haiku", "fable")),
+                )
                 return servable
     except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
         logger.warning(
@@ -1020,7 +1029,14 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
             profile,
             exc_info=True,
         )
-    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    resolved = model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    logger.warning(
+        "claude-sdk: no model pinned for this session; resolved %r from the "
+        "bundled catalog. Pin a model in the agent spec or dispatch to "
+        "control which endpoint is billed.",
+        resolved,
+    )
+    return resolved
 
 
 class _GatewayModelVocabulary(NamedTuple):
@@ -1689,6 +1705,7 @@ class ClaudeSDKExecutor(Executor):
         self._elicitation_handler: ElicitationHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
+        self._pending_framework_context: dict[str, str] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
         # Force-close tasks for clients evicted on turn cancellation, kept
@@ -1732,6 +1749,7 @@ class ClaudeSDKExecutor(Executor):
         self._gateway_uses_databricks_profile = bool(
             gateway and self._gateway_host is None and base_url_override is None
         )
+        self._resolved_default_model: str | None = None
 
         # Lazily-started local proxy that restores request fields the
         # Claude CLI strips on the gateway path (thinking.display).
@@ -2169,6 +2187,31 @@ class ClaudeSDKExecutor(Executor):
             env.setdefault(var, model_id)
         return self._gateway_vocabulary.model_overrides
 
+    def _install_framework_context_hook(
+        self, sdk: _ClaudeSDK, options: SdkOptions, session_key: str
+    ) -> None:
+        """Read current-turn context even when the SDK reuses its original hooks."""
+        hook_matcher = getattr(sdk, "HookMatcher", None)
+        if hook_matcher is None:
+            return
+
+        async def add_context(
+            _payload: object, _tool_use_id: str | None, _context: object
+        ) -> _JsonObject:
+            text = self._pending_framework_context.pop(session_key, "")
+            if not text:
+                return {}
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": text,
+                }
+            }
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        hooks.setdefault("UserPromptSubmit", []).append(hook_matcher(hooks=[add_context]))
+        options.hooks = hooks
+
     def _install_subagent_router_hook(
         self,
         sdk: _ClaudeSDK,
@@ -2439,9 +2482,10 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
+        resume_session = session_key in self._clients
         prompt = self._build_prompt(
             messages,
-            resume_session=session_key in self._clients,
+            resume_session=resume_session,
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -2505,9 +2549,11 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = await run_sync_on_thread(
-                _resolve_databricks_claude_model, self._databricks_profile
-            )
+            if self._resolved_default_model is None:
+                self._resolved_default_model = await run_sync_on_thread(
+                    _resolve_databricks_claude_model, self._databricks_profile
+                )
+            model = self._resolved_default_model
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
@@ -2661,6 +2707,7 @@ class ClaudeSDKExecutor(Executor):
             options.can_use_tool = self._can_use_tool_gate
 
         self._install_subagent_router_hook(sdk, options, model)
+        self._install_framework_context_hook(sdk, options, session_key)
 
         # Log the full configuration for debugging
         logger.info(
@@ -2845,6 +2892,19 @@ class ClaudeSDKExecutor(Executor):
                 yield ExecutorError(message=f"LLM call denied by policy: {_deny_reason}")
                 return
 
+        notice_messages = messages
+        if resume_session:
+            notice_messages = []
+            for message in reversed(messages):
+                if message.get("role") != "user":
+                    break
+                notice_messages.insert(0, message)
+        self._pending_framework_context[session_key] = "\n\n".join(
+            notice
+            for message in notice_messages
+            if message.get("role") == "user"
+            for notice in framework_notices(message.get("content"))
+        )
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3224,6 +3284,7 @@ class ClaudeSDKExecutor(Executor):
             self._evict_client_on_cancel(session_key)
             raise
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
+            self._pending_framework_context.pop(session_key, None)
             self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)
             stderr_text = "\n".join(stderr_lines) if stderr_lines else "(no stderr captured)"
@@ -3255,6 +3316,8 @@ class ClaudeSDKExecutor(Executor):
                 else _usage_from_observed_call(last_call_usage, observed_model or model),
             )
             return
+        finally:
+            self._pending_framework_context.pop(session_key, None)
         # A turn can end without ``ResultMessage`` usage — the CLI can close
         # the stream early, fail terminally (auth failure, rejected retries),
         # or be cut short before its final usage is reported. In all of those

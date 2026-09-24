@@ -95,6 +95,7 @@ function renderViewer(
   opts: {
     viewMode?: "editor" | "preview" | "source" | "diff";
     truncated?: boolean;
+    position?: { line: number };
     onRequestEditMode?: () => void;
   } = {},
 ) {
@@ -104,6 +105,7 @@ function renderViewer(
   // a .md path to exercise the remaining Shiki path.
   return render(
     <CodeViewer
+      position={opts.position}
       conversationId="conv_1"
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
@@ -146,9 +148,127 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
 });
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe("CodeViewer find-in-file shortcut", () => {
+  function renderMarkdownViewer(
+    viewMode: "editor" | "source",
+    setSearchOpen: (open: boolean) => void,
+  ) {
+    render(
+      <>
+        <textarea aria-label="Prompt" />
+        <CodeViewer
+          conversationId="conv_1"
+          path="notes.md"
+          fileQuery={makeFileQuery("hello")}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen={true}
+          searchOpen={false}
+          setSearchOpen={setSearchOpen}
+          searchInputRef={noopRef}
+          viewMode={viewMode}
+        />
+      </>,
+    );
+  }
+
+  it("leaves Ctrl+F to a focused composer on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("editor", setSearchOpen);
+    const composer = screen.getByRole("textbox", { name: "Prompt" });
+    composer.focus();
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    composer.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(setSearchOpen).not.toHaveBeenCalled();
+    expect(composer).toHaveFocus();
+  });
+
+  it("opens Markdown find-in-file with Cmd+F on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("editor", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("leaves Ctrl+F to a focused composer beside Markdown source on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+    const composer = screen.getByRole("textbox", { name: "Prompt" });
+    composer.focus();
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    composer.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(setSearchOpen).not.toHaveBeenCalled();
+    expect(composer).toHaveFocus();
+  });
+
+  it("opens Markdown source find-in-file with Cmd+F on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("opens Markdown source find-in-file with Ctrl+F on Windows/Linux", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+});
 
 describe("CodeViewer Cmd+A select-all and copy interception", () => {
   it("copy after Cmd+A writes raw file content to clipboardData", () => {
@@ -316,12 +436,34 @@ describe("CodeViewer markdown preview comment hint", () => {
   });
 });
 
+// Streamdown renders a diagram only once an IntersectionObserver reports it
+// visible; report every observed element visible so diagrams render in jsdom.
+class VisibleIntersectionObserver {
+  private readonly callback: IntersectionObserverCallback;
+  constructor(callback: IntersectionObserverCallback) {
+    this.callback = callback;
+  }
+  observe(target: Element) {
+    this.callback(
+      [{ isIntersecting: true, target } as IntersectionObserverEntry],
+      this as unknown as IntersectionObserver,
+    );
+  }
+  unobserve() {}
+  disconnect() {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+}
+
 describe("CodeViewer markdown preview rendering (issue #970)", () => {
   // The read-only markdown preview is now the default surface for .md files, so
   // it must faithfully render the GFM feature set the issue calls out:
   // headings, lists, tables, code blocks, blockquotes, task lists, emoji.
   const renderMd = (content: string) =>
     renderViewer(content, true, "doc.md", { viewMode: "preview" });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   it("renders headings", () => {
     const { container } = renderMd("# Title\n\n## Subtitle");
@@ -352,6 +494,41 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(container.querySelector("pre")?.textContent).toBe("literal raw pre");
     expect(screen.queryByTestId("mermaid-preview")).toBeNull();
   });
+
+  it("explains an invalid Mermaid fence instead of dumping the parser error", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: proceed once; do not call Save\n    A=>B: again\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 3");
+    expect(card.querySelector("code")?.textContent).toBe(
+      "Note over A,B: proceed once; do not call Save",
+    );
+    expect(card.textContent).toContain("#59;");
+    // The raw parser dump is still there, folded away.
+    expect(card.querySelector("details pre")?.textContent).toContain("got 'NEWLINE'");
+  }, 15_000);
+
+  it("reports the author's line number past front matter and comments Mermaid strips", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\n---\ntitle: Flow\n---\n\n%% comment\nsequenceDiagram\n    A->>B: hi\n    Note over A,B once twice\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 8");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B once twice");
+  }, 15_000);
+
+  it("maps the line by position when front matter repeats the diagram text", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\n---\ntitle: |\n  sequenceDiagram\n  Note over A,B once twice\n---\nsequenceDiagram\n  Note over A,B once twice\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 7");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B once twice");
+  }, 15_000);
 
   it("renders Mermaid fences as diagrams instead of plain code", async () => {
     const { container } = renderMd("```mermaid\nflowchart LR\n  A --> B\n```");
@@ -773,3 +950,37 @@ describe("CodeViewer .ipynb routing", () => {
     expect(screen.getByText(/truncated/i)).toBeDefined();
   });
 });
+
+describe("source line navigation", () => {
+  it("centers and highlights the requested Markdown source line", () => {
+    const scroll = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      renderViewer("first\nsecond\nthird", true, "notes.md", { position: { line: 2 } });
+      const line = screen.getByText("second").closest("[data-line]")?.parentElement?.parentElement;
+      expect(scroll).toHaveBeenCalledWith({ block: "center" });
+      expect(scroll.mock.instances.at(-1)).toBe(line);
+      expect(line).toHaveClass("bg-yellow-200/40");
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  });
+});
+
+it.each([true, false])(
+  "clamps Markdown citations to the last loaded line (truncated=%s)",
+  (truncated) => {
+    const scroll = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      renderViewer("first\nlast", true, "notes.md", { truncated, position: { line: 5000 } });
+      const last = screen.getByText("last").closest("[data-line]")?.parentElement?.parentElement;
+      expect(scroll.mock.instances.at(-1)).toBe(last);
+      expect(last).toHaveClass("bg-yellow-200/40");
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  },
+);

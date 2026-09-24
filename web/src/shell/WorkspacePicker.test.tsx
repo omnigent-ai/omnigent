@@ -29,6 +29,11 @@ import {
   type HostFilesystemEntry,
 } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
+import {
+  WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
+  WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
+} from "./WorktreeRadioRow";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -37,7 +42,8 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // is open, so the default is harmless for the other suites.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
-vi.mock("@/hooks/useHostWorktrees", () => ({
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
   useHostWorktrees: vi.fn(() => ({
     data: [],
     isFetching: false,
@@ -711,46 +717,167 @@ describe("WorkspacePicker modal actions", () => {
     expect(screen.getByTestId("workspace-picker-entry-src")).not.toBeDisabled();
   });
 
-  it("renders breadcrumb chrome and linked worktrees in the full modal", () => {
+  it.each([undefined, null, "other", "github"] as const)(
+    "selects linked worktrees regardless of provider metadata (%s)",
+    (remoteProvider) => {
+      useHostWorktreesMock.mockReturnValue({
+        data: [
+          {
+            path: "/Users/corey/repo",
+            branch: "main",
+            is_main: true,
+            detached: false,
+            ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
+            updated_at: 1_700_000_000,
+          },
+          {
+            path: "/Users/corey/worktrees/feature-layout",
+            branch: "feature/layout",
+            is_main: false,
+            detached: false,
+            ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
+            updated_at: 1_700_000_000,
+          },
+        ],
+        isFetching: false,
+        isPlaceholderData: false,
+        error: null,
+      } as unknown as ReturnType<typeof useHostWorktrees>);
+      const onNavigate = vi.fn();
+      const onSelect = vi.fn();
+
+      render(
+        <WorkspacePicker
+          hostId="host_1"
+          initialPath="/Users/corey/repo"
+          onSelect={onSelect}
+          onNavigate={onNavigate}
+        />,
+      );
+
+      expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toContain("repo");
+      expect(screen.getByRole("complementary", { name: "Worktrees" })).toBeInTheDocument();
+      expect(screen.getByText("Don't use")).toBeInTheDocument();
+      expect(screen.getByText("feature-layout")).toBeInTheDocument();
+      expect(screen.queryByText("main")).toBeNull();
+
+      expect(screen.getByTestId("workspace-picker")).toHaveClass(
+        "h-[min(520px,calc(100dvh-4rem))]",
+        "w-[min(800px,calc(100vw-2rem))]",
+        "rounded-[20px]",
+      );
+      expect(screen.getByTestId("workspace-picker-body")).toHaveClass(
+        "md:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]",
+      );
+      const currentFolderRow = screen.getByTestId("workspace-picker-current-folder");
+      const linkedWorktreeRow = screen.getByTestId(
+        "workspace-picker-worktree-/Users/corey/worktrees/feature-layout",
+      );
+      const spaciousRowClasses = WORKTREE_RADIO_SPACIOUS_ROW_CLASS.split(" ");
+      const spaciousInputClasses = WORKTREE_RADIO_SPACIOUS_INPUT_CLASS.split(" ");
+      expect(currentFolderRow).toHaveClass(...spaciousRowClasses);
+      expect(linkedWorktreeRow).toHaveClass(...spaciousRowClasses);
+      expect(screen.getByRole("radio", { name: "Don't use" })).toHaveClass(...spaciousInputClasses);
+      expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toHaveClass(
+        ...spaciousInputClasses,
+      );
+      expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass(
+        "min-h-[27px]",
+        "px-2",
+        "py-[3px]",
+      );
+      expect(screen.getByTestId("workspace-picker-select")).toHaveClass(
+        "h-7",
+        "px-3",
+        "font-normal",
+      );
+
+      fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
+      expect(
+        screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
+      ).toHaveClass("bg-muted");
+      expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
+      fireEvent.click(screen.getByRole("button", { name: "Use this folder" }));
+      expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
+      expect(onSelect).toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
+    },
+  );
+
+  it("keeps cached verified worktrees and selection while a nested path query is disabled", () => {
+    useHostFilesystemMock.mockImplementation((_host, path) =>
+      path === "/Users/corey/repo/src"
+        ? result({
+            data: {
+              entries: [dir("src", "/Users/corey/repo/src")],
+              truncated: false,
+            },
+            isLoading: false,
+            isFetching: true,
+            isPlaceholderData: true,
+            error: null,
+          })
+        : result({
+            data: {
+              entries: [dir("src", "/Users/corey/repo/src")],
+              truncated: false,
+            },
+            isLoading: false,
+            isPlaceholderData: false,
+            error: null,
+          }),
+    );
+    useHostWorktreesMock.mockImplementation(
+      (_host, path) =>
+        (path === null
+          ? {
+              data: undefined,
+              isFetching: false,
+              isPlaceholderData: false,
+              error: null,
+            }
+          : {
+              data: [
+                {
+                  path: "/Users/corey/repo",
+                  branch: "main",
+                  is_main: true,
+                  detached: false,
+                },
+                {
+                  path: "/Users/corey/worktrees/feature-layout",
+                  branch: "feature/layout",
+                  is_main: false,
+                  detached: false,
+                },
+              ],
+              isFetching: false,
+              isPlaceholderData: false,
+              error: null,
+            }) as ReturnType<typeof useHostWorktrees>,
+    );
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />);
+
+    expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible();
+    const worktreeRadio = screen.getByRole("radio", { name: "Use worktree feature-layout" });
+    fireEvent.click(worktreeRadio);
+    expect(worktreeRadio).toBeChecked();
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
+    expect(useHostWorktreesMock).toHaveBeenLastCalledWith("host_1", null);
+    expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible();
+    expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toBeChecked();
+  });
+
+  it("hides the worktree panel for a non-Git directory", () => {
     useHostWorktreesMock.mockReturnValue({
-      data: [
-        {
-          path: "/Users/corey/repo",
-          branch: "main",
-          is_main: true,
-          detached: false,
-        },
-        {
-          path: "/Users/corey/worktrees/feature-layout",
-          branch: "feature/layout",
-          is_main: false,
-          detached: false,
-        },
-      ],
+      data: [],
       isFetching: false,
       isPlaceholderData: false,
       error: null,
     } as unknown as ReturnType<typeof useHostWorktrees>);
-    const onNavigate = vi.fn();
 
-    render(
-      <WorkspacePicker
-        hostId="host_1"
-        initialPath="/Users/corey/repo"
-        onSelect={vi.fn()}
-        onNavigate={onNavigate}
-      />,
-    );
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />);
 
-    expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toContain("repo");
-    expect(screen.getByRole("complementary", { name: "Worktrees" })).toBeInTheDocument();
-    expect(screen.getByText("feature/layout")).toBeInTheDocument();
-    expect(screen.queryByText("main")).toBeNull();
-
-    fireEvent.click(
-      screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
-    );
-    expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/worktrees/feature-layout");
+    expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
   });
 
   it("queries linked worktrees for a Windows path in the full modal", () => {
@@ -771,7 +898,7 @@ describe("WorkspacePicker modal actions", () => {
     expect(useHostWorktreesMock).toHaveBeenCalledWith("host_1", windowsPath);
   });
 
-  it("keeps compact callers single-pane and uses viewport-safe modal height", () => {
+  it("keeps compact callers single-pane and uses the fixed viewport-safe modal frame", () => {
     const { rerender } = render(
       <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onNavigate={vi.fn()} />,
     );
@@ -783,8 +910,84 @@ describe("WorkspacePicker modal actions", () => {
       <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />,
     );
     const modalClass = screen.getByTestId("workspace-picker").className;
-    expect(modalClass).toContain("calc(100dvh-6rem)");
+    expect(modalClass).toContain("h-[min(520px,calc(100dvh-4rem))]");
+    expect(modalClass).toContain("w-[min(800px,calc(100vw-2rem))]");
     expect(modalClass).not.toContain("min-h-80");
+  });
+
+  it("keeps full-dialog geometry invariant as worktree states change", async () => {
+    const fullPicker = () => screen.getByTestId("workspace-picker");
+    const header = () => screen.getByTestId("workspace-picker-header");
+    const footer = () => screen.getByTestId("workspace-picker-footer");
+    const frameClasses = ["h-[min(520px,calc(100dvh-4rem))]", "w-[min(800px,calc(100vw-2rem))]"];
+    const expectFixedFrame = (expectedClassName: string) => {
+      expect(fullPicker().className).toBe(expectedClassName);
+      for (const className of frameClasses) expect(fullPicker().className).toContain(className);
+      expect(header().className).toContain("min-h-12");
+      expect(footer().className).toContain("min-h-16");
+    };
+
+    useHostWorktreesMock.mockReturnValue({
+      data: [],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    const { rerender } = render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    const expectedClassName = fullPicker().className;
+    expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
+    expectFixedFrame(expectedClassName);
+
+    useHostWorktreesMock.mockReturnValue({
+      data: undefined,
+      isFetching: true,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    rerender(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    expectFixedFrame(expectedClassName);
+
+    useHostWorktreesMock.mockReturnValue({
+      data: [
+        { path: "/Users/corey/repo", branch: "main", is_main: true, detached: false },
+        {
+          path: "/Users/corey/worktrees/feature-layout",
+          branch: "feature/layout",
+          is_main: false,
+          detached: false,
+        },
+      ],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    rerender(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible());
+    expectFixedFrame(expectedClassName);
+
+    fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
+    expectFixedFrame(expectedClassName);
   });
 });
 

@@ -12,10 +12,9 @@ posts one, the SPA renders the card, and the test drives the controls. Unlike
 endpoint returns the elicitation id immediately rather than parking, which is
 how the runner's own callback uses it.
 
-The binary counterpart is ``test_approval_card.py``, which drives a real
-consent prompt, and the keyboard half of the story is ``test_approve_hotkey.py``:
-a prompt asking for fields must not be acceptable from the keyboard, since a
-keystroke would send the server none of what it asked for.
+The full-stack case keeps one representative server-to-browser form journey.
+Fast form and hotkey suites own schema render variants, bare consent, and the
+rule that a keyboard shortcut cannot accept a prompt that still needs fields.
 """
 
 from __future__ import annotations
@@ -38,9 +37,6 @@ _RENDER_TIMEOUT_MS = 15_000
 # Loading the conversation is slower than rendering a card in it, and slower
 # again when the whole directory runs at once, so it gets its own budget.
 _LOAD_TIMEOUT_MS = 60_000
-# A wrong accept has to travel keydown -> handler -> POST -> server state, so
-# too short a window here reads as "nothing happened" on a loaded shard.
-_NON_EVENT_MS = 5_000
 # The composer's placeholder changes while a prompt is pending; its accessible
 # name does not, which is what makes it usable as a "transcript is up" signal.
 _COMPOSER = "Message the agent"
@@ -172,82 +168,4 @@ def test_a_schema_that_names_fields_renders_a_form_and_submits(
 
     responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
     expect(responded).to_be_visible(timeout=_RENDER_TIMEOUT_MS)
-    _wait_for(lambda: not _parked(base_url, session_id, eid))
-
-
-@pytest.mark.timeout(180)
-def test_a_consent_prompt_keeps_its_buttons(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """A schema naming no fields is a yes/no question, and stays one.
-
-    A policy ASK carries no properties. Rendering an empty form for it would
-    replace a working control with an unusable one. This one passes against the
-    pre-change UI as well — it guards the path this change must not touch,
-    rather than proving the change.
-    """
-    base_url, session_id = seeded_session
-
-    eid = _raise_elicitation(base_url, session_id, {"type": "object"})
-    _wait_for_parked(base_url, session_id, eid)
-    _open_session(page, base_url, session_id)
-
-    card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
-    expect(card).to_be_visible(timeout=_RENDER_TIMEOUT_MS)
-    expect(card.locator(_FORM)).to_have_count(0)
-    expect(card.get_by_role("button", name="Approve")).to_be_visible()
-    reject = card.get_by_role("button", name="Reject")
-    expect(reject).to_be_visible()
-
-    # Answer it rather than leaving it parked for whatever runs next.
-    reject.click()
-    _wait_for(lambda: not _parked(base_url, session_id, eid))
-
-
-@pytest.mark.timeout(180)
-def test_the_keyboard_cannot_accept_a_prompt_that_asks_for_fields(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """Cmd/Ctrl+Enter must not walk around the disabled Submit.
-
-    The hotkey accepts a pending prompt with no content. That is right for a
-    yes/no gate and wrong here: the server asked for values, and accepting from
-    the keyboard would send it none of them.
-
-    No wait proves a keystroke did nothing, so the same test goes on to answer
-    the form. Reaching ``responded`` that way is the control: the page was live
-    and taking input all along, so the earlier stillness was the guard working
-    rather than a keystroke that never landed.
-    """
-    base_url, session_id = seeded_session
-
-    eid = _raise_elicitation(base_url, session_id, _SCHEMA)
-    _wait_for_parked(base_url, session_id, eid)
-    _open_session(page, base_url, session_id)
-
-    card = (
-        page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
-        .filter(has=page.locator(_FORM))
-        .first
-    )
-    expect(card).to_be_visible(timeout=_RENDER_TIMEOUT_MS)
-    form = card.locator(_FORM)
-
-    page.keyboard.press("Control+Enter")
-    page.wait_for_timeout(_NON_EVENT_MS)
-
-    # Still pending, on the card and on the server, and still refusing a submit
-    # it has no values for.
-    expect(card).to_be_visible()
-    expect(form.locator(_SUBMIT)).to_be_disabled()
-    assert _parked(base_url, session_id, eid), "the keystroke accepted it"
-
-    form.locator(f'{_FIELD.format("branch")} input[type="text"]').fill("release/2.4")
-    form.locator(f"{_FIELD.format('channel')} select").select_option("stable")
-    form.locator(_SUBMIT).click()
-    expect(page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first).to_be_visible(
-        timeout=_RENDER_TIMEOUT_MS
-    )
     _wait_for(lambda: not _parked(base_url, session_id, eid))

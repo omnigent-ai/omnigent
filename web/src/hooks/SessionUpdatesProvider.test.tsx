@@ -8,7 +8,7 @@
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
-import type { ReactNode } from "react";
+import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -22,19 +22,33 @@ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
 const setWatched = vi.fn();
+const start = vi.fn();
 const subscribe = vi.fn((_fn: () => void) => () => {});
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: {
-    start: vi.fn(),
+    start: (...args: unknown[]) => start(...args),
     stop: vi.fn(),
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
   },
 }));
 
+import { SidebarDataContext, SidebarDataProvider, useSidebarView } from "./useSidebarData";
+import { useCanEdit } from "./usePermissions";
+import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
+
+type SidebarDataValue = NonNullable<ContextType<typeof SidebarDataContext>>;
+const identityPendingSidebarData = {
+  identityReady: false,
+  watchedIds: ["conv_a"],
+} as unknown as SidebarDataValue;
+const identityReadySidebarData = {
+  ...identityPendingSidebarData,
+  identityReady: true,
+};
 
 function conv(id: string): Conversation {
   return {
@@ -94,6 +108,7 @@ function lastWatched(): string[] {
 
 beforeEach(() => {
   setWatched.mockClear();
+  start.mockClear();
   subscribe.mockClear();
 });
 
@@ -103,6 +118,33 @@ afterEach(() => {
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
+  it("waits for sidebar identity before starting session updates", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+
+    const { rerender } = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityPendingSidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(start).not.toHaveBeenCalled();
+
+    rerender(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityReadySidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(start).toHaveBeenCalledOnce();
+  });
+
   it("watches the cached sidebar ids when no session is open", () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_a", "conv_b"]);
@@ -550,4 +592,77 @@ describe("SessionUpdatesProvider projects_changed frames", () => {
       [{ queryKey: ["project-order"] }],
     ]);
   });
+});
+
+it("updates pending counts on a pinned row outside the scope windows", () => {
+  const client = new QueryClient();
+  client.setQueryData(["pinned-conversations"], {
+    conversations: [
+      { ...conv("old-pin"), labels: { "omnigent.pinned": "123" }, pending_elicitations_count: 0 },
+    ],
+    filterHonored: true,
+  });
+  renderProvider(client, ["/"]);
+  act(() =>
+    frameHandler()({
+      type: "changed",
+      items: [{ ...wireItem("old-pin", 2, 100), pending_elicitations_count: 3 }],
+    }),
+  );
+  const data = client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"]);
+  expect(data?.conversations[0]).toMatchObject({
+    pending_elicitations_count: 3,
+    comments_count: 2,
+    labels: { "omnigent.pinned": "123" },
+  });
+});
+
+it("keeps a directly opened shared session watched and permission-aware with the Shared list inactive", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const mine = conv("mine");
+  const sharedKey = ["conversations", "", false, null, "shared"];
+  client.setQueryData(sharedKey, {
+    pages: [{ data: [{ ...conv("retained-shared"), permission_level: 1 }] }],
+    pageParams: [undefined],
+  });
+  client.setQueryData(["session", "direct-shared"], { id: "direct-shared", permissionLevel: 1 });
+  const fetch = vi.fn(async (url: string) => ({
+    ok: true,
+    json: async () => ({ data: url.includes("pinned=true") ? [] : [mine], has_more: false }),
+  }));
+  vi.stubGlobal("fetch", fetch);
+  function Selection() {
+    useSidebarView("mine");
+    return null;
+  }
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/c/direct-shared"]}>
+        <SidebarDataProvider
+          config={{ ...sidebarConfig, inboxIncludesShared: false, pinsIncludeShared: false }}
+        >
+          <Selection />
+          <SessionUpdatesProvider>{children}</SessionUpdatesProvider>
+        </SidebarDataProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+  try {
+    const { result, unmount } = renderHook(() => useCanEdit("direct-shared"), { wrapper });
+    await waitFor(() => expect(lastWatched()).toEqual(["direct-shared", "mine"]));
+    expect(result.current).toBe(false);
+    act(() =>
+      client.setQueryData(["session", "direct-shared"], {
+        id: "direct-shared",
+        permissionLevel: 2,
+      }),
+    );
+    await waitFor(() => expect(result.current).toBe(true));
+    expect(fetch.mock.calls.some(([url]) => url.includes("visibility=shared"))).toBe(false);
+    expect(client.getQueryData(sharedKey)).toBeDefined();
+    unmount();
+  } finally {
+    client.clear();
+    vi.unstubAllGlobals();
+  }
 });

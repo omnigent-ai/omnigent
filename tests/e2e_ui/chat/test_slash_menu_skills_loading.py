@@ -144,8 +144,10 @@ def test_codex_skill_menu_completes_and_sends_native_skill(
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill(trigger)
-    expect(page.get_by_test_id("slash-menu-item-help")).to_have_text("/help")
-    expect(page.get_by_test_id("slash-menu-item-code-review")).to_have_text("$code-review")
+    # Rows show the command name plus its description inline (grouped-tray
+    # style), so assert the name is present rather than an exact match.
+    expect(page.get_by_test_id("slash-menu-item-help")).to_contain_text("/help")
+    expect(page.get_by_test_id("slash-menu-item-code-review")).to_contain_text("$code-review")
 
     composer.fill(f"{trigger}review")
     composer.press("Tab")
@@ -220,12 +222,14 @@ def test_new_session_menu_uses_the_selected_agents_effective_catalog(
 
     def session_agents(route: Route) -> None:
         # Session-scoped agents must not replace the fixture's selected agent.
-        if parse_qs(urlparse(route.request.url).query).get("kind") == ["any"]:
+        query = parse_qs(urlparse(route.request.url).query)
+        if query.get("visibility") == ["mine"] and "pinned" not in query:
             route.fulfill(json={"data": [], "has_more": False})
         else:
             route.fallback()
 
     page.route("**/v1/sessions?*", session_agents)
+    page.route_web_socket("**/v1/sessions/updates*", lambda _: None)
     page.route(
         "**/v1/hosts",
         lambda route: route.fulfill(
@@ -261,6 +265,10 @@ def test_new_session_menu_uses_the_selected_agents_effective_catalog(
         "**/v1/hosts/preview-host/harnesses/*/model-options*",
         lambda route: route.fulfill(json={"models": []}),
     )
+    page.route(
+        "**/v1/hosts/preview-host/worktrees?*",
+        lambda route: route.fulfill(json={"data": []}),
+    )
 
     def discover(route: Route) -> None:
         if "host_id" in parse_qs(urlparse(route.request.url).query):
@@ -291,7 +299,7 @@ def test_new_session_menu_uses_the_selected_agents_effective_catalog(
         "agent_id": ["preview-agent"],
     }
     pending[0].fulfill(json={"skills": [{"name": "allowed", "description": "Permitted skill"}]})
-    expect(page.get_by_test_id("slash-menu-item-allowed")).to_have_text(f"{prefix}allowed")
+    expect(page.get_by_test_id("slash-menu-item-allowed")).to_contain_text(f"{prefix}allowed")
     composer.fill("/")
     expect(page.get_by_test_id("slash-menu-item-obsolete")).not_to_be_visible()
     composer.fill("/allow")

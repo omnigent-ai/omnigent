@@ -14,11 +14,15 @@
 //  12. Comments are marked seen (inbox-clearing registry) only while the
 //      comments panel is open — never from merely opening the file.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useMemo } from "react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
+import { isFilePositionPending } from "./filePositionState";
+
+const codeViewerRenders = vi.hoisted(() => vi.fn());
 
 // ── Mock heavy child components ───────────────────────────────────────────────
 
@@ -28,22 +32,32 @@ vi.mock("./CodeViewer", () => ({
   // The "make dirty" button lets a test drive the editor's unsaved-edits signal
   // (onDirtyChange) so the mode-switch / navigation guard can be exercised.
   CodeViewer: ({
+    path,
+    position,
     viewMode,
     searchOpen,
     onDirtyChange,
   }: {
+    path: string;
+    position?: { line: number };
     viewMode: string;
     searchOpen?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
-  }) => (
-    <div
-      data-testid="code-viewer"
-      data-view-mode={viewMode}
-      data-search-open={String(!!searchOpen)}
-    >
-      <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
-    </div>
-  ),
+  }) => {
+    codeViewerRenders({ path, position });
+    return (
+      <div
+        data-testid="code-viewer"
+        data-view-mode={viewMode}
+        data-search-open={String(!!searchOpen)}
+      >
+        <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
+        {viewMode === "editor" && (
+          <textarea aria-label="Draft text" onChange={() => onDirtyChange?.(true)} />
+        )}
+      </div>
+    );
+  },
 }));
 
 vi.mock("./CommentsPanel", () => ({
@@ -84,16 +98,19 @@ vi.mock("./MonacoDiffViewer", () => ({
   // Surface the toggle-driven props as data attributes so tests can assert the
   // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
   MonacoDiffViewer: ({
+    position,
     wrapLines,
     hideWhitespace,
     searchOpen,
   }: {
+    position?: { line: number };
     wrapLines?: boolean;
     hideWhitespace?: boolean;
     searchOpen?: boolean;
   }) => (
     <div
       data-testid="diff-viewer"
+      data-line={position?.line}
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
       data-search-open={String(!!searchOpen)}
@@ -102,6 +119,10 @@ vi.mock("./MonacoDiffViewer", () => ({
 }));
 
 // ── Mock hooks ────────────────────────────────────────────────────────────────
+
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: vi.fn(() => false),
+}));
 
 vi.mock("@/hooks/useComments", () => ({
   useComments: vi.fn(),
@@ -159,11 +180,13 @@ vi.mock("@/store/chatStore", () => ({
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
+import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
@@ -201,6 +224,7 @@ function LocationDisplay() {
 }
 
 interface RenderProps {
+  position?: { line: number; column?: number };
   open?: boolean;
   path?: string;
   /**
@@ -225,6 +249,7 @@ interface RenderProps {
  * the current params after state changes.
  */
 function viewerTree({
+  position,
   open = false,
   path = "file1.py",
   initialSearch = "",
@@ -239,6 +264,7 @@ function viewerTree({
       <MemoryRouter initialEntries={[url]}>
         <LocationDisplay />
         <FileViewer
+          position={position}
           open={open}
           conversationId="conv_1"
           path={path}
@@ -264,6 +290,7 @@ beforeEach(() => {
   // localStorage. Clear it between tests so a preference written by one test
   // can't leak into another that asserts the hardcoded defaults.
   localStorage.clear();
+  vi.mocked(useIsMobileViewport).mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -562,6 +589,100 @@ describe("FileViewer prev/next navigation order", () => {
 });
 
 describe("FileViewer URL sync — diff param", () => {
+  it.each(
+    [false, true].flatMap((isMobile) =>
+      ["file1.py", "notes.md"].map((path) => ({ isMobile, path })),
+    ),
+  )(
+    "only the active viewer writes the $path URL through resizing (mobile=$isMobile)",
+    async ({ isMobile, path }) => {
+      await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+        () =>
+          ({
+            data: { available: true, data: [{ path, name: path, status: "modified", bytes: 10 }] },
+          }) as ReturnType<typeof useWorkspaceChangedFiles>,
+        async () => {
+          vi.mocked(useIsMobileViewport).mockReturnValue(isMobile);
+          useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+          const client = new QueryClient();
+          function Viewers() {
+            return (
+              <QueryClientProvider client={client}>
+                <MemoryRouter initialEntries={[`/?file=${path}`]}>
+                  <LocationDisplay />
+                  {(["desktop", "mobile"] as const).map((viewport) => (
+                    <div key={viewport} data-testid={viewport}>
+                      <FileViewer
+                        viewport={viewport}
+                        open
+                        path={path}
+                        conversationId="conv_1"
+                        onClose={vi.fn()}
+                      />
+                    </div>
+                  ))}
+                </MemoryRouter>
+              </QueryClientProvider>
+            );
+          }
+          const { rerender } = render(<Viewers />);
+          const first = within(screen.getByTestId(isMobile ? "mobile" : "desktop"));
+          const second = within(screen.getByTestId(isMobile ? "desktop" : "mobile"));
+          fireEvent.click(first.getByRole("button", { name: "Show diff" }));
+          expect(await first.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(second.queryByTestId("diff-viewer")).toBeNull();
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+
+          // Resizing transfers URL ownership without changing either viewer's mode.
+          vi.mocked(useIsMobileViewport).mockReturnValue(!isMobile);
+          rerender(<Viewers />);
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+          fireEvent.click(second.getByRole("button", { name: "Show diff" }));
+          expect(await second.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+          fireEvent.click(second.getByRole("button", { name: "Exit diff view" }));
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+          expect(first.getByTestId("diff-viewer")).toBeInTheDocument();
+
+          vi.mocked(useIsMobileViewport).mockReturnValue(isMobile);
+          rerender(<Viewers />);
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+          fireEvent.click(first.getByRole("button", { name: "Exit diff view" }));
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+        },
+      );
+    },
+  );
+
+  it("restores the active diff param after another navigation replaces the search params", async () => {
+    function FileNavigation() {
+      const [, setParams] = useSearchParams();
+      return (
+        <button type="button" onClick={() => setParams({ file: "file1.py", tab: "files" })}>
+          Open file citation
+        </button>
+      );
+    }
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/?file=file1.py&diff=1"]}>
+          <LocationDisplay />
+          <FileNavigation />
+          <FileViewer open conversationId="conv_1" path="file1.py" onClose={vi.fn()} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open file citation" }));
+
+    expect(screen.getByTestId("diff-viewer")).toBeInTheDocument();
+    expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=file1.py");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("tab=files");
+  });
+
   it("initializes diff view when URL contains ?diff=1 and the file is in the changed list", async () => {
     // file1.py is returned by the useWorkspaceChangedFiles mock → isDiffAvailable=true.
     // Starting with ?diff=1 means diffActive is initialized to true, so viewMode="diff".
@@ -1560,7 +1681,11 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
   // keybinding — the keybinding needs editor focus and doesn't fire inside the
   // managed same-root embed, so cmd+f silently did nothing there. These assert
   // that a Cmd/Ctrl+F flips the toggle FileViewer hands each surface.
+  let platform: string;
+
   beforeEach(() => {
+    platform = "MacIntel";
+    vi.spyOn(navigator, "platform", "get").mockImplementation(() => platform);
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
   });
 
@@ -1575,9 +1700,24 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
   });
 
   it("opens find on the code surface with Ctrl+F (Windows/Linux)", () => {
+    platform = "Linux x86_64";
     renderViewer({ open: true, path: "file1.py" });
     fireEvent.keyDown(window, { key: "f", ctrlKey: true });
     expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("does not intercept Ctrl+F on macOS", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(searchOpenOf("code-viewer")).toBe("false");
   });
 
   it("opens find in the diff view with Cmd+F", async () => {
@@ -1776,4 +1916,182 @@ describe("FileViewer 3D model files", () => {
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
   });
+});
+
+describe("file position navigation", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+  it("comment selection supersedes a citation, while a later citation is a fresh request", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const position = { line: 100 };
+    const { rerender } = renderViewer({ open: true, path: "file1.py", position });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    expect(isFilePositionPending(position)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(isFilePositionPending(position)).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Hide comments" }));
+    const next = { line: 100 };
+    rerender(viewerTree({ open: true, path: "file1.py", position: next }));
+    expect(isFilePositionPending(next)).toBe(true);
+  });
+
+  it("a linked comment supersedes a citation supplied alongside it", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const position = { line: 100 };
+    renderViewer({ open: true, path: "file1.py", position, initialSearch: "comment=c1" });
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
+    expect(isFilePositionPending(position)).toBe(false);
+  });
+  it("never passes the previous file's citation into the next file's first render", () => {
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "source",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    const { rerender } = renderViewer({ open: true, path: "file1.md", position: { line: 12 } });
+    codeViewerRenders.mockClear();
+    rerender(viewerTree({ open: true, path: "file2.md" }));
+    expect(codeViewerRenders).toHaveBeenCalled();
+    for (const [props] of codeViewerRenders.mock.calls) {
+      expect(props).toEqual({ path: "file2.md", position: undefined });
+    }
+  });
+
+  it("keeps a manually selected preview when the viewer remounts with the old citation", () => {
+    const props = { open: true, path: "file1.md", position: { line: 12 } };
+    const { unmount } = renderViewer(props);
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Preview/ }));
+    unmount();
+    renderViewer(props);
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "preview");
+  });
+
+  it("opens source instead of a preferred Markdown preview and allows switching back", () => {
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "preview",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    renderViewer({ open: true, path: "file1.md", position: { line: 12 } });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Preview/ }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "preview");
+  });
+
+  it.each(["file1.py", "file1.md"])(
+    "keeps diff mode for repeated citations to %s",
+    async (path) => {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [{ path, name: path, bytes: 10, modified_at: null, status: "modified" }],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      const { rerender } = renderViewer({
+        open: true,
+        path,
+        position: { line: 12 },
+        initialSearch: "diff=1",
+      });
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-line", "12");
+      expect(screen.queryByTestId("code-viewer")).toBeNull();
+      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+      rerender(viewerTree({ open: true, path, position: { line: 30 } }));
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-line", "30");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+    },
+  );
+
+  it("keeps normal view when a cited file has a diff available", () => {
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: {
+        available: true,
+        data: [
+          { path: "file1.py", name: "file1.py", bytes: 10, modified_at: null, status: "modified" },
+        ],
+      },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    renderViewer({ open: true, path: "file1.py", position: { line: 12 } });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+    expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=1");
+  });
+
+  it("confirms external navigation before applying it, and does not confirm twice", () => {
+    let guard: FileNavigationGuard | undefined;
+    const unregister = vi.fn();
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return unregister;
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "file1.md" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    const { unmount } = render(<GuardedViewer />);
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    const navigate = vi.fn();
+    act(() => guard!("file2.md", { line: 12 }, navigate));
+    expect(navigate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(draft).toHaveValue("Unsaved draft");
+
+    // Viewer-owned navigation may already have a guard when it reaches AppShell.
+    act(() => guard!("file2.md", { line: 12 }, () => guard!("file2.md", { line: 12 }, navigate)));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+    unmount();
+    expect(unregister).toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "keeps unsaved Markdown edits when a line navigation is cancelled (diff preference=%s)",
+    (diffActive) => {
+      writeFileViewPreferences({
+        diffActive,
+        diffLayout: "unified",
+        previewableViewMode: "editor",
+        hideWhitespace: false,
+        wrapLines: false,
+      });
+      const { rerender, unmount } = renderViewer({ open: true, path: "file1.md" });
+      const request = { line: 12 };
+      const draft = screen.getByRole("textbox", { name: "Draft text" });
+      fireEvent.change(draft, { target: { value: "Unsaved Markdown draft" } });
+      rerender(viewerTree({ open: true, path: "file1.md", position: request }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+      expect(screen.getByRole("textbox", { name: "Draft text" })).toBe(draft);
+      expect(draft).toHaveValue("Unsaved Markdown draft");
+      unmount();
+      renderViewer({ open: true, path: "file1.md", position: request });
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+    },
+  );
 });

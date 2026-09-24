@@ -154,6 +154,58 @@ def test_update_host_id_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     assert updated.host_id == _uid("host_xyz")
 
 
+def test_execution_target_managed_sandbox_round_trips(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A managed_sandbox task persists and reads back, and update can switch it."""
+    created = store.create(
+        scheduled_task_id=_uid("st_managed"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        execution_target="managed_sandbox",
+    )
+    assert created.execution_target == "managed_sandbox"
+    assert store.get(_uid("st_managed")).execution_target == "managed_sandbox"
+    # Switch back to connected_host via update.
+    switched = store.update(_uid("st_managed"), execution_target="connected_host")
+    assert switched is not None
+    assert switched.execution_target == "connected_host"
+
+
+def test_update_workspace_explicit_null_clears_it(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update(workspace=None)`` clears the workspace; omitting it leaves it.
+
+    Regression for the managed-switch round-trip: clearing a pinned workspace
+    must be possible so switching a task to managed execution (which unpins both
+    host and workspace) doesn't strand a workspace-without-host.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_ws"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        workspace="/repo",
+        host_id=_uid("h"),
+    )
+    # Omitting workspace leaves it unchanged.
+    unchanged = store.update(_uid("st_ws"), name="renamed")
+    assert unchanged is not None and unchanged.workspace == "/repo"
+    # Explicit None clears both host and workspace (the managed-switch shape).
+    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None)
+    assert cleared is not None
+    assert cleared.workspace is None
+    assert cleared.host_id is None
+
+
 def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     """Updating ``state`` to ``paused`` reads back ``paused``."""
     store.create(

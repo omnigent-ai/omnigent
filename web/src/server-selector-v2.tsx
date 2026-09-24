@@ -8,6 +8,7 @@
 import { type CSSProperties, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ServerSelectorV2, type ServerSelectorV2Setup } from "./pages/onboarding/ServerSelectorV2";
+import { maybeMockSetup } from "./pages/onboarding/mockSetup";
 import "./index.css";
 
 const DEFAULT_URL = "http://localhost:6767";
@@ -35,7 +36,18 @@ function setupBridge(): OmnigentSetup | undefined {
   return (window as unknown as { omnigentSetup?: OmnigentSetup }).omnigentSetup;
 }
 
+// Mock-or-real router: with `?mock=1` render the URL-param mock (dev only, see
+// mockSetup.ts), otherwise the real bridge-wired flow. Split so each branch's
+// hooks run unconditionally (rules of hooks).
 function SetupApp() {
+  const mock = maybeMockSetup(new URLSearchParams(window.location.search));
+  if (mock) {
+    return <ServerSelectorV2 setup={mock} />;
+  }
+  return <BridgeSetupApp />;
+}
+
+function BridgeSetupApp() {
   const params = new URLSearchParams(window.location.search);
   const failedUrl = params.get("url");
   const error = params.get("error") ?? undefined;

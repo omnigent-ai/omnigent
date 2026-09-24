@@ -51,32 +51,78 @@ final class ServerURLTests: XCTestCase {
   }
 }
 
-final class InWebViewAuthTests: XCTestCase {
-  func testDatabricksHostsUseInWebViewAuth() {
+final class ServerAuthenticationTests: XCTestCase {
+  func testClassifiesWorkspaceHosts() {
     for origin in [
       "https://databricks.com",
       "https://dbc-123.cloud.databricks.com",
       "https://azuredatabricks.net",
       "https://adb-123.azuredatabricks.net",
-      "https://databricksapps.com",
-      "https://my-app.aws.databricksapps.com",
       "https://DBC-123.CLOUD.DATABRICKS.COM",
+      "https://ADB-123.AZUREDATABRICKS.NET",
     ] {
-      XCTAssertTrue(usesInWebViewAuth(origin), origin)
+      XCTAssertEqual(ServerAuthentication(origin: origin), .databricksWorkspace, origin)
     }
   }
 
-  func testOtherHostsUseSystemBrowserAuth() {
+  func testClassifiesAppsSeparatelyFromWorkspaces() {
+    for origin in [
+      "https://databricksapps.com",
+      "https://my-app.aws.databricksapps.com",
+      "https://MY-APP.AZURE.DATABRICKSAPPS.COM",
+    ] {
+      XCTAssertEqual(ServerAuthentication(origin: origin), .databricksApp, origin)
+    }
+  }
+
+  func testOtherHostsAndLookalikesUseOIDC() {
     for origin in [
       "https://example.com",
+      "https://localhost:6767",
       "https://notdatabricks.com",
+      "https://notazuredatabricks.net",
+      "https://notdatabricksapps.com",
       "https://databricks.com.example.org",
+      "https://azuredatabricks.net.example.org",
       "https://databricksapps.com.example.org",
+      "https://databricks.com@example.org",
+      "https://example.org/databricks.com",
       "not a URL",
+      "",
     ] {
-      XCTAssertFalse(usesInWebViewAuth(origin), origin)
+      XCTAssertEqual(ServerAuthentication(origin: origin), .oidc, origin)
     }
-    XCTAssertFalse(usesInWebViewAuth(nil))
+    XCTAssertEqual(ServerAuthentication(origin: nil), .oidc)
+    XCTAssertEqual(ServerAuthentication(host: nil), .oidc)
+    XCTAssertEqual(ServerAuthentication(host: ""), .oidc)
+  }
+
+  func testClassificationDependsOnlyOnHost() {
+    for origin in [
+      "http://dbc-123.cloud.databricks.com",
+      "https://dbc-123.cloud.databricks.com:8443/omnigent?o=123#conversation",
+    ] {
+      XCTAssertEqual(ServerAuthentication(origin: origin), .databricksWorkspace, origin)
+    }
+    XCTAssertEqual(
+      ServerAuthentication(origin: "https://my-app.databricksapps.com:8443/c/abc"), .databricksApp)
+  }
+
+  func testHostAndOriginClassificationAgree() {
+    for host in [
+      "databricks.com", "DBC-123.CLOUD.DATABRICKS.COM", "adb-123.azuredatabricks.net",
+      "databricksapps.com", "MY-APP.AWS.DATABRICKSAPPS.COM", "example.org",
+      "notdatabricks.com", "azuredatabricks.net.example.org", "databricksapps.com.example.org",
+    ] {
+      XCTAssertEqual(
+        ServerAuthentication(host: host), ServerAuthentication(origin: "https://\(host)"), host)
+    }
+  }
+
+  func testOnlyAppsAuthenticationRemainsInline() {
+    XCTAssertFalse(ServerAuthentication.databricksWorkspace.usesInWebViewAuth)
+    XCTAssertTrue(ServerAuthentication.databricksApp.usesInWebViewAuth)
+    XCTAssertFalse(ServerAuthentication.oidc.usesInWebViewAuth)
   }
 }
 

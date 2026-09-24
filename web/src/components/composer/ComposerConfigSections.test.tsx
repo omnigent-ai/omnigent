@@ -8,8 +8,10 @@ afterEach(cleanup);
 // The checkbox rows need a menu context; render the sections inside an open
 // menu, the same way both harness pickers mount them.
 function renderSections(props: {
+  sdk?: ComposerConfigSection;
   models?: ComposerConfigSection;
   efforts?: ComposerConfigSection;
+  extra?: ComposerConfigSection[];
 }) {
   return render(
     <DropdownMenu open>
@@ -43,6 +45,26 @@ const modelsSection = (testId: string): ComposerConfigSection => ({
 });
 
 describe("ComposerConfigSections", () => {
+  it("renders Agent SDK before Models with separators between sections", () => {
+    renderSections({
+      sdk: {
+        testId: "sdks",
+        header: "Agent SDK",
+        choices: [
+          { key: "claude", label: "Claude SDK", checked: true, onSelect: vi.fn() },
+          { key: "codex", label: "Codex", checked: false, onSelect: vi.fn() },
+        ],
+      },
+      models: modelsSection("models"),
+    });
+
+    const sdk = screen.getByTestId("sdks");
+    const models = screen.getByTestId("models");
+    expect(within(sdk).getByText("Agent SDK")).toBeInTheDocument();
+    expect(sdk.compareDocumentPosition(models) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByRole("separator")).toHaveLength(1);
+  });
+
   it("renders Models and Effort sections with headers, testids, and one row per choice", () => {
     renderSections({
       models: modelsSection("models"),
@@ -90,6 +112,28 @@ describe("ComposerConfigSections", () => {
     });
     fireEvent.click(screen.getByTestId("models-opus"));
     expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders extra sections after Models/Effort, each with its own header and separator-led row", () => {
+    renderSections({
+      models: modelsSection("models"),
+      extra: [
+        {
+          testId: "fusion-leads",
+          header: "Lead",
+          choices: [{ key: "fable", label: "Claude Fable 5.1", checked: true, onSelect: vi.fn() }],
+        },
+        {
+          testId: "fusion-sidekicks",
+          header: "Sidekick",
+          choices: [{ key: "swe", label: "SWE-2 Medium", checked: true, onSelect: vi.fn() }],
+        },
+      ],
+    });
+    expect(within(screen.getByTestId("fusion-leads")).getByText("Lead")).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("fusion-sidekicks")).getByText("SWE-2 Medium"),
+    ).toBeInTheDocument();
   });
 
   it("omits a section whose prop is undefined and renders a static (no-onSelect) row disabled", () => {

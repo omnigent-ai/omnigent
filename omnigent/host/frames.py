@@ -23,8 +23,10 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 from os import PathLike
+from typing import Any
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
@@ -38,6 +40,16 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # does not exist on the host (e.g. the worktree was deleted). Shared by the
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+
+# Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
+# is present only in builds that have the feature, so the server gates on
+# presence — no host-version table to maintain, and a build that lacks the
+# feature simply omits the token (older hosts send no ``capabilities`` at all).
+# The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
+CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+
+# Every capability THIS build supports; reported verbatim in the hello frame.
+HOST_CAPABILITIES: list[str] = [CAP_CODEX_SIDE_CHAT, CAP_FILESYSTEM_ATTACHMENTS]
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -160,6 +172,10 @@ class HostHelloFrame:
     :param interactive_shells: Ordered interactive shells installed on this
         machine, with its login shell first. ``None`` means an older host did
         not report an inventory.
+    :param capabilities: Optional build-capability tokens this host advertises
+        (see ``HOST_CAPABILITIES`` / ``CAP_*``). Empty from an older host that
+        predates a given capability, so the server treats absence as "not
+        supported" without a version check.
     """
 
     version: str
@@ -171,6 +187,7 @@ class HostHelloFrame:
     interactive_shells: list[str] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    capabilities: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -233,6 +250,7 @@ class HostLaunchRunnerFrame:
     workspace: str
     session_id: str | None = None
     harness: str | None = None
+    inference_config: dict[str, Any] | None = None
 
 
 @dataclass
@@ -627,7 +645,9 @@ class HostListWorktreesResultFrame:
     :param status: ``"ok"`` or ``"failed"``.
     :param worktrees: One dict per worktree with keys ``path`` (str),
         ``branch`` (str | None), ``is_main`` (bool), ``detached``
-        (bool), main first. ``None`` on failure.
+        (bool), and optional ``updated_at`` (Unix epoch seconds or null),
+        main first.
+        Older hosts omit the optional metadata. ``None`` on failure.
     :param error: Error message when ``status`` is ``"failed"``, e.g.
         ``"not a git repository"``. ``None`` on success.
     """
@@ -1060,12 +1080,16 @@ class HostImportLocalDoneFrame:
     :param failed: Count of enumerated sessions the host could not read/parse
         (skipped, no session frame sent). The server folds these into its own
         failed tally so the reported counts account for every target.
+    :param failures: Per-session detail for the sessions counted in ``failed``,
+        each ``{"external_session_id", "source", "reason"}``, so the UI can name
+        each failed session and why. Empty from older hosts (only ``failed``).
     """
 
     request_id: str
     status: str
     error: str | None = None
     failed: int = 0
+    failures: list[_JsonObject] = field(default_factory=list)
 
 
 HostFrame = (
@@ -1160,6 +1184,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "interactive_shells": frame.interactive_shells,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "capabilities": list(frame.capabilities),
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1188,6 +1213,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
+                "inference_config": frame.inference_config,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1551,6 +1577,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "error": frame.error,
                 "failed": frame.failed,
+                "failures": frame.failures,
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
@@ -1735,6 +1762,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         ),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        capabilities=_optional_str_list(msg, "capabilities"),
     )
 
 
@@ -1762,12 +1790,16 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     :param msg: Decoded frame object.
     :returns: Typed launch-runner frame.
     """
+    inference_config = msg.get("inference_config")
+    if inference_config is not None and not isinstance(inference_config, dict):
+        raise ValueError("inference_config must be an object or null")
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
+        inference_config=inference_config,
     )
 
 
@@ -2337,12 +2369,19 @@ def _decode_import_local_session(msg: _JsonObject) -> HostImportLocalSessionFram
 
 def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
     """Decode a host.import_local_done frame."""
+    raw_failures = msg.get("failures")
+    failures = (
+        [entry for entry in raw_failures if isinstance(entry, dict)]
+        if isinstance(raw_failures, list)
+        else []
+    )
     return HostImportLocalDoneFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         error=_optional_nullable_str(msg, "error"),
         # Absent on older hosts; default to 0 so decode stays backward-compatible.
         failed=raw_failed if isinstance(raw_failed := msg.get("failed"), int) else 0,
+        failures=failures,
     )
 
 

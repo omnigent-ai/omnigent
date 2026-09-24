@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -201,6 +202,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":
         return _main_route_turn(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "framework-context":
+        return _main_framework_context(raw_argv[1:])
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -1097,6 +1100,30 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bridge-dir", required=True)
     parser.add_argument("--conversation-url")
     return parser.parse_args(argv)
+
+
+def _main_framework_context(argv: list[str]) -> int:
+    """Add pending framework context to one submitted prompt."""
+    args = _parse_evaluate_policy_args(argv)
+    sys.stdin.read()
+    path = Path(args.bridge_dir) / CLAUDE_FRAMEWORK_CONTEXT_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+        path.unlink(missing_ok=True)
+    except OSError:
+        return 0
+    if text:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": text,
+                    }
+                }
+            )
+        )
+    return 0
 
 
 def _parse_evaluate_policy_args(argv: list[str]) -> argparse.Namespace:

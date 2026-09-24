@@ -111,11 +111,11 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 
 
-# "quiesced": the claude-native sub-agent transcript-quiescence badge — a
-# UI signal only, never a terminal edge (the runner must not deliver a
-# parent-inbox completion from it).
+_SUBAGENT_STATUS_TYPE: str = "subagent.status"
+
+
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed", "quiesced"}
+    {"idle", "running", "waiting", "failed"}
 )
 
 
@@ -288,6 +288,9 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 
 
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
+
+
+_LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: str = "omnigent.last_task_error_agent_name"
 
 
 # Optional structured failure fields (present when the runner classified the
@@ -483,6 +486,20 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
 
 
+# How long an archive defers tearing down the session's runner, giving an Undo's
+# unarchive time to land first. When the teardown fires it re-reads the persisted
+# archived flag and skips if the session was unarchived, so any Undo whose
+# unarchive PERSISTS before this fires keeps the runner — across replicas, since
+# the guard is the shared row, not an in-memory timer.
+#
+# MUST stay above the client Undo pill's total lifetime, which the pill caps at
+# ARCHIVE_UNDO_MAX_LIFETIME_MS (5s) in web/src/shell/archiveUndoToast.tsx. The
+# pill merges successive archives, so without that cap it could linger past this
+# grace and offer an Undo AFTER the teardown already ran — and the re-check
+# can't un-stop a runner. The cap keeps the pill's Undo window inside this grace.
+_ARCHIVE_STOP_UNDO_GRACE_S = 8.0
+
+
 _HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
 
 
@@ -522,6 +539,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
+    _SUBAGENT_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MCP_STARTUP_TYPE,
@@ -549,6 +567,33 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+@dataclass
+class _RunnerStatusProbeBackoff:
+    """
+    Skip window for a session's runner status probe after slow probes.
+
+    :param skip_until: Monotonic time before which the probe is skipped.
+    :param failures: Consecutive slow or failed probes; sets the next window.
+    :param runner_id: Runner the slow probes were against, e.g.
+        ``"runner_0123456789abcdef"``; a rebind to another runner discards
+        the window.
+    """
+
+    skip_until: float
+    failures: int
+    runner_id: str | None
+
+
+_runner_status_probe_backoff: WorkspaceScopedCache[str, _RunnerStatusProbeBackoff] = (
+    WorkspaceScopedCache()
+)
+
+# The one runner status probe in flight per session; concurrent snapshots await it.
+_runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None]] = (
+    WorkspaceScopedCache()
+)
 
 
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
@@ -1086,6 +1131,7 @@ __all__ = [
     "_STOP_RUNNER_RESULT_TIMEOUT_S",
     "_STOP_SESSION_TYPE",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
+    "_SUBAGENT_STATUS_TYPE",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
@@ -1094,6 +1140,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
@@ -1116,6 +1163,8 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
+    "_runner_status_probe_backoff",
+    "_runner_status_probe_inflight",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

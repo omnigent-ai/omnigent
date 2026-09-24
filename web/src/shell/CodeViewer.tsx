@@ -10,6 +10,8 @@
 //   Existing comments highlight the lines they span. Clicking inside a
 //   highlighted range navigates to that comment in CommentsPanel.
 
+import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import { createPortal } from "react-dom";
 import {
   isValidElement,
@@ -77,6 +79,7 @@ import { PreviewCommentBanner } from "./PreviewCommentBanner";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
@@ -394,6 +397,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 // ---------------------------------------------------------------------------
 
 export interface CodeViewerProps {
+  position?: FilePosition;
   conversationId: string;
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
@@ -437,6 +441,7 @@ export interface CodeViewerProps {
 }
 
 export function CodeViewer({
+  position,
   conversationId,
   path,
   fileQuery,
@@ -510,6 +515,24 @@ export function CodeViewer({
   // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
   const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
 
+  const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
+  useEffect(() => {
+    if (
+      !position ||
+      !isFilePositionPending(position) ||
+      showMonaco ||
+      viewMode !== "source" ||
+      !fileQuery.isSuccess
+    )
+      return;
+    if (revealedPositionRef.current === position) return;
+    const index = Math.min(Math.max(1, position.line), rawLines.length) - 1;
+    const line = matchLineRefs.current.get(index);
+    if (!line) return;
+    line.scrollIntoView({ block: "center" });
+    revealedPositionRef.current = position;
+  }, [position, showMonaco, viewMode, fileQuery.isSuccess, rawLines]);
+
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
   // composer reads — only the native coding-agent harnesses act on it, so
   // gate the button to them (same set as the "@"-mention feature).
@@ -570,7 +593,7 @@ export function CodeViewer({
   useEffect(() => {
     if (!panelOpen || !isMarkdownEditor) return;
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      if (hasCommandModifier(e) && e.key === "f") {
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -589,7 +612,7 @@ export function CodeViewer({
     // above with its own find bar).
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      if (hasCommandModifier(e) && e.key === "f") {
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -862,6 +885,7 @@ export function CodeViewer({
         }
       >
         <MonacoCodeEditor
+          position={position}
           content={content}
           conversationId={conversationId}
           path={path}
@@ -1019,7 +1043,12 @@ export function CodeViewer({
                 if (el) matchLineRefs.current.set(idx, el);
                 else matchLineRefs.current.delete(idx);
               }}
-              className={cn(isCurrentMatch && "bg-yellow-200/40 dark:bg-yellow-700/30")}
+              className={cn(
+                (isCurrentMatch ||
+                  (position &&
+                    lineNum === Math.min(Math.max(1, position.line), rawLines.length))) &&
+                  "bg-yellow-200/40 dark:bg-yellow-700/30",
+              )}
             >
               <div className="flex items-stretch">
                 {/* Gutter — line number; MessageCircleIcon when a comment starts here */}

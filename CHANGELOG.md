@@ -1,9 +1,9 @@
 # Changelog
 
-All notable user-facing changes to omnigent are documented here. This file is
-generated at release time from each PR's `## Changelog` section, tagged by the
-PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on the
-website under `/releases`.
+This file is generated at release time from each PR's `## Changelog` section
+(or its title), tagged by the PR's `Type of change` (e.g. `[UI]`), with linked
+PRs and author credits. The concise, curated highlights live on the website
+under `/releases`.
 
 ## [v0.14.0] — 2026-09-15
 

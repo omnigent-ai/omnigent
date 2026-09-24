@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
@@ -169,6 +169,15 @@ function FileSearchProbe({
 }) {
   useWorkspaceFileSearch(id, query, include, exclude, { enabled });
   return null;
+}
+
+function FileSearchTruncatedProbe({ id, query }: { id: string; query: string }) {
+  const { data } = useWorkspaceFileSearch(id, query);
+  return (
+    <output data-testid="truncated">
+      {data === undefined ? "pending" : String(data.truncated)}
+    </output>
+  );
 }
 
 function AllFilesPathsProbe({
@@ -688,6 +697,25 @@ describe("useWorkspaceFileSearch gating", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_live/resources/environments/default/search?limit=500&q=main&include=*.ts&exclude=**%2Fnode_modules",
     );
+  });
+});
+
+describe("useWorkspaceFileSearch truncation", () => {
+  it("surfaces the server's truncated flag so a miss is not shown as definitive", async () => {
+    // The server already reported that its scan budget ran out; the hook used
+    // to drop that and hand the panel a bare empty list.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({ object: "list", data: [], has_more: false, truncated: true }),
+    );
+
+    render(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="reyden" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("truncated")).toHaveTextContent("true"));
   });
 });
 

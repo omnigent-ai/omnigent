@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sqlite3
 import threading
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine
 from omnigent.llms.types import (
     FunctionCallOutput,
     MessageOutput,
@@ -479,6 +481,38 @@ def pytest_runtest_teardown(item: pytest.Item) -> None:
         "file patches it, suspect rerun/fixture-teardown plugin breakage "
         "(see the pytest-rerunfailures pin rationale in pyproject.toml)."
     )
+
+
+@pytest.fixture(scope="session")
+def _sqlite_db_template(
+    tmp_path_factory: pytest.TempPathFactory, _worker_db_uri: str
+) -> Path | None:
+    """Migrate once per worker; the root db_uri fixture copies this for each test.
+
+    Override this fixture with None for server tests of cold initialization.
+    External database fixtures retain their existing per-worker lifecycle.
+    """
+    if _worker_db_uri:
+        return None
+
+    directory = tmp_path_factory.mktemp("server-db-template")
+    source = directory / "source.db"
+    template = directory / "empty.db"
+    uri = f"sqlite:///{source}"
+    engine = get_or_create_engine(uri)
+    try:
+        # SQLite backup includes committed WAL contents without copying sidecars.
+        with (
+            contextlib.closing(sqlite3.connect(source)) as src,
+            contextlib.closing(sqlite3.connect(template)) as dst,
+        ):
+            src.backup(dst)
+    finally:
+        with _engine_lock:
+            _engine_cache.pop(uri, None)
+        engine.dispose()
+    template.chmod(0o444)
+    return template
 
 
 @pytest.fixture()

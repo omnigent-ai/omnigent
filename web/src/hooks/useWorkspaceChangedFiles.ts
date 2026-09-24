@@ -317,6 +317,8 @@ interface FilesystemListResponse {
     modified_at: number | null;
   }[];
   has_more: boolean;
+  /** True when the server stopped scanning before it covered the tree. */
+  truncated?: boolean;
 }
 
 /**
@@ -513,13 +515,23 @@ export function relativizeToWorkspace(
 
 // ── Recursive file search ──────────────────────────────────────────────────────
 
+export interface WorkspaceFileSearchResult {
+  files: WorkspaceFile[];
+  /**
+   * True when the server gave up before covering the whole tree, so a file
+   * missing from `files` may still exist. The UI must not present that as a
+   * definitive "no match".
+   */
+  truncated: boolean;
+}
+
 async function fetchWorkspaceFileSearch(
   conversationId: string,
   query: string,
   include: string,
   exclude: string,
   location: string,
-): Promise<WorkspaceFile[]> {
+): Promise<WorkspaceFileSearchResult> {
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
@@ -533,20 +545,23 @@ async function fetchWorkspaceFileSearch(
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
-  if (res.status === 404) return [];
-  if (await isRunnerUnavailable503(res)) return [];
+  if (res.status === 404) return { files: [], truncated: false };
+  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse, location);
+  const json = (await res.json()) as FilesystemListResponse;
+  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
 }
 
 /**
  * Search for files recursively in the workspace by name/path substring,
  * optionally scoped by include/exclude glob filters (VSCode-style).
  *
- * Calls the server-side ``/search`` endpoint which performs a full directory
- * walk so results include files in unexpanded subdirectories.  The query is
- * disabled when ``query`` is empty — the include/exclude globs only narrow an
- * active text query, they do not search on their own.
+ * Calls the server-side ``/search`` endpoint which covers the whole workspace
+ * so results include files in unexpanded subdirectories.  The result carries
+ * ``truncated`` when the server stopped early, so an empty ``files`` is not
+ * proof of absence.  The query is disabled when ``query`` is empty — the
+ * include/exclude globs only narrow an active text query, they do not search
+ * on their own.
  *
  * @param conversationId Session/conversation id, or undefined when not ready.
  * @param query Free-text name/path substring; required for the query to fire.

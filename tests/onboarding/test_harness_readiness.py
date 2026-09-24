@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+import threading
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
+    _READINESS_PROBE_MAX_WORKERS,
     configured_harness_map,
     harness_is_configured,
 )
@@ -530,6 +533,49 @@ def test_configured_harness_map_probes_codex_readiness_once(
     result = configured_harness_map()
 
     assert calls == 1
+    assert result["codex"] == "needs-auth"
+    assert result["codex-native"] == "needs-auth"
+    assert result["native-codex"] == "needs-auth"
+
+
+def test_configured_harness_map_runs_independent_probes_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent readiness probes overlap without duplicating aliases."""
+    lock = threading.Lock()
+    release = threading.Event()
+    active = 0
+    max_active = 0
+    calls: Counter[str] = Counter()
+
+    def _availability(canonical: str) -> bool | str:
+        nonlocal active, max_active
+        with lock:
+            calls[canonical] += 1
+            active += 1
+            max_active = max(max_active, active)
+            if active >= _READINESS_PROBE_MAX_WORKERS:
+                release.set()
+        if not release.wait(timeout=1.0):
+            raise AssertionError("readiness probes did not overlap")
+        with lock:
+            active -= 1
+        if "codex" in canonical:
+            return "needs-auth"
+        return canonical != "claude-native"
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._harness_availability",
+        _availability,
+    )
+
+    result = configured_harness_map()
+
+    assert result
+    assert max_active == _READINESS_PROBE_MAX_WORKERS
+    assert all(count == 1 for count in calls.values())
+    assert result["claude-native"] is False
+    assert result["native-claude"] is True
     assert result["codex"] == "needs-auth"
     assert result["codex-native"] == "needs-auth"
     assert result["native-codex"] == "needs-auth"
