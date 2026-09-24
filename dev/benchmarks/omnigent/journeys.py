@@ -363,7 +363,7 @@ async def _setup_target_session(env: BenchEnvironment) -> str:
     the journey still exercises the read path.
     """
     assert env.client is not None
-    listing = await env.client.get("/v1/sessions", params={"limit": 1})
+    listing = await env.client.get("/v1/sessions", params={"limit": 1, "visibility": "all"})
     listing.raise_for_status()
     data = listing.json().get("data", [])
     if data:
@@ -378,14 +378,14 @@ async def _setup_target_session(env: BenchEnvironment) -> str:
 
 async def _measure_list_sessions(env: BenchEnvironment, _ctx: JourneyContext) -> None:
     assert env.client is not None
-    resp = await env.client.get("/v1/sessions", params={"limit": 20})
+    resp = await env.client.get("/v1/sessions", params={"limit": 20, "visibility": "all"})
     resp.raise_for_status()
 
 
 async def _measure_search_sessions(env: BenchEnvironment, _ctx: JourneyContext) -> None:
     assert env.client is not None
     resp = await env.client.get(
-        "/v1/sessions", params={"limit": 20, "search_query": _SEARCH_TOKEN}
+        "/v1/sessions", params={"limit": 20, "search_query": _SEARCH_TOKEN, "visibility": "all"}
     )
     resp.raise_for_status()
 
@@ -462,7 +462,9 @@ async def _measure_list_projects(env: BenchEnvironment, _ctx: JourneyContext) ->
 async def _measure_list_project_sessions(env: BenchEnvironment, ctx: JourneyContext) -> None:
     assert env.client is not None
     project = cast(str, ctx)  # _setup_project_name
-    resp = await env.client.get("/v1/sessions", params={"limit": 20, "project": project})
+    resp = await env.client.get(
+        "/v1/sessions", params={"limit": 20, "project": project, "visibility": "all"}
+    )
     resp.raise_for_status()
 
 

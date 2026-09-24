@@ -1843,7 +1843,7 @@ async def _inherited_parent_model(
         parent_model = validate_model_override(raw_model)
     except ValueError:
         return None
-    if child_harness is not None and model_family_mismatch(child_harness, parent_model):
+    if child_harness is not None and _dispatch_model_mismatch(child_harness, parent_model):
         _logger.debug(
             "sys_session_send: not inheriting parent model %r for sub-agent %r "
             "(family mismatch with harness %s); child runs its default",
@@ -2280,6 +2280,25 @@ def _subagent_allowed_harnesses(
     )
 
 
+def _dispatch_model_mismatch(harness: str, model: str) -> str | None:
+    """Treat configured model IDs as opaque; legacy sessions retain family checks."""
+    from omnigent.errors import OmnigentError
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+    )
+
+    config = load_runtime_inference_config()
+    if binding_for_harness(config, harness) is not None:
+        try:
+            resolve_bound_model(config, harness, model)
+        except OmnigentError as exc:
+            return str(exc)
+        return None
+    return model_family_mismatch(harness, model)
+
+
 def _normalize_subagent_model(
     model: str,
     *,
@@ -2305,8 +2324,15 @@ def _normalize_subagent_model(
     :param harness: The child's declared harness, e.g. ``"claude-native"``.
     :returns: The id to persist as ``model_override``.
     """
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
     from omnigent.models.model_catalog import resolve_model_provider
 
+    # ACP commands own their model namespace, even when provider credentials are shared.
+    if canonicalize_harness(harness) == "acp" or (
+        harness is not None
+        and binding_for_harness(load_runtime_inference_config(), harness) is not None
+    ):
+        return model
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None or harness is None:
         return model
@@ -2754,7 +2780,7 @@ async def _execute_subagent_tool(
                     f"{child_harness or 'unknown'!r} has no model-override "
                     "plumbing. Omit 'model' to use the harness default."
                 )
-            mismatch = model_family_mismatch(child_harness, model) if child_harness else None
+            mismatch = _dispatch_model_mismatch(child_harness, model) if child_harness else None
             if mismatch is not None:
                 return (
                     f"Error: sys_session_send 'model' rejected for sub-agent "
@@ -4515,6 +4541,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "permission_mode",
     "workspace",
     "host_id",
+    "execution_target",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4529,6 +4556,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "max_cost_usd",
     "workspace",
     "host_id",
+    "execution_target",
     "state",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -5371,6 +5399,8 @@ async def _agent_list_fetch(
     try:
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
         params.update(params_extra or {})
+        if path == "/v1/sessions":
+            params["visibility"] = "all"
         if after is not None:
             params["after"] = after
         resp = await server_client.get(path, params=params, timeout=30.0)
@@ -5960,7 +5990,12 @@ async def _collect_global_sessions(
     # which would strand every child created by ``sys_session_create``
     # once its conversation_id is lost. Their ``parent_session_id`` marks
     # them apart from the top-level rows.
-    params: dict[str, str | int] = {"limit": limit, "order": "desc", "kind": "any"}
+    params: dict[str, str | int] = {
+        "limit": limit,
+        "order": "desc",
+        "kind": "any",
+        "visibility": "all",
+    }
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:

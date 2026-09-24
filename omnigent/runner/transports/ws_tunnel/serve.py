@@ -27,7 +27,7 @@ from starlette.types import ASGIApp, Message, Scope
 from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_SLICE_KEY_ENV_VAR,
@@ -394,7 +394,12 @@ async def serve_tunnel(
         except Exception:
             _logger.exception(
                 "on_reconnect callback failed",
-                extra={"session_id": runner_primary_session_id()},
+                extra=debug_event(
+                    "runner_reconnect_callback_failed",
+                    session_id=runner_primary_session_id(),
+                    runner_id=runner_id,
+                    stage="runner_connect",
+                ),
             )
 
     while True:
@@ -836,7 +841,12 @@ async def _serve_tunnel_once(
             "runner %s connected to %s",
             runner_id,
             tunnel_url,
-            extra={"session_id": runner_primary_session_id()},
+            extra=debug_event(
+                "runner_connected",
+                session_id=runner_primary_session_id(),
+                runner_id=runner_id,
+                stage="runner_connect",
+            ),
         )
 
         def _on_resume_from_suspend(gap_s: float) -> None:
@@ -1036,11 +1046,14 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+
     await send_text(
         encode_frame(
             HelloFrame(
                 runner_version=runner_version,
                 frame_protocol_version=1,
+                capabilities=[CAP_FILESYSTEM_ATTACHMENTS],
                 telemetry_opt_out=_tel_opt_out,
                 direct_attach_port=direct_attach_port,
                 direct_attach_token=direct_attach_token,

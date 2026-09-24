@@ -281,14 +281,15 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
         )
 
     state = {"large": False}
-    kinds: dict[str, list[str | None]] = {"/v1/agents": [], "/v1/sessions": []}
+    session_queries: list[httpx.QueryParams] = []
+    agent_queries: list[httpx.QueryParams] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/agents":
-            kinds["/v1/agents"].append(request.url.params.get("kind"))
+            agent_queries.append(request.url.params)
             return _server_page(request, _agent_rows(large=state["large"]))
         if request.url.path == "/v1/sessions":
-            kinds["/v1/sessions"].append(request.url.params.get("kind"))
+            session_queries.append(request.url.params)
             return _server_page(request, _session_rows(large=False))
         if request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(404)
@@ -337,6 +338,9 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
     assert len(complete["session_agents"]) == _ROW_COUNT
     assert len(complete["local_configs"]) == _ROW_COUNT
     assert "page" not in complete
+    assert all(query.get("visibility") == "all" for query in session_queries)
+    assert all("visibility" not in query for query in agent_queries)
+    assert session_queries[2]["after"] == "conv_04"
     assert [row["agent_id"] for row in later["builtins"]] == [
         f"ag_{index:02d}" for index in range(5, 10)
     ]
@@ -357,8 +361,8 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
     # Every page of the session-bound source widens to sub-agent sessions,
     # so a continuation can't silently narrow back to top-level rows. The
     # template agent catalog stays unparameterized.
-    assert kinds["/v1/sessions"] and set(kinds["/v1/sessions"]) == {"any"}
-    assert kinds["/v1/agents"] and set(kinds["/v1/agents"]) == {None}
+    assert session_queries and {query.get("kind") for query in session_queries} == {"any"}
+    assert agent_queries and {query.get("kind") for query in agent_queries} == {None}
 
 
 @pytest.mark.asyncio
@@ -465,6 +469,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     ]
     received_afters: list[str | None] = []
     received_kinds: list[str | None] = []
+    received_visibilities: list[str | None] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_caller/child_sessions":
@@ -474,6 +479,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
         if request.url.path == "/v1/sessions":
             received_afters.append(request.url.params.get("after"))
             received_kinds.append(request.url.params.get("kind"))
+            received_visibilities.append(request.url.params.get("visibility"))
             return _server_page(request, rows)
         raise AssertionError(f"unexpected path {request.url.path}")
 
@@ -503,6 +509,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     # kind is a constant of the view, not a cursor filter: the
     # continuation page must widen exactly like the first.
     assert received_kinds == ["any", "any"]
+    assert received_visibilities == ["all", "all"]
 
 
 @pytest.mark.asyncio

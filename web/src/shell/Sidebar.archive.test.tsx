@@ -20,7 +20,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // file exercises the archive path from a row's kebab.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -172,24 +172,19 @@ describe("archive flow", () => {
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
   });
 
-  it("shows an Undo pill (with a Settings link) on archive", async () => {
+  it("shows an Undo toast (with a View archived action) on archive", async () => {
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
     // The toast fires synchronously on click (the row is about to unmount, so
     // it can't wait for a mutate callback) — no need to drive onSuccess.
-    const toast = await screen.findByTestId("archive-undo-toast");
     // Singular copy for one session — never "session(s)".
-    expect(toast).toHaveTextContent("Archived 1 session.");
-    // Undo is the prominent action: bold + underlined per the design.
-    const undo = within(toast).getByTestId("archive-undo-button");
-    expect(undo).toHaveClass("font-bold", "underline");
-    // The Settings pointer is kept alongside Undo.
-    expect(within(toast).getByRole("link", { name: "View in Settings" })).toHaveAttribute(
-      "href",
-      "/settings/archived",
-    );
+    expect(await screen.findByText("Archived 1 session")).toBeInTheDocument();
+    expect(screen.queryByText(/session\(s\)/)).not.toBeInTheDocument();
+    // Undo and the View archived pointer are the toast's two actions.
+    expect(screen.getByRole("button", { name: "Undo" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View archived" })).toBeInTheDocument();
   });
 
   it("archives from the row's quick-archive hover button", () => {

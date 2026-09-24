@@ -55,7 +55,7 @@ import shlex
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import click
 
@@ -1882,12 +1882,15 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         try:
-            log: str = self._load_core().read_namespaced_pod_log(
-                pod_name,
-                namespace,
-                container=container,
-                tail_lines=_LOG_TAIL_LINES,
-                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+            log = cast(
+                str,
+                self._load_core().read_namespaced_pod_log(
+                    pod_name,
+                    namespace,
+                    container=container,
+                    tail_lines=_LOG_TAIL_LINES,
+                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                ),
             )
         except (ApiException, HTTPError):
             return ""

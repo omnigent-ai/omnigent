@@ -103,6 +103,7 @@ def load_agent_def(
         custom handlers — the operator already has code execution, so
         the restriction would add no security there.
     """
+    path: Path | None = None
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
         with open(path) as f:
@@ -111,6 +112,17 @@ def load_agent_def(
     else:
         data = path_or_dict
         instructions_root = None
+    if not isinstance(data, dict):
+        # An empty or comments-only document loads as None, and a bare scalar or
+        # list loads as that value. Every reader below indexes it as a mapping,
+        # so without this guard the first ``data.get(...)`` raised a bare
+        # AttributeError — which the upload/validate path surfaced as an
+        # internal error instead of naming the malformed spec.
+        found = "an empty document" if data is None else f"a {type(data).__name__}"
+        where = f" in {path}" if path is not None else ""
+        raise ValueError(
+            f"Agent spec must be a YAML mapping of top-level keys; found {found}{where}."
+        )
     if enforce_handler_allowlist:
         _reject_unregistered_policy_handlers(data)
     return _parse_agent_def(data, instructions_root=instructions_root)

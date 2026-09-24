@@ -91,6 +91,27 @@ describe("newChatPickerCache", () => {
     expect(readNewChatPickerOptionsCache(key)).toEqual(options);
   });
 
+  it("preserves missing catalogs separately from successfully fetched empty catalogs", () => {
+    const partialOptions = {
+      ...options,
+      models: { claude: undefined, codex: [], pi: options.models.pi },
+    };
+    writeNewChatPickerOptionsCache(key, partialOptions);
+    expect(readNewChatPickerOptionsCache(key)).toEqual(partialOptions);
+  });
+
+  it("treats legacy empty catalogs as unknown while retaining populated catalogs", () => {
+    writeNewChatPickerOptionsCache(key, options);
+    const record = JSON.parse(localStorage.getItem(`${key}:options`)!);
+    delete record.preview.catalogVersion;
+    localStorage.setItem(`${key}:options`, JSON.stringify(record));
+
+    const migrated = { ...options, models: { ...options.models, pi: undefined } };
+    expect(readNewChatPickerOptionsCache(key)).toEqual(migrated);
+    writeNewChatPickerOptionsCache(key, readNewChatPickerOptionsCache(key));
+    expect(readNewChatPickerOptionsCache(key)).toEqual(migrated);
+  });
+
   it("isolates and expires cached menu choices just like their labels", () => {
     writeNewChatPickerOptionsCache(key, options);
     expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey("another-project"))).toBeNull();
@@ -113,6 +134,7 @@ describe("newChatPickerCache", () => {
   it.each([
     { ...options, agents: null },
     { ...options, hostId: 42 },
+    { ...options, catalogVersion: 2 },
     { ...options, models: { ...options.models, claude: [{ id: "fable", displayName: false }] } },
     {
       ...options,
@@ -375,7 +397,7 @@ describe("directory and permission previews", () => {
     hostId: "host_1",
     workspace: "/work/repo",
     repositoryLabel: "repo",
-    branchLabel: "New worktree",
+    branchLabel: "New",
     branchDescription: "Create or select a worktree from main repository branch: main",
   };
 

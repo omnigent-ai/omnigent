@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import type { Host } from "@/hooks/useHosts";
 import type { AgentBundleInput } from "@/lib/agentBundle";
@@ -133,8 +133,9 @@ export const NeedsSetupBadges: Story = {
     host: {
       ...readyHost,
       configured_harnesses: {
-        // SDK agents (polly/debby) stay available; the intended badges here are
-        // the native codex/cursor rows below.
+        // SDK agents (polly/debby) stay available; the intended badges are the
+        // native codex/cursor rows, which demote to the "Other..." flyout when
+        // they can't launch on the host.
         "claude-sdk": true,
         "claude-native": true,
         "codex-native": "needs-auth",
@@ -149,7 +150,45 @@ export const NeedsSetupBadges: Story = {
       </CapabilitiesProvider>
     ),
   ],
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    // The badged rows live behind the harness overflow flyout now.
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await page.findByTestId("new-chat-landing-harness-more"));
+  },
+};
+
+export const ClaudeSelected: Story = {
+  args: {
+    effectiveAgentId: claude.id,
+    agentLabel: "Claude Code",
+    triggerDetails: [
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Effort", value: "High" },
+    ],
+  },
   play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
+export const ReadOnlyPermissionSummary: Story = {
+  args: {
+    triggerDetails: [
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Permission mode", value: "Plan" },
+    ],
+    triggerTooltipRows: [
+      { label: "Harness", value: "Claude Code" },
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Permission mode", value: "Plan" },
+    ],
+  },
+  play: async ({ canvasElement }) => {
+    const page = within(canvasElement.ownerDocument.body);
+    within(canvasElement).getByTestId("new-chat-landing-agent-select").focus();
+    await expect(await page.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
+      "Permission mode: Plan",
+    );
+  },
 };
 
 export const SmartRoutingWithCustomAgents: Story = {

@@ -52,6 +52,7 @@ import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -72,35 +73,12 @@ import {
 } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
-// Session-scoped URL params that the file viewer / Files panel write
-// for one session and AppShell's restore effect re-reads on the next.
-// Stripping these on rail navigation prevents a sticky ``?file=`` from
-// the previous session yanking the user into the file viewer of the
-// next one. Other params (e.g. ``?debug=1`` for ``useDebugMode``) are
-// global and must be preserved across navigation.
-const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
 const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
 const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
-
-/**
- * Build a rail-link search string from the current URL, dropping the
- * session-scoped params and keeping anything else.
- *
- * @param search - The current ``location.search`` string,
- *   e.g. ``"?file=foo.txt&debug=1"``.
- * @returns A search string suitable for a ``<Link to={{ search }}>``,
- *   e.g. ``"?debug=1"`` or ``""`` when nothing remains.
- */
-function railLinkSearch(search: string): string {
-  const params = new URLSearchParams(search);
-  for (const key of SESSION_SCOPED_PARAMS) params.delete(key);
-  const next = params.toString();
-  return next ? `?${next}` : "";
-}
 
 interface SubagentsPanelProps {
   /** The conversation currently rendered in main. Used only to
@@ -523,7 +501,7 @@ function iconForWrapperOrHarness(
 
 function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
   const { session } = useSession(rootSessionId);
-  const search = railLinkSearch(useLocation().search);
+  const search = sessionNavigationSearch(useLocation().search);
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
   // TerminalFirstContext to decide a session is claude/codex-native.
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
@@ -540,10 +518,10 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
     <li>
       <Link
         // Drop session-scoped params (``file``, ``diff``, ``comment``,
-        // ``view``) when navigating in the rail — those are tied to
+        // ``view``, ``message``) when navigating in the rail — those are tied to
         // one session's file-viewer state and must not bleed into the
         // next. Global params like ``?debug=1`` are preserved by
-        // ``railLinkSearch`` so debug mode stays on across navigation.
+        // ``sessionNavigationSearch`` so debug mode stays on across navigation.
         to={{ pathname: `/c/${rootSessionId}`, search }}
         data-testid="subagent-main-row"
         data-root-session-id={rootSessionId}
@@ -603,7 +581,7 @@ function SubagentRow({
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
-  const search = railLinkSearch(useLocation().search);
+  const search = sessionNavigationSearch(useLocation().search);
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;

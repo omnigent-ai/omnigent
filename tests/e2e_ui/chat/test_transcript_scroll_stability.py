@@ -65,7 +65,7 @@ _WATCH = """
   window.__writes = [];
   window.__thumbHeights = [];
   const log = (from, to) => window.__writes.push([
-    Math.round(performance.now()), Math.round(from), Math.round(to), Math.round(desc.get.call(el)),
+    performance.now(), Math.round(from), Math.round(to), Math.round(desc.get.call(el)),
   ]);
   Object.defineProperty(el, 'scrollTop', {
     configurable: true,
@@ -107,9 +107,15 @@ _TRACK_ROWS = """
     for (const r of el.querySelectorAll('[data-index]')) {
       rows[r.getAttribute('data-bubble-key')] = Math.round(r.getBoundingClientRect().top);
     }
-    window.__rowSamples.push([Math.round(performance.now()), Math.round(el.scrollTop), rows]);
+    window.__rowSamples.push([performance.now(), Math.round(el.scrollTop), rows]);
   };
-  const tick = () => { setTimeout(sample, 0); requestAnimationFrame(tick); };
+  const tick = () => {
+    // Observe after the application's layout observers, before this frame paints.
+    // A timer can instead sample a later React commit before its layout settles.
+    const observer = new ResizeObserver(() => { sample(); observer.disconnect(); });
+    observer.observe(el);
+    requestAnimationFrame(tick);
+  };
   requestAnimationFrame(tick);
 }
 """
@@ -182,9 +188,9 @@ def _seed_turns(session_id: str) -> None:
 
 def _row_moves(
     samples: list[list[Any]],
-    writers: list[list[int | str]],
-    since: int,
-) -> list[tuple[int, int]]:
+    writers: list[list[float]],
+    since: float,
+) -> list[tuple[float, int]]:
     """On-screen moves of the mounted rows after *since* that the reader did not make.
 
     Per painted frame, the scroll delta minus the code's own writes is the
@@ -192,21 +198,18 @@ def _row_moves(
     The median leftover across rows present in both frames is content shifting
     under the reader.
     """
-    moves: list[tuple[int, int]] = []
+    moves: list[tuple[float, int]] = []
     for (t0, st0, rows0), (t1, st1, rows1) in pairwise(samples):
         if t1 < since:
             continue
         common = [key for key in rows0 if key in rows1]
         if not common:
             continue
-        programmatic = sum(int(w[3]) - int(w[1]) for w in writers if t0 < int(w[0]) <= t1)
+        programmatic = sum(int(w[3]) - int(w[1]) for w in writers if t0 < w[0] <= t1)
         reader = (st1 - st0) - programmatic
         leftovers = sorted((rows1[key] - rows0[key]) + reader for key in common)
         unexplained = leftovers[len(leftovers) // 2]
         if abs(unexplained) <= 4:
-            continue
-        if moves and moves[-1][1] == -unexplained and t1 - moves[-1][0] <= 20:
-            moves.pop()
             continue
         moves.append((t1, unexplained))
     return moves
@@ -237,7 +240,7 @@ def test_scrolling_back_through_history_never_moves_the_offset(
 
     page.evaluate(_WATCH)
     page.evaluate(_TRACK_ROWS)
-    t_start = page.evaluate("() => Math.round(performance.now())")
+    t_start = page.evaluate("() => performance.now()")
 
     # Wheel up in bursts, giving each fetch room to land mid-scroll — the
     # moment the old correction fired. The transcript is virtualized, so the

@@ -19,9 +19,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import subprocess
+import threading
 import time
+from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -29,6 +32,7 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
 from omnigent.entities import Conversation
+from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -44,6 +48,8 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.identity import HostIdentity
+from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -224,9 +230,12 @@ async def _serve_one_launch(
     # Bounded so a routing bug can't hang the test: stat + launch are
     # 2 frames, the rest of the budget absorbs interleaved pings. One deadline
     # for the whole exchange — a per-receive budget would multiply by 40.
-    deadline = Deadline(20.0)
+    deadline = Deadline(30.0)
     for _ in range(40):
-        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
+        # Allow server work between stat and launch under CI load: a
+        # receive_output timeout cancels the mock host tunnel and makes
+        # a slow session create fail with a spurious "host is offline" 409.
+        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -1303,6 +1312,162 @@ async def test_host_session_message_relaunches_offline_runner(
         "relaunch must mint a NEW runner_id (replace_runner_id); a stale id "
         "would keep routing messages to the dead runner"
     )
+
+
+async def test_first_message_during_host_spawn_does_not_launch_replacement(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Drive real host status and server recovery while the initial spawn is paused."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    host = HostProcess(
+        identity=HostIdentity(host_id=_HOST_ID, name="test"), server_url="http://testserver"
+    )
+    loop = asyncio.get_running_loop()
+    spawning = asyncio.Event()
+    status_started = asyncio.Event()
+    replacement_seen = asyncio.Event()
+    release_spawn = threading.Event()
+    launch_frames: list[HostLaunchRunnerFrame] = []
+    stop_frames: list[HostStopRunnerFrame] = []
+    status_results: list[str] = []
+    spawned: list[subprocess.Popen[bytes]] = []
+    forwarded: list[str] = []
+
+    def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        proc = Mock(spec=subprocess.Popen, pid=1234 + len(spawned))
+        proc.poll.return_value = None
+        spawned.append(proc)
+        loop.call_soon_threadsafe(spawning.set)
+        assert release_spawn.wait(budget(10.0)), "test did not release spawn"
+        return proc, tmp_path / "runner.log"
+
+    real_status = host._handle_runner_status
+
+    async def _status(frame: HostRunnerStatusFrame) -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await real_status(frame)
+
+    class HostWS:
+        async def send(self, raw: str) -> None:
+            frame = decode_host_frame(raw)
+            if isinstance(frame, HostRunnerStatusResultFrame):
+                status_results.append(frame.status)
+            await comm.send_input({"type": "websocket.receive", "text": raw})
+
+    ws = HostWS()
+
+    async def _serve_host() -> None:
+        while True:
+            output = await comm.receive_output(timeout=budget(20.0))
+            if output["type"] != "websocket.send":
+                continue
+            try:
+                frame = decode_host_frame(output["text"])
+            except ValueError:
+                continue
+            if isinstance(frame, HostLaunchRunnerFrame):
+                launch_frames.append(frame)
+                if len(launch_frames) > 1:
+                    replacement_seen.set()
+            if isinstance(frame, HostStopRunnerFrame):
+                stop_frames.append(frame)
+            host._start_frame_task(ws, output["text"])  # type: ignore[arg-type]
+
+    def _runner_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(request.url.path)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_request), base_url="http://runner"
+    )
+
+    async def _get_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient | None:
+        if (
+            launch_frames
+            and app.state.tunnel_registry.get(
+                token_bound_runner_id(launch_frames[0].binding_token)
+            )
+            is not None
+        ):
+            return fake_runner
+        return None
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda _harness: True)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    monkeypatch.setattr(host, "_stop_runner_proc", lambda _proc: None)
+    monkeypatch.setattr(host, "_handle_runner_status", _status)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    serve = asyncio.create_task(_serve_host())
+    create = asyncio.create_task(
+        client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": str(tmp_path),
+            },
+        )
+    )
+    post: asyncio.Task[httpx.Response] | None = None
+    try:
+        await asyncio.wait_for(spawning.wait(), budget(10.0))
+        initial = launch_frames[0]
+        session_id = initial.session_id
+        runner_id = token_bound_runner_id(initial.binding_token)
+        post = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+            )
+        )
+        await asyncio.wait_for(status_started.wait(), budget(5.0))
+        # If the buggy host answered immediately, let real server recovery
+        # consume that verdict so the failure identifies the duplicate launch.
+        if status_results == ["unknown"]:
+            await asyncio.wait_for(replacement_seen.wait(), budget(5.0))
+        assert len(launch_frames) == 1, "premature unknown caused a second runner launch"
+        assert not status_results, "status must await the pending spawn"
+
+        release_spawn.set()
+        response = await asyncio.wait_for(create, budget(5.0))
+        assert response.status_code == 201, response.text
+        await _wait_for_runner_connect_waiter(app, runner_id, timeout_s=budget(5.0))
+        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        response = await asyncio.wait_for(post, budget(5.0))
+        assert response.status_code < 300, response.text
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert conv is not None and conv.runner_id == runner_id
+        assert len(launch_frames) == len(spawned) == 1
+        assert stop_frames == []
+        assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
+    finally:
+        release_spawn.set()
+        for task in (create, post, serve):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(t for t in (create, post, serve) if t is not None), return_exceptions=True
+        )
+        await asyncio.gather(*host._frame_tasks, return_exceptions=True)
+        await host._drain_runner_stop_tasks()
+        await asyncio.gather(*host._watcher_tasks, return_exceptions=True)
+        await fake_runner.aclose()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
 
 
 async def test_host_session_message_waits_for_bound_runner_before_relaunch(
@@ -2461,6 +2626,21 @@ async def test_concurrent_relaunches_are_single_flight(
 
     set_runner_client(None)
 
+    launch_runner = sessions_module._launch_runner_on_host
+    both_callers_ready = asyncio.Event()
+    observed_bindings: list[str | None] = []
+
+    async def _race_launch(*args: Any, **kwargs: Any) -> Any:
+        observed_bindings.append(args[0].runner_id)
+        if len(observed_bindings) == 2:
+            both_callers_ready.set()
+        await both_callers_ready.wait()
+        return await launch_runner(*args, **kwargs)
+
+    # Both requests must snapshot the offline binding before either rotates it.
+    # With startup grace disabled, a later snapshot would request another launch.
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
+
     def _post() -> Any:
         return client.post(
             f"/v1/sessions/{session_id}/events",
@@ -2476,6 +2656,8 @@ async def test_concurrent_relaunches_are_single_flight(
     tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
     launches: list[HostLaunchRunnerFrame] = []
     try:
+        await asyncio.wait_for(both_callers_ready.wait(), timeout=10.0)
+        assert observed_bindings == [session["runner_id"], session["runner_id"]]
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.

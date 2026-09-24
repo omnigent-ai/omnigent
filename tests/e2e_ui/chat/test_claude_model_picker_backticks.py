@@ -15,10 +15,11 @@ the Model picker → every row must read as a plain model name and both
 
 The catalog is produced by the REAL probe pipeline
 (``omnigent.harnesses.claude_native.main.claude_model_catalog``) against a stub ``claude``
-CLI whose stream-json output is byte-identical to what a real Claude Code
-2.1.250 ``claude -p "/model"`` run printed when captured live — so the test
-is deterministic regardless of which CLI version this machine has installed,
-while every line of Omnigent's parsing/composition code still runs for real.
+CLI that supplies structured initialize options and replays the model labels
+captured from Claude Code 2.1.250. The test is deterministic regardless of the
+installed CLI version, while Omnigent's parsing/composition code runs for real.
+The availability regression marks Fable disabled in initialize while leaving
+its help alias and model resolution intact.
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ _FAKE_CLAUDE_CLI = textwrap.dedent(
     """\
     #!/usr/bin/env python3
     import json
+    import os
     import sys
 
     RESOLUTIONS = {
@@ -84,6 +86,16 @@ _FAKE_CLAUDE_CLI = textwrap.dedent(
     args = sys.argv[1:]
     alias = args[args.index("--model") + 1] if "--model" in args else None
     if alias is None:
+        models = [
+            {"value": value, "disabled": bool(os.environ.get("FAKE_FABLE_DISABLED"))
+             and value.startswith("fable")}
+            for value in RESOLUTIONS
+        ]
+        print(json.dumps({
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": "model-catalog",
+                         "response": {"models": models}},
+        }))
         model, label = RESOLUTIONS["default"]
         text = f"Current model: {label}\\n{USAGE}"
     else:
@@ -248,3 +260,26 @@ def test_claude_native_picker_1m_context_rows_read_alike(
         assert _ONE_M_ROW_SHAPE.fullmatch(text), (
             f"1M-context row {text!r} does not read as a plain '<Name> (1M context)' label"
         )
+
+
+def test_claude_native_picker_omits_disabled_fable(
+    page: Page,
+    seeded_session: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Fable stays absent even when /model help and alias resolution advertise it."""
+    monkeypatch.setenv("FAKE_FABLE_DISABLED", "1")
+    base_url, session_id = seeded_session
+    catalog = _probe_catalog_from_claude_2_1_250(monkeypatch, tmp_path)
+    _patch_session_as_claude_native(page, session_id, catalog, llm_model="claude-opus-5[1m]")
+
+    _open_model_picker(page, base_url, session_id)
+
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows).to_have_count(len(_EXPECTED_LABELS) - 1)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="fable"]')).to_have_count(0)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="fable[1m]"]')).to_have_count(0)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="opus"]')).to_contain_text(
+        "Opus 5"
+    )

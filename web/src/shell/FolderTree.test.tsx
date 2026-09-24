@@ -531,3 +531,43 @@ describe("FolderTree default expansion on conversation switch", () => {
     expect(screen.getByRole("button", { name: "beta/" })).toHaveAttribute("aria-expanded", "true");
   });
 });
+
+describe("FolderTree truncated search", () => {
+  it("says the scan stopped early instead of a flat no-match when results were truncated", () => {
+    // A repo larger than the server's scan budget returns zero matches AND
+    // truncated=true; presenting that as "No files match" told users a file
+    // they could see on disk did not exist.
+    renderTree({ searchQuery: "reyden", searchResults: [], searchTruncated: true });
+
+    expect(screen.getByText(/No files match "reyden"/)).toHaveTextContent(
+      "the search stopped early, so results may be incomplete",
+    );
+  });
+
+  it("keeps the truncation note when every match is in a hidden directory", () => {
+    // The hidden-only branch replaces the results list with a "show hidden"
+    // prompt; a truncated scan still has to be distinguishable there.
+    renderTree({
+      searchQuery: "env",
+      searchResults: [file(".env")],
+      searchTruncated: true,
+    });
+
+    expect(screen.getByText(/in hidden directories/)).toHaveTextContent(
+      "Search stopped early — results may be incomplete.",
+    );
+  });
+
+  it("footnotes partial results when the scan was truncated", () => {
+    renderTree({
+      searchQuery: "main",
+      searchResults: [file("src/main.py")],
+      searchTruncated: true,
+    });
+
+    expect(screen.getByText("src/main.py")).toBeInTheDocument();
+    expect(
+      screen.getByText("Search stopped early — results may be incomplete."),
+    ).toBeInTheDocument();
+  });
+});

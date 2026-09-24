@@ -2010,9 +2010,11 @@ class TestCodexExecutor(unittest.TestCase):
                 )
             ]
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], TurnComplete)
-            self.assertEqual(events[0].response, "done")
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], TextChunk)
+            self.assertEqual(events[0].text, "done")
+            self.assertIsInstance(events[1], TurnComplete)
+            self.assertEqual(events[1].response, "done")
 
         _run(_t())
 

@@ -128,8 +128,8 @@ def _agents_body() -> str:
     ``claude-native-ui`` is the only built-in the picker needs here — its
     name is what gates the permission-mode UI (``isClaudeNativeAgent``) and,
     ranked first by display name, it auto-selects so no explicit pick is
-    required. ``harness: null`` keeps the "needs setup" badge off regardless
-    of the (stubbed) host's readiness map.
+    required. The host fixture explicitly reports the harness ready so the row
+    remains selectable under readiness-aware picker behavior.
     """
     return json.dumps(
         {
@@ -139,7 +139,7 @@ def _agents_body() -> str:
                     "name": "claude-native-ui",
                     "display_name": "Claude Code",
                     "description": "Anthropic's coding agent",
-                    "harness": None,
+                    "harness": "claude-native",
                     "skills": [],
                 }
             ]
@@ -412,6 +412,16 @@ def _hosts_body() -> str:
                     "name": "e2e-host",
                     "owner": "e2e",
                     "status": "online",
+                    "configured_harnesses": {
+                        "antigravity-native": True,
+                        "claude-native": True,
+                        "codex-native": True,
+                        "cursor-native": True,
+                        "devin-native": True,
+                        "kimi-native": True,
+                        "opencode-native": True,
+                        "pi-native": True,
+                    },
                 }
             ]
         }
@@ -491,6 +501,19 @@ async def _register_common_routes(
         "**/v1/hosts/*/harnesses/*/model-options",
         lambda route: route.fulfill(json={"models": []}),
     )
+    await page.route(
+        "**/v1/sandbox-providers/*/harnesses/*/model-options*",
+        lambda route: route.fulfill(
+            json={
+                "configured": False,
+                "status": "unconfigured",
+                "models": [],
+                "configuration_revision": None,
+                "provider_label": None,
+                "default_model": None,
+            }
+        ),
+    )
     await page.route(_WORKTREES_RE, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
@@ -547,7 +570,7 @@ async def _open_entry_config(page, agent_id: str) -> None:
         .get_by_text("Edit", exact=True)
         .click()
     )
-    await page.get_by_test_id("new-chat-landing-config-gear").click()
+    await expect(page.get_by_test_id("new-chat-landing-config-harness")).to_be_visible()
 
 
 async def _save_config(page) -> None:
@@ -618,7 +641,9 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
                 "Bypass permissions",
             )
             for label in perm_labels:
-                await expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
+                await expect(
+                    page.get_by_role("menuitemradio", name=label, exact=True)
+                ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-permission-option-acceptEdits").click()
             await expect(perm).to_contain_text("Accept edits")
 
@@ -749,7 +774,8 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             composer = page.get_by_role("textbox", name="Message the agent")
             await expect(composer).to_be_editable()
             await expect(composer).to_have_attribute("placeholder", re.compile("Send a follow-up"))
-            await expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
+            await expect(page.get_by_role("button", name="Interrupt", exact=True)).to_be_enabled()
+            await expect(page.get_by_role("button", name="Send", exact=True)).to_have_count(0)
             await expect(
                 page.get_by_test_id("message-bubble").get_by_text("set up the project", exact=True)
             ).to_be_visible()
@@ -1537,6 +1563,80 @@ def test_start_session_managed_remembers_host_over_sandbox_default(
     _run_in_fresh_loop(_drive_managed_remembers_host(base_url, session_id))
 
 
+@pytest.mark.parametrize("viewport_width", [1440, 390], ids=["desktop", "mobile"])
+def test_start_session_managed_repository_uses_workspace_bar(
+    seeded_session: tuple[str, str],
+    viewport_width: int,
+) -> None:
+    """The managed repository picker lives in the responsive workspace bar."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(
+        _drive_managed_repository_workspace_bar(base_url, session_id, viewport_width)
+    )
+
+
+async def _drive_managed_repository_workspace_bar(
+    base_url: str, session_id: str, viewport_width: int
+) -> None:
+    repo_url = "https://github.com/omnigent-ai/a-very-long-sandbox-repository-name.git"
+    repo_name = "a-very-long-sandbox-repository-name"
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page(
+            viewport={"width": viewport_width, "height": 844 if viewport_width == 390 else 900}
+        )
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            await page.route(
+                "**/v1/info",
+                lambda route: route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                ),
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            controls = page.get_by_test_id("new-chat-landing-workspace-controls")
+            repository = controls.get_by_test_id("new-chat-landing-repo-chip")
+            await expect(controls).to_be_visible()
+            await expect(repository).to_have_attribute(
+                "aria-label", "Sandbox repositories: None selected"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_count(0)
+            await expect(page.get_by_test_id("new-chat-landing-worktree-chip")).to_have_count(0)
+
+            await repository.click()
+            await page.get_by_test_id("new-chat-landing-repo-input").fill(repo_url)
+            await page.get_by_test_id("new-chat-landing-repo-add").click()
+            await expect(repository).to_have_attribute(
+                "aria-label", f"Sandbox repositories: {repo_name}"
+            )
+            repository_label = repository.locator("[data-workspace-collapse-label]")
+            if viewport_width == 390:
+                await expect(controls).to_have_attribute("data-labels", "collapsed")
+                await expect(repository_label).to_be_hidden()
+            else:
+                await expect(controls).not_to_have_attribute("data-labels", "collapsed")
+                await expect(repository_label).to_be_visible()
+
+            await page.keyboard.press("Escape")
+            await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_type"] == "managed", body
+            assert body["workspaces"] == [repo_url], body
+        finally:
+            await browser.close()
+
+
 async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
     host_id, host_name = _HOST_ALPHA
     # The loopback E2E server exposes exactly one online host, so the landing
@@ -1850,13 +1950,13 @@ async def _drive_managed_sandbox_after_slow_info(base_url: str, session_id: str)
 def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
     """Picking a model + reasoning effort rides along to the create call.
 
-    For the Claude-native agent the Edit menu shows model/effort
-    choices that start with NOTHING selected — no model/effort default is
-    forced, so an untouched picker omits the override and Claude Code keeps its
-    own configured model. Explicitly selecting "Opus" and "High" must (a) update
-    those selects as immediate feedback and (b) reach ``POST /v1/sessions`` as
-    ``model_override: "opus"`` + ``reasoning_effort: "high"`` (the runner reads
-    them as ``--model`` / ``--effort`` at terminal launch).
+    For the Claude-native agent the Edit menu starts on its explicit default
+    entries, so an untouched picker omits the overrides and Claude Code keeps
+    its own configured model and effort. Explicitly selecting "Opus" and
+    "High" must (a) update those selects as immediate feedback and (b) reach
+    ``POST /v1/sessions`` as ``model_override: "opus"`` +
+    ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
+    ``--effort`` at terminal launch).
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
@@ -1921,7 +2021,7 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # No override is forced until the user selects a model or effort.
+            # Default entries are selected without forcing an override.
             await _open_entry_models(page, "ag_claude_e2e")
             await _expect_model_menu_without_advanced_settings(page)
             model = page.locator(
@@ -1931,10 +2031,10 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
             )
             await expect(model).to_contain_text("Harness default")
-            await expect(effort).to_have_count(0)
+            await expect(effort).to_contain_text("Default")
             await expect(
                 page.get_by_role("menuitemcheckbox", name="Default", exact=True)
-            ).to_have_count(0)
+            ).to_have_count(1)
 
             # Model and effort picks commit immediately using the live host catalog.
             await page.get_by_role("menuitemcheckbox", name="Opus 4.8", exact=True).click()
@@ -2193,14 +2293,16 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await expect(approval).to_be_visible()
             await approval.click()
             for label in ("Default", "Full access", "Read only", "Bypass approvals & sandbox"):
-                await expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
+                await expect(
+                    page.get_by_role("menuitemradio", name=label, exact=True)
+                ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-permission-option-bypass").click()
             await expect(approval).to_contain_text("Bypass approvals & sandbox")
             await expect(
                 page.get_by_test_id("new-chat-landing-permission-menu")
             ).not_to_be_visible()
             await approval.click()
-            await page.get_by_role("menuitem", name="Full access", exact=True).click()
+            await page.get_by_role("menuitemradio", name="Full access", exact=True).click()
             await expect(approval).to_contain_text("Full access")
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
@@ -2396,10 +2498,20 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             community_harness = page.get_by_test_id("new-chat-landing-harness-community-brain")
             await expect(community_harness).to_be_visible()
             await expect(community_harness).to_contain_text("Community Brain")
-            # Picking a harness updates the select; Save commits the override
-            # (the agent chip keeps the bare agent label "Polly").
+            # Picking a harness commits immediately in the integrated config
+            # page (the agent chip keeps the bare agent label "Polly").
             await community_harness.click()
-            await _save_config(page)
+            await expect(page.get_by_test_id("new-chat-landing-config-harness")).to_contain_text(
+                "Community Brain"
+            )
+            await page.keyboard.press("Escape")
+            if (
+                await page.get_by_test_id("new-chat-landing-agent-select").get_attribute(
+                    "aria-expanded"
+                )
+                == "true"
+            ):
+                await page.keyboard.press("Escape")
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -2504,6 +2616,10 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "pi-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2590,6 +2706,10 @@ async def _drive_antigravity_native_start(base_url: str, session_id: str) -> Non
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "antigravity-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2686,6 +2806,10 @@ async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "opencode-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2777,6 +2901,10 @@ async def _drive_kimi_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "kimi-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -3341,10 +3469,11 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
 def test_start_session_select_existing_worktree(seeded_session: tuple[str, str]) -> None:
     """Picking an existing worktree starts in its directory in git bind mode.
 
-    The branch chip's input doubles as a combobox: focusing it lists the
-    repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
-    one must (a) point the workspace at that worktree's directory and
-    (b) send the ``git`` spec in bind mode on ``POST /v1/sessions`` —
+    The branch chip lists the repo's existing worktrees
+    (``GET /v1/hosts/{id}/worktrees``). Selecting one must (a) point the
+    workspace at that worktree's directory, (b) close the selector without
+    copying the branch into the ``New`` input, and (c) send the ``git`` spec
+    in bind mode on ``POST /v1/sessions`` —
     ``existing_worktree: true`` with the worktree's branch as
     ``branch_name`` — so no worktree is created but the sidebar shows the
     branch and the delete flow can offer to remove it.
@@ -3405,21 +3534,29 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
                 state="visible", timeout=30_000
             )
 
-            # Open the worktree chip; focusing the branch combobox reveals the
-            # repo's existing (linked) worktrees. The main tree is filtered out,
-            # so only the one linked worktree is offered.
+            # Open the worktree chip. The main tree is filtered out, so only
+            # the one linked worktree is offered.
             await page.get_by_test_id("new-chat-landing-branch-chip").click()
-            await page.get_by_test_id("new-chat-landing-branch-input").focus()
             option = page.get_by_test_id("new-chat-landing-worktree-option")
             await expect(option).to_have_count(1)
-            await expect(option).to_contain_text("feature/x")
+            await expect(option).to_contain_text("feature-x")
             await option.click()
+            await expect(page.get_by_test_id("new-chat-landing-worktree-dropdown")).to_have_count(
+                0
+            )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
+                "feature/x"
+            )
 
-            # The warning confirms the session will start in the existing
-            # worktree (rather than creating a new one).
+            # Reopening keeps the existing row selected while reserving New
+            # exclusively for creating a different worktree.
+            await page.get_by_test_id("new-chat-landing-branch-chip").click()
+            await expect(page.get_by_test_id("new-chat-landing-branch-input")).to_have_value("")
+            option = page.get_by_test_id("new-chat-landing-worktree-option")
+            await expect(option.get_by_role("radio")).to_be_checked()
             await expect(
                 page.get_by_test_id("new-chat-landing-existing-worktree-warning")
-            ).to_be_visible()
+            ).to_have_count(0)
 
             await page.get_by_test_id("new-chat-landing-input").fill("work in the worktree")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -3750,7 +3887,9 @@ async def _drive_agy_skip_permissions(base_url: str, session_id: str) -> None:
             # agy has exactly two states: its own prompt, or no prompt at all.
             await skip.click()
             for label in ("Ask every time", "Skip permissions"):
-                await expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
+                await expect(
+                    page.get_by_role("menuitemradio", name=label, exact=True)
+                ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-permission-option-skip").click()
 
             await expect(skip).to_contain_text("Skip permissions")

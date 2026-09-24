@@ -74,7 +74,6 @@ function isAuthGatePath(rawUrl) {
  *   getPinnedOrigin: () => string | null,
  *   onAway: (returnUrl: string | null) => void,
  *   onReturn: () => void,
- *   onLeave?: () => void,
  *   delayMs?: number,
  *   debugLog?: (message: string) => void,
  *   setTimeoutFn?: typeof setTimeout,
@@ -88,7 +87,6 @@ function registerServerAwayWatch(
     getPinnedOrigin,
     onAway,
     onReturn,
-    onLeave = () => {},
     delayMs = AWAY_BANNER_DELAY_MS,
     debugLog = () => {},
     setTimeoutFn = setTimeout,
@@ -98,7 +96,6 @@ function registerServerAwayWatch(
   let lastServerUrl = null;
   let awayTimer = null;
   let notified = false;
-  let left = false;
   let disposed = false;
 
   function cancelTimer() {
@@ -111,20 +108,11 @@ function registerServerAwayWatch(
   function onServer(url) {
     lastServerUrl = url;
     notified = false;
-    left = false;
     cancelTimer();
     onReturn();
   }
 
   function onForeign() {
-    // Fire onLeave once per away episode, immediately — this is the expiry
-    // signal (the workspace bounced us to a login/SSO page via a client-side
-    // navigation, which webRequest redirects never surface). Separate from the
-    // delayed banner: a listener can silently recover before the banner shows.
-    if (!left) {
-      left = true;
-      onLeave();
-    }
     if (notified) return;
     cancelTimer();
     debugLog(`away-watch: left the pinned server, banner in ${delayMs}ms unless it returns`);
@@ -176,7 +164,6 @@ function registerServerAwayWatch(
      */
     reset() {
       notified = false;
-      left = false;
       cancelTimer();
     },
   };

@@ -65,6 +65,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -81,6 +82,7 @@ import {
   type GithubChecks,
   type GithubComment,
   type GithubInfo,
+  type GithubPrAssociation,
 } from "@/hooks/useGithub";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
@@ -766,8 +768,21 @@ function SidebarNode({
   );
 }
 
+function pullRequestLabel(pr: GithubPrAssociation): string {
+  const host = pr.host === "github.com" ? "" : `${pr.host}/`;
+  const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
+  const identity = `${host}${pr.repository} #${pr.number}${inferred}`;
+  const title = pr.title?.trim();
+  return title ? `${identity} — ${title}` : identity;
+}
+
 export function GithubPanel({ conversationId }: { conversationId: string }) {
+  const isMobileViewport = useIsMobileViewport();
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
+  const [prPickerOpen, setPrPickerOpen] = useState(false);
+  const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
+  // Select focuses rows on both pointer hover and keyboard navigation.
+  const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
@@ -797,6 +812,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   }, [conversationId, selected, info.data?.selected_pr_url]);
   const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
   const prs = associations?.prs ?? [];
+  const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const linkInEmptyState = prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";
   const linkControls = (
     <>
@@ -868,30 +884,71 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
         <div className="shrink-0 border-b border-border p-2">
           <div className="flex items-center gap-2">
             {prs.length > 0 && (
-              <Select
-                value={selected ?? associations.selected_pr_url ?? ""}
-                onValueChange={changeSelection}
-              >
-                <SelectTrigger
-                  aria-label="Session pull request"
-                  className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
+              <TooltipProvider>
+                <Select
+                  open={prPickerOpen}
+                  onOpenChange={(open) => {
+                    setPrPickerOpen(open);
+                    setPrPickerTooltipOpen(false);
+                    setFocusedPrUrl(undefined);
+                  }}
+                  value={selected ?? associations.selected_pr_url ?? ""}
+                  onValueChange={changeSelection}
                 >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent
-                  position="popper"
-                  align="start"
-                  className="w-(--radix-select-trigger-width)"
-                >
-                  {prs.map((pr) => (
-                    <SelectItem key={pr.url} value={pr.url} className="break-all">
-                      {pr.host === "github.com" ? "" : `${pr.host}/`}
-                      {pr.repository} #{pr.number}
-                      {pr.relationship === "inferred" ? " (from branch)" : ""}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                  <Tooltip
+                    open={prPickerTooltipOpen && !prPickerOpen}
+                    onOpenChange={(open) => setPrPickerTooltipOpen(open && !prPickerOpen)}
+                  >
+                    <TooltipTrigger asChild>
+                      <SelectTrigger
+                        aria-label="Session pull request"
+                        className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                    </TooltipTrigger>
+                    {selectedPr && (
+                      <TooltipContent className="wrap-anywhere">
+                        {pullRequestLabel(selectedPr)}
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="w-(--radix-select-trigger-width)"
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") setPrPickerOpen(false);
+                    }}
+                  >
+                    {prs.map((pr) => (
+                      <Tooltip key={pr.url} open={prPickerOpen && focusedPrUrl === pr.url}>
+                        <TooltipTrigger asChild>
+                          <SelectItem
+                            value={pr.url}
+                            onFocus={() => setFocusedPrUrl(pr.url)}
+                            onBlur={() =>
+                              setFocusedPrUrl((current) =>
+                                current === pr.url ? undefined : current,
+                              )
+                            }
+                            className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
+                          >
+                            {pullRequestLabel(pr)}
+                          </SelectItem>
+                        </TooltipTrigger>
+                        <TooltipContent
+                          side={isMobileViewport ? "bottom" : "left"}
+                          className="wrap-anywhere"
+                          style={isMobileViewport ? { pointerEvents: "none" } : undefined}
+                        >
+                          {pullRequestLabel(pr)}
+                        </TooltipContent>
+                      </Tooltip>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </TooltipProvider>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1">
               <TooltipProvider delayDuration={0}>

@@ -22,6 +22,7 @@ import {
 } from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
+import { withBasePath } from "@/lib/basePath";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import {
@@ -265,12 +266,17 @@ function WorkspaceFileLink({
   const { open: openWorkspaceFile, unopenable, resolvedPath } = useWorkspaceFileOpener(path);
 
   if (!path) {
+    // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
+    // `/c/<id>`) under the deployment base path; no-op for external URLs, `#`
+    // fragments, and at the origin root. The router basename does not reach raw
+    // markdown anchors, so they are prefixed here.
+    const rebased = typeof href === "string" ? withBasePath(href) : href;
     // Streamdown renders external links with target="_blank"; those need the
     // popup fallback so a click still works where new tabs can't open.
-    const blankHref = props.target === "_blank" && typeof href === "string" ? href : null;
+    const blankHref = props.target === "_blank" && typeof rebased === "string" ? rebased : null;
     return (
       <a
-        href={href}
+        href={rebased}
         className={cn(STREAMDOWN_LINK_CLASS, className)}
         title={title}
         data-streamdown="link"

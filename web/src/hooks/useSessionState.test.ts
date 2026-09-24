@@ -35,19 +35,25 @@ describe("getSessionState — priority composition", () => {
   });
 
   it("flags a latest-message error even when the session has settled to idle", () => {
-    expect(getSessionState(conv({ status: "idle" }), true)).toEqual({ kind: "error" });
+    expect(getSessionState(conv({ status: "idle" }), "error")).toEqual({ kind: "error" });
   });
 
   it("keeps running and approval states ahead of a previous message error", () => {
-    expect(getSessionState(conv({ status: "running" }), true)).toEqual({ kind: "running" });
-    expect(getSessionState(conv({ status: "idle", pending_elicitations_count: 1 }), true)).toEqual({
-      kind: "awaiting",
-      count: 1,
-    });
+    expect(getSessionState(conv({ status: "running" }), "error")).toEqual({ kind: "running" });
+    expect(
+      getSessionState(conv({ status: "idle", pending_elicitations_count: 1 }), "error"),
+    ).toEqual({ kind: "awaiting", count: 1 });
   });
 
   it("returns error from the existing failed session status", () => {
     expect(getSessionState(conv({ status: "failed" }))).toEqual({ kind: "error" });
+  });
+
+  it("renders a runner disconnect neutrally and clears stale failed status after recovery", () => {
+    expect(getSessionState(conv({ status: "failed" }), "disconnected")).toEqual({
+      kind: "disconnected",
+    });
+    expect(getSessionState(conv({ status: "failed" }), "recovered_disconnect")).toBeNull();
   });
 
   it("follows status updates without retaining an old error", () => {

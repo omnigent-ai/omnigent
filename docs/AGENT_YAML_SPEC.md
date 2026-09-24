@@ -199,6 +199,41 @@ Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
 app. See the [OpenClaw integration guide](openclaw.md) for registry import,
 Gateway setup, and compatibility details.
 
+To offer a curated model picker for a custom ACP agent, explicitly reference a
+named provider in its agent spec:
+
+```yaml
+executor:
+  harness: acp:helper
+  auth:
+    type: provider
+    name: team-gateway
+```
+
+Configure at least two distinct model IDs in that provider's family `models:`
+map in `config.yaml`, for example `models: {default: model-a, fast: model-b}`.
+Tier aliases resolve to concrete IDs. The provider default leads the picker;
+session selections cannot add models to the configured list. A default-only
+map leaves model switching unrestricted, and an unrelated global default
+provider does not change custom ACP agents. An explicitly selected provider
+must resolve successfully; configuration errors do not remove model restrictions.
+
+With curation enabled, a model pinned in the spec or ACP-agent configuration
+must also appear in the list. An unlisted default prevents launch even when a
+valid override is selected; clearing a selection restores the approved default.
+
+The ACP command still owns its gateway URL and authentication; this provider
+reference supplies model choices, not credentials. Configure matching provider
+definitions on the server and execution host. Select a model from the session
+composer and send a turn to apply it through ACP without losing the live
+session, provided the command supports ACP model switching. If the switch fails,
+the turn reports an error without sending the prompt on the previous model.
+Retrying attempts the switch again in the same session.
+
+Set `OMNIGENT_ACP_ENV_UNSET` on the execution host to a comma-separated list of
+environment variable names to remove from the ACP command's environment. The
+setting propagates through the runner and affects newly spawned commands.
+
 ## Local OS access
 
 Declare `os_env` only for agents that need local file/shell tools.

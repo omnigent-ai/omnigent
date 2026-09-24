@@ -25,7 +25,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from dev.lint import lint_workspace_scoped_cache
+from dev.lint import lint_session_list_visibility, lint_workspace_scoped_cache
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,11 @@ RULES: list[Rule] = [
         name=lint_workspace_scoped_cache.RULE_NAME,
         check=lint_workspace_scoped_cache.check,
         hint=lint_workspace_scoped_cache.HINT,
+    ),
+    Rule(
+        name=lint_session_list_visibility.RULE_NAME,
+        check=lint_session_list_visibility.check,
+        hint=lint_session_list_visibility.HINT,
     ),
 ]
 

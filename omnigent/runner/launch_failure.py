@@ -185,15 +185,28 @@ _NATIVE_ERROR_HTTP_STATUS = re.compile(
     r"\s*[:=(]?\s*(\d{3})\b",
     re.IGNORECASE,
 )
+# AI-gateway budget / usage-limit markers. The gateway returns HTTP 403 +
+# PERMISSION_DENIED for these; they are not auth failures.
+_BUDGET_EXHAUSTED_FRAGMENTS = (
+    "has reached its limit",
+    "rate limit is set to 0",
+)
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies a rate limit.
 
+    Also corrects ``codex_reauth_required`` when the message reveals that the
+    real cause is a budget/usage-limit exhaustion (older runners misclassify
+    the gateway's 403 as auth; the server fixes it on deploy).
+
     :param code: Existing error code; specific diagnoses are preserved.
     :param message: Native harness error text, from its status or transcript.
-    :returns: The semantic rate-limit code, or the existing code if unrecognized.
+    :returns: The semantic error code, or the existing code if unrecognized.
     """
+    lowered = message.lower()
+    if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
+        return "budget_exhausted"
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
@@ -231,6 +244,10 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "codex_turn_error": "Codex ran into an error during this turn.",
     "native_turn_error": "The agent ran into an error during this turn.",
     "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",
+    "budget_exhausted": (
+        "The AI gateway refused this turn because a spending budget or usage limit is "
+        "exhausted. Contact an admin to raise it, or use a different budget."
+    ),
 }
 
 

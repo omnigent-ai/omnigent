@@ -92,7 +92,9 @@ import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
@@ -308,6 +310,8 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** Only the viewer for the active layout synchronizes the URL. */
+  viewport?: "desktop" | "mobile";
   /** Called when the user presses Escape to close the active file tab. */
   onCloseTab?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
@@ -349,6 +353,7 @@ function FileViewerBody({
   onNavigateTo,
   permissionLevel,
   frameless,
+  viewport,
   onCommentsOpenChange,
   sort = "recent",
 }: FileViewerProps) {
@@ -356,6 +361,8 @@ function FileViewerBody({
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
   const [searchParams, setSearchParams] = useSearchParams();
+  const isMobile = useIsMobileViewport();
+  const ownsUrl = viewport === undefined || (viewport === "mobile") === isMobile;
   // Capture URL params once on open — we don't want re-renders caused by our own
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(searchParams.get("diff") === "1");
@@ -872,7 +879,7 @@ function FileViewerBody({
   useEffect(() => {
     if (!open || !isMonacoFindSurface) return;
     const handler = (e: KeyboardEvent) => {
-      if (!((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "f")) return;
+      if (!(hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "f")) return;
       if (!viewerIsActiveSurfaceRef.current) return;
       e.preventDefault();
       e.stopPropagation();
@@ -934,7 +941,7 @@ function FileViewerBody({
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
-    if (!open) return;
+    if (!open || !ownsUrl) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
@@ -950,7 +957,7 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [diffActive, isDiffAvailable, open, searchParams, setSearchParams]);
+  }, [diffActive, isDiffAvailable, open, ownsUrl, searchParams, setSearchParams]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.

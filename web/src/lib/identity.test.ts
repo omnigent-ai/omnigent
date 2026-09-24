@@ -120,6 +120,61 @@ describe("getCurrentUserId", () => {
   });
 });
 
+describe("resolveIdentity base-path login redirect", () => {
+  let originalLocation: Location;
+
+  beforeEach(() => {
+    originalLocation = window.location;
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "location", { configurable: true, value: originalLocation });
+    delete window.__OMNIGENT_BASE_PATH__;
+  });
+
+  function mockLocation(pathname: string): void {
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        pathname,
+        search: "",
+        href: "",
+        origin: "http://localhost",
+        host: "localhost",
+        protocol: "http:",
+      },
+    });
+  }
+
+  it("redirects to the base-prefixed login URL on 401", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    mockLocation("/proxy/6767/c/abc");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(window.location.href).toBe(
+      `/proxy/6767/login?return_to=${encodeURIComponent("/proxy/6767/c/abc")}`,
+    );
+  });
+
+  it("does not redirect when already on the base-prefixed login path", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    mockLocation("/proxy/6767/login");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(window.location.href).toBe("");
+  });
+});
+
 describe("authenticatedFetch", () => {
   it("injects X-Forwarded-Email header once the identity is resolved", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice" }));

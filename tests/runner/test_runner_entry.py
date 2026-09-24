@@ -235,6 +235,47 @@ def test_make_auth_token_factory_returns_none_without_databricks_creds(
     assert _make_auth_token_factory() is None
 
 
+def test_make_auth_token_factory_re_resolves_when_reused_sdk_auth_goes_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The factory replaces stale SDK auth before retrying a mint."""
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def __init__(self, token: str) -> None:
+            self.token = token
+            self.stale = False
+
+        def authenticate(self) -> dict[str, str]:
+            if self.stale:
+                raise FileNotFoundError("baked CLI binary path was deleted")
+            return {"Authorization": f"Bearer {self.token}"}
+
+    cfgs: list[_Cfg] = []
+
+    def _resolve(profile: str | None = None) -> tuple[_DatabricksBearerAuth, str]:
+        cfgs.append(_Cfg(f"cli-token-{len(cfgs) + 1}"))
+        return _DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.test"
+
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)  # skip OIDC branch
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _resolve,
+    )
+
+    factory = _make_auth_token_factory()
+    assert factory is not None
+    assert factory() == "cli-token-1"
+
+    cfgs[0].stale = True
+
+    assert factory() == "cli-token-2", (
+        "the factory kept the stale SDK auth instead of re-resolving, so a "
+        "live session stays fail-closed after a CLI upgrade"
+    )
+    assert len(cfgs) == 2
+
+
 def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
