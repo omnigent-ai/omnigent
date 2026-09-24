@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from itertools import pairwise
+from typing import Any
 from unittest.mock import patch
 
 from playwright.sync_api import Page, expect
@@ -26,6 +27,68 @@ _TAG_SCROLLER = """
   el.setAttribute('data-pw-scroller', '1');
   el.scrollTop = el.scrollHeight;
   return el.scrollHeight > el.clientHeight + 4;
+}
+"""
+
+_WATCH = """
+() => {
+  const el = document.querySelector('[data-pw-scroller]');
+  const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+  window.__writes = [];
+  window.__thumbHeights = [];
+  const log = (from, to) => window.__writes.push([
+    performance.now(), Math.round(from), Math.round(to), Math.round(desc.get.call(el))]);
+  Object.defineProperty(el, 'scrollTop', {
+    configurable: true,
+    get() { return desc.get.call(this); },
+    set(v) { const from = desc.get.call(this); desc.set.call(this, v); log(from, v); },
+  });
+  const origScrollTo = el.scrollTo.bind(el);
+  el.scrollTo = (...args) => {
+    const from = desc.get.call(el);
+    const result = origScrollTo(...args);
+    log(from, typeof args[0] === 'object' ? args[0].top : args[1]);
+    return result;
+  };
+  const sample = () => {
+    const thumb = document.querySelector('[data-testid="transcript-scrollbar-thumb"]');
+    if (thumb) {
+      const h = Math.round(thumb.getBoundingClientRect().height);
+      if (window.__thumbHeights.at(-1) !== h) window.__thumbHeights.push(h);
+    }
+    requestAnimationFrame(sample);
+  };
+  requestAnimationFrame(sample);
+}
+"""
+
+_TRACK_ROWS = """
+() => {
+  const el = document.querySelector('[data-pw-scroller]');
+  window.__rowSamples = [];
+  const sample = () => {
+    const rows = {};
+    for (const row of el.querySelectorAll('[data-index]'))
+      rows[row.getAttribute('data-bubble-key')] = Math.round(row.getBoundingClientRect().top);
+    window.__rowSamples.push([performance.now(), Math.round(el.scrollTop), rows]);
+  };
+  const tick = () => {
+    const observer = new ResizeObserver(() => { sample(); observer.disconnect(); });
+    observer.observe(el);
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+"""
+
+_READING = """
+() => {
+  const el = document.querySelector('[data-pw-scroller]');
+  return { writes: window.__writes, rowSamples: window.__rowSamples,
+    thumbHeights: window.__thumbHeights,
+    trackHeight: document.querySelector('[data-testid="transcript-scrollbar"]')
+      .getBoundingClientRect().height,
+    scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
 }
 """
 
@@ -58,8 +121,8 @@ def _seed_turns(session_id: str) -> None:
                         content=[
                             {
                                 "type": "output_text",
-                                "text": f"reply number {turn}\\n\\n"
-                                + "\\n\\n".join(f"detail line {turn}.{line}" for line in range(6)),
+                                "text": f"reply number {turn}\n\n"
+                                + "\n\n".join(f"detail line {turn}.{line}" for line in range(6)),
                             }
                         ],
                         agent="hello_world",
@@ -68,6 +131,69 @@ def _seed_turns(session_id: str) -> None:
             ]
         )
     SqlAlchemyConversationStore(str(_server_state["database_uri"])).append(session_id, items)
+
+
+def _row_moves(
+    samples: list[list[Any]], writers: list[list[float]], since: float
+) -> list[tuple[float, int]]:
+    moves: list[tuple[float, int]] = []
+    for (t0, st0, rows0), (t1, st1, rows1) in pairwise(samples):
+        if t1 < since:
+            continue
+        common = [key for key in rows0 if key in rows1]
+        if not common:
+            continue
+        programmatic = sum(
+            int(write[3]) - int(write[1]) for write in writers if t0 < write[0] <= t1
+        )
+        reader = (st1 - st0) - programmatic
+        leftovers = sorted((rows1[key] - rows0[key]) + reader for key in common)
+        unexplained = leftovers[len(leftovers) // 2]
+        if abs(unexplained) > 4:
+            moves.append((t1, unexplained))
+    return moves
+
+
+def test_scrolling_back_through_history_never_moves_the_offset(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Paged history holds the reader and sizes the thumb to the loaded share."""
+    base_url, session_id = seeded_session
+    _seed_turns(session_id)
+    page_fetches: list[str] = []
+    page.on(
+        "request",
+        lambda request: page_fetches.append(request.url) if "after=" in request.url else None,
+    )
+    page.set_viewport_size(_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_text(_NEWEST_REPLY).first).to_be_visible(timeout=30_000)
+    assert page.evaluate(_TAG_SCROLLER), "transcript did not overflow; seed more turns"
+    page.wait_for_timeout(500)
+    page.mouse.move(_VIEWPORT["width"] // 2, _VIEWPORT["height"] // 2)
+    page.mouse.wheel(0, -400)
+    page.wait_for_timeout(400)
+    page.evaluate(_WATCH)
+    page.evaluate(_TRACK_ROWS)
+    started = page.evaluate("() => performance.now()")
+    for _ in range(40):
+        for _ in range(10):
+            page.mouse.wheel(0, -240)
+            page.wait_for_timeout(16)
+        page.wait_for_timeout(250)
+        if len(page_fetches) >= 2:
+            break
+    page.wait_for_timeout(1500)
+    reading = page.evaluate(_READING)
+    assert len(page_fetches) >= 2, page_fetches
+    assert _row_moves(reading["rowSamples"], reading["writes"], started) == []
+    heights = reading["thumbHeights"]
+    assert heights == sorted(heights, reverse=True), reading
+    expected = max(
+        56, round(reading["trackHeight"] * reading["clientHeight"] / reading["scrollHeight"])
+    )
+    assert abs(heights[-1] - expected) <= 2, (heights[-1], expected, reading)
 
 
 # --- Tool-heavy transcripts: the view holds while pages land and stops with the reader ---

@@ -9,7 +9,7 @@ from itertools import pairwise
 import pytest
 from playwright.sync_api import FloatRect, Locator, Page, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract, list_payload, message_item
+from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
 TOLERANCE = 1.0
 PHONE = {"width": 390, "height": 664}
@@ -63,6 +63,15 @@ def assert_row_grid(rows: list[FloatRect]) -> None:
         assert row["height"] == pytest.approx(first["height"], abs=TOLERANCE)
     for before, after in pairwise(rows):
         assert after["y"] - before["y"] == pytest.approx(before["height"], abs=TOLERANCE)
+
+
+def border_left_px(locator: Locator) -> float:
+    value = locator.evaluate("el => getComputedStyle(el).borderLeftWidth")
+    return float(value.removesuffix("px"))
+
+
+def assert_primitive_inset(measured: float, border_px: float = 0) -> None:
+    assert measured == pytest.approx(12 + border_px, abs=TOLERANCE)
 
 
 def open_live(
@@ -127,11 +136,7 @@ def seed_long_transcript(
 
 
 def seed_items(chat: ChatSessionContract, newest_first: list[dict]) -> None:
-    """Install special transcript rows without expanding the shared fixture API."""
-    chat.contract.json(
-        f"/v1/sessions/{chat.session_id}/items",
-        list_payload(newest_first),
-    )
+    chat.set_items(newest_first)
 
 
 GEOMETRY_PROBE = """() => {
@@ -170,6 +175,127 @@ def settled_geometry(page: Page, timeout_s: float = 15.0) -> dict:
             return current
         previous = current
     raise AssertionError(f"layout never settled; last reading: {previous}")
+
+
+def scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
+    return page.evaluate(
+        """distance => {
+          const ta = document.querySelector('textarea[aria-label="Message the agent"]');
+          const scroller = ta.closest('form').parentElement.querySelector('[role="log"] > div');
+          scroller.dispatchEvent(new WheelEvent('wheel', {deltaY: -100}));
+          scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight - distance;
+          scroller.dispatchEvent(new Event('scroll'));
+          return {scrollTop: Math.round(scroller.scrollTop), distanceFromBottom: Math.round(
+            scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)};
+        }""",
+        distance,
+    )
+
+
+def scroll_with_native_touch(page: Page) -> dict:
+    session = page.context.new_cdp_session(page)
+    try:
+        session.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 1})
+        target = page.evaluate(
+            """() => {
+              const ta = document.querySelector('textarea[aria-label="Message the agent"]');
+              const form = ta.closest('form');
+              const scroller = form.parentElement.querySelector('[role="log"] > div');
+              const rect = scroller.getBoundingClientRect();
+              const events = [];
+              const record = event => events.push(event.type);
+              for (const type of ['pointerdown', 'pointermove', 'pointercancel'])
+                window.addEventListener(type, record, {capture: true});
+              scroller.addEventListener('scroll', record);
+              scroller.addEventListener('scrollend', record);
+              window.__nativeTouchProbe = {events, scroller};
+              return {x: Math.round(rect.left + rect.width * .75),
+                y: Math.round(rect.top + Math.min(rect.height * .2, 140)),
+                initialScrollTop: Math.round(scroller.scrollTop)};
+            }"""
+        )
+        point = {
+            "x": target["x"],
+            "y": target["y"],
+            "id": 1,
+            "radiusX": 2,
+            "radiusY": 2,
+            "force": 1,
+        }
+        session.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
+        page.wait_for_timeout(50)
+        for offset in (35, 75, 120, 170, 225, 280):
+            session.send(
+                "Input.dispatchTouchEvent",
+                {"type": "touchMove", "touchPoints": [{**point, "y": point["y"] + offset}]},
+            )
+            page.wait_for_timeout(16)
+        session.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        page.wait_for_timeout(600)
+        return page.evaluate(
+            """initial => { const {events, scroller} = window.__nativeTouchProbe; return {
+              events, initialScrollTop: initial, settledScrollTop: Math.round(scroller.scrollTop),
+              settledDistance: Math.round(scroller.scrollHeight - scroller.clientHeight
+                - scroller.scrollTop)}; }""",
+            target["initialScrollTop"],
+        )
+    finally:
+        session.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
+        session.detach()
+
+
+def append_streamed_output(page: Page, height: int) -> dict:
+    return page.evaluate(
+        """height => {
+          const ta = document.querySelector('textarea[aria-label="Message the agent"]');
+          const scroller = ta.closest('form').parentElement.querySelector('[role="log"] > div');
+          const content = scroller.firstElementChild;
+          const spacer = content.lastElementChild;
+          const geometry = () => ({
+            scrollHeight: scroller.scrollHeight, scrollTop: scroller.scrollTop});
+          const before = geometry();
+          const streamed = document.createElement('div');
+          streamed.dataset.testid = 'streamed-output-probe';
+          streamed.style.cssText = `flex: 0 0 auto; height: ${height}px`;
+          streamed.textContent = 'Additional streamed output below the reader.';
+          content.insertBefore(streamed, spacer);
+          return {before, after: geometry()};
+        }""",
+        height,
+    )
+
+
+def append_output_during_composer_reflow(
+    page: Page, initial_height: int, followup_height: int
+) -> dict:
+    return page.evaluate(
+        """async ({initialHeight, followupHeight}) => {
+          const ta = document.querySelector('textarea[aria-label="Message the agent"]');
+          const scroller = ta.closest('form').parentElement.querySelector('[role="log"] > div');
+          const content = scroller.firstElementChild;
+          const spacer = content.lastElementChild;
+          const append = (height, testid) => {
+            const el = document.createElement('div');
+            el.dataset.testid = testid;
+            el.style.cssText = `flex: 0 0 auto; height: ${height}px`;
+            el.textContent = 'Additional streamed output below the reader.';
+            content.insertBefore(el, spacer);
+          };
+          const geometry = () => ({clientHeight: scroller.clientHeight,
+            scrollHeight: scroller.scrollHeight, scrollTop: scroller.scrollTop});
+          const before = geometry();
+          append(initialHeight, 'same-frame-output-probe');
+          const setter = Object.getOwnPropertyDescriptor(
+            HTMLTextAreaElement.prototype, 'value').set;
+          setter.call(ta, `${ta.value}\n\n\n`);
+          ta.dispatchEvent(new InputEvent('input', {bubbles: true}));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          append(followupHeight, 'during-reflow-output-probe');
+          return {before, afterDuringReflow: geometry()};
+        }""",
+        {"initialHeight": initial_height, "followupHeight": followup_height},
+    )
 
 
 def tag_scroller(page: Page) -> None:

@@ -13,11 +13,15 @@ from tests.browser_ui.chat._geometry_helpers import (
     PHONE,
     TABLET,
     TOLERANCE,
+    append_output_during_composer_reflow,
+    append_streamed_output,
     assert_no_overlap,
+    assert_primitive_inset,
     assert_row_grid,
     assert_same_vertical_center,
     assert_symmetric_insets,
     assert_within_viewport,
+    border_left_px,
     box,
     drag_thumb_with_mouse,
     drag_thumb_with_touch,
@@ -26,6 +30,8 @@ from tests.browser_ui.chat._geometry_helpers import (
     park_at_bottom,
     right_inset,
     scroll_state,
+    scroll_to_distance_from_bottom,
+    scroll_with_native_touch,
     seed_items,
     seed_long_transcript,
     settled_geometry,
@@ -66,7 +72,14 @@ def _submit(page: Page, surface: str):
 
 def _attach(page: Page, names: list[str]) -> None:
     page.locator('input[type="file"]').first.set_input_files(
-        [{"name": name, "mimeType": "text/plain", "buffer": b"geometry"} for name in names]
+        [
+            {
+                "name": name,
+                "mimeType": "video/mp4" if name.endswith(".mp4") else "text/plain",
+                "buffer": b"geometry",
+            }
+            for name in names
+        ]
     )
 
 
@@ -136,19 +149,24 @@ def test_content_and_action_controls_follow_shared_inset_lines(
     surface: str,
 ) -> None:
     chat = chat_session_contract
+    if surface == "landing":
+        chat.harness = "claude-native"
     _surface(page, chat, surface, DESKTOP)
-    _attach(page, ["alpha.txt", "beta.txt"])
+    _attach(page, ["alpha.txt", "clip.mp4"])
     card = box(page.locator("[data-composer-card]"))
     input_box = box(_input(page, surface))
     chip = box(page.get_by_role("button", name="Remove alpha.txt").locator(".."))
     if surface == "landing":
+        error = box(page.get_by_test_id("new-chat-landing-attachment-error"))
         leading = box(page.get_by_test_id("new-chat-landing-attach"))
         controls = [
             leading,
+            box(page.get_by_test_id("new-chat-landing-permission-chip")),
             box(page.get_by_test_id("new-chat-landing-agent-select")),
             box(_submit(page, surface)),
         ]
     else:
+        error = box(page.get_by_text(re.compile("can't be attached")))
         leading = box(page.get_by_test_id("composer-attach"))
         controls = [
             leading,
@@ -156,7 +174,9 @@ def test_content_and_action_controls_follow_shared_inset_lines(
             box(_submit(page, surface)),
         ]
     expected_left = input_box["x"] - card["x"]
+    assert_primitive_inset(expected_left, border_left_px(page.locator("[data-composer-card]")))
     assert chip["x"] - card["x"] == pytest.approx(expected_left, abs=TOLERANCE)
+    assert error["x"] - card["x"] == pytest.approx(expected_left, abs=TOLERANCE)
     assert leading["x"] - card["x"] == pytest.approx(expected_left, abs=TOLERANCE)
     assert right_inset(card, box(_submit(page, surface))) == pytest.approx(
         right_inset(card, input_box), abs=TOLERANCE
@@ -235,6 +255,10 @@ def test_wrapped_attachment_rows_keep_the_grid(
 ) -> None:
     chat = chat_session_contract
     open_live(page, chat, DESKTOP)
+    workspace = page.get_by_role("complementary", name="Workspace")
+    if not workspace.is_visible():
+        page.get_by_role("button", name="Expand right panel").click()
+        expect(workspace).to_be_visible()
     names = [
         "quarterly-planning-notes.txt",
         "customer-feedback-export.csv",
@@ -258,7 +282,12 @@ def test_wrapped_attachment_rows_keep_the_grid(
     for line in lines:
         for chip in line[1:]:
             assert_same_vertical_center(line[0], chip)
+    assert lines[0][0]["x"] == pytest.approx(
+        box(page.get_by_label("Message the agent"))["x"], abs=TOLERANCE
+    )
     assert all(line[0]["x"] == pytest.approx(lines[0][0]["x"], abs=TOLERANCE) for line in lines)
+    for above, below in pairwise(lines):
+        assert above[0]["y"] + above[0]["height"] - below[0]["y"] <= TOLERANCE
 
 
 def _register_agents(chat: ChatSessionContract, *, skills: bool = False) -> None:
@@ -289,6 +318,12 @@ def test_slash_rows_follow_the_row_grid(
         "rgba(0, 0, 0, 0)",
         "transparent",
     }
+    panel = box(hovered.locator("xpath=../.."))
+    row = box(hovered)
+    menu_chrome = border_left_px(hovered.locator("xpath=../..")) + 8
+    left = row["x"] - panel["x"] - menu_chrome
+    right = panel["x"] + panel["width"] - menu_chrome - row["x"] - row["width"]
+    assert left == pytest.approx(right, abs=TOLERANCE)
 
 
 def test_mention_chips_follow_the_row_grid(
@@ -326,11 +361,13 @@ def test_mention_chips_follow_the_row_grid(
         option.get_by_role("button", name=name).click()
     chips = [box(page.locator(f"span[title='{name}']").locator("..")) for name in names]
     for chip in chips[1:]:
+        assert chip["height"] == pytest.approx(chips[0]["height"], abs=TOLERANCE)
         assert_same_vertical_center(chips[0], chip)
     gaps = [
         chips[index + 1]["x"] - chips[index]["x"] - chips[index]["width"] for index in range(2)
     ]
     assert gaps[0] == pytest.approx(gaps[1], abs=TOLERANCE)
+    assert chips[0]["x"] == pytest.approx(box(composer)["x"], abs=TOLERANCE)
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
@@ -357,17 +394,16 @@ def test_picker_rows_follow_the_row_grid(
         ],
         selected_model="opus[1m]",
     )
+    chat.update_session(
+        labels={"omnigent.wrapper": "claude-code-native-ui"}, reasoning_effort="high"
+    )
     _surface(page, chat, surface, viewport)
     if surface == "landing":
         page.get_by_test_id("new-chat-landing-agent-select").click()
         rows = page.locator(".composer-agent-menu .composer-agent-row")
     else:
         page.get_by_test_id("composer-config-gear").click()
-        page.get_by_test_id("composer-agent-edit").click()
-        rows = page.locator(
-            "[role^='menuitem'][data-testid^='composer-agent-model-']"
-            ":not([data-testid='composer-agent-model-summary'])"
-        )
+        rows = page.locator(".composer-agent-menu [role=menuitem]")
     expect(rows.first).to_be_visible()
     rows.locator("xpath=ancestor::*[contains(@class, 'composer-agent-menu')][1]").first.evaluate(
         "el => Promise.all(el.getAnimations({subtree: true}).map(a => a.finished.catch(() => {})))"
@@ -375,6 +411,20 @@ def test_picker_rows_follow_the_row_grid(
     values = [box(rows.nth(index)) for index in range(min(rows.count(), 3))]
     assert len(values) >= 2
     assert_row_grid(values)
+    if surface == "landing":
+        icons = [box(rows.nth(index).locator("img, svg").first) for index in range(2)]
+        labels = [box(rows.nth(index).locator("span.truncate").first) for index in range(2)]
+        summaries = [
+            box(rows.nth(index).locator("[data-testid*='agent-summary-']")) for index in range(2)
+        ]
+        assert icons[0]["x"] == pytest.approx(icons[1]["x"], abs=TOLERANCE)
+    else:
+        labels = [box(rows.nth(index).locator("span.flex-1").first) for index in range(2)]
+        summaries = [box(rows.nth(index).locator("span.text-right").first) for index in range(2)]
+    assert labels[0]["x"] == pytest.approx(labels[1]["x"], abs=TOLERANCE)
+    assert summaries[0]["x"] + summaries[0]["width"] == pytest.approx(
+        summaries[1]["x"] + summaries[1]["width"], abs=TOLERANCE
+    )
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
@@ -419,9 +469,27 @@ def test_queued_rows_and_nested_workspace_share_the_tray_grid(
     assert row_boxes[0]["x"] == pytest.approx(row_boxes[1]["x"], abs=TOLERANCE)
     assert row_boxes[0]["width"] == pytest.approx(row_boxes[1]["width"], abs=TOLERANCE)
     assert row_boxes[0]["height"] == pytest.approx(row_boxes[1]["height"], abs=TOLERANCE)
+    columns = []
+    for index in range(2):
+        row = rows.nth(index)
+        columns.append(
+            {
+                "status": box(row.locator(":scope > *:first-child")),
+                "label": box(row.locator("span.truncate").first),
+                "trailing": box(row.locator(":scope > span").last),
+            }
+        )
+    for name in ("status", "label", "trailing"):
+        assert columns[0][name]["x"] == pytest.approx(columns[1][name]["x"], abs=TOLERANCE)
+    assert_primitive_inset(columns[0]["status"]["x"] - box(strip)["x"])
     tray = page.get_by_test_id("composer-workspace-controls")
     assert tray.evaluate("el => getComputedStyle(el).borderTopWidth") == "0px"
     assert box(strip)["x"] == pytest.approx(box(tray)["x"], abs=TOLERANCE)
+    card = box(page.locator("[data-composer-card]"))
+    input_box = box(composer)
+    tray_box = box(tray)
+    assert tray_box["x"] - card["x"] == pytest.approx(input_box["x"] - card["x"], abs=TOLERANCE)
+    assert right_inset(card, tray_box) == pytest.approx(tray_box["x"] - card["x"], abs=TOLERANCE)
 
 
 @pytest.mark.parametrize(
@@ -463,10 +531,13 @@ def test_chat_width_scales_while_prose_remains_readable(
     )
     open_live(page, chat, {"width": viewport_width, "height": 1080})
     expect(page.get_by_text("Responsive prose width marker.", exact=False)).to_be_visible()
+    expect(page.locator("table")).to_be_visible()
     widths = page.evaluate(
         """() => {
           const frame = document.querySelector('.chat-conversation-content');
           const composer = document.querySelector('[data-composer-card]');
+          const workspace = document.querySelector(
+            '[data-testid="composer-workspace-controls"]').parentElement;
           const bubbles = [...document.querySelectorAll(
             '[data-testid="message-bubble"][data-role="assistant"]')];
           const prose = bubbles.find(b => b.textContent.includes('Responsive prose'));
@@ -479,6 +550,9 @@ def test_chat_width_scales_while_prose_remains_readable(
             prose: prose.getBoundingClientRect().width,
             table: table.getBoundingClientRect().width,
             composer: composer.getBoundingClientRect().width,
+            workspace: workspace.getBoundingClientRect().width,
+            composerLeft: composer.getBoundingClientRect().left,
+            frameLeft: frame.getBoundingClientRect().left,
           };
         }"""
     )
@@ -486,6 +560,8 @@ def test_chat_width_scales_while_prose_remains_readable(
     assert widths["prose"] == pytest.approx(expected_prose, abs=TOLERANCE)
     assert widths["table"] == pytest.approx(widths["inner"], abs=TOLERANCE)
     assert widths["composer"] == pytest.approx(expected_frame, abs=TOLERANCE)
+    assert widths["workspace"] == pytest.approx(expected_frame, abs=TOLERANCE)
+    assert widths["composerLeft"] == pytest.approx(widths["frameLeft"], abs=TOLERANCE)
 
 
 def test_composer_fits_available_space_while_resizing(
@@ -527,7 +603,29 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
     seed_long_transcript(chat, 20)
     open_live(page, chat, {"width": 1280, "height": 720})
     composer = page.get_by_label("Message the agent")
-    composer.fill("\n".join(f"Draft line {line}" for line in range(20)))
+    transition = page.evaluate(
+        r"""async () => {
+          const composer = document.querySelector('textarea[aria-label="Message the agent"]');
+          const setter = Object.getOwnPropertyDescriptor(
+            HTMLTextAreaElement.prototype, 'value').set;
+          const samples = [];
+          for (let i = 0; i < 20; i += 1) {
+            setter.call(composer, Array.from({length: i + 1}, (_, line) =>
+              `Draft line ${line}`).join('\n'));
+            composer.dispatchEvent(new InputEvent('input', {bubbles: true}));
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            samples.push({input: getComputedStyle(composer.parentElement).overflowY,
+              root: getComputedStyle(document.documentElement).overflowY,
+              body: getComputedStyle(document.body).overflowY,
+              rootScrollTop: document.scrollingElement.scrollTop});
+          }
+          return samples;
+        }"""
+    )
+    assert all(
+        sample == {"input": "hidden", "root": "hidden", "body": "hidden", "rootScrollTop": 0}
+        for sample in transition
+    ), transition
     geometry = page.evaluate(
         """() => {
           const composer = document.querySelector('textarea[aria-label="Message the agent"]');
@@ -539,6 +637,7 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
             webkitDisplay: getComputedStyle(el, '::-webkit-scrollbar').display,
           });
           return { composer: probe(composer), transcript: probe(transcript),
+            input: getComputedStyle(composer.parentElement).overflowY,
             root: getComputedStyle(document.documentElement).overflowY,
             body: getComputedStyle(document.body).overflowY };
         }"""
@@ -548,10 +647,12 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
         assert geometry[surface]["scrollbarWidth"] == "none"
         assert geometry[surface]["webkitDisplay"] == "none"
     assert geometry["root"] == "hidden" and geometry["body"] == "hidden"
+    assert geometry["input"] == "hidden"
     composer.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     assert composer.evaluate("el => el.scrollTop") > 0
 
 
+@pytest.mark.browser_context_args(has_touch=True)
 def test_composer_growth_reflows_without_covering_output(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -562,6 +663,45 @@ def test_composer_growth_reflows_without_covering_output(
     composer = page.get_by_label("Message the agent")
     composer.click()
     baseline = settled_geometry(page)
+
+    def assert_clearance(state: dict, label: str) -> None:
+        assert abs(state["overlap"]) <= TOLERANCE, (label, state)
+        assert state["lastMessageBottom"] <= state["composerTop"] + TOLERANCE, (label, state)
+        assert state["formMarginTop"] == 0, (label, state)
+        assert state["distanceFromBottom"] <= TOLERANCE, (label, state)
+
+    def assert_reader_anchor(before: dict, after: dict, label: str) -> None:
+        assert after["viewport"][2] == pytest.approx(before["viewport"][2], abs=TOLERANCE), (
+            label,
+            before,
+            after,
+        )
+        assert len(after["messageTops"]) == len(before["messageTops"]), (label, before, after)
+        assert after["messageTops"] == pytest.approx(before["messageTops"], abs=TOLERANCE), (
+            label,
+            before,
+            after,
+        )
+
+    assert baseline["railTicks"], baseline
+    assert_clearance(baseline, "baseline")
+
+    page.locator('[role="log"] > div').first.hover()
+    page.mouse.wheel(0, -50)
+    near_bottom_escaped = settled_geometry(page)
+    assert near_bottom_escaped["distanceFromBottom"] == pytest.approx(50, abs=TOLERANCE)
+    for _ in range(3):
+        composer.press("Shift+Enter")
+    near_bottom_grown = settled_geometry(page)
+    assert_reader_anchor(near_bottom_escaped, near_bottom_grown, "near-bottom escaped growth")
+    assert abs(near_bottom_grown["overlap"]) <= TOLERANCE
+
+    for _ in range(3):
+        composer.press("Backspace")
+    settled_geometry(page)
+    scroll_to_distance_from_bottom(page, 0)
+    assert_clearance(settled_geometry(page), "after near-bottom reset")
+
     for _ in range(3):
         composer.press("Shift+Enter")
     grown = settled_geometry(page)
@@ -573,8 +713,125 @@ def test_composer_growth_reflows_without_covering_output(
     assert grown["distanceFromBottom"] <= TOLERANCE
     composer.type("hello", delay=20)
     typed = settled_geometry(page)
-    assert typed["composerHeight"] == grown["composerHeight"]
-    assert typed["messageTops"] == grown["messageTops"]
+    for key in (
+        "messageTops",
+        "composerHeight",
+        "composerTop",
+        "transcriptBottom",
+        "viewport",
+        "railTicks",
+    ):
+        assert typed[key] == grown[key], ("after typing", key, grown[key], typed[key])
+    assert_clearance(typed, "after typing")
+
+    for _ in range(len("hello") + 3):
+        composer.press("Backspace")
+    shrunk = settled_geometry(page)
+    assert shrunk["composerHeight"] == baseline["composerHeight"]
+    for key in ("messageTops", "composerTop", "transcriptBottom", "viewport", "railTicks"):
+        assert shrunk[key] == baseline[key], ("after deleting", key, baseline[key], shrunk[key])
+    assert_clearance(shrunk, "after deleting")
+
+    page.set_viewport_size({"width": 500, "height": 713})
+    page.reload()
+    expect(page.get_by_label("Message the agent")).to_be_visible()
+    composer = page.get_by_label("Message the agent")
+    composer.click()
+    touch_baseline = settled_geometry(page)
+    assert_clearance(touch_baseline, "native touch baseline")
+    touch = scroll_with_native_touch(page)
+    assert touch["settledDistance"] > 100, touch
+    assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
+    assert "pointercancel" in touch["events"] and "scroll" in touch["events"], touch
+    assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
+    touch_settled = settled_geometry(page)
+    assert touch_settled["distanceFromBottom"] == pytest.approx(touch["settledDistance"], abs=8)
+    composer.press("Shift+Enter")
+    touch_grown = settled_geometry(page)
+    assert_reader_anchor(touch_settled, touch_grown, "native touch composer growth")
+    assert abs(touch_grown["overlap"]) <= TOLERANCE
+
+    page.set_viewport_size({"width": 1280, "height": 720})
+    composer.fill("")
+    settled_geometry(page)
+    scroll_to_distance_from_bottom(page, 180)
+    escaped = settled_geometry(page)
+    assert escaped["distanceFromBottom"] == pytest.approx(180, abs=TOLERANCE)
+    appended = append_streamed_output(page, 240)
+    streamed = settled_geometry(page)
+    added_height = streamed["viewport"][1] - appended["before"]["scrollHeight"]
+    assert added_height > 0
+    assert appended["after"]["scrollTop"] == appended["before"]["scrollTop"]
+    assert streamed["distanceFromBottom"] == pytest.approx(
+        escaped["distanceFromBottom"] + added_height, abs=TOLERANCE
+    )
+    for _ in range(3):
+        composer.press("Shift+Enter")
+    streamed_grown = settled_geometry(page)
+    assert_reader_anchor(streamed, streamed_grown, "streamed composer growth")
+    assert abs(streamed_grown["overlap"]) <= TOLERANCE
+
+    for _ in range(3):
+        composer.press("Backspace")
+    settled_geometry(page)
+    append_streamed_output(page, 120)
+    after_more_output = settled_geometry(page)
+    user_distance = after_more_output["distanceFromBottom"] + 70
+    scroll_to_distance_from_bottom(page, user_distance)
+    after_user_scroll = settled_geometry(page)
+    assert after_user_scroll["distanceFromBottom"] == pytest.approx(user_distance, abs=TOLERANCE)
+    for _ in range(3):
+        composer.press("Shift+Enter")
+    after_user_scroll_grown = settled_geometry(page)
+    assert_reader_anchor(after_user_scroll, after_user_scroll_grown, "reader composer growth")
+    assert abs(after_user_scroll_grown["overlap"]) <= TOLERANCE
+
+    for _ in range(3):
+        composer.press("Backspace")
+    settled_geometry(page)
+    scroll_to_distance_from_bottom(page, 180)
+    same_frame_escaped = settled_geometry(page)
+    combined = append_output_during_composer_reflow(page, 240, 90)
+    same_frame_grown = settled_geometry(page)
+    assert same_frame_grown["viewport"][1] > combined["before"]["scrollHeight"]
+    assert same_frame_grown["viewport"][0] < combined["before"]["clientHeight"]
+    assert page.locator('[data-testid="same-frame-output-probe"]').count() == 1
+    assert page.locator('[data-testid="during-reflow-output-probe"]').count() == 1
+    assert_reader_anchor(same_frame_escaped, same_frame_grown, "same-frame reflow")
+    assert abs(same_frame_grown["overlap"]) <= TOLERANCE
+
+    composer.fill("")
+    settled_geometry(page)
+    scroll_to_distance_from_bottom(page, 400)
+    button_escaped = settled_geometry(page)
+    assert button_escaped["distanceFromBottom"] == pytest.approx(400, abs=TOLERANCE)
+    button = page.locator('[role="log"] button:has(svg.lucide-arrow-down)')
+    expect(button).to_be_visible()
+    button.click()
+    button_relocked = settled_geometry(page)
+    assert button_relocked["distanceFromBottom"] <= TOLERANCE
+    for _ in range(3):
+        composer.press("Shift+Enter")
+    button_relocked_grown = settled_geometry(page)
+    assert button_relocked_grown["composerHeight"] > button_relocked["composerHeight"]
+    assert_clearance(button_relocked_grown, "button relock growth")
+    append_streamed_output(page, 80)
+    assert settled_geometry(page)["distanceFromBottom"] <= TOLERANCE
+
+    composer.fill("")
+    settled_geometry(page)
+    scroll_to_distance_from_bottom(page, 320)
+    send_escaped = settled_geometry(page)
+    assert send_escaped["distanceFromBottom"] == pytest.approx(320, abs=TOLERANCE)
+    composer.fill("round-three line one\nline two\nline three")
+    assert settled_geometry(page)["distanceFromBottom"] >= 319
+    chat.event_ack = {"queued": False, "item_id": "geometry-send-item"}
+    page.get_by_role("button", name="Send", exact=True).click()
+    assert settled_geometry(page)["distanceFromBottom"] <= TOLERANCE
+    composer.fill("next draft\nline two\nline three")
+    send_relocked_grown = settled_geometry(page)
+    assert_clearance(send_relocked_grown, "growth after send")
+    expect(composer).to_be_focused()
 
 
 def test_composer_growth_stays_bottom_pinned_every_frame(
@@ -586,7 +843,8 @@ def test_composer_growth_stays_bottom_pinned_every_frame(
     open_live(page, chat, {"width": 1280, "height": 720})
     composer = page.get_by_label("Message the agent")
     composer.click()
-    assert settled_geometry(page)["distanceFromBottom"] <= TOLERANCE
+    baseline = settled_geometry(page)
+    assert baseline["distanceFromBottom"] <= TOLERANCE
     distances = page.evaluate(
         """async () => {
           const ta = document.querySelector('textarea[aria-label="Message the agent"]');
@@ -609,6 +867,9 @@ def test_composer_growth_stays_bottom_pinned_every_frame(
         }"""
     )
     assert max(distances, default=0) <= TOLERANCE
+    grown = settled_geometry(page)
+    assert grown["composerHeight"] > baseline["composerHeight"]
+    assert grown["distanceFromBottom"] <= TOLERANCE
 
 
 def _single_reply(chat: ChatSessionContract, words: int) -> None:
@@ -652,8 +913,11 @@ def test_fully_visible_transcript_paints_no_scrollbar(
 ) -> None:
     chat = chat_session_contract
     _single_reply(chat, 140)
-    open_live(page, chat, {"width": 1600, "height": 1000})
+    open_live(page, chat, {"width": 1400, "height": 800})
+    page.get_by_role("button", name="Expand right panel").click()
+    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
     expect(page.get_by_text("word0000", exact=False)).to_be_visible()
+    page.wait_for_timeout(1200)
     state = _fully_visible_state(page)
     assert state["first"] >= state["top"] and state["last"] <= state["bottom"] - 32
     assert not state["thumb"], state
@@ -665,10 +929,7 @@ def test_panel_resize_does_not_summon_a_ghost_scrollbar(
 ) -> None:
     chat = chat_session_contract
     _single_reply(chat, 95)
-    chat.contract.json(
-        f"/v1/sessions/{chat.session_id}",
-        lambda _request: {**chat._session(), "workspace": "/workspace"},
-    )
+    chat.update_session(workspace="/workspace")
     chat.contract.json(
         f"/v1/sessions/{chat.session_id}/resources/environments/default",
         {"metadata": {"root": "/workspace"}},
@@ -683,11 +944,6 @@ def test_panel_resize_does_not_summon_a_ghost_scrollbar(
         ),
         list_payload([]),
     )
-    chat.contract.json(
-        re.compile(r"/v1/hosts/[^/]+/worktrees(?:\?.*)?$"),
-        list_payload([]),
-    )
-    chat.contract.json("/v1/skills", list_payload([]))
     open_live(page, chat, {"width": 1600, "height": 1000})
     page.get_by_role("button", name="Expand right panel").click()
     workspace = page.get_by_role("complementary", name="Workspace")
