@@ -1151,3 +1151,44 @@ def test_trace_cleanup_attempts_both_paths_and_preserves_original_error(tmp_path
     with pytest.raises(zipfile.BadZipFile):
         sanitize_trace(path)
     assert attempts == [path, path.with_suffix(".tmp")]
+
+
+@pytest.mark.parametrize("url", ["http://[broken", "http://host:99999/path"])
+def test_malformed_url_does_not_prevent_command_or_output_collection(tmp_path, monkeypatch, url):
+    from dev.repro_env.execution import safe_url
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "execution-context.json").write_text("{}")
+    assert safe_url(url) == "[redacted-url]"
+    assert (
+        run(tmp_path, [sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit(7)", url])
+        == 7
+    )
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    assert (attempt / "stdout.txt").read_text() == "[redacted-url]\n"
+    assert json.loads((attempt / "attempt.json").read_text())["command"][-1] == "[redacted-url]"
+
+
+def test_redaction_failure_does_not_prevent_spawn_or_stop_pipe_drain(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "execution-context.json").write_text("{}")
+    nested = "[" * 2000 + "0" + "]" * 2000
+    script = """
+import sys
+print(sys.argv[1], flush=True)
+for _ in range(4000):
+    print('continued output' * 10)
+print('survived')
+sys.exit(7)
+"""
+    assert run(tmp_path, [sys.executable, "-c", script, nested]) == 7
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    saved = (attempt / "stdout.txt").read_text()
+    assert nested not in saved
+    assert saved.endswith("survived\n")
+    record = json.loads((attempt / "attempt.json").read_text())
+    assert record["command"] is None
+    assert not record["output_complete"]
+    assert {"command_redaction", "output_redaction"} <= {
+        e["operation"] for e in record["collection_errors"]
+    }

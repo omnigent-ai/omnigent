@@ -116,13 +116,16 @@ def clean(value, secrets=None):
 
 
 def safe_url(url: str) -> str:
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    if ":" in host:
-        host = f"[{host}]"
-    if parts.port is not None:
-        host += f":{parts.port}"
-    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        if parts.port is not None:
+            host += f":{parts.port}"
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    except ValueError:
+        return "[redacted-url]"
 
 
 def digest_file(path: Path) -> str:
@@ -255,7 +258,7 @@ def run(
         "attempt_id": attempt_id,
         "started_at_ns": time.time_ns(),
         "status": "incomplete",
-        "command": journal.clean(command),
+        "command": journal.capture("command_redaction", lambda: journal.clean(command)),
         "cwd": str(root),
         "python": sys.version,
         "producer": "repro_env_exec",
@@ -370,7 +373,13 @@ def run(
 
         def save_line():
             nonlocal total, saved, truncated
-            text = journal.clean(pending.decode(errors="replace"))
+            text = journal.capture(
+                "output_redaction", lambda: journal.clean(pending.decode(errors="replace"))
+            )
+            if text is None:
+                output_errors.append(name)
+                pending.clear()
+                return
             if saved is not None:
                 try:
                     available = max(0, MAX_OUTPUT - total)
@@ -490,7 +499,9 @@ def run(
         return result
     except BaseException as exc:
         record["error_type"] = type(exc).__name__
-        record["error"] = journal.clean(str(exc))
+        record["error"] = journal.capture(
+            "error_redaction", lambda exc=exc: journal.clean(str(exc))
+        )
         raise
     finally:
         if process is not None:
