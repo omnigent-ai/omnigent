@@ -51,6 +51,36 @@ _logger = logging.getLogger(__name__)
 _DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
 
 
+# GIT_* variables that would redirect repository discovery or inject config
+# into a git subprocess. Dropped from anchored invocations so an inherited
+# environment cannot point them at another repository.
+_GIT_DISCOVERY_ENV = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_PARAMETERS",
+    }
+)
+
+
+def _anchored_git_env() -> dict[str, str]:
+    """Return this process's environment minus repository-redirecting ``GIT_*``.
+
+    :returns: A copy of ``os.environ`` without :data:`_GIT_DISCOVERY_ENV`
+        and without ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_KEY_n`` /
+        ``GIT_CONFIG_VALUE_n``.
+    """
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _GIT_DISCOVERY_ENV and not k.startswith("GIT_CONFIG_")
+    }
+
+
 def _git_timeout_seconds() -> float:
     """Return the git-subprocess timeout, honoring the env override.
 
@@ -980,32 +1010,51 @@ class GitFilesystemRegistry(FilesystemRegistry):
         to be budgeted. Failures return ``None`` so callers fall back to the
         walk.
 
+        Git runs anchored at this registry's repository root, with the scope
+        passed as a pathspec rather than as the working directory: a
+        repository nested under the workspace (``sub/.git``, which a sandboxed
+        agent can create) is then never discovered, so its config cannot name
+        commands for this unsandboxed process to run. The fsmonitor hook is
+        disabled and repository-redirecting ``GIT_*`` variables are dropped
+        for the same reason.
+
         :param subdir: Directory relative to the workspace root, e.g.
             ``"src/app"``; ``""`` for the whole workspace.
         :returns: Paths relative to *subdir*, or ``None`` when git could not
             answer.
         """
-        argv = ["git", "ls-files", "-z"]
-        cwd = self._cwd / subdir if subdir else self._cwd
+        scope = self._cwd / subdir if subdir else self._cwd
+        try:
+            pathspec = scope.resolve().relative_to(self._git_root).as_posix()
+        except ValueError:
+            return None
+        argv = ["git", "-C", str(self._git_root), "-c", "core.fsmonitor=false", "ls-files", "-z"]
+        if pathspec != ".":
+            argv += ["--", f":(literal){pathspec}"]
         try:
             result = subprocess.run(
-                argv, cwd=str(cwd), capture_output=True, timeout=_git_timeout_seconds()
+                argv,
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+                env=_anchored_git_env(),
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
-            _logger.warning(
-                "GitFilesystemRegistry.list_tracked_files: %r in %s failed: %s", argv, cwd, exc
-            )
+            _logger.warning("GitFilesystemRegistry.list_tracked_files: %r failed: %s", argv, exc)
             return None
         if result.returncode != 0:
             _logger.warning(
-                "GitFilesystemRegistry.list_tracked_files: %r in %s exited %d: %s",
+                "GitFilesystemRegistry.list_tracked_files: %r exited %d: %s",
                 argv,
-                cwd,
                 result.returncode,
                 result.stderr.decode("utf-8", errors="replace").strip(),
             )
             return None
-        return [p for p in result.stdout.decode("utf-8", errors="replace").split("\0") if p]
+        prefix = "" if pathspec == "." else pathspec + "/"
+        return [
+            p[len(prefix) :]
+            for p in result.stdout.decode("utf-8", errors="replace").split("\0")
+            if len(p) > len(prefix) and p.startswith(prefix)
+        ]
 
     def last_changed_files(self) -> list[str] | None:
         return self._last_changes

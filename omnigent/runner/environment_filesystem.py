@@ -904,7 +904,7 @@ def match(dirpath, name, is_dir):
     if q not in p.lower():
         return
     try:
-        st = os.stat(dirpath + '/' + name)
+        st = os.stat(os.path.join(dirpath, name))
         results.append({'n': name, 'p': p, 's': None if is_dir else st.st_size,
                         'm': int(st.st_mtime), 'd': is_dir})
     except OSError:
@@ -932,7 +932,7 @@ def scan(walk_root, defer):
                 # committed 'node_modules -> ..' would let pass 2 escape the
                 # workspace. os.walk(followlinks=False) never crosses symlinks
                 # mid-tree; deferring only real dirs keeps that boundary intact.
-                full = dirpath + '/' + d
+                full = os.path.join(dirpath, d)
                 if not os.path.islink(full):
                     deferred.append(full)
             kept.append(d)

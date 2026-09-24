@@ -23,6 +23,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
@@ -3546,7 +3547,10 @@ def create_runner_app(
     app.state.filesystem_registry = filesystem_registry
 
     _session_fs_registries: dict[str, FilesystemRegistry] = {}
-    _search_fs_registries: dict[str, FilesystemRegistry] = {}
+    # Roots whose search registry stays warm; bounded so distinct generated
+    # workspaces cannot accumulate for the runner's lifetime.
+    _search_fs_registries: OrderedDict[str, FilesystemRegistry] = OrderedDict()
+    _search_registry_cache_size = 8
 
     def _search_registry_for_root(root: Path) -> FilesystemRegistry:
         """Registry rooted at *root*, the tree a search actually walks.
@@ -3567,6 +3571,9 @@ def create_runner_app(
             registry = create_filesystem_registry(watch_path=root)
             registry.start()
             _search_fs_registries[key] = registry
+            while len(_search_fs_registries) > _search_registry_cache_size:
+                _search_fs_registries.popitem(last=False)
+        _search_fs_registries.move_to_end(key)
         return registry
 
     async def _session_snapshot(session_id: str) -> _SessionSnapshot:

@@ -1487,8 +1487,8 @@ def test_git_line_counts_numstat_failure_degrades_but_status_intact(
 
 def test_git_list_tracked_files_is_relative_to_the_requested_subdir(tmp_path: Path) -> None:
     """Search relies on the index for repos too big to walk, so the listing must
-    cover every tracked file, ignore untracked ones, re-root under a scoped
-    directory the way the walk reports paths, and admit failure with ``None``."""
+    cover every tracked file, ignore untracked ones, and re-root under a scoped
+    directory the way the walk reports paths."""
     env = _git_env()
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
     (tmp_path / "src" / "app").mkdir(parents=True)
@@ -1502,7 +1502,9 @@ def test_git_list_tracked_files_is_relative_to_the_requested_subdir(tmp_path: Pa
 
     assert reg.list_tracked_files() == ["README.md", "src/app/main.py"]
     assert reg.list_tracked_files("src") == ["app/main.py"]
-    assert reg.list_tracked_files("missing-dir") is None
+    # Anchored at the repository root, a missing directory is just an empty
+    # scope, not a git failure.
+    assert reg.list_tracked_files("missing-dir") == []
 
 
 def test_agent_edit_registry_has_no_index_to_consult(
@@ -1534,3 +1536,32 @@ def test_git_last_changed_files_snapshots_the_paths_still_on_disk(tmp_path: Path
     # limit=1 caps the page returned, not what the snapshot retains.
     reg.list_changed_files("conv", limit=1)
     assert sorted(reg.last_changed_files() or []) == ["kept.txt", "new.txt"]
+
+
+def test_git_list_tracked_files_never_runs_a_nested_repositorys_hooks(tmp_path: Path) -> None:
+    """A sandboxed agent can create ``sub/.git`` and point its ``core.fsmonitor``
+    at any command; the scoped index read runs in this unsandboxed process, so
+    it must stay anchored at the workspace's own repository and never let git
+    discover the nested one. Also checks the scope still narrows correctly."""
+    env = _git_env()
+
+    def git(*args: str, cwd: Path) -> None:
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, env=env)
+
+    git("init", "-q", cwd=tmp_path)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.txt").write_text("a")
+    (tmp_path / "top.txt").write_text("t")
+    git("add", "-A", cwd=tmp_path)
+    git("commit", "-q", "-m", "init", cwd=tmp_path)
+    marker = tmp_path / "hook_ran"
+    hook = tmp_path / "hook.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    git("init", "-q", cwd=tmp_path / "sub")
+    git("config", "core.fsmonitor", str(hook), cwd=tmp_path / "sub")
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert reg.list_tracked_files("sub") == ["a.txt"]
+    assert reg.list_tracked_files() == ["sub/a.txt", "top.txt"]
+    assert not marker.exists(), "git discovered the nested repository and ran its hook"
