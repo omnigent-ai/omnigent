@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
@@ -125,12 +127,11 @@ def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
     page.wait_for_timeout(500)
 
     unexpected_gets: list[str] = []
-    session_get = f"/v1/sessions/{chat.session_id}?"
+    session_path = f"/v1/sessions/{chat.session_id}"
 
     def record_request(request: Request) -> None:
-        if request.method == "GET" and (
-            session_get in request.url or "/model-options" in request.url
-        ):
+        path = urlparse(request.url).path
+        if request.method == "GET" and (path == session_path or path.endswith("/model-options")):
             unexpected_gets.append(request.url)
 
     page.on("request", record_request)
