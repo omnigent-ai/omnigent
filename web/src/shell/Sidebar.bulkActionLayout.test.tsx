@@ -215,18 +215,21 @@ describe("bulk-action bar layout", () => {
     // Enter selection mode WITHOUT selecting anything yet.
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
 
-    // Both actions are present up front (not conditionally hidden) but
+    // All three actions are present up front (not conditionally hidden) but
     // disabled while nothing is selected.
     const archiveBtn = screen.getByTestId("bulk-archive");
     const deleteBtn = screen.getByTestId("bulk-delete");
+    const moveBtn = screen.getByTestId("bulk-move-to-project");
     expect(archiveBtn).toBeDisabled();
     expect(deleteBtn).toBeDisabled();
+    expect(moveBtn).toBeDisabled();
     expect(screen.getByText("0 selected")).toBeInTheDocument();
 
-    // Selecting a row enables both.
+    // Selecting a row enables all three actions.
     fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
     expect(archiveBtn).toBeEnabled();
     expect(deleteBtn).toBeEnabled();
+    expect(moveBtn).toBeEnabled();
     expect(screen.getByText("1 selected")).toBeInTheDocument();
   });
 
