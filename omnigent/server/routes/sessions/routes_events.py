@@ -629,7 +629,10 @@ def register_events_routes(
                 await _post_event_impl(request, batch.session_id, body)
             except OmnigentError as exc:
                 return EventAckFrame(
-                    batch.id, index, exc.code, retryable=exc.http_status in {429, 502, 503, 504}
+                    batch.id,
+                    index,
+                    exc.code,
+                    retryable=exc.http_status in {408, 429} or exc.http_status >= 500,
                 )
             except ValueError:
                 return EventAckFrame(batch.id, index, "invalid session event")

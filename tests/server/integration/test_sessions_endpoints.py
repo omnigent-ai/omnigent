@@ -32,6 +32,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
@@ -1440,6 +1441,42 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     assert [event["type"] for event in published].count("response.output_text.delta") == 1
     items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
     assert [item["content"][0]["text"] for item in items] == ["saved"]
+
+
+async def test_runner_ingest_retries_internal_server_failures(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(session["id"], "runner-a")
+
+    async def fail_persist(*_args: Any, **_kwargs: Any) -> None:
+        raise OmnigentError("temporary store failure", code=ErrorCode.INTERNAL_ERROR)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._persist_external_conversation_item",
+        fail_persist,
+    )
+    ack = await app.state.runner_event_ingest(
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="runner-a",
+        batch=EventBatchFrame(
+            id="b-fail",
+            session_id=session["id"],
+            events=[
+                {
+                    "type": "external_conversation_item",
+                    "data": {"source_id": "record-a", "item_type": "message", "item_data": {}},
+                }
+            ],
+        ),
+    )
+    assert ack.applied == 0 and ack.retryable
 
 
 async def test_session_event_batch_rejects_body_over_ten_mib(
