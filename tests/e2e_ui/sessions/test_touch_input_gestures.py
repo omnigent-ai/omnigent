@@ -1,13 +1,4 @@
-"""E2E: touch input across the web shell.
-
-Five journeys, each driven with real (CDP-synthesized) touch input against the
-live SPA so Chromium's gesture recognizer arbitrates them as a finger would:
-a touch drag on a pane divider resizes it, a horizontal swipe on a session row
-tracks the finger, a leftward swipe opens the default delete confirmation,
-a long-press with realistic finger wobble opens the row menu, and an unfolded
-foldable (touch at md+ width) drops the row's hover controls in favor of the
-long-press menu.
-"""
+"""CDP touch journeys for resize, row swipe, long-press, and tablet controls."""
 
 from __future__ import annotations
 
