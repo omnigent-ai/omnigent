@@ -28,13 +28,12 @@ def exchange(page, url, timeout=5000):
     )
 
 
-def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
+def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path, browser):
     import shutil
     import threading
     import zipfile
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    from playwright.sync_api import sync_playwright
     from websockets.sync.server import serve
 
     class Handler(BaseHTTPRequestHandler):
@@ -67,9 +66,7 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
     collector.node = "browser-attempt"
     try:
         collector.install_browser()
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(args=["--no-sandbox"])
-            context = browser.new_context(record_video_dir=str(tmp_path / "temporary-video"))
+        with browser.new_context(record_video_dir=str(tmp_path / "temporary-video")) as context:
             page = context.new_page()
             base = f"http://127.0.0.1:{server.server_port}"
             page.goto(base)
@@ -87,8 +84,6 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
             port = sockets.socket.getsockname()[1]
             result = exchange(page, f"ws://127.0.0.1:{port}/terminal")
             assert result == "observed-output"
-            context.close()
-            browser.close()
         shutil.rmtree(tmp_path / "temporary-video")
         saved = events(tmp_path / "saved")
         assert any(
@@ -130,11 +125,11 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["close", "silent", "mismatch"])
-def test_websocket_exchange_finishes_when_server_does_not_reply_as_expected(mode):
+def test_websocket_exchange_finishes_when_server_does_not_reply_as_expected(mode, browser):
     import contextlib
     import threading
 
-    from playwright.sync_api import Error, sync_playwright
+    from playwright.sync_api import Error
     from websockets.exceptions import ConnectionClosed
     from websockets.sync.server import serve
 
@@ -150,9 +145,7 @@ def test_websocket_exchange_finishes_when_server_does_not_reply_as_expected(mode
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(args=["--no-sandbox"])
-            context = browser.new_context()
+        with browser.new_context() as context:
             page = context.new_page()
             url = f"ws://127.0.0.1:{server.socket.getsockname()[1]}/terminal"
             if mode == "mismatch":
@@ -161,8 +154,6 @@ def test_websocket_exchange_finishes_when_server_does_not_reply_as_expected(mode
                 expected = "closed before response" if mode == "close" else "timed out"
                 with pytest.raises(Error, match=expected):
                     exchange(page, url, timeout=1000)
-            context.close()
-            browser.close()
     finally:
         server.shutdown()
         thread.join(timeout=3)
