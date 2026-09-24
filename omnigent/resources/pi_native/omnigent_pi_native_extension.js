@@ -939,6 +939,16 @@ async function triggerCompaction(config, ctx, customInstructions) {
  *   - Applied: return true. The paired ``model_select`` handler mirrors the
  *     resulting model back to Omnigent, so the web pill reflects the switch.
  */
+const inferenceProviderIds = new Set([
+  "omnigent",
+  "omnigent-openai",
+  "omnigent-completions",
+]);
+
+function hasInferenceBinding() {
+  return process.env.OMNIGENT_PI_INFERENCE_BOUND === "1";
+}
+
 async function applyModelChange(pi, config, ctx, modelId) {
   const id = typeof modelId === "string" ? modelId.trim() : "";
   if (!id) return false;
@@ -965,9 +975,24 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
   let model;
   try {
-    const models = listModels();
+    const models = listModels().filter(
+      (candidate) =>
+        !hasInferenceBinding() ||
+        (candidate && inferenceProviderIds.has(candidate.provider)),
+    );
     const separator = id.indexOf("/");
-    if (separator > 0) {
+    if (hasInferenceBinding()) {
+      // Profile IDs are literal, including slashes that resemble Pi providers.
+      model = models.find((candidate) => candidate && candidate.id === id);
+      if (!model && separator > 0 && inferenceProviderIds.has(id.slice(0, separator))) {
+        model = models.find(
+          (candidate) =>
+            candidate &&
+            candidate.provider === id.slice(0, separator) &&
+            candidate.id === id.slice(separator + 1),
+        );
+      }
+    } else if (separator > 0) {
       const provider = id.slice(0, separator);
       const bareId = id.slice(separator + 1);
       model = models.find(
@@ -1035,6 +1060,7 @@ function modelReference(model) {
   const modelId = model && typeof model.id === "string" ? model.id : "";
   if (!modelId) return "";
   const provider = model && typeof model.provider === "string" ? model.provider : "";
+  if (hasInferenceBinding() && inferenceProviderIds.has(provider)) return modelId;
   return provider ? `${provider}/${modelId}` : modelId;
 }
 
@@ -1075,6 +1101,7 @@ async function postModelOptions(config, ctx) {
   const options = [];
   const seen = new Set();
   for (const model of models) {
+    if (hasInferenceBinding() && (!model || !inferenceProviderIds.has(model.provider))) continue;
     const modelId = model && typeof model.id === "string" ? model.id : "";
     const id = modelReference(model);
     if (!id || seen.has(id)) continue;
@@ -1097,6 +1124,7 @@ function startInboxPoller(
   handleCompact,
   handleModelChange,
   handleThinkingLevelChange,
+  isTurnActive,
 ) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
@@ -1142,8 +1170,21 @@ function startInboxPoller(
         payload.type === "user_message" &&
         typeof payload.content === "string"
       ) {
+        // Mid-turn messages must STEER into the active turn: the Pi SDK
+        // holds deliverAs "followUp" until the whole agent loop finishes, so
+        // a web "Send now" delivered as a follow-up stays visibly queued in
+        // the Pi CLI even though the web UI already reported success. When
+        // the agent is idle, keep "followUp" — it starts the next turn
+        // immediately, preserving initiating-message behavior. A turn ending
+        // between this check and the send is benign: the message still
+        // reaches Pi's queue, and a throw leaves the file for the next tick,
+        // which recomputes the mode.
+        const deliverAs =
+          typeof isTurnActive === "function" && isTurnActive()
+            ? "steer"
+            : "followUp";
         try {
-          pi.sendUserMessage(payload.content, { deliverAs: "followUp" });
+          pi.sendUserMessage(payload.content, { deliverAs });
         } catch (_err) {
           // Leave the file to retry next tick, capped by attempt count.
           const key = id ?? fullPath;
@@ -1827,6 +1868,13 @@ module.exports = function (pi) {
         triggerCompaction(config, latestContext, customInstructions),
       (model) => applyModelChange(pi, config, latestContext, model),
       (level) => pi.setThinkingLevel(level),
+      () => {
+        // Prefer the SDK's live idle signal; fall back to the agent loop
+        // state on SDK versions that don't expose isIdle() (same fallback
+        // as requestInterrupt).
+        const idle = safeIsIdle(latestContext);
+        return idle === null ? agentRunning : !idle;
+      },
     );
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId

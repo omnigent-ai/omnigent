@@ -153,10 +153,10 @@ async def test_unknown_and_unowned_project_are_404(
 
 
 async def test_workspace_outside_configured_root_is_allowed_silently(
-    project_create_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    project_create_client: httpx.AsyncClient,
 ) -> None:
     """A per-session working directory outside the project root is a deliberate
-    choice, not a mismatch — no warning, and strict mode does not reject it."""
+    choice — the session is created with no warning surfaced."""
     project_id = await _project(
         project_create_client,
         {"agent_id": CUSTOM_AGENT_ID, "workspace": "/work/project"},
@@ -170,53 +170,30 @@ async def test_workspace_outside_configured_root_is_allowed_silently(
     assert response.status_code == 201, response.text
     assert "warnings" not in response.json()
 
-    # Strict mode still gates other mismatches (e.g. agent), but a differing
-    # workspace no longer produces a warning to escalate.
-    monkeypatch.setenv("OMNIGENT_STRICT_PROJECT_SESSION_CREATE", "1")
-    response = await project_create_client.post("/v1/sessions", json=payload, headers=_headers())
+
+@pytest.mark.parametrize("agent_id", [BUILTIN_AGENT_ID, OTHER_AGENT_ID])
+async def test_explicit_agent_differing_from_pin_is_allowed_silently(
+    project_create_client: httpx.AsyncClient,
+    agent_id: str,
+) -> None:
+    """An explicit agent differing from the project's pin (builtin or custom)
+    binds as requested and surfaces no warning."""
+    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "agent_id": agent_id},
+        headers=_headers(),
+    )
     assert response.status_code == 201, response.text
+    assert response.json()["agent_id"] == agent_id
     assert "warnings" not in response.json()
 
 
-async def test_builtin_agent_mismatch_warning_surfaces(
+async def test_fork_of_mismatched_session_stays_clean(
     project_create_client: httpx.AsyncClient,
 ) -> None:
-    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
-    response = await project_create_client.post(
-        "/v1/sessions",
-        json={"project_id": project_id, "agent_id": BUILTIN_AGENT_ID},
-        headers=_headers(),
-    )
-    assert response.status_code == 201, response.text
-    assert response.json()["warnings"][0]["code"] == "project_agent_mismatch"
-
-
-async def test_custom_agent_mismatch_warning_surfaces(
-    project_create_client: httpx.AsyncClient,
-) -> None:
-    """Any explicit agent differing from the pin warns, not just builtins."""
-    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
-    response = await project_create_client.post(
-        "/v1/sessions",
-        json={"project_id": project_id, "agent_id": OTHER_AGENT_ID},
-        headers=_headers(),
-    )
-    assert response.status_code == 201, response.text
-    assert response.json()["warnings"][0]["code"] == "project_agent_mismatch"
-
-
-@pytest.mark.parametrize("strict", [False, True])
-async def test_fork_of_mismatched_session_emits_no_warnings(
-    project_create_client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    strict: bool,
-) -> None:
-    """Forking a session whose agent mismatches its project stays clean.
-
-    The fork never requested a project — the mismatch belongs to the source
-    session — so the fork response gains no ``warnings`` key and strict mode
-    must not reject it.
-    """
+    """Forking a session whose agent differs from its project files into the
+    same project and surfaces no warning."""
     project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
     created = await project_create_client.post(
         "/v1/sessions", json={"agent_id": BUILTIN_AGENT_ID}, headers=_headers()
@@ -229,8 +206,6 @@ async def test_fork_of_mismatched_session_emits_no_warnings(
         headers=_headers(),
     )
     assert moved.status_code == 200, moved.text
-    if strict:
-        monkeypatch.setenv("OMNIGENT_STRICT_PROJECT_SESSION_CREATE", "1")
     fork = await project_create_client.post(
         f"/v1/sessions/{session_id}/fork", json={}, headers=_headers()
     )
@@ -435,7 +410,7 @@ async def test_explicit_null_workspace_is_not_defaulted(
     assert response.json()["workspace"] is None
 
 
-async def test_git_default_fill_with_differing_workspace_emits_no_warning(db_uri: str) -> None:
+async def test_git_default_fill_with_differing_workspace(db_uri: str) -> None:
     project_store = SqlAlchemyProjectStore(db_uri)
     project = project_store.create(
         "487b7cb7ac30abf4debfaa578d052ec6",
@@ -457,10 +432,10 @@ async def test_git_default_fill_with_differing_workspace_emits_no_warning(db_uri
         project_store=project_store,
     )
     # The omitted git block is default-filled from config; an explicit workspace
-    # outside the project root is a deliberate choice and emits no warning.
+    # outside the project root is a deliberate choice and is left untouched.
     assert resolved.body.git is not None
     assert resolved.body.git.branch_name == "feature/project"
-    assert resolved.warnings == ()
+    assert resolved.body.workspace == "/work/other"
 
 
 async def test_multipart_create_defaults_workspace_and_files_atomically(

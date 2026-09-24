@@ -77,14 +77,15 @@ test coverage is not needed for this change.
 One line, in the user's voice, describing the user-facing change. The category
 is taken from the "Type of change" boxes above (e.g. UI / frontend change renders
 as "[UI] <your line>"), so don't repeat it here — just describe the change. The
-PR link is added for you.
+PR link and author credit are added for you.
 
 Lower the bar than docs: DO keep this for small features and UX changes
 (moved/renamed buttons, new flags, copy tweaks).
 
 DELETE THIS WHOLE SECTION if the change isn't noteworthy (CI, refactors,
-test-only changes, dependency bumps with no user impact) — it will simply be
-left out of the changelog. A Breaking change must always keep this section.
+test-only changes, dependency bumps with no user impact). The complete changelog
+will use the PR title and still credit the author. A Breaking change must always
+keep this section.
 
 Example:  `omnigent run --watch` reruns an agent when files change
 -->

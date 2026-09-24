@@ -9,8 +9,8 @@ from urllib.request import Request, urlopen
 
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.comments import (
-    COMMENT_MARKER,
     build_triage_comment,
+    is_triage_comment,
     preserve_needs_info_deadline,
 )
 from issue_prioritization.labels import LabelManifest
@@ -24,6 +24,11 @@ from issue_prioritization.mutations import (
 from issue_prioritization.pipeline import PipelineRun
 
 DUPLICATE_COMMENT_MARKER = "<!-- omnigent-duplicate-check -->"
+
+
+class GitHubNotFound(RuntimeError):
+    """A GitHub resource returned 404 — e.g. an issue deleted or transferred out
+    of the repo since the bronze snapshot. Callers may skip it, not fail."""
 
 
 class GitHubLabels(Protocol):
@@ -212,13 +217,17 @@ class GitHubClient:
             page += 1
         return tuple(issues[:limit])
 
-    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+    def open_issue(
+        self, issue_number: int, *, full_author_history: bool = False
+    ) -> BronzeIssue | None:
         value = self.issue_data(issue_number)
         if value.get("state") != "open" or "pull_request" in value:
             return None
         author = value.get("user")
         author_login = str(author.get("login", "")) if isinstance(author, dict) else ""
         comments = self._author_comments(issue_number, author_login)
+        if not full_author_history:
+            comments = tuple(comment[:4000] for comment in comments[-5:])
         if comments:
             original_body = str(value.get("body") or "")
             value = {
@@ -247,10 +256,14 @@ class GitHubClient:
                 user = comment.get("user")
                 login = str(user.get("login", "")) if isinstance(user, dict) else ""
                 body = str(comment.get("body") or "").strip()
-                if login.casefold() == author_login.casefold() and body:
-                    comments.append(body[:4000])
+                if (
+                    login.casefold() == author_login.casefold()
+                    and body
+                    and not is_triage_comment(body)
+                ):
+                    comments.append(body)
             if len(value) < 100:
-                return tuple(comments[-5:])
+                return tuple(comments)
             page += 1
 
     def apply_labels(
@@ -279,8 +292,8 @@ class GitHubClient:
             if not isinstance(value, list):
                 raise ValueError("GitHub issue comments response must be an array")
             for comment in value:
-                if not isinstance(comment, dict) or COMMENT_MARKER not in str(
-                    comment.get("body", "")
+                if not isinstance(comment, dict) or not is_triage_comment(
+                    str(comment.get("body", ""))
                 ):
                     continue
                 comment_id = int(comment["id"])
@@ -371,7 +384,10 @@ class GitHubClient:
                 content = response.read()
         except HTTPError as exc:
             detail = exc.read().decode(errors="replace")
-            raise RuntimeError(f"GitHub API {method} {path} failed: {exc.code} {detail}") from exc
+            message = f"GitHub API {method} {path} failed: {exc.code} {detail}"
+            if exc.code == 404:
+                raise GitHubNotFound(message) from exc
+            raise RuntimeError(message) from exc
         return json.loads(content) if content else None
 
 
@@ -411,36 +427,47 @@ class GitHubMutationSink:
         states = self.states.load()
         updated = []
         applied = []
+        skipped: list[int] = []
         try:
             for proposed in run.mutations:
                 issue_number = proposed.target.issue_number
-                current_labels = self.client.issue_labels(issue_number)
-                state = self.planner.resolve_state(
-                    issue_number,
-                    current_labels,
-                    states.get(issue_number),
-                )
-                target = proposed.target
-                if self.target_resolver is not None:
-                    target = self.target_resolver(target, current_labels, state)
-                plan = self.planner.plan_one(target, current_labels, state)
-                if plan.labels_add or plan.labels_remove:
-                    self.client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
-                applied.append(plan)
-                previous = states.get(issue_number)
-                if plan.next_state != previous and (
-                    previous is not None or plan.next_state.has_ownership
-                ):
-                    updated.append(plan.next_state)
-                states[issue_number] = plan.next_state
-                labels_after = _labels_after(current_labels, plan)
-                if item := ranked.get(issue_number):
-                    self.client.upsert_issue_comment(
+                try:
+                    current_labels = self.client.issue_labels(issue_number)
+                    state = self.planner.resolve_state(
                         issue_number,
-                        build_triage_comment(item, plan, labels_after, run.scored_at),
+                        current_labels,
+                        states.get(issue_number),
                     )
+                    target = proposed.target
+                    if self.target_resolver is not None:
+                        target = self.target_resolver(target, current_labels, state)
+                    plan = self.planner.plan_one(target, current_labels, state)
+                    if plan.labels_add or plan.labels_remove:
+                        self.client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
+                    applied.append(plan)
+                    previous = states.get(issue_number)
+                    if plan.next_state != previous and (
+                        previous is not None or plan.next_state.has_ownership
+                    ):
+                        updated.append(plan.next_state)
+                    states[issue_number] = plan.next_state
+                    labels_after = _labels_after(current_labels, plan)
+                    if item := ranked.get(issue_number):
+                        self.client.upsert_issue_comment(
+                            issue_number,
+                            build_triage_comment(item, plan, labels_after, run.scored_at),
+                        )
+                except GitHubNotFound:
+                    # The bronze snapshot lags GitHub: an issue deleted or
+                    # transferred since ingestion 404s on this live re-check.
+                    # Skip it rather than abort the whole apply.
+                    skipped.append(issue_number)
         finally:
             self.states.upsert(updated)
+        if skipped:
+            print(
+                f"Skipped {len(skipped)} issue(s) gone from GitHub (deleted/transferred): {skipped}"
+            )
         return tuple(applied)
 
 

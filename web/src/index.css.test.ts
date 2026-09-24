@@ -39,6 +39,56 @@ const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 // every rule-extraction below so the block grammar lives in one place.
 const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
+describe("composer picker single highlight", () => {
+  const rules = cssBlocks
+    .map(([block]) => block)
+    .filter((block) => block.includes(".composer-agent-menu"));
+  const highlightRule = rules.find((block) => block.includes("background-color: var(--muted)"))!;
+
+  it("uses shared input and submenu state instead of stale native focus-visible", () => {
+    expect(highlightRule).toBeDefined();
+    const selectors = selectorOf(highlightRule).replace(/\s+/g, " ");
+    expect(selectors).toContain('.composer-agent-menu[data-initial-selection="true"]');
+    expect(selectors).toContain(
+      '.composer-agent-menu[data-input-method="pointer"]:not([data-initial-selection="true"])',
+    );
+    expect(selectors).toContain(
+      '.composer-agent-menu[data-input-method="keyboard"] .composer-agent-row:focus-within',
+    );
+    expect(selectors).toContain(
+      '.composer-agent-menu .composer-agent-row:has(> [aria-haspopup="menu"][data-state="open"])',
+    );
+    const interactionSelectors = selectors.slice(
+      selectors.indexOf(", .composer-agent-menu[data-input-method"),
+    );
+    expect(selectors).toContain('[data-active="true"]');
+    expect(interactionSelectors).not.toContain('[data-active="true"]');
+    expect(rules.join("\n")).not.toContain(":focus-visible");
+    expect(
+      rules.find((block) => selectorOf(block) === '.composer-agent-menu [role^="menuitem"]'),
+    ).toContain("background-color: transparent");
+  });
+
+  it("uses pointer cursors only on enabled picker items", () => {
+    const cursorRule = rules.find((block) => block.includes("cursor: pointer"))!;
+    const { getByTestId } = render(
+      createElement(
+        "div",
+        { className: "composer-agent-menu" },
+        createElement("div", { role: "menuitem", "data-testid": "enabled" }),
+        createElement("div", {
+          role: "menuitemcheckbox",
+          "data-testid": "disabled",
+          "data-disabled": "",
+        }),
+      ),
+    );
+    expect(getByTestId("enabled").matches(selectorOf(cursorRule))).toBe(true);
+    expect(getByTestId("disabled").matches(selectorOf(cursorRule))).toBe(false);
+    cleanup();
+  });
+});
+
 /* Regression test for the "transparent dropdown in prod" bug.
  *
  * Dark mode renders popovers/cards with a semi-transparent background that

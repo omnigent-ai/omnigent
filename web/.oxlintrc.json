@@ -98,7 +98,7 @@
       }
     },
     {
-      "files": ["src/lib/identity.ts", "src/lib/sessionHost.ts"],
+      "files": ["src/lib/identity.ts", "src/lib/sessionHost.ts", "src/lib/basePath.ts"],
       "rules": {
         "no-underscore-dangle": "off"
       }
@@ -107,7 +107,8 @@
       "files": ["**/*.test.ts", "**/*.test.tsx"],
       "rules": {
         "no-restricted-globals": "off",
-        "no-restricted-imports": "off"
+        "no-restricted-imports": "off",
+        "no-underscore-dangle": "off"
       }
     },
     {

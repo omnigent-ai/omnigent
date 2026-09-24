@@ -29,6 +29,10 @@ or a trusted-proxy header, so a cross-origin page cannot ride the user's
 credentials. The middleware leaves those modes as passthrough unless the
 deployment opts into an explicit allowlist via
 ``OMNIGENT_WS_ALLOWED_ORIGINS``.
+
+An allowlist entry's host may start with ``*.`` to trust every
+subdomain of a domain in one entry, e.g. ``https://*.ts.net`` for a
+Tailscale MagicDNS tailnet (see :func:`_wildcard_entry_suffix`).
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from urllib.parse import urlsplit
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from omnigent.process_logging import log_once
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.auth import local_single_user_enabled
 
@@ -103,14 +108,104 @@ def parse_allowed_origins() -> frozenset[str]:
     """Read the optional explicit origin allowlist from the environment.
 
     Reads ``OMNIGENT_WS_ALLOWED_ORIGINS`` (comma-separated). Whitespace
-    around each entry is stripped and empty entries are dropped.
+    around each entry is stripped and empty entries are dropped. An
+    entry's host may start with ``*.`` to match every subdomain of a
+    domain (see :func:`_origin_matches_wildcard_entry`); entries are
+    returned as-is, unparsed, and wildcard expansion happens later at
+    match time in :func:`origin_allowed`.
+
+    An entry containing ``*`` that doesn't parse as a valid wildcard (see
+    :func:`_wildcard_entry_suffix`) logs a warning — it will never match
+    any ``Origin``, and without this, the only symptom is a legitimate
+    origin mysteriously getting rejected with no diagnostic pointing at
+    the bad entry.
 
     :returns: The set of explicitly allowed origins, e.g.
-        ``frozenset({"https://app.example.com"})``; empty when the env
-        var is unset or blank.
+        ``frozenset({"https://app.example.com", "https://*.ts.net"})``;
+        empty when the env var is unset or blank.
     """
     raw = os.environ.get(_ALLOWED_ORIGINS_ENV, "")
-    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+    entries = frozenset(part.strip() for part in raw.split(",") if part.strip())
+    for entry in entries:
+        if "*" in entry and _wildcard_entry_suffix(entry) is None:
+            # This runs on every connection; log once so a persistent
+            # misconfiguration doesn't flood the logs.
+            log_once(
+                _logger,
+                logging.WARNING,
+                "%s entry %r looks like a wildcard pattern but is malformed "
+                "(expected 'scheme://*.<domain>', with '*' as the entire "
+                "leftmost label) — it will never match any Origin",
+                _ALLOWED_ORIGINS_ENV,
+                entry,
+            )
+    return entries
+
+
+def _wildcard_entry_suffix(entry: str) -> tuple[str, str, int | None] | None:
+    """Parse a ``scheme://*.<domain>[:port]`` allowlist entry.
+
+    :param entry: One raw allowlist entry, e.g. ``"https://*.ts.net"``.
+    :returns: ``(scheme, dotted_suffix, port)`` — ``dotted_suffix`` keeps
+        its leading ``.`` (e.g. ``".ts.net"``) so a suffix match can never
+        cross a label boundary — when ``entry``'s host is exactly a
+        ``*.`` leftmost label followed by a non-empty domain, and the
+        entry carries nothing beyond ``scheme://*.<domain>[:port]`` (no
+        path, query, fragment, or userinfo — those have no meaning for an
+        ``Origin``, which is exactly ``scheme://host[:port]``, so any
+        entry carrying one is a malformed pattern, not a decorated valid
+        one). ``None`` when ``entry`` is not a wildcard entry at all, or
+        is one with an ambiguous, decorated, or empty pattern (a bare
+        ``*``, ``*.``, a second ``*`` anywhere, a path/query/fragment/
+        userinfo, or the wildcard outside the leftmost label) — those
+        never match anything rather than risk over-matching.
+    """
+    try:
+        parts = urlsplit(entry)
+        port = parts.port  # raises ValueError lazily for an out-of-range port
+    except ValueError:
+        return None
+    if (
+        parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+        or parts.username
+        or parts.password
+    ):
+        return None
+    host = parts.hostname
+    if not parts.scheme or host is None or not host.startswith("*."):
+        return None
+    suffix = host[1:]  # keep the leading "." from "*.<domain>" -> ".<domain>"
+    if suffix == "." or "*" in suffix:
+        return None
+    return parts.scheme, suffix, port
+
+
+def _origin_matches_wildcard_entry(origin: str, entry: str) -> bool:
+    """Check whether ``origin`` matches one ``*.``-prefixed allowlist entry.
+
+    :param origin: The connection's ``Origin`` header value.
+    :param entry: One raw allowlist entry, e.g. ``"https://*.ts.net"``.
+    :returns: ``True`` when ``entry`` is a valid wildcard entry and
+        ``origin`` shares its scheme and port and its hostname ends with
+        the entry's domain suffix (at any subdomain depth, but never the
+        bare domain itself — the leading ``.`` kept in the suffix rules
+        that out).
+    """
+    parsed_entry = _wildcard_entry_suffix(entry)
+    if parsed_entry is None:
+        return False
+    entry_scheme, suffix, entry_port = parsed_entry
+    try:
+        parts = urlsplit(origin)
+        origin_port = parts.port  # raises ValueError lazily for an out-of-range port
+    except ValueError:
+        return False
+    host = parts.hostname
+    if host is None:
+        return False
+    return parts.scheme == entry_scheme and origin_port == entry_port and host.endswith(suffix)
 
 
 def origin_allowed(
@@ -128,8 +223,16 @@ def origin_allowed(
 
     Policy:
 
-    - The first-party sentinel (:data:`OMNIGENT_INTERNAL_WS_ORIGIN`) and
-      any origin in ``extra_allowed`` are always allowed.
+    - The first-party sentinel (:data:`OMNIGENT_INTERNAL_WS_ORIGIN`), any
+      origin literally in ``extra_allowed``, and any origin matching a
+      ``*.``-prefixed wildcard entry in ``extra_allowed`` (e.g.
+      ``https://*.ts.net`` trusting every ``*.ts.net`` subdomain — see
+      :func:`_origin_matches_wildcard_entry`) are always allowed. An
+      origin containing ``*`` is never admitted via literal equality —
+      ``*`` isn't a valid hostname character, so no real browser can ever
+      send one; it is resolved purely as a wildcard pattern (valid →
+      suffix match, invalid → matches nothing), never as an exact-string
+      replay of a configured entry.
     - A missing ``Origin`` is allowed: non-browser clients never send one,
       and browsers always do (the header is on the forbidden-header list,
       so page JS cannot strip or forge it), so its absence is not a
@@ -151,7 +254,10 @@ def origin_allowed(
     """
     if origin == OMNIGENT_INTERNAL_WS_ORIGIN:
         return True
-    if origin is not None and origin in extra_allowed:
+    if origin is not None and (
+        ("*" not in origin and origin in extra_allowed)
+        or any(_origin_matches_wildcard_entry(origin, entry) for entry in extra_allowed)
+    ):
         return True
     if origin is None:
         return True

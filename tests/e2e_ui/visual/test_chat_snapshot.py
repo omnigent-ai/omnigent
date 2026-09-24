@@ -168,6 +168,7 @@ _TOKEN_SPANS = '[data-streamdown="code-block-body"] span[style*="--sdm-c"]'
 
 
 @pytest.mark.visual
+@pytest.mark.workspace_panel_product_default
 def test_chat_conversation_matches_baseline(
     snapshot_page: Page,
     live_server: str,

@@ -40,11 +40,9 @@ export function ViewModeToggle() {
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
-      // Inset track: p-0.5 around two size-6 segments lands the control at
-      // 32px tall, matching the header's other controls. Desktop-only — on a
-      // mobile viewport the component returns null and the switch folds into
-      // the header kebab instead (ViewModeMenuItems).
-      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
+      // Two 36×24 segments separated by 2px make a flush 74×24 track.
+      // Desktop-only — mobile folds the switch into the header kebab.
+      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0"
     >
       <ViewModeSegment
         label="Chat view"
@@ -53,7 +51,7 @@ export function ViewModeToggle() {
         testId="view-mode-chat"
         componentId="chat.header.view_chat"
       >
-        <MessagesSquareIcon className="size-3.5" />
+        <MessagesSquareIcon className="size-4" />
       </ViewModeSegment>
       <ViewModeSegment
         label={terminalLabel}
@@ -63,9 +61,9 @@ export function ViewModeToggle() {
         componentId="chat.header.view_terminal"
       >
         {terminalStartingUp ? (
-          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+          <Loader2Icon className="size-4 animate-spin" aria-hidden />
         ) : (
-          <TerminalIcon className="size-3.5" />
+          <TerminalIcon className="size-4" />
         )}
       </ViewModeSegment>
     </div>
@@ -107,10 +105,10 @@ function ViewModeSegment({
             data-testid={testId}
             componentId={componentId}
             className={cn(
-              "border-none",
+              "h-6 w-9 rounded-[6px] border px-2.5 py-0",
               active
-                ? "bg-background text-foreground shadow-sm hover:bg-background"
-                : "text-muted-foreground hover:bg-transparent hover:text-foreground",
+                ? "border-border bg-background text-foreground shadow-sm hover:bg-background"
+                : "border-transparent text-muted-foreground hover:bg-transparent hover:text-foreground",
             )}
           >
             {children}

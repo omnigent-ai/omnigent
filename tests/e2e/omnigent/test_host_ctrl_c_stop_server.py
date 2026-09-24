@@ -56,7 +56,7 @@ _HEALTH_POLL_TIMEOUT = 30.0
 # land inside the asyncio run loop (not mid-server-spawn).
 _LISTENING_MARKER = "Listening for sessions"
 # The ``click.confirm`` prompt text emitted on a clean stop in local mode.
-_PROMPT_MARKER = "Stop it too?"
+_PROMPT_MARKER = "Stop it too? [y/N]: "
 _STOPPED_MARKER = "Stopped the local server"
 _LEFT_RUNNING_MARKER = "Left the local server running"
 
@@ -83,6 +83,8 @@ def _connect_env(base_env: Mapping[str, str], home: Path) -> dict[str, str]:
     # The suite-level pytest data directory would otherwise override this
     # test's deliberately isolated HOME in the spawned CLI process.
     env.pop("OMNIGENT_DATA_DIR", None)
+    # Browser processes can inherit the PTY and interfere with shutdown input.
+    env["OMNIGENT_HOST_NO_OPEN"] = "1"
     env["HOME"] = str(home)
     env["TERM"] = "xterm-256color"
     env["LINES"] = "40"
@@ -284,7 +286,7 @@ def test_host_ctrl_c_yes_stops_local_server(
         # server runs in its own session (start_new_session=True) so it does
         # NOT receive this signal — only the prompt decides its fate.
         child.sendcontrol("c")
-        child.expect(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
+        child.expect_exact(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
         child.send("y\r")
 
         # The prompt's success line proves stop_local_omnigent_server() was invoked.
@@ -332,7 +334,7 @@ def test_host_ctrl_c_no_leaves_local_server_running(
         server_pid, port = _boot_connect_and_get_server(child, home)
 
         child.sendcontrol("c")
-        child.expect(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
+        child.expect_exact(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
         child.send("n\r")
 
         # The decline line proves we took the "leave it running" branch.
@@ -399,7 +401,7 @@ def test_host_ctrl_c_reused_server_shows_no_prompt(
         # Connect must exit cleanly with NO prompt. If the prompt fired,
         # ``click.confirm`` would block on stdin (we send nothing), so we'd
         # match the prompt marker instead of EOF — caught explicitly below.
-        idx = child.expect([pexpect.EOF, _PROMPT_MARKER], timeout=_EXIT_TIMEOUT)
+        idx = child.expect_exact([pexpect.EOF, _PROMPT_MARKER], timeout=_EXIT_TIMEOUT)
         assert idx == 0, (
             "connect offered to stop a server it reused (did not spawn) — the "
             "stop-server prompt must only appear for a server connect started"

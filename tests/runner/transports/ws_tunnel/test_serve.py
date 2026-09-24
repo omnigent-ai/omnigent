@@ -628,6 +628,7 @@ async def test_serve_tunnel_replaces_rejected_host_bootstrap_token(
 @pytest.mark.asyncio
 async def test_serve_tunnel_once_sends_bearer_header(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Authenticated remote tunnels pass the bearer on the WS handshake.
 
@@ -726,6 +727,10 @@ async def test_serve_tunnel_once_sends_bearer_header(
     # handshake (keeps the asserted header set exact).
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
 
+    import logging
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.transports.ws_tunnel.serve")
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "session_auth")
     connected: list[int] = []
     await _serve_tunnel_once(
         _noop_app,
@@ -741,6 +746,13 @@ async def test_serve_tunnel_once_sends_bearer_header(
     # The accepted upgrade fires the connected callback exactly once —
     # serve_tunnel relies on it to mark the runner as ever-connected.
     assert connected == [1]
+    connected_rows = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_connected"
+    ]
+    assert len(connected_rows) == 1
+    assert connected_rows[0].session_id == "session_auth"
+    assert connected_rows[0].attributes["runner_id"] == "runner_auth"
+    assert connected_rows[0].levelno == logging.INFO
 
     assert captured["url"] == "wss://example.databricksapps.com/v1/runners/runner_auth/tunnel"
     # A wss:// tunnel carries a verifying SSL context (asserted separately since
@@ -762,6 +774,12 @@ async def test_serve_tunnel_once_sends_bearer_header(
         "ping_timeout": serve_module.TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     }
     assert isinstance(captured["sent"], str)
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame
+
+    hello = decode_frame(captured["sent"])
+    assert isinstance(hello, HelloFrame)
+    assert CAP_FILESYSTEM_ATTACHMENTS in hello.capabilities
 
 
 async def test_serve_tunnel_once_sends_org_header(
