@@ -28,11 +28,28 @@ def test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open(
         selected_model="sonnet",
     )
     page.goto(chat_session_contract.url)
+    if turns:
+        expect(page.get_by_text("Request 1", exact=False)).to_be_visible()
 
     pill = page.get_by_test_id("composer-config-gear")
     expect(pill).to_be_visible()
-    pill.hover()
     tooltip = page.get_by_test_id("composer-config-gear-tooltip")
+    picker = page.get_by_test_id("composer-agent-menu")
+
+    pill.hover()
+    page.wait_for_timeout(100)
+    pill.click()
+    expect(picker).to_be_visible()
+    page.wait_for_timeout(1_000)
+    expect(picker).to_be_visible()
+    expect(page.locator('[data-slot="tooltip-content"]')).to_have_count(0)
+
+    page.keyboard.press("Escape")
+    expect(picker).not_to_be_visible()
+    expect(tooltip).not_to_be_visible()
+
+    page.mouse.move(0, 0)
+    pill.hover()
     expect(tooltip).to_be_visible()
     expect(page.locator('[data-slot="tooltip-content"]')).to_have_count(1)
     expect(tooltip).to_contain_text("Harness: Claude")
@@ -40,7 +57,6 @@ def test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open(
     expect(tooltip).to_contain_text("Connection: Databricks · oss")
 
     pill.click()
-    picker = page.get_by_test_id("composer-agent-menu")
     expect(picker).to_be_visible()
     expect(tooltip).not_to_be_visible()
     expect(page.locator('[data-slot="tooltip-content"]')).to_have_count(0)
