@@ -25,11 +25,18 @@ _MONITOR_TASK = {
 }
 
 
-def _pill_badge(page: Page, count: int) -> Locator:
+def _pill_badge(page: Page, count: int, *, working: bool = False) -> Locator:
+    """Locate the compact count badge by its accessible name.
+
+    The badge renders only the bare count as visible text; the sentence form
+    ("N background task(s) still running") is its accessible name, prefixed
+    with "Agent working —" while the agent's turn is active.
+    """
     plural = "" if count == 1 else "s"
-    return page.get_by_role(
-        "button", name=f"{count} background task{plural} still running", exact=True
-    )
+    name = f"{count} background task{plural} still running"
+    if working:
+        name = f"Agent working — {name}"
+    return page.get_by_role("button", name=name, exact=True)
 
 
 def _publish_status(
@@ -74,13 +81,18 @@ def test_background_task_indicator_label_lifecycle(
     expect(_pill_badge(page, 1)).to_have_text("1", timeout=15_000)
     expect(working).to_have_count(0)
 
+    # A running turn lights the shimmer AND flips the badge to its working
+    # form (spinner icon, "Agent working" accessible name) — on a phone the
+    # shimmer scrolls off screen, so the badge is the cue that stays visible.
     _publish_status(base_url, session_id, "running")
     expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
-    expect(_pill_badge(page, 1)).to_have_text("1")
+    expect(_pill_badge(page, 1, working=True)).to_have_text("1")
+    expect(page.get_by_test_id("background-task-working")).to_be_visible()
 
     _publish_status(base_url, session_id, "idle")
     expect(working).to_have_count(0, timeout=15_000)
     expect(_pill_badge(page, 1)).to_have_text("1")
+    expect(page.get_by_test_id("background-task-working")).to_have_count(0)
 
     _publish_status(base_url, session_id, "idle", background_task_count=0)
     expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
