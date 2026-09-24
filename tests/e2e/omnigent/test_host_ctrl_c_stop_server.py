@@ -44,8 +44,11 @@ import pexpect
 # REPL lifecycle e2e exercises; 90s mirrors that suite's readiness budget so
 # a cold import + server start on a loaded CI box still settles.
 _BOOT_TIMEOUT = 90.0
-_PROMPT_TIMEOUT = 30.0
-_EXIT_TIMEOUT = 30.0
+# Ctrl-C teardown awaits more work than startup does: cancelling capability
+# discovery cannot stop harness-CLI probes already blocking in a thread pool,
+# so the prompt waits on them. Share boot's budget rather than a smaller one.
+_PROMPT_TIMEOUT = _BOOT_TIMEOUT
+_EXIT_TIMEOUT = _BOOT_TIMEOUT
 # Bounded poll budget for observing the detached server flip up/down. The
 # server lives in another process, so we poll its /health rather than wait on
 # an in-process signal.
@@ -185,6 +188,41 @@ def _force_stop_server(pid: int) -> None:
         os.kill(pid, signal.SIGTERM)
 
 
+def _expect(
+    child: pexpect.spawn,
+    pattern: str | list[str],
+    *,
+    timeout: float,
+    what: str,
+    exact: bool = False,
+) -> int:
+    """
+    ``child.expect``/``expect_exact`` that reports the real PTY tail on timeout.
+
+    pexpect's own ``TIMEOUT`` dump truncates ``before`` to its last 100
+    characters, which on this host daemon is just the tail of whatever
+    background-maintenance log lines happened to print last — useless for
+    telling a genuine hang apart from a teardown step that was still running
+    when the clock ran out. Re-raise with a longer tail so the next failure
+    is diagnosable instead of anonymous.
+
+    :param child: Live pexpect child.
+    :param pattern: Regex (or literal, when ``exact``) or list of them.
+    :param timeout: Max seconds to wait.
+    :param what: Human description of the marker, for the failure message.
+    :param exact: Use ``expect_exact`` (literal match) instead of ``expect``.
+    :returns: The matched index, as ``child.expect``/``expect_exact`` return.
+    """
+    matcher = child.expect_exact if exact else child.expect
+    try:
+        return matcher(pattern, timeout=timeout)
+    except pexpect.TIMEOUT:
+        tail = (child.before or "")[-2000:]
+        raise pexpect.TIMEOUT(
+            f"timed out after {timeout:.0f}s waiting for {what} ({pattern!r}).\nPTY tail:\n{tail}"
+        ) from None
+
+
 def _boot_connect_and_get_server(child: pexpect.spawn, home: Path) -> tuple[int, int]:
     """
     Wait for connect to be fully up and return the live server's pid/port.
@@ -198,7 +236,7 @@ def _boot_connect_and_get_server(child: pexpect.spawn, home: Path) -> tuple[int,
     :param home: Isolated HOME holding the server pidfile.
     :returns: ``(pid, port)`` of the running detached server.
     """
-    child.expect(_LISTENING_MARKER, timeout=_BOOT_TIMEOUT)
+    _expect(child, _LISTENING_MARKER, timeout=_BOOT_TIMEOUT, what="the host to finish booting")
     pid, port = _read_local_server_record(home)
     assert _wait_for_health(port, expected=True, timeout=_HEALTH_POLL_TIMEOUT), (
         f"detached local server on port {port} never became healthy after the "
@@ -286,12 +324,18 @@ def test_host_ctrl_c_yes_stops_local_server(
         # server runs in its own session (start_new_session=True) so it does
         # NOT receive this signal — only the prompt decides its fate.
         child.sendcontrol("c")
-        child.expect_exact(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
+        _expect(
+            child,
+            _PROMPT_MARKER,
+            timeout=_PROMPT_TIMEOUT,
+            what="the stop-server prompt",
+            exact=True,
+        )
         child.send("y\r")
 
         # The prompt's success line proves stop_local_omnigent_server() was invoked.
-        child.expect(_STOPPED_MARKER, timeout=_PROMPT_TIMEOUT)
-        child.expect(pexpect.EOF, timeout=_EXIT_TIMEOUT)
+        _expect(child, _STOPPED_MARKER, timeout=_PROMPT_TIMEOUT, what="the stopped-server line")
+        _expect(child, pexpect.EOF, timeout=_EXIT_TIMEOUT, what="the host process to exit")
 
         # The decisive end-to-end assertion: the real server process actually
         # went down. If the prompt's "yes" branch were wired wrong (or stop
@@ -334,12 +378,18 @@ def test_host_ctrl_c_no_leaves_local_server_running(
         server_pid, port = _boot_connect_and_get_server(child, home)
 
         child.sendcontrol("c")
-        child.expect_exact(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
+        _expect(
+            child,
+            _PROMPT_MARKER,
+            timeout=_PROMPT_TIMEOUT,
+            what="the stop-server prompt",
+            exact=True,
+        )
         child.send("n\r")
 
         # The decline line proves we took the "leave it running" branch.
-        child.expect(_LEFT_RUNNING_MARKER, timeout=_PROMPT_TIMEOUT)
-        child.expect(pexpect.EOF, timeout=_EXIT_TIMEOUT)
+        _expect(child, _LEFT_RUNNING_MARKER, timeout=_PROMPT_TIMEOUT, what="the left-running line")
+        _expect(child, pexpect.EOF, timeout=_EXIT_TIMEOUT, what="the host process to exit")
 
         # The decisive end-to-end assertion: the real server is STILL up after
         # the host process exited. If "no" accidentally stopped it (or the
@@ -389,7 +439,7 @@ def test_host_ctrl_c_reused_server_shows_no_prompt(
         child = _spawn_connect(omnigent_python, omnigent_repo_root, env)
         # Connect attaches to the already-running server (same pid/port — it
         # reused it rather than spawning a new one).
-        child.expect(_LISTENING_MARKER, timeout=_BOOT_TIMEOUT)
+        _expect(child, _LISTENING_MARKER, timeout=_BOOT_TIMEOUT, what="the host to finish booting")
         reused_pid, reused_port = _read_local_server_record(home)
         assert (reused_pid, reused_port) == (server_pid, port), (
             f"connect did not reuse the pre-spawned server: expected "
@@ -401,7 +451,13 @@ def test_host_ctrl_c_reused_server_shows_no_prompt(
         # Connect must exit cleanly with NO prompt. If the prompt fired,
         # ``click.confirm`` would block on stdin (we send nothing), so we'd
         # match the prompt marker instead of EOF — caught explicitly below.
-        idx = child.expect_exact([pexpect.EOF, _PROMPT_MARKER], timeout=_EXIT_TIMEOUT)
+        idx = _expect(
+            child,
+            [pexpect.EOF, _PROMPT_MARKER],
+            timeout=_EXIT_TIMEOUT,
+            what="connect to exit with no stop-server prompt",
+            exact=True,
+        )
         assert idx == 0, (
             "connect offered to stop a server it reused (did not spawn) — the "
             "stop-server prompt must only appear for a server connect started"

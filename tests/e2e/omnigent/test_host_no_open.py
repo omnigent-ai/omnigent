@@ -16,6 +16,7 @@ from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _PROMPT_TIMEOUT,
     _boot_connect_and_get_server,
     _connect_env,
+    _expect,
     _force_stop_server,
     _read_local_server_record,
 )
@@ -71,9 +72,15 @@ def test_host_browser_preference(
         assert opened == ([f"http://127.0.0.1:{port}"] if expect_open else [])
 
         child.sendcontrol("c")
-        child.expect_exact(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
+        _expect(
+            child,
+            _PROMPT_MARKER,
+            timeout=_PROMPT_TIMEOUT,
+            what="the stop-server prompt",
+            exact=True,
+        )
         child.send("y\r")
-        child.expect(pexpect.EOF, timeout=_EXIT_TIMEOUT)
+        _expect(child, pexpect.EOF, timeout=_EXIT_TIMEOUT, what="the host process to exit")
         child.close()
         assert child.exitstatus == 0
     finally:

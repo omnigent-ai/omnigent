@@ -889,9 +889,25 @@ def test_repl_tool_call_refusal_blocks_tool(
         child.send("testing456" + "\r")
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
-        child.expect("refused", timeout=5)
-        # Turn is now aborted — wait for the REPL to return to idle.
-        _wait_for_turn_complete(child, timeout=30)
+        try:
+            # Local rendering once the keystroke lands, not a round trip, but
+            # a saturated shard still delays the repaint.
+            child.expect("refused", timeout=20)
+        except pexpect.TIMEOUT:
+            tail = _strip_ansi(child.before or "")[-1500:]
+            raise pexpect.TIMEOUT(
+                f"timed out waiting for the refusal echo.\nPTY tail (ANSI-stripped):\n{tail}"
+            ) from None
+        # Turn is now aborted — wait for the REPL to return to idle, on the
+        # same 45s budget the other turn-settle waits in this file use.
+        try:
+            _wait_for_turn_complete(child, timeout=45)
+        except pexpect.TIMEOUT:
+            tail = _strip_ansi(child.before or "")[-1500:]
+            raise pexpect.TIMEOUT(
+                f"timed out waiting for the turn to settle after refusal.\n"
+                f"PTY tail (ANSI-stripped):\n{tail}"
+            ) from None
         # The tool must never have run: raw echo output must not appear
         # anywhere in the terminal buffer captured so far.
         assert "echo: testing456" not in child.before, (
