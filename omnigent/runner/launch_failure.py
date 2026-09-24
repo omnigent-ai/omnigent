@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
     "FailureDiagnosis",
@@ -188,14 +189,20 @@ _NATIVE_ERROR_HTTP_STATUS = re.compile(
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
-    """Refine a native turn's generic code when its text identifies a rate limit.
+    """Refine a native turn's generic code when its text identifies the cause.
+
+    Recognizes rate limits and content-length cap rejections (a request
+    carrying an oversized transcript, rejected by the deployment's byte
+    cap before the model sees it).
 
     :param code: Existing error code; specific diagnoses are preserved.
     :param message: Native harness error text, from its status or transcript.
-    :returns: The semantic rate-limit code, or the existing code if unrecognized.
+    :returns: The semantic code, or the existing code if unrecognized.
     """
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code
+    if detect_request_size_overflow(message) is not None:
+        return "context_length_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:

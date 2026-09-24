@@ -740,6 +740,54 @@ async def test_context_overflow_gemini_pattern(
 
 
 @pytest.mark.asyncio
+async def test_context_overflow_content_length_cap_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    A content-length cap rejection (Databricks front door, byte sizes)
+    raises ContextWindowExceededError with approximate token counts.
+    """
+    databricks_body = json.dumps(
+        {
+            "error_code": "BAD_REQUEST",
+            "message": (
+                "Server received a request which exceeds maximum allowed "
+                "content length. RequestSize(bytes): 33967957, "
+                "Limit(bytes): 33554432"
+            ),
+        }
+    )
+    http_400 = httpx.HTTPStatusError(
+        "bad request",
+        request=httpx.Request("POST", "http://test"),
+        response=httpx.Response(
+            400,
+            content=databricks_body.encode(),
+            headers={"content-type": "application/json"},
+        ),
+    )
+    mock_adapter = _MockAdapter(side_effect=http_400)
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with pytest.raises(ContextWindowExceededError) as exc_info:
+        await Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    # Byte sizes are carried as approximate tokens (bytes // 4) so the
+    # overflow flows through the token-based plumbing.
+    assert exc_info.value.max_context_tokens == 33554432 // 4, (
+        f"Expected max=33554432//4, got {exc_info.value.max_context_tokens}."
+    )
+    assert exc_info.value.actual_tokens == 33967957 // 4, (
+        f"Expected actual=33967957//4, got {exc_info.value.actual_tokens}."
+    )
+    assert exc_info.value.code == "context_length_exceeded"
+
+
+@pytest.mark.asyncio
 async def test_unrecognized_400_not_context_overflow(
     monkeypatch: pytest.MonkeyPatch,
     retry_config: RetryPolicy,

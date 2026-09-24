@@ -79,6 +79,7 @@ from omnigent.inner.native_attachments import (
     has_unresolved_file_id,
     resolve_file_id_block,
 )
+from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -1366,6 +1367,9 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     "context window",
     "maximum context length",
     "prompt is too long",
+    # Deployment byte cap (e.g. the Databricks Apps front door) rejected a
+    # request carrying an oversized transcript before the model saw it.
+    "exceeds maximum allowed content length",
 )
 
 
@@ -1382,6 +1386,12 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     msg = str(error.get("message", "")).lower()
     if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
         return None
+    # Content-length cap rejections report bytes (request first, limit
+    # second) — parse them specifically so the generic numeric fallback
+    # below doesn't invert them, and express them as approximate tokens.
+    size_overflow = detect_request_size_overflow(msg)
+    if size_overflow is not None:
+        return size_overflow.approx_limit_tokens, size_overflow.approx_request_tokens
     actual_gt_max = re.search(r"(\d{4,})\D*>\D*(\d{4,})", msg)
     if actual_gt_max is not None:
         return int(actual_gt_max.group(2)), int(actual_gt_max.group(1))

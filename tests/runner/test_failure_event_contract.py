@@ -169,3 +169,37 @@ async def test_context_overflow_preserves_a_valid_queued_failure() -> None:
     error = await _assert_failure_on_both_streams(app, source="llm")
     assert error["code"] == "context_length_exceeded"
     assert error["type"] == "_ContextWindowOverflow"
+
+
+@pytest.mark.asyncio
+async def test_content_length_cap_failure_is_normalized_to_context_overflow() -> None:
+    """A byte-cap rejection surfaced by the harness classifies as a context overflow."""
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_test"}}),
+            _sse(
+                {
+                    "type": "response.failed",
+                    "error": {
+                        "code": "unknown_error",
+                        "message": (
+                            'LLM returned HTTP 400: {"error_code":"BAD_REQUEST",'
+                            '"message":"Server received a request which exceeds '
+                            "maximum allowed content length. "
+                            'RequestSize(bytes): 33967957, Limit(bytes): 33554432"}'
+                        ),
+                    },
+                }
+            ),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    error = await _assert_failure_on_both_streams(app, source="llm")
+    assert error["code"] == "context_length_exceeded"
+    assert error["type"] == "_ContextWindowOverflow"
+    # Byte sizes are expressed as approximate tokens; actual must stay
+    # above max (the generic numeric fallback would invert them).
+    assert f"{33967957 // 4} tokens > {33554432 // 4} max" in error["message"]

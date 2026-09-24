@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase, OmnigentError
@@ -52,6 +53,66 @@ def is_context_length_exceeded(exc: BaseException) -> bool:
         next_exc = current.__cause__ or current.__context__
         current = next_exc if isinstance(next_exc, BaseException) else None
     return False
+
+
+# Databricks front-door rejection of an oversized request body, e.g.
+# ``Server received a request which exceeds maximum allowed content length.
+# RequestSize(bytes): 33967957, Limit(bytes): 33554432``. The edge rejects
+# the request before the model sees it, so the sizes are bytes, not tokens.
+_REQUEST_SIZE_OVERFLOW = re.compile(
+    r"exceeds maximum allowed content length.*?"
+    r"RequestSize\(bytes\):\s*(\d+).*?Limit\(bytes\):\s*(\d+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Rough bytes-per-token ratio for expressing a byte-cap rejection in the
+# token units the context-overflow plumbing carries.
+_APPROX_BYTES_PER_TOKEN = 4
+
+
+@dataclass(frozen=True)
+class RequestSizeOverflow:
+    """
+    A request rejected for exceeding a byte-size content-length cap.
+
+    :param request_bytes: Size of the rejected request, e.g. ``33967957``.
+    :param limit_bytes: The deployment's content-length cap, e.g.
+        ``33554432`` (the 32 MiB Databricks Apps front-door limit).
+    """
+
+    request_bytes: int
+    limit_bytes: int
+
+    @property
+    def approx_request_tokens(self) -> int:
+        """The request size expressed as an approximate token count."""
+        return max(self.request_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+
+    @property
+    def approx_limit_tokens(self) -> int:
+        """The byte cap expressed as an approximate token count."""
+        return max(self.limit_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+
+
+def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
+    """Parse a content-length cap rejection from an error *message*.
+
+    Recognizes the Databricks front-door shape above. A transcript large
+    enough to hit the byte cap cannot fit the model's context window
+    either, so callers classify the failure as ``context_length_exceeded``
+    (recoverable by compaction) instead of an unknown permanent error.
+
+    :param message: Error text that may embed the rejection, e.g. a raw
+        response body or a harness-reported failure string.
+    :returns: The parsed sizes, or ``None`` when *message* does not match.
+    """
+    match = _REQUEST_SIZE_OVERFLOW.search(message)
+    if match is None:
+        return None
+    return RequestSizeOverflow(
+        request_bytes=int(match.group(1)),
+        limit_bytes=int(match.group(2)),
+    )
 
 
 def llm_error_category(code: str) -> ErrorCategory:

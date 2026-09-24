@@ -169,6 +169,40 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
     assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
 
 
+_CONTENT_LENGTH_REJECTION = (
+    '{"error_code":"BAD_REQUEST","message":"Server received a request which '
+    "exceeds maximum allowed content length. RequestSize(bytes): 33967957, "
+    'Limit(bytes): 33554432"}'
+)
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        _CONTENT_LENGTH_REJECTION,
+        (
+            "Server received a request which exceeds maximum allowed content "
+            "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
+        ),
+    ],
+)
+def test_classifies_content_length_cap_rejection_as_context_overflow(
+    code: str, message: str
+) -> None:
+    assert classify_native_turn_error(code, message) == "context_length_exceeded"
+
+
+def test_content_length_text_without_sizes_stays_generic() -> None:
+    message = "Server received a request which exceeds maximum allowed content length."
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing"])
+def test_content_length_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _CONTENT_LENGTH_REJECTION) == code
+
+
 @pytest.mark.parametrize(
     ("code", "expected_substring"),
     [
