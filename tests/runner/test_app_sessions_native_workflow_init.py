@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.native import native_dispatch
@@ -1108,7 +1109,7 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
     )
 
     async with _runner_client(app) as client:
-        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        with caplog.at_level(logging.WARNING, logger="omnigent.inner.native_attachments"):
             resp = await client.post(
                 "/v1/sessions/conv_hist_fail/events",
                 json={
@@ -1121,7 +1122,15 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
             )
 
     assert resp.status_code == 202
-    assert "failed to resolve file_id" in caplog.text
+    failures = [
+        record_to_row(record, source="runner")
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_attachment_read_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["session_id"] == "conv_hist_fail"
+    assert failures[0]["attributes"]["stage"] == "metadata"
+    assert failures[0]["attributes"]["exception_type"] == "ConnectError"
     for _ in range(20):
         if harness_client.posted_bodies:
             break
