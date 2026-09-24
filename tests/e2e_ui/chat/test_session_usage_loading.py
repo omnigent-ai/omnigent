@@ -405,9 +405,17 @@ def test_legacy_snapshot_usage_needs_no_separate_fetch(
     usage_read = _session_read_matcher(session_url, include_usage=True)
     separate_usage_reads: list[str] = []
 
+    captured_response: list = []
+
     def legacy_snapshot(route: Route) -> None:
-        response = route.fetch(url=f"{session_url}?include_items=false&include_liveness=false")
-        assert response.status == 200, response.text()
+        # Older clients refetch the snapshot in the background after this test
+        # body finishes; serve repeats from the first upstream read so a late
+        # read never fetches across teardown.
+        if not captured_response:
+            captured_response.append(
+                route.fetch(url=f"{session_url}?include_items=false&include_liveness=false")
+            )
+        response = captured_response[0]
         body = response.json()
         body.pop("usage_included", None)
         route.fulfill(response=response, body=json.dumps(body))
@@ -418,12 +426,19 @@ def test_legacy_snapshot_usage_needs_no_separate_fetch(
 
     page.route(metadata_read, legacy_snapshot)
     page.on("request", record_usage_read)
-    page.goto(f"{base_url}/c/{session_id}")
-    panel = _usage_panel(page)
-    expect(panel.get_by_test_id("agent-info-session-cost")).to_have_text("$2.75")
-    breakdown = panel.get_by_test_id("agent-info-usage-by-model")
-    breakdown.locator("summary").press("Enter")
-    expect(breakdown.get_by_test_id("agent-info-model-legacy-model")).to_contain_text("$2.75")
-    expect(page.get_by_placeholder("Send a message…")).to_be_editable()
-    _flush_browser_updates(page)
-    assert not separate_usage_reads, "legacy snapshots already include usage"
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        panel = _usage_panel(page)
+        expect(panel.get_by_test_id("agent-info-session-cost")).to_have_text("$2.75")
+        breakdown = panel.get_by_test_id("agent-info-usage-by-model")
+        breakdown.locator("summary").press("Enter")
+        expect(breakdown.get_by_test_id("agent-info-model-legacy-model")).to_contain_text("$2.75")
+        expect(page.get_by_placeholder("Send a message…")).to_be_editable()
+        _flush_browser_updates(page)
+        assert captured_response, "legacy snapshot read should have been intercepted"
+        assert captured_response[0].status == 200, captured_response[0].text()
+        assert not separate_usage_reads, "legacy snapshots already include usage"
+    finally:
+        # Drop the snapshot route before teardown so a late background refetch
+        # cannot enter the handler while the context is closing.
+        page.unroute_all(behavior="ignoreErrors")
