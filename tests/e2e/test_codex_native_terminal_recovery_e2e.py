@@ -1,7 +1,6 @@
-"""Real Codex/tmux recovery against a gated local model endpoint.
+"""Real Codex/tmux recovery against an isolated local model endpoint.
 
-Run with an empty CODEX_HOME and OMNIGENT_CONFIG_HOME. A system-wide Codex
-provider override must also be isolated so it cannot redirect model requests.
+Use empty CODEX_HOME and OMNIGENT_CONFIG_HOME.
 """
 
 from __future__ import annotations
@@ -58,7 +57,6 @@ def _wait_for(check: Callable[[], Any], description: str, timeout: float = 60.0)
 
 
 def _app_server_pid(listen_url: str) -> int:
-    # The unique loopback listener identifies only this test's app-server.
     output = subprocess.run(
         ["ps", "-ww", "-eo", "pid=,ppid=,args="],
         capture_output=True,
@@ -169,8 +167,7 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
         original_thread = state.thread_id
         print(f"E2E started: app_server_pid={original_pid}, thread={original_thread}", flush=True)
 
-        # Warm-up proves a real model round-trip and lets the thread id persist
-        # on the server before either terminal recovery path is exercised.
+        # Persist the thread before testing recovery.
         marker = f"READY_{uuid.uuid4().hex}"
         configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=model)
         _send_user_text(http_client, session_id=session_id, text="Reply with the ready marker")

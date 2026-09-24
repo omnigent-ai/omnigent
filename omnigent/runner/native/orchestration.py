@@ -4465,8 +4465,7 @@ async def _launch_codex_native_tui(
             or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
         ),
     )
-    # Apply configured wrappers and pass-through args at the same boundary
-    # for initial launches and terminal-only recovery.
+    # Apply configured wrappers to both cold start and recovery.
     from omnigent.config import load_effective_config
     from omnigent.harness_startup_config import (
         resolve_harness_args,
@@ -4608,9 +4607,8 @@ async def _auto_create_codex_terminal(
     terminal exists yet. Mirrors :func:`_auto_create_claude_terminal`: it
     boots a Codex app-server, registers the Codex TUI as a streamable
     terminal resource attached to that app-server, then runs the transcript
-    forwarder so the chat and terminal share one thread. If only the TUI
-    exited, reuse the live app-server and forwarder for the same thread;
-    terminal recovery must not restart agent execution or MCP initialization.
+    forwarder so the chat and terminal share one thread. An exited TUI
+    reuses its live app-server and forwarder.
 
     Fresh sessions launch without a thread id so the TUI owns thread
     creation; resume sessions launch with the persisted Codex thread id,
