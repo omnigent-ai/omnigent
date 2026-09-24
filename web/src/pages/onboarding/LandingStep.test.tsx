@@ -39,4 +39,19 @@ describe("LandingStep", () => {
     fireEvent.click(screen.getByRole("button", { name: /join your team \(field-eng-omni\)/i }));
     expect(onJoinManaged).toHaveBeenCalledWith("https://field-eng-omni.aws.databricksapps.com");
   });
+
+  it("offers 'Show all servers…' in the preset dropdown → onJoinServer", () => {
+    const onJoinServer = vi.fn();
+    render(
+      <LandingStep
+        managedServers={["https://field-eng-omni.aws.databricksapps.com"]}
+        onGetStarted={vi.fn()}
+        onJoinServer={onJoinServer}
+        onJoinManaged={vi.fn()}
+      />,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /show all servers/i }));
+    expect(onJoinServer).toHaveBeenCalledOnce();
+  });
 });

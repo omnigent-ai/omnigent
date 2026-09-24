@@ -218,6 +218,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onBack={() => setStep("landing")}
             onConnect={connect}
             onCopy={setup.onCopy}
+            onShowAll={() => setStep("server")}
           />
         )}
         {step === "terminal" && (
