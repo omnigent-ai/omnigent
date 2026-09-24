@@ -111,7 +111,7 @@ class UpsertMCPServerRequest(BaseModel):
     """
 
     name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
-    transport: Literal["http", "stdio"]
+    transport: Literal["http", "stdio", "registry"]
     description: str | None = Field(default=None, max_length=512)
     url: str | None = None
     headers: dict[str, str] | None = None
@@ -135,6 +135,10 @@ class UpsertMCPServerRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> UpsertMCPServerRequest:
         """Enforce the same transport shape as the agent spec parser."""
+        if self.transport == "registry":
+            if self.url or self.headers or self.command or self.args:
+                raise ValueError("Registry services cannot override server connection settings")
+            return self
         if self.transport == "http":
             if not self.url:
                 raise ValueError("url is required when transport is 'http'")
