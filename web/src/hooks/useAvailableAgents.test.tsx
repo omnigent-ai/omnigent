@@ -419,6 +419,45 @@ describe("useAvailableAgents", () => {
     ]);
   });
 
+  it("labels a user-registered native-harness template by its own name", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "ag_native",
+            name: "claude-native-ui",
+            description: null,
+            harness: "claude-native",
+            builtin: true,
+          },
+          {
+            id: "ag_custom",
+            name: "autoresearch",
+            description: "Custom research agent wrapping Claude Code.",
+            harness: "claude-native",
+            builtin: false,
+          },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: EMPTY_MINE,
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    // The seeded wrapper keeps the vendor label; the user-registered template
+    // must show its own name so the two picker rows are distinguishable.
+    const seeded = result.current.data?.find((a) => a.id === "ag_native");
+    const custom = result.current.data?.find((a) => a.id === "ag_custom");
+    expect(seeded?.display_name).toBe("Claude Code");
+    expect(custom?.display_name).toBe("Autoresearch");
+  });
+
   it("defaults a missing harness to null", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
