@@ -109,7 +109,10 @@ from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    VERBATIM_TITLE_LABEL_KEY,
+    VERBATIM_TITLE_LABEL_VALUE,
     is_session_closed,
+    is_title_verbatim,
     title_without_closed_marker,
 )
 
@@ -3155,10 +3158,11 @@ async def _send_to_existing_session(
             }
         )
     display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
-    parsed = _parse_session_title(display_title)
-    # A sys_session_create child keeps its verbatim title and has no
-    # sub_agent_name, so when the title does not parse as "<agent>:<title>"
-    # the identity comes from the snapshot's agent fields instead.
+    # Verbatim titles may contain colons; use the agent binding instead.
+    if is_title_verbatim(_string_mapping(snap_data.get("labels"))):
+        parsed = _ParsedTitle(agent=None, title=None)
+    else:
+        parsed = _parse_session_title(display_title)
     agent_label = (
         parsed.agent
         or _optional_string(snap_data.get("sub_agent_name"))
@@ -3294,6 +3298,8 @@ def _build_session_create_body(
     body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
+        # Preserve verbatim titles, including colons, across readers.
+        "labels": {VERBATIM_TITLE_LABEL_KEY: VERBATIM_TITLE_LABEL_VALUE},
     }
     if isinstance(title, str) and title:
         body["title"] = title
@@ -3374,6 +3380,20 @@ def _finalize_created_session(
     )
 
 
+def _reserved_title_error(title: object) -> str | None:
+    """Reject titles containing the closed-session marker."""
+    if not isinstance(title, str) or _CLOSED_TITLE_INFIX not in title:
+        return None
+    return json.dumps(
+        {
+            "error": (
+                f"sys_session_create 'title' may not contain {_CLOSED_TITLE_INFIX!r} — "
+                "it is a reserved session-lifecycle marker. Choose another title."
+            )
+        }
+    )
+
+
 async def _execute_session_create(
     args: _JsonObject,
     *,
@@ -3439,6 +3459,9 @@ async def _execute_session_create(
                 )
             }
         )
+    reserved_title = _reserved_title_error(args.get("title"))
+    if reserved_title is not None:
+        return reserved_title
     if has_config_path:
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
@@ -3630,7 +3653,11 @@ async def _upload_config_bundle(
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
-    metadata: _JsonObject = {"parent_session_id": conversation_id}
+    metadata: _JsonObject = {
+        "parent_session_id": conversation_id,
+        # Match the agent-id create path for verbatim titles.
+        "labels": {VERBATIM_TITLE_LABEL_KEY: VERBATIM_TITLE_LABEL_VALUE},
+    }
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
@@ -5330,6 +5357,7 @@ async def _agent_list_fetch(
     *,
     after: str | None,
     limit: int,
+    params_extra: dict[str, str] | None = None,
 ) -> _DiscoveryPage:
     """
     Fetch one cursor page of a paginated list endpoint.
@@ -5343,10 +5371,13 @@ async def _agent_list_fetch(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
+    :param params_extra: Endpoint-specific query params merged into every
+        page request, e.g. the session listing's ``kind`` scope.
     :returns: Rows and server continuation metadata.
     """
     try:
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+        params.update(params_extra or {})
         if path == "/v1/sessions":
             params["visibility"] = "all"
         if after is not None:
@@ -5534,7 +5565,8 @@ async def _agent_list_via_rest(
 
     - ``builtins``: ``GET /v1/agents`` (template agents), projected to
       ``{agent_id, name, description, harness}``.
-    - ``session_agents``: ``GET /v1/sessions``, projected to
+    - ``session_agents``: ``GET /v1/sessions`` over both top-level and
+      sub-agent sessions, projected to
       ``{session_id, agent_id, agent_name, status}`` so the caller can
       launch the agent directly (``sys_session_create`` by
       ``agent_id``) or ``sys_agent_get`` / ``sys_agent_download`` a
@@ -5579,6 +5611,8 @@ async def _agent_list_via_rest(
             server_client,
             after=cursor_state["session_agents"][1],
             limit=source_limit,
+            # Include agents bound only to child sessions.
+            params_extra={"kind": "any"},
         )
     )
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
@@ -5823,11 +5857,11 @@ async def _collect_sub_agents(
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
 
     Returns ``[{"agent", "title", "conversation_id"}, ...]``, skipping
-    closed and titleless/colonless rows so they never re-surface to the
-    LLM. Includes the caller's own children and, when the caller is
-    itself a child (e.g. a user-added agent), its parent (surfaced as
-    ``agent="main"``) and its siblings — so an added agent can still
-    discover ``main`` and its session-mates. Best-effort: a failed
+    closed rows so they never re-surface to the LLM. Includes the
+    caller's own children and, when the caller is itself a child (e.g.
+    a user-added agent), its parent (surfaced as ``agent="main"``) and
+    its siblings — so an added agent can still discover ``main`` and
+    its session-mates. Best-effort: a failed
     lookup yields ``[]`` (or own-children-only) rather than raising.
 
     :param conversation_id: The caller session id.
@@ -5914,7 +5948,9 @@ async def _collect_global_sessions(
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
     Projects each accessible session to ``{session_id, agent_name, title,
-    status, runner_id, runner_online, parent_session_id}``.
+    status, runner_id, runner_online, parent_session_id}``. Both
+    top-level and sub-agent sessions are listed; a non-null
+    ``parent_session_id`` marks a child.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
@@ -5928,7 +5964,13 @@ async def _collect_global_sessions(
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
+    # The server defaults to top-level sessions; include children for recovery.
+    params: dict[str, str | int] = {
+        "limit": limit,
+        "order": "desc",
+        "kind": "any",
+        "visibility": "all",
+    }
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:
@@ -5976,24 +6018,37 @@ def _child_rows_to_entries(
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
 
-    Skips closed and titleless/colonless rows. The server already
-    parses ``tool``/``session_name`` from the title (including the
-    ``"ui:<agent>:<label>"`` form), so those are reused.
+    Skips closed or id-less rows. Framework-named children use the
+    title-derived agent for named sends; verbatim-titled children use
+    their bound agent and retain the whole title.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
     """
     entries: list[dict[str, str | None]] = []
     for row in rows:
+        conversation_id = _optional_string(row.get("id"))
         title = _optional_string(row.get("title"))
         labels = _string_mapping(row.get("labels"))
-        if not title or ":" not in title or is_session_closed(labels, title):
+        if conversation_id is None or is_session_closed(labels, title):
             continue
+        session_name = _optional_string(row.get("session_name"))
+        if is_title_verbatim(labels):
+            # Keep the caller's title whole; attribute from the agent binding.
+            agent = _optional_string(row.get("agent_name")) or _optional_string(row.get("tool"))
+            entry_title: str | None = title
+        elif session_name is not None:
+            agent = _optional_string(row.get("tool")) or _optional_string(row.get("agent_name"))
+            entry_title = session_name
+        else:
+            agent = _optional_string(row.get("agent_name")) or _optional_string(row.get("tool"))
+            entry_title = title
         entries.append(
             {
-                "agent": _optional_string(row.get("tool")),
-                "title": _optional_string(row.get("session_name")),
-                "conversation_id": _optional_string(row.get("id")),
+                # Hide the internal ``-native-ui`` wrapper name.
+                "agent": public_agent_name(agent),
+                "title": entry_title,
+                "conversation_id": conversation_id,
             }
         )
     return entries
@@ -6207,7 +6262,9 @@ async def _session_close_via_rest(
     On success marks the child with ``omnigent.closed=true`` and
     rewrites its internal title to ``"<agent>:<title>:closed:<id>"`` so
     future ``sys_session_send`` calls with the same ``(agent, title)``
-    create a fresh child.
+    create a fresh child. Children created by ``sys_session_create``
+    store the caller's title verbatim, with no agent prefix to
+    recover; those tombstone as ``"<title>:closed:<id>"``.
 
     :param args: Parsed tool arguments; requires ``conversation_id``.
     :param conversation_id: The calling session's own id, e.g.
@@ -6233,10 +6290,19 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
-    if parsed.agent is None or parsed.title is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    raw_title = _optional_string(target_snap.get("title"))
+    # Verbatim titles have no agent prefix, even when they contain a colon.
+    if is_title_verbatim(_string_mapping(target_snap.get("labels"))):
+        parsed = _ParsedTitle(agent=None, title=None)
+    else:
+        parsed = _parse_session_title(raw_title)
+    if parsed.agent is not None:
+        display_title = parsed.title
+        prefix = f"{parsed.agent}:{display_title}"
+    else:
+        display_title = title_without_closed_marker(raw_title)
+        prefix = display_title or ""
+    new_title = f"{prefix}{_CLOSED_TITLE_INFIX}{target_id}"
     try:
         patch = await server_client.patch(
             f"/v1/sessions/{target_id}",
@@ -6259,7 +6325,7 @@ async def _session_close_via_rest(
             "closed": True,
             "conversation_id": target_id,
             "agent": parsed.agent,
-            "title": parsed.title,
+            "title": display_title,
         }
     )
 
@@ -6312,7 +6378,15 @@ async def _fetch_peek_meta(
     body = _string_object_dict(snap.json())
     if body is None:
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
-    parsed = _parse_session_title(_optional_string(body.get("title")))
+    title_value = _optional_string(body.get("title"))
+    if is_title_verbatim(_string_mapping(body.get("labels"))):
+        # Preserve the whole title and use the bound agent for identity.
+        agent = _optional_string(body.get("sub_agent_name")) or _optional_string(
+            body.get("agent_name")
+        )
+        parsed = _ParsedTitle(agent=agent, title=title_without_closed_marker(title_value))
+    else:
+        parsed = _parse_session_title(title_value)
     raw_pending = body.get("pending_elicitations")
     pending = _json_object_list(raw_pending)
     return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)
