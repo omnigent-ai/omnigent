@@ -5163,6 +5163,8 @@ export function NewChatLandingScreen() {
     const returnedDraft = recoverFailedSessionDraft(originalDraft, temporaryConversationId);
     if (onScreenRef.current) {
       setMessage(returnedDraft.message);
+      // The draft's files were validated when the user attached them, so
+      // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
     } else {
       writeLandingDraft(returnedDraft);

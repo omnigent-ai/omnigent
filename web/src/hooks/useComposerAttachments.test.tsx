@@ -79,10 +79,12 @@ describe("useComposerAttachments", () => {
 
     expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
     const error = result.current.attachmentError ?? "";
-    // Both rejections surface, joined so the notice shows them together.
-    expect(error).toContain("clip.mp4");
-    expect(error).toContain("clip2.mp4");
-    expect(error.split("\n")).toHaveLength(2);
+    // Both rejections surface, joined in incoming-file order so the notice
+    // reads in the order the user picked the files.
+    const lines = error.split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("clip.mp4");
+    expect(lines[1]).toContain("clip2.mp4");
   });
 
   it("clears a stale rejection when a clean batch arrives", () => {
@@ -185,14 +187,35 @@ describe("useComposerAttachments", () => {
     expect(result.current.attachmentError).toBeNull();
   });
 
-  it("restoreFiles sets the list without validating or touching the error", () => {
+  it("seeds initialFiles verbatim, without validating them", () => {
+    // Trusted input is not re-checked on the way in — re-validating could
+    // silently drop files the composer already accepted.
+    const { result } = renderHook(() => useComposerAttachments({ initialFiles: [videoFile()] }));
+
+    expect(result.current.files.map((f) => f.name)).toEqual(["clip.mp4"]);
+    expect(result.current.attachmentError).toBeNull();
+  });
+
+  it("restoreFiles sets the list without validating it", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    // A previously-stored draft is restored verbatim — re-validating could
-    // silently drop files the user already attached.
     act(() => result.current.restoreFiles([videoFile()]));
 
     expect(result.current.files.map((f) => f.name)).toEqual(["clip.mp4"]);
     expect(result.current.attachmentError).toBeNull();
+  });
+
+  it("restoreFiles leaves a pre-existing rejection notice untouched", () => {
+    const { result } = renderHook(() => useComposerAttachments());
+    act(() => result.current.addFiles([textFile(), videoFile()]));
+    const notice = result.current.attachmentError;
+    expect(notice).toContain("clip.mp4");
+
+    act(() => result.current.restoreFiles([textFile()]));
+
+    expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
+    // The exact same notice string — an implementation that cleared or
+    // recomputed it on restore would fail here.
+    expect(result.current.attachmentError).toBe(notice);
   });
 
   it("clearError clears the notice without touching the files", () => {
@@ -213,5 +236,43 @@ describe("useComposerAttachments", () => {
 
     expect(result.current.files).toEqual([]);
     expect(result.current.attachmentError).toBeNull();
+  });
+
+  it("keeps every action's identity stable across rerenders", () => {
+    // Effect-facing consumers list these in dependency arrays; a fresh
+    // function each render would re-fire their effects in a loop.
+    const { result, rerender } = renderHook(
+      ({ accepted, removed }: { accepted: () => void; removed: () => void }) =>
+        useComposerAttachments({ onAccepted: accepted, onRemoved: removed }),
+      { initialProps: { accepted: vi.fn(), removed: vi.fn() } },
+    );
+    const before = { ...result.current };
+
+    act(() => result.current.addFiles([textFile()]));
+    rerender({ accepted: vi.fn(), removed: vi.fn() });
+
+    expect(result.current.addFiles).toBe(before.addFiles);
+    expect(result.current.removeFile).toBe(before.removeFile);
+    expect(result.current.replaceFiles).toBe(before.replaceFiles);
+    expect(result.current.restoreFiles).toBe(before.restoreFiles);
+    expect(result.current.onPaste).toBe(before.onPaste);
+    expect(result.current.clearError).toBe(before.clearError);
+    expect(result.current.clear).toBe(before.clear);
+  });
+
+  it("invokes the latest option callbacks through the stable actions", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ cb }: { cb: (files: File[]) => void }) => useComposerAttachments({ onAccepted: cb }),
+      { initialProps: { cb: first } },
+    );
+    rerender({ cb: second });
+
+    const file = textFile();
+    act(() => result.current.addFiles([file]));
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledWith([file]);
   });
 });

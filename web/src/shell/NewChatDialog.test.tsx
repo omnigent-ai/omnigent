@@ -7761,6 +7761,55 @@ describe("NewChatLandingScreen attachments", () => {
     );
     expect(screen.getByText("notes.txt")).toBeTruthy();
   });
+
+  it("keeps the rejection notice verbatim when a create is rejected on screen", async () => {
+    // A mixed batch leaves a valid chip plus a rejection notice. A wholesale
+    // re-validating restore of the returned draft would clear the notice
+    // (every restored file is valid); the verbatim restore keeps both
+    // exactly as the user left them.
+    let rejectCreate: (() => void) | null = null;
+    authenticatedFetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          rejectCreate = () =>
+            resolve({
+              ok: false,
+              status: 400,
+              json: async () => ({ detail: "workspace already in use" }),
+              text: async () => "workspace already in use",
+            } as unknown as Response);
+        }),
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rebuild the parser" },
+    });
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [ok] },
+    });
+    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [clip] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(rejectCreate).not.toBeNull());
+
+    // The user is still on the landing when the create comes back rejected.
+    await act(async () => {
+      rejectCreate!();
+    });
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-error")).toBeTruthy());
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
+  });
 });
 
 // Paste mirrors the in-session composer exactly: files on the clipboard

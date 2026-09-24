@@ -1,16 +1,15 @@
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { validateAttachments } from "@/lib/attachments";
 
 export interface UseComposerAttachmentsOptions {
-  /** Files already attached when the composer mounts (a restored draft). */
-  initialFiles?: File[];
   /**
-   * Runs after accepted files append — the caller's side effects (refocus
-   * the textarea, mark the draft dirty) live here so the hook never learns
-   * about sessions, textareas, or focus.
+   * Files to start with. Used verbatim — trusted input is not re-validated,
+   * so nothing the composer already accepted can be silently dropped.
    */
+  initialFiles?: File[];
+  /** Runs after a batch appends at least one file; receives the accepted files. */
   onAccepted?: (accepted: File[]) => void;
-  /** Runs after a removal, for the same caller-owned side effects. */
+  /** Runs after a removal. */
   onRemoved?: () => void;
 }
 
@@ -19,23 +18,21 @@ export interface ComposerAttachmentsApi {
   attachmentError: string | null;
   /** Validate, append the accepted files, and surface the rejections. */
   addFiles: (incoming: File[]) => void;
-  /** Drop one chip; the stale rejection notice goes with it. */
+  /** Drop one file by index and clear the rejection notice. */
   removeFile: (index: number) => void;
   /**
-   * Validating wholesale replace — a stored draft handed back for editing
-   * (a send that never reached the server) is re-checked because it may
-   * predate the current limits.
+   * Validating wholesale replacement: the list becomes the accepted files
+   * and the rejections become the notice. For input of unknown provenance.
    */
   replaceFiles: (incoming: File[]) => void;
   /**
-   * Non-validating wholesale set — files the composer itself accepted
-   * earlier (a recalled message, a restored draft) come back verbatim;
-   * re-validating could silently drop what the user already attached.
+   * Verbatim wholesale replacement for already-trusted files — re-validating
+   * could silently drop them. Leaves the notice untouched.
    */
   restoreFiles: (files: File[]) => void;
   /**
-   * Pasted images/files attach instead of inserting as text; the event is
-   * claimed only when the clipboard actually carried a usable file, so a
+   * Attach file-kind clipboard items instead of letting them insert as
+   * text. The event is claimed only when a usable file was present, so a
    * plain-text paste keeps its native behavior.
    */
   onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
@@ -45,11 +42,10 @@ export interface ComposerAttachmentsApi {
 
 /**
  * Attachment state for a composer: the accepted files plus the rejection
- * notice, with the add/remove/paste affordances both composer surfaces
- * share. Validation runs here, before any upload — a bad file caught only
- * at upload time would surface as a server 415 after the message was
- * already sent. The hook owns no side effects beyond its own state;
- * callers wire theirs (focus, dirty tracking) through the callbacks.
+ * notice from client-side validation (`@/lib/attachments`). Every returned
+ * action keeps a stable identity across renders, so the actions are safe
+ * in effect dependency lists; option callbacks are always invoked at their
+ * latest via refs.
  */
 export function useComposerAttachments({
   initialFiles,
@@ -58,53 +54,62 @@ export function useComposerAttachments({
 }: UseComposerAttachmentsOptions = {}): ComposerAttachmentsApi {
   const [files, setFiles] = useState<File[]>(() => initialFiles ?? []);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  // Callback freshness is separated from action identity: the refs always
+  // hold the latest options, so the actions below never need re-creating.
+  const onAcceptedRef = useRef(onAccepted);
+  onAcceptedRef.current = onAccepted;
+  const onRemovedRef = useRef(onRemoved);
+  onRemovedRef.current = onRemoved;
 
-  const addFiles = (incoming: File[]) => {
+  const addFiles = useCallback((incoming: File[]) => {
     const { accepted, errors } = validateAttachments(incoming);
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
-      onAccepted?.(accepted);
+      onAcceptedRef.current?.(accepted);
     }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-  };
+  }, []);
 
-  const removeFile = (index: number) => {
+  const removeFile = useCallback((index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
     setAttachmentError(null);
-    onRemoved?.();
-  };
+    onRemovedRef.current?.();
+  }, []);
 
-  const replaceFiles = (incoming: File[]) => {
+  const replaceFiles = useCallback((incoming: File[]) => {
     const { accepted, errors } = validateAttachments(incoming);
     setFiles(accepted);
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-  };
+  }, []);
 
-  const restoreFiles = (restored: File[]) => {
+  const restoreFiles = useCallback((restored: File[]) => {
     setFiles(restored);
-  };
+  }, []);
 
-  const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const pasted: File[] = [];
-    for (const item of items) {
-      if (item.kind !== "file") continue;
-      const file = item.getAsFile();
-      if (file !== null) pasted.push(file);
-    }
-    if (pasted.length > 0) {
-      e.preventDefault();
-      addFiles(pasted);
-    }
-  };
+  const onPaste = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const pasted: File[] = [];
+      for (const item of items) {
+        if (item.kind !== "file") continue;
+        const file = item.getAsFile();
+        if (file !== null) pasted.push(file);
+      }
+      if (pasted.length > 0) {
+        e.preventDefault();
+        addFiles(pasted);
+      }
+    },
+    [addFiles],
+  );
 
-  const clearError = () => setAttachmentError(null);
+  const clearError = useCallback(() => setAttachmentError(null), []);
 
-  const clear = () => {
+  const clear = useCallback(() => {
     setFiles([]);
     setAttachmentError(null);
-  };
+  }, []);
 
   return {
     files,
