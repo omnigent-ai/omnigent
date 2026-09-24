@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from dataclasses import dataclass
@@ -649,16 +650,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
             resource_role: str | None = None,
             parent_os_env: Any = None,
         ) -> SessionResourceView:
-            """
-            Record the terminal launch request.
-
-            :param session_id: Session id being launched.
-            :param terminal_name: Terminal name, e.g. ``"tui"``.
-            :param session_key: Terminal session key, e.g. ``"main"``.
-            :param spec: Terminal launch spec.
-            :param resource_role: Private runner resource marker.
-            :returns: Terminal resource view.
-            """
+            """Record the terminal launch request."""
             assert session_id == "11c50cd73e9c32ccb0af5b9db291db8b"
             assert terminal_name == "tui"
             assert session_key == "main"
@@ -684,13 +676,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
             self.patches: list[_RecordedPatch] = []
 
         async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
-            """
-            Record the PATCH and return a 200.
-
-            :param url: Request path, e.g. ``"/v1/sessions/11c50cd73e9c32ccb0af5b9db291db8b"``.
-            :param kwargs: Request keyword arguments carrying ``json``.
-            :returns: HTTP 200 response.
-            """
+            """Accept the presentation-label PATCH."""
             self.patches.append(_RecordedPatch(url=url, json=kwargs.get("json") or {}))
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
@@ -792,7 +778,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
             resource_role: str | None = None,
             parent_os_env: Any = None,
         ) -> SessionResourceView:
-            """Record the spec + parent_os_env and return a resource view."""
+            """Record the terminal launch request."""
             del terminal_name, session_key, resource_role
             captured["spec"] = spec
             captured["parent_os_env"] = parent_os_env
@@ -807,7 +793,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
         """Server client that absorbs the label PATCH from the helper."""
 
         async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
-            """Return a 200 for the presentation-label PATCH."""
+            """Accept the presentation-label PATCH."""
             del kwargs
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
@@ -1101,3 +1087,63 @@ async def test_dead_registered_pane_close_does_not_restore_running(
     assert registry.get(sid, "claude", "main") is None, (
         "Stale entry must be removed from the registry"
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_create_repl_terminal_survives_removed_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create the REPL from runner workspace without reading a deleted process cwd."""
+    session_id = "11c50cd73e9c32ccb0af5b9db291db8b"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+
+    def missing_cwd() -> str:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(os, "getcwd", missing_cwd)
+
+    launched_specs: list[Any] = []
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the launched REPL terminal spec."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the terminal launch request."""
+            launched_specs.append(spec)
+            return SessionResourceView(
+                id="terminal_tui_main",
+                type="terminal",
+                session_id=session_id,
+                name="tui",
+            )
+
+    class _NoopServerClient:
+        """Server client that accepts the presentation-label PATCH."""
+
+        async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
+            """Accept the presentation-label PATCH."""
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    terminal_view = await _auto_create_repl_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_NoopServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert terminal_view.id == "terminal_tui_main"
+    assert len(launched_specs) == 1
+    assert launched_specs[0].os_env.cwd == str(workspace)

@@ -885,6 +885,23 @@ def _runner_workspace_dir() -> str:
         ) from exc
 
 
+def _claude_session_workspace(session_workspace: str | None) -> Path:
+    """Resolve and validate the session workspace without an eager cwd lookup."""
+    raw = session_workspace or os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
+    try:
+        workspace = Path(raw).expanduser() if raw else Path.cwd()
+        workspace = workspace.absolute()
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise OmnigentError(
+            "The session workspace is no longer available.", code=ErrorCode.WORKSPACE_MISSING
+        ) from exc
+    if not workspace.is_dir():
+        raise OmnigentError(
+            "The session workspace is not a directory.", code=ErrorCode.WORKSPACE_MISSING
+        )
+    return workspace
+
+
 def _codex_session_workspace(session_workspace: str | None) -> Path:
     """
     Resolve the cwd for a runner-owned Codex terminal.
@@ -7225,6 +7242,17 @@ def _native_terminal_start_error_payload(
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.WORKSPACE_MISSING:
+        return {
+            "code": ErrorCode.WORKSPACE_MISSING,
+            "error_id": error_id,
+            "message": (
+                "This session's workspace is no longer available. Restore the intended "
+                "workspace and restart the runner, or start a new session with an existing "
+                "workspace. Restarting alone does not restore the directory. "
+                f"Error ID: {error_id}."
+            ),
+        }
     if runtime_name == "Codex" and isinstance(exc, TerminalExitedDuringLaunch):
         message = _codex_terminal_exit_summary(exc.instance, before_thread=False)
         # A failed diagnostic read must not hide the known terminal-exit cause.
@@ -7715,10 +7743,10 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
-    workspace = (
-        session_init.snapshot.workspace
-        if session_init is not None and session_init.snapshot.workspace
-        else _runner_workspace_dir()
+    workspace = str(
+        _claude_session_workspace(
+            session_init.snapshot.workspace if session_init is not None else None
+        )
     )
     started_at = time.monotonic()
     _logger.info(
@@ -8381,7 +8409,7 @@ async def _auto_create_claude_terminal(
         resolve_harness_command,
     )
 
-    _harness_cfg = load_effective_config()
+    _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``
