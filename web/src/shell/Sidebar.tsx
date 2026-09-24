@@ -4923,6 +4923,7 @@ function useProjectFolderMenu(
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  const renameInputRef = useRef<HTMLInputElement>(null);
   // The icon staged in the rename modal, committed only on Confirm:
   //   undefined = untouched (show the saved icon), string = a picked emoji,
   //   null = staged removal. Reset to `undefined` each time the modal opens.
@@ -4969,6 +4970,11 @@ function useProjectFolderMenu(
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent
           onClick={(e) => e.stopPropagation()}
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            renameInputRef.current?.focus();
+            renameInputRef.current?.select();
+          }}
           // emoji-mart preventDefaults the pointer event, so Radix's own
           // outside-dismissal never fires for clicks elsewhere in the modal.
           // Catch them in the capture phase and close the picker ourselves,
@@ -5108,6 +5114,7 @@ function useProjectFolderMenu(
                 </PopoverContent>
               </Popover>
               <input
+                ref={renameInputRef}
                 className="w-full bg-transparent px-3 py-2 text-ui outline-none"
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
