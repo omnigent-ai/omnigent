@@ -23,7 +23,9 @@ import json
 import logging
 import os
 import queue
+import shlex
 import socket
+import subprocess
 import threading
 import time
 import traceback
@@ -48,6 +50,7 @@ from omnigent.version import VERSION
 # its host), so only four values are needed. See config_from_env.
 CLIENT_ID_ENV_VAR = "OMNIGENT_DEBUG_LOG_CLIENT_ID"
 CLIENT_SECRET_ENV_VAR = "OMNIGENT_DEBUG_LOG_CLIENT_SECRET"
+CLIENT_SECRET_COMMAND_ENV_VAR = "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND"
 WORKSPACE_URL_ENV_VAR = "OMNIGENT_DEBUG_LOG_WORKSPACE_URL"
 ENDPOINT_ENV_VAR = "OMNIGENT_DEBUG_LOG_ENDPOINT"
 
@@ -104,6 +107,7 @@ _FLUSH_INTERVAL_S = 2.0
 _QUEUE_MAX_RECORDS = 10_000
 _TOKEN_REFRESH_SKEW_S = 300.0
 _HTTP_TIMEOUT_S = 10.0
+_SECRET_COMMAND_TIMEOUT_S = 30.0
 # Logger-name prefixes the sink drops as noise: httpx/httpcore emit an
 # "HTTP Request: …" line per call — high-volume plumbing the debug view doesn't
 # want (and the sink's own uploads go through httpx).
@@ -154,7 +158,8 @@ class DebugLogConfig:
     """Resolved configuration for the debug-log sink."""
 
     client_id: str
-    client_secret: str
+    client_secret: str | None
+    client_secret_command: tuple[str, ...] | None
     workspace_url: str  # OIDC token-mint host, e.g. https://dbc-….cloud.databricks.com
     insert_url: str  # full ZeroBus …/tables/<table>/insert URL
     table: str  # catalog.schema.table, parsed from insert_url
@@ -188,27 +193,46 @@ def _parse_insert_url(insert_url: str) -> tuple[str, str] | None:
 def config_from_env() -> DebugLogConfig | None:
     """Build the sink config from the environment, or ``None`` when disabled.
 
-    All four variables must be set for the sink to run. When none are set it
-    stays silently off (the default for OSS/customers); a *partial* or malformed
-    set logs one warning naming the problem, then disables — that partial case
-    almost always means someone tried to enable it and slipped.
+    The client secret may be supplied directly or by a command. The command is
+    invoked lazily by the uploader thread, so a slow credential provider never
+    delays process startup. When no variables are set the sink stays silently
+    off; a partial or ambiguous configuration logs one warning and disables it.
     """
     client_id = os.environ.get(CLIENT_ID_ENV_VAR)
     client_secret = os.environ.get(CLIENT_SECRET_ENV_VAR)
+    client_secret_command_text = os.environ.get(CLIENT_SECRET_COMMAND_ENV_VAR)
     workspace_url = os.environ.get(WORKSPACE_URL_ENV_VAR)
     insert_url = os.environ.get(ENDPOINT_ENV_VAR)
-    if not (client_id and client_secret and workspace_url and insert_url):
-        present = {
-            CLIENT_ID_ENV_VAR: client_id,
-            CLIENT_SECRET_ENV_VAR: client_secret,
-            WORKSPACE_URL_ENV_VAR: workspace_url,
-            ENDPOINT_ENV_VAR: insert_url,
-        }
-        missing = [name for name, value in present.items() if not value]
-        # A partial set almost always means someone tried to enable it and slipped.
-        if len(missing) < len(present):
-            _logger.warning("debug-log sink disabled: missing env var(s): %s", ", ".join(missing))
+    values = (client_id, client_secret, client_secret_command_text, workspace_url, insert_url)
+    if not any(values):
         return None
+    if client_secret and client_secret_command_text:
+        _logger.warning(
+            "debug-log sink disabled: set only one of %s and %s",
+            CLIENT_SECRET_ENV_VAR,
+            CLIENT_SECRET_COMMAND_ENV_VAR,
+        )
+        return None
+    if not (
+        client_id
+        and (client_secret or client_secret_command_text)
+        and workspace_url
+        and insert_url
+    ):
+        _logger.warning("debug-log sink disabled: incomplete OMNIGENT_DEBUG_LOG_* configuration")
+        return None
+    client_secret_command = None
+    if client_secret_command_text:
+        try:
+            client_secret_command = tuple(shlex.split(client_secret_command_text))
+        except ValueError:
+            _logger.warning(
+                "debug-log sink disabled: could not parse %s", CLIENT_SECRET_COMMAND_ENV_VAR
+            )
+            return None
+        if not client_secret_command:
+            _logger.warning("debug-log sink disabled: %s is empty", CLIENT_SECRET_COMMAND_ENV_VAR)
+            return None
     parsed = _parse_insert_url(insert_url)
     if parsed is None:
         _logger.warning("debug-log sink disabled: could not parse %s", ENDPOINT_ENV_VAR)
@@ -217,6 +241,7 @@ def config_from_env() -> DebugLogConfig | None:
     return DebugLogConfig(
         client_id=client_id,
         client_secret=client_secret,
+        client_secret_command=client_secret_command,
         workspace_url=workspace_url.rstrip("/"),
         insert_url=insert_url,
         table=table,
@@ -596,6 +621,7 @@ class _TokenSource:
         self._lock = threading.Lock()
         self._token: str | None = None
         self._expires_at = 0.0
+        self._client_secret = config.client_secret
 
     def token(self) -> str | None:
         with self._lock:
@@ -611,6 +637,40 @@ class _TokenSource:
         with self._lock:
             self._token = None
             self._expires_at = 0.0
+            if self._config.client_secret_command is not None:
+                self._client_secret = None
+
+    def _resolve_client_secret(self) -> str | None:
+        if self._client_secret is not None:
+            return self._client_secret
+        command = self._config.client_secret_command
+        if command is None:
+            return None
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=_SECRET_COMMAND_TIMEOUT_S,
+            )
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+            _diag("secret_command", "client-secret command failed: %s", type(exc).__name__)
+            return None
+        if completed.returncode != 0:
+            _diag(
+                "secret_command_status",
+                "client-secret command exited with status %d",
+                completed.returncode,
+            )
+            return None
+        secret = completed.stdout.strip()
+        if not secret:
+            _diag("secret_command_empty", "client-secret command returned no credential")
+            return None
+        self._client_secret = secret
+        return secret
 
     def _authorization_details(self) -> str:
         parts = self._config.table.split(".")
@@ -640,11 +700,14 @@ class _TokenSource:
         )
 
     def _mint(self) -> tuple[str, float] | None:
+        client_secret = self._resolve_client_secret()
+        if client_secret is None:
+            return None
         resource = f"api://databricks/workspaces/{self._config.workspace_id}/zerobusDirectWriteApi"
         try:
             response = self._client.post(
                 f"{self._config.workspace_url}/oidc/v1/token",
-                auth=(self._config.client_id, self._config.client_secret),
+                auth=(self._config.client_id, client_secret),
                 data={
                     "grant_type": "client_credentials",
                     "scope": "all-apis",
@@ -662,6 +725,11 @@ class _TokenSource:
             )
             return None
         if response.status_code != 200:
+            if (
+                response.status_code in (401, 403)
+                and self._config.client_secret_command is not None
+            ):
+                self._client_secret = None
             # The body carries the OAuth error (invalid_client, unauthorized
             # authorization_details, …) — the actionable part.
             _diag(
