@@ -15,7 +15,7 @@ use tokio::time::{sleep, timeout};
 use crate::browser;
 use crate::omnigent_cmd;
 use crate::pod::Pod;
-use crate::process::ProcSpec;
+use crate::process::{ProcSpec, WebCommands};
 use crate::state::{ProcId, ProcStatus, Shared};
 
 const CONVERSATION_PREFILL_VERSION: &str = "v1";
@@ -77,7 +77,7 @@ pub struct Supervisor {
     pod: Arc<Pod>,
     shared: Arc<Mutex<Shared>>,
     env: Vec<(String, String)>,
-    vite_enabled: bool,
+    web: Option<WebCommands>,
     /// Whether `--trust-lan-origins` was requested, so we can warn if it was
     /// asked for but no LAN interface turned up any origins to trust.
     trust_lan_origins: bool,
@@ -93,7 +93,7 @@ impl Supervisor {
     pub fn new(
         pod: Arc<Pod>,
         shared: Arc<Mutex<Shared>>,
-        vite_enabled: bool,
+        web: Option<WebCommands>,
         trust_lan_origins: bool,
     ) -> Supervisor {
         let env = pod.env();
@@ -102,7 +102,7 @@ impl Supervisor {
             pod,
             shared,
             env,
-            vite_enabled,
+            web,
             trust_lan_origins,
             slots: Default::default(),
             expected_stops: HashSet::new(),
@@ -139,10 +139,14 @@ impl Supervisor {
         }
 
         self.start_backend().await;
-        if self.vite_enabled {
+        if let Some(web) = &self.web {
+            if web.vite.program == "corepack" && self.pod.profile.is_none() {
+                self.event("pnpm is not on PATH; using corepack pnpm for web commands");
+            }
             self.prepare_vite().await;
-            self.spawn(ProcId::Vite);
-            self.open_ui_when_ready();
+            if self.spawn(ProcId::Vite) {
+                self.open_ui_when_ready();
+            }
         }
 
         loop {
@@ -336,7 +340,7 @@ impl Supervisor {
             // backend, so treat it as a backend restart.
             ProcId::Server | ProcId::Host => self.start_backend_restart().await,
             ProcId::Vite => {
-                if self.vite_enabled {
+                if self.web.is_some() {
                     self.event("restarting vite");
                     self.stop(ProcId::Vite).await;
                     self.prepare_vite().await;
@@ -346,17 +350,13 @@ impl Supervisor {
         }
     }
 
-    fn spec(&self, id: ProcId) -> ProcSpec {
-        match id {
-            ProcId::Server => ProcSpec::server(&self.pod),
-            ProcId::Host => ProcSpec::host(&self.pod),
-            ProcId::Vite => ProcSpec::vite(&self.pod),
-        }
-    }
-
     /// Spawn a child in its own process group and wire up output + exit monitor.
-    fn spawn(&mut self, id: ProcId) {
-        let spec = self.spec(id);
+    fn spawn(&mut self, id: ProcId) -> bool {
+        let spec = match id {
+            ProcId::Server => &ProcSpec::server(&self.pod),
+            ProcId::Host => &ProcSpec::host(&self.pod),
+            ProcId::Vite => &self.web.as_ref().expect("web is enabled").vite,
+        };
         self.set_status(id, ProcStatus::Starting);
 
         let mut cmd = Command::new(&spec.program);
@@ -385,7 +385,7 @@ impl Supervisor {
                     .unwrap()
                     .log_proc(id, format!("failed to spawn {}: {e}", spec.program));
                 self.set_status(id, ProcStatus::Crashed);
-                return;
+                return false;
             }
         };
 
@@ -422,6 +422,7 @@ impl Supervisor {
                 status,
             });
         });
+        true
     }
 
     /// Prepare web dependencies before Vite starts, but only when they are
@@ -430,13 +431,10 @@ impl Supervisor {
     /// non-fatal: we still let Vite try, so a transient pnpm hiccup doesn't block
     /// the whole session.
     async fn prepare_vite(&self) {
-        if self
-            .pod
-            .profile
-            .as_ref()
-            .is_some_and(|profile| profile.prepare.is_none())
-            || !self.pod.needs_web_prepare()
-        {
+        let Some(spec) = self.web.as_ref().and_then(|web| web.prepare.as_ref()) else {
+            return;
+        };
+        if !self.pod.needs_web_prepare() {
             return;
         }
         self.set_status(ProcId::Vite, ProcStatus::Starting);
@@ -445,7 +443,6 @@ impl Supervisor {
             "web deps missing or stale — preparing dependencies".into(),
         );
 
-        let spec = ProcSpec::web_prepare(&self.pod);
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
@@ -596,7 +593,7 @@ impl Supervisor {
                 }
             }
             ProcId::Vite => {
-                if self.vite_enabled {
+                if self.web.is_some() {
                     self.spawn(ProcId::Vite);
                 }
             }
