@@ -4014,6 +4014,40 @@ describe("Composer paste", () => {
   });
 });
 
+// A send that fails before the server takes ownership hands its text and
+// files back to the composer for retry. The files re-enter through the same
+// up-front validation as a fresh attach — when the upload itself was what
+// failed (a 415 on an unsupported type), re-arming that file would only
+// fail again, so it is dropped with the same inline reason.
+describe("Composer failed-send attachment restore", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("restores the retriable files and flags the ones current limits reject", () => {
+    render(<Composer {...composerProps()} />);
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
+      }),
+    );
+
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    // The store entry drained on restore, so the draft can't come back twice.
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+});
+
 // The "Chatting with sub-agent …" tray peeks above the composer only when a
 // sub-agent label is passed (the active session is a child). It must name the
 // sub-agent so the composer reads as messaging the child, not the orchestrator.

@@ -59,7 +59,6 @@ import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdow
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
-import { validateAttachments } from "@/lib/attachments";
 import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
@@ -195,6 +194,7 @@ import {
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
+import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -2423,8 +2423,6 @@ function ComposerImpl(
     removeQuote,
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
-  const [files, setFiles] = useState<File[]>([]);
-  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
@@ -2679,8 +2677,6 @@ function ComposerImpl(
   valueRef.current = fullText;
   const replyDraftRef = useRef(storedReplyDraft);
   replyDraftRef.current = storedReplyDraft;
-  const filesRef = useRef(files);
-  filesRef.current = files;
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
   // the input, which would delete the draft. Only save when the user
@@ -2697,6 +2693,38 @@ function ComposerImpl(
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
 
+  // Attachments — same hook as the landing composer; the live composer's
+  // own side effects (dirty tracking, desktop refocus) stay in the
+  // callbacks so the hook never learns about sessions or focus.
+  const {
+    files,
+    attachmentError,
+    addFiles,
+    removeFile,
+    replaceFiles,
+    restoreFiles,
+    onPaste,
+    clearError,
+    clear: clearAttachments,
+  } = useComposerAttachments({
+    onAccepted: () => {
+      dirtyRef.current = true;
+      // Return focus to the composer so the user can keep typing right
+      // after attaching (the file picker / paperclip button steals it).
+      if (!isMobileRef.current) textareaRef.current?.focus();
+    },
+    onRemoved: () => {
+      dirtyRef.current = true;
+    },
+  });
+  const filesRef = useRef(files);
+  filesRef.current = files;
+  // The hook re-creates its functions every render; the restore effects
+  // below key off conversation state, not attachment identity, so they
+  // reach the current function through a ref rather than a dependency.
+  const attachmentsRef = useRef({ restoreFiles, replaceFiles });
+  attachmentsRef.current = { restoreFiles, replaceFiles };
+
   useEffect(() => {
     const previousConversationId = draftConversationIdRef.current;
     const promoted =
@@ -2709,7 +2737,7 @@ function ComposerImpl(
     const restored = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
     replaceText(restored?.text ?? "", restored?.replyDraft);
     textareaRef.current = tailTextareaRef.current;
-    setFiles(restored?.files ?? []);
+    attachmentsRef.current.restoreFiles(restored?.files ?? []);
     dirtyRef.current = false;
     // Publish which conversation the composer's text now belongs to. The
     // failed-send restore below reads value/files through refs, which still
@@ -2998,11 +3026,8 @@ function ComposerImpl(
     replaceText(failedSendDraft.text, failedSendDraft.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
-    if (failedSendDraft.files.length > 0) {
-      const { accepted, errors } = validateAttachments(failedSendDraft.files);
-      setFiles(accepted);
-      setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-    }
+    if (failedSendDraft.files.length > 0)
+      attachmentsRef.current.replaceFiles(failedSendDraft.files);
     if (!isMobileRef.current) textareaRef.current?.focus();
   }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
 
@@ -3220,21 +3245,6 @@ function ComposerImpl(
     onGrowthRef.current?.();
   });
 
-  const addFiles = (incoming: File[]) => {
-    // Reject unsupported types (only images, PDF, and text/code) and
-    // oversized files up front — before the upload — with a friendly
-    // message. The server enforces the same limits authoritatively.
-    const { accepted, errors } = validateAttachments(incoming);
-    if (accepted.length > 0) {
-      setFiles((prev) => [...prev, ...accepted]);
-      dirtyRef.current = true;
-      // Return focus to the composer so the user can keep typing right
-      // after attaching (the file picker / paperclip button steals it).
-      if (!isMobileRef.current) textareaRef.current?.focus();
-    }
-    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-  };
-
   // Files dropped anywhere in the chat column attach here, not just on the
   // composer box. Scoped to the column so the sidebar and workspace rail keep
   // their own drag behavior; with no such ancestor the card is the target.
@@ -3243,12 +3253,6 @@ function ComposerImpl(
     setDropTarget(el?.closest<HTMLElement>("[data-chat-surface]") ?? el);
   }, []);
   const isDragActive = useFileDropTarget(dropTarget, addFiles);
-
-  const removeFile = (index: number) => {
-    setFiles((prev) => prev.filter((_, i) => i !== index));
-    setAttachmentError(null);
-    dirtyRef.current = true;
-  };
 
   const clearComposerAfterSend = (resetNativeInputSession: boolean) => {
     const textarea = textareaRef.current;
@@ -3423,8 +3427,7 @@ function ComposerImpl(
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
-    setFiles([]);
-    setAttachmentError(null);
+    clearAttachments();
     setMentionedItems([]);
     setMention(null);
   };
@@ -3571,7 +3574,7 @@ function ComposerImpl(
           if (target !== undefined) {
             e.preventDefault();
             resetCursor();
-            setFiles(target.files ?? []);
+            restoreFiles(target.files ?? []);
             dequeueMessage(target.queueId);
             applyRecall(ta, target);
             return;
@@ -3592,27 +3595,11 @@ function ComposerImpl(
     }
   };
 
-  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const pastedFiles: File[] = [];
-    for (const item of items) {
-      if (item.kind === "file") {
-        const file = item.getAsFile();
-        if (file) pastedFiles.push(file);
-      }
-    }
-    if (pastedFiles.length > 0) {
-      e.preventDefault();
-      addFiles(pastedFiles);
-    }
-  };
-
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
     editText(id, e.target.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
-    if (attachmentError !== null) setAttachmentError(null);
+    if (attachmentError !== null) clearError();
     setMention(
       mentionEnabled
         ? detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length)
@@ -3675,7 +3662,7 @@ function ComposerImpl(
             resetCursor();
             recallingRef.current = false;
             textareaRef.current = tailTextareaRef.current;
-            setFiles(target.files ?? []);
+            restoreFiles(target.files ?? []);
             dequeueMessage(queueId);
             textareaRef.current?.focus();
           }}
@@ -3747,7 +3734,7 @@ function ComposerImpl(
             setInputFocused(false);
             dismissMention();
           },
-          onPaste: handlePaste,
+          onPaste,
           onScroll: (e) => {
             // Keep the overlay's scroll position locked to the textarea's.
             if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
@@ -3814,7 +3801,7 @@ function ComposerImpl(
                     onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
                     onBlur: dismissMention,
                     onKeyDown: handleKeyDown,
-                    onPaste: handlePaste,
+                    onPaste,
                     "data-has-draft": hasDraft ? "true" : undefined,
                   })}
                 />
