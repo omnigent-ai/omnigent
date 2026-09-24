@@ -53,6 +53,9 @@ _MEDIA_NAME = "clip.mp4"
 _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
 
+_TSV_NAME = "rows.tsv"
+_TSV_BODY = "a\tb\n1\t2\n"
+
 # A ZIP is a common input, such as an iCloud Photos export.
 _ZIP_NAME = "photos.zip"
 
@@ -181,6 +184,30 @@ def test_reject_unsupported_type(
     expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
     # And the inline rejection error is shown.
     expect(page.get_by_text("can't be attached", exact=False)).to_be_visible(timeout=10_000)
+
+
+def test_attach_tsv_the_server_accepts(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Accept .tsv through the file input even when the OS reports a binary MIME."""
+    del tmp_path
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    file_input = page.locator('input[type="file"][accept*="image/"]')
+    # A binary MIME forces classification to use the extension allowlist.
+    file_input.set_input_files(
+        {
+            "name": _TSV_NAME,
+            "mimeType": "application/octet-stream",
+            "buffer": _TSV_BODY.encode(),
+        }
+    )
+
+    expect(page.get_by_role("button", name=f"Remove {_TSV_NAME}")).to_be_visible(timeout=10_000)
+    expect(page.get_by_text("can't be attached", exact=False)).to_have_count(0)
 
 
 def test_landing_rejects_unsupported_type_and_keeps_message(
