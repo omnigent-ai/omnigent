@@ -47,6 +47,11 @@ from tests.e2e.conftest import POLL_INTERVAL_S
 # reconnect attempt is guaranteed to land inside the outage window.
 _RESTART_WINDOW_S = 6.0
 
+# Ceiling for both daemon-online waits. The daemon's own startup reaches ~25s
+# (15s capability init, a 10s connect-open timeout, plus subprocess and import
+# time), so a 30s wait left no margin for a loaded shard's scheduling noise.
+_DAEMON_ONLINE_BUDGET_S = 60.0
+
 _404_RESPONSE = (
     b"HTTP/1.1 404 Not Found\r\n"
     b"content-type: text/plain\r\n"
@@ -212,13 +217,16 @@ def _spawn_host_daemon_via(
 def _wait_for_host_online(
     client: httpx.Client,
     host_id: str,
-    timeout: float = 30.0,
+    timeout: float = _DAEMON_ONLINE_BUDGET_S,
+    *,
+    daemon_log: Path | None = None,
 ) -> None:
     """Poll GET /v1/hosts until *host_id* appears online.
 
     :param client: HTTP client pointed at the (direct) server.
     :param host_id: Host ID to wait for.
     :param timeout: Max seconds to wait.
+    :param daemon_log: Path to the daemon's log file; appended on failure.
     :raises AssertionError: If the host never appears online.
     """
     deadline = time.monotonic() + timeout
@@ -234,10 +242,14 @@ def _wait_for_host_online(
             # deadline expires.
             pass
         time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
+    log_tail = ""
+    if daemon_log is not None:
+        with contextlib.suppress(OSError):
+            log_tail = f"\nDaemon log tail:\n{daemon_log.read_text()[-2000:]}"
+    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s{log_tail}")
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(240)
 def test_host_survives_transient_404_during_server_restart(
     live_server: str,
     http_client: httpx.Client,
@@ -269,7 +281,7 @@ def test_host_survives_transient_404_during_server_restart(
             server_url=proxy_url,
             mock_llm_server_url=mock_llm_server_url,
         )
-        _wait_for_host_online(http_client, host_id, timeout=30.0)
+        _wait_for_host_online(http_client, host_id, daemon_log=daemon_log)
 
         # "Restart the server container": the proxy serves 404 for the
         # tunnel route and severs the live tunnel, so the daemon
@@ -280,7 +292,7 @@ def test_host_survives_transient_404_during_server_restart(
 
         # The daemon must ride out the window: give it time to notice the
         # restored backend and re-register, checking it never exits.
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + _DAEMON_ONLINE_BUDGET_S
         while time.monotonic() < deadline:
             rc = proc.poll()
             assert rc is None, (
@@ -303,8 +315,8 @@ def test_host_survives_transient_404_during_server_restart(
             time.sleep(POLL_INTERVAL_S)
         else:
             raise AssertionError(
-                "Host daemon did not come back online within 30s of the "
-                f"server returning. Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
+                f"Host daemon did not come back online within {_DAEMON_ONLINE_BUDGET_S:.0f}s "
+                f"of the server returning. Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
             )
 
         # And it must not have died at any point (belt-and-braces: the poll
