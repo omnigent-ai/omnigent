@@ -142,6 +142,59 @@ def test_contract_set_items_replaces_history_with_copies(
     assert history["data"][0]["role"] == "user"
 
 
+def test_contract_updates_session_and_health_before_and_after_navigation(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.update_session(
+        created_at=123,
+        sandbox_status={"stage": "provisioning"},
+        permission_level="view",
+        runner_id="runner-starting",
+        host_id=None,
+        workspace=None,
+    )
+    chat.set_health(runner_online=False, host_online=False)
+    page.goto(chat.url)
+
+    before = page.evaluate(
+        """async sessionId => ({
+            session: await fetch(`/v1/sessions/${sessionId}`).then(response => response.json()),
+            health: await fetch("/health").then(response => response.json()),
+        })""",
+        chat.session_id,
+    )
+    assert before["session"]["created_at"] == 123
+    assert before["session"]["sandbox_status"] == {"stage": "provisioning"}
+    assert before["session"]["permission_level"] == "view"
+    assert before["session"]["runner_id"] == "runner-starting"
+    assert before["session"]["host_id"] is None
+    assert before["session"]["workspace"] is None
+    assert before["health"]["sessions"][chat.session_id] == {
+        "runner_online": False,
+        "host_online": False,
+    }
+
+    chat.update_session(sandbox_status={"stage": "failed", "error": "launch failed"})
+    chat.set_health(runner_online=True)
+    after = page.evaluate(
+        """async sessionId => ({
+            session: await fetch(`/v1/sessions/${sessionId}`).then(response => response.json()),
+            health: await fetch("/health").then(response => response.json()),
+        })""",
+        chat.session_id,
+    )
+    assert after["session"]["sandbox_status"] == {
+        "stage": "failed",
+        "error": "launch failed",
+    }
+    assert after["health"]["sessions"][chat.session_id] == {
+        "runner_online": True,
+        "host_online": False,
+    }
+
+
 def test_contract_records_and_persists_session_patches(
     page: Page,
     chat_session_contract: ChatSessionContract,

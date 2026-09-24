@@ -24,7 +24,11 @@ The mutable handle exposes `session_id`, `url`, `event_posts`,
 `upload_requests`, `skills`, `skill_requests`, and `session_patches`. Use
 `set_items(...)` before navigation to replace history with arbitrary wire items,
 or `seed_transcript(...)` to generate Markdown/code turns. Use
-`set_skills(...)` to replace the session's `/v1/skills` response. To exercise
+`update_session(...)` before or after navigation to override session wire fields,
+including setting `host_id=None` and `workspace=None`. Use `set_health(...)` to
+override per-session liveness fields such as `runner_online`.
+
+Use `set_skills(...)` to replace the session's `/v1/skills` response. To exercise
 loading UI, call `release = hold_skills()` before navigation, then call
 `release()` after the request appears in `skill_requests`. Session PATCH bodies
 are recorded in `session_patches`, merged into the mocked session, and reflected

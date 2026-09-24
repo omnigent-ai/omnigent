@@ -226,6 +226,7 @@ class ChatSessionContract:
     session_patches: list[dict[str, Any]] = field(default_factory=list)
     _items: list[dict[str, Any]] = field(default_factory=list)
     _session_updates: dict[str, Any] = field(default_factory=dict)
+    _health_updates: dict[str, Any] = field(default_factory=dict)
     _status: str = "idle"
     _hold_skill_responses: bool = False
     _pending_skill_routes: list[Route] = field(default_factory=list)
@@ -261,6 +262,14 @@ class ChatSessionContract:
     def set_items(self, items: Sequence[Mapping[str, Any]]) -> None:
         """Replace history with copies of the supplied wire items."""
         self._items = [dict(item) for item in items]
+
+    def update_session(self, **fields: Any) -> None:
+        """Merge wire fields into subsequent mocked session snapshots."""
+        self._session_updates.update(fields)
+
+    def set_health(self, **fields: Any) -> None:
+        """Override per-session fields returned by the health endpoint."""
+        self._health_updates.update(fields)
 
     def set_catalog(
         self,
@@ -343,6 +352,11 @@ class ChatSessionContract:
             "policies": [],
             "terminals": [],
         }
+
+    def _health(self) -> dict[str, Any]:
+        status = {"runner_online": True, "host_online": True}
+        status.update(self._health_updates)
+        return {"sessions": {self.session_id: status}}
 
 
 def install_chat_session_routes(handle: ChatSessionContract) -> None:
@@ -454,9 +468,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
         )
     contract.json(
         "/health",
-        lambda _request: {
-            "sessions": {handle.session_id: {"runner_online": True, "host_online": True}}
-        },
+        lambda _request: handle._health(),
     )
     model_catalog = re.compile(
         rf"/v1/hosts/{re.escape(handle.host_id)}/harnesses/[^/]+/model-options(?:\?.*)?$"
