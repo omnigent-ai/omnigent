@@ -5076,36 +5076,36 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     ]
 
 
+@pytest.mark.parametrize(
+    ("detail", "expected_message"),
+    [
+        (
+            "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
+            "It may not exist or you may not have access to it.",
+            "The turn failed without a reported reason; the last assistant message was: "
+            "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
+            "It may not exist or you may not have access to it.",
+        ),
+        (
+            "API Error: 502 The upstream server returned an invalid response.",
+            "API Error: 502 The upstream server returned an invalid response.",
+        ),
+    ],
+)
 async def test_post_external_session_status_failed_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    detail: str,
+    expected_message: str,
 ) -> None:
-    """
-    A ``failed`` edge with no wire ``output`` carries the persisted error text.
-
-    claude-native's ``StopFailure`` edge posts no ``output``, but the
-    harness's own explanation (its last assistant message, e.g. "There's an
-    issue with the selected model (…)") is already persisted. The handler
-    must attach it so the parent inbox shows it instead of the generic
-    "Error: native sub-agent turn failed", and surface it as the session's
-    typed error under the harness-neutral ``native_turn_error`` code.
-    """
+    """Attach persisted assistant text to the parent event while labeling it in the typed error."""
     from omnigent.server.routes import sessions as sessions_module
 
-    detail = (
-        "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
-        "It may not exist or you may not have access to it."
-    )
     forwarded: list[dict[str, Any]] = []
     published: list[tuple[str, dict[str, Any]]] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture forwarded runner events.
-
-        :param request: Request sent to the fake runner.
-        :returns: Accepted response.
-        """
+        """Capture forwarded runner events."""
         forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
         return httpx.Response(204)
 
@@ -5118,13 +5118,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
         session_id: str,
         runner_router: object,
     ) -> httpx.AsyncClient:
-        """
-        Resolve the session to the fake runner client.
-
-        :param session_id: Session id being routed.
-        :param runner_router: Real app runner router, unused here.
-        :returns: The fake runner client.
-        """
+        """Return the fake runner client for this session."""
         del session_id, runner_router
         return fake_runner
 
@@ -5182,7 +5176,77 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     error = failed_events[0]["error"]
     assert error is not None
     assert error["code"] == "native_turn_error"
-    assert "selected model" in error["message"]
+    assert error["message"] == expected_message
+
+
+@pytest.mark.parametrize(
+    ("extra_data", "expected_code"),
+    [
+        # No wire output at all: harness-neutral fallback.
+        ({}, "native_turn_error"),
+        # Whitespace-only output is still detail-less.
+        ({"output": "   "}, "native_turn_error"),
+        # A detail-less reauth keeps its reauth code with the fallback message.
+        ({"reauth_required": True}, "codex_reauth_required"),
+    ],
+)
+async def test_post_external_session_status_failed_without_detail_still_carries_a_message(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    extra_data: dict[str, Any],
+    expected_code: str,
+) -> None:
+    """Require a typed fallback error when neither wire nor persisted detail exists."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions.routes_events import (
+        _NATIVE_FAILURE_WITHOUT_DETAIL,
+    )
+
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the forwarded runner event."""
+        del request
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        """Return the fake runner client for this session."""
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        status_resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", **extra_data},
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
+    assert failed_events, f"no failed status was published: {published}"
+    error = failed_events[0]["error"]
+    assert error is not None, "a failed status edge was published with no error detail"
+    assert error["code"] == expected_code
+    assert error["message"] == _NATIVE_FAILURE_WITHOUT_DETAIL
 
 
 async def test_post_external_session_status_failed_keeps_wire_output_and_codex_code(

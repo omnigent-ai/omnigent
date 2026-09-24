@@ -281,6 +281,17 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
 )
 
 
+# Detail-less native failures still need a user-visible reason.
+_NATIVE_FAILURE_WITHOUT_DETAIL = (
+    "The turn failed but the agent reported no detail. See the runner log for details."
+)
+
+# Distinguish persisted assistant text from a forwarder-reported reason.
+_NATIVE_FAILURE_ENRICHED_DETAIL_PREFIX = (
+    "The turn failed without a reported reason; the last assistant message was: "
+)
+
+
 def _event_body_too_large() -> HTTPException:
     """Build the shared error for an oversized session-event request."""
     return HTTPException(
@@ -1545,18 +1556,28 @@ def register_events_routes(
             # last_task_error, not only the sub-agent parent-inbox path.
             output = data.get("output")
             status_error: ErrorDetail | None = None
-            if status == "failed" and isinstance(output, str) and output.strip():
+            if status == "failed":
+                # The web renders a failure only when this edge carries an error.
+                detail = output.strip() if isinstance(output, str) and output.strip() else ""
+                wire_output = body.data.get("output")
+                wire_detail = wire_output.strip() if isinstance(wire_output, str) else ""
+                if not detail:
+                    message = _NATIVE_FAILURE_WITHOUT_DETAIL
+                elif wire_detail or detail.casefold().startswith("api error:"):
+                    # A forwarder reason or an explicit API error is already diagnostic.
+                    message = detail
+                else:
+                    # Label persisted assistant text so it is not mistaken for the reason.
+                    message = f"{_NATIVE_FAILURE_ENRICHED_DETAIL_PREFIX}{detail}"
                 if data.get("reauth_required") is True:
+                    # Preserve the reauth classification even without detail.
                     error_code = "codex_reauth_required"
                 else:
-                    # Store-enriched failures are harness-neutral; wire output
-                    # retains the Codex fallback unless a rate limit is known.
-                    error_code = (
-                        "codex_turn_error" if body.data.get("output") else "native_turn_error"
-                    )
+                    # Only a nonblank wire reason receives the Codex-specific code.
+                    error_code = "codex_turn_error" if wire_detail else "native_turn_error"
                 status_error = ErrorDetail(
-                    code=classify_native_turn_error(error_code, output),
-                    message=output.strip(),
+                    code=classify_native_turn_error(error_code, detail),
+                    message=message,
                 )
             if status_error is not None:
                 failed_agent_name = await asyncio.to_thread(

@@ -2734,6 +2734,25 @@ def _build_skipped_kiro_items(
     return items
 
 
+# Older runners can omit the failure reason; point users to the runner log.
+_RELAYED_FAILURE_WITHOUT_MESSAGE = (
+    "The turn failed but the runner reported no detail. See the runner log for details."
+)
+_RELAYED_FAILURE_REASON_STAND_IN = "no reason reported (see the runner log for details)"
+
+
+def _ensure_relayed_failure_reason(error: ErrorDetail) -> ErrorDetail:
+    """Repair a relayed failure whose message is blank or ends at a dropped-reason colon."""
+    message = error.message.strip()
+    if not message:
+        return error.model_copy(update={"message": _RELAYED_FAILURE_WITHOUT_MESSAGE})
+    if message.endswith(":"):
+        return error.model_copy(
+            update={"message": f"{message} {_RELAYED_FAILURE_REASON_STAND_IN}"}
+        )
+    return error
+
+
 async def _enrich_terminal_status_with_subagent_output(
     data: dict[str, Any],
     status: str,
@@ -6986,6 +7005,8 @@ async def _relay_runner_stream_once(
                                 else None
                             )
                             if status == "failed" and status_error is not None:
+                                # Normalize failures from runners that predate this guard.
+                                status_error = _ensure_relayed_failure_reason(status_error)
                                 await _persist_session_status_error_labels(
                                     session_id,
                                     status_error,
