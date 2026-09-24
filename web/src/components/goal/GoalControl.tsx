@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CircleCheckIcon, GoalIcon, TargetIcon } from "lucide-react";
+import { GoalIcon, TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Goal } from "@/lib/goalApi";
@@ -94,7 +94,7 @@ export function GoalControl(props: GoalControlProps) {
 /** Icon-only workspace-bar indicator for the current goal; details on hover, dialog on click. */
 export function GoalStatusPill({ goal, onOpen }: { goal: Goal; onOpen?: () => void }) {
   const done = goal.status === "complete";
-  const Icon = done ? CircleCheckIcon : GoalIcon;
+  const Icon = done ? GoalIcon : TargetIcon;
   const label = `Goal ${formatGoalStatus(goal.status)}`;
   return (
     <Tooltip>
