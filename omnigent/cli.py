@@ -5005,6 +5005,12 @@ def stop(force: bool) -> None:
     # this, that server survives the off-switch — the exact "I ran stop and a
     # server is still on the default port" symptom.
     orphan_pid = stop_untracked_local_server()
+    # A runner that died without graceful teardown (SIGKILL, OOM) leaves its
+    # detached tmux terminal with no owner to reap it; that server and its
+    # harness child would otherwise outlive the off-switch.
+    from omnigent.inner.terminal import reap_orphaned_terminals
+
+    reaped_terminals = reap_orphaned_terminals()
 
     parts: list[str] = []
     if stopped:
@@ -5013,6 +5019,8 @@ def stop(force: bool) -> None:
         parts.append("the background server")
     if orphan_pid is not None:
         parts.append(f"an untracked server on :{_DEFAULT_LOCAL_PORT} (pid {orphan_pid})")
+    if reaped_terminals:
+        parts.append(f"{reaped_terminals} orphaned terminal(s)")
     if parts:
         click.echo("Stopped " + " and ".join(parts) + ".")
     else:
