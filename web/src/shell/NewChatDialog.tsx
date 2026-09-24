@@ -19,6 +19,7 @@ import {
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
+  HarnessMenuNavigationLabel,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
@@ -1930,7 +1931,12 @@ export function AgentHarnessPicker({
                 className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
                 <WandSparklesIcon className="size-4" aria-hidden="true" />
-                <span className="min-w-0 flex-1 truncate text-left">{SMART_ROUTING_LABEL}</span>
+                <span
+                  data-harness-menu-choice-label=""
+                  className="min-w-0 flex-1 truncate text-left"
+                >
+                  {SMART_ROUTING_LABEL}
+                </span>
                 <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
                   Harness + model
                 </span>
@@ -1955,7 +1961,7 @@ export function AgentHarnessPicker({
                     }}
                     className="items-center"
                   >
-                    <span className="flex-1 text-left">{otherHarnessLabel}</span>
+                    <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
                   </DropdownMenuItem>
                 ) : (
@@ -1975,7 +1981,7 @@ export function AgentHarnessPicker({
                         }
                       }}
                     >
-                      <span className="flex-1 text-left">{otherHarnessLabel}</span>
+                      <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     </DropdownMenuSubTrigger>
                     <HarnessPickerSubContent
                       sideOffset={-4}
@@ -2007,7 +2013,7 @@ export function AgentHarnessPicker({
                 }}
                 className="items-center"
               >
-                <span className="flex-1 text-left">Custom agents...</span>
+                <HarnessMenuNavigationLabel>Custom agents...</HarnessMenuNavigationLabel>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
               </DropdownMenuItem>
             ) : (
@@ -2017,7 +2023,7 @@ export function AgentHarnessPicker({
                   data-testid="new-chat-landing-custom-agents"
                   className="cursor-pointer items-center"
                 >
-                  <span className="flex-1 text-left">Custom agents...</span>
+                  <HarnessMenuNavigationLabel>Custom agents...</HarnessMenuNavigationLabel>
                 </DropdownMenuSubTrigger>
                 <HarnessPickerSubContent
                   sideOffset={-4}

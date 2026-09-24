@@ -233,6 +233,7 @@ async def _open_landing(
     session_id: str,
     *,
     agents_body: str | None = None,
+    smart_routing: bool = False,
 ) -> None:
     """Route-stub and open the landing composer on a fresh async page."""
     await _register_common_routes(
@@ -246,6 +247,19 @@ async def _open_landing(
         f"**/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
         lambda route: route.fulfill(json={"models": _CLAUDE_HOST_ROWS}),
     )
+    if smart_routing:
+        await page.route(
+            "**/v1/info",
+            lambda route: route.fulfill(
+                json={
+                    "accounts_enabled": False,
+                    "single_user": True,
+                    "needs_setup": False,
+                    "smart_routing_enabled": True,
+                    "smart_routing_sources": {"external": True, "oss": False},
+                }
+            ),
+        )
     await page.goto(f"{base_url}/")
     await async_expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
 
@@ -1016,12 +1030,12 @@ async def _landing_shared_width(base_url: str, session_id: str, live_width: floa
 
 
 def _three_agent_agents_body() -> str:
-    """Stub body for ``GET /v1/agents``: three agents so the landing picker
-    has sibling rows to measure."""
+    """Stub body for ``GET /v1/agents``: three harnesses plus one custom
+    agent, so the landing picker renders both navigation rows."""
     agents = [
         ("ag_claude_e2e", "claude-native-ui", "Claude Code", "claude-native"),
         ("ag_codex_e2e", "codex-native-ui", "Codex", "codex-native"),
-        ("ag_gemini_e2e", "gemini-cli", "Gemini CLI", "gemini-cli"),
+        ("ag_opencode_e2e", "opencode-native-ui", "OpenCode", "opencode-native"),
     ]
     return json.dumps(
         {
@@ -1036,6 +1050,17 @@ def _three_agent_agents_body() -> str:
                 }
                 for agent_id, name, display, harness in agents
             ]
+            + [
+                {
+                    "id": "ag_custom_e2e",
+                    "name": "custom-e2e",
+                    "display_name": "Custom E2E",
+                    "description": "Custom agent for picker geometry",
+                    "harness": "claude-sdk",
+                    "skills": [],
+                    "builtin": False,
+                }
+            ]
         }
     )
 
@@ -1048,8 +1073,8 @@ def _row_boxes(page: Page | AsyncPage, locator) -> list[FloatRect]:
 
 
 def test_landing_picker_rows_follow_the_row_grid(seeded_session: tuple[str, str]) -> None:
-    """Landing agent-picker rows share the row grid (icon x, label x, trailing
-    x, height, pitch) at desktop and phone widths."""
+    """Landing picker rows keep separate icon and navigation-label columns,
+    aligned headings, row heights, and chevrons at desktop and phone widths."""
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_landing_picker_grid(base_url, session_id))
 
@@ -1060,7 +1085,13 @@ async def _landing_picker_grid(base_url: str, session_id: str) -> None:
         context = await browser.new_context(viewport=_DESKTOP)
         page = await context.new_page()
         try:
-            await _open_landing(page, base_url, session_id, agents_body=_three_agent_agents_body())
+            await _open_landing(
+                page,
+                base_url,
+                session_id,
+                agents_body=_three_agent_agents_body(),
+                smart_routing=True,
+            )
             for viewport in [_DESKTOP, _PHONE]:
                 # A fresh load at each width: resizing desktop-to-phone leaves
                 # the sidebar drawer open over the composer and it eats the
@@ -1112,6 +1143,80 @@ async def _landing_picker_grid(base_url: str, session_id: str) -> None:
                 assert abs(rights[0] - rights[1]) <= _TOL, (
                     f"picker-row value columns diverge ({viewport['width']}px): "
                     f"{rights[0]:.2f} vs {rights[1]:.2f}"
+                )
+
+                menu = page.locator(".composer-agent-menu").first
+                smart_routing_row = page.get_by_test_id("new-chat-landing-harness-smart-routing")
+                await async_expect(smart_routing_row).to_be_visible()
+                section_labels = menu.locator("[data-harness-menu-section-label]")
+                await async_expect(section_labels).to_have_count(2)
+                harness_header = section_labels.filter(has_text="Harnesses")
+                agents_header = section_labels.filter(has_text="Agents")
+                other_row = page.get_by_test_id("new-chat-landing-harness-more")
+                custom_row = page.get_by_test_id("new-chat-landing-custom-agents")
+                await async_expect(other_row).to_be_visible()
+                await async_expect(custom_row).to_be_visible()
+
+                navigation_rows = [other_row, custom_row]
+                navigation_labels = [
+                    row.locator("[data-harness-menu-navigation-label]") for row in navigation_rows
+                ]
+                navigation_chevrons = [row.locator("svg").last for row in navigation_rows]
+                headers = [harness_header, agents_header]
+                for header, row, label, chevron in zip(
+                    headers,
+                    navigation_rows,
+                    navigation_labels,
+                    navigation_chevrons,
+                    strict=True,
+                ):
+                    header_text_x = await header.evaluate(
+                        "(el) => el.getBoundingClientRect().x + "
+                        "parseFloat(getComputedStyle(el).paddingLeft)"
+                    )
+                    row_box = await row.bounding_box()
+                    label_box = await label.bounding_box()
+                    chevron_box = await chevron.bounding_box()
+                    assert all(box is not None for box in [row_box, label_box, chevron_box])
+                    assert row_box is not None
+                    assert label_box is not None
+                    assert chevron_box is not None
+                    assert abs(label_box["x"] - header_text_x) <= _TOL, (
+                        f"navigation label does not align with its section heading "
+                        f"({viewport['width']}px): {label_box['x']:.2f} vs "
+                        f"{header_text_x:.2f}"
+                    )
+                    _assert_same_vertical_center(row_box, label_box)
+                    _assert_same_vertical_center(row_box, chevron_box)
+
+                navigation_row_boxes = [await row.bounding_box() for row in navigation_rows]
+                assert all(box is not None for box in navigation_row_boxes)
+                other_row_box, custom_row_box = navigation_row_boxes
+                assert other_row_box is not None and custom_row_box is not None
+                assert abs(other_row_box["height"] - custom_row_box["height"]) <= _TOL
+                assert abs(other_row_box["height"] - boxes[0]["height"]) <= _TOL
+
+                chevron_boxes = [await chevron.bounding_box() for chevron in navigation_chevrons]
+                assert all(box is not None for box in chevron_boxes)
+                other_chevron, custom_chevron = chevron_boxes
+                assert other_chevron is not None and custom_chevron is not None
+                assert abs(other_chevron["x"] - custom_chevron["x"]) <= _TOL
+
+                choice_labels = menu.locator("[data-harness-menu-choice-label]")
+                choice_count = await choice_labels.count()
+                assert choice_count >= 3
+                choice_boxes = [
+                    await choice_labels.nth(i).bounding_box() for i in range(choice_count)
+                ]
+                assert all(box is not None for box in choice_boxes)
+                choice_xs = [box["x"] for box in choice_boxes if box is not None]
+                assert max(choice_xs) - min(choice_xs) <= _TOL, (
+                    f"icon-bearing picker labels diverge ({viewport['width']}px): {choice_xs}"
+                )
+                navigation_x = (await navigation_labels[0].bounding_box())["x"]
+                assert choice_xs[0] - navigation_x > _TOL, (
+                    f"icon-bearing and no-icon labels collapsed into one column "
+                    f"({viewport['width']}px): {choice_xs[0]:.2f} vs {navigation_x:.2f}"
                 )
                 await page.keyboard.press("Escape")
                 # The menu unmounts after its close animation; reopening before
