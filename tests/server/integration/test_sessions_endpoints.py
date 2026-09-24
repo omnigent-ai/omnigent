@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
@@ -33,6 +35,7 @@ from omnigent.entities import (
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
@@ -1310,6 +1313,133 @@ async def test_session_event_batch_is_ordered_and_idempotent(
         "inspect logs",
         "found it",
     ]
+
+
+async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], "runner-owning-session")
+    event = {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": "native:record-1",
+            "item_type": "message",
+            "response_id": "r1",
+            "item_data": {
+                "role": "assistant",
+                "agent": "claude-native-ui",
+                "content": [{"type": "output_text", "text": "from tunnel"}],
+            },
+        },
+    }
+    ingest = app.state.runner_event_ingest
+    batch = EventBatchFrame(id="b1", session_id=session["id"], events=[event])
+    rejected = await ingest(
+        app=app, headers=Headers({}), owner=None, runner_id="another-runner", batch=batch
+    )
+    assert rejected.applied == 0 and not rejected.retryable
+    first = await ingest(
+        app=app, headers=Headers({}), owner=None, runner_id="runner-owning-session", batch=batch
+    )
+    second = await ingest(
+        app=app, headers=Headers({}), owner=None, runner_id="runner-owning-session", batch=batch
+    )
+    assert first.applied == second.applied == 1
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert [item["content"][0]["text"] for item in items] == ["from tunnel"]
+    forbidden = await ingest(
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="runner-owning-session",
+        batch=EventBatchFrame(
+            id="b2", session_id=session["id"], events=[{"type": "message", "data": {}}]
+        ),
+    )
+    assert forbidden.applied == 0 and not forbidden.retryable
+    partial = await ingest(
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="runner-owning-session",
+        batch=EventBatchFrame(
+            id="b3", session_id=session["id"], events=[event, {"type": "message", "data": {}}]
+        ),
+    )
+    assert partial.applied == 1 and not partial.retryable
+    items_after = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert len(items_after) == 1
+
+
+async def test_runner_batch_reports_prefix_after_unexpected_failure(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes.sessions import routes_events as event_routes
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(session["id"], "runner-a")
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session, event: published.append(event),
+    )
+    persist = event_routes._persist_external_conversation_item
+    attempts = 0
+
+    async def fail_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary database failure")
+        return await persist(*args, **kwargs)
+
+    monkeypatch.setattr(event_routes, "_persist_external_conversation_item", fail_once)
+    item = {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": "record-1",
+            "item_type": "message",
+            "response_id": "resp-1",
+            "item_data": {
+                "role": "assistant",
+                "agent": "claude-native-ui",
+                "content": [{"type": "output_text", "text": "saved"}],
+            },
+        },
+    }
+    batch = EventBatchFrame(
+        id="first",
+        session_id=session["id"],
+        events=[
+            {"type": "external_output_text_delta", "data": {"delta": "preview"}},
+            item,
+        ],
+    )
+    ingest = app.state.runner_event_ingest
+    first = await ingest(
+        app=app, headers=Headers({}), owner=None, runner_id="runner-a", batch=batch
+    )
+    assert first.applied == 1 and first.retryable
+    retry = await ingest(
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="runner-a",
+        batch=EventBatchFrame(id="retry", session_id=session["id"], events=[item]),
+    )
+    assert retry.applied == 1
+    assert [event["type"] for event in published].count("response.output_text.delta") == 1
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert [item["content"][0]["text"] for item in items] == ["saved"]
 
 
 async def test_session_event_batch_rejects_body_over_ten_mib(
