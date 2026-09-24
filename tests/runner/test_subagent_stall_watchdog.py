@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 
 from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, pending_approvals
 from tests.runner.helpers import NullServerClient
 
 PARENT_SESSION_ID = "conv_parent_orchestrator"
@@ -202,6 +202,112 @@ async def test_stall_sweep_leaves_launching_children_to_the_launch_sweep(
         == []
     )
     assert entry.status == "launching"
+
+
+@pytest.mark.asyncio
+async def test_recovered_waiting_child_is_left_to_reconciliation(
+    _clean_subagent_registry: None,
+) -> None:
+    """A restart-recovered ``waiting`` dispatch is the reconcile loop's business.
+
+    Such an entry awaits *remote* completion and has no local edges by
+    construction, so the local-silence sweep must not synthesize a failure —
+    the server may already hold its real result, and recovery only re-selects
+    ``waiting`` entries.
+    """
+    entry = runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="worker",
+        title="recovered",
+    )
+    entry.status = "waiting"
+
+    assert (
+        runner_app.reap_stalled_subagent_dispatches(
+            now=entry.last_activity_at + STALL_TIMEOUT_S * 10, timeout_s=STALL_TIMEOUT_S
+        )
+        == []
+    )
+    assert entry.status == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_child_awaiting_human_approval_is_not_reaped(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child parked on an ASK gate emits no edges but must not be failed.
+
+    The approval has its own day-long budget; reaping it here would abandon a
+    live turn the user is about to answer.
+    """
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    entry = _dispatch_running_child()
+    monkeypatch.setattr(
+        pending_approvals,
+        "has_pending",
+        lambda conv_id: conv_id == CHILD_SESSION_ID,
+    )
+
+    assert (
+        runner_app.reap_stalled_subagent_dispatches(
+            now=entry.last_activity_at + STALL_TIMEOUT_S * 10, timeout_s=STALL_TIMEOUT_S
+        )
+        == []
+    )
+    assert entry.status == "running"
+    assert not entry.stalled
+    assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_genuine_result_supersedes_a_watchdog_stall_failure(
+    _clean_subagent_registry: None,
+) -> None:
+    """A real terminal edge after a stall failure wins and re-wakes the parent.
+
+    The watchdog failure is a guess that the child's edge would never arrive.
+    When the child later completes for real, that result must replace the
+    placeholder failure and be delivered, not discarded as already-delivered.
+    """
+    server = _WakeRecordingServerClient()
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    entry = _dispatch_running_child()
+
+    runner_app.reap_stalled_subagent_dispatches(
+        now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
+        timeout_s=STALL_TIMEOUT_S,
+        mark_terminal=app.state.mark_subagent_terminal_and_wake,
+    )
+    assert entry.status == "failed"
+    assert entry.stalled
+    failed_payload = inbox.get_nowait()
+    assert failed_payload["status"] == "failed"
+
+    for _ in range(100):
+        if server.wake_posts:
+            break
+        await asyncio.sleep(0.01)
+    assert len(server.wake_posts) == 1
+
+    # The child's real completion lands after the backstop already fired. It
+    # must replace the placeholder failure and re-deliver — ``delivered_now``
+    # is the signal that schedules the parent wake, not an already-delivered
+    # no-op that would strand the real result.
+    ack = app.state.mark_subagent_terminal_and_wake(
+        CHILD_SESSION_ID, status="completed", output="the real answer"
+    )
+
+    assert ack.delivered_now
+    assert entry.status == "completed"
+    assert not entry.stalled
+    completed_payload = inbox.get_nowait()
+    assert completed_payload["status"] == "completed"
+    assert completed_payload["output"] == "the real answer"
 
 
 def test_stall_timeout_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1635,6 +1635,10 @@ class _SubagentWorkEntry:
     :param last_activity_at: Unix timestamp of the most recent
         runner-visible edge for this child (status edge or published
         event). Seeds to the dispatch time; drives the stall sweep.
+    :param stalled: Whether the recorded terminal is a watchdog-synthesized
+        stall failure rather than a real child edge. A later genuine
+        terminal edge supersedes it, so the parent acts on the real result
+        instead of the backstop's placeholder.
     """
 
     parent_session_id: str
@@ -1650,6 +1654,7 @@ class _SubagentWorkEntry:
     completed_at: float | None = None
     delivered: bool = False
     last_activity_at: float = dataclasses.field(default_factory=time.time)
+    stalled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2170,6 +2175,21 @@ def mark_subagent_work_terminal(
             reason=_SUBAGENT_DELIVERY_UNTRACKED,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+        if entry.stalled:
+            # The recorded terminal is a watchdog-synthesized stall failure — a
+            # guess that the child's real edge would never arrive. A later
+            # genuine terminal edge (a forwarded completion, or a reconciled
+            # remote result) disproves that guess, so it supersedes the stall
+            # and is re-delivered; the parent must act on the real result, not
+            # the backstop's placeholder. Only the stall sweep sets ``stalled``,
+            # and it never touches an already-terminal entry, so any terminal
+            # report reaching here is the genuine edge.
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            entry.stalled = False
+            return _deliver_subagent_completion(entry)
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
@@ -2326,12 +2346,26 @@ def reap_stalled_subagent_dispatches(
     Fail sub-agent dispatches that started and then went silent.
 
     Complements :func:`reap_stalled_subagent_launches`, which only covers a
-    child wedged before its first edge. Once a child reaches ``running`` /
-    ``waiting`` nothing else bounds its lifetime, so any harness drift that
-    loses the child's terminal edge presents as a silent infinite hang with
-    the parent's inbox empty. This sweep is keyed on the absence of edges,
-    not on wall-clock since dispatch: a child still emitting activity keeps
+    child wedged before its first edge. Once a child reaches ``running``
+    nothing else bounds its lifetime, so any harness drift that loses the
+    child's terminal edge presents as a silent infinite hang with the
+    parent's inbox empty. This sweep is keyed on the absence of edges, not on
+    wall-clock since dispatch: a child still emitting activity keeps
     refreshing ``last_activity_at`` and is never reaped.
+
+    A ``running`` child parked on a human-approval gate is exempt: the ASK
+    has its own, day-long budget, so failing it here would abandon a live
+    turn the user is about to answer.
+
+    A ``waiting`` entry is likewise never reaped here: it is a restart-
+    recovered dispatch awaiting *remote* completion and has no local edges
+    by construction, so the reconcile loop — which reads the child's
+    authoritative server status — owns it. Synthesizing a local failure
+    would lose a result the server may already hold, and recovery only ever
+    re-selects ``waiting`` entries.
+
+    A reaped failure is a guess, not proof: it marks the entry ``stalled``
+    so a genuine terminal edge arriving later still supersedes it.
 
     :param now: Clock override for tests, e.g. ``time.time()``.
     :param timeout_s: Budget override for tests; defaults to
@@ -2349,27 +2383,33 @@ def reap_stalled_subagent_dispatches(
     current = time.time() if now is None else now
     reaped: list[_SubagentWorkEntry] = []
     for entry in list(_subagent_work_by_child.values()):
-        # ``launching`` belongs to the launch sweep; terminal entries are done.
-        if entry.status not in ("running", "waiting"):
+        # ``launching`` belongs to the launch sweep; ``waiting`` is a recovered
+        # dispatch the reconcile loop owns; terminal entries are done.
+        if entry.status != "running":
+            continue
+        if pending_approvals.has_pending(entry.child_session_id):
+            # Parked on a human-approval gate: silence is expected and the ASK
+            # has its own budget. Never fail a turn the user is about to answer.
             continue
         silent_for = current - entry.last_activity_at
         if silent_for < budget:
             continue
         _logger.warning(
-            "Sub-agent dispatch silent for %.0fs; failing it: parent=%s child=%s status=%s",
+            "Sub-agent dispatch silent for %.0fs; failing it: parent=%s child=%s",
             silent_for,
             entry.parent_session_id,
             entry.child_session_id,
-            entry.status,
         )
+        # A guess the child is wedged, not proof: mark it so a genuine terminal
+        # edge landing later still supersedes this synthesized failure.
+        entry.stalled = True
         deliver(
             entry.child_session_id,
             status="failed",
             output=(
                 f"Error: sub-agent {entry.agent!r} title {entry.title!r} produced no "
-                f"activity for {budget:.0f}s while {entry.status!r}; the dispatch is "
-                "wedged and its result will never arrive. Re-dispatch if the work is "
-                "still needed."
+                f"activity for {budget:.0f}s while running; the dispatch appears "
+                "wedged. Re-dispatch if the work is still needed."
             ),
         )
         reaped.append(entry)
