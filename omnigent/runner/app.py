@@ -4147,26 +4147,8 @@ def create_runner_app(
             harness_name = canonicalize_harness(harness_name) or harness_name
 
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
-            if _start_verdict is not None:
-                if _start_verdict.action in ("deny", "ask"):
-                    _logger.error(
-                        "Runner session initialization failed",
-                        extra=debug_event(
-                            "runner_session_init_failed",
-                            stage="session_init",
-                            status_code=403,
-                            error_code="agent_start_denied",
-                        ),
-                    )
-                    return JSONResponse(
-                        status_code=403,
-                        content={
-                            "error": "agent_start_denied",
-                            "detail": _start_verdict.deny_text or "Agent start denied by policy",
-                        },
-                    )
-                if _start_verdict.data is not None:
-                    _apply_sandbox_override_from_verdict(spec, _start_verdict.data)
+            if _start_verdict is not None and _start_verdict.data is not None:
+                _apply_sandbox_override_from_verdict(spec, _start_verdict.data)
 
             await _ensure_session_subagent_router(
                 session_id,
@@ -13686,17 +13668,10 @@ async def _evaluate_agent_start_gate(
     spec: AgentSpec,
     harness: str,
 ) -> PolicyVerdict | None:
-    """Evaluate ``__agent_start`` through the spec's policy gate.
+    """Evaluate the synthetic start probe for sandbox transforms.
 
-    Constructs a :class:`RunnerToolPolicyGate` from the spec and
-    evaluates a synthetic ``__agent_start`` tool call.  This reuses
-    the same gate that guards MCP tool calls — no round-trip to the
-    Omnigent server required.
-
-    :param spec: The resolved agent spec (``AgentSpec``).
-    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
-    :returns: A :class:`PolicyVerdict` if the spec has guardrails
-        policies, ``None`` if no policies apply.
+    Deny and ask verdicts from generic tool policies are logged and ignored so
+    they cannot leave a session partially initialized.
     """
     from omnigent.runner.policy import RunnerToolPolicyGate
 
@@ -13708,7 +13683,7 @@ async def _evaluate_agent_start_gate(
     if spec.os_env is not None and spec.os_env.sandbox is not None:
         sandbox_dict = cast(_JsonObject, dataclasses.asdict(spec.os_env.sandbox))
 
-    return await gate.evaluate_tool_call(
+    verdict = await gate.evaluate_tool_call(
         "sys_agent_start",
         {
             "agent_name": getattr(spec, "name", None) or "",
@@ -13716,6 +13691,15 @@ async def _evaluate_agent_start_gate(
             "sandbox": sandbox_dict,
         },
     )
+    if verdict.action in ("deny", "ask"):
+        _logger.warning(
+            "Policy %r returned %s for the synthetic sys_agent_start probe; "
+            "ignoring it — tool_call policies do not gate agent start",
+            verdict.policy_name,
+            verdict.action,
+        )
+        return None
+    return verdict
 
 
 def _apply_sandbox_override_from_verdict(
