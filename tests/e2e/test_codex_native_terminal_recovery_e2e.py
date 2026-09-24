@@ -183,7 +183,7 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
             # Codex also generates titles on this model; only the recovery
             # prompt may consume the gated response.
             configure_mock_llm(
-                mock_llm_server_url, [{"text": marker, "block": True}], key=model, match=prompt
+                mock_llm_server_url, [{"text": marker, "block": True}], match=prompt
             )
             _send_user_text(http_client, session_id=session_id, text=prompt)
             _wait_for(

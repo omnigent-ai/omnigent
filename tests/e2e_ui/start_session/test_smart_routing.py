@@ -30,6 +30,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _SESSIONS_RE,
@@ -156,10 +157,13 @@ async def _register_routing_routes(
 
     await page.route("**/v1/info", handle_info)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
     # The landing needs a working directory before Send enables, and the
     # stubbed host has no browsable filesystem.
     await page.add_init_script(
@@ -317,13 +321,13 @@ async def _drive_smart_routing_disabled(base_url: str, session_id: str) -> None:
             )
 
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            # The routing entry remains visible but cannot be selected.
+            # Unavailable routing is omitted; ordinary harness selection remains available.
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
             ).to_be_visible()
             await expect(
                 page.get_by_test_id("new-chat-landing-harness-smart-routing")
-            ).to_be_disabled()
+            ).to_have_count(0)
 
             await (
                 page.get_by_test_id("new-chat-landing-agent-config-ag_claude_e2e")

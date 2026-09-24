@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { formatStatusModelLabel } from "@/lib/composerModelLabel";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
+import { formatStatusModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
+import { isCodexHarness } from "@/lib/harnessSetup";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import {
   getSessionModelLabelCacheKey,
@@ -18,6 +20,7 @@ export function useSessionModelLabel(
   options: readonly NativeModelOption[],
   expectsCatalog: boolean,
   confirmed: boolean,
+  hostOptions: readonly NativeModelOption[] = [],
 ) {
   const user = getCurrentUserId();
   const [, identityChanged] = useReducer((revision: number) => revision + 1, 0);
@@ -37,7 +40,7 @@ export function useSessionModelLabel(
   const key = confirmed ? getSessionModelLabelCacheKey(scope, raw) : null;
   const catalogReady = options.length > 0;
   const option = options.find((row) => row.id === raw) ?? options.find((row) => row.model === raw);
-  const displayName = option?.displayName ?? null;
+  const displayName = option?.displayName != null ? nativeModelLabel(option) : null;
   const stored = useMemo(() => readSessionModelLabelCache(key), [key]);
   const remembered = useRef<{ key: string; displayName: string | null } | null>(null);
   const cached =
@@ -49,7 +52,15 @@ export function useSessionModelLabel(
     writeSessionModelLabelCache(key, displayName);
   }, [expectsCatalog, catalogReady, key, displayName]);
 
-  const waiting = expectsCatalog && raw !== null && !catalogReady && cached === null;
+  // Host names are a display fallback only; the session cache stays session-owned.
+  const hostOption =
+    scope.harness != null && isCodexHarness(scope.harness)
+      ? findNativeModelOption(hostOptions, raw)
+      : (hostOptions.find((row) => row.id === raw) ?? hostOptions.find((row) => row.model === raw));
+  const cachedLabel =
+    cached !== null && raw !== null ? nativeModelLabel({ id: raw, displayName: cached }) : null;
+  const fallbackLabel = cachedLabel ?? (hostOption ? nativeModelLabel(hostOption) : null);
+  const waiting = expectsCatalog && raw !== null && !catalogReady && fallbackLabel === null;
   // Finishing identity bootstrap must not restart an in-flight metadata wait.
   const target = JSON.stringify([scope.sessionId, scope.hostId, scope.agentId, scope.harness, raw]);
   const [timedOutTarget, setTimedOutTarget] = useState<string | null>(null);
@@ -67,7 +78,7 @@ export function useSessionModelLabel(
         ? formatStatusModelLabel(raw, options)
         : raw === null
           ? null
-          : cached,
+          : fallbackLabel,
     loading: waiting && !unavailable,
     unavailable,
   };

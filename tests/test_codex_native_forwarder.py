@@ -1170,6 +1170,50 @@ def test_classify_codex_error_auth_vs_generic() -> None:
     assert fwd._classify_codex_error({"codexErrorInfo": "Other"}, "disk full") == generic
 
 
+def test_classify_codex_error_budget_exhausted_not_auth() -> None:
+    """AI-gateway budget exhaustion (HTTP 403) must not classify as auth.
+
+    The gateway returns PERMISSION_DENIED with HTTP 403 when a spending budget
+    is exhausted.  The 403 and the word "403" in the message would otherwise
+    trigger the auth classifier, sending users a misleading re-auth hint.
+    """
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    auth = fwd._CODEX_ERROR_KIND_AUTH
+
+    # Realistic message shape from the AI gateway (budget name and id are
+    # synthetic; see prod samples for the real shape).
+    budget_msg = (
+        'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+        '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached its'
+        " limit of $100. To continue, contact an admin to increase the budget or use a"
+        ' different budget."}'
+    )
+    # Budget exhaustion is generic even when codexErrorInfo carries a 403 status.
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 403}}, budget_msg)
+        == generic
+    )
+    # Budget exhaustion is generic even when codexErrorInfo is absent.
+    assert fwd._classify_codex_error({}, budget_msg) == generic
+
+    # A disabled per-user rate limit (rate limit is set to 0) is also generic.
+    rate_zero_msg = (
+        'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+        '"rate limit is set to 0 for user test@example.com"}'
+    )
+    assert fwd._classify_codex_error({}, rate_zero_msg) == generic
+
+    # A genuine 401 auth failure must still classify as auth.
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": "unauthorized"}, "401 Unauthorized") == auth
+    )
+    # A genuine 403 permission error unrelated to budget must still classify as auth.
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 403}}, "access denied")
+        == auth
+    )
+
+
 def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
     """``_terminal_error_from_turn`` returns the classified ``turn.error``.
 

@@ -2,22 +2,20 @@
 
 A shared session's shell runs commands on the runner. When the runner is
 not isolated (``sandbox_active: false``), that shell can read files the
-session owner can reach — so write-capable shell access must be gated the
-same way interactive terminal attach is (see ``test_terminal_attach.py``).
+session owner can reach. A command has no path to inspect, so there is no
+"inside the workspace" form that could be opened to collaborators the way
+the filesystem proxy does — the shell is the owner's machine, full stop.
 
 The shell proxy at
 ``POST /v1/sessions/{id}/resources/environments/{env}/shell`` runs
-``_validate_session(required_level=LEVEL_EDIT)`` *before* proxying. These
+``_validate_session(required_level=LEVEL_OWNER)`` *before* proxying. These
 tests pin that gate end to end at the server boundary:
 
-- a read-only collaborator is rejected with 403 and the request never
-  reaches the runner (decisive: the secret-capable shell is unreachable),
-- an edit collaborator is allowed through and the command is proxied,
+- a read-only or edit collaborator is rejected with 403 and the request
+  never reaches the runner (decisive: the secret-capable shell is
+  unreachable),
+- the owner (and an admin) is allowed through and the command is proxied,
 - an unauthenticated caller is rejected.
-
-The deeper gap — an *edit* collaborator on an unsafe runner reading
-out-of-root/sensitive files via shell — is pinned by
-the strict-xfail matrix in ``test_filesystem_path_isolation_e2e.py``.
 
 The filesystem proxy carries a second, stricter gate. Mutations under the
 workspace need ``LEVEL_EDIT``; an ABSOLUTE path is the owner's own machine
@@ -353,19 +351,41 @@ async def test_shell_rejects_unauthenticated_before_runner(
 
 
 @pytest.mark.asyncio
-async def test_shell_allows_edit_collaborator_and_proxies(
+async def test_shell_rejects_edit_collaborator_before_runner(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
 ) -> None:
-    """An edit collaborator is allowed through and the command is proxied."""
+    """Edit is not enough: the shell has no workspace-relative form, so the
+    bar is the same one an absolute filesystem path carries."""
+    resp = await client.post(
+        _SHELL_PATH,
+        json={"command": "cat ~/.ssh/id_rsa"},
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller",
+    ["real-owner@example.com", "admin@example.com"],
+    ids=["owner", "admin"],
+)
+async def test_shell_allows_owner_and_proxies(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+) -> None:
+    """The owner (or an admin) is allowed through and the command is proxied."""
     resp = await client.post(
         _SHELL_PATH,
         json={"command": "echo hi"},
-        headers={"X-Forwarded-Email": "owner@example.com"},
+        headers={"X-Forwarded-Email": caller},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["stdout"] == "ok\n"
-    # The edit-level command reached the runner verbatim.
+    # The owner's command reached the runner verbatim.
     assert runner_client.posts == [(_SHELL_PATH, {"command": "echo hi"})]
 
 
@@ -681,3 +701,65 @@ async def test_filesystem_windows_absolute_is_owner_gated_too(
 
     assert resp.status_code == 403, resp.text
     assert runner_client.gets == []
+
+
+# ── Elicitation resolve gate ─────────────────────────────────────
+#
+# Elicitations (policy ASK gates, harness permission prompts, questions to
+# the user) are answered by any collaborator who can drive the agent
+# (``LEVEL_EDIT``); a read-only share can neither see nor answer them.
+
+_ELICITATION_PATH = "/v1/sessions/conv_share/elicitations/elicit_0123456789abcdef"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [
+        ("real-owner@example.com", 202),
+        ("owner@example.com", 202),
+        ("viewer@example.com", 403),
+    ],
+    ids=["owner-allowed", "edit-allowed", "read-denied"],
+)
+async def test_elicitation_resolve_requires_edit(
+    client: httpx.AsyncClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """The verdict endpoint is gated at edit, like the events route that
+    delivers the same verdict in-band."""
+    resp = await client.post(
+        f"{_ELICITATION_PATH}/resolve",
+        json={"action": "accept"},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert resp.status_code == expected, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+async def test_elicitation_get_requires_edit(
+    client: httpx.AsyncClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """Reading a pending prompt carries the same bar as answering it."""
+    resp = await client.get(_ELICITATION_PATH, headers={"X-Forwarded-Email": caller})
+
+    assert resp.status_code == expected, resp.text
+
+
+@pytest.mark.asyncio
+async def test_elicitation_resolve_rejects_unauthenticated(
+    client: httpx.AsyncClient,
+) -> None:
+    """No identity fails closed at 401 before the permission check."""
+    resp = await client.post(f"{_ELICITATION_PATH}/resolve", json={"action": "accept"})
+
+    assert resp.status_code == 401, resp.text

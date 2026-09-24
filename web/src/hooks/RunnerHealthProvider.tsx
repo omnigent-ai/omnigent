@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 // App-level wrapper that exposes per-session liveness via context so
 // hooks can gate on runner / host reachability without each standing up
 // its own poller.
@@ -33,7 +34,6 @@ import {
 } from "react";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { isTempConvId } from "@/store/chatStore";
-import { useConversations } from "@/hooks/useConversations";
 import { type RunnerHealthInput, useRunnerHealth } from "@/hooks/useRunnerHealth";
 import { useSession } from "@/hooks/useSession";
 
@@ -52,7 +52,7 @@ type RegisterRunnerHealth = (key: string, sessions: RunnerHealthInput[] | null) 
 const RunnerHealthRegistryContext = createContext<RegisterRunnerHealth>(() => {});
 
 export function RunnerHealthProvider({ children }: { children: ReactNode }) {
-  const { data } = useConversations("", true);
+  const { data } = useLoadedConversations();
   const sidebarSessions = useMemo(() => data?.pages.flatMap((page) => page.data) ?? [], [data]);
 
   // The open session is the one liveness actually matters for now (the

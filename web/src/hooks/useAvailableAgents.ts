@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
+import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
@@ -20,9 +21,8 @@ export interface AvailableAgent {
   // by kind rather than by name slug.
   harness: string | null;
   // Skills bundled in the agent spec (name + one-line description).
-  // Feeds the landing composer's "/" menu before a session exists;
-  // host-discovered skills only resolve once a runner is bound, so
-  // they're absent here. Empty on older servers without the field.
+  // Shown while discovery loads; the skills endpoint returns the effective catalog.
+  // Empty on older servers without the field.
   skills: { name: string; description: string }[];
   // Server-seeded built-in (deterministic, name-derived id) vs a
   // user-registered template. Only set on catalog rows from GET /v1/agents;
@@ -44,8 +44,7 @@ export interface AvailableAgent {
   // rewrites a template's bundle on every server restart (non-reproducible
   // tar), bumping updated_at/version for unchanged content — which would let
   // a restarted template spuriously beat a newer upload. created_at is
-  // immutable, so it is the stable signal. Omitted on older servers and on
-  // session-derived agents (whose recency comes from the scanned session).
+  // immutable, so it is the stable signal. Omitted on older servers.
   created_at?: number | null;
   // Session id used to fetch the full agent spec on hover. Only set on
   // session-discovered agents (custom uploads); absent on catalog agents
@@ -111,27 +110,19 @@ interface BuiltinAgentsListWire {
   last_id?: string | null;
 }
 
-/** Wire row of the sessions scan, GET /v1/sessions?kind=any. */
-interface SessionListItemWire {
-  id: string;
-  agent_id?: string | null;
-  agent_name?: string | null;
-  // Session creation epoch — proxy for "when the user last ran this agent",
-  // used to pick the newest among same-named uploads / templates.
-  created_at?: number | null;
-}
-
 /**
  * Fetch the built-in agents from the read-only list `GET /v1/agents`
  * (see designs/BUILTIN_AGENTS.md).
  */
-async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
+export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
   const rows: BuiltinAgentWire[] = [];
   let after: string | null = null;
   // Each page provides the cursor for the next request.
   /* oxlint-disable no-await-in-loop */
   do {
-    const url = after == null ? "/v1/agents" : `/v1/agents?after=${encodeURIComponent(after)}`;
+    const params = new URLSearchParams();
+    if (after !== null) params.set("after", after);
+    const url = params.size ? `/v1/agents?${params}` : "/v1/agents";
     const res = await authenticatedFetch(url);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
@@ -155,78 +146,35 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
   }));
 }
 
-/**
- * A unique session-bound agent discovered by the sessions scan, paired
- * with one session it was seen on (used to fetch the full AgentObject
- * via `GET /v1/sessions/{id}/agent`, which is keyed by session id).
- */
-interface ScannedSessionAgent {
+interface DiscoveredSessionAgent {
   agentId: string;
   agentName: string;
-  sessionId: string;
-  // Creation epoch of the session it was seen on — recency proxy for
-  // newest-wins supersession. null when the server omits created_at.
   createdAt: number | null;
+  agent: AvailableAgent;
 }
 
-/**
- * Scan the caller's sessions — sub-agent children included — for unique
- * bound agents. `kind=any` requires server support; an older server
- * ignores the unknown param and returns only top-level sessions, which
- * degrades discovery scope rather than failing. Archived sessions are
- * included: archiving a session must not make its (possibly still
- * deployed) agent undiscoverable — e.g. a project-pinned agent whose
- * anchor session was archived.
- */
-async function scanSessionAgents(): Promise<ScannedSessionAgent[]> {
-  // limit=100 bounds the scan to the most recent sessions: an agent whose
-  // only session is older than the newest 100 won't be discovered. A
-  // deliberate recency cut — the picker is for agents the user is
-  // actively working with.
-  const res = await authenticatedFetch("/v1/sessions?limit=100&kind=any&include_archived=true");
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as { data: SessionListItemWire[] };
-  const seen = new Map<string, ScannedSessionAgent>();
-  for (const session of body.data) {
-    // Rows without an agent_name are orphaned (agent row deleted); skip
-    // them, matching useAgents' sessions-derived list.
-    if (!session.agent_id || !session.agent_name) continue;
-    if (seen.has(session.agent_id)) continue;
-    seen.set(session.agent_id, {
-      agentId: session.agent_id,
-      agentName: session.agent_name,
-      sessionId: session.id,
-      createdAt: session.created_at ?? null,
-    });
-  }
-  return Array.from(seen.values());
-}
-
-/**
- * Direct lookup for a pinned agent the bounded scan missed (its only
- * sessions are archived or paginated out of the newest 100): any one
- * session bound to it names it and anchors the on-hover detail fetch.
- * null when no such session is visible to the caller — the agent is
- * genuinely unresolvable and the consumer surfaces that explicitly.
- */
-async function lookupPinnedAgent(agentId: string): Promise<AvailableAgent | null> {
-  try {
-    const res = await authenticatedFetch(
-      `/v1/sessions?limit=1&kind=any&include_archived=true&agent_id=${encodeURIComponent(agentId)}`,
-    );
-    if (!res.ok) return null;
-    const body = (await res.json()) as { data: SessionListItemWire[] };
-    const row = body.data[0];
-    if (!row?.agent_id || !row.agent_name) return null;
-    return sessionAgentFromScan({
-      agentId: row.agent_id,
-      agentName: row.agent_name,
-      sessionId: row.id,
-      createdAt: row.created_at ?? null,
-    });
-  } catch {
-    return null;
-  }
+/** Discover agents from the first 30 owned sessions already loaded by the sidebar. */
+export function useSessionAgents(enabled = true) {
+  const { mine } = useSidebarData();
+  const data = useMemo(() => {
+    if (!enabled || !mine.data) return undefined;
+    const agents = new Map<string, AvailableAgent>();
+    for (const row of mine.data.pages.flatMap((page) => page.data).slice(0, 30)) {
+      if (!row.agent_id || !row.agent_name || agents.has(row.agent_id)) continue;
+      agents.set(row.agent_id, {
+        id: row.agent_id,
+        name: row.agent_name,
+        display_name: displayNameForAgent(row.agent_name),
+        description: null,
+        harness: null,
+        skills: [],
+        sessionId: row.id,
+        created_at: row.created_at,
+      });
+    }
+    return [...agents.values()];
+  }, [enabled, mine.data]);
+  return { ...mine, data };
 }
 
 /** Wire shape of `GET /v1/sessions/{id}/agent` (AgentObject). */
@@ -238,24 +186,8 @@ interface AgentObjectWire {
   skills?: { name: string; description: string }[];
 }
 
-/**
- * Build an AvailableAgent from session scan data alone — no extra fetch.
- * description, harness, and skills are null/empty and filled in on hover
- * via prefetchAvailableAgentDetails.
- */
-function sessionAgentFromScan(scanned: ScannedSessionAgent): AvailableAgent {
-  return {
-    id: scanned.agentId,
-    name: scanned.agentName,
-    display_name: displayNameForAgent(scanned.agentName),
-    description: null,
-    harness: null,
-    skills: [],
-    sessionId: scanned.sessionId,
-    // builtin/created_at intentionally omitted: session-derived agents never
-    // seed the catalog, and their recency comes from the scanned session's
-    // createdAt (used directly in the dedup), not from this object.
-  };
+function sessionAgentFromDiscovery(discovered: DiscoveredSessionAgent): AvailableAgent {
+  return discovered.agent;
 }
 
 /**
@@ -309,87 +241,35 @@ export async function prefetchAvailableAgentDetails(
   }
 }
 
-/**
- * The new-session picker's agent catalog: the catalog from
- * `GET /v1/agents` (seeded built-ins + user-registered templates), plus
- * custom agents discovered on the caller's sessions (sub-agent sessions
- * included) via `GET /v1/sessions?kind=any`.
- *
- * Two kinds of catalog row are handled differently when a same-named
- * `omnigent run` upload exists:
- *
- * - SEEDED built-ins (`builtin: true`, deterministic id) are protected:
- *   they always list verbatim, and a same-named upload (or a fork/switch
- *   clone of one — `agentRootName` peels every `"(fork <id>)"` layer) is
- *   dropped. The seeded agent is the canonical identity for its name.
- * - USER-registered templates (`builtin: false`, e.g. `--agent`) compete
- *   with same-named uploads on recency: the newest of {template, uploads}
- *   wins, so a fresh `omnigent run agent.yaml` supersedes a stale template
- *   instead of being shadowed by it. This is the fix for the picker binding
- *   an older version when a newer one was just run.
- *
- * Session rows binding a catalog agent directly (by id) are dropped — that
- * agent is already represented. Genuinely custom uploads (a local YAML mints
- * a fresh agent_id per session) collapse by base name, newest session
- * winning (#3234). Binding any survivor needs no new server support:
- * `POST /v1/sessions {agent_id}` already authorizes session-scoped agents
- * the caller can read.
- *
- * Older servers omit `builtin`, so every catalog row degrades to "protected"
- * — i.e. the prior shadow-everything behavior — rather than misclassifying.
- *
- * A failing sessions scan (e.g. transient 5xx) degrades to the catalog list
- * rather than blanking the picker — catalog availability must not be hostage
- * to the discovery extension. A SLOW scan must not hold it hostage either:
- * {@link useAvailableAgents} serves the same catalog-only rows as placeholder
- * data while this merged fetch is in flight (see the hook).
- *
- * `pinnedAgentIds` (e.g. a project's configured default agent) are guaranteed
- * to survive: any pinned id the merged list lacks — dropped by the
- * newest-wins name collapse (an id swap would silently rebind the project),
- * or missed by the recency-bounded scan — is restored from the scan, from
- * the catalog (a session-less user template can lose its bucket to a newer
- * same-named upload), or resolved via a direct per-agent session lookup.
- * A pinned id in neither source stays absent (the consumer surfaces that
- * state).
- */
+/** Keep configured agent ids through name deduplication within the available sources. */
 async function fetchAvailableAgents(
-  pinnedAgentIds: string[] = [],
-  fetchCatalog: () => Promise<AvailableAgent[]> = fetchBuiltinAgents,
+  pinnedAgentIds: string[],
+  queryClient: QueryClient,
+  sessionAgents: AvailableAgent[],
 ): Promise<AvailableAgent[]> {
-  const [catalog, scanned] = await Promise.all([
-    fetchCatalog(),
-    scanSessionAgents().catch(() => [] as ScannedSessionAgent[]),
-  ]);
-  const merged = mergeAvailableAgents(catalog, scanned);
-
-  // Pinned-survival pass: restore every pinned id the merge lost (from the
-  // scan when it saw the agent but a same-named newer row won its bucket),
-  // from the catalog when the pin is a user-registered template with no
-  // sessions of its own, or via a direct lookup when neither source saw it.
-  const missingPinned = pinnedAgentIds.filter((id) => !merged.some((a) => a.id === id));
-  const restored = await Promise.all(
-    missingPinned.map((id) => {
-      const seen = scanned.find((s) => s.agentId === id);
-      if (seen) return Promise.resolve(sessionAgentFromScan(seen));
-      const template = catalog.find((a) => a.id === id);
-      return template ? Promise.resolve(template) : lookupPinnedAgent(id);
-    }),
-  );
-  merged.push(...restored.filter((a): a is AvailableAgent => a !== null));
+  const catalog = await queryClient.fetchQuery({
+    queryKey: AGENT_CATALOG_QUERY_KEY,
+    queryFn: fetchAgentCatalog,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+  const discovered = sessionAgents.map((agent) => ({
+    agentId: agent.id,
+    agentName: agent.name,
+    createdAt: agent.created_at ?? null,
+    agent,
+  }));
+  const merged = mergeAvailableAgents(catalog, discovered);
+  for (const id of pinnedAgentIds) {
+    if (merged.some((agent) => agent.id === id)) continue;
+    const agent = sessionAgents.find((a) => a.id === id) ?? catalog.find((a) => a.id === id);
+    if (agent) merged.push(agent);
+  }
   return merged;
 }
 
-/**
- * The pure, synchronous core of {@link fetchAvailableAgents}: merge the
- * catalog with the discovery scan's unique session agents (no pinned-survival
- * pass — that needs async lookups). Also called with an empty scan to build
- * the catalog-only placeholder rows served while the scan is in flight; that
- * shape matches the failing-scan degradation exactly.
- */
 function mergeAvailableAgents(
   catalog: AvailableAgent[],
-  scanned: ScannedSessionAgent[],
+  discovered: DiscoveredSessionAgent[],
 ): AvailableAgent[] {
   // Seeded built-ins are emitted verbatim and protected; user-registered
   // templates seed the newest-wins buckets so an upload can supersede them.
@@ -405,12 +285,11 @@ function mergeAvailableAgents(
 
   const recencyOf = (a: AvailableAgent): number => a.created_at ?? 0;
 
-  // base name -> winning candidate, decided by recency. A resolved template
-  // carries full info; a session candidate is enriched lazily below.
+  // Choose the newest catalog candidate for each base name.
   interface Candidate {
     recency: number;
     template: AvailableAgent | null;
-    scanned: ScannedSessionAgent | null;
+    discovered: DiscoveredSessionAgent | null;
   }
   const byName = new Map<string, Candidate>();
 
@@ -421,10 +300,10 @@ function mergeAvailableAgents(
   for (const t of userTemplates) {
     const base = agentRootName(t.name);
     if (seededNames.has(base)) continue;
-    byName.set(base, { recency: recencyOf(t), template: t, scanned: null });
+    byName.set(base, { recency: recencyOf(t), template: t, discovered: null });
   }
 
-  for (const agent of scanned) {
+  for (const agent of discovered) {
     // Peel EVERY clone layer: a fork of a fork is named
     // `"<name> (fork ag_a) (fork ag_b)"`, and a single-layer strip would
     // leave a non-matching name that slips the seeded-shadow check.
@@ -437,17 +316,17 @@ function mergeAvailableAgents(
     if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
     // Genuine custom upload (or a clone of one). Newest same-named row wins,
     // superseding an older user-registered template seeded above. Strict `>`
-    // so equal recency keeps the FIRST seen — the scan is newest-first, so
-    // ties resolve to the newest session (matches prior collapse behavior).
+    // so equal recency keeps the FIRST seen — the discovery is newest-first, so
+    // ties preserve the catalog ordering.
     const recency = agent.createdAt ?? 0;
     const existing = byName.get(base);
     if (!existing || recency > existing.recency) {
-      byName.set(base, { recency, template: null, scanned: agent });
+      byName.set(base, { recency, template: null, discovered: agent });
     }
   }
 
   const resolved = Array.from(byName.values())
-    .map((c) => (c.template !== null ? c.template : sessionAgentFromScan(c.scanned!)))
+    .map((c) => (c.template !== null ? c.template : sessionAgentFromDiscovery(c.discovered!)))
     .filter((agent) => {
       const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
       return nativeKey !== "kiro" || !hasKiroBuiltin;
@@ -468,10 +347,7 @@ const AVAILABLE_AGENTS_STALE_MS = 30_000;
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
   /**
-   * Agent ids that must survive discovery — e.g. the current project's
-   * configured default agent, which the recency-bounded scan can miss and
-   * the same-name collapse could otherwise drop or id-swap. Resolved via a
-   * direct lookup when needed; ids with no visible session stay absent.
+   * Preserve configured agent ids even when another agent wins the same-name merge.
    */
   pinnedAgentIds?: string[];
 }
@@ -508,6 +384,7 @@ function applyAcpHarnessCatalog(
 
 export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   const enabled = options.enabled ?? true;
+  const sessionAgents = useSessionAgents(enabled);
   // Normalized, order-stable pin key so equivalent pin sets share one cache
   // entry and a caller's fresh array literal doesn't churn the query. Agent
   // ids never contain "," so the join is unambiguous.
@@ -531,54 +408,43 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   );
   const queryClient = useQueryClient();
   // The harness/built-in rows come entirely from GET /v1/agents, so they must
-  // not wait for a slow sessions discovery scan (managed deployments with
+  // not wait for a slow Mine session load (managed deployments with
   // large session tables). This catalog query resolves fast and feeds the
   // merged query's placeholder below; same enabled gate as the merged query.
-  const { data: catalog } = useQuery({
+  const catalogQuery = useQuery({
     queryKey: AGENT_CATALOG_QUERY_KEY,
-    queryFn: fetchBuiltinAgents,
+    queryFn: () => fetchAgentCatalog(),
     enabled,
     staleTime: AVAILABLE_AGENTS_STALE_MS,
   });
-  // Catalog merged with an empty scan — the same rows a failing scan degrades
+  const { data: catalog } = catalogQuery;
+  // Catalog merged with an empty discovery — the same rows a failing discovery degrades
   // to — shown while the merged fetch is in flight and upgraded in place when
-  // the scan lands. Consumers that must not resolve stored ids against a
+  // the discovery lands. Consumers that must not resolve stored ids against a
   // partial list read isPlaceholderData to tell this state apart.
   //
-  // Only PROTECTED rows (`builtin !== false`: seeded built-ins plus older
-  // servers that omit the flag) feed the placeholder. A user-registered
-  // template (`builtin === false`) competes newest-wins with same-named
-  // session-discovered agents in the resolved merge (#3234), so surfacing it
-  // as launchable before the scan lands could bind a stale template id that
-  // the merge would have superseded. The harness rows this placeholder exists
-  // to deliver are all protected, so nothing user-visible is delayed.
   const placeholderData = useMemo(
-    () =>
-      catalog === undefined
-        ? undefined
-        : mergeAvailableAgents(
-            catalog.filter((agent) => agent.builtin !== false),
-            [],
-          ),
+    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
     [catalog],
   );
-  return useQuery({
-    // Unpinned consumers keep the historical bare key; pinned variants get
-    // their own entry (prefetch patches both via a prefix match).
-    queryKey: pinnedKey === "" ? ["available-agents"] : ["available-agents", pinnedKey],
+  const query = useQuery({
+    // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
+    queryKey: ["available-agents", pinnedKey, sessionAgents.data ?? null],
     // fetchQuery dedupes with the catalog query's in-flight fetch, so the
     // merged fetch reuses (not repeats) the catalog request.
     queryFn: () =>
-      fetchAvailableAgents(pinnedKey === "" ? [] : pinnedKey.split(","), () =>
-        queryClient.fetchQuery({
-          queryKey: AGENT_CATALOG_QUERY_KEY,
-          queryFn: fetchBuiltinAgents,
-          staleTime: AVAILABLE_AGENTS_STALE_MS,
-        }),
+      fetchAvailableAgents(
+        pinnedKey === "" ? [] : pinnedKey.split(","),
+        queryClient,
+        sessionAgents.data ?? [],
       ),
-    enabled,
+    enabled: enabled && (sessionAgents.data !== undefined || sessionAgents.isError),
     staleTime: AVAILABLE_AGENTS_STALE_MS,
     placeholderData,
     select,
   });
+  return {
+    ...query,
+    isLoading: query.isLoading || (enabled && query.isPending && catalogQuery.isPending),
+  };
 }

@@ -1,8 +1,10 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
-import { Link } from "@/lib/routing";
+import type { useNavigate } from "@/lib/routing";
 import { undoArchiveConversations, type Conversation } from "@/hooks/useConversations";
+
+type NavigateFn = ReturnType<typeof useNavigate>;
 
 /**
  * How long the post-archive Undo pill stays on screen, in milliseconds. 3s
@@ -10,7 +12,19 @@ import { undoArchiveConversations, type Conversation } from "@/hooks/useConversa
  */
 const ARCHIVE_UNDO_DURATION_MS = 3000;
 
-/** Stable id so repeated archives update ONE pill (merge) and reset its timer. */
+/**
+ * Absolute cap on the merged pill's total on-screen life, measured from the
+ * FIRST archive in the batch. Merges shorten the remaining countdown toward
+ * this cap rather than resetting a fresh 3s each time, so the pill can't outlive
+ * the server's per-session teardown grace (`_ARCHIVE_STOP_UNDO_GRACE_S`, 8s).
+ * If it could, the earliest-archived session's runner would be stopped at the
+ * grace while the pill still offered Undo — undoing then would restore a row
+ * over a dead pane. Kept below the grace with margin for the unarchive round
+ * trip. MUST stay < that grace.
+ */
+const ARCHIVE_UNDO_MAX_LIFETIME_MS = 5000;
+
+/** Stable id so repeated archives update ONE pill (merge). */
 const ARCHIVE_UNDO_TOAST_ID = "archive-undo";
 
 // The sessions the visible pill would undo. Archives in quick succession
@@ -21,13 +35,18 @@ const ARCHIVE_UNDO_TOAST_ID = "archive-undo";
 // re-inject them into the sidebar even after a refetch evicted the archived
 // rows (see `undoArchiveConversations`).
 let batched: Conversation[] = [];
+// When the current batch's pill first appeared (epoch ms), or null if none.
+let batchStartedAtMs: number | null = null;
 // The most recent caller's QueryClient. Every entry point resolves the same
 // app-level client, so the latest one correctly unarchives the whole batch.
 let activeQueryClient: QueryClient | null = null;
+let activeNavigate: NavigateFn | null = null;
 
 function clearBatch(): void {
   batched = [];
+  batchStartedAtMs = null;
   activeQueryClient = null;
+  activeNavigate = null;
 }
 
 function runUndo(): void {
@@ -40,33 +59,11 @@ function runUndo(): void {
   }
 }
 
-/** The pill body: "Archived N session(s). Undo" plus a small Settings link. */
-function ArchiveUndoToast({ count }: { count: number }) {
-  return (
-    <div
-      data-testid="archive-undo-toast"
-      className="flex items-center gap-3 rounded-full border border-border bg-card px-4 py-2 text-sm text-foreground shadow-composer dark:bg-card-solid"
-    >
-      <span>
-        Archived {count} {count === 1 ? "session" : "sessions"}.{" "}
-        <button
-          type="button"
-          data-testid="archive-undo-button"
-          onClick={runUndo}
-          className="cursor-pointer font-bold underline underline-offset-2 hover:text-primary"
-        >
-          Undo
-        </button>
-      </span>
-      <Link
-        to="/settings/archived"
-        onClick={() => toast.dismiss(ARCHIVE_UNDO_TOAST_ID)}
-        className="border-l border-border pl-3 text-xs text-muted-foreground hover:text-foreground hover:underline"
-      >
-        View in Settings
-      </Link>
-    </div>
-  );
+function runViewArchived(): void {
+  const navigate = activeNavigate;
+  clearBatch();
+  toast.dismiss(ARCHIVE_UNDO_TOAST_ID);
+  navigate?.("/settings/archived");
 }
 
 /**
@@ -75,17 +72,33 @@ function ArchiveUndoToast({ count }: { count: number }) {
  * Fire it right after kicking off the archive — like the old Settings toast, it
  * runs synchronously on the click because the archiving row unmounts on the
  * next frame (optimistic overlay). Repeated calls merge their rows into the
- * same pill and reset its countdown, so undoing restores every session archived
- * since the pill first appeared. A failed archive reconciles its own row back
- * and the extra row in the batch is harmless — unarchiving a session that never
- * archived is a no-op.
+ * same pill, so undoing restores every session archived since the pill first
+ * appeared. A failed archive reconciles its own row back and the extra row in
+ * the batch is harmless — unarchiving a session that never archived is a no-op.
+ *
+ * A merge does NOT reset a fresh countdown: the batch has an ABSOLUTE deadline
+ * (`ARCHIVE_UNDO_MAX_LIFETIME_MS` from the first archive), and a merge only
+ * shortens the remaining time toward it. So the pill can't outlive the
+ * earliest-archived session's server teardown grace and offer an Undo for a
+ * runner already stopped. An archive arriving after the deadline starts a FRESH
+ * batch rather than extending the expiring one.
  */
 export function showArchiveUndoToast(
   queryClient: QueryClient,
   conversations: readonly Conversation[],
+  navigate: NavigateFn,
 ): void {
   if (conversations.length === 0) return;
+  const now = Date.now();
+  // Start (or restart) the batch when there is none, or when the current one
+  // has hit its absolute deadline — a late archive must not join a batch whose
+  // pill is expiring, or it would extend an Undo past the server grace.
+  if (batchStartedAtMs === null || now - batchStartedAtMs >= ARCHIVE_UNDO_MAX_LIFETIME_MS) {
+    batched = [];
+    batchStartedAtMs = now;
+  }
   activeQueryClient = queryClient;
+  activeNavigate = navigate;
   const seen = new Set(batched.map((c) => c.id));
   for (const conv of conversations) {
     if (!seen.has(conv.id)) {
@@ -93,11 +106,19 @@ export function showArchiveUndoToast(
       seen.add(conv.id);
     }
   }
+  // Time left until the batch's absolute deadline; capped at the normal
+  // single-archive duration so one archive still gets the full pill. A merge
+  // shortens this toward the deadline and never adds to it.
+  const remaining = Math.min(
+    ARCHIVE_UNDO_DURATION_MS,
+    batchStartedAtMs + ARCHIVE_UNDO_MAX_LIFETIME_MS - now,
+  );
   const count = batched.length;
-  toast.custom(() => <ArchiveUndoToast count={count} />, {
+  toast(`Archived ${count} ${count === 1 ? "session" : "sessions"}`, {
     id: ARCHIVE_UNDO_TOAST_ID,
-    duration: ARCHIVE_UNDO_DURATION_MS,
-    unstyled: true,
+    duration: remaining,
+    action: { label: "Undo", onClick: runUndo },
+    cancel: { label: "View archived", onClick: runViewArchived },
     testId: "archive-undo-toast-item",
     onAutoClose: clearBatch,
     onDismiss: clearBatch,

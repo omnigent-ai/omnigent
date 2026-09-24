@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
@@ -53,6 +54,116 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
+});
+
+describe("message navigation highlight", () => {
+  const text = "Highlight only this message content";
+  const messageId = "highlight_target";
+  const createdAtS = 1_700_000_000;
+  const bubbles: Bubble[] = [
+    {
+      kind: "user",
+      itemId: messageId,
+      content: [{ type: "input_text", text }],
+      createdAtS,
+    },
+    {
+      kind: "assistant",
+      responseId: messageId,
+      stableId: "highlight_assistant",
+      lifecycle: "completed",
+      error: null,
+      items: [{ kind: "text", itemId: "highlight_text", text, final: true }],
+      createdAtS,
+    },
+  ];
+
+  it.each(bubbles)("keeps the $kind highlight inside the content bubble", (bubble) => {
+    useChatStore.setState({ flashItemId: null });
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={bubble} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+    const highlightSelector = ".animate-message-highlight";
+    expect(container.querySelector(highlightSelector)).toBeNull();
+
+    act(() => useChatStore.setState({ flashItemId: messageId }));
+
+    const highlight = screen.getByText(text).closest(highlightSelector);
+    expect(highlight).not.toBeNull();
+    expect(container.querySelectorAll(highlightSelector)).toHaveLength(1);
+    expect(screen.getByTestId("message-bubble")).not.toHaveClass("animate-message-highlight");
+    expect(screen.getByTestId("message-timestamp").closest(highlightSelector)).toBeNull();
+    for (const button of screen.getAllByRole("button")) {
+      expect(button.closest(highlightSelector)).toBeNull();
+    }
+
+    act(() => useChatStore.setState({ flashItemId: "another_message" }));
+    expect(container.querySelector(highlightSelector)).toBeNull();
+
+    act(() => useChatStore.setState({ flashItemId: messageId }));
+    expect(screen.getByText(text).closest(highlightSelector)).not.toBeNull();
+    act(() => useChatStore.setState({ flashItemId: null }));
+    expect(container.querySelector(highlightSelector)).toBeNull();
+  });
+});
+
+describe("UserBubble literal text", () => {
+  it.each([
+    [
+      "unfinished placeholder",
+      "how about to reduce the output you can do like\n• ••\n" +
+        "<exact line(s) that needs to be seen without edit\n" +
+        "so for any matching line in the output which shows it, dont edit it or excerpt it, " +
+        "if any of the line shows important info",
+    ],
+    ["complete placeholder", "Keep <exact lines> visible."],
+    ["HTML example", '<div class="example">Keep this text</div>'],
+    ["HTML comment", "Keep <!-- this comment --> visible."],
+    ["multiline HTML", "<div>\n  first line\n  second line\n</div>"],
+  ])("preserves %s", (_name, text) => {
+    render(
+      <BubbleView
+        bubble={{
+          kind: "user",
+          itemId: "user_literal",
+          content: [{ type: "input_text", text }],
+        }}
+        isLastAssistant={false}
+      />,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    for (const line of text.split("\n")) {
+      expect(bubble).toHaveTextContent(line.trim());
+    }
+  });
+
+  it("keeps Markdown formatting and inline code alongside literal tags", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_markdown",
+            content: [
+              {
+                type: "input_text",
+                text: "**Keep** <exact lines> and `<code>`\n\n- first\n- second",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByText("Keep")).toHaveAttribute("data-streamdown", "strong");
+    expect(screen.getByText("<code>").tagName).toBe("CODE");
+    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent("<exact lines>");
+  });
 });
 
 describe("AssistantBubble error retry", () => {
@@ -209,12 +320,89 @@ describe("AssistantBubble error retry", () => {
     );
     render(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
 
     await waitFor(() => expect(screen.queryByTestId("error-pill")).toBeNull());
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_retry/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
+  });
+});
+
+describe("UserBubble long-prompt collapse", () => {
+  const COLLAPSE_THRESHOLD = 12000;
+  const TAIL = "UNIQUE_TAIL";
+
+  // Overflowing ASCII characters followed by the tail
+  const LONG_TEXT = "a".repeat(COLLAPSE_THRESHOLD) + TAIL;
+  const EMOJI_AT_BOUNDARY = "a".repeat(COLLAPSE_THRESHOLD - 1) + "🔥" + "b".repeat(100);
+  const SHORT_TEXT = "Hello, world!";
+
+  function userBubble(text: string): Extract<Bubble, { kind: "user" }> {
+    return {
+      kind: "user",
+      itemId: "user_collapse_test",
+      content: [{ type: "input_text", text }],
+    };
+  }
+
+  it("renders a short prompt fully without a collapse button", () => {
+    render(<BubbleView bubble={userBubble(SHORT_TEXT)} isLastAssistant={false} />);
+
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(SHORT_TEXT);
+    expect(screen.queryByRole("button", { name: /show full prompt/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
+  });
+
+  it("hides the tail when collapsed, shows it when expanded, hides it again when re-collapsed", () => {
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+
+    // Initially collapsed
+    expect(bubble).not.toHaveTextContent(TAIL);
+    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+
+    // After expanding
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+    expect(bubble).toHaveTextContent(TAIL);
+
+    // After collapsing again
+    fireEvent.click(screen.getByRole("button", { name: /collapse prompt/i }));
+    expect(bubble).not.toHaveTextContent(TAIL);
+  });
+
+  it("Copy always writes the full text to the clipboard regardless of collapse state", async () => {
+    const writtenTexts: string[] = [];
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        writeText: vi.fn((text: string) => {
+          writtenTexts.push(text);
+          return Promise.resolve();
+        }),
+      },
+    });
+
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    const copyButton = screen.getByRole("button", { name: /^copy$/i });
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(writtenTexts).toHaveLength(1));
+    expect(writtenTexts[0]).toBe(LONG_TEXT);
+    expect(writtenTexts[0]).toContain(TAIL);
+  });
+
+  it("does not corrupt an emoji at slice boundary", () => {
+    render(<BubbleView bubble={userBubble(EMOJI_AT_BOUNDARY)} isLastAssistant={false} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+
+    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+
+    expect(bubble).not.toHaveTextContent("🔥");
+    expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
+    expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
   });
 });

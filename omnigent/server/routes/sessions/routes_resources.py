@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import mimetypes
 import ntpath
 import urllib.parse
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -73,6 +75,8 @@ from omnigent.server.routes._sessions.helpers import (
     FILE_CONTENT_CACHE_CONTROL,
     _ancestor_session_ids,
     _attachment_disposition,
+    _await_settled_managed_launch,
+    _enforce_filesystem_attachment_policy,
     _file_content_etag,
     _get_runner_client_for_resource_access,
     _if_none_match_matches,
@@ -80,8 +84,12 @@ from omnigent.server.routes._sessions.helpers import (
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
+    _raise_if_runner_session_agent_missing,
+    _raise_if_session_agent_missing_payload,
     _read_upload_capped,
+    _require_filesystem_attachment_harness,
     _stored_file_to_resource,
+    require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
@@ -141,6 +149,21 @@ def _get_image_compression_gate() -> asyncio.Semaphore:
     return _image_compression_gate
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_attachment_upload_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
+    """Return the lock serializing one session's attachment quota check and store."""
+    lock = _attachment_upload_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _attachment_upload_locks[session_id] = lock
+    return lock
+
+
 def register_resources_routes(
     router: APIRouter,
     *,
@@ -154,6 +177,50 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
 ) -> None:
     """Register the resources routes on router."""
+
+    async def _require_filesystem_attachment_support(
+        request: Request, conv: Conversation, filename: str
+    ) -> None:
+        await _require_filesystem_attachment_harness(conv, filename)
+        tracker = getattr(request.app.state, "managed_launches", None)
+        launch = tracker.get(conv.id) if tracker is not None else None
+        if launch is not None and conv.host_id is None and conv.runner_id is None:
+            await _await_settled_managed_launch(launch)
+            refreshed = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+            if refreshed is None:
+                raise _session_not_found()
+            conv = refreshed
+        tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+        if (
+            conv.host_id is not None
+            and host_registry is not None
+            and host_registry.get(conv.host_id) is None
+            and (
+                conv.runner_id is None
+                or tunnel_registry is None
+                or tunnel_registry.get(conv.runner_id) is None
+            )
+            and not (
+                runner_router is not None
+                and await asyncio.to_thread(runner_router.host_is_on_another_replica, conv.host_id)
+            )
+        ):
+            # Upload can be the first action after a managed sandbox sleeps.
+            _, conv = await ensure_runner_connected(
+                session_id=conv.id,
+                conv=conv,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+            )
+        await asyncio.to_thread(
+            require_filesystem_attachment_runtime,
+            host_id=conv.host_id,
+            runner_id=conv.runner_id,
+            host_registry=host_registry,
+            tunnel_registry=tunnel_registry,
+            runner_router=runner_router,
+        )
 
     @router.get(
         "/sessions/{session_id}/resources",
@@ -372,6 +439,10 @@ def register_resources_routes(
             payload = None
         if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
             raise HTTPException(status_code=502, detail="runner download failed")
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) with its client-safe message instead of forwarding the
+        # runner's raw resolver text verbatim.
+        _raise_if_session_agent_missing_payload(payload)
         return JSONResponse(status_code=resp.status_code, content=payload)
 
     async def _proxy_get_to_runner(
@@ -388,7 +459,9 @@ def register_resources_routes(
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :returns: Parsed JSON response body.
-        :raises HTTPException: 502 on runner failure.
+        :raises OmnigentError: Typed ``not_found`` (404) or
+            ``session_agent_missing`` (410) re-derived from the runner body.
+        :raises HTTPException: 502 on any other runner failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -423,6 +496,9 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
@@ -1544,7 +1620,7 @@ def register_resources_routes(
         :param file: The uploaded file (multipart form data).
         :returns: The session file resource object.
         """
-        await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
                 status_code=501,
@@ -1555,6 +1631,7 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
+        from omnigent.inner.native_attachments import requires_filesystem
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
@@ -1567,70 +1644,120 @@ def register_resources_routes(
             image_needs_compression,
         )
 
-        # Resolve the type from the declared MIME + filename BEFORE reading
-        # the body, so an unsupported or oversized upload is rejected without
-        # buffering it. Attachments are inlined into the model context as
-        # base64 (see content_resolver.resolve_content_references); only
-        # images, PDF, and text/code files are usable — others (pptx, docx,
-        # zip, …) would be garbled or blow the request size, so reject them.
+        # Validate the type and limits before buffering the file.
         content_type = _resolve_content_type(
             file.content_type,
             file.filename,
         )
-        type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
-            # The browser/OS can mislabel a text/code file as binary (e.g. a
-            # .csv reported as application/vnd.ms-excel on Windows). Fall back
-            # to the extension — matching the web client's allowlist — and
-            # normalize the type so the resolver inlines it as text.
-            ext_type = attachment_text_type_for_extension(file.filename)
-            if ext_type is not None:
-                content_type = ext_type
+        # Check the filename first so a misleading MIME cannot skip the
+        # harness requirement or the quotas for files that need local tools.
+        filesystem_required = requires_filesystem(file.filename)
+        if filesystem_required:
+            # Drop the declared type so the file is never stored as text.
+            content_type = _resolve_content_type("application/octet-stream", file.filename)
+            await _require_filesystem_attachment_support(request, conv, file.filename)
+        # Hold the quota check through the store below, so parallel uploads can't
+        # all spend the same remaining allowance.
+        attachment_lock = (
+            _attachment_upload_lock(session_id)
+            if filesystem_required
+            else contextlib.nullcontext()
+        )
+        async with attachment_lock:
+            if filesystem_required:
+                read_limit = _enforce_filesystem_attachment_policy(
+                    [file.filename],
+                    session_id=session_id,
+                    file_store=file_store,
+                )
+            else:
                 type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
-            raise HTTPException(
-                status_code=415,
-                detail=(
-                    f"Unsupported attachment type '{content_type}'. Only images, "
-                    "PDF, and text/code files can be attached."
+                if type_limit is None:
+                    # The browser/OS can mislabel a text/code file as binary (e.g. a
+                    # .csv reported as application/vnd.ms-excel on Windows). Fall back
+                    # to the extension — matching the web client's allowlist — and
+                    # normalize the type so the resolver inlines it as text.
+                    ext_type = attachment_text_type_for_extension(file.filename)
+                    if ext_type is not None:
+                        content_type = ext_type
+                        type_limit = attachment_upload_limit(content_type)
+                if type_limit is None:
+                    raise HTTPException(
+                        status_code=415,
+                        detail=(
+                            f"Unsupported attachment type '{content_type}'. Attach images, PDF, "
+                            "or text/code files, or use Claude Code or Codex for archives, "
+                            "Office documents, and databases."
+                        ),
+                    )
+                read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+            filename = file.filename
+            # Persist original dimensions only after a downscale.
+            source_dims: tuple[int, int] | None = None
+            if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+                # Compressible images carry the large cap and the decode, so they are
+                # the server's peak upload memory. The body is already spooled to
+                # disk by the multipart parser, so gate the in-memory read + the
+                # decode/re-encode behind the admission semaphore: a burst of
+                # concurrent uploads waits (each holding only a disk-backed temp
+                # file), instead of every one buffering the full image in RAM and
+                # decoding at once. This bounds peak memory to the gate size × the
+                # per-upload cost, without serializing the network transfer.
+                async with _get_image_compression_gate():
+                    content = await _read_upload_capped(file, read_limit)
+                    if image_needs_compression(len(content), content_type):
+                        try:
+                            compressed, resolved_type, source_dims = await asyncio.to_thread(
+                                compress_image_attachment, content, content_type
+                            )
+                        except ImageCompressionError as exc:
+                            raise HTTPException(status_code=413, detail=str(exc)) from exc
+                        # A re-encode (e.g. PNG → JPEG) changes the type; realign the
+                        # filename extension so name, bytes, and MIME stay consistent.
+                        if resolved_type != content_type:
+                            filename = image_filename_for_content_type(
+                                file.filename, resolved_type
+                            )
+                        content, content_type = compressed, resolved_type
+            else:
+                # PDF/text/SVG and other non-compressed types use their smaller
+                # per-type caps and aren't decoded, so they read outside the gate.
+                content = await _read_upload_capped(file, read_limit)
+            stored = file_store.create(
+                session_id=session_id,
+                filename=filename,
+                bytes=len(content),
+                content_type=content_type,
+                source_metadata=(
+                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
                 ),
             )
-        read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
-        filename = file.filename
-        if content_type in _COMPRESSIBLE_IMAGE_MIMES:
-            # Compressible images carry the large cap and the decode, so they are
-            # the server's peak upload memory. The body is already spooled to
-            # disk by the multipart parser, so gate the in-memory read + the
-            # decode/re-encode behind the admission semaphore: a burst of
-            # concurrent uploads waits (each holding only a disk-backed temp
-            # file), instead of every one buffering the full image in RAM and
-            # decoding at once. This bounds peak memory to the gate size × the
-            # per-upload cost, without serializing the network transfer.
-            async with _get_image_compression_gate():
-                content = await _read_upload_capped(file, read_limit)
-                if image_needs_compression(len(content), content_type):
-                    try:
-                        compressed, resolved_type = await asyncio.to_thread(
-                            compress_image_attachment, content, content_type
-                        )
-                    except ImageCompressionError as exc:
-                        raise HTTPException(status_code=413, detail=str(exc)) from exc
-                    # A re-encode (e.g. PNG → JPEG) changes the type; realign the
-                    # filename extension so name, bytes, and MIME stay consistent.
-                    if resolved_type != content_type:
-                        filename = image_filename_for_content_type(file.filename, resolved_type)
-                    content, content_type = compressed, resolved_type
-        else:
-            # PDF/text/SVG and other non-compressed types use their smaller
-            # per-type caps and aren't decoded, so they read outside the gate.
-            content = await _read_upload_capped(file, read_limit)
-        stored = file_store.create(
-            session_id=session_id,
-            filename=filename,
-            bytes=len(content),
-            content_type=content_type,
-        )
-        artifact_store.put(stored.id, content)
+            try:
+                artifact_store.put(stored.id, content)
+            except Exception as exc:
+                # Release quota before another upload can acquire the session lock.
+                try:
+                    file_store.delete(stored.id, session_id=session_id)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete uploaded file row during rollback: session=%s file_id=%s",
+                        session_id,
+                        stored.id,
+                        exc_info=True,
+                    )
+                try:
+                    artifact_store.delete(stored.id)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete uploaded file blob during rollback: session=%s file_id=%s",
+                        session_id,
+                        stored.id,
+                        exc_info=True,
+                    )
+                raise OmnigentError(
+                    "Failed to upload file. Please try again.",
+                    code=ErrorCode.INTERNAL_ERROR,
+                ) from exc
         resource = _stored_file_to_resource(session_id, stored)
         _publish_and_persist_resource_event(
             session_id,
@@ -1704,10 +1831,15 @@ def register_resources_routes(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        # Content is immutable per file id, so a still-valid cached copy can be
-        # answered before ever touching the artifact store. Transcripts re-render
-        # the same attachments on every load, and the originals run to megabytes.
-        etag = _file_content_etag(stored.id)
+        # The bytes live under blob_key (== id for own uploads; the source's
+        # blob for a fork copy that shares it). Content is immutable per blob,
+        # so a still-valid cached copy can be answered before ever touching the
+        # artifact store — and keying the ETag on the blob lets a fork and its
+        # source share the browser cache for the same bytes. Transcripts
+        # re-render the same attachments on every load, and originals run to
+        # megabytes.
+        blob_key = stored.blob_key or stored.id
+        etag = _file_content_etag(blob_key)
         if _if_none_match_matches(request.headers.get("if-none-match"), etag):
             return Response(
                 status_code=304,
@@ -1716,7 +1848,7 @@ def register_resources_routes(
                     "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
                 },
             )
-        content = await asyncio.to_thread(artifact_store.get, stored.id)
+        content = await asyncio.to_thread(artifact_store.get, blob_key)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
         # The filename and bytes are fully user-controlled. Serving the
         # content inline lets a browser navigating directly to this URL
@@ -1759,12 +1891,26 @@ def register_resources_routes(
                 status_code=501,
                 detail="file store not configured",
             )
-        if not file_store.delete(file_id, session_id=session_id):
+        # Learn the blob this row points at BEFORE deleting the row — a fork
+        # copy shares the source's blob (blob_key != id), so we can't assume
+        # the blob lives under file_id.
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
+        if stored is None:
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        artifact_store.delete(file_id)
+        blob_key = stored.blob_key or stored.id
+        if not await asyncio.to_thread(file_store.delete, file_id, session_id=session_id):
+            raise OmnigentError(
+                "File not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        # Delete the bytes only once no surviving row (e.g. a fork sharing this
+        # blob) still references them — otherwise the fork's attachment would
+        # 404 after the source deletes its copy.
+        if await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key):
+            await asyncio.to_thread(artifact_store.delete, blob_key)
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.deleted",
@@ -1817,7 +1963,7 @@ def register_resources_routes(
             copy_total_bytes_limit,
         )
 
-        await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
                 status_code=501,
@@ -1861,7 +2007,9 @@ def register_resources_routes(
         total_bytes = 0
         for file_id in body.file_ids:
             stored = file_store.get(file_id, session_id=body.source_session_id)
-            if stored is None or not artifact_store.exists(stored.id):
+            # The source row may itself share a blob (blob_key != id), so probe
+            # existence under the effective blob key, not the row id.
+            if stored is None or not artifact_store.exists(stored.blob_key or stored.id):
                 raise OmnigentError(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,
@@ -1874,55 +2022,81 @@ def register_resources_routes(
                 )
             sources.append(stored)
 
-        # Commit the copies one file at a time (read → create → put) so peak
-        # memory is a single blob, not the whole batch. If any step fails
-        # mid-batch, roll back the rows/blobs already created.
-        mapping: dict[str, CopiedFile] = {}
-        created: list[str] = []
-        copied: list[StoredFile] = []
-        try:
-            for stored in sources:
-                content = artifact_store.get(stored.id)
-                new = file_store.create(
+        # Files requiring filesystem tools entering a session pass the same checks as an upload,
+        # held under the same lock, so a copy can't skip the harness or quotas.
+        from omnigent.inner.native_attachments import requires_filesystem
+
+        filesystem_sources = [
+            stored
+            for stored in sources
+            if stored.filename and requires_filesystem(stored.filename)
+        ]
+        if filesystem_sources:
+            await _require_filesystem_attachment_support(
+                request, conv, filesystem_sources[0].filename or ""
+            )
+        attachment_lock = (
+            _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()
+        )
+        async with attachment_lock:
+            if filesystem_sources:
+                _enforce_filesystem_attachment_policy(
+                    [stored.filename or "" for stored in filesystem_sources],
                     session_id=session_id,
-                    filename=stored.filename,
-                    bytes=stored.bytes,
-                    content_type=stored.content_type,
+                    file_store=file_store,
+                    sizes=[stored.bytes for stored in filesystem_sources],
                 )
-                created.append(new.id)
-                artifact_store.put(new.id, content)
-                # Carry the preserved filename + content_type back so the
-                # caller can attach the copy without a follow-up metadata GET.
-                mapping[stored.id] = CopiedFile(
-                    new_id=new.id,
-                    filename=new.filename,
-                    content_type=new.content_type,
-                )
-                copied.append(new)
-        except Exception as exc:
-            for new_id in created:
-                try:
-                    file_store.delete(new_id, session_id=session_id)
-                except Exception:
-                    _logger.warning(
-                        "Failed to delete copied file row during rollback: session=%s file_id=%s",
-                        session_id,
-                        new_id,
-                        exc_info=True,
+            # Commit the copies one file at a time (read → create → put) so peak
+            # memory is a single blob, not the whole batch. If any step fails
+            # mid-batch, roll back the rows/blobs already created.
+            mapping: dict[str, CopiedFile] = {}
+            created: list[str] = []
+            copied: list[StoredFile] = []
+            try:
+                for stored in sources:
+                    content = artifact_store.get(stored.blob_key or stored.id)
+                    new = file_store.create(
+                        session_id=session_id,
+                        filename=stored.filename,
+                        bytes=stored.bytes,
+                        content_type=stored.content_type,
+                        # Preserve transform metadata on copies.
+                        source_metadata=stored.source_metadata,
                     )
-                try:
-                    artifact_store.delete(new_id)
-                except Exception:
-                    _logger.warning(
-                        "Failed to delete copied file blob during rollback: session=%s file_id=%s",
-                        session_id,
-                        new_id,
-                        exc_info=True,
+                    created.append(new.id)
+                    artifact_store.put(new.id, content)
+                    # Carry the preserved filename + content_type back so the
+                    # caller can attach the copy without a follow-up metadata GET.
+                    mapping[stored.id] = CopiedFile(
+                        new_id=new.id,
+                        filename=new.filename,
+                        content_type=new.content_type,
                     )
-            raise OmnigentError(
-                "Failed to copy files into destination session",
-                code=ErrorCode.INTERNAL_ERROR,
-            ) from exc
+                    copied.append(new)
+            except Exception as exc:
+                for new_id in created:
+                    try:
+                        file_store.delete(new_id, session_id=session_id)
+                    except Exception:
+                        _logger.warning(
+                            "Failed to delete copied file row during rollback: session=%s file_id=%s",
+                            session_id,
+                            new_id,
+                            exc_info=True,
+                        )
+                    try:
+                        artifact_store.delete(new_id)
+                    except Exception:
+                        _logger.warning(
+                            "Failed to delete copied file blob during rollback: session=%s file_id=%s",
+                            session_id,
+                            new_id,
+                            exc_info=True,
+                        )
+                raise OmnigentError(
+                    "Failed to copy files into destination session",
+                    code=ErrorCode.INTERNAL_ERROR,
+                ) from exc
 
         # Resource events fire only after every write lands. Publishing them
         # inside the copy loop would emit (and persist as transcript items)
@@ -1982,6 +2156,18 @@ def register_resources_routes(
         if method == "GET":
             return await _proxy_get_to_runner(session_id, path, conv)
         if method == "PUT":
+            # Reads can use the host tunnel, but saving needs a runner to
+            # enforce the environment's write policy. Reconnect before saving
+            # and use the refreshed binding if recovery launched a new runner.
+            if request is not None:
+                _, conv = await ensure_runner_connected(
+                    session_id=session_id,
+                    conv=conv,
+                    app_state=request.app.state,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router or get_server_runner_router(),
+                    raise_host_refusal=True,
+                )
             status, payload = await _proxy_put_to_runner(
                 session_id,
                 path,
@@ -2012,6 +2198,10 @@ def register_resources_routes(
             raise HTTPException(status_code=405)
 
         if status >= 400:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) with its client-safe message instead of forwarding
+            # the runner's raw resolver text verbatim.
+            _raise_if_session_agent_missing_payload(payload)
             error = payload.get("error", {})
             message = error.get("message", "filesystem operation failed")
             if status == 404:
@@ -2619,6 +2809,12 @@ def register_resources_routes(
         """
         Execute a shell command in an environment.
 
+        Owner-only. A command has no path to inspect, so unlike the
+        filesystem proxy there is no workspace-relative form that could
+        be opened to collaborators: any command reaches the owner's own
+        machine, the same boundary ``_browse_level`` closes for absolute
+        paths, and it passes no policy or approval gate on the way.
+
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
         :param request: JSON body with ``command`` and optional
@@ -2633,6 +2829,7 @@ def register_resources_routes(
             path,
             body,
             request=request,
+            required_level=LEVEL_OWNER,
             environment_id=environment_id,
             publish_invalidation=False,
         )

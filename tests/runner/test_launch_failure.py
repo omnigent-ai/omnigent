@@ -164,9 +164,55 @@ def test_preserves_other_native_turn_errors(message: str) -> None:
     assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
 
 
-@pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing", "invalid_input"])
+@pytest.mark.parametrize("code", ["workspace_missing", "invalid_input"])
 def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
+
+
+@pytest.mark.parametrize(
+    "code",
+    # Budget detection runs before the early-return guard, so it applies to
+    # codex_reauth_required (old runners) as well as the two generic codes.
+    ["native_turn_error", "codex_turn_error", "codex_reauth_required"],
+)
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Realistic AI-gateway budget exhaustion message (budget name/id synthetic).
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+            '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached'
+            " its limit of $100. To continue, contact an admin to increase the budget or"
+            ' use a different budget."}'
+        ),
+        # Realistic budget message with the old re-auth hint appended by older runners.
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+            '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached'
+            " its limit of $100. To continue, contact an admin to increase the budget or"
+            ' use a different budget."}\n\n'
+            "If this looks like an auth issue, running `codex login` may help."
+        ),
+        # Minimal form — just the key phrase.
+        "Budget X has reached its limit of $0.",
+        # Disabled per-user rate limit (rate limit is set to 0).
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED",'
+            '"message":"rate limit is set to 0 for user test@example.com"}'
+        ),
+    ],
+)
+def test_classifies_budget_exhausted(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "budget_exhausted"
+
+
+def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
+    """A real auth failure under codex_reauth_required must not be reclassified."""
+    message = (
+        "401 Unauthorized: your login has expired.\n\n"
+        "If this looks like an auth issue, running `codex login` may help."
+    )
+    assert classify_native_turn_error("codex_reauth_required", message) == "codex_reauth_required"
 
 
 @pytest.mark.parametrize(
@@ -179,6 +225,7 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
+        ("budget_exhausted", "budget"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

@@ -381,20 +381,21 @@ class CredentialSourceSpec:
     The secret is resolved in the *parent* (trusted) process and never
     handed to the sandbox verbatim — only a synthetic placeholder is.
 
-    :param kind: Resolution mode, one of ``"env"``, ``"file"``, or
-        ``"command"``.
+    :param kind: Resolution mode: env, file, command, or unix_socket.
     :param env: Environment-variable name carrying the secret when
         ``kind="env"``, e.g. ``"OA_TEST_GITHUB_PAT"``.
-    :param path: File path to read when ``kind="file"`` (``~`` is
-        expanded), e.g. ``"~/.config/tokens/github_pat.txt"``.
+    :param path: File or Unix socket path (``~`` is expanded).
     :param command: Shell command whose stdout is the secret when
         ``kind="command"``, e.g. ``"gh auth token"``.
+    :param refresh_interval_seconds: Re-resolve file or Unix socket sources on
+        access after this interval. ``None`` resolves only at startup.
     """
 
-    kind: Literal["env", "file", "command"]
+    kind: Literal["env", "file", "command", "unix_socket"]
     env: str | None = None
     path: str | None = None
     command: str | None = None
+    refresh_interval_seconds: float | None = None
 
 
 @dataclass

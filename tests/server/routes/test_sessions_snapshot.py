@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,22 +24,10 @@ from omnigent.server.routes.sessions import (
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
-async def _drain_runner_skills(session_id: str) -> None:
-    """Pump the loop until the snapshot's background skills fetch lands.
-
-    Skills are now eventual-consistent (``[]`` on the first poll,
-    populated on a later one), so tests must wait for the fetch.
-    """
-    for _ in range(100):
-        if session_id in _sessions_mod._runner_skills_cache:
-            return
-        await asyncio.sleep(0)
-
-
 async def _drain_model_options(session_id: str) -> None:
     """Pump the loop until the background native model-options fetch lands.
 
-    Runner model options are eventual-consistent like skills: the first
+    Runner model options are eventually consistent: the first
     snapshot returns ``[]`` and starts the runner query; a later snapshot
     serves the cache.
     """
@@ -692,15 +681,428 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
     # Still "running" from the cached value.
     assert snapshot2.status == "running"
     # Status is server-cached, so only the FIRST snapshot queries the
-    # runner for status; the second hits the cache. (Skills are
-    # runner-owned and fetched every snapshot via ``/skills`` — the
-    # runner caches them per session — so filter those out here.)
-    status_calls = [u for u in fake_client.get_calls if not u.endswith("/skills")]
+    # runner for status; the second hits the cache.
+    status_calls = fake_client.get_calls
     assert len(status_calls) == 1, (
         f"Expected 1 runner status GET (cache hit on second call), "
         f"got {len(status_calls)}. If 2, the cache "
         f"wasn't populated after the first query."
     )
+
+
+class _HangingRunnerClient:
+    """Fake runner whose status GET never answers, like a stalled runner behind a live tunnel."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        await asyncio.Future()
+
+
+class _NotFoundRunnerClient:
+    """Fake runner that does not know the session."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+
+class _GatedRunnerClient:
+    """Fake runner whose status GET blocks until released, so callers provably overlap."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.arrived = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        self.arrived.set()
+        await self.release.wait()
+        return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+
+def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A runner that never answers costs one bounded probe, then none until the backoff ends.
+
+    The tunnel transport ignores httpx timeouts, so an unanswered probe used to
+    hold every snapshot of the session until the runner spoke or its tunnel
+    dropped, and nothing was cached, so the next snapshot waited again.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "0a4d2f9c6b1e4e8f9c3a7d5b2e1f0a9c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert first.status == "idle"
+    assert second.status == "idle"
+    # One probe, cut off at the budget; the second snapshot skipped it entirely.
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "no answer within 0.05s" in warnings[0].getMessage()
+    assert "skipping it for 30s" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_concurrent_cache_misses_share_one_status_probe() -> None:
+    """Callers racing on a cold status cache await one shared in-flight probe.
+
+    The runner's answer is gated on an event the test controls, so the second
+    caller provably attaches while the first probe is still in flight; the pass
+    cannot come from two probes merely running back to back.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "4e8b6d3a0f5c4c2d9a7e9b6f5c3d4e1a"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _GatedRunnerClient()
+
+    first = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    # One yield schedules `second` onto the shared probe; only then may it finish.
+    await asyncio.sleep(0)
+    runner_client.release.set()
+
+    assert await asyncio.gather(first, second) == ["running", "running"]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) == "running"
+    assert _mod._runner_status_probe_inflight.get(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_cancelled_caller_does_not_abort_shared_status_probe() -> None:
+    """Cancelling one caller's snapshot leaves the shared probe running for the rest."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "5f9c7e4b1a2d4d3e8b0f1c9d6e5a7b2c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _GatedRunnerClient()
+
+    first = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    runner_client.release.set()
+
+    assert await second == "running"
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_resumes_after_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the backoff has elapsed the next snapshot probes the runner again."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "1b5e3a0d7c2f4f9a8d4b6e3c2f0a1b8d"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_BACKOFF_S", 0.0)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert len(runner_client.get_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_asks_again_after_non_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that does not know the session yet is asked again on the next snapshot.
+
+    A freshly bound runner answers 404 until session init lands; that answer is
+    cheap, so it must not put the session in the slow-probe backoff.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "2c6f4b1e8d3a4a0b9e5c7f4d3a1b2c9e"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _NotFoundRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert first.status == "idle"
+    assert second.status == "idle"
+    assert len(runner_client.get_calls) == 2
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+
+
+class _SlowNotFoundRunnerClient:
+    """Fake runner that answers 404 only after a delay: stalled, and without the session."""
+
+    def __init__(self, delay_s: float) -> None:
+        self.delay_s = delay_s
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        await asyncio.sleep(self.delay_s)
+        return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_slow_non_200_probe_enters_backoff(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-200 that took longer than the slow threshold is treated like a failed probe."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "6a0d8f5c2b7e4e4f9c1a3b8d7e6f5a4b"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_SLOW_S", 0.01)
+    runner_client = _SlowNotFoundRunnerClient(delay_s=0.05)
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert len(runner_client.get_calls) == 1
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "HTTP 404 after" in warnings[0].getMessage()
+
+
+class _SwitchableRunnerClient:
+    """Fake runner that hangs until told to answer 200."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.answer = False
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        if self.answer:
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "idle"})
+        await asyncio.Future()
+        return None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_probe_backoff_doubles_per_slow_probe_and_resets_on_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive slow probes double the skip window up to the cap; a prompt answer clears it."""
+    import time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "7b1e9a6d3c8f4f5a0d2b4c9e8f7a6b5c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _SwitchableRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    def _window_s() -> float:
+        return _mod._runner_status_probe_backoff.get(session_id).skip_until - time.monotonic()
+
+    def _expire_window() -> None:
+        _mod._runner_status_probe_backoff.get(session_id).skip_until = time.monotonic() - 1.0
+
+    expected_windows = [30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
+    for failures, expected in enumerate(expected_windows, start=1):
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        entry = _mod._runner_status_probe_backoff.get(session_id)
+        assert entry.failures == failures
+        assert abs(_window_s() - expected) < 2.0, (failures, _window_s())
+        _expire_window()
+    assert len(runner_client.get_calls) == len(expected_windows)
+
+    runner_client.answer = True
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.status == "idle"
+    assert _mod._session_status_cache.get(session_id) == "idle"
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+
+
+class _MalformedRunnerClient:
+    """Fake runner whose 200 carries a body that is not a JSON object."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        return SimpleNamespace(status_code=200, json=lambda: ["not", "an", "object"])
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_malformed_200_probe_fails_softly_for_every_waiter(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 200 without a status object is a failed probe, not an exception every waiter sees."""
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "8c2f0b7e4d9a4a6b1e3c5d0f9a8b7c6d"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _MalformedRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first, second = await asyncio.gather(
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+        )
+
+    assert (first.status, second.status) == ("idle", "idle")
+    assert len(runner_client.get_calls) == 1
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "malformed body" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_probe_backoff_is_discarded_when_the_runner_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skip window recorded against one runner does not silence probes of its replacement."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "9d3a1c8f6b5e4e7d0f2a4b6c8e1d3f5a"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    stalled = _HangingRunnerClient()
+
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    assert await orchestration._probe_runner_live_status(stalled, session_id, "runner_old") is None  # type: ignore[arg-type]
+    assert _mod._runner_status_probe_backoff.get(session_id).runner_id == "runner_old"
+
+    class _HealthyRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    replacement = _HealthyRunnerClient()
+    status = await orchestration._probe_runner_live_status(replacement, session_id, "runner_new")  # type: ignore[arg-type]
+
+    assert status == "running"
+    assert replacement.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+    assert _mod._session_status_cache.get(session_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_bound_holds_over_the_tunnel_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over the real tunnel an unanswered probe ends at the budget with nothing in flight."""
+    import time
+
+    import httpx
+
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    class _IdleWS:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    session_id = "3d7a5c2f9e4b4b1c8f6d8a5e4b2c3d0f"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.1)
+    registry = TunnelRegistry()
+    registry.register(
+        "runner_one",
+        _IdleWS(),
+        HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[]),
+    )
+    runner_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"), base_url="http://runner"
+    )
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    try:
+        started = time.monotonic()
+        snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        elapsed = time.monotonic() - started
+    finally:
+        await runner_client.aclose()
+
+    assert snapshot.status == "idle"
+    assert elapsed < 1.0
+    tunnel = registry.get("runner_one")
+    assert tunnel is not None
+    assert tunnel.in_flight == {}
+    assert _mod._runner_status_probe_backoff.get(session_id) is not None
 
 
 @pytest.mark.asyncio
@@ -718,14 +1120,6 @@ async def test_session_snapshot_uses_persisted_status_after_server_restart(
 
     session_id = "bef42153ba7a4f2cb35350dc23b27c93"
     _mod._session_status_cache.pop(session_id, None)
-    _mod._runner_skills_cache.pop(session_id, None)
-
-    class _SkillsResponse:
-        status_code = 200
-
-        @staticmethod
-        def json() -> dict[str, list[Any]]:
-            return {"skills": []}
 
     class _IdleRunnerClient:
         def __init__(self) -> None:
@@ -733,8 +1127,6 @@ async def test_session_snapshot_uses_persisted_status_after_server_restart(
 
         async def get(self, url: str, timeout: float = 5.0) -> Any:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _SkillsResponse()
             raise AssertionError("persisted running status must avoid the idle runner probe")
 
     runner_client = _IdleRunnerClient()
@@ -754,13 +1146,11 @@ async def test_session_snapshot_uses_persisted_status_after_server_restart(
             _ConversationStore([], conversations={session_id: conv}),  # type: ignore[arg-type]
             session_id,
         )
-        await _drain_runner_skills(session_id)
     finally:
         _mod._session_status_cache.pop(session_id, None)
-        _mod._runner_skills_cache.pop(session_id, None)
 
     assert snapshot.status == "running"
-    status_calls = [url for url in runner_client.get_calls if not url.endswith("/skills")]
+    status_calls = runner_client.get_calls
     assert status_calls == []
 
 
@@ -809,8 +1199,6 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
 
     class _FakeResponse:
         status_code = 200
@@ -834,7 +1222,15 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         def __init__(self) -> None:
             self.resolved_for: list[str] = []
 
-        def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> RoutedRunner:
+            # Mirrors the real router: callers hand over the row they already
+            # authorized so it need not re-read the conversation.
+            del conversation
             self.resolved_for.append(conversation_id)
             return RoutedRunner(runner_id="runner_test", client=fake_client)  # type: ignore[arg-type]
 
@@ -862,75 +1258,9 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         "instead of synthesizing a default status"
     )
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
-    await _drain_runner_skills("3ce755917a74a49f0c8feaf50f058ed9")
     assert fake_client.get_calls == [
         "/v1/sessions/3ce755917a74a49f0c8feaf50f058ed9",
-        "/v1/sessions/3ce755917a74a49f0c8feaf50f058ed9/skills",
     ]
-
-
-@pytest.mark.asyncio
-async def test_session_snapshot_includes_skills_from_runner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Skills are runner-owned: the snapshot's ``skills`` field is
-    populated from the bound runner's ``GET /v1/sessions/{id}/skills``
-    (discovered against the runner's filesystem), so the web composer
-    can list them in its slash-command menu.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: dict[str, object]) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> dict[str, object]:
-            return self._payload
-
-    class _FakeRunnerClient:
-        def __init__(self) -> None:
-            self.get_calls: list[str] = []
-
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse(
-                    {
-                        "skills": [
-                            {"name": "triage-issues", "description": "Triage issues."},
-                            {"name": "mlflow-bug", "description": "File an MLflow bug."},
-                        ]
-                    }
-                )
-            return _FakeResponse({"status": "idle"})
-
-    fake_client = _FakeRunnerClient()
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-    # First poll returns [] and kicks the background fetch; a later poll serves them.
-    first = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6dc1e933ea5626723a7c79af592a4dc8",
-    )
-    assert first.skills == []
-    await _drain_runner_skills("6dc1e933ea5626723a7c79af592a4dc8")
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6dc1e933ea5626723a7c79af592a4dc8",
-    )
-
-    assert "/v1/sessions/6dc1e933ea5626723a7c79af592a4dc8/skills" in fake_client.get_calls
-    assert [s.name for s in snapshot.skills] == ["triage-issues", "mlflow-bug"]
-    assert snapshot.skills[0].description == "Triage issues."
 
 
 @pytest.mark.asyncio
@@ -958,8 +1288,6 @@ async def test_session_snapshot_includes_model_options_from_runner(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -977,8 +1305,6 @@ async def test_session_snapshot_includes_model_options_from_runner(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
@@ -1057,8 +1383,6 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     """
     from omnigent.server.routes import sessions as _mod
 
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -1077,8 +1401,6 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             del timeout
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse({"detail": "Not Found"}, status_code=404)
             if url.endswith("/kiro-model-options"):
@@ -1143,8 +1465,6 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -1163,8 +1483,6 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
@@ -1234,8 +1552,6 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._pushed_model_options_cache.clear()
@@ -1254,8 +1570,6 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             return _FakeResponse({"status": "idle"})
 
     fake_client = _FakeRunnerClient()
@@ -1323,8 +1637,6 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -1342,8 +1654,6 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
@@ -1412,8 +1722,6 @@ async def test_snapshot_refresh_scopes_cached_options_to_cursor(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_cache["3626053dfa9668a8604cc06e0b590ae0"] = [
@@ -1441,8 +1749,6 @@ async def test_snapshot_refresh_scopes_cached_options_to_cursor(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
@@ -1514,8 +1820,6 @@ async def test_session_snapshot_serves_cached_model_options_while_runner_offline
 
     session_id = "conv_offline_catalog"
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_stale.discard(session_id)
@@ -1530,8 +1834,6 @@ async def test_session_snapshot_serves_cached_model_options_while_runner_offline
 
     class _FakeRunnerClient:
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse({"models": [{"id": "gpt-5.5", "displayName": "GPT-5.5"}]})
             return _FakeResponse({"status": "idle"})
@@ -1593,8 +1895,6 @@ async def test_session_snapshot_refetches_stale_model_options_after_relaunch(
 
     session_id = "conv_stale_catalog"
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_stale.discard(session_id)
@@ -1612,8 +1912,6 @@ async def test_session_snapshot_refetches_stale_model_options_after_relaunch(
             self.model_id = "old-model"
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse({"models": [{"id": self.model_id}]})
             return _FakeResponse({"status": "idle"})
@@ -1685,8 +1983,6 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
 
     session_id = "conv_host_catalog"
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_stale.discard(session_id)
@@ -1748,8 +2044,6 @@ async def test_session_snapshot_retries_empty_model_options(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
@@ -1786,8 +2080,6 @@ async def test_session_snapshot_retries_empty_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return _FakeResponse(self._codex_payloads.pop(0))
             return _FakeResponse({"status": "idle"})
@@ -1847,8 +2139,6 @@ async def test_session_snapshot_retries_503_model_options(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
@@ -1898,8 +2188,6 @@ async def test_session_snapshot_retries_503_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             if url.endswith("/model-options"):
                 return self._codex_responses.pop(0)
             return _FakeResponse({"status": "idle"})
@@ -1945,155 +2233,6 @@ async def test_session_snapshot_retries_503_model_options(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "skills", [[], [{"name": "triage-issues", "description": "Triage issues."}]]
-)
-async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
-    monkeypatch: pytest.MonkeyPatch,
-    skills: list[dict[str, str]],
-) -> None:
-    """
-    The background runner-skills fetch publishes ``session.skills`` once
-    it populates the cache, so a connected client is nudged to re-read
-    the now-warm snapshot. Without this push the slash-command menu stays
-    empty until the next bind (the bug that motivated this event): the
-    first snapshot poll serves ``[]`` and the web query does not poll.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: dict[str, object]) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> dict[str, object]:
-            return self._payload
-
-    class _FakeRunnerClient:
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": skills})
-            return _FakeResponse({"status": "idle"})
-
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-
-    # Capture session-stream publishes by rebinding the module's
-    # ``session_stream`` reference to a recorder. Rebinding the name in
-    # the sessions module's namespace (not patching ``publish`` through
-    # the shared module singleton) keeps the mock from leaking into other
-    # tests — see omnigent-testing rule 14.
-    published: list[dict[str, object]] = []
-
-    class _RecordingStream:
-        @staticmethod
-        def publish(conversation_id: str, event: dict[str, object]) -> None:
-            published.append({"conversation_id": conversation_id, **event})
-
-    monkeypatch.setattr(_mod, "session_stream", _RecordingStream)
-
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-    # First poll serves [] and kicks the background fetch.
-    first = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
-    assert first.skills == []
-    assert first.skills_status == "loading"
-    await _drain_runner_skills("38aed2dc1dc1b08dbbaa1cf9592d7ae5")
-
-    # Exactly one session.skills event for this session was published when
-    # the fetch resolved. A missing event means the push regressed and the
-    # menu would stay empty; a duplicate means it fired more than once per
-    # resolve.
-    skills_events = [
-        e
-        for e in published
-        if e.get("type") == "session.skills"
-        and e.get("conversation_id") == "38aed2dc1dc1b08dbbaa1cf9592d7ae5"
-    ]
-    assert len(skills_events) == 1, (
-        f"Expected exactly 1 session.skills publish on fetch resolve, "
-        f"got {len(skills_events)}: {published}"
-    )
-    ready = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
-    assert ready.skills_status == "ready"
-    assert [s.model_dump() for s in ready.skills] == skills
-
-
-@pytest.mark.asyncio
-async def test_session_snapshot_skills_empty_without_runner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    With no runner bound (neither router nor singleton resolves a
-    client), skills come back ``[]`` rather than crashing — discovery
-    is runner-owned and there is nothing to query.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    monkeypatch.setattr(
-        "omnigent.runtime.get_runner_client",
-        lambda: None,
-    )
-    monkeypatch.setattr(
-        "omnigent.runtime.get_runner_router",
-        lambda: None,
-    )
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6222f438412b74067ff5915857f79312",
-    )
-
-    assert snapshot.skills == []
-    assert snapshot.skills_status == "unavailable"
-
-
-@pytest.mark.asyncio
-async def test_session_snapshot_skills_empty_on_malformed_runner_payload(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A malformed ``/skills`` payload (items missing ``name``/``description``,
-    or a non-JSON body) must not break the snapshot — skills fall back to
-    ``[]`` (the documented best-effort contract).
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: object) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> object:
-            return self._payload
-
-    class _FakeRunnerClient:
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                # Items missing the required name/description keys.
-                return _FakeResponse({"skills": [{"oops": "no name"}]})
-            return _FakeResponse({"status": "idle"})
-
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "21ad0587558979245a26b40ebe2638ef",
-    )
-
-    assert snapshot.skills == []
-
-
-@pytest.mark.asyncio
 async def test_session_snapshot_prefers_router_over_singleton(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2105,8 +2244,6 @@ async def test_session_snapshot_prefers_router_over_singleton(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
 
     class _Response:
         def __init__(self, status: str) -> None:
@@ -2129,7 +2266,14 @@ async def test_session_snapshot_prefers_router_over_singleton(
     singleton_client = _Client("idle")
 
     class _FakeRouter:
-        def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> RoutedRunner:
+            """Mirrors the real router's already-authorized-row parameter."""
+            del conversation_id, conversation
             return RoutedRunner(runner_id="runner_test", client=router_client)  # type: ignore[arg-type]
 
     monkeypatch.setattr(
@@ -2148,11 +2292,8 @@ async def test_session_snapshot_prefers_router_over_singleton(
     )
 
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
-    await _drain_runner_skills("1cef6d7d1ef0c577c6ccfc690e5bc8ed")
     assert router_client.get_calls == [
         "/v1/sessions/1cef6d7d1ef0c577c6ccfc690e5bc8ed",
-        "/v1/sessions/1cef6d7d1ef0c577c6ccfc690e5bc8ed/skills",
     ]
     assert singleton_client.get_calls == [], (
         "singleton should not have been queried when the router resolved a client"
@@ -2503,6 +2644,32 @@ def test_truncate_label_empty_string() -> None:
 # ── _persist_session_status_error_labels ─────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("response_id", "names", "expected"),
+    [
+        ("failed_turn", ["claude-native-ui"], "claude-native-ui"),
+        ("failed_turn", ["claude-native-ui", "codex-native-ui"], None),
+        ("other_turn", ["claude-native-ui"], None),
+        (None, ["claude-native-ui"], None),
+    ],
+)
+def test_status_error_identity_requires_an_unambiguous_response(
+    response_id: str | None, names: list[str], expected: str | None
+) -> None:
+    from omnigent.entities import MessageData
+    from omnigent.server.routes._sessions.helpers import _response_agent_name_from_store
+
+    items = [
+        SimpleNamespace(
+            response_id="failed_turn",
+            data=MessageData(role="assistant", agent=name, content=[]),
+        )
+        for name in names
+    ]
+    store = SimpleNamespace(list_items=lambda *args, **kwargs: SimpleNamespace(data=items))
+    assert _response_agent_name_from_store(store, "session", response_id) == expected
+
+
 @pytest.mark.asyncio
 async def test_persist_error_labels_truncates_long_message() -> None:
     """A failure message longer than 256 chars is truncated before the store
@@ -2634,12 +2801,13 @@ async def test_persist_and_project_structured_error_round_trip() -> None:
         remediation="Run the host as a non-root user (uid != 0).",
     )
     await _persist_session_status_error_labels(
-        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore()
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore(), agent_name="claude-native-ui"
     )  # type: ignore[arg-type]
 
     labels = captured["aa11bb22cc33dd44ee55ff6677889900"]
     projected = _last_task_error_from_labels(labels)
     assert projected == {
+        "agent_name": "claude-native-ui",
         "code": "required_terminal_exited",
         "message": "Claude Code can't run as root\n\n...diagnostics...",
         "title": "Claude Code can't run as root",
@@ -2675,7 +2843,148 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
     assert labels["omnigent.last_task_error_title"] == ""
     assert labels["omnigent.last_task_error_cause"] == ""
     assert labels["omnigent.last_task_error_remediation"] == ""
+    assert labels["omnigent.last_task_error_agent_name"] == ""
     assert _last_task_error_from_labels(labels) == {
         "code": "runner_error",
         "message": "turn setup failed",
     }
+
+
+def _side_chat_child(
+    *,
+    runner_id: str | None,
+    parent_id: str | None = "parent",
+    nickname: str = "Side chat",
+    wrapper: str = "codex-native-ui-subagent",
+    kind: str = "sub_agent",
+) -> Any:
+    """A conversation row shaped like a codex ``/side`` child."""
+    labels: dict[str, str] = {"omnigent.wrapper": wrapper}
+    if nickname:
+        labels["omnigent.codex_native.agent_nickname"] = nickname
+    return SimpleNamespace(
+        kind=kind,
+        labels=labels,
+        parent_conversation_id=parent_id,
+        runner_id=runner_id,
+    )
+
+
+class _ParentStore:
+    """A conversation store that returns one canned parent row."""
+
+    def __init__(self, parent: Any) -> None:
+        self._parent = parent
+
+    def get_conversation(self, conversation_id: str) -> Any:
+        return self._parent
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_sealed_on_runner_divergence() -> None:
+    """A resumed/relaunched host gives the parent a fresh ``runner_id`` while the
+    side-chat child keeps its birth one. The divergence means the ephemeral fork's
+    owning runner is gone, so the child seals read-only."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    child = _side_chat_child(runner_id="runner-birth")
+    store = _ParentStore(SimpleNamespace(runner_id="runner-resumed"))
+    assert await _codex_side_chat_fork_sealed(child, store) is True  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_not_sealed_when_runner_matches() -> None:
+    """A plain page reload keeps the same live runner, so parent and child agree
+    and the still-reachable fork stays sendable."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    child = _side_chat_child(runner_id="runner-birth")
+    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))
+    assert await _codex_side_chat_fork_sealed(child, store) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_seal_only_applies_to_side_chats() -> None:
+    """The seal is gated to the ``/side`` nickname. An ordinary codex sub-agent
+    (durable, not an ephemeral fork) with a diverged runner must NOT be sealed —
+    and a non-codex row is ignored entirely."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    diverged = _ParentStore(SimpleNamespace(runner_id="runner-resumed"))
+
+    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
+    assert await _codex_side_chat_fork_sealed(ordinary, diverged) is False  # type: ignore[arg-type]
+
+    not_codex = _side_chat_child(
+        runner_id="runner-birth", wrapper="claude-code-native-ui-subagent"
+    )
+    assert await _codex_side_chat_fork_sealed(not_codex, diverged) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_not_sealed_without_reliable_signal() -> None:
+    """Missing signals can't prove the fork is gone, so the child stays sendable:
+    a child with no runner_id, no parent link, or a parent that has no runner_id
+    (never diverged) is not sealed."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    live_parent = _ParentStore(SimpleNamespace(runner_id="runner-birth"))
+
+    no_child_runner = _side_chat_child(runner_id=None)
+    assert await _codex_side_chat_fork_sealed(no_child_runner, live_parent) is False  # type: ignore[arg-type]
+
+    no_parent_link = _side_chat_child(runner_id="runner-birth", parent_id=None)
+    assert await _codex_side_chat_fork_sealed(no_parent_link, live_parent) is False  # type: ignore[arg-type]
+
+    parent_no_runner = _ParentStore(SimpleNamespace(runner_id=None))
+    child = _side_chat_child(runner_id="runner-birth")
+    assert await _codex_side_chat_fork_sealed(child, parent_no_runner) is False  # type: ignore[arg-type]
+
+    missing_parent = _ParentStore(None)
+    assert await _codex_side_chat_fork_sealed(child, missing_parent) is False  # type: ignore[arg-type]
+
+
+async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as mod
+
+    mod._session_status_cache.clear()
+    calls: list[str] = []
+    published: list[dict[str, object]] = []
+
+    class Runner:
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            calls.append(url)
+            assert not url.endswith("/skills")
+
+            class Response:
+                status_code = 200
+
+                def json(self) -> dict[str, str]:
+                    return {"status": "idle"}
+
+            return Response()
+
+    class Stream:
+        @staticmethod
+        def publish(session_id: str, event: dict[str, object]) -> None:
+            published.append(event)
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: Runner())
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    monkeypatch.setattr(mod, "session_stream", Stream)
+    snapshot = await _get_session_snapshot(_ConversationStore([]), "session-menu-independent")  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    assert "skills" not in snapshot.model_dump()
+    assert "skills_status" not in snapshot.model_dump()
+    assert all(not url.endswith("/skills") for url in calls)
+    assert all(event.get("type") != "session.skills" for event in published)

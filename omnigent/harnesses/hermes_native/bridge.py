@@ -298,6 +298,13 @@ def _load_user_hermes_config() -> _ConfigObject:
 _MCP_BRIDGE_CONFIG_FILE = "bridge.json"
 
 
+def _policy_hook_script_path() -> str:
+    """Absolute path to the shipped hook entrypoint, resolved from its module."""
+    from omnigent.inner import hermes_policy_hook
+
+    return str(Path(hermes_policy_hook.__file__).resolve())
+
+
 def write_policy_hook_config(
     bridge_dir: Path,
     server_url: str,
@@ -338,7 +345,7 @@ def write_policy_hook_config(
     # token-bearing hook wrapper.
     _ensure_dir(hermes_home)
 
-    hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
+    hook_script_path = _policy_hook_script_path()
 
     # Wrapper shell script: sets env vars and execs the Python hook. It bakes a
     # one-shot auth token + workspace-routing header, so it is owner-only
@@ -438,7 +445,7 @@ def inject_relay_into_policy_hook(
     if not wrapper.is_file():
         return False
 
-    hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
+    hook_script_path = _policy_hook_script_path()
     from omnigent.native.native_policy_hook import _RELAY_TOKEN_ENV, _RELAY_URL_ENV
 
     new_text = (

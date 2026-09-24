@@ -19,18 +19,18 @@ def _open_appearance(page: Page, base_url: str) -> None:
     )
 
 
-def test_sidebar_font_size_card_is_removed(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_sidebar_font_size_card_is_removed(page: Page, live_server: str) -> None:
     """The dedicated Sidebar font size card is no longer rendered."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     expect(page.get_by_role("group", name="Sidebar settings", exact=True)).to_have_count(0)
     expect(page.get_by_test_id("sidebar-font-size-input")).to_have_count(0)
 
 
-def test_appearance_reset_restores_defaults(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_appearance_reset_restores_defaults(page: Page, live_server: str) -> None:
     """Clicking Reset → confirm resets UI font size and terminal theme back to defaults."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     font_size_input = page.get_by_test_id("ui-font-size-input")

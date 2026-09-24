@@ -9,6 +9,7 @@ function with a stub async client returning controlled snapshots.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -61,8 +62,14 @@ class _Client:
     def __init__(self, resp: _Resp | None = None, raise_exc: Exception | None = None) -> None:
         self._resp = resp
         self._raise_exc = raise_exc
+        self.urls: list[str] = []
+        self.params: list[dict[str, str] | None] = []
 
-    async def get(self, url: str, timeout: float | None = None) -> _Resp:
+    async def get(
+        self, url: str, timeout: float | None = None, params: dict[str, str] | None = None
+    ) -> _Resp:
+        self.urls.append(url)
+        self.params.append(params)
         if self._raise_exc is not None:
             raise self._raise_exc
         assert self._resp is not None
@@ -80,9 +87,13 @@ class _SequenceClient:
     def __init__(self, actions: list[Any]) -> None:
         self._actions = list(actions)
         self.calls = 0
+        self.params: list[dict[str, str] | None] = []
 
-    async def get(self, url: str, timeout: float | None = None) -> _Resp:
+    async def get(
+        self, url: str, timeout: float | None = None, params: dict[str, str] | None = None
+    ) -> _Resp:
         self.calls += 1
+        self.params.append(params)
         action = self._actions[self.calls - 1]
         if isinstance(action, Exception):
             raise action
@@ -149,6 +160,68 @@ async def test_invalid_field_raises(field: str, value: Any, match: str) -> None:
     client = _Client(_Resp(200, {field: value}))
     with pytest.raises(RuntimeError, match=match):
         await _run(client)
+
+
+@pytest.mark.asyncio
+async def test_launch_config_reads_the_metadata_only_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch-config read skips transcript, liveness, and usage aggregation."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    client = _Client(_Resp(200, {"workspace": "/tmp/repo"}))
+
+    await _run(client)
+
+    assert client.urls == ["/v1/sessions/conv_1"]
+    assert client.params == [
+        {"include_items": "false", "include_liveness": "false", "include_usage": "false"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reader",
+    [
+        pytest.param(_orchestration._codex_native_launch_config, id="codex"),
+        pytest.param(_orchestration._pi_native_launch_config, id="pi"),
+        pytest.param(_orchestration._kiro_native_launch_config, id="kiro"),
+        pytest.param(_orchestration._opencode_native_launch_config, id="opencode"),
+        pytest.param(_orchestration._session_payload_for_host_spawn_check, id="host-spawn"),
+        pytest.param(_orchestration._load_legacy_claude_launch_metadata, id="legacy-claude"),
+        pytest.param(_orchestration._claude_native_session_wants_rebuild, id="claude-rebuild"),
+    ],
+)
+async def test_native_metadata_reads_skip_usage_aggregation(
+    reader: Callable[..., Awaitable[Any]],
+) -> None:
+    """Launch and resume metadata reads opt out of expensive response-only work."""
+    requests: list[httpx.Request] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "workspace": "/tmp/repo",
+                "total_cost_usd": None,
+                "usage_by_model": None,
+                "usage_included": False,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://server", transport=httpx.MockTransport(_handle)
+    ) as client:
+        await reader(session_id="conv_1", server_client=client)
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/sessions/conv_1"
+    assert dict(requests[0].url.params) == {
+        "include_items": "false",
+        "include_liveness": "false",
+        "include_usage": "false",
+    }
+    assert requests[0].extensions["timeout"]["read"] == 10.0
 
 
 @pytest.mark.asyncio
@@ -224,6 +297,10 @@ async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) ->
     cfg = await _codex_native_launch_config(session_id="conv_1", server_client=client)
     assert cfg.terminal_launch_args == ["--config", "x=y"]
     assert client.calls == 2, "Should retry once after the transient read timeout."
+    assert (
+        client.params
+        == [{"include_items": "false", "include_liveness": "false", "include_usage": "false"}] * 2
+    )
     assert retry_sleeps == [pytest.approx(0.5)], "One backoff sleep before the retry."
 
 

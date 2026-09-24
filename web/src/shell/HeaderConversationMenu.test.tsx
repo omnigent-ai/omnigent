@@ -5,6 +5,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
@@ -24,6 +26,9 @@ const mocks = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
   fork: vi.fn(),
+  exportTranscript: vi.fn(),
+  triggerDownload: vi.fn(),
+  toastError: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -50,6 +55,20 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
   const actual = await importOriginal<typeof UnseenConversationsModule>();
   return { ...actual, markConversationUnread: mocks.markUnread };
 });
+
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApiModule>();
+  return { ...actual, exportSessionTranscript: mocks.exportTranscript };
+});
+
+vi.mock("@/hooks/useFileContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseFileContentModule>();
+  return { ...actual, triggerBrowserDownload: mocks.triggerDownload };
+});
+
+vi.mock("sonner", () => ({
+  toast: { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() },
+}));
 
 const CONVERSATION: Conversation = {
   id: "conv-1",
@@ -128,6 +147,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -157,6 +177,33 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Mark as unread" }));
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
+  });
+
+  it("downloads the transcript as <session-id>.jsonl from Export", async () => {
+    const jsonl = '{"record_type":"session_meta","id":"conv-1"}\n';
+    mocks.exportTranscript.mockResolvedValueOnce(jsonl);
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.triggerDownload).toHaveBeenCalledTimes(1));
+    expect(mocks.exportTranscript).toHaveBeenCalledWith("conv-1");
+    const [blob, filename] = mocks.triggerDownload.mock.calls[0]! as [Blob, string];
+    expect(filename).toBe("conv-1.jsonl");
+    expect(await blob.text()).toBe(jsonl);
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an export failure as a toast and downloads nothing", async () => {
+    mocks.exportTranscript.mockRejectedValueOnce(new Error("boom"));
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Export failed"));
+    expect(mocks.triggerDownload).not.toHaveBeenCalled();
   });
 
   it("opens a full-history fork from the session menu", () => {
@@ -388,7 +435,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
     openMenu();
     const label = screen.getByText("Quarterly planning");
-    expect(label).toHaveAttribute("data-slot", "dropdown-menu-label");
+    expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();
@@ -430,6 +477,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -451,6 +499,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",

@@ -20,8 +20,10 @@ behaves as the visible share of the loaded document.
 
 from __future__ import annotations
 
+import time
 from itertools import pairwise
 from typing import Any
+from unittest.mock import patch
 
 from playwright.sync_api import Page, expect
 
@@ -63,7 +65,7 @@ _WATCH = """
   window.__writes = [];
   window.__thumbHeights = [];
   const log = (from, to) => window.__writes.push([
-    Math.round(performance.now()), Math.round(from), Math.round(to), Math.round(desc.get.call(el)),
+    performance.now(), Math.round(from), Math.round(to), Math.round(desc.get.call(el)),
   ]);
   Object.defineProperty(el, 'scrollTop', {
     configurable: true,
@@ -105,9 +107,15 @@ _TRACK_ROWS = """
     for (const r of el.querySelectorAll('[data-index]')) {
       rows[r.getAttribute('data-bubble-key')] = Math.round(r.getBoundingClientRect().top);
     }
-    window.__rowSamples.push([Math.round(performance.now()), Math.round(el.scrollTop), rows]);
+    window.__rowSamples.push([performance.now(), Math.round(el.scrollTop), rows]);
   };
-  const tick = () => { setTimeout(sample, 0); requestAnimationFrame(tick); };
+  const tick = () => {
+    // Observe after the application's layout observers, before this frame paints.
+    // A timer can instead sample a later React commit before its layout settles.
+    const observer = new ResizeObserver(() => { sample(); observer.disconnect(); });
+    observer.observe(el);
+    requestAnimationFrame(tick);
+  };
   requestAnimationFrame(tick);
 }
 """
@@ -180,9 +188,9 @@ def _seed_turns(session_id: str) -> None:
 
 def _row_moves(
     samples: list[list[Any]],
-    writers: list[list[int | str]],
-    since: int,
-) -> list[tuple[int, int]]:
+    writers: list[list[float]],
+    since: float,
+) -> list[tuple[float, int]]:
     """On-screen moves of the mounted rows after *since* that the reader did not make.
 
     Per painted frame, the scroll delta minus the code's own writes is the
@@ -190,21 +198,18 @@ def _row_moves(
     The median leftover across rows present in both frames is content shifting
     under the reader.
     """
-    moves: list[tuple[int, int]] = []
+    moves: list[tuple[float, int]] = []
     for (t0, st0, rows0), (t1, st1, rows1) in pairwise(samples):
         if t1 < since:
             continue
         common = [key for key in rows0 if key in rows1]
         if not common:
             continue
-        programmatic = sum(int(w[3]) - int(w[1]) for w in writers if t0 < int(w[0]) <= t1)
+        programmatic = sum(int(w[3]) - int(w[1]) for w in writers if t0 < w[0] <= t1)
         reader = (st1 - st0) - programmatic
         leftovers = sorted((rows1[key] - rows0[key]) + reader for key in common)
         unexplained = leftovers[len(leftovers) // 2]
         if abs(unexplained) <= 4:
-            continue
-        if moves and moves[-1][1] == -unexplained and t1 - moves[-1][0] <= 20:
-            moves.pop()
             continue
         moves.append((t1, unexplained))
     return moves
@@ -235,7 +240,7 @@ def test_scrolling_back_through_history_never_moves_the_offset(
 
     page.evaluate(_WATCH)
     page.evaluate(_TRACK_ROWS)
-    t_start = page.evaluate("() => Math.round(performance.now())")
+    t_start = page.evaluate("() => performance.now()")
 
     # Wheel up in bursts, giving each fetch room to land mid-scroll — the
     # moment the old correction fired. The transcript is virtualized, so the
@@ -385,9 +390,7 @@ def _seed_tool_heavy_turns(session_id: str) -> None:
         MessageData,
         NewConversationItem,
     )
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        SqlAlchemyConversationStore,
-    )
+    from omnigent.stores.conversation_store import sqlalchemy_store
 
     items: list[NewConversationItem] = []
     for turn in range(_TOOL_TURNS + 1):
@@ -440,7 +443,11 @@ def _seed_tool_heavy_turns(session_id: str) -> None:
                 ),
             )
         )
-    SqlAlchemyConversationStore(str(_server_state["database_uri"])).append(session_id, items)
+    store = sqlalchemy_store.SqlAlchemyConversationStore(str(_server_state["database_uri"]))
+    # Seed settled history beyond the UI's 15s recent-activity window.
+    # Only this local append uses the old timestamp; browser timers run normally.
+    with patch.object(sqlalchemy_store, "now_epoch", return_value=int(time.time()) - 60):
+        store.append(session_id, items)
 
 
 def _wheel_gestures(page: Page, *, count: int, delta_y: int) -> None:
@@ -504,11 +511,7 @@ def test_paging_a_tool_heavy_transcript_holds_the_view_and_stops_with_the_reader
     page.set_viewport_size(_TALL_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_text(_NEWEST_TOOL_REPLY).first).to_be_visible(timeout=30_000)
-    # Tool folds whose last activity is under RECENT_ACTIVITY_WINDOW_S (15s) old
-    # mount expanded and collapse a few seconds later — a legitimate on-screen
-    # shrink this test must not mistake for a yank. The seed is seconds old, so
-    # let it age past that window before paging any of it in.
-    page.wait_for_timeout(15_000)
+    expect(page.get_by_test_id("turn-worked-fold").first).to_have_attribute("data-state", "closed")
     assert page.evaluate(_TAG_TRANSCRIPT_SCROLLER), "transcript scroller not found"
     page.evaluate(_TRACK_LANDMARK, _NEWEST_TOOL_REPLY)
     page.mouse.move(_TALL_VIEWPORT["width"] // 2, _TALL_VIEWPORT["height"] // 2)
@@ -667,12 +670,12 @@ def test_streaming_reply_keeps_a_bottom_pinned_view_at_the_bottom(
     # And followed the reply as it grew.
     growing = [s for s in samples if s[2] > height_before]
     assert growing, samples[:3]
-    # Each growth step lands a frame before stick-to-bottom's resize handler
-    # scrolls to it, so one frame away from the bottom is normal. Staying away
-    # is not: that is the view falling behind the reply.
+    # A resize may precede its scroll correction by one frame. Count only
+    # intervals bounded by two off-bottom samples; a delayed first sample
+    # does not establish how long the view has been behind.
     behind_ms = 0
     longest_behind_ms = 0
-    for (t0, _d0, _h0), (t1, d1, _h1) in pairwise(growing):
-        behind_ms = behind_ms + (t1 - t0) if d1 > 8 else 0
+    for (t0, d0, _h0), (t1, d1, _h1) in pairwise(growing):
+        behind_ms = behind_ms + (t1 - t0) if d0 > 8 and d1 > 8 else 0
         longest_behind_ms = max(longest_behind_ms, behind_ms)
     assert longest_behind_ms <= 100, (longest_behind_ms, [s for s in growing if s[1] > 8][:20])

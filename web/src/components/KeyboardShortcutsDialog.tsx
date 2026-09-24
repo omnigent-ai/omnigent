@@ -15,6 +15,8 @@ import {
   ALT_KEY,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
+  composerSteerAllShortcutKeys,
+  CTRL_KEY,
   ENTER_KEY,
   Kbd,
   MOD_KEY,
@@ -81,7 +83,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
-      { label: "Open model picker", keys: [MOD_KEY, SHIFT_KEY, "M"] },
+      { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],
@@ -136,6 +138,10 @@ function shortcutGroupsFor(
         items: [
           { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
           {
+            label: "Send now, with all queued messages",
+            keys: composerSteerAllShortcutKeys(submitWithModEnter),
+          },
+          {
             label: "New line in message",
             keys: composerNewLineShortcutKeys(submitWithModEnter),
           },
@@ -151,11 +157,15 @@ function shortcutGroupsFor(
 }
 
 /**
- * The shortcut reference, grouped, as plain inline content (no dialog
- * chrome). Shared by the {@link KeyboardShortcutsDialog} overlay and the
- * Settings page, which embeds it directly instead of behind a trigger.
+ * The shortcut reference shared by the dialog and Settings page. The dialog
+ * keeps the compact inline list; Settings uses section headings with bordered
+ * list cards to match the rest of its content.
  */
-export function KeyboardShortcutsList() {
+export function KeyboardShortcutsList({
+  variant = "compact",
+}: {
+  variant?: "compact" | "settings";
+}) {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -165,21 +175,32 @@ export function KeyboardShortcutsList() {
     readSubmitWithModEnter(),
     preventsKeyboardSubmit,
   );
+  const settings = variant === "settings";
   return (
-    <>
+    <div className={settings ? "flex flex-col gap-6" : undefined}>
       {groups.map((group) => (
-        <section key={group.title} className="mb-4 last:mb-0">
-          <h3 className="mb-1 text-sm font-medium text-muted-foreground">
+        <section key={group.title} className={settings ? "" : "mb-4 last:mb-0"}>
+          <h3
+            className={
+              settings
+                ? "mb-3 text-ui font-medium text-foreground"
+                : "mb-1 text-sm font-medium text-muted-foreground"
+            }
+          >
             {group.title}
             {group.note ? (
               <span className="ml-1.5 font-normal text-muted-foreground/70">· {group.note}</span>
             ) : null}
           </h3>
-          <ul>
+          <ul className={settings ? "rounded-xl border border-border bg-card px-4" : undefined}>
             {group.items.map((item) => (
               <li
                 key={item.label}
-                className="flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
+                className={
+                  settings
+                    ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
+                    : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
+                }
               >
                 <span className="text-ui text-foreground">{item.label}</span>
                 <span className="flex shrink-0 items-center gap-1">
@@ -192,7 +213,7 @@ export function KeyboardShortcutsList() {
           </ul>
         </section>
       ))}
-    </>
+    </div>
   );
 }
 
