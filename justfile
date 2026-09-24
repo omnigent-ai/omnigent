@@ -115,6 +115,49 @@ electron-dev: _ensure-web _ensure-electron
 electron-build: _ensure-web _ensure-electron
     pnpm --filter ./web/electron run build
 
+# Build (if needed) and launch the packaged app (reads MDM managed prefs).
+# Flags: --rebuild (force a fresh build even if one exists),
+#        --v2-flow (force the new server-selector wizard on),
+#        --reset-state (first uninstall the CLI + wipe app data for a fresh
+#                       user; destructive, asks for confirmation).
+[group('electron')]
+electron-run *flags: _ensure-web _ensure-electron
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "$(uname)" = "Darwin" ] || { echo "electron-run is macOS-only (managed-prefs testing); build with 'just electron-build' and open the app for your OS."; exit 1; }
+    rebuild=0; v2=0; reset_state=0
+    for f in {{flags}}; do
+        case "$f" in
+            --rebuild) rebuild=1 ;;
+            --v2-flow) v2=1 ;;
+            --reset-state) reset_state=1 ;;
+            *) echo "unknown flag: $f (supported: --rebuild, --v2-flow, --reset-state)"; exit 2 ;;
+        esac
+    done
+    app="$(ls -d web/electron/dist/mac*/Omnigent.app 2>/dev/null | head -1 || true)"
+    if [ "$rebuild" = 1 ] || [ -z "$app" ]; then
+        echo "Building the packaged app (this takes a few minutes)…"
+        pnpm --filter ./web/electron run build
+        app="$(ls -d web/electron/dist/mac*/Omnigent.app 2>/dev/null | head -1)"
+    fi
+    echo "Quitting any running Omnigent…"
+    osascript -e 'quit app "Omnigent"' 2>/dev/null || true
+    pkill -x Omnigent 2>/dev/null || true
+    sleep 1
+    if [ "$reset_state" = 1 ]; then
+        echo "--reset-state will UNINSTALL the omnigent CLI and remove the desktop"
+        echo "app's data (session cookies, recent servers) for a fresh-user test."
+        read -r -p 'Type "yes" to proceed: ' reply
+        [ "$reply" = "yes" ] || { echo "Aborted."; exit 1; }
+        sh scripts/uninstall_oss.sh cli desktop-data --yes
+    fi
+    echo "Launching $app${v2:+ (v2 flow forced)}"
+    if [ "$v2" = 1 ]; then
+        open -n "$app" --env OMNIGENT_SERVER_SELECTOR_V2=1
+    else
+        open -n "$app"
+    fi
+
 # --- Lint ---
 
 [group('lint')]
