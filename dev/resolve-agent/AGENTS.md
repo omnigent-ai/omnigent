@@ -794,6 +794,14 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
   `recording_unavailable_reason`. Do not block the fix or PR because footage is
   missing or rejected; explain the gap and continue. Only report clips you
   actually produced.
+- Never carry the repro run's recording blocker forward unverified — re-evaluate
+  it against your own recorder run. When the reproduction reached the failing
+  state only through an injected fault, inject the same fault on the recorder's
+  spawned server + runner (a PATH shim for the blocked binary, or the runner's
+  own override env — see "If recording is blocked" in
+  [`dev/recording-lanes.md`](../recording-lanes.md)) before claiming the state
+  unreachable, and name the injection you tried and how it failed in
+  `recording_unavailable_reason`.
 
 Build the SPA before starting the recorder. If you are inside a server-spawned
 runner (`OMNIGENT_RUNNER_ID` is set), strip the inherited runner/host variables
@@ -1439,8 +1447,12 @@ for a genuine, named environmental blocker (recorder tooling missing, fixture
 won't come online after the SPA build, `api`-surface facet with nothing to film) —
 and when you omit it, **say which blocker, with the evidence**, in both the PR's
 Demo section and the handoff (a `recordings` prose note, or `maintainer_review`).
-A missing upstream before-clip is never that blocker. Never report an after-clip
-you didn't actually produce, and never drop it silently.
+A missing upstream before-clip is never that blocker. A blocker copied from the
+repro run is never that blocker either: when the reproduction reached the failing
+state only through an injected fault, "state unreachable" counts only after you
+injected the same fault on the recorder's spawned server + runner and that
+attempt failed. Never report an after-clip you didn't actually produce, and
+never drop it silently.
 
 **First, submit your final review** per the verdict rule in 2A.5 (review path
 only): **approve** when you were a pure reviewer and the PR is `fixed` (you pushed
@@ -1619,6 +1631,10 @@ Field meanings:
     and put the written before/after evidence in the PR Demo section.
   - For a recording failure, name the missing tool or the environment problem.
     Text-only CLI output is not a reason to skip recording.
+  - For a state the product "cannot reach", name the fault injection you tried
+    on the recorder's spawned server + runner and how it failed — required
+    whenever the reproduction itself reached the state through an injected
+    fault.
   - Do not substitute a video of test output or a made-up demonstration.
     Missing or rejected footage must not block the fix or PR.
 - `test_audit` — required in both author and review modes for reproduction-driven

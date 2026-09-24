@@ -550,6 +550,14 @@ Follow these rules for each clip:
   the journey, set `recordings: []` and name the specific blocker in
   `recording_unavailable_reason`. Do not block the verdict because footage is
   missing or rejected; explain the gap and continue.
+- If your reproduction reached the failing state only through an injected fault
+  (a fake process manager, a stalled or failing subprocess, a patched callable),
+  "the product cannot reach the state" is not a blocker until you have injected
+  the same fault on the recorder's spawned server + runner — a PATH shim for the
+  blocked binary, or the runner's own override env; see "If recording is
+  blocked" in the lanes guide — and that attempt failed. Then
+  `recording_unavailable_reason` must name the injection you tried and how it
+  failed.
 
 ## Output — the reproduction artifacts
 

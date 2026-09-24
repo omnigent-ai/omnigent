@@ -49,6 +49,19 @@ Recording is **best-effort**:
   to show, set `recordings: []` for that facet. Name the specific blocker in
   `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
   that cannot start.
+- **An injected fault is not an unreachable state.** When the failing state is
+  reached only through an injected fault — a fake process manager, a stalled or
+  failing subprocess, a patched callable — claim "the product cannot reach the
+  state" only after you have injected the same fault on the recorder's own
+  spawned server + runner and watched that attempt fail. The runner resolves
+  helper binaries from PATH (`bwrap` in `omnigent/inner/bwrap_sandbox.py`), so a
+  PATH shim for the blocked binary, or the runner's own override env, puts the
+  live stack into the same stall an in-process test injects. Footage filmed
+  under such an injection is valid product footage — the sanctioned lane for
+  `linux_bwrap` launch stalls — provided the injected fault is the one the
+  reproduction used and the clip's caption names it. When the injection itself
+  failed, `recording_unavailable_reason` must name the injection you tried and
+  how it failed.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
