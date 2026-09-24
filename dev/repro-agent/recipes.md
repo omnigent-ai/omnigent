@@ -88,7 +88,7 @@ actual routing/configuration conflicts in the supported sandbox.
 | --- | --- | --- |
 | Claude-native chat/terminal | `native_claude_mock_session`; `tests/e2e_ui/messages/test_native_claude_render_parity.py` | Real Claude CLI; drive the reported composer or terminal action. A synthetic hook is not native tool execution. |
 | Codex-native chat/terminal | `native_codex_mock_session`; `tests/e2e_ui/messages/test_native_codex_render_parity.py` | Real Codex CLI; native slash commands must be typed into the terminal. An SDK call does not exercise that path. |
-| Pi-native terminal | `omnigent/harnesses/pi_native/main.py`; shared Terminal-view helpers in `tests/e2e_ui/messages/test_native_claude_render_parity.py` | Real Pi CLI; use the reported entry point and actual session terminal. |
+| Pi-native terminal | `omnigent/harnesses/pi_native/main.py` for launch/resume; browser input helpers below | Real Pi CLI; the Claude fixture and its local pane reader do not configure or capture Pi. |
 | OpenAI Agents web journey | `custom_agent_session`; `tests/e2e_ui/messages/test_message_render_parity.py` | Real web composer and executor; a direct Python helper bypasses the user journey. |
 
 Adapt the relevant driver to the ticket; these existing tests are references,
@@ -105,14 +105,42 @@ Independent execution collection and claim verification remain separate work.
 
 ## Drive the reported native terminal
 
-Use the product's terminal resources to find the actual session terminal, then
-follow the existing driver for that harness and the reported entry point. A
-runner's local socket may be inaccessible from the agent's shell; that alone
-does not establish that the product's terminal connection is unavailable.
+1. **Keep the session ID from creation.** Existing native fixtures return
+   `(base_url, session_id)`. If creation itself is the reported action, drive
+   it in the UI and observe the unmodified `POST /v1/sessions` response's `id`;
+   reuse the response listener and `_wait_for_create` pattern in
+   `tests/e2e_ui/start_session/test_cancel_initial_message_live.py`. A `temp:`
+   browser URL is not the assigned ID. If listing sessions, `GET /v1/sessions`
+   returns a paginated object with rows in `data`, not a top-level list.
+2. **Reuse browser input helpers.** In
+   `tests/e2e_ui/messages/test_native_claude_render_parity.py`,
+   `_open_terminal_view`, `_wait_terminal_connected`, and `_focus_tui` work
+   through the shared Terminal view. After opening the actual session page:
 
-Send the reported keys through the real terminal connection and capture its
-visible response. Chat-message APIs and generated configuration files do not
-prove terminal input occurred. Keep relevant terminal traffic unstubbed. If the
-reported entry point cannot be driven, preserve the diagnostic, mark the action
-unverified, and register a plan revision before trying a different entry point.
-The ticket and accepted plan determine the commands and outcomes to observe.
+   ```python
+   _open_terminal_view(page)
+   _wait_terminal_connected(page)
+   _focus_tui(page)
+   page.keyboard.type(reported_text, delay=15)
+   # Send further keys only when the reported action calls for them.
+   ```
+
+   `_type_into_tui` also presses Enter; use it only for a submitted command or
+   prompt, not an interaction that needs to remain open while typing.
+3. **Capture the terminal surface.** Keep the Terminal view in the Playwright
+   recording and save a screenshot at the reported observation point. xterm
+   renders to canvas: `.xterm-rows` / `.xterm.inner_text()` are not reliable
+   terminal readers. The same file's `_pane_text` is **Claude-specific** and
+   needs its runner's local filesystem/socket; do not copy it for another
+   harness. For remote text capture, discover the target session's terminal in
+   `GET /v1/sessions/{id}/resources` (`data`, type `terminal`) and use the existing
+   resource attach protocol in `omnigent/server/routes/terminal_attach.py`
+   (`read_only=true` for observation). Its binary output contains ANSI terminal
+   updates, not plain DOM text. A missing local socket does not imply the
+   product terminal is unavailable.
+
+Keep terminal traffic unstubbed and inspect the captured response. Configuration
+files and chat-message APIs do not prove terminal interaction. If the reported
+entry point cannot be driven, retain the diagnostic and mark it unverified;
+register a plan revision before trying a different entry point. Capture before
+fixture cleanup and follow [recording-lanes](../recording-lanes.md).
