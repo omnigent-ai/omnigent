@@ -28,6 +28,15 @@ so the existing bundle byte scan can inspect it. Screenshots/videos can still co
 visible private data; neither redaction nor the byte scan inspects image pixels.
 An existing trace owner, an abruptly killed browser, or a driver that does not close
 its contexts can leave browser artifacts unavailable; collection errors remain explicit.
+If trace redaction fails, the raw trace is deliberately removed from this automatically
+uploaded directory; renaming it here would still upload it. The collector records the
+failure without advertising a saved trace. Other observations remain available.
+
+Collection errors are best-effort diagnostics: they do not replace command exit codes,
+test outcomes, or mock responses. If output writers have not stopped, the attempt marks
+its artifact inventory incomplete and omits hashes. Provider journaling runs outside the
+model-state lock on a worker thread. These records can add I/O latency; they are not a
+zero-overhead measurement of the original journey.
 
 ## Runtime
 

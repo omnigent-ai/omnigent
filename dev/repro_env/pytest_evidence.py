@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import tokenize
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -11,7 +12,7 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
-from .execution import Journal, clean, safe_url, sanitize_trace
+from .execution import Journal, digest_file, safe_url, sanitize_trace
 
 
 class Evidence:
@@ -28,11 +29,16 @@ class Evidence:
         self.journal.emit(kind, test_id=self.node, **data)
 
     def capture(self, operation, callback):
-        try:
-            return callback()
-        except Exception as exc:  # noqa: BLE001 — collection errors must not replace test outcomes.
-            self.emit("collection_error", operation=operation, error_type=type(exc).__name__)
-            return None
+        return self.journal.capture(operation, callback, test_id=self.node)
+
+    def artifact(self, operation, path, callback, **data):
+        def save():
+            callback()
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            self.emit("artifact", path=path.name, **data)
+
+        self.capture(operation, save)
 
     def session(self, url, body=None):
         parts = urlsplit(url)
@@ -40,7 +46,9 @@ class Evidence:
         if parts.hostname not in {"127.0.0.1", "localhost", "::1"}:
             return
         origin = f"{parts.scheme}://{parts.netloc}"
-        match = re.search(r"/(?:v1/sessions|c)/([^/]+)", parts.path)
+        match = re.match(r"^/v1/sessions/([^/]+)(?:/|$)", parts.path)
+        if match is None:
+            match = re.fullmatch(r"/c/([^/]+)/?", parts.path)
         sid = (
             match[1]
             if match
@@ -162,7 +170,9 @@ class Evidence:
                 state["tracing"] = True
 
             self.capture("trace_start", start_trace)
-            context.on("page", lambda page: self.page(page, state))
+            context.on(
+                "page", lambda page: self.capture("browser_page", lambda: self.page(page, state))
+            )
             context.on(
                 "response",
                 lambda response: self.capture(
@@ -183,15 +193,12 @@ class Evidence:
                 for page in state["pages"]:
                     if not page.is_closed():
                         path = self.directory / f"screen-{uuid.uuid4().hex}.png"
-                        self.capture(
+                        self.artifact(
                             "screenshot",
+                            path,
                             lambda page=page, path=path: page.screenshot(path=str(path)),
-                        )
-                        self.emit(
-                            "artifact",
                             context_id=state["id"],
                             created_in_test=state["created_in_test"],
-                            path=path.name,
                             kind_of_artifact="screenshot",
                             url=safe_url(page.url),
                         )
@@ -200,14 +207,14 @@ class Evidence:
 
                     def save_trace():
                         context.tracing.stop(path=str(path))
-                        sanitize_trace(path)
+                        sanitize_trace(path, self.journal.secrets)
 
-                    self.capture("trace_stop", save_trace)
-                    self.emit(
-                        "artifact",
+                    self.artifact(
+                        "trace_stop",
+                        path,
+                        save_trace,
                         context_id=state["id"],
                         created_in_test=state["created_in_test"],
-                        path=path.name,
                         kind_of_artifact="playwright_trace",
                     )
             result = close(context, *args, **kwargs)
@@ -215,14 +222,12 @@ class Evidence:
                 for page in state["pages"]:
                     if page.video:
                         path = self.directory / f"video-{uuid.uuid4().hex}.webm"
-                        self.capture(
-                            "video", lambda page=page, path=path: page.video.save_as(str(path))
-                        )
-                        self.emit(
-                            "artifact",
+                        self.artifact(
+                            "video",
+                            path,
+                            lambda page=page, path=path: page.video.save_as(str(path)),
                             context_id=state["id"],
                             created_in_test=state["created_in_test"],
-                            path=path.name,
                             kind_of_artifact="video",
                         )
             return result
@@ -233,15 +238,28 @@ class Evidence:
                 lambda: self.contexts.get(route.request.frame.page.context, {}).get("id"),
             )
             result = fulfill(route, *args, **kwargs)
-            self.emit(
-                "browser_fulfill",
-                context_id=context_id,
-                url=safe_url(route.request.url),
-                boundary="browser response",
-                body=kwargs.get("body"),
-                json=kwargs.get("json"),
-                status=kwargs.get("status"),
-            )
+
+            def record_fulfillment():
+                source = kwargs.get("path")
+                response = kwargs.get("response")
+                self.emit(
+                    "browser_fulfill",
+                    context_id=context_id,
+                    url=safe_url(route.request.url),
+                    boundary="browser response",
+                    body=kwargs.get("body"),
+                    json=kwargs.get("json"),
+                    status=kwargs.get("status"),
+                    path=str(source) if source is not None else None,
+                    source_sha256=self.capture("fulfill_source", lambda: digest_file(Path(source)))
+                    if source is not None
+                    else None,
+                    response_source={"url": safe_url(response.url), "status": response.status}
+                    if response is not None
+                    else None,
+                )
+
+            self.capture("browser_fulfill", record_fulfillment)
             return result
 
         self.patch.setattr(Browser, "new_context", new_context)
@@ -280,7 +298,7 @@ class Evidence:
         page.on("websocket", websocket)
         page.on(
             "framenavigated",
-            lambda frame: self.navigation(frame, state),
+            lambda frame: self.capture("navigation", lambda: self.navigation(frame, state)),
         )
 
     def navigation(self, frame, state):
@@ -326,9 +344,17 @@ def pytest_runtest_protocol(item):
         collector.emit("test_start", nodeid=item.nodeid)
         source = Path(str(item.path))
         target = collector.directory / f"source-{uuid.uuid4().hex}.py"
-        target.write_text(clean(source.read_text()))
-        collector.emit(
-            "artifact", path=target.name, source=str(source), kind_of_artifact="test_source"
+
+        def copy_source():
+            with tokenize.open(source) as stream:
+                target.write_text(collector.journal.clean(stream.read()))
+
+        collector.artifact(
+            "test_source",
+            target,
+            copy_source,
+            source=str(source),
+            kind_of_artifact="test_source",
         )
     yield
     if collector:

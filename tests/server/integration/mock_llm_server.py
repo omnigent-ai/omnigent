@@ -60,6 +60,7 @@ open-time HTTP status, cannot express).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -80,20 +81,35 @@ _evidence_journals = {}
 def _record_evidence(kind: str, body=None) -> None:
     attempt = os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR")
     runtime = os.environ.get("OMNIGENT_REPRO_EVIDENCE_ROOT")
-    if not attempt and not (runtime and (Path(runtime) / "execution-context.json").is_file()):
-        return
-    from dev.repro_env.execution import Journal
+    try:
+        if not attempt and not (runtime and (Path(runtime) / "execution-context.json").is_file()):
+            return
+        from dev.repro_env.execution import Journal
 
-    directory = Path(attempt) if attempt else Path(runtime) / "execution/service"
-    if directory not in _evidence_journals:
-        _evidence_journals[directory] = Journal(directory)
-    _evidence_journals[directory].emit(
-        "provider_mock",
-        action=kind,
-        body=body,
-        boundary="model provider",
-        correlation="timestamp and request content",
-    )
+        directory = Path(attempt) if attempt else Path(runtime) / "execution/service"
+        if directory not in _evidence_journals:
+            _evidence_journals[directory] = Journal(directory)
+        _evidence_journals[directory].emit(
+            "provider_mock",
+            action=kind,
+            body=body,
+            boundary="model provider",
+            correlation="timestamp and request content",
+        )
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
+async def _record_evidence_async(kind: str, body=None) -> None:
+    if os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR") or os.environ.get(
+        "OMNIGENT_REPRO_EVIDENCE_ROOT"
+    ):
+        try:
+            await asyncio.to_thread(_record_evidence, kind, body)
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
 
 
 # Default queue key when none is specified or no model matches.
@@ -960,7 +976,7 @@ class MockState:
         model = parsed.get("model") if isinstance(parsed, dict) else None
         return self.resolve_queue(model)
 
-    def reset(self) -> None:
+    def reset(self, *, record_evidence: bool = True) -> None:
         """Clear all state (queues, captured requests, gates).
 
         Queues that have a fallback response set (via ``POST /mock/set_fallback``)
@@ -983,7 +999,8 @@ class MockState:
                 queue.reset()  # clear responses/index, keep fallback
             else:
                 del self.queues[key]
-        _record_evidence("reset")
+        if record_evidence:
+            _record_evidence("reset")
         self.captured_requests.clear()
         self.request_count = 0
         self.served_models = []
@@ -1013,10 +1030,11 @@ async def create_response(
 
     async with _state._lock:
         _state.request_count += 1
-        _record_evidence("request", parsed)
         _state.captured_requests.append(parsed)
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    await _record_evidence_async("request", parsed)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1090,10 +1108,11 @@ async def create_message(
 
     async with _state._lock:
         _state.request_count += 1
-        _record_evidence("request", parsed)
         _state.captured_requests.append(parsed)
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    await _record_evidence_async("request", parsed)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1208,11 +1227,12 @@ async def create_chat_completion(
 
     async with _state._lock:
         _state.request_count += 1
-        _record_evidence("request", parsed)
         _state.captured_requests.append(parsed)
         model = parsed.get("model") if isinstance(parsed, dict) else None
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    await _record_evidence_async("request", parsed)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1433,7 +1453,8 @@ async def reset() -> dict[str, bool]:
     Fallbacks set via ``POST /mock/set_fallback`` are preserved.
     """
     async with _state._lock:
-        _state.reset()
+        _state.reset(record_evidence=False)
+    await _record_evidence_async("reset")
     return {"reset": True}
 
 

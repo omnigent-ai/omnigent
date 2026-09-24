@@ -22,31 +22,38 @@ from .runtime import write_json
 
 MAX_EVENT = 256 * 1024
 MAX_OUTPUT = 8 * 1024 * 1024
+OUTPUT_JOIN_TIMEOUT = 5
+SECRET_NAME = re.compile(r"authorization|cookie|password|secret|api.?key|token", re.I)
 
 
-def clean(value):
+def secret_values(env):
+    return tuple(
+        sorted(
+            {value for name, value in env.items() if len(value) >= 8 and SECRET_NAME.search(name)},
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def clean(value, secrets=None):
     """Omit credentials from structured observations; bundle scanning still applies."""
+    if secrets is None:
+        secrets = secret_values(os.environ)
     if isinstance(value, dict):
-        if re.search(
-            r"authorization|cookie|password|secret|api.?key|token",
-            str(value.get("name", "")),
-            re.I,
-        ):
-            value = {**value, "value": "[redacted]"} if "value" in value else value
+        if SECRET_NAME.search(str(value.get("name", ""))) and "value" in value:
+            value = {**value, "value": "[redacted]"}
         return {
-            k: "[redacted]"
-            if re.search(r"authorization|cookie|password|secret|api.?key|token", k, re.I)
-            else clean(v)
+            k: "[redacted]" if SECRET_NAME.search(k) else clean(v, secrets)
             for k, v in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [clean(v) for v in value]
+        return [clean(v, secrets) for v in value]
     if isinstance(value, bytes):
         value = value.decode(errors="replace")
     if isinstance(value, str):
-        for name, secret in os.environ.items():
-            if len(secret) >= 8 and re.search(r"TOKEN|SECRET|PASSWORD|API_KEY", name):
-                value = value.replace(secret, "[redacted]")
+        for secret in secrets:
+            value = value.replace(secret, "[redacted]")
         value = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[redacted]", value)
     return value
 
@@ -68,29 +75,60 @@ def digest_file(path: Path) -> str:
 
 
 class Journal:
+    """Best-effort sink: collection failures cannot change the observed result."""
+
     def __init__(self, directory: Path):
         self.directory = directory
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = directory / f"events-{os.getpid()}-{uuid.uuid4().hex}.jsonl"
         self.lock = threading.Lock()
+        self.errors = []
+        self.secrets = secret_values(os.environ)
+        self.capture(
+            "create_directory", lambda: directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        )
+
+    def clean(self, value):
+        return clean(value, self.secrets)
+
+    def failure(self, operation, exc):
+        error = {"operation": operation, "error_type": type(exc).__name__}
+        self.errors.append(error)
+        with contextlib.suppress(Exception):
+            print(
+                f"reproduction evidence {operation} failed: {type(exc).__name__}", file=sys.stderr
+            )
+        return error
+
+    def capture(self, operation, callback, **context):
+        try:
+            return callback()
+        except Exception as exc:  # noqa: BLE001 — evidence failures cannot replace outcomes.
+            self.emit("collection_error", **self.failure(operation, exc), **context)
+            return None
 
     def emit(self, kind: str, **data) -> None:
-        event = {"time_ns": time.time_ns(), "kind": kind, **clean(data)}
-        encoded = json.dumps(event, ensure_ascii=True)
-        if len(encoded) > MAX_EVENT:
-            event = {
-                "time_ns": event["time_ns"],
-                "kind": kind,
-                "truncated": True,
-                "original_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
-                "preview": encoded[:MAX_EVENT],
-            }
-        with self.lock, self.path.open("a") as stream:
-            stream.write(json.dumps(event) + "\n")
+        try:
+            event = {"time_ns": time.time_ns(), "kind": kind, **self.clean(data)}
+            encoded = json.dumps(event, ensure_ascii=True)
+            if len(encoded) + 1 > MAX_EVENT:
+                event = {
+                    "time_ns": event["time_ns"],
+                    "kind": kind[:256],
+                    "truncated": True,
+                    "original_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+                    "preview": encoded[:4096],
+                }
+                encoded = json.dumps(event, ensure_ascii=True)
+            with self.lock, self.path.open("a") as stream:
+                stream.write(encoded + "\n")
+        except Exception as exc:  # noqa: BLE001 — including disk exhaustion during error reporting.
+            self.failure("journal_write", exc)
 
 
-def sanitize_trace(path: Path) -> None:
+def sanitize_trace(path: Path, secrets=None) -> None:
     """Redact text resources and keep ZIP members visible to the bundle byte scan."""
+    if secrets is None:
+        secrets = secret_values(os.environ)
     temporary = path.with_suffix(".tmp")
     try:
         with (
@@ -107,13 +145,14 @@ def sanitize_trace(path: Path) -> None:
                     lines = []
                     for line in content.splitlines(keepends=True):
                         try:
-                            lines.append(json.dumps(clean(json.loads(line))) + "\n")
+                            lines.append(json.dumps(clean(json.loads(line), secrets)) + "\n")
                         except ValueError:
-                            lines.append(clean(line))
+                            lines.append(clean(line, secrets))
                     data = "".join(lines).encode()
                 target.writestr(member.filename, data)
         temporary.replace(path)
     except BaseException:
+        # Never retain raw credential-bearing traces in the automatically uploaded tree.
         path.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
         raise
@@ -136,22 +175,25 @@ def inventory(directory: Path) -> list[dict]:
     return sorted(result, key=lambda row: row["path"])
 
 
-def run(output: Path, command: list[str], env: dict[str, str], *, prepare=None) -> int:
-    """Record every opted-in command, including failed and interrupted attempts."""
-    context = json.loads((output / "execution-context.json").read_text())
+def run(
+    output: Path, command: list[str], env: dict[str, str] | None = None, *, prepare=None
+) -> int:
+    """Keep the command's outcome even if optional evidence collection fails."""
+    if env is not None and prepare is not None:
+        raise ValueError("Supply either env or prepare, not both")
     attempt_id = uuid.uuid4().hex
     directory = output / "execution" / attempt_id
     journal = Journal(directory)
+    if env is not None:
+        journal.secrets = secret_values({**os.environ, **env})
     root = Path.cwd()
     record = {
         "schema_version": 1,
         "attempt_id": attempt_id,
-        "context": context,
         "started_at_ns": time.time_ns(),
         "status": "incomplete",
-        "command": clean(command),
+        "command": journal.clean(command),
         "cwd": str(root),
-        "checkout": launch_observations(root),
         "python": sys.version,
         "producer": "repro_env_exec",
         "limitations": [
@@ -160,68 +202,130 @@ def run(output: Path, command: list[str], env: dict[str, str], *, prepare=None) 
             "No observed event does not prove an action was absent.",
         ],
     }
-    write_json(directory / "attempt.json", record)
-    plan = root / ".omnigent/reproduction-plan.json"
-    record["working_plan_sha256"] = digest_file(plan) if plan.is_file() else None
-    launch = output / "launch-observations.json"
-    record["runtime_launch"] = json.loads(launch.read_text()) if launch.is_file() else None
-    changed = subprocess.run(
-        ["git", "ls-files", "-z", "--modified", "--others", "--exclude-standard"],
-        capture_output=True,
-        cwd=root,
-    )
-    record["changed_files"] = [
-        {"path": name, "sha256": digest_file(root / name)}
-        for name in changed.stdout.decode(errors="replace").split("\0")
-        if name and (root / name).is_file() and not (root / name).is_symlink()
-    ]
-    diff = subprocess.run(["git", "diff", "--binary", "HEAD"], capture_output=True, cwd=root)
-    record["tracked_diff_sha256"] = (
-        hashlib.sha256(diff.stdout).hexdigest() if not diff.returncode else None
-    )
-    record["command_files"] = [
-        {"path": arg, "sha256": digest_file(root / arg)}
-        for arg in command
-        if not arg.startswith("-") and (root / arg).is_file() and not (root / arg).is_symlink()
-    ]
-    write_json(directory / "attempt.json", record)
+
+    def save_record():
+        record["collection_errors"] = list(journal.errors)
+        journal.capture("attempt_write", lambda: write_json(directory / "attempt.json", record))
+
+    def fingerprint(path):
+        return journal.capture(
+            "file_fingerprint", lambda: {"path": str(path), "sha256": digest_file(root / path)}
+        )
+
+    def git(*args):
+        result = subprocess.run(["git", *args], capture_output=True, cwd=root, timeout=5)
+        if result.returncode:
+            raise RuntimeError("Git metadata unavailable")
+        return result.stdout
+
+    save_record()
+
+    def collect_metadata():
+        record["context"] = journal.capture(
+            "execution_context",
+            lambda: json.loads((output / "execution-context.json").read_text()),
+        )
+        record["checkout"] = journal.capture("checkout", lambda: launch_observations(root))
+        plan = root / ".omnigent/reproduction-plan.json"
+        record["working_plan_sha256"] = journal.capture(
+            "working_plan", lambda: digest_file(plan) if plan.is_file() else None
+        )
+        launch = output / "launch-observations.json"
+        record["runtime_launch"] = journal.capture(
+            "runtime_launch", lambda: json.loads(launch.read_text()) if launch.is_file() else None
+        )
+        changed = journal.capture(
+            "changed_files",
+            lambda: git("ls-files", "-z", "--modified", "--others", "--exclude-standard"),
+        )
+        record["changed_files"] = []
+        if changed is not None:
+            for name in changed.decode(errors="replace").split("\0"):
+                if name and not (root / name).is_symlink():
+                    row = fingerprint(name)
+                    if row is not None:
+                        record["changed_files"].append(row)
+        diff = journal.capture("tracked_diff", lambda: git("diff", "--binary", "HEAD"))
+        record["tracked_diff_sha256"] = (
+            hashlib.sha256(diff).hexdigest() if diff is not None else None
+        )
+        record["command_files"] = []
+        for arg in command:
+            if (
+                not arg.startswith("-")
+                and (root / arg).is_file()
+                and not (root / arg).is_symlink()
+            ):
+                row = fingerprint(arg)
+                if row is not None:
+                    record["command_files"].append(row)
+
+    journal.capture("metadata", collect_metadata)
+    save_record()
     stack = contextlib.ExitStack()
     process = None
-    interrupted = False
+    group_owned = False
+    pending_signals = []
     old_signals = {}
     threads = []
+    output_errors = []
 
     def forward(signum, _frame):
-        nonlocal interrupted
-        interrupted = True
-        journal.emit("signal", number=signum)
+        pending_signals.append(signum)
         if process is not None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signum)
+                if group_owned:
+                    os.killpg(process.pid, signum)
+                else:
+                    process.send_signal(signum)
 
     def copy(stream, destination, name):
+        saved = journal.capture("output_open", lambda: (directory / name).open("w"))
+        if saved is None:
+            output_errors.append(name)
         total = 0
-        with (directory / name).open("w") as saved:
+        try:
             for line in iter(lambda: stream.readline(65536), b""):
-                destination.write(line.decode(errors="replace"))
-                destination.flush()
-                text = clean(line.decode(errors="replace"))
-                if total < MAX_OUTPUT:
-                    saved.write(text[: MAX_OUTPUT - total])
-                    saved.flush()
+                text = journal.clean(line.decode(errors="replace"))
+                if destination is not None:
+                    try:
+                        destination.write(line.decode(errors="replace"))
+                        destination.flush()
+                    except Exception as exc:  # noqa: BLE001 — keep draining the child's pipes.
+                        journal.failure("console_output", exc)
+                        destination = None
+                if saved is not None and total < MAX_OUTPUT:
+                    try:
+                        saved.write(text[: MAX_OUTPUT - total])
+                        saved.flush()
+                    except Exception as exc:  # noqa: BLE001 — keep draining even if storage fails.
+                        journal.failure("saved_output", exc)
+                        output_errors.append(name)
+                        with contextlib.suppress(Exception):
+                            saved.close()
+                        saved = None
                 total += len(text)
+        except Exception as exc:  # noqa: BLE001 — expose partial output separately from child status.
+            output_errors.append(name)
+            journal.failure("output_read", exc)
+        finally:
+            if saved is not None:
+                journal.capture("output_close", saved.close)
+            journal.capture("pipe_close", stream.close)
         if total > MAX_OUTPUT:
             journal.emit("output_truncated", stream=name, original_characters=total)
 
     try:
         if prepare is not None:
             env = stack.enter_context(prepare())
+        elif env is None:
+            env = dict(os.environ)
+        journal.secrets = secret_values({**os.environ, **env})
         child_env = {**env, "OMNIGENT_REPRO_ATTEMPT_DIR": str(directory.resolve())}
         plugins = [p for p in child_env.get("PYTEST_PLUGINS", "").split(",") if p]
         if "dev.repro_env.pytest_evidence" not in plugins:
             plugins.append("dev.repro_env.pytest_evidence")
         child_env["PYTEST_PLUGINS"] = ",".join(plugins)
-        # Console-script pytest must resolve this checkout's collector too.
         child_env["PYTHONPATH"] = os.pathsep.join(
             filter(
                 None,
@@ -240,6 +344,9 @@ def run(output: Path, command: list[str], env: dict[str, str], *, prepare=None) 
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        group_owned = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
+        if pending_signals:
+            forward(pending_signals[-1], None)
         for stream, destination, name in (
             (process.stdout, sys.stdout, "stdout.txt"),
             (process.stderr, sys.stderr, "stderr.txt"),
@@ -247,26 +354,42 @@ def run(output: Path, command: list[str], env: dict[str, str], *, prepare=None) 
             thread = threading.Thread(target=copy, args=(stream, destination, name), daemon=True)
             thread.start()
             threads.append(thread)
+        if group_owned:
+            # Keep the leader unreaped until group cleanup: its PGID cannot be recycled.
+            os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            group_owned = False
         result = process.wait()
         record.update(
-            status="incomplete" if interrupted or result < 0 else "finished", exit_code=result
+            status="incomplete" if pending_signals or result < 0 else "finished", exit_code=result
         )
         return result
     except BaseException as exc:
         record["error_type"] = type(exc).__name__
-        record["error"] = clean(str(exc))
+        record["error"] = journal.clean(str(exc))
         raise
     finally:
         if process is not None:
-            # Descendants must not keep pipes or services alive after this command ends.
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
+            if group_owned:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                group_owned = False
             for thread in threads:
-                thread.join(timeout=5)
-            record["output_complete"] = all(not thread.is_alive() for thread in threads)
+                thread.join(timeout=OUTPUT_JOIN_TIMEOUT)
+            record["output_complete"] = not output_errors and all(
+                not thread.is_alive() for thread in threads
+            )
         for sig, handler in old_signals.items():
             signal.signal(sig, handler)
-        stack.close()
+        for sig in pending_signals:
+            journal.emit("signal", number=sig)
+        journal.capture("environment_close", stack.close)
         record["ended_at_ns"] = time.time_ns()
-        record["artifacts"] = inventory(directory)
-        write_json(directory / "attempt.json", record)
+        # Preserve the outcome before optional hashing, which can fail independently.
+        save_record()
+        stable = all(not thread.is_alive() for thread in threads)
+        artifacts = journal.capture("inventory", lambda: inventory(directory)) if stable else None
+        record["artifacts"] = artifacts or []
+        record["artifacts_complete"] = artifacts is not None
+        save_record()

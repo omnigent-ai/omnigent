@@ -52,6 +52,14 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
             page.get_by_label("Input").fill("actual input")
             page.route("**/v1/fake", lambda route: route.fulfill(json={"stand_in": True}))
             page.evaluate("fetch('/v1/fake').then(r => r.json())")
+            replacement = tmp_path / "replacement.json"
+            replacement.write_text('{"from_file": true}')
+            page.route("**/v1/from-file", lambda route: route.fulfill(path=str(replacement)))
+            assert page.evaluate("fetch('/v1/from-file').then(r => r.json())") == {
+                "from_file": True
+            }
+            page.route("**/v1/from-response", lambda route: route.fulfill(response=route.fetch()))
+            page.evaluate("fetch('/v1/from-response').then(r => r.json())")
             port = sockets.socket.getsockname()[1]
             result = page.evaluate(
                 """url => new Promise(resolve => {
@@ -70,6 +78,11 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
             e["kind"] == "browser_fulfill" and e["json"] == {"stand_in": True} for e in saved
         )
         assert any(e["kind"] == "browser_route_registered" for e in saved)
+        fulfilled = [e for e in saved if e["kind"] == "browser_fulfill"]
+        assert any(e["path"] == str(replacement) and e["source_sha256"] for e in fulfilled)
+        assert any(
+            e["response_source"] and e["response_source"]["status"] == 200 for e in fulfilled
+        )
         frames = [e for e in saved if e["kind"] == "websocket_frame"]
         assert {(e["direction"], e["payload"]) for e in frames} == {
             ("framesent", "native-input"),

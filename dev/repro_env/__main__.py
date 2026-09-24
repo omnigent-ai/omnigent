@@ -47,7 +47,7 @@ def execute(output: Path, command: list[str]) -> int:
     if (output / "execution-context.json").is_file():
         from .execution import run
 
-        return run(output, command, dict(os.environ), prepare=lambda: command_environment(output))
+        return run(output, command, prepare=lambda: command_environment(output))
     with command_environment(output) as env:
         return subprocess.call(command, env=env)
 
