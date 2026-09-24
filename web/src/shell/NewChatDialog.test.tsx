@@ -7322,6 +7322,30 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(tooltip).toHaveTextContent("Loading skills…");
   });
 
+  it("keeps Start disabled for a restored slash draft that never takes focus", async () => {
+    // The stashed draft rides back onto a remounted landing; with discovery
+    // still in flight its partial command token must keep Start blocked even
+    // though this mount never focused the textarea (no autofocus on touch).
+    const restoreViewport = forceMobileViewport();
+    try {
+      mockSkills({ skillsStatus: "loading" });
+      const first = renderLanding();
+      typeMessage("/rev");
+      first.unmount();
+
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("/rev");
+      expect(screen.getByTestId("new-chat-landing-input")).not.toHaveFocus();
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      expect(submit).toBeDisabled();
+      fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+      const tooltip = await screen.findByTestId("new-chat-landing-submit-error-tooltip");
+      expect(tooltip).toHaveTextContent("Loading skills…");
+    } finally {
+      restoreViewport();
+    }
+  });
+
   it("hides the cached host catalog when the host disconnects", () => {
     mockAgents([skilledAgent()]);
     mockSkills({ skills: [{ name: "host-only", description: "Host-only skill" }] });
