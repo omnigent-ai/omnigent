@@ -1001,8 +1001,10 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     Wrapper invocations (claude-native today) upload a fresh agent
     bundle per session, so ``agents.get_by_name`` returns no canonical
     record — agent-id filtering can't be used. List the caller's own
-    sessions, including native subagents, and filter by the wrapper label
-    client-side.
+    sessions and filter by the wrapper label client-side. Native children
+    are listed too, but only for callers that pass ``host_id``: a child's
+    resumable host is inherited from its ancestry, so without a host to
+    compare against the picker keeps its top-level-only listing.
 
     Renders workspace metadata so the user can see which cwd each
     session was launched from -- claude --resume requires cwd parity
@@ -1025,9 +1027,19 @@ async def pick_conversation_by_wrapper_label_from_sdk(
         diagnostics / migration workflows — it never routes through
         this picker).
     """
-    all_convos = await _list_sessions_with_retry(
-        client, limit=200, agent_id=None, order="desc", kind="any"
-    )
+    all_convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
+    if host_id is not None:
+        # Children get their own page so they never displace top-level rows, and
+        # only host-scoped callers see them: their host comes from their ancestry.
+        children = await _list_sessions_with_retry(
+            client, limit=200, agent_id=None, order="desc", kind="sub_agent"
+        )
+        listed = {c.id for c in all_convos}
+        all_convos = sorted(
+            [*all_convos, *(c for c in children if c.id not in listed)],
+            key=lambda c: getattr(c, "created_at", 0),
+            reverse=True,
+        )
     rows_by_id = {c.id: c for c in all_convos}
 
     def _resumable_here(c: SessionListItem) -> bool:

@@ -1076,7 +1076,7 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
         "agent_name": None,
         "order": "desc",
         "visibility": "mine",
-        "kind": "any",
+        "kind": None,
     }
     rendered = out.getvalue()
     assert "ad9fa6806e0d3c94166f9b4dafcc1069" in rendered
@@ -1448,13 +1448,13 @@ async def test_wrapper_picker_includes_owned_children_on_the_invoking_host(
         {
             "agent_id": "agent_native",
             "status": "running",
-            "created_at": 1700000000,
-            "updated_at": 1700000001,
+            "created_at": 1700000100 - index,
+            "updated_at": 1700000100 - index,
             "owner": "me@example.test",
             "labels": {"omnigent.wrapper": wrapper_value},
             **row,
         }
-        for row in rows
+        for index, row in enumerate(rows)
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1467,28 +1467,36 @@ async def test_wrapper_picker_includes_owned_children_on_the_invoking_host(
                     "data": [
                         row
                         for row in sessions
-                        if row["owner"] == "me@example.test"
-                        and (kind == "any" or row["kind"] == kind)
+                        if row["owner"] == "me@example.test" and row["kind"] == kind
                     ]
                 },
             )
         assert request.url.path.endswith("/items")
         return httpx.Response(200, json={"data": []})
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        client = SimpleNamespace(sessions=SessionsNamespace(http, "http://srv"))
-        out = io.StringIO()
-        selected = await pick_conversation_by_wrapper_label_from_sdk(
-            client,
-            wrapper_value=wrapper_value,
-            agent_name="native",
-            host_id="host_local",
-            out=out,
-            in_=io.StringIO("1\n"),
-        )
+    async def pick(host_id: str | None) -> tuple[str | None, str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = SimpleNamespace(sessions=SessionsNamespace(http, "http://srv"))
+            out = io.StringIO()
+            selected = await pick_conversation_by_wrapper_label_from_sdk(
+                client,
+                wrapper_value=wrapper_value,
+                agent_name="native",
+                host_id=host_id,
+                out=out,
+                in_=io.StringIO("1\n"),
+            )
+            return selected, out.getvalue()
 
+    # A caller without a host identity keeps the top-level-only listing.
+    selected, rendered = await pick(None)
+    assert selected == "conv_parent"
+    assert "remote native session" in rendered
+    assert "native child" not in rendered
+    assert "grandchild" not in rendered
+
+    selected, rendered = await pick("host_local")
     assert selected == "conv_child"
-    rendered = out.getvalue()
     assert "standalone native session" in rendered
     assert "local native grandchild" in rendered
     assert "remote native child" not in rendered
