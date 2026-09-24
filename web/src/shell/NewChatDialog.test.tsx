@@ -5858,6 +5858,73 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it.each([
+    {
+      id: "a_codex",
+      name: "codex-native-ui",
+      displayName: "Codex",
+      harness: "codex-native",
+      readiness: "needs-auth",
+      warning: "Codex needs Codex authentication on machine-1 — run codex login",
+    },
+    {
+      id: "a_cursor",
+      name: "cursor-native-ui",
+      displayName: "Cursor",
+      harness: "cursor-native",
+      readiness: "binary-missing",
+      warning: "Cursor isn't configured on machine-1 — run omni setup",
+    },
+    {
+      id: "a_pi",
+      name: "pi-native-ui",
+      displayName: "Pi",
+      harness: "pi-native",
+      readiness: "version-too-low",
+      warning: "Pi has an outdated CLI on machine-1 — run omni setup",
+    },
+  ])(
+    "renders the $readiness availability warning for $displayName",
+    async ({ id, name, displayName, harness, readiness, warning }) => {
+      mockAgents([
+        DEFAULT_LANDING_AGENTS[0],
+        {
+          id,
+          name,
+          display_name: displayName,
+          description: null,
+          harness,
+          skills: [],
+        },
+      ]);
+      renderLanding();
+      selectUnconfiguredAgent(id);
+      mockHosts([
+        {
+          ...host("online"),
+          configured_harnesses: {
+            "claude-native": true,
+            "codex-native": true,
+            [harness]: readiness,
+          },
+        } as Host,
+      ]);
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Harness readiness changed" },
+      });
+
+      const notice = screen.getByTestId("new-chat-landing-harness-warning");
+      expect(notice).toHaveTextContent(warning);
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      if (screen.queryByTestId(`new-chat-landing-agent-${id}`) == null) {
+        fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+      }
+      const row = screen.getByTestId(`new-chat-landing-agent-${id}`);
+      expect(row).toHaveAttribute("aria-disabled", "true");
+      expect(within(row).getByTestId(`new-chat-landing-agent-warning-${id}`)).toBeVisible();
+    },
+  );
+
   it("disables broken harness rows and explains the actionable failure", async () => {
     mockHosts([
       { ...host("online"), configured_harnesses: { "codex-native": "future-error" } } as Host,

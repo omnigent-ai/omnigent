@@ -4857,49 +4857,114 @@ describe("Composer config gear", () => {
     expect(screen.getByRole("menuitemcheckbox", { name: "Latest" })).toBeVisible();
   });
 
-  it.each(["claude", "codex", "cursor", "kiro", "pi", "devin"] as const)(
-    "selects the default-marked %s row as an explicit model",
-    async (modelPickerKind) => {
-      const options = [
-        { id: "primary", displayName: "Primary", isDefault: true },
-        { id: "alternate", displayName: "Alternate" },
-      ];
-      const setModel = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ setModel, codexModelOptions: options });
+  it.each([
+    "claude",
+    "codex",
+    "cursor",
+    "kiro",
+    "opencode",
+    "pi",
+    "devin",
+    "acp",
+    "configured",
+  ] as const)("selects alternate and reapplies the %s default row", async (modelPickerKind) => {
+    const options = [
+      { id: "primary", displayName: "Primary", isDefault: true },
+      { id: "alternate", displayName: "Alternate" },
+    ];
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel, codexModelOptions: options });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind,
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    // A catalog default alone is not evidence of the session's current model.
+    expect(screen.getByRole("menuitemcheckbox", { name: "Primary" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith("alternate", expect.anything()));
+    act(() => useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }));
+
+    await openSessionModels();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
+    const resetsToDefault =
+      modelPickerKind === "opencode" ||
+      modelPickerKind === "acp" ||
+      modelPickerKind === "configured";
+    await waitFor(() =>
+      expect(setModel).toHaveBeenLastCalledWith(resetsToDefault ? null : "primary", {
+        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+      }),
+    );
+    expect(setModel).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["claude", "sonnet[1m]", "Sonnet 5 (1M context)"],
+    ["codex", "gpt-5.5", "Codex Pretty 5.5"],
+    ["cursor", "composer-2.5", "Composer 2.5"],
+    ["kiro", "claude-haiku-4-5", "Claude Haiku 4.5"],
+    ["opencode", "anthropic/claude-sonnet-4", "anthropic/claude-sonnet-4"],
+    ["acp", "private/fast", "Private Fast"],
+  ] as const)(
+    "renders %s catalog metadata verbatim in the model row",
+    async (modelPickerKind, id, displayName) => {
+      useChatStore.setState({ llmModel: id, sessionModelOverride: id });
       renderWithTooltips(
         <Composer
           {...composerProps({
             showEffort: false,
             showModels: true,
             modelPickerKind,
-            codexModelOptions: options,
+            codexModelOptions: [{ id, model: `wire/${id}`, displayName }],
           })}
         />,
       );
 
       await openSessionModels();
-      // A catalog default alone is not evidence of the session's current model.
-      expect(screen.getByRole("menuitemcheckbox", { name: "Primary" })).toHaveAttribute(
-        "aria-checked",
-        "false",
-      );
-      expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
-      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
-      await waitFor(() => expect(setModel).toHaveBeenCalledWith("alternate", expect.anything()));
-      act(() =>
-        useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }),
-      );
-
-      await openSessionModels();
-      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
-      await waitFor(() =>
-        expect(setModel).toHaveBeenLastCalledWith("primary", {
-          expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
-        }),
-      );
-      expect(setModel).toHaveBeenCalledTimes(2);
+      const row = screen.getByRole("menuitemcheckbox", { name: displayName });
+      expect(row).toHaveAttribute("data-model-id", id);
+      expect(row).toHaveTextContent(displayName);
     },
   );
+
+  it("appends an unknown reported Codex model as the checked current row", async () => {
+    useChatStore.setState({
+      llmModel: "gpt-unlisted",
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: [{ id: "gpt-5.5", displayName: "Codex Pretty 5.5" }],
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "gpt-unlisted (current)" }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Codex Pretty 5.5" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
 
   it("names the model Codex's Default resolves to, like the new-session gear", async () => {
     const options = [
