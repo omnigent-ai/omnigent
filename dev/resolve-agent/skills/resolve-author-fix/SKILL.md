@@ -121,7 +121,7 @@ than shipping a hollow green.
 
 **Record the result after the fix.** Use the recovered reproduction test and
 journey to prepare the recording, even if the earlier run left no video.
-See [`dev/recording-lanes.md`](../recording-lanes.md) for setup and recording
+See [`dev/recording-lanes.md`](../../../recording-lanes.md) for setup and recording
 steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 
 - Record the user action and the corrected product behavior. Tests may drive

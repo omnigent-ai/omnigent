@@ -31,7 +31,7 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    to your handoff `recordings`. This is **not** gated on the repro handoff
    carrying footage — you have the test and the journey, which is all the recorder
    needs, so produce the after-clip whether or not any before-clip was recovered.
-   Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../recording-lanes.md)
+   Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../../../recording-lanes.md)
    (build the SPA first, record via `OMNIGENT_E2E_RECORD_DIR`, per-surface `web` /
    `mobile` / `terminal` / `cli` / `desktop` mechanics) — saving to
    `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the clip

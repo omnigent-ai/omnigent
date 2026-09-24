@@ -101,7 +101,7 @@ Once the set is genuinely green:
    the `recordings/` clips or any `.omnigent/` handoff files (e.g.
    `.omnigent/repro-handoff.json`): recordings are workspace artifacts that ride
    in the PR's Demo section / CI artifact bundle, not in the diff (see
-   [`dev/recording-lanes.md`](../recording-lanes.md)). Do **not** use a blanket
+   [`dev/recording-lanes.md`](../../../recording-lanes.md)). Do **not** use a blanket
    `git add -A` / `git add .` that sweeps them in — stage the fix and test paths
    explicitly, and run `git status` / `git diff --cached --stat` before committing
    to confirm the staged set is only the fix + test. If a recording or handoff
