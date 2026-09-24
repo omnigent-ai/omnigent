@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -14,7 +15,8 @@ from .runtime import serve
 from .transport import Relay
 
 
-def execute(output: Path, command: list[str]) -> int:
+@contextmanager
+def command_environment(output: Path):
     state = json.loads((output / "environment.json").read_text())
     if state["status"] != "ready":
         raise RuntimeError(f"Reproduction environment is {state['status']}; inspect {output}")
@@ -38,6 +40,15 @@ def execute(output: Path, command: list[str]) -> int:
             status.raise_for_status()
             if not status.json().get("online"):
                 raise RuntimeError(f"Reproduction runner is offline; inspect {output}")
+        yield env
+
+
+def execute(output: Path, command: list[str]) -> int:
+    if (output / "execution-context.json").is_file():
+        from .execution import run
+
+        return run(output, command, dict(os.environ), prepare=lambda: command_environment(output))
+    with command_environment(output) as env:
         return subprocess.call(command, env=env)
 
 

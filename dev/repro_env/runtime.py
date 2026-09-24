@@ -172,6 +172,7 @@ def supervise(output: Path) -> None:
 
         write_json(output / "launch-observations.json", launch_observations(root))
         env = dict(os.environ)
+        env["OMNIGENT_REPRO_EVIDENCE_ROOT"] = str(output)
         claude_dir = output / "claude-config"
         claude_dir.mkdir(exist_ok=True)
         write_json(

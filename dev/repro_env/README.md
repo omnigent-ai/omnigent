@@ -1,5 +1,36 @@
 # Prepared reproduction environment
 
+## Execution evidence (opt-in)
+
+With the coordinated workflow enabled, preparation writes `execution-context.json`
+containing the run, accepted-plan and report identities. Each subsequent `exec`
+creates an `execution/<attempt-id>/attempt.json`: command, times, checkout and
+changed-file fingerprints, exit status, and artifact hashes. Stdout/stderr remain
+visible and are also retained. Failed commands retain their original exit status;
+interrupted records remain incomplete. Without the context file, execution is
+unchanged.
+
+The wrapper loads `dev.repro_env.pytest_evidence` automatically for pytest. It
+records test outcomes, synchronous Playwright traces (including input actions),
+terminal WebSocket frames, observed browser response replacements, screenshots,
+and videos before fixture cleanup. Local synchronous HTTP session activity is
+recorded, with session items/resources captured before deletion. The existing
+mock provider journals requests before reset, including outside pytest. The
+workflow bundles these files and independently hashes the retained copies.
+
+These are agent-workspace observations, not a protected or independently verified
+account. Async browser/HTTP clients, external servers, commands outside the wrapper,
+and arbitrary custom mocks are not fully covered. Collection errors, truncation,
+missing records and incomplete attempts remain explicit. Shared-runtime provider
+events have timestamps, not assumed ownership by a particular attempt. Do not
+interpret missing events as proof an action did not happen. Trace text receives credential redaction and is stored uncompressed inside the ZIP
+so the existing bundle byte scan can inspect it. Screenshots/videos can still contain
+visible private data; neither redaction nor the byte scan inspects image pixels.
+An existing trace owner, an abruptly killed browser, or a driver that does not close
+its contexts can leave browser artifacts unavailable; collection errors remain explicit.
+
+## Runtime
+
 CI starts the product server, runner and mock model server in a persistent
 sandbox before repro-agent launches. It configures both real native CLIs with
 mock providers and isolated product/CLI state. The workflow owns their lifetime;

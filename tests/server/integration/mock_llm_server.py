@@ -61,17 +61,40 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time as _time_mod
 import uuid as _uuid_mod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI()
+_evidence_journals = {}
+
+
+def _record_evidence(kind: str, body=None) -> None:
+    attempt = os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR")
+    runtime = os.environ.get("OMNIGENT_REPRO_EVIDENCE_ROOT")
+    if not attempt and not (runtime and (Path(runtime) / "execution-context.json").is_file()):
+        return
+    from dev.repro_env.execution import Journal
+
+    directory = Path(attempt) if attempt else Path(runtime) / "execution/service"
+    if directory not in _evidence_journals:
+        _evidence_journals[directory] = Journal(directory)
+    _evidence_journals[directory].emit(
+        "provider_mock",
+        action=kind,
+        body=body,
+        boundary="model provider",
+        correlation="timestamp and request content",
+    )
+
 
 # Default queue key when none is specified or no model matches.
 _DEFAULT_KEY = "default"
@@ -960,6 +983,7 @@ class MockState:
                 queue.reset()  # clear responses/index, keep fallback
             else:
                 del self.queues[key]
+        _record_evidence("reset")
         self.captured_requests.clear()
         self.request_count = 0
         self.served_models = []
@@ -989,6 +1013,7 @@ async def create_response(
 
     async with _state._lock:
         _state.request_count += 1
+        _record_evidence("request", parsed)
         _state.captured_requests.append(parsed)
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
@@ -1065,6 +1090,7 @@ async def create_message(
 
     async with _state._lock:
         _state.request_count += 1
+        _record_evidence("request", parsed)
         _state.captured_requests.append(parsed)
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
@@ -1182,6 +1208,7 @@ async def create_chat_completion(
 
     async with _state._lock:
         _state.request_count += 1
+        _record_evidence("request", parsed)
         _state.captured_requests.append(parsed)
         model = parsed.get("model") if isinstance(parsed, dict) else None
         queue = _state.resolve_queue_for_request(parsed)
