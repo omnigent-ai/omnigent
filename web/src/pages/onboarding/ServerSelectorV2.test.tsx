@@ -25,25 +25,64 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByRole("heading", { name: "Meet Omnigent" })).toBeInTheDocument();
   });
 
-  it("Get started advances to the deployment-mode step", () => {
+  it("Get started locally shows the local intro (not install yet)", () => {
     render(<ServerSelectorV2 setup={makeSetup()} />);
-    fireEvent.click(screen.getByRole("button", { name: /get started/i }));
-    expect(
-      screen.getByRole("heading", { name: /where do you want your sessions/i }),
-    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /get started locally/i }));
+    // Local/Cloud switcher was replaced by a single local intro; install starts
+    // only after clicking Install Omnigent.
+    expect(screen.getByRole("heading", { name: /set up omnigent locally/i })).toBeInTheDocument();
+    expect(screen.queryByText(/starting the local server/i)).not.toBeInTheDocument();
   });
 
-  it("Join a server advances to the server-select step", () => {
+  it("Install Omnigent from the local intro starts the install", () => {
     render(<ServerSelectorV2 setup={makeSetup()} />);
-    fireEvent.click(screen.getByRole("button", { name: /join a server/i }));
-    expect(screen.getByRole("heading", { name: /join an existing server/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /get started locally/i }));
+    fireEvent.click(screen.getByRole("button", { name: /install omnigent/i }));
+    expect(screen.getByText(/starting the local server/i)).toBeInTheDocument();
+  });
+
+  it("a returning user (installed) starts on the server list, not the landing", () => {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({ installed: true, recentServers: ["https://team.example.com/"] })}
+      />,
+    );
+    expect(screen.getByText(/^Recents$/)).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Meet Omnigent" })).not.toBeInTheDocument();
+  });
+
+  it("Join your team advances to the server-select step", () => {
+    render(
+      <ServerSelectorV2 setup={makeSetup({ recentServers: ["https://team.example.com/"] })} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team/i }));
+    expect(screen.getByText(/^Recents$/)).toBeInTheDocument();
+  });
+
+  it("picking a preset server from the landing shows its detail step", () => {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({ managedServers: ["https://field-eng-omni.aws.databricksapps.com"] })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(field-eng-omni\)/i }));
+    expect(screen.getByRole("heading", { name: /you.?re in/i })).toBeInTheDocument();
+    // Single server, no radio list to select from.
+    expect(screen.queryByRole("radiogroup")).not.toBeInTheDocument();
   });
 
   it("opens directly on the server step when a connect error is present", () => {
-    render(<ServerSelectorV2 setup={makeSetup({ error: "Could not load http://dead/" })} />);
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          error: "Could not load http://dead/",
+          recentServers: ["https://team.example.com/"],
+        })}
+      />,
+    );
     // The error banner is only reachable on the server step — so being able to
     // see it proves the flow opened there rather than on the landing hero.
-    expect(screen.getByRole("heading", { name: /join an existing server/i })).toBeInTheDocument();
+    expect(screen.getByText(/^Recents$/)).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("Could not load http://dead/");
   });
 

@@ -18,11 +18,13 @@ import {
   CopyIcon,
   FileTextIcon,
   FolderIcon,
-  GitForkIcon,
   ImageIcon,
+  Link2Icon,
   Loader2Icon,
+  SplitIcon,
   XIcon,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
@@ -31,6 +33,7 @@ import {
   MessageActions,
   MessageAction,
   MessageContent,
+  type MessageResponseProps,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import {
@@ -49,27 +52,51 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
-import type { MessageContentBlock } from "@/lib/blocks";
-import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
+import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
+import {
+  attachmentLabel,
+  ELICITATION_RESPONSE_PREFIX,
+  imagePreview,
+  isTextBlock,
+  keyedAttachments,
+} from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retrySession } from "@/lib/sessionsApi";
+import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+import {
+  ConversationScopeContext,
+  useScopedConversationId,
+} from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
-import { SessionImage } from "@/components/SessionImage";
+import { InlineImage, SessionImage } from "@/components/SessionImage";
+import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { SessionStatus } from "@/lib/types";
+import {
+  TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
+  type TranscriptScrollbarDragDetail,
+} from "@/pages/TranscriptScrollbar";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+
+const COLLAPSE_THRESHOLD = 12000;
+
+// Slice a string by threshold and remove corrupted symbols
+function sliceByCodePoint(str: string, limit: number): string {
+  return str.slice(0, limit).replace(/[\uD800-\uDBFF]$/, "");
+}
 
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
@@ -77,9 +104,7 @@ export const SessionSharedContext = createContext(false);
 
 export function extractUserText(content: MessageContentBlock[]): string {
   return content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
+    .filter(isTextBlock)
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")
@@ -103,9 +128,7 @@ function isAbsolutePath(p: string): boolean {
  */
 function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
   const text = content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
+    .filter(isTextBlock)
     .map((c) => c.text)
     .join("");
   const out: MentionItem[] = [];
@@ -185,6 +208,7 @@ export function buildPendingBubbles(
       kind: "user",
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
+      pending: true,
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -338,6 +362,16 @@ export const WORKING_MESSAGES = [
   "Tinkering…",
   "Pondering…",
   "Brewing…",
+  "Noodling…",
+  "Wrangling…",
+  "Conjuring…",
+  "Assembling…",
+  "Percolating…",
+  "Untangling…",
+  "Scheming…",
+  "Finagling…",
+  "Whirring…",
+  "Puzzling…",
 ] as const;
 
 /**
@@ -369,6 +403,11 @@ function useAgentTurnActive(): boolean {
  */
 export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
   if (blockedOn) {
+    // A "dialog open" block lives only in the terminal tab, so point the user
+    // there to respond rather than leaving the session looking hung.
+    if (blockedOn === "dialog open") {
+      return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
+    }
     return `Blocked on: ${blockedOn}`;
   }
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
@@ -438,7 +477,9 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
     const startTimeMs = createdAtS != null ? createdAtS * 1000 : Date.now();
 
     const updateElapsed = () => {
-      setElapsed(Math.round((Date.now() - startTimeMs) / 1000));
+      // Clamp: a server-provided start marginally ahead of this client's
+      // clock must read as "just started", not a negative count.
+      setElapsed(Math.max(0, Math.round((Date.now() - startTimeMs) / 1000)));
     };
 
     updateElapsed();
@@ -493,10 +534,12 @@ export const BubbleView = memo(
     bubble,
     isLastAssistant = false,
     showsWorking = false,
+    actionsPersistent = false,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
+    actionsPersistent?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
@@ -519,12 +562,14 @@ export const BubbleView = memo(
         bubble={bubble}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
+        actionsPersistent={actionsPersistent}
       />
     );
   },
   (prev, next) =>
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
+    (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -566,14 +611,81 @@ function useCopyMessage(getText: () => string): {
   return { isCopied, handleCopy };
 }
 
+/** Pill for an attachment with no preview of its own: a non-image file, an
+ *  upload still in flight, or an image block carrying nothing renderable. */
+function AttachmentChip({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
+  return (
+    <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
+      <Icon className="size-3 shrink-0" />
+      <span className="max-w-[180px] truncate">{label}</span>
+    </span>
+  );
+}
+
+// User-authored tags and placeholders are text, including valid HTML examples.
+const USER_MESSAGE_REMARK_REHYPE_OPTIONS: MessageResponseProps["remarkRehypeOptions"] = {
+  handlers: {
+    html: (_state, node: { value: string }) =>
+      node.value
+        .split("\n")
+        .flatMap((line, index) => [
+          ...(index
+            ? [{ type: "element" as const, tagName: "br", properties: {}, children: [] }]
+            : []),
+          { type: "text" as const, value: line },
+        ]),
+  },
+};
+
+/**
+ * Copy a deep link to this message (``?message=<id>`` on the session URL).
+ * Same confirmation UX as {@link useCopyMessage}.
+ *
+ * @param messageId - Stable id stamped on the bubble (user itemId / assistant responseId).
+ */
+function useCopyMessageLink(messageId: string | null): {
+  isLinkCopied: boolean;
+  handleCopyLink: () => void;
+} {
+  const [isLinkCopied, setIsLinkCopied] = useState(false);
+  const timeoutRef = useRef<number>(0);
+  const isMobile = useIsMobileViewport();
+
+  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+
+  const handleCopyLink = useCallback(() => {
+    if (!messageId || isLinkCopied) return;
+    copyText(buildMessageDeepLink(messageId)).then(
+      () => {
+        setIsLinkCopied(true);
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = window.setTimeout(() => setIsLinkCopied(false), 2000);
+        if (isMobile) {
+          showToast(<span className="text-ui">Link copied</span>, { duration: 1500 });
+        }
+      },
+      (error) => {
+        console.warn("Failed to copy message link", error);
+      },
+    );
+  }, [messageId, isLinkCopied, isMobile]);
+
+  return { isLinkCopied, handleCopyLink };
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
-  const sessionId = useChatStore((s) => s.conversationId);
+  // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
+  // the main conversation the root store projects.
+  const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  // - input_image: `imagePreview` picks the variant — an uploaded file, an
+  //   imported inline data URI, an in-flight upload chip, or a placeholder
+  //   for a block carrying neither.
+  // - input_file: always render as a chip (non-image files can't be
+  //   previewed inline).
   const text = extractUserText(bubble.content);
-  const images = bubble.content.filter(
-    (c): c is Extract<MessageContentBlock, { type: "input_image" }> => c.type === "input_image",
-  );
+  const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
@@ -584,6 +696,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
+    bubble.pending ? null : bubble.itemId,
+  );
+  // Collapse long prompts by default to avoid expensive Markdown parsing and
+  // a large DOM for text the user hasn't asked to read yet.
+  const isLong = text.length > COLLAPSE_THRESHOLD;
+  const [isCollapsed, setIsCollapsed] = useState(isLong);
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
@@ -600,6 +719,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
+      data-message-id={bubble.itemId}
       className="max-w-[640px]"
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
@@ -627,58 +747,61 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             </Tooltip>
           )}
           <MessageContent
-            className={cn(flashing && "animate-user-msg-flash")}
+            className={flashing ? "animate-message-highlight" : undefined}
             // Another contributor's bubble takes their avatar color at low
             // alpha instead of the default bg-muted.
             style={
               showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
             }
           >
-            {/* Inline image previews — one non-wrapping strip. */}
+            {/* Inline image previews. Wrap rather than scroll horizontally:
+                a landscape image fills the bubble width, so a second one in a
+                non-wrapping strip would sit off-screen in the overflow and
+                look like it never rendered. */}
             {images.length > 0 && (
-              <div className="mb-1.5 flex gap-2 overflow-x-auto">
-                {images.map((img) =>
-                  img.file_id.startsWith("pending:") ? (
-                    // Upload in-flight — show a chip placeholder
-                    <span
-                      key={img.file_id}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      <ImageIcon className="size-3 shrink-0" />
-                      <span className="max-w-[180px] truncate">
-                        {img.filename ?? img.file_id.replace("pending:", "")}
-                      </span>
-                    </span>
-                  ) : (
-                    // Uploaded — render the actual image
-                    <SessionImage
-                      key={img.file_id}
-                      path={
-                        sessionId
-                          ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
-                          : undefined
-                      }
-                      alt={img.filename ?? img.file_id}
-                      // Sizing lives in SessionImage, which reserves a matching
-                      // box so the bubble's height is settled before bytes land.
-                      className="rounded-md object-contain"
-                    />
-                  ),
-                )}
+              <div className="mb-1.5 flex flex-wrap items-start gap-2">
+                {keyedAttachments(
+                  images,
+                  (img) => img.file_id ?? img.image_url ?? img.filename,
+                ).map(({ key, item: img }) => {
+                  const preview = imagePreview(img);
+                  if (preview.kind === "uploaded") {
+                    return (
+                      <SessionImage
+                        key={key}
+                        path={
+                          sessionId
+                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(preview.fileId)}/content`
+                            : undefined
+                        }
+                        alt={preview.alt}
+                        className="rounded-md object-contain"
+                      />
+                    );
+                  }
+                  if (preview.kind === "inline") {
+                    return (
+                      <InlineImage
+                        key={key}
+                        src={preview.src}
+                        alt={preview.alt}
+                        className="rounded-md object-contain"
+                      />
+                    );
+                  }
+                  // In-flight upload, or a block with nothing renderable on it.
+                  return <AttachmentChip key={key} icon={ImageIcon} label={preview.label} />;
+                })}
               </div>
             )}
             {/* Non-image file chips */}
             {fileChips.length > 0 && (
               <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {fileChips.map((att) => (
-                  <span
-                    key={att.file_id}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    <FileTextIcon className="size-3 shrink-0" />
-                    <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
-                  </span>
-                ))}
+                {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
+                  ({ key, item: att }) => (
+                    <AttachmentChip key={key} icon={FileTextIcon} label={attachmentLabel(att)} />
+                  ),
+                )}
               </div>
             )}
             {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
@@ -709,36 +832,72 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
-              nothing rather than an empty markdown block. */}
-            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
+              nothing rather than an empty markdown block.
+              For long prompts, only the visible slice is passed to the renderer
+              so the Markdown parser never processes hidden text. */}
+            {text && (
+              <>
+                <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
+                  <FilePathAwareMessageResponse
+                    breaks
+                    mode="static"
+                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                  >
+                    {isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text}
+                  </FilePathAwareMessageResponse>
+                  {/* Gradient fade at the bottom of collapsed prompts to signal
+                      there is more content below. */}
+                  {isCollapsed && isLong && (
+                    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
+                  )}
+                </div>
+                {isLong && (
+                  <button
+                    type="button"
+                    onClick={() => setIsCollapsed((c) => !c)}
+                    className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {isCollapsed
+                      ? `Show full prompt (${text.length.toLocaleString()} chars)`
+                      : "Collapse prompt"}
+                  </button>
+                )}
+              </>
+            )}
           </MessageContent>
         </div>
-        {/* Skip an empty row when there is neither a timestamp nor a copy
-            action. 40%-visible on touch, hover/focus-reveal on desktop. */}
-        {(ts || text) && (
-          <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-            {ts && (
-              <span
-                className="select-none text-[11px] leading-4 text-foreground/56"
-                data-testid="message-timestamp"
-              >
-                {ts}
-              </span>
-            )}
+        {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
+        <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          {ts && (
+            <span
+              className="select-none text-[11px] leading-4 text-foreground/56"
+              data-testid="message-timestamp"
+            >
+              {ts}
+            </span>
+          )}
+          <MessageActions>
             {text && (
-              <MessageActions>
-                <MessageAction
-                  tooltip="Copy"
-                  size="icon-xxs"
-                  onClick={handleCopy}
-                  componentId="chat.message.copy_user"
-                >
-                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                </MessageAction>
-              </MessageActions>
+              <MessageAction
+                tooltip="Copy"
+                size="icon-xxs"
+                onClick={handleCopy}
+                componentId="chat.message.copy_user"
+              >
+                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+              </MessageAction>
             )}
-          </div>
-        )}
+            <MessageAction
+              tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+              size="icon-xxs"
+              data-testid="copy-message-link"
+              disabled={bubble.pending}
+              onClick={handleCopyLink}
+            >
+              {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+            </MessageAction>
+          </MessageActions>
+        </div>
       </div>
     </Message>
   );
@@ -748,32 +907,77 @@ function AssistantBubble({
   bubble,
   isLastAssistant = false,
   showsWorking = false,
+  actionsPersistent = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
+  actionsPersistent?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const conversationId = useChatStore((s) => s.conversationId);
-  // A pending elicitation means the turn is parked awaiting the user — still in
-  // flight even when its lifecycle or the session status reads settled.
-  const hasPendingElicitation = useChatStore((s) =>
+  //
+  // Scoped so a side-chat bubble reads the CHILD's status and targets the child
+  // for retry — not whatever the root store currently projects. Unscoped (the
+  // main transcript) reads the root store exactly as before; `useConversationEntryState(null)`
+  // is inert (no subscription, stable empty snapshot).
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const scopedState = useConversationEntryState(scopedConversationId);
+  const activeConversationId = useChatStore((s) => s.conversationId);
+  const conversationId = scopedConversationId ?? activeConversationId;
+  const rootSessionStatus = useChatStore((s) => s.sessionStatus);
+  const rootHasPendingElicitation = useChatStore((s) =>
     s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
   );
+  const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
+  // A pending elicitation means the turn is parked awaiting the user — still in
+  // flight even when its lifecycle or the session status reads settled.
+  const hasPendingElicitation = scopedConversationId
+    ? scopedState.blocks.some((b) => b.type === "elicitation" && b.status === "pending")
+    : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
+  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
+  const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
-  const handleRetryError = useCallback(async () => {
-    if (!conversationId) throw new Error("Session is not available");
-    const result = await retrySession(conversationId);
-    if (!result.recovered) {
-      throw new Error("The session is already connected; no recovery was performed");
-    }
-  }, [conversationId]);
+  const handleRetryError = useCallback(
+    async (item: Extract<RenderItem, { kind: "error" }>) => {
+      if (!conversationId) throw new Error("Session is not available");
+      if (item.code === "rate_limit_exceeded") {
+        // Read a FRESH snapshot of the target conversation at click time: the
+        // scoped child's own entry in a side chat, else the root store. The
+        // child tab is fixed, so only the main chat guards against the user
+        // switching the active conversation out from under a queued retry.
+        const current = scopedConversationId
+          ? conversationRegistry.peek(scopedConversationId)?.getState()
+          : useChatStore.getState();
+        if (!current) throw new Error("The selected session has changed");
+        if (!scopedConversationId && useChatStore.getState().conversationId !== conversationId) {
+          throw new Error("The selected session has changed");
+        }
+        if (!isLastAssistant) throw new Error("Only the latest failed turn can be retried");
+        if (
+          current.status === "streaming" ||
+          current.sessionStatus === "launching" ||
+          current.sessionStatus === "running" ||
+          current.sessionStatus === "waiting" ||
+          current.pendingUserMessages.length > 0 ||
+          current.blocks.some((block) => block.type === "elicitation" && block.status === "pending")
+        ) {
+          throw new Error("Wait for the current turn to finish before retrying");
+        }
+        await retryRateLimitedTurn(conversationId);
+        return;
+      }
+      const result = await retrySession(conversationId);
+      if (!result.recovered) {
+        throw new Error("The session is already connected; no recovery was performed");
+      }
+    },
+    [conversationId, scopedConversationId, isLastAssistant],
+  );
 
   if (bubble.items.length === 0) return null;
 
@@ -790,6 +994,7 @@ function AssistantBubble({
     isLastAssistant,
     hasPendingElicitation,
     showsWorking,
+    defaultExpanded: bubble.defaultExpanded,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -809,13 +1014,20 @@ function AssistantBubble({
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
+        data-response-stable-id={bubble.stableId}
+        data-message-id={bubble.responseId}
         className={
           spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
         }
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap rather
             than shrink-wrapping to the summary row's ~110px. */}
-        <MessageContent className={spansFullColumn || foldOnly ? "w-full" : undefined}>
+        <MessageContent
+          className={cn(
+            (spansFullColumn || foldOnly) && "w-full",
+            flashing && "animate-message-highlight rounded-lg",
+          )}
+        >
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -826,6 +1038,7 @@ function AssistantBubble({
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
+            defaultExpanded={bubble.defaultExpanded}
             onRetryError={handleRetryError}
           />
         </MessageContent>
@@ -838,12 +1051,18 @@ function AssistantBubble({
             <span>Interrupted</span>
           </p>
         )}
-        {/* Skipped on a fold-only bubble, when there is neither a timestamp nor
-            actions, and on an error-only bubble. Order: actions, then timestamp. */}
-        {!foldOnly && !errorOnly && (ts || markdownText) && (
-          <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-            {markdownText && (
-              <MessageActions>
+        {/* Skip fold-only and error-only bubbles. Order: actions, then timestamp. */}
+        {!foldOnly && !errorOnly && (
+          <div
+            className={cn(
+              "flex items-center gap-3 py-1",
+              actionsPersistent
+                ? "opacity-100"
+                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+            )}
+          >
+            <MessageActions>
+              {markdownText && (
                 <MessageAction
                   tooltip="Copy"
                   size="icon-xxs"
@@ -852,22 +1071,30 @@ function AssistantBubble({
                 >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
-                {/* Fork from this response: clone the session with history
+              )}
+              {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                  <MessageAction
-                    tooltip="Fork from here"
-                    size="icon-xxs"
-                    data-testid="fork-from-response"
-                    onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-                    componentId="chat.message.fork"
-                  >
-                    <GitForkIcon size={14} />
-                  </MessageAction>
-                )}
-              </MessageActions>
-            )}
+              {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                <MessageAction
+                  tooltip="Fork from here"
+                  size="icon-xxs"
+                  data-testid="fork-from-response"
+                  onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                  componentId="chat.message.fork"
+                >
+                  <SplitIcon size={14} />
+                </MessageAction>
+              )}
+              <MessageAction
+                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+                size="icon-xxs"
+                data-testid="copy-message-link"
+                onClick={handleCopyLink}
+              >
+                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+              </MessageAction>
+            </MessageActions>
             {ts && (
               <span
                 className="select-none text-[11px] leading-4 text-foreground/56"
@@ -1004,21 +1231,54 @@ function historyLoadThreshold(el: HTMLElement): number {
 const TOUCH_DRAG_SLOP_PX = 8;
 
 /**
- * Follow-up pages one gesture may chain beyond the page it fetched itself.
- * Settled tool-heavy turns mount folded, so a fetched page can land near-zero
- * height; a fresh gesture grants a fresh budget so older history stays reachable
- * at a reader-paced rate instead of a runaway loop.
+ * Quiet gap after which the next upward tick — a wheel notch, a scrollbar-drag
+ * move, a repeating key — counts as a new gesture with a fresh budget.
  */
-const PREPEND_CHAIN_PAGES_PER_GESTURE = 2;
-
-/** Quiet gap after which the next wheel-up tick counts as a new gesture. */
 const WHEEL_GESTURE_QUIET_MS = 300;
+
+/**
+ * Pages one gesture — a wheel flick, a finger drag, a key, a scrollbar drag —
+ * may chain beyond its first while every page folds into a turn already on
+ * screen. One enormous turn would otherwise let a single gesture page in the
+ * whole transcript with the reader's hands off.
+ */
+const SEEK_PAGES_PER_GESTURE = 30;
+
+/**
+ * Quiet time after the last scroll event before a touch-armed page may land.
+ * On a phone a flick keeps the pane moving after the finger lifts, and a page
+ * landing mid-motion writes the scroll offset, which kills that momentum dead —
+ * the fling stops a third of the way. Only a pane that moved this recently is
+ * held; a drag that has already come to rest fetches at once, finger down or
+ * not. Wheel, keyboard, and scrollbar gestures carry no native momentum and are
+ * not held.
+ */
+const TOUCH_SETTLE_MS = 120;
+
+/** Keys that scroll a pane upward: a request for older history when pressed outside an editor. */
+const HISTORY_SCROLL_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
+/** Keys that scroll a pane downward: the reader is done asking for older history. */
+const HISTORY_LEAVE_KEYS = new Set(["ArrowDown", "PageDown", "End"]);
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
+  );
+}
 
 export function HistoryAutoLoader({
   scrollElement,
+  rowCount,
 }: {
   scrollElement?: HTMLElement | null;
-} = {}) {
+  /**
+   * Rows the transcript renders. A page that adds none folded into a turn
+   * already on screen. A row streaming in at the bottom also counts and ends a
+   * seek one page early; the reader's next flick resumes it.
+   */
+  rowCount: number;
+}) {
   // useStickToBottomContext exposes scrollRef in the runtime context even though
   // the public TS types only declare isAtBottom and scrollToBottom. Cast to it.
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
@@ -1033,72 +1293,173 @@ export function HistoryAutoLoader({
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
-  // Whether the reader has asked to move the transcript upward yet. Intent, not
-  // movement: a window taller than the transcript has no scroll range at all.
+  // The reader's unserved request for older history. Armed only by input —
+  // wheel, touch, keyboard, or a scrollbar drag — and consumed by the fetch it
+  // triggers. Movement alone is not intent: the
+  // virtualizer, the bottom lock, and native anchoring all move scrollTop
+  // upward while a page settles, and reading those as gestures paged the whole
+  // transcript in with the reader's hands off the trackpad.
   const scrolledUpRef = useRef(false);
-  const lastScrollTopRef = useRef<number | null>(null);
+  // Whether the browser would send keyboard scrolling to the transcript: the
+  // last pointer press landed on it or its scrollbar, and focus has not since
+  // moved to something else on the page.
+  const pointerInTranscriptRef = useRef(false);
   const touchStartYRef = useRef<number | null>(null);
-  // Whether the current touch sequence already granted its gesture budget.
+  const touchLastYRef = useRef<number | null>(null);
+  // Whether the request in hand was armed by a finger. A touch request waits
+  // for the pane to stop moving before it fetches; see TOUCH_SETTLE_MS.
+  const touchArmedRef = useRef(false);
+  const lastScrollAtRef = useRef(Number.NEGATIVE_INFINITY);
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Whether the current touch sequence already armed a request.
   const touchGestureSpentRef = useRef(false);
-  const lastWheelUpAtRef = useRef(Number.NEGATIVE_INFINITY);
-  // Prepend-fed fetches left before the chain must wait for a fresh gesture.
-  const chainBudgetRef = useRef(PREPEND_CHAIN_PAGES_PER_GESTURE);
+  const lastUpwardTickAtRef = useRef(Number.NEGATIVE_INFINITY);
+  // Rows on screen when the gesture being served began, while it is still
+  // seeking. A settled tool-heavy turn is one folded row, so a page can land
+  // entirely inside it and show the reader nothing; the gesture keeps paging
+  // until a page adds a row, then waits for the next gesture.
+  const seekBaseRowsRef = useRef<number | null>(null);
+  const seekPagesLeftRef = useRef(SEEK_PAGES_PER_GESTURE);
+  // Whether the current gesture has fetched yet: its first page is free, every
+  // later one — chained or from a further tick of the same gesture — spends
+  // the budget, even after a page that added a row ended the seek.
+  const gestureFetchedRef = useRef(false);
 
-  // Position across a prepend is held by native scroll anchoring, not by this
-  // component. Writing scrollTop here instead used to interrupt the reader's
-  // gesture.
+  // Position across a prepend is held by the transcript (VirtualBubbleList), not
+  // by this component. Writing scrollTop here instead used to interrupt the
+  // reader's gesture.
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
-    lastScrollTopRef.current = el.scrollTop;
-    const noteUpwardGesture = () => {
+    const noteUpwardGesture = (seekPages: number, viaTouch = false) => {
+      touchArmedRef.current = viaTouch;
       scrolledUpRef.current = true;
-      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
+      // A fresh gesture seeks from what is on screen now, with a fresh budget.
+      seekBaseRowsRef.current = null;
+      seekPagesLeftRef.current = seekPages;
+      gestureFetchedRef.current = false;
       setScrollRevision((revision) => revision + 1);
     };
+    // Scrolling back down withdraws the request: the page in flight still
+    // lands, but nothing chains after it.
+    const noteDownwardGesture = () => {
+      scrolledUpRef.current = false;
+      seekBaseRowsRef.current = null;
+    };
+    // Scroll movement alone is never intent: the virtualizer, the bottom lock,
+    // and the transcript's own hold all move scrollTop while a page settles. It
+    // only re-evaluates an already armed request against the threshold.
     const handleScroll = () => {
-      const previous = lastScrollTopRef.current;
-      lastScrollTopRef.current = el.scrollTop;
-      // Only an upward move counts.
-      if (previous !== null && el.scrollTop < previous - 0.5) {
-        scrolledUpRef.current = true;
-        chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
-      }
+      lastScrollAtRef.current = performance.now();
       setScrollRevision((revision) => revision + 1);
+    };
+    // One upward tick of a wheel, a scrollbar drag, or a repeating key. The
+    // first after a quiet gap is a fresh gesture; later ticks keep the request
+    // open on the same budget, so a long scroll keeps paging at the reader's
+    // pace without refilling.
+    const noteUpwardTick = () => {
+      const now = performance.now();
+      const newGesture = now - lastUpwardTickAtRef.current > WHEEL_GESTURE_QUIET_MS;
+      lastUpwardTickAtRef.current = now;
+      if (newGesture) {
+        noteUpwardGesture(SEEK_PAGES_PER_GESTURE);
+        return;
+      }
+      scrolledUpRef.current = true;
+      setScrollRevision((revision) => revision + 1);
+    };
+    // The transcript draws its own scrollbar; a thumb drag reports its direction
+    // here, so a drag up asks and a drag back down withdraws.
+    const handleScrollbarDrag = (event: Event) => {
+      const { direction } = (event as CustomEvent<TranscriptScrollbarDragDetail>).detail;
+      if (direction === "down") noteDownwardGesture();
+      else noteUpwardTick();
     };
     const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY >= 0) return;
-      const now = performance.now();
-      const newGesture = now - lastWheelUpAtRef.current > WHEEL_GESTURE_QUIET_MS;
-      lastWheelUpAtRef.current = now;
-      if (newGesture) noteUpwardGesture();
+      if (event.deltaY > 0) noteDownwardGesture();
+      else if (event.deltaY < 0) noteUpwardTick();
     };
     const handleTouchStart = (event: TouchEvent) => {
       touchStartYRef.current = event.touches[0]?.clientY ?? null;
+      touchLastYRef.current = touchStartYRef.current;
       touchGestureSpentRef.current = false;
+    };
+    // Lift: re-evaluate at once, so a drag that stopped still fetches without
+    // waiting for another scroll event.
+    const handleTouchEnd = () => {
+      setScrollRevision((revision) => revision + 1);
     };
     const handleTouchMove = (event: TouchEvent) => {
       const start = touchStartYRef.current;
+      const last = touchLastYRef.current;
       const current = event.touches[0]?.clientY;
-      if (start === null || current === undefined || current <= start + TOUCH_DRAG_SLOP_PX) return;
-      if (touchGestureSpentRef.current) return;
+      if (start === null || last === null || current === undefined) return;
+      // A finger moving back up the screen (scrolling down) by more than the
+      // slop since its last position withdraws, mid-drag or not.
+      if (current < last - TOUCH_DRAG_SLOP_PX) {
+        touchLastYRef.current = current;
+        noteDownwardGesture();
+        return;
+      }
+      if (current > last) touchLastYRef.current = current;
+      if (current <= start + TOUCH_DRAG_SLOP_PX || touchGestureSpentRef.current) return;
       touchGestureSpentRef.current = true;
-      noteUpwardGesture();
+      noteUpwardGesture(SEEK_PAGES_PER_GESTURE, true);
     };
+    const inTranscript = (target: EventTarget | null) =>
+      target instanceof Node &&
+      (el.contains(target) ||
+        (target instanceof Element && target.closest("[data-transcript-scrollbar]") !== null));
+    const handlePointerDown = (event: PointerEvent) => {
+      pointerInTranscriptRef.current = inTranscript(event.target);
+    };
+    // Focus moving elsewhere (Tab, a dialog opening) takes keyboard scrolling
+    // with it; focus inside the transcript is covered by the activeElement check.
+    const handleFocusIn = (event: FocusEvent) => {
+      if (!inTranscript(event.target)) pointerInTranscriptRef.current = false;
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // A control that consumed the key (a menu, a listbox) scrolled nothing.
+      if (event.defaultPrevented || isEditableTarget(event.target)) return;
+      // Only plain keys the browser would scroll this pane with; modified ones
+      // are shortcuts (turn navigation is Cmd/Ctrl+Alt+Arrow). Space pages down
+      // and Shift+Space pages up.
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      // Shift+Arrow/Home/PageUp extends a text selection; only Shift+Space scrolls.
+      if (event.shiftKey && event.key !== " ") return;
+      if (!pointerInTranscriptRef.current && !el.contains(el.ownerDocument.activeElement)) return;
+      const key = event.key === " " ? (event.shiftKey ? "PageUp" : "PageDown") : event.key;
+      if (HISTORY_LEAVE_KEYS.has(key)) noteDownwardGesture();
+      if (HISTORY_SCROLL_KEYS.has(key)) noteUpwardTick();
+    };
+    const doc = el.ownerDocument;
     el.addEventListener("scroll", handleScroll, { passive: true });
     el.addEventListener("wheel", handleWheel, { passive: true });
     el.addEventListener("touchstart", handleTouchStart, { passive: true });
     el.addEventListener("touchmove", handleTouchMove, { passive: true });
+    el.addEventListener("touchend", handleTouchEnd, { passive: true });
+    el.addEventListener("touchcancel", handleTouchEnd, { passive: true });
+    el.addEventListener(TRANSCRIPT_SCROLLBAR_DRAG_EVENT, handleScrollbarDrag);
+    doc.addEventListener("pointerdown", handlePointerDown, { passive: true });
+    doc.addEventListener("focusin", handleFocusIn);
+    doc.addEventListener("keydown", handleKeyDown);
     return () => {
       el.removeEventListener("scroll", handleScroll);
       el.removeEventListener("wheel", handleWheel);
       el.removeEventListener("touchstart", handleTouchStart);
       el.removeEventListener("touchmove", handleTouchMove);
+      el.removeEventListener("touchend", handleTouchEnd);
+      el.removeEventListener("touchcancel", handleTouchEnd);
+      if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+      el.removeEventListener(TRANSCRIPT_SCROLLBAR_DRAG_EVENT, handleScrollbarDrag);
+      doc.removeEventListener("pointerdown", handlePointerDown);
+      doc.removeEventListener("focusin", handleFocusIn);
+      doc.removeEventListener("keydown", handleKeyDown);
     };
   }, [ctx.scrollRef, scrollElement]);
 
-  // The single paging effect. Fetches are driven by user scrolls or a changed
-  // oldest item, including a visually height-neutral prepend.
+  // The single paging effect. Re-evaluated on reader input, scroll movement, and
+  // a changed oldest item (a settled prepend, even a height-neutral one).
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
@@ -1112,45 +1473,76 @@ export function HistoryAutoLoader({
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
-      // A new window is a new open: require a fresh upward scroll.
+      // A new window is a new open: require a fresh gesture, with a fresh budget.
       scrolledUpRef.current = false;
-      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
-      lastScrollTopRef.current = el.scrollTop;
+      seekBaseRowsRef.current = null;
+      seekPagesLeftRef.current = SEEK_PAGES_PER_GESTURE;
+      gestureFetchedRef.current = false;
+      lastUpwardTickAtRef.current = Number.NEGATIVE_INFINITY;
     }
 
     const state = useChatStore.getState();
-
-    // Reader-driven only. The bind fetches its whole window in one request, and
-    // this waits for the reader to actually scroll up.
     if (
-      !scrolledUpRef.current ||
       !state.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
-      !(itemsChanged || scrollPositionChanged) ||
-      el.scrollTop >= historyLoadThreshold(el)
+      !(itemsChanged || scrollPositionChanged)
     ) {
       return;
     }
-
-    // A prepend re-feeding the chain spends gesture budget: without a bound,
-    // folded (height-neutral) pages would re-feed fetches until history ran out.
-    if (itemsChanged && !scrollPositionChanged) {
-      if (chainBudgetRef.current <= 0) return;
-      chainBudgetRef.current -= 1;
+    if (el.scrollTop >= historyLoadThreshold(el)) return;
+    // A finger-armed request waits while the pane is still moving, so the page
+    // cannot land mid-fling. A pane that has been still for the settle window
+    // fetches at once — a slow drag that stopped at the top has no momentum to
+    // protect, finger down or not. The scroll listener re-runs this effect while
+    // a fling decelerates; a timer covers the final quiet stretch.
+    if (touchArmedRef.current && (scrolledUpRef.current || seekBaseRowsRef.current !== null)) {
+      const sinceScroll = performance.now() - lastScrollAtRef.current;
+      if (sinceScroll < TOUCH_SETTLE_MS) {
+        if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+        settleTimerRef.current = setTimeout(
+          () => {
+            settleTimerRef.current = null;
+            setScrollRevision((revision) => revision + 1);
+          },
+          Math.max(16, TOUCH_SETTLE_MS - sinceScroll),
+        );
+        return;
+      }
     }
-
+    if (scrolledUpRef.current) {
+      scrolledUpRef.current = false;
+      // A gesture's first page is free; the budget bounds the pages after it,
+      // including those a further tick of the same gesture asks for.
+      if (gestureFetchedRef.current) {
+        if (seekPagesLeftRef.current <= 0) return;
+        seekPagesLeftRef.current -= 1;
+      }
+      gestureFetchedRef.current = true;
+      seekBaseRowsRef.current ??= rowCount;
+      void state.loadMoreHistory();
+      return;
+    }
+    // No open request: a settled page chains only while the gesture is still
+    // seeking, the page showed the reader nothing new, and budget remains.
+    if (!itemsChanged || seekBaseRowsRef.current === null) return;
+    if (rowCount > seekBaseRowsRef.current || seekPagesLeftRef.current <= 0) {
+      seekBaseRowsRef.current = null;
+      return;
+    }
+    seekPagesLeftRef.current -= 1;
     void state.loadMoreHistory();
   }, [
     ctx.scrollRef,
     historyGeneration,
     loadingMoreHistory,
     oldestItemId,
+    rowCount,
     scrollElement,
     scrollRevision,
   ]);
 
-  // No visible control — history loads purely on scroll-up.
+  // No visible control — history loads purely on reader input.
   return null;
 }
 
@@ -1163,6 +1555,9 @@ const PINNED_ANCHOR_TOP_GAP_PX = 96;
  */
 const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
 
+/** Frames to wait for the windowed anchor row to mount before settling capture. */
+const ANCHOR_CAPTURE_MAX_RETRIES = 10;
+
 /**
  * Trailing spacer that pins the initially loaded turn's anchor to the top of
  * the viewport. The anchor is captured once when the hydrated chat surface
@@ -1170,6 +1565,10 @@ const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
  */
 export function LatestTurnSpacer({
   scrollElement,
+  conversationId,
+  blockCount: blockCountProp,
+  committedUserIds,
+  hasCommittedAnchor: hasCommittedAnchorProp,
   // Gap left above the pinned anchor. Defaults to clearing the top fade band;
   // with the Plan accordion pinned above (fade dropped, container already below
   // the header), the caller passes the small content inset so a framed turn
@@ -1180,35 +1579,81 @@ export function LatestTurnSpacer({
   // the spacer's own ResizeObserver delivery runs a frame later, and the
   // intervening paint is the visible transcript jump.
   measureRef,
+  // Bumped by the transcript when the virtualizer's mounted range changes, so a
+  // windowed-out anchor that has since remounted (which needn't resize any
+  // observed element) triggers a fresh measure — the ResizeObserver alone would
+  // miss it, leaving a stale reservation.
+  remeasureNonce = 0,
 }: {
   scrollElement?: HTMLElement | null;
+  conversationId?: string | null;
+  blockCount?: number;
+  committedUserIds?: ReadonlySet<string>;
+  hasCommittedAnchor?: boolean;
   topGapPx?: number;
   measureRef?: React.RefObject<(() => void) | null>;
+  remeasureNonce?: number;
 } = {}) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
-  // Block changes remeasure the frozen anchor; streaming growth is covered by
-  // the ResizeObserver. The hydration gate remounts this component on a
-  // conversation switch, which captures that conversation's initial anchor.
-  const blockCount = useChatStore((s) => s.blocks.length);
+  const storeBlockCount = useChatStore((s) => s.blocks.length);
+  const blockCount = blockCountProp ?? storeBlockCount;
   const spacerRef = useRef<HTMLDivElement>(null);
-  // `undefined` means capture has not run; `null` is a completed capture with
-  // no suitable initial anchor (for example a brand-new empty conversation).
-  const initialAnchorRef = useRef<HTMLElement | null | undefined>(undefined);
+  // The anchor is stored by stable id, not by node reference: the transcript is
+  // windowed, so its DOM node is destroyed when the row scrolls out and a fresh
+  // node is mounted when it returns — a captured node reference would stay
+  // detached forever, and a semantic "last assistant text" would silently
+  // retarget to whatever earlier turn is still mounted. `undefined` = capture
+  // not run yet; a resolved value is a {kind,id} anchor (a committed user
+  // message, or an assistant response by its stable id) or `null` (a settled
+  // capture with no suitable anchor, e.g. a brand-new conversation).
+  const initialAnchorRef = useRef<{ kind: "user" | "assistant"; id: string } | null | undefined>(
+    undefined,
+  );
   const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
+  // Bounded rAF retries for capturing the anchor when committed blocks exist but
+  // their rows haven't mounted yet (windowed transcript, published a frame
+  // before the virtualizer fills its window). A resize we could observe isn't
+  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
+  // retry ourselves rather than wait for one. When the budget runs out (e.g. a
+  // tool-only trailing turn that never has an anchor) capture settles to `null`.
+  const captureFrameRef = useRef(0);
+  const captureAttemptsRef = useRef(0);
+  // The anchor node measured last, and a flag the ResizeObserver sets to force
+  // the next measure past the same-node skip (viewport/content size changed).
+  const lastAnchorNodeRef = useRef<HTMLElement | null>(null);
+  const forceMeasureRef = useRef(true);
+
+  // Transcript keys the spacer by displayed conversation; this reset also
+  // covers callers that reuse one spacer instance across conversation changes.
+  const storeConversationId = useChatStore((s) => s.conversationId);
+  const displayedConversationId = conversationId ?? storeConversationId;
+  const prevConversationIdRef = useRef(displayedConversationId);
+  if (prevConversationIdRef.current !== displayedConversationId) {
+    prevConversationIdRef.current = displayedConversationId;
+    initialAnchorRef.current = undefined;
+    initialCommittedUserIdsRef.current = null; // recomputed below from new blocks
+    captureAttemptsRef.current = 0;
+    lastAnchorNodeRef.current = null;
+    forceMeasureRef.current = true;
+  }
   if (initialCommittedUserIdsRef.current === null) {
-    const ids = new Set<string>();
-    for (const block of useChatStore.getState().blocks) {
-      if (
-        block.type === "user_message" &&
-        !isSystemUserContent(block.content) &&
-        block.ctx.itemId !== null
-      ) {
-        ids.add(block.ctx.itemId);
+    if (committedUserIds) {
+      initialCommittedUserIdsRef.current = new Set(committedUserIds);
+    } else {
+      const ids = new Set<string>();
+      for (const block of useChatStore.getState().blocks) {
+        if (
+          block.type === "user_message" &&
+          !isSystemUserContent(block.content) &&
+          block.ctx.itemId !== null
+        ) {
+          ids.add(block.ctx.itemId);
+        }
       }
+      initialCommittedUserIdsRef.current = ids;
     }
-    initialCommittedUserIdsRef.current = ids;
   }
 
   const measure = useCallback(() => {
@@ -1218,29 +1663,99 @@ export function LatestTurnSpacer({
     if (initialAnchorRef.current === undefined) {
       // Match DOM bubbles against committed blocks so an optimistic pending
       // send visible during this first layout can never become the anchor.
+      // Defer capture until a bubble is actually mounted — on a windowed
+      // transcript the scroll element can be published a frame before the
+      // virtualizer mounts any rows, and settling on `null` then would freeze
+      // the spacer with no anchor.
       const users = scrollEl.querySelectorAll<HTMLElement>(
         '[data-role="user"][data-user-message-id]',
       );
-      let initialUser: HTMLElement | null = null;
+      let initialUserId: string | null = null;
       for (let index = users.length - 1; index >= 0; index -= 1) {
-        const candidate = users[index]!;
-        const itemId = candidate.dataset.userMessageId;
+        const itemId = users[index]!.dataset.userMessageId;
         if (itemId !== undefined && initialCommittedUserIdsRef.current!.has(itemId)) {
-          initialUser = candidate;
+          initialUserId = itemId;
           break;
         }
       }
-      const texts = scrollEl.querySelectorAll<HTMLElement>(
-        '[data-testid="assistant-text-section"]',
-      );
-      initialAnchorRef.current = initialUser ?? texts[texts.length - 1] ?? null;
+      // No committed user anchor: pin the LAST assistant response by its stable
+      // id (the same id the bubble is keyed by), captured now while it's mounted
+      // at the bottom, so re-resolution later targets that exact turn — not
+      // whichever assistant text happens to be last in the windowed set.
+      let initialAssistantId: string | null = null;
+      if (initialUserId === null) {
+        const texts = scrollEl.querySelectorAll<HTMLElement>(
+          '[data-testid="assistant-text-section"]',
+        );
+        const lastText = texts[texts.length - 1];
+        initialAssistantId =
+          lastText?.closest<HTMLElement>("[data-role='assistant']")?.dataset.responseStableId ??
+          null;
+      }
+      if (initialUserId === null && initialAssistantId === null) {
+        const hasCommittedAnchor =
+          hasCommittedAnchorProp ??
+          (initialCommittedUserIdsRef.current!.size > 0 ||
+            useChatStore.getState().blocks.some((b) => b.type !== "user_message"));
+        // Rows not mounted yet: retry on the next frame, up to a small budget,
+        // so a resize that never comes can't leave the spacer uncaptured — and
+        // an anchorless turn (tool-only trailing bubble) still settles instead
+        // of retrying forever. The `requestAnimationFrame` guard keeps this a
+        // no-op in environments without it rather than throwing.
+        if (
+          hasCommittedAnchor &&
+          captureAttemptsRef.current < ANCHOR_CAPTURE_MAX_RETRIES &&
+          typeof requestAnimationFrame === "function"
+        ) {
+          if (captureFrameRef.current === 0) {
+            captureFrameRef.current = requestAnimationFrame(() => {
+              captureFrameRef.current = 0;
+              captureAttemptsRef.current += 1;
+              measure();
+            });
+          }
+          return;
+        }
+      }
+      initialAnchorRef.current =
+        initialUserId !== null
+          ? { kind: "user", id: initialUserId }
+          : initialAssistantId !== null
+            ? { kind: "assistant", id: initialAssistantId }
+            : null;
     }
-    const anchor = initialAnchorRef.current;
-    if (!anchor) {
+    const anchorKey = initialAnchorRef.current;
+    if (anchorKey === null) {
       // Do not let the always-mounted sentinel become a zero-height flex item.
       spacerEl.style.display = "none";
       return;
     }
+    // Re-resolve the live node by id every measure so a windowed row that was
+    // unmounted and remounted (a new DOM node) is picked up again.
+    const anchor =
+      anchorKey.kind === "user"
+        ? scrollEl.querySelector<HTMLElement>(
+            `[data-role="user"][data-user-message-id="${CSS.escape(anchorKey.id)}"]`,
+          )
+        : scrollEl.querySelector<HTMLElement>(
+            `[data-role="assistant"][data-response-stable-id="${CSS.escape(anchorKey.id)}"] [data-testid="assistant-text-section"]`,
+          );
+    // The transcript is windowed, so the anchor can be scrolled out of the
+    // mounted set. A missing node would report a zeroed rect that blows the
+    // reservation up — hold the last good height until the anchor re-mounts.
+    if (!anchor) return;
+    spacerEl.style.display = "";
+    // The reservation depends only on the anchor NODE and the viewport height,
+    // both scroll-invariant. This effect also fires on every windowed-range
+    // change (a scroll-frequency signal), so skip the forced-layout rect reads
+    // below whenever neither changed — a viewport resize routes through the
+    // ResizeObserver, which sets `forceMeasureRef` to bypass this guard. Keeps
+    // ordinary scrolling free of per-frame getBoundingClientRect reflows while
+    // still re-measuring when the anchor node actually (re)mounts.
+    const forced = forceMeasureRef.current;
+    forceMeasureRef.current = false;
+    if (!forced && anchor === lastAnchorNodeRef.current) return;
+    lastAnchorNodeRef.current = anchor;
     // rect diffs are scroll-invariant, and the spacer's top is fixed by the
     // content above it, so this is stable across the height we're about to set.
     const spacerRect = spacerEl.getBoundingClientRect();
@@ -1261,17 +1776,32 @@ export function LatestTurnSpacer({
     );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
-  }, [ctx.scrollRef, scrollElement, topGapPx]);
+  }, [ctx.scrollRef, hasCommittedAnchorProp, scrollElement, topGapPx]);
+
+  // A block-count change shifts content; force past the same-node skip. The
+  // range nonce (scroll) does NOT force — the guard skips it when the anchor
+  // node is unchanged, which is the whole point of decoupling scroll from the
+  // spacer's forced layout.
+  useLayoutEffect(() => {
+    forceMeasureRef.current = true;
+    measure();
+  }, [measure, blockCount, displayedConversationId]);
 
   useLayoutEffect(() => {
     measure();
-  }, [measure, blockCount]);
+  }, [measure, remeasureNonce]);
 
   useLayoutEffect(() => {
     if (!measureRef) return;
-    measureRef.current = measure;
+    // The composer's same-task growth pin reads geometry right after; force a
+    // real measure so it reflects the shrunk viewport, not a skipped no-op.
+    const forcedMeasure = () => {
+      forceMeasureRef.current = true;
+      measure();
+    };
+    measureRef.current = forcedMeasure;
     return () => {
-      if (measureRef.current === measure) measureRef.current = null;
+      if (measureRef.current === forcedMeasure) measureRef.current = null;
     };
   }, [measure, measureRef]);
 
@@ -1279,11 +1809,17 @@ export function LatestTurnSpacer({
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;
     const contentEl = spacerRef.current?.parentElement;
     if (!scrollEl || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure());
+    const observer = new ResizeObserver(() => {
+      forceMeasureRef.current = true; // viewport / content size changed
+      measure();
+    });
     observer.observe(scrollEl); // viewport (clientHeight) changes
     if (contentEl) observer.observe(contentEl); // streaming / reflow growth
     return () => observer.disconnect();
   }, [ctx.scrollRef, measure, scrollElement]);
+
+  // Cancel any pending capture-retry frame when the surface unmounts.
+  useEffect(() => () => cancelAnimationFrame(captureFrameRef.current), []);
 
   return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
 }

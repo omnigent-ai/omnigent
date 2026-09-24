@@ -186,7 +186,7 @@ def _create_claude_native_session(base_url: str) -> str:
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.claude_native import _materialize_claude_agent_spec
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
@@ -406,10 +406,13 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
         )
         assert ok.status_code == 200, "small item pages must keep working"
         assert len(ok.json()["data"]) == 100
-        big = _http.get(
+        # Uvicorn closes connections after unhandled errors. Use a disposable
+        # client so the resume PATCH cannot race with this connection closing.
+        big = httpx.get(
             f"{base_url}/v1/sessions/{session_id}/items",
             params={"limit": 1000, "order": "asc"},
             timeout=60.0,
+            trust_env=False,
         )
         assert big.status_code == 500, "large-page failure signature must be live"
         assert big.json()["error"]["code"] == "internal_error"

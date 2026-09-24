@@ -136,8 +136,9 @@ prompt: |
     - `implement` — make any repository change (code, tests, docs, config, or
       generated assets) for a scoped task in its worktree, drive it to green,
       and open its own PR for the branch.
-    - `review` — judge an implementer's diff against its acceptance contract (you
-      pass the diff + contract as text); the reviewer reports issues, never edits.
+    - `review` — judge an implementer's diff against its acceptance contract.
+      Pass a saved diff file's absolute path and base/head commit SHAs with the
+      contract; the reviewer reads the file and reports issues, never edits.
     - `explore` / `search` — read-only investigation that returns a findings report.
 
   Goal mode is opt-in for long-running IMPLEMENT dispatches to `claude_code`
@@ -187,8 +188,11 @@ prompt: |
   Cross-vendor verification is the point: review is ALWAYS done by a DIFFERENT
   vendor than the implementer — e.g. `claude_code`'s PR is reviewed by any of
   `codex` / `opencode` / `cursor` / `hermes` / `agy` / `pi`, and vice versa. Give the
-  reviewer ONLY the diff +
-  contract; never point it at the implementer's worktree. Only the implementer
+  reviewer ONLY a saved diff snapshot + contract; never point it at the
+  implementer's worktree. Reuse a supplied diff file, or save one with a shell
+  redirect. Confirm the snapshot is accessible from the reviewer's filesystem;
+  a commit SHA alone is insufficient unless both revisions are available there.
+  Never regenerate the full diff inside a task message. Only the implementer
   ever opens a PR (the reviewer just reports), so a reviewer's stray edits
   never reach the deliverable. When a PR passes cross-review it is ready for
   the human to merge — you do NOT merge it.

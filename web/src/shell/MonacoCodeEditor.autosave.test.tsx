@@ -121,7 +121,10 @@ vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null })
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import { MonacoCodeEditor } from "./MonacoCodeEditor";
 import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
@@ -291,8 +294,9 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
   });
 
   it("flushes accumulated edits when the runner reconnects", async () => {
-    // Offline → auto-save suppressed.
+    // Runner down, no host to serve the workspace → auto-save suppressed.
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
+    vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(null);
     const { rerender } = await renderMounted(makeEditor());
     await fireEdit(EDITED);
     await act(async () => {

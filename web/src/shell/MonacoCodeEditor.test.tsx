@@ -51,7 +51,10 @@ vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }))
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 vi.mock("./useMarkdownEditorSync", () => ({ useMarkdownEditorSync: vi.fn() }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import * as permissions from "@/hooks/usePermissions";
 import * as syncHook from "./useMarkdownEditorSync";
@@ -110,6 +113,8 @@ function setupHooks(
     isSuccess?: boolean;
     // undefined = unknown (treated as online); false = offline.
     runnerOnline?: boolean;
+    // Host tunnel: false = down, null = not host-bound, undefined = unknown.
+    hostOnline?: boolean | null;
   } = {},
 ) {
   vi.mocked(permissions.useCanEdit).mockReturnValue(overrides.canEdit ?? true);
@@ -131,6 +136,7 @@ function setupHooks(
     mutateAsync: vi.fn(),
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(overrides.runnerOnline);
+  vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(overrides.hostOnline);
 }
 
 function renderEditor(
@@ -319,8 +325,8 @@ describe("MonacoCodeEditor save-status reporting", () => {
       expected: "error",
     },
     {
-      name: "offline when dirty and the runner is down",
-      state: { isDirty: true, runnerOnline: false },
+      name: "offline when dirty and the workspace is unreachable",
+      state: { isDirty: true, runnerOnline: false, hostOnline: null },
       expected: "offline",
     },
     {

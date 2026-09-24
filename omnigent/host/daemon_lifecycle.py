@@ -25,6 +25,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from omnigent.process_logging import data_dir
 
@@ -69,9 +70,35 @@ def normalize_daemon_target(server_url: str | None) -> str:
     """Return the registry key for a daemon target.
 
     :param server_url: Requested server URL, or ``None`` / empty for local mode.
-    :returns: ``"local"`` for local mode, else the URL without a trailing slash.
+    :returns: ``"local"`` for local mode, else a canonical server URL.
     """
-    return _LOCAL_DAEMON_MARKER if not server_url else server_url.rstrip("/")
+    if not server_url:
+        return _LOCAL_DAEMON_MARKER
+
+    fallback_target = server_url.rstrip("/")
+    try:
+        parsed = urlsplit(server_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return fallback_target
+    if not parsed.scheme or hostname is None:
+        return fallback_target
+
+    scheme = parsed.scheme.lower()
+    hostname = hostname.lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    if port is None or (scheme, port) in {("http", 80), ("https", 443)}:
+        port_suffix = ""
+    else:
+        port_suffix = f":{port}"
+
+    raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
+    userinfo = f"{raw_userinfo}@" if separator else ""
+    netloc = f"{userinfo}{hostname}{port_suffix}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, parsed.query, parsed.fragment))
 
 
 def _target_digest(target: str) -> str:

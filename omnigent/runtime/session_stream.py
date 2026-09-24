@@ -33,12 +33,15 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import (
     audit_event_logger,
     debug_event,
     debug_sink_enabled,
     sse_event_logger,
+    sse_logging_enabled,
 )
+from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -59,10 +62,10 @@ class SubscriberOverflowError(RuntimeError):
 # (queue, event_loop) pairs. The event_loop reference is needed
 # so the sync producer thread can safely deliver items via
 # ``call_soon_threadsafe`` into the queue's owning loop.
-_subscribers: dict[
+_subscribers: WorkspaceScopedCache[
     str,
     set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
-] = {}
+] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
@@ -85,7 +88,8 @@ def _enqueue_or_overflow(
     queue.put_nowait(_OVERFLOW)
 
 
-# ── SSE-event debug logging (table-only; see omnigent.debug_logging) ──────────
+# ── SSE-event debug logging (ZeroBus table and/or local file; see
+# omnigent.debug_logging) ─────────────────────────────────────────────────────
 # Frequent, low-signal events not worth a debug-log row.
 _SSE_SKIP_TYPES = frozenset(
     {"session.terminal.activity", "session.heartbeat", "response.heartbeat"}
@@ -103,6 +107,17 @@ _TURN_OUTCOME_BY_EVENT_TYPE = {
     "response.cancelled": "cancelled",
     "response.incomplete": "incomplete",
 }
+_FAILED_EVENT_SOURCES = ("llm", "execution", "tool", "harness")
+# The authoritative progress-impact per turn outcome: this is where "the task
+# actually stopped" is known, so it overrides any per-error code default (a
+# nominally-transient retry that ultimately failed the turn lands here as
+# blocking). ``completed`` carries no impact; ``cancelled`` is a user-initiated
+# stop, not lost progress.
+_TURN_OUTCOME_IMPACT = {
+    "failed": ErrorImpact.BLOCKING,
+    "incomplete": ErrorImpact.BLOCKING,
+    "cancelled": ErrorImpact.BENIGN,
+}
 # Top-level event fields safe to log — stable identifiers, closed enums, and
 # pure numerics only. Deliberately excludes human/LLM-authored free text
 # (``reason`` — PolicyDeniedEvent's deny reason is LLM-generated and can quote
@@ -115,6 +130,7 @@ _SSE_SAFE_KEYS = (
     "call_id",
     "message_id",
     "phase",
+    "stage",
     "attempt",
     "max_attempts",
     "sequence_number",
@@ -151,24 +167,37 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
             attrs["item_id"] = item["id"]
         if isinstance(item.get("type"), str):
             attrs["item_type"] = item["type"]
+        # For error items, capture level and code so dashboards can exclude
+        # info-level notices from error-rate metrics.
+        if item.get("type") == "error":
+            if isinstance(item.get("level"), str):
+                attrs["item_level"] = item["level"]
+            code = item.get("code")
+            if isinstance(code, str) and len(code) <= 64:
+                attrs["item_code"] = code
     error = event.get("error")
+    if not isinstance(error, dict) and isinstance(response, dict):
+        error = response.get("error")
     if isinstance(error, dict):
         if error.get("code") is not None:
             attrs["error_code"] = error["code"]
         if error.get("source") is not None:
             attrs["error_source"] = error["source"]
+    if event.get("type") == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
+        attrs["error_source"] = event["source"]
     return attrs
 
 
 def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
-    """Mirror one emitted SSE event to the debug-log table (best-effort).
+    """Mirror one emitted SSE event to the debug-log sinks (best-effort).
 
-    No-op unless the debug-log sink is enabled. Logs the event name and safe
-    ids only (never content); heartbeats / terminal-activity are skipped, and
-    failure events go at WARNING. Never raises into :func:`publish`.
+    No-op unless a sink is enabled (the ZeroBus table, the local file, or both).
+    Logs the event name and safe ids only (never content); heartbeats /
+    terminal-activity are skipped, and failure events go at WARNING. Never raises
+    into :func:`publish`.
     """
     with contextlib.suppress(Exception):
-        if not debug_sink_enabled():
+        if not sse_logging_enabled():
             return
         event_type = event.get("type")
         if not isinstance(event_type, str) or event_type in _SSE_SKIP_TYPES:
@@ -177,7 +206,11 @@ def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
         extra = debug_event(event_type, session_id=conversation_id)
         extra["attributes"] = _sse_safe_attributes(event)
         sse_event_logger().log(level, "sse %s", event_type, extra=extra)
-        _log_turn_outcome(conversation_id, event_type, event)
+        # Turn-outcome audit rows are table-only: emit them only when the ZeroBus
+        # sink is on, not merely when the file sink is (the audit logger has no
+        # handler without the table, so an unguarded call would leak to root).
+        if debug_sink_enabled():
+            _log_turn_outcome(conversation_id, event_type, event)
 
 
 def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, Any]) -> None:
@@ -198,8 +231,17 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
         if isinstance(response, dict) and isinstance(response.get("id"), str):
             attributes["response_id"] = response["id"]
         error = event.get("error")
+        if not isinstance(error, dict) and isinstance(response, dict):
+            error = response.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
             attributes["error_code"] = str(error["code"])
+        if event_type == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
+            attributes["error_source"] = event["source"]
+        impact = _TURN_OUTCOME_IMPACT.get(outcome)
+        if impact is not None:
+            attributes["error_impact"] = impact.value
+            # A terminal turn outcome is, by definition, in the turn phase.
+            attributes["error_phase"] = ErrorPhase.TURN.value
     level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
     audit_event_logger().log(level, "turn %s", outcome, extra=extra)
 
@@ -235,9 +277,9 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
         this to fail fast instead of awaiting a response that can never
         arrive; most callers ignore it.
     """
-    # Mirror the emitted event to the debug-log table (best-effort, table-only,
-    # no-op unless the sink is enabled). Done first so it captures every event
-    # the server produces — including ones with no live subscriber.
+    # Mirror the emitted event to the debug-log sinks (best-effort, no content,
+    # no-op unless a sink is enabled). Done first so it captures every event the
+    # server produces — including ones with no live subscriber.
     _log_sse_event(conversation_id, event)
     # Track reconnect state and centrally suppress or rewrite native deltas
     # before they reach subscribers.
@@ -305,7 +347,9 @@ def shutdown_all() -> None:
     :func:`close` per-conversation instead.
     """
     with _lock:
-        all_subs = [entry for subs in _subscribers.values() for entry in subs]
+        # Shutdown spans every workspace and runs context-free, so sweep the
+        # whole backing rather than the current workspace's slice.
+        all_subs = [entry for subs in _subscribers.all_values() for entry in subs]
     for queue, _ in all_subs:
         _enqueue_or_overflow(queue, _DONE)
 

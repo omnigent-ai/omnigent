@@ -31,7 +31,7 @@ _SKILLS = [
 _HELP_NEEDLE = "/repro-skill-00"
 
 
-def _patch_session_host(page: Page, session_id: str) -> None:
+def _patch_session_host(page: Page, session_id: str, *, native: bool = False) -> None:
     """Give the browser's session snapshot a host + workspace so skills load."""
     session_path = f"/v1/sessions/{session_id}"
 
@@ -42,6 +42,9 @@ def _patch_session_host(page: Page, session_id: str) -> None:
         response = route.fetch()
         body = response.json()
         body.update(host_id="header-band-host", workspace="/workspace")
+        if native:
+            body.update(harness="codex-native")
+            body["labels"] = {**body.get("labels", {}), "omnigent.wrapper": "codex-native-ui"}
         route.fulfill(response=response, json=body)
 
     page.route(f"**{session_path}*", snapshot)
@@ -51,6 +54,24 @@ def _serve_skills(page: Page, session_id: str) -> None:
     page.route(
         f"**/v1/skills?session_id={session_id}",
         lambda route: route.fulfill(json={"skills": _SKILLS}),
+    )
+
+
+def _serve_files(page: Page, session_id: str) -> None:
+    entries = [
+        {
+            "id": f"file-{i}",
+            "name": f"file-{i:02d}.txt",
+            "path": f"file-{i:02d}.txt",
+            "type": "file",
+            "bytes": 1,
+            "modified_at": None,
+        }
+        for i in range(40)
+    ]
+    page.route(
+        f"**/v1/sessions/{session_id}/resources/environments/default/filesystem*",
+        lambda route: route.fulfill(json={"object": "list", "data": entries, "has_more": False}),
     )
 
 
@@ -155,6 +176,11 @@ def test_help_command_output_stays_below_header(
         f"/help output top {geom['feedback']['top']} crosses under header bottom "
         f"{geom['header']['bottom']} — header paints over the /help output"
     )
+    panel = page.get_by_test_id("composer-command-output")
+    overflow = panel.evaluate(
+        "(el) => [el.clientHeight, el.scrollHeight, getComputedStyle(el).overflowY]"
+    )
+    assert overflow[1] > overflow[0] and overflow[2] == "auto", overflow
 
 
 def test_slash_menu_stays_below_header_on_short_window(
@@ -185,6 +211,39 @@ def test_slash_menu_stays_below_header_on_short_window(
         f"slash menu top {geom['menu']['top']} crosses under header bottom "
         f"{geom['header']['bottom']} on a short window"
     )
+    overflow = page.get_by_test_id("slash-menu-item-help").evaluate(
+        "(el) => [el.parentElement.clientHeight, el.parentElement.scrollHeight]"
+    )
+    assert overflow[1] > overflow[0], overflow
+
+
+def test_mention_menu_stays_below_header_on_short_window(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    base_url, session_id = seeded_session
+    _patch_session_host(page, session_id, native=True)
+    _serve_files(page, session_id)
+    _install_stream_controller(page, session_id)
+
+    page.set_viewport_size({"width": 1280, "height": 430})
+    page.goto(f"{base_url}/c/{session_id}")
+
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill("@")
+    item = page.get_by_test_id("file-mention-item-0")
+    expect(item).to_be_visible(timeout=15_000)
+
+    geom = _header_and_menu(page, "file-mention-item-0")
+    assert geom["header"] is not None
+    assert geom["menu"] is not None
+    assert geom["menu"]["top"] >= geom["header"]["bottom"] - 1, geom
+    overflow = item.evaluate(
+        "(el) => { const list = el.closest('[role=listbox]'); "
+        "return [list.clientHeight, list.scrollHeight, getComputedStyle(list).overflowY]; }"
+    )
+    assert overflow[1] > overflow[0] and overflow[2] == "auto", overflow
 
 
 def test_bare_model_command_clears_the_draft(

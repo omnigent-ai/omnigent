@@ -204,11 +204,11 @@ def _capath_ca_bytes(capath: str | None) -> bytes:
 def _system_ca_bundle() -> bytes:
     """Return the system CA bundle as PEM bytes.
 
-    Delegates cafile resolution to :func:`omnigent.tls.resolve_ca_file` (single
+    Delegates cafile resolution to :func:`omnigent.util.tls.resolve_ca_file` (single
     source of truth: OS trust store first, certifi fallback). Also includes loose
     certs under ``capath`` where corporate MDM roots often live.
     """
-    from omnigent.tls import resolve_ca_file
+    from omnigent.util.tls import resolve_ca_file
 
     cafile_bytes = Path(resolve_ca_file()).read_bytes()
 

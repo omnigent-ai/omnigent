@@ -27,11 +27,12 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
-from omnigent._platform import resolve_cli_binary
-from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES, canonicalize_harness
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
@@ -42,6 +43,7 @@ from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
+    DEVIN_KEY,
     GOOSE_KEY,
     HERMES_KEY,
     KIMI_KEY,
@@ -75,6 +77,11 @@ from omnigent.onboarding.provider_config import (
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
 # harness gated below on its binary plus an API key or OAuth credential.
 _logger = logging.getLogger(__name__)
+
+# Bound startup and periodic readiness work: the slow checks are independent
+# CLI version/auth probes, but an unbounded process burst would be unfriendly on
+# smaller hosts.
+_READINESS_PROBE_MAX_WORKERS = 4
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
     {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
@@ -145,6 +152,14 @@ _KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"
 # ``hermes model``); the headless ``hermes`` harness gates on the same binary.
 _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-hermes"})
 
+# Native Devin harnesses boot the resident ``devin`` TUI (``omni devin``). Devin
+# owns its own auth (``devin auth login`` writes a credential file it reads back
+# at spawn), so there is no Omnigent-managed key to gate on and readiness is
+# binary presence — like the other native CLI harnesses. Without these entries
+# they'd fail open like an unknown harness, letting a binary-less launch die
+# inside the executor.
+_DEVIN_NATIVE_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
+
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
 # to the same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``
@@ -207,6 +222,9 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         ``False`` or a reason string otherwise.
     """
     canonical = _canonical_harness(harness)
+    if IS_WINDOWS and canonical in NATIVE_HARNESSES:
+        # Native harnesses require tmux/PTY, which the runner does not support on Windows.
+        return False
     if canonical == "acp":
         # The generic ACP harness has no fixed binary — "configured" means at
         # least one agent is registered in the ``acp:`` config block. Each
@@ -232,6 +250,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(GOOSE_KEY)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
         return _installer_only_availability(HERMES_KEY)
+    if canonical in _DEVIN_NATIVE_HARNESSES:
+        return _installer_only_availability(DEVIN_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -459,8 +479,10 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
+    if IS_WINDOWS and canonical in NATIVE_HARNESSES:
+        return False
     if _is_codex_family_harness(canonical):
-        from omnigent.codex_native import _codex_auth_unavailable_reason
+        from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
         return _codex_auth_unavailable_reason() or True
     install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)
@@ -556,18 +578,38 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
+    spellings.update(_DEVIN_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
-    availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}
-    result: dict[str, HarnessAvailability] = {}
+    canonical_by_cache_key: dict[tuple[str, ...], str] = {}
+    cache_key_by_spelling: dict[str, tuple[str, ...]] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
-        cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
-        if cache_key not in availability_cache:
-            availability_cache[cache_key] = _harness_availability(canonical)
-        result[spelling] = availability_cache[cache_key]
-    return result
+        # Windows-native Codex must not share plain Codex's readiness cache entry.
+        if _is_codex_family_harness(canonical) and not (
+            IS_WINDOWS and canonical in NATIVE_HARNESSES
+        ):
+            cache_key: tuple[str, ...] = ("codex",)
+        else:
+            cache_key = ("harness", canonical)
+        canonical_by_cache_key.setdefault(cache_key, canonical)
+        cache_key_by_spelling[spelling] = cache_key
+
+    with ThreadPoolExecutor(
+        max_workers=min(_READINESS_PROBE_MAX_WORKERS, len(canonical_by_cache_key)),
+        thread_name_prefix="harness-readiness",
+    ) as executor:
+        futures = {
+            cache_key: executor.submit(_harness_availability, canonical)
+            for cache_key, canonical in canonical_by_cache_key.items()
+        }
+        availability_cache = {cache_key: future.result() for cache_key, future in futures.items()}
+
+    return {
+        spelling: availability_cache[cache_key]
+        for spelling, cache_key in cache_key_by_spelling.items()
+    }

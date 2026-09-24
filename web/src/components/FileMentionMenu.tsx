@@ -49,7 +49,12 @@ export function FileMentionMenu({
     <div
       className={cn("absolute bottom-full left-0 mb-2 flex items-end gap-2", COMPOSER_POPOVER_Z)}
     >
-      <div className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu">
+      <div
+        className={cn(
+          "flex w-80 max-w-[calc(100vw-2rem)] shrink-0 flex-col overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu",
+          COMPOSER_POPOVER_MAX_H,
+        )}
+      >
         <div className="flex items-center justify-between gap-2 px-1.5 py-1 text-sm font-medium text-muted-foreground">
           <span className="truncate">{currentDir ? `/${currentDir}` : "Workspace"}</span>
           <span className="shrink-0 text-[10px]">↵ open · ⇥ attach</span>
@@ -57,11 +62,7 @@ export function FileMentionMenu({
         {entries.length === 0 && loading ? (
           <div className="px-1.5 py-1 text-ui text-muted-foreground">Loading…</div>
         ) : (
-          <div
-            ref={listRef}
-            role="listbox"
-            className={cn(COMPOSER_POPOVER_MAX_H, "overflow-y-auto")}
-          >
+          <div ref={listRef} role="listbox" className="min-h-0 overflow-y-auto">
             {entries.map((entry, i) => {
               const isDir = entry.type === "directory";
               return (

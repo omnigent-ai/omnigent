@@ -2,8 +2,8 @@
 
 Shared by the ACP executors (``acp`` generic, ``goose``, ``qwen``). Reuses the
 *same* stdio ``serve-mcp`` relay the native harnesses use
-(:mod:`omnigent.claude_native_bridge`): the ACP agent spawns
-``python -Im omnigent.claude_native_bridge serve-mcp --bridge-dir <dir>`` as an
+(:mod:`omnigent.harnesses.claude_native.bridge`): the ACP agent spawns
+``python -Im omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>`` as an
 MCP server, which proxies each Omnigent tool call back through ``tool_executor``
 (→ :meth:`TurnContext.dispatch_tool` → the Omnigent server, where TOOL_CALL /
 TOOL_RESULT policy is enforced). The agent keeps its own filesystem/shell tools;
@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 if TYPE_CHECKING:
-    from omnigent.claude_native_bridge import ClaudeNativeToolRelay, ToolExecutor
+    from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ class OmnigentAcpMcp:
         if tool_executor is None or not tools:
             return []  # not ready — retry on a later turn, don't cache
         try:
-            from omnigent.claude_native_bridge import (
+            from omnigent.harnesses.claude_native.bridge import (
                 build_mcp_config,
                 prepare_acp_mcp_bridge_dir,
                 start_tool_relay,

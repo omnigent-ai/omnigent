@@ -3,25 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-    codex_native_bridge,
-    cursor_native,
-    cursor_native_bridge,
-    kiro_native,
-    kiro_native_bridge,
-)
-from omnigent.claude_native_bridge import (
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
-from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.cursor_native import main as cursor_native
+from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.harnesses.kiro_native import main as kiro_native
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -67,7 +67,7 @@ class _RecordingCodexAppServerClient:
     Test double for Codex app-server JSON-RPC controls.
 
     :param transport: Transport passed to
-        :func:`omnigent.codex_native_app_server.client_for_transport`, e.g.
+        :func:`omnigent.harnesses.codex_native.app_server.client_for_transport`, e.g.
         ``"ws://127.0.0.1:1234"``.
     :param client_name: App-server client name, e.g.
         ``"omnigent-codex-native-runner"``.
@@ -156,7 +156,7 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     204 as a no-op. The update is a next-turn setting: it is valid even when
     no active turn id is recorded.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "524fe55f9d5a7f66fec5c5401a930b84"
@@ -265,8 +265,8 @@ async def test_events_codex_native_plan_mode_change_preserves_developer_instruct
     real HTTP path end-to-end and asserts the current value is read back
     and threaded through to ``thread/settings/update``.
     """
-    from omnigent import codex_native_app_server
-    from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
 
     conv_id = "6f2f8f7f6a3b4c5d9e0f1a2b3c4d5e6f"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -379,7 +379,7 @@ async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
     plan-mode preservation feature exists to prevent. The tri-state read
     must refuse to guess instead.
     """
-    from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
 
     conv_id = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -684,8 +684,9 @@ async def test_opencode_native_model_options_uses_cli_catalog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from omnigent import opencode_native_app_server, opencode_native_bridge
-    from omnigent.opencode_native_bridge import OpenCodeNativeBridgeState
+    from omnigent.harnesses.opencode_native import app_server as opencode_native_app_server
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "conv_opencode_native_model_options"
@@ -746,6 +747,57 @@ async def test_opencode_native_model_options_uses_cli_catalog(
 
 
 @pytest.mark.asyncio
+async def test_bound_opencode_switch_qualifies_the_literal_gateway_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.inference_config import inference_config_scope
+    from omnigent.spec.types import ExecutorSpec
+
+    update = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge.update_model_override", update)
+    spec = AgentSpec(
+        spec_version=1,
+        name="bound-opencode",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def resolve(_agent: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    profile = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "opencode-native": {
+                    "provider": "gateway",
+                    "default_model": "omnigent/literal",
+                    "model_allowlist": ["omnigent/literal"],
+                }
+            }
+        },
+    }
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": "bound-opencode", "agent_id": "agent-1"}
+        )
+        assert response.status_code == 201, response.text
+        with inference_config_scope(profile):
+            response = await client.post(
+                "/v1/sessions/bound-opencode/events",
+                json={"type": "model_change", "model": "omnigent/literal"},
+            )
+    assert response.status_code == 200, response.text
+    assert update.call_args.args[1] == "omnigent/omnigent/literal"
+
+
+@pytest.mark.asyncio
 async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -758,7 +810,7 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     is still creating its app-server bridge; that would permanently hide the
     Web UI model picker for the session.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
     conv_id = "d2f0a2d856bc03c1674d3d634b4f250c"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -848,9 +900,13 @@ async def test_codex_native_model_options_query_model_list(
     session, so the model named by the session's ``config.toml`` — the one
     the pane launched on — wins when the list offers it.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_args, **_kwargs: None
+    )
     conv_id = "68ba0a62ebe928d26adf37c8974ce1eb"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
@@ -1025,8 +1081,168 @@ async def test_codex_native_model_options_query_model_list(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["default", "other", "missing-spec", "invalid-config"])
+async def test_codex_model_catalog_writeback_uses_session_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """Session rows stay in their provider's shared cache, including across sessions."""
+    from omnigent.harnesses.codex_native import app_server as codex
+    from omnigent.models import model_catalog_store
+    from omnigent.runner.session_init_protocol import (
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+    from omnigent.spec.types import DatabricksAuth
+
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text("[default]\nhost = https://a.example\n[other]\nhost = https://b.example\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.setattr(codex, "_find_codex_cli", lambda: sys.executable)
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    profile = "default" if case == "default" else "other"
+    spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native"},
+            auth=DatabricksAuth(profile=profile),
+        ),
+    )
+
+    async def resolve_spec(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    def resolve_launch(
+        *, model: str | None, spec: AgentSpec | None = None
+    ) -> codex.NativeCodexLaunch:
+        if case == "invalid-config":
+            raise RuntimeError("provider configuration unavailable")
+        selected = spec.executor.auth.profile if spec is not None else "default"
+        return codex.NativeCodexLaunch([], model, selected)
+
+    launch_resolver = Mock(side_effect=resolve_launch)
+    monkeypatch.setattr(codex, "resolve_native_codex_launch", launch_resolver)
+    credentials = Mock(side_effect=AssertionError("cache reuse must not acquire credentials"))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
+    )
+    catalogs = {}
+    fingerprints = {}
+    for provider in ("default", "other"):
+        rows = [
+            {"id": "shared-picker", "model": f"{provider}.schema.model", "isDefault": True},
+            {"id": "second-picker", "model": f"{provider}.schema.second"},
+        ]
+        fingerprint = codex.codex_catalog_fingerprint(codex.NativeCodexLaunch([], None, provider))
+        model_catalog_store.write_catalog("codex-native", fingerprint, rows)
+        catalogs[provider], fingerprints[provider] = rows, fingerprint
+    live_rows = [dict(row, displayName="Live model") for row in catalogs[profile]]
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "second-picker"\n')
+    fake_client = _RecordingCodexAppServerClient("ws://codex.test", "test")
+    monkeypatch.setattr(codex, "client_for_transport", lambda *args, **kwargs: fake_client)
+
+    async def fake_launch(session_id: str, *args: Any, **kwargs: Any) -> SessionResourceView:
+        return SessionResourceView(
+            id="terminal_codex_main",
+            type="terminal",
+            session_id=session_id,
+            name="codex:main",
+            metadata={"running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", fake_launch
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=None if case == "missing-spec" else resolve_spec,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        for session_id in (uuid.uuid4().hex, uuid.uuid4().hex):
+            codex_native_bridge.write_bridge_state(
+                codex_native_bridge.bridge_dir_for_bridge_id(session_id),
+                codex_native_bridge.CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path="ws://codex.test",
+                    thread_id="test-thread",
+                    codex_home=str(codex_home),
+                ),
+            )
+            init = RunnerSessionInitEnvelope(
+                protocol_version=2,
+                server_version="0.14.0",
+                session_id=session_id,
+                agent_id="test-agent",
+                suppress_recovery_turn=True,
+                snapshot=RunnerSessionInitSnapshot(
+                    created_at=0,
+                    updated_at=0,
+                    harness_override="codex-native",
+                ),
+            )
+            created = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": "test-agent",
+                    "session_init": init.model_dump(mode="json"),
+                },
+            )
+            assert created.status_code == 201, created.text
+            fake_client.model_list_responses = [{"result": {"data": live_rows}}]
+            response = await client.get(f"/v1/sessions/{session_id}/codex-model-options")
+            assert response.status_code == 200, response.text
+            assert response.json()["models"] == codex.mark_launch_default(
+                live_rows, "second-picker"
+            )
+            await asyncio.gather(
+                *[
+                    task
+                    for task in asyncio.all_tasks()
+                    if getattr(task.get_coro(), "__name__", "") == "_write_back_codex_catalog"
+                ]
+            )
+            for provider in ("default", "other"):
+                expected = (
+                    live_rows
+                    if provider == profile and case in {"default", "other"}
+                    else catalogs[provider]
+                )
+                assert (
+                    model_catalog_store.read_catalog("codex-native", fingerprints[provider])
+                    == expected
+                )
+            catalog_dir = model_catalog_store.catalog_path(
+                "codex-native", fingerprints[profile]
+            ).parent
+            assert len(list(catalog_dir.glob("*.json"))) == 2
+            for provider, host in (
+                ("default", "https://a.example"),
+                ("other", "https://b.example"),
+            ):
+                assert (
+                    codex._resolve_databricks_codex_model(
+                        host, provider, "shared-picker", codex_path=sys.executable
+                    )
+                    == f"{provider}.schema.model"
+                )
+            credentials.assert_not_called()
+    if case == "missing-spec":
+        launch_resolver.assert_not_called()
+    else:
+        assert launch_resolver.call_count == 2
+        launch_resolver.assert_called_with(model=None, spec=spec)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
 async def test_claude_native_model_options_use_session_launch_catalog(
     monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
 ) -> None:
     """The session listing is the launch catalog from one cached Claude config.
 
@@ -1034,10 +1250,12 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     marked, both reads agree (the second is the session cache), and the
     launch-time config resolution is shared — the spec resolves once.
     """
-    from omnigent.claude_native import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
     conv_id = "6a416804870ed618cc8908f5cebab937"
     claude_spec = AgentSpec(
         spec_version=1,
@@ -1063,12 +1281,18 @@ async def test_claude_native_model_options_use_session_launch_catalog(
         resolved_specs.append(spec)
         return config
 
-    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve
+    )
     probe_calls: list[int] = []
 
     async def _probe(claude_config: object) -> ClaudeModelProbe:
         del claude_config
         probe_calls.append(1)
+        if empty:
+            return ClaudeModelProbe(
+                alias_rows=[], disabled_models=frozenset({"system.ai.claude-opus-4-10"})
+            )
         return ClaudeModelProbe(
             alias_rows=[
                 {
@@ -1086,7 +1310,7 @@ async def test_claude_native_model_options_use_session_launch_catalog(
             default_label="Opus 4.10",
         )
 
-    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
 
     async def _fake_auto_create(
         session_id: str,
@@ -1141,6 +1365,8 @@ async def test_claude_native_model_options_use_session_launch_catalog(
             },
         ]
     }
+    if empty:
+        expected = {"models": []}
     assert first.status_code == 200
     assert first.json() == expected
     assert second.json() == expected
@@ -1148,6 +1374,110 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     # the store's fingerprint cache kept the probe to a single boot.
     assert resolved_specs == [claude_spec]
     assert probe_calls == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
+async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
+) -> None:
+    """Serving the session listing rewrites the bridge's picker vocabulary.
+
+    A cold launch can record no picker values (the store held no catalog
+    yet) while routed picks are accepted against this listing, so the
+    executor's launch snapshot must be refreshed to the served vocabulary --
+    and an authoritative empty catalog clears stale launch values instead
+    of leaving them to spell switches the pane cannot make.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+    from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
+    conv_id = "7b527915981fe729dd9a19a6dfcbc048"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: ClaudeNativeUcodeConfig(env={}, api_key_helper="printf token", model=None),
+    )
+
+    async def _probe(claude_config: object) -> ClaudeModelProbe:
+        del claude_config
+        if empty:
+            return ClaudeModelProbe(alias_rows=[], disabled_models=frozenset())
+        return ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "claude-opus-4-10", "displayName": "Opus 4.10"},
+                {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3", "displayName": "GLM"},
+            ],
+            disabled_models=frozenset(),
+        )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
+    recorded: list[tuple[Any, Any, Any, list[str]]] = []
+
+    def _record(
+        bridge_dir: Any,
+        *,
+        launch_env: Any,
+        launch_model: Any,
+        picker_values: Any = None,
+    ) -> None:
+        recorded.append((bridge_dir, launch_env, launch_model, list(picker_values or [])))
+
+    monkeypatch.setattr(claude_bridge, "record_model_vocabulary", _record)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        listing = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert listing.status_code == 200, listing.text
+    assert recorded, "the listing must refresh the bridge vocabulary"
+    bridge_dir, launch_env, launch_model, picker_values = recorded[-1]
+    assert bridge_dir == claude_bridge.bridge_dir_for_bridge_id(conv_id)
+    assert launch_env is None
+    assert launch_model is None
+    assert picker_values == ([] if empty else ["opus", "system.ai.glm-5-3"])
 
 
 @pytest.mark.asyncio
@@ -1162,11 +1492,13 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     lifetime. The store's single-flight probe survives the inline wait
     expiring — the second read joins it instead of restarting it.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.runner import app as runner_app_module
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
 
     conv_id = "9c527915981fe729dd9a19a6dfcbca49"
     claude_spec = AgentSpec(
@@ -1185,7 +1517,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         model="system.ai.claude-opus-4-10",
     )
     monkeypatch.setattr(
-        "omnigent.claude_native.resolve_native_claude_config",
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
         lambda *, spec: config,
     )
     release = asyncio.Event()
@@ -1197,7 +1529,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         nonlocal probe_calls
         probe_calls += 1
         await release.wait()
-        from omnigent.claude_native import ClaudeModelProbe
+        from omnigent.harnesses.claude_native.main import ClaudeModelProbe
 
         return ClaudeModelProbe(
             alias_rows=[{"id": "sonnet[1m]", "model": "claude-sonnet-5[1m]"}],
@@ -1205,7 +1537,9 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
             default_label=None,
         )
 
-    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _slow_probe)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.probe_claude_model_options", _slow_probe
+    )
     monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
 
     async def _fake_auto_create(
@@ -1288,7 +1622,7 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
     """
     import click
 
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     conv_id = "7b527915981fe729dd9a19a6dfcbca48"
     claude_spec = AgentSpec(
@@ -1305,7 +1639,9 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
         del spec
         raise click.ClickException("Databricks profile 'p' exposes no Claude model services.")
 
-    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve
+    )
 
     async def _fake_auto_create(
         session_id: str,
@@ -1346,8 +1682,10 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
 async def test_claude_native_model_options_expire_and_reread_the_store(
     monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
 ) -> None:
     """The session listing follows the store once its cache TTL passes.
 
@@ -1355,15 +1693,17 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     a runner restart: an expired entry re-reads the store instead of serving
     the rows it cached at first read, and a warm store costs no new probe.
     """
-    from omnigent import model_catalog_store
-    from omnigent.claude_native import (
+    from omnigent.harnesses.claude_native.main import (
         ClaudeModelProbe,
         ClaudeNativeUcodeConfig,
         claude_catalog_fingerprint,
     )
+    from omnigent.models import model_catalog_store
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
     monkeypatch.setattr("omnigent.runner.app._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0)
     conv_id = "8c1f2e3d4a5b46c7d8e9f0a1b2c3d4e5"
     claude_spec = AgentSpec(
@@ -1386,7 +1726,9 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
         del spec
         return config
 
-    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve
+    )
     probe_calls: list[int] = []
 
     async def _probe(claude_config: object) -> ClaudeModelProbe:
@@ -1400,7 +1742,7 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
             default_label="Opus 4.10",
         )
 
-    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
 
     async def _fake_auto_create(
         session_id: str,
@@ -1433,6 +1775,8 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
             "isDefault": True,
         }
     ]
+    if empty:
+        refreshed = []
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1451,7 +1795,7 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     assert first.status_code == 200
     assert [row["model"] for row in first.json()["models"]] == ["system.ai.claude-opus-4-10"]
     assert second.status_code == 200
-    assert [row["model"] for row in second.json()["models"]] == ["system.ai.claude-opus-5"]
+    assert [row["model"] for row in second.json()["models"]] == [row["model"] for row in refreshed]
     # A warm store re-read costs no new harness probe.
     assert probe_calls == [1]
 
@@ -1466,10 +1810,12 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
     the config a launch resolved must retire rows listed under the previous
     one rather than serving them until the cache TTL passes.
     """
-    from omnigent.claude_native import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
     conv_id = "9d2e3f4a5b6c47d8e9f0a1b2c3d4e5f6"
     claude_spec = AgentSpec(
         spec_version=1,
@@ -1492,7 +1838,9 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
         del spec
         return _config("system.ai.claude-opus-4-10")
 
-    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve
+    )
 
     async def _probe(claude_config: ClaudeNativeUcodeConfig) -> ClaudeModelProbe:
         return ClaudeModelProbe(
@@ -1501,7 +1849,7 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
             default_label="Opus",
         )
 
-    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
     recorders: list[Any] = []
 
     async def _fake_auto_create(
@@ -1625,7 +1973,7 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
     3. The session is NOT added to ``_interrupted_sessions``; no marker in
        ``_session_histories``.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
@@ -1773,7 +2121,7 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
     3. The session is NOT added to ``_interrupted_sessions``; no marker leaks
        into ``_session_histories``.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
@@ -1920,7 +2268,7 @@ async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_tu
     Codex TUI's startup interrupt — ``turn/interrupt`` with an empty turn
     id — instead of doing nothing.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = f"36ea25fd09df4a2d85136100fbecd3e9{event_type}"
@@ -2056,7 +2404,7 @@ async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
     send the startup interrupt (empty turn id, best-effort, first) and
     flip the bridge's pending servers to ``cancelled``.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "14fb6a0dde97fc0f7a58a84e1be2c538"
@@ -2171,7 +2519,7 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     An idle codex-native session must not send spurious ``turn/interrupt``
     requests to the app-server on every Stop press.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "5cb0fd92163581dee07e5462a93d5021"
@@ -2276,7 +2624,7 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
     2. An ``interrupt_*`` payload is written to the session's bridge inbox.
     3. NO ``[System: interrupted]`` marker is persisted (the floor never ran).
     """
-    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
@@ -2379,7 +2727,7 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     """
     import json as _json
 
-    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "conv_pi_native_model_change"
@@ -3465,6 +3813,146 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
     ] == []
     # The harness subprocess is still released — the terminal is gone.
     assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> None:
+    """A voluntary /exit (exit 0 + resume banner) is not a crash.
+
+    When the user types /exit or /quit, the CLI prints a "Resume this session
+    with:" banner and exits 0. The pane activity from printing the banner can
+    trip the PTY watcher back to "running" before the pane dies, making
+    session_was_idle False even though the user quit intentionally. The runner
+    must detect the banner and treat the exit as a clean stop: publish idle,
+    release the harness, and never render a red required_terminal_exited card.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = uuid.uuid4().hex
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal_claude_main",
+                terminal_name="claude",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                exit_status=0,
+                # The PTY activity from printing the banner reset the memo to
+                # running, so the generic session_was_idle guard would otherwise
+                # misclassify this normal quit as a crash.
+                session_was_idle=False,
+                last_output=(
+                    "No changes made.\n\nResume this session with:\nclaude --resume abc123"
+                ),
+            )
+        )
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    # The terminal resource is removed and a final idle clears the spinner.
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_claude_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    assert {"type": "session.status", "status": "idle"} in queued_events
+    # No spurious failure card — the user quit normally.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    # The harness subprocess is released.
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
+    """A non-claude terminal exiting with the resume-banner text is still a failure.
+
+    The voluntary-exit banner check is scoped to terminal_name=="claude". Another
+    CLI printing similar text with exit 0 must not bypass the failure path.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = uuid.uuid4().hex
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal_other_main",
+                terminal_name="other",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                exit_status=0,
+                session_was_idle=False,
+                last_output=("Resume this session with:\nother --resume abc123"),
+            )
+        )
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    # Non-claude terminal: the banner does not suppress the failure card.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] != []
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "idle"
+    ] == []
 
 
 @pytest.mark.asyncio

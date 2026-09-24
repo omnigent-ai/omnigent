@@ -1,8 +1,9 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
-import { BubbleView } from "./ChatPage";
+import { BubbleView, buildPendingBubbles } from "./ChatPage";
 
 // UserBubble renders its text through the same markdown renderer as the
 // assistant bubble (FilePathAwareMessageResponse → Streamdown). These tests
@@ -167,6 +168,102 @@ describe("UserBubble system messages", () => {
   });
 });
 
+describe("UserBubble image attachments", () => {
+  const INLINE_PNG =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+  it("renders an imported inline image that carries no file id", () => {
+    // Codex rollouts inline a pasted image as a `data:` URI with no file_id
+    // (`session_import/local.py` preserves the block verbatim).
+    renderBubble(
+      userBubble("look at this", {
+        content: [
+          { type: "input_text", text: "look at this" },
+          { type: "input_image", image_url: INLINE_PNG, filename: "shot.png" },
+        ],
+      }),
+    );
+
+    expect(screen.getByAltText("shot.png")).toHaveAttribute("src", INLINE_PNG);
+    expect(screen.getByText("look at this")).toBeInTheDocument();
+  });
+
+  it("keeps the rest of the message readable when an image block is malformed", () => {
+    // The non-fatal fallback: one unusable attachment costs its own preview,
+    // never the surrounding transcript.
+    renderBubble(
+      userBubble("still readable", {
+        content: [{ type: "input_image" }, { type: "input_text", text: "still readable" }],
+      }),
+    );
+
+    expect(screen.getByText("still readable")).toBeInTheDocument();
+    expect(screen.getByText("Unavailable image")).toBeInTheDocument();
+  });
+
+  it("still shows a chip while an upload is in flight", () => {
+    renderBubble(
+      userBubble("uploading", {
+        content: [
+          { type: "input_image", file_id: "pending:shot.png" },
+          { type: "input_text", text: "uploading" },
+        ],
+      }),
+    );
+
+    expect(screen.getByText("shot.png")).toBeInTheDocument();
+    expect(screen.queryByAltText("shot.png")).toBeNull();
+  });
+});
+
+describe("UserBubble file attachments", () => {
+  it("labels a non-image attachment with its filename", () => {
+    renderBubble(
+      userBubble("read this", {
+        content: [
+          { type: "input_file", file_id: "file_1", filename: "notes.pdf" },
+          { type: "input_text", text: "read this" },
+        ],
+      }),
+    );
+
+    expect(screen.getByText("notes.pdf")).toBeInTheDocument();
+    expect(screen.getByText("read this")).toBeInTheDocument();
+  });
+
+  // An imported transcript is copied verbatim server-side, so a file block can
+  // carry any type; a non-string label would throw "Objects are not valid as a
+  // React child" and blank the whole transcript.
+  it.each([
+    ["an object filename", { type: "input_file", filename: { name: "notes.pdf" } }],
+    ["a numeric file id", { type: "input_file", file_id: 42 }],
+    ["both fields malformed", { type: "input_file", filename: 7, file_id: ["file_1"] }],
+  ])("renders a generic chip when a file block carries %s", (_case, block) => {
+    renderBubble(
+      userBubble("still readable", {
+        content: [block, { type: "input_text", text: "still readable" }] as MessageContentBlock[],
+      }),
+    );
+
+    expect(screen.getByText("Attachment")).toBeInTheDocument();
+    expect(screen.getByText("still readable")).toBeInTheDocument();
+  });
+
+  it("drops a text block whose text is not a string instead of rendering it", () => {
+    renderBubble(
+      userBubble("real text", {
+        content: [
+          { type: "input_text", text: { parts: ["oops"] } },
+          { type: "input_text", text: "real text" },
+        ] as MessageContentBlock[],
+      }),
+    );
+
+    expect(screen.getByText("real text")).toBeInTheDocument();
+    expect(screen.queryByText(/\[object Object\]/)).toBeNull();
+  });
+});
+
 describe("AssistantBubble lifecycle rendering", () => {
   it("shows an interrupted indicator for cancelled assistant bubbles", () => {
     renderBubble(assistantBubble("cancelled"));
@@ -256,6 +353,85 @@ describe("UserBubble copy button", () => {
       }),
     );
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+  });
+});
+
+describe("UserBubble copy-link button", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["pend_12", "server_pending_input_12"])(
+    "disables links for pending input %s until promotion, while keeping text copy",
+    async (tempId) => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      vi.stubGlobal("location", { href: "https://app.example/c/conv_1" });
+      const [pending] = buildPendingBubbles(
+        [{ tempId, content: [{ type: "input_text", text: "queued message" }] }],
+        null,
+      );
+      const { rerender } = renderBubble(pending);
+      const link = screen.getByRole("button", { name: "Copy link" });
+      expect(link).toBeDisabled();
+      fireEvent.click(link);
+      expect(writeText).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith("queued message"));
+
+      rerender(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BubbleView bubble={userBubble("queued message", { itemId: "item_42" })} />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Copy link" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+      await waitFor(() =>
+        expect(writeText).toHaveBeenLastCalledWith("https://app.example/c/conv_1?message=item_42"),
+      );
+    },
+  );
+
+  it("copies a ?message= deep link for the bubble itemId", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    vi.stubGlobal("location", {
+      href: "https://app.example/c/conv_1?debug=1",
+    });
+
+    renderBubble(userBubble("link me", { itemId: "item_42" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        "https://app.example/c/conv_1?debug=1&message=item_42",
+      ),
+    );
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute("data-message-id", "item_42");
+  });
+});
+
+describe("AssistantBubble copy-link button", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("stamps data-message-id with the responseId and copies that link", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    vi.stubGlobal("location", {
+      href: "https://app.example/c/conv_1",
+    });
+
+    renderBubble(assistantBubble("completed"));
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute(
+      "data-message-id",
+      "codex_turn_123",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("https://app.example/c/conv_1?message=codex_turn_123"),
+    );
   });
 });
 

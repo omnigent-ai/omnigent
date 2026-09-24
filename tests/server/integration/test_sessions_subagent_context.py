@@ -21,10 +21,13 @@ no runner bound, no LLM):
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -36,8 +39,15 @@ from omnigent.entities.conversation import (
     MessageData,
     NewConversationItem,
 )
+from omnigent.host.frames import HostHelloFrame
+from omnigent.runtime import set_runner_router
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -45,9 +55,17 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import build_agent_bundle, create_test_agent
+from tests.server.integration.test_sessions_tunnel_three_layer import (
+    _connect_runner_tunnel,
+)
+from tests.server.integration.test_sessions_tunnel_three_layer import (
+    _send_hello_and_wait as _send_runner_hello_and_wait,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -600,3 +618,238 @@ async def test_bundled_agent_uploaded_as_child_stays_private(
         "an outsider bound a session to a private bundled agent: "
         f"{intruder.status_code} {intruder.text}"
     )
+
+
+# ── Replica routing: a child must route like its parent ──────────
+
+
+_ROUTING_HOST_ID = "5c7f0d3a8b1e4f6a9c2d7e8f0a1b2c3d"
+_ROUTING_RUNNER_ID = "runner_token_two_replica_routing"
+
+
+@dataclass
+class _TwoReplicaStack:
+    """Two server replicas over one database.
+
+    :param tunnel_replica: The replica holding the host and runner tunnels.
+    :param tunnel_client: HTTP client bound to ``tunnel_replica``.
+    :param keyless_replica: A replica that shares the database but holds no
+        tunnels — where an unkeyed request lands.
+    :param keyless_client: HTTP client bound to ``keyless_replica``.
+    :param conv_store: Conversation store over the shared database.
+    """
+
+    tunnel_replica: FastAPI
+    tunnel_client: httpx.AsyncClient
+    keyless_replica: FastAPI
+    keyless_client: httpx.AsyncClient
+    conv_store: SqlAlchemyConversationStore
+
+
+@pytest_asyncio.fixture()
+async def two_replica_stack(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> AsyncIterator[_TwoReplicaStack]:
+    """Model a host-sharded deployment with two replicas.
+
+    A host's control tunnel and its runners' tunnels register on ONE replica
+    (keyed by ``host_id``). Every replica shares the database, so a request
+    that lands elsewhere sees the same rows but an empty tunnel registry —
+    the routing miss the ``WRONG_REPLICA`` re-address exists for.
+
+    Resource routes resolve the runner through the runtime-global router,
+    which in production is per-process. Point it at the keyless replica whose
+    resource routes this suite exercises; the tunnel replica's router is
+    consulted directly through its app state.
+    """
+    host_store = HostStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    def _replica(name: str) -> FastAPI:
+        return create_app(
+            agent_store=SqlAlchemyAgentStore(db_uri),
+            file_store=SqlAlchemyFileStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            artifact_store=artifact_store,
+            agent_cache=AgentCache(
+                artifact_store=artifact_store,
+                cache_dir=tmp_path / name / "cache",
+            ),
+            comment_store=SqlAlchemyCommentStore(db_uri),
+            host_store=host_store,
+        )
+
+    tunnel_replica = _replica("tunnel-replica")
+    keyless_replica = _replica("keyless-replica")
+    set_runner_router(keyless_replica.state.runner_router)
+    try:
+        async with (
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=tunnel_replica),
+                base_url="http://tunnel-replica",
+            ) as tunnel_client,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=keyless_replica),
+                base_url="http://keyless-replica",
+            ) as keyless_client,
+        ):
+            yield _TwoReplicaStack(
+                tunnel_replica=tunnel_replica,
+                tunnel_client=tunnel_client,
+                keyless_replica=keyless_replica,
+                keyless_client=keyless_client,
+                conv_store=SqlAlchemyConversationStore(db_uri),
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            await tunnel_replica.state.runner_router.aclose()
+        with contextlib.suppress(Exception):
+            await keyless_replica.state.runner_router.aclose()
+        set_runner_router(None)
+
+
+def _status_and_error_code(resp: httpx.Response) -> tuple[int, str]:
+    """Reduce a response to ``(status, error code)`` for routing assertions."""
+    body = resp.json()
+    return resp.status_code, str(body.get("error", {}).get("code"))
+
+
+async def test_codex_subagent_child_routes_like_its_parent_across_replicas(
+    two_replica_stack: _TwoReplicaStack,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A hostless codex sub-agent child must classify a routing miss as its parent does.
+
+    Reproduces the managed-deployment report where every Codex sub-agent
+    child opened from the web said "runner offline" while the parent kept
+    working: the child copies the parent's ``runner_id`` but no ``host_id``,
+    so a request that lands on a replica without the tunnel cannot tell
+    "wrong replica" (re-address) from "runner gone" (503). The parent, being
+    host-bound, gets the re-addressable ``wrong_replica``; the child must too,
+    for resource reads, a message send, and a retry — and the misrouted send
+    must not be recorded as a failed turn.
+    """
+    stack = two_replica_stack
+    conv_store = stack.conv_store
+
+    # A codex-native parent bound to a host and its runner — the row a
+    # ``omnigent codex`` session on a devbox produces.
+    agent = await create_test_agent(stack.tunnel_client, name="codex-native-parent")
+    parent_id = agent["_session_id"]
+    conv_store.set_host_id(parent_id, _ROUTING_HOST_ID, workspace=str(tmp_path / "ws"))
+    conv_store.replace_runner_id(parent_id, _ROUTING_RUNNER_ID)
+    conv_store.set_labels(
+        parent_id, {_CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CODEX_NATIVE_WRAPPER_LABEL_VALUE}
+    )
+
+    # The host and the runner tunnel register on the tunnel replica only.
+    HostStore(db_uri).upsert_on_connect(_ROUTING_HOST_ID, "devbox", RESERVED_USER_LOCAL)
+    stack.tunnel_replica.state.host_registry.register(
+        _ROUTING_HOST_ID,
+        AsyncMock(),
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="devbox",
+            runners=[_ROUTING_RUNNER_ID],
+        ),
+        owner=RESERVED_USER_LOCAL,
+    )
+    communicator = await _connect_runner_tunnel(stack.tunnel_replica, _ROUTING_RUNNER_ID)
+    try:
+        await _send_runner_hello_and_wait(
+            communicator,
+            stack.tunnel_replica,
+            _ROUTING_RUNNER_ID,
+            harnesses=["codex-native"],
+        )
+
+        # Codex spawns a sub-agent thread; the codex-native forwarder registers
+        # it with exactly this event.
+        start = await stack.tunnel_client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "external_codex_subagent_start",
+                "data": {
+                    "thread_id": "thr_worker_1",
+                    "agent_nickname": "Codex",
+                    "agent_role": "worker",
+                    "prompt": "Investigate the flaky test",
+                },
+            },
+        )
+        assert start.status_code == 202, f"codex sub-agent start failed: {start.text}"
+        child_id = start.json()["child_session_id"]
+        child = conv_store.get_conversation(child_id)
+        assert child is not None
+        assert child.kind == "sub_agent"
+        assert child.runner_id == _ROUTING_RUNNER_ID, "child must share the parent's runner"
+
+        # The runner is online: the replica holding its tunnel resolves the
+        # child's runner client. Whatever the other replica says next is a
+        # routing artifact, not an outage.
+        routed = stack.tunnel_replica.state.runner_router.client_for_session_resources(child_id)
+        assert routed.runner_id == _ROUTING_RUNNER_ID
+
+        # An unkeyed request lands on the other replica. The host-bound
+        # parent is classified as re-addressable ...
+        parent_terminals = await stack.keyless_client.get(
+            f"/v1/sessions/{parent_id}/resources/terminals"
+        )
+        assert _status_and_error_code(parent_terminals) == (400, "wrong_replica"), (
+            f"parent baseline drifted: {parent_terminals.status_code} {parent_terminals.text}"
+        )
+
+        # ... and its child must be classified exactly the same way: it runs
+        # on the parent's runner, on the parent's host's replica.
+        child_terminals = await stack.keyless_client.get(
+            f"/v1/sessions/{child_id}/resources/terminals"
+        )
+        assert _status_and_error_code(child_terminals) == (400, "wrong_replica"), (
+            "a hostless sub-agent child on the wrong replica must re-address like its "
+            f"parent, not report the runner offline: {child_terminals.status_code} "
+            f"{child_terminals.text}"
+        )
+
+        send = await stack.keyless_client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "status?"}],
+                },
+            },
+        )
+        assert _status_and_error_code(send) == (400, "wrong_replica"), (
+            "a message to a hostless sub-agent child on the wrong replica must "
+            f"re-address, not fail the turn: {send.status_code} {send.text}"
+        )
+
+        retry = await stack.keyless_client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "retry_session", "data": {}},
+        )
+        assert _status_and_error_code(retry) == (400, "wrong_replica"), (
+            f"retry on the wrong replica must re-address: {retry.status_code} {retry.text}"
+        )
+
+        # The misrouted send left no failed turn behind on the child.
+        snapshot = await stack.keyless_client.get(f"/v1/sessions/{child_id}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["status"] != "failed", (
+            "a misrouted send must not be recorded as a failed turn on the child"
+        )
+        items = await stack.keyless_client.get(f"/v1/sessions/{child_id}/items")
+        assert items.status_code == 200, items.text
+        assert items.json()["data"] == [], (
+            f"a misrouted send must not persist items on the child: {items.json()['data']!r}"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(Exception):
+            await communicator.wait(timeout=budget(2.0))

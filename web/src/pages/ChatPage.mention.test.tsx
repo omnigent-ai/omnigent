@@ -3,6 +3,7 @@ import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactElement } from "react";
@@ -10,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import { COMPOSER_POPOVER_MAX_H } from "@/pages/chatLayout";
 
 // Drill-down "@"-mention browses one directory at a time, so the test stubs
 // both sources: the root listing (useWorkspaceAllFiles) and the per-directory
@@ -59,6 +61,16 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
 }));
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: () => ({ branchState: "unknown", prCount: 0 }),
+}));
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: () => ({ children: [] }),
+}));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
@@ -101,9 +113,6 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     onSelectAgent: vi.fn(),
     permissionLevel: null,
     readOnlyReason: null,
-    replyQuotes: [],
-    onRemoveQuote: vi.fn(),
-    onClearAllQuotes: vi.fn(),
     effortLevels: ["low", "medium", "high"] as const,
     showEffort: true,
     showModels: false,
@@ -232,6 +241,8 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     type("@");
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
     expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+    expect(screen.getByRole("listbox").parentElement).toHaveClass(COMPOSER_POPOVER_MAX_H);
+    expect(screen.getByRole("listbox").closest(".bottom-full")).toHaveClass("z-20");
   });
 
   it("opens a folder to reveal nested files, then delivers the chosen file", () => {

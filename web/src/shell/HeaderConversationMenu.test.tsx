@@ -1,9 +1,12 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
@@ -22,6 +25,10 @@ const mocks = vi.hoisted(() => ({
   archive: vi.fn(),
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
+  fork: vi.fn(),
+  exportTranscript: vi.fn(),
+  triggerDownload: vi.fn(),
+  toastError: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -49,6 +56,20 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
   return { ...actual, markConversationUnread: mocks.markUnread };
 });
 
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApiModule>();
+  return { ...actual, exportSessionTranscript: mocks.exportTranscript };
+});
+
+vi.mock("@/hooks/useFileContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseFileContentModule>();
+  return { ...actual, triggerBrowserDownload: mocks.triggerDownload };
+});
+
+vi.mock("sonner", () => ({
+  toast: { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() },
+}));
+
 const CONVERSATION: Conversation = {
   id: "conv-1",
   object: "conversation",
@@ -69,16 +90,23 @@ const SECOND_CONVERSATION: Conversation = {
 };
 
 function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
+  // A QueryClientProvider is required: the menu reads useQueryClient() to hand
+  // the post-archive Undo toast a client for unarchiving.
+  const queryClient = new QueryClient();
   return (
-    <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
-      <HeaderConversationMenu
-        conversation={CONVERSATION}
-        currentProject={null}
-        canShare
-        onShare={() => {}}
-        {...overrides}
-      />
-    </MemoryRouter>
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
+        <HeaderConversationMenu
+          conversation={CONVERSATION}
+          currentProject={null}
+          canShare
+          canFork
+          onShare={() => {}}
+          onFork={mocks.fork}
+          {...overrides}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
   );
 }
 
@@ -118,6 +146,8 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -149,6 +179,42 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
   });
 
+  it("downloads the transcript as <session-id>.jsonl from Export", async () => {
+    const jsonl = '{"record_type":"session_meta","id":"conv-1"}\n';
+    mocks.exportTranscript.mockResolvedValueOnce(jsonl);
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.triggerDownload).toHaveBeenCalledTimes(1));
+    expect(mocks.exportTranscript).toHaveBeenCalledWith("conv-1");
+    const [blob, filename] = mocks.triggerDownload.mock.calls[0]! as [Blob, string];
+    expect(filename).toBe("conv-1.jsonl");
+    expect(await blob.text()).toBe(jsonl);
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an export failure as a toast and downloads nothing", async () => {
+    mocks.exportTranscript.mockRejectedValueOnce(new Error("boom"));
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Export failed"));
+    expect(mocks.triggerDownload).not.toHaveBeenCalled();
+  });
+
+  it("opens a full-history fork from the session menu", () => {
+    renderMenu();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(mocks.fork).toHaveBeenCalledOnce();
+  });
+
   it("renames from the mobile Rename dialog", () => {
     // Rename is mobile-only in this menu now — desktop renames by clicking the
     // breadcrumb title (HeaderTitle).
@@ -169,9 +235,9 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // Just the flag: the optimistic overlay lives in the hook, and the
-    // "view archived" toast fires synchronously (navigating away unmounts this
-    // menu, so a mutate onSuccess callback wouldn't fire).
+    // Just the flag: the optimistic overlay lives in the hook, and the Undo
+    // toast fires synchronously (navigating away unmounts this menu, so a
+    // mutate onSuccess callback wouldn't fire).
     expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
 
     view.unmount();
@@ -184,6 +250,22 @@ describe("HeaderConversationMenu", () => {
       id: "conv-1",
       deleteBranch: true,
     });
+  });
+
+  it("offers Unarchive on an archived session and unarchives in place", () => {
+    // An archived session reopened by URL must not be re-offered the action
+    // that was already taken; the item flips like the sidebar row's menu.
+    renderMenu({ conversation: { ...CONVERSATION, archived: true } });
+
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+    const item = screen.getByRole("menuitem", { name: "Unarchive" });
+    expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
+
+    fireEvent.click(item);
+    // Just the flag flip: unarchiving keeps the user on the session, so no
+    // redirect home and no Undo toast.
+    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: false });
   });
 
   it("labels project actions for filed and unfiled sessions", () => {
@@ -353,7 +435,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
     openMenu();
     const label = screen.getByText("Quarterly planning");
-    expect(label).toHaveAttribute("data-slot", "dropdown-menu-label");
+    expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();
@@ -377,7 +459,9 @@ describe("HeaderConversationMenu", () => {
     mocks.isMobile = true;
     renderMenu();
     const mobileTrigger = screen.getByRole("button", { name: "Conversation actions" });
-    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-4");
+    // 44px tap-target floor on phones, matching the sibling header controls.
+    expect(mobileTrigger).toHaveClass("max-md:size-11");
+    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-5");
     openMenu();
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
   });
@@ -392,6 +476,8 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -412,6 +498,8 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",

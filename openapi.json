@@ -126,7 +126,7 @@
             "type": "array"
           },
           "skills": {
-            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
+            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session exists. `GET /skills` discovers host skills and, when given `session_id`, merges the session's bundled skills. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },
@@ -172,7 +172,7 @@
       },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
-        "description": "Request body for the current-agent automatic rename endpoint.",
+        "description": "Proposed title for a framework or agent-initiated rename.",
         "properties": {
           "title": {
             "maxLength": 100,
@@ -196,7 +196,8 @@
                 "enum": [
                   "not_top_level",
                   "no_seed",
-                  "title_changed"
+                  "title_changed",
+                  "generation_failed"
                 ],
                 "type": "string"
               },
@@ -1056,9 +1057,13 @@
                 "type": "integer"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
+            "description": "Opaque vendor compaction-window identifier. Current Codex writes a UUID string to `payload.window_id` on its `type == \"compacted\"` rollout JSONL record; older Codex rollouts used integer counters there.",
             "title": "Window Id"
           }
         },
@@ -1100,7 +1105,7 @@
         "type": "object"
       },
       "CompactionInProgressEvent": {
-        "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.",
+        "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.\n\nA long compaction is announced repeatedly (once per status poll), so\nclients must treat every event carrying the same `started_at` as one\ncompaction \u2014 refreshing their indicator rather than stacking another.",
         "properties": {
           "sequence_number": {
             "anyOf": [
@@ -1114,6 +1119,20 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp (seconds) when this compaction was first reported in progress. Stable across repeated progress events for the same compaction, so clients can anchor an elapsed counter to the true start \u2014 including after a page reload. `None` when the emitter does not track it.",
+            "title": "Started At"
           },
           "type": {
             "const": "response.compaction.in_progress",
@@ -1672,6 +1691,20 @@
             "title": "Elicitation Id",
             "type": "string"
           },
+          "reason": {
+            "anyOf": [
+              {
+                "const": "unanswered",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Why a verdict-less resolution happened, when known. `\"unanswered\"`: the hook stopped waiting (a severed poll never re-parked, the ask timed out) before anyone answered, so the prompt is gone rather than decided and the UI can say so instead of implying it was resolved elsewhere. `None` when a verdict is present or the reason is unknown.",
+            "title": "Reason"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -1760,7 +1793,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "Optional one/two-sentence explanation of why it failed. Paired with `title`.",
             "title": "Cause"
           },
@@ -1783,7 +1815,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "Optional concrete next step to fix it, e.g. a command to run. `None` when there is no single clear fix.",
             "title": "Remediation"
           },
@@ -1796,7 +1827,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "Optional short headline naming what went wrong, e.g. `\"Claude Code can't run as root\"`. Present when the runner recognized the failure (see `omnigent.runner.launch_failure`); lets the UI show a clear card title instead of the raw `code`.",
             "title": "Title"
           }
@@ -1865,6 +1895,20 @@
           "error"
         ],
         "title": "ErrorEvent",
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "description": "The body every failed request carries: a single `error` object.\n\nMirrors what the FastAPI exception handler emits for an\n`~omnigent.errors.OmnigentError`, so documented error responses\nand the runtime envelope stay the same shape.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail",
+            "description": "Machine-readable detail about the failure."
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
         "type": "object"
       },
       "ExtensionAssetErrorResponse": {
@@ -2578,6 +2622,79 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostModelOptionsResponse": {
+        "description": "Pre-launch model choices resolved by a host harness.\n\n`error` carries the host's reason for an empty catalog \u2014 a probe that\nfailed on the host is not a transport failure, so the request still\nsucceeds and the picker can say WHY it is empty instead of a generic\n\"Models unavailable\".",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "models": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "routable_models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Routable Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models",
+          "routable_models"
+        ],
+        "title": "HostModelOptionsResponse",
+        "type": "object"
+      },
+      "ImportFailureRef": {
+        "description": "One session that could not be imported, with a user-facing reason.\n\n`external_session_id` / `source` name the source session when known (a\nhost that reports only a count leaves them `None`); `reason` explains the\nfailure so the UI can show it instead of an anonymous \"N failed\". Also the\nshape of each `{\"event\": \"failed\", ...}` line on the stream endpoint.",
+        "properties": {
+          "external_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Session Id"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "ImportFailureRef",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -2618,6 +2735,17 @@
             "default": false,
             "title": "Force",
             "type": "boolean"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
           },
           "items": {
             "items": {
@@ -2921,6 +3049,13 @@
             "title": "Failed",
             "type": "integer"
           },
+          "failures": {
+            "items": {
+              "$ref": "#/components/schemas/ImportFailureRef"
+            },
+            "title": "Failures",
+            "type": "array"
+          },
           "imported": {
             "format": "int64",
             "title": "Imported",
@@ -3092,6 +3227,18 @@
             ],
             "title": "Role",
             "type": "string"
+          },
+          "stream_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native live-preview stream finalized by this assistant message. Persisted so reconnect snapshots can suppress delayed preview chunks after the authoritative item.",
+            "title": "Stream Message Id"
           }
         },
         "required": [
@@ -3657,6 +3804,67 @@
           "joined_at"
         ],
         "title": "PresenceViewer",
+        "type": "object"
+      },
+      "ProjectOrderRequest": {
+        "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.\nThe serialized preference must fit in 65,535 bytes after compression and\nframing; lists below the 10,000-ID limit can still exceed this byte limit.",
+        "properties": {
+          "ordered_project_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 32,
+                  "minLength": 32,
+                  "pattern": "^[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                "maxItems": 10000,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ordered Project Ids"
+          }
+        },
+        "required": [
+          "ordered_project_ids"
+        ],
+        "title": "ProjectOrderRequest",
+        "type": "object"
+      },
+      "ProjectOrderResponse": {
+        "description": "Current sorting mode and the manual order retained in either mode.",
+        "properties": {
+          "ordered_project_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ordered Project Ids"
+          },
+          "sort_mode": {
+            "enum": [
+              "alphabetical",
+              "manual"
+            ],
+            "title": "Sort Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sort_mode",
+          "ordered_project_ids"
+        ],
+        "title": "ProjectOrderResponse",
         "type": "object"
       },
       "QueuedEvent": {
@@ -4319,6 +4527,18 @@
             ],
             "title": "Scope",
             "type": "string"
+          },
+          "task_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human label of the task/spawn this decision governed, e.g. `\"Research auth flows\"` \u2014 what ties a fan-out's decision to its sub-agent when every spawn shares one `agent` type. `None` when the spawn carried none, and on rows written before the field existed.",
+            "title": "Task Description"
           }
         },
         "required": [
@@ -4470,6 +4690,17 @@
             ],
             "title": "Sandbox Provider"
           },
+          "sandbox_provider_capabilities": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "boolean"
+              },
+              "type": "object"
+            },
+            "default": {},
+            "title": "Sandbox Provider Capabilities",
+            "type": "object"
+          },
           "sandbox_providers": {
             "items": {
               "type": "string"
@@ -4556,6 +4787,7 @@
             "response.reasoning_text.delta": "#/components/schemas/ReasoningTextDeltaEvent",
             "response.retry": "#/components/schemas/RetryEvent",
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
+            "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
             "session.codex_approval_mode": "#/components/schemas/SessionCodexApprovalModeEvent",
@@ -4573,7 +4805,6 @@
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
-            "session.skills": "#/components/schemas/SessionSkillsEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
@@ -4629,9 +4860,6 @@
             "$ref": "#/components/schemas/SessionMcpStartupEvent"
           },
           {
-            "$ref": "#/components/schemas/SessionSkillsEvent"
-          },
-          {
             "$ref": "#/components/schemas/SessionModelOptionsEvent"
           },
           {
@@ -4645,6 +4873,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSupersededEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionBtwSidechatEvent"
           },
           {
             "$ref": "#/components/schemas/SessionPresenceEvent"
@@ -4801,6 +5032,59 @@
           "agent_name"
         ],
         "title": "SessionAgentChangedEvent",
+        "type": "object"
+      },
+      "SessionBtwSidechatEvent": {
+        "description": "A Claude Code `/btw` side-chat exchange to show transiently.\n\n`/btw` opens an ephemeral side conversation whose answer Claude Code\nkeeps only in its in-TUI overlay \u2014 it is never written to the session\ntranscript. The claude-native forwarder scrapes the settled overlay\nfrom the pane and emits this event so the managed web UI can show the\nsame ephemeral overlay (dismissed with Escape), WITHOUT adding a\npersisted side-chat turn to the main conversation.\n\nCategory: **transient** (SSE-only), live-only by design. Nothing is\npersisted and there is no SSE replay, so a reload drops the overlay \u2014\nmatching the terminal, where Escape closes it and leaves no history.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.btw_sidechat\", \"conversation_id\": <id>, \"question\": <str>, \"answer\": <str>, \"truncated\": <bool>}`.",
+        "properties": {
+          "answer": {
+            "description": "The side-chat answer text.",
+            "title": "Answer",
+            "type": "string"
+          },
+          "conversation_id": {
+            "description": "The conversation whose stream this rides.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "question": {
+            "description": "The `/btw` request line as typed, e.g. `\"/btw is this backward compatible?\"`.",
+            "title": "Question",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "truncated": {
+            "default": false,
+            "description": "True when the pane clipped a longer answer; the web overlay notes it and points at the terminal for the full text.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "type": {
+            "const": "session.btw_sidechat",
+            "description": "Always `\"session.btw_sidechat\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "question",
+          "answer"
+        ],
+        "title": "SessionBtwSidechatEvent",
         "type": "object"
       },
       "SessionChangedFilesInvalidatedEvent": {
@@ -5063,6 +5347,16 @@
             "title": "Codex Bypass Sandbox",
             "type": "boolean"
           },
+          "host_type": {
+            "default": "external",
+            "description": "How the fork's host is obtained \u2014 `\"external\"` (the default: the caller binds one afterwards, via `POST /v1/hosts/{host_id}/runners` from the web dialog or `PATCH /v1/sessions/{id}` from the REPL) or `\"managed\"` (the server provisions a sandbox host for the fork, the same background launch a `host_type: \"managed\"` create schedules).",
+            "enum": [
+              "external",
+              "managed"
+            ],
+            "title": "Host Type",
+            "type": "string"
+          },
           "model_override": {
             "anyOf": [
               {
@@ -5086,6 +5380,23 @@
             ],
             "description": "Per-session reasoning-effort override to apply to the fork, e.g. `\"high\"`. **Omitting** the field inherits the source's effort; an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets it. Validated against the shared effort vocabulary; provider support is enforced at launch. Set by the web fork dialog's effort picker.",
             "title": "Reasoning Effort"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which configured sandbox provider to provision on `host_type: \"managed\"` (one of the server's `sandbox_providers`); `None` takes the server's first. Only valid with `host_type: \"managed\"`.",
+            "title": "Sandbox Provider"
+          },
+          "side_chat": {
+            "default": false,
+            "title": "Side Chat",
+            "type": "boolean"
           },
           "terminal_launch_args": {
             "anyOf": [
@@ -5126,6 +5437,18 @@
             ],
             "description": "Truncation point for the copied history, e.g. `\"resp_abc123\"`. When set, only items up to and including the last item of that response are copied \u2014 items after it are dropped from the fork. When `None` (default), the full history is copied.",
             "title": "Up To Response Id"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Git repository URL (optionally `#<branch>`) the server clones into the fork's sandbox as its working directory, e.g. `\"https://github.com/org/repo#release-1.2\"`. **Omitting** the field inherits the repository the source session recorded, so cloning a sandbox session lands the fork in the same checkout; an explicit value overrides it and an explicit `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"` \u2014 an external fork's directory is chosen when it binds a host.",
+            "title": "Workspace"
           }
         },
         "title": "SessionForkRequest",
@@ -6373,6 +6696,22 @@
             "title": "Id",
             "type": "string"
           },
+          "inference_configured": {
+            "default": false,
+            "title": "Inference Configured",
+            "type": "boolean"
+          },
+          "inference_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inference Error"
+          },
           "items": {
             "description": "Committed conversation items in chronological order. Empty for a freshly created session.",
             "items": {
@@ -6581,13 +6920,11 @@
             ],
             "description": "Managed-sandbox launch progress while the session's background sandbox launch is in flight or has failed \u2014 see `SandboxStatus`. `None` for sessions without a managed launch and once the launch succeeds. Sourced from the Omnigent server's in-memory `_session_sandbox_status_cache` at snapshot build time, so a client opening the session mid-launch sees the current stage."
           },
-          "skills": {
-            "description": "Skills the bound agent has access to \u2014 the merged result of the agent spec's bundled `skills` and the host-scope skills discovered along the agent workdir / `~/.claude/skills/` (subject to the spec's `skills_filter`). Mirrors what the TUI passes to the runner at startup. Empty list when the agent spec cannot be loaded, or when bundled + host discovery yields nothing.",
-            "items": {
-              "$ref": "#/components/schemas/SkillSummary"
-            },
-            "title": "Skills",
-            "type": "array"
+          "share_workspace_files": {
+            "default": false,
+            "description": "Whether the owner opted into letting view-level collaborators browse the workspace (Files/Changes/GitHub surfaces). `False` by default \u2014 read grants share the conversation only. The web share dialog reads this to render the toggle, and the rail reads it to decide whether to mount the file surfaces for a view-only viewer.",
+            "title": "Share Workspace Files",
+            "type": "boolean"
           },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
@@ -6658,7 +6995,7 @@
             "title": "Title"
           },
           "todos": {
-            "description": "Current Claude Code todo list items for `omnigent claude` sessions, as raw dicts from Claude's todo JSON file. Each dict has `content`, `status`, and `activeForm` keys. Empty list for non-claude-native sessions or when no todos have been reported yet. Sourced from the Omnigent server's in-memory `_session_todos_cache`.",
+            "description": "Current native Plan items reported by a harness. Each has `content`, `status`, and `activeForm`. Persisted in conversation metadata; empty before the first report or after an explicit clear.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -6676,7 +7013,7 @@
                 "type": "null"
               }
             ],
-            "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
+            "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event. Also `None` when `usage_included` is `False`.",
             "title": "Total Cost Usd"
           },
           "updated_at": {
@@ -6704,8 +7041,14 @@
                 "type": "null"
               }
             ],
-            "description": "Per-model breakdown of the same subtree usage, keyed by the raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` when no per-model usage has been recorded (older sessions recorded before this field existed, or before the first turn). Lets the UI show which models a session spent its tokens / budget on.",
+            "description": "Per-model breakdown of the same subtree usage, keyed by the raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` when no per-model usage has been recorded (older sessions recorded before this field existed, or before the first turn). Lets the UI show which models a session spent its tokens / budget on. Also `None` when `usage_included` is `False`.",
             "title": "Usage By Model"
+          },
+          "usage_included": {
+            "default": true,
+            "description": "`False` when the caller skipped usage aggregation with `include_usage=false`. Both usage fields are then unknown, not zero or this session's own-only spend. Display clients can load them with a separate `GET /v1/sessions/{id}` using `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
+            "title": "Usage Included",
+            "type": "boolean"
           },
           "workspace": {
             "anyOf": [
@@ -6789,41 +7132,6 @@
           "stage"
         ],
         "title": "SessionSandboxStatusEvent",
-        "type": "object"
-      },
-      "SessionSkillsEvent": {
-        "description": "Signal that a session's runner-owned skills have resolved.\n\nSkills are discovered against the bound runner's filesystem and\nfetched off the session-snapshot hot path: the snapshot kicks a\nsingle background fetch (`_load_runner_skills` in\n`omnigent/server/routes/sessions.py`) and serves `[]` until\nit lands. This event fires the moment that background fetch\npopulates the per-session skills cache, so a connected web client\ncan re-read the snapshot and fill its slash-command menu instead\nof waiting for the next bind.\n\nCarries no payload beyond the conversation id \u2014 it is a \"skills\nare ready, re-read the snapshot\" nudge, mirroring the\ninvalidate-then-refetch shape used by\n`SessionChangedFilesInvalidatedEvent`. The snapshot's\n`skills` field (now cache-backed) stays the source of truth.",
-        "properties": {
-          "conversation_id": {
-            "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed the menu from the session snapshot's `skills` field, which is populated by the runner-skills cache at snapshot build time.",
-            "title": "Conversation Id",
-            "type": "string"
-          },
-          "sequence_number": {
-            "anyOf": [
-              {
-                "format": "int64",
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Sequence Number"
-          },
-          "type": {
-            "const": "session.skills",
-            "description": "Always `\"session.skills\"`.",
-            "title": "Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "type",
-          "conversation_id"
-        ],
-        "title": "SessionSkillsEvent",
         "type": "object"
       },
       "SessionStatusEvent": {
@@ -7130,7 +7438,7 @@
         "type": "object"
       },
       "SessionTodosEvent": {
-        "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets web render a\nlive todo panel in the right column without polling.",
+        "description": "Plan/TODO update from a native terminal-backed session.\n\nEmitted after an `external_session_todos` POST from a native\nharness forwarder, which captures structured Plan updates from\nClaude or Codex and forwards them to the Omnigent server. Lets web\nrender a live todo panel in the right column without polling.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -7151,7 +7459,7 @@
             "title": "Sequence Number"
           },
           "todos": {
-            "description": "Current todo items read from Claude's todo file. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, the gerund form) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is populated by `_session_todos_cache` at snapshot build time.",
+            "description": "Current native Plan/TODO items from a harness. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, display activity) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is restored from persisted metadata at snapshot build time.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -7467,6 +7775,23 @@
           "description"
         ],
         "title": "SkillSummary",
+        "type": "object"
+      },
+      "SkillsResponse": {
+        "description": "User-invocable skill metadata discovered on a host.",
+        "properties": {
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSummary"
+            },
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "skills"
+        ],
+        "title": "SkillsResponse",
         "type": "object"
       },
       "SlashCommandData": {
@@ -8162,6 +8487,18 @@
             ],
             "description": "Identifier of a registered runner, e.g. `\"runner_abc123\"`. `None` leaves runner binding unchanged.",
             "title": "Runner Id"
+          },
+          "share_workspace_files": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opt-in that lets people with *view* (read-only) access browse the session's workspace files. `True` turns sharing on, `False` turns it off (back to edit-only, the default), `None` leaves it unchanged. Manage-gated \u2014 it sits with the grant/revoke and public-access controls that decide who can see the session. Never widens absolute-path browsing, which stays owner-only.",
+            "title": "Share Workspace Files"
           },
           "silent": {
             "default": false,
@@ -9573,12 +9910,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {},
-                    "type": "array"
-                  },
-                  "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HostModelOptionsResponse"
                 }
               }
             },
@@ -9659,7 +9991,7 @@
     },
     "/v1/hosts/{host_id}/worktrees": {
       "get": {
-        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
+        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached, updated_at?}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
         "operationId": "list_host_worktrees_v1_hosts__host_id__worktrees_get",
         "parameters": [
           {
@@ -9799,7 +10131,7 @@
     },
     "/v1/imports/local/stream": {
       "post": {
-        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
+        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch. Each session that could not be imported\nemits one `{\"event\": \"failed\", \"external_session_id\", \"source\", \"reason\"}` line (after the successes), and a terminal\n`{\"event\": \"done\", ...}` carries the tally plus the full `failures`\nlist. A mid-stream host read failure emits `{\"event\": \"error\", ...}`\nbefore `done` (the sessions read so far are already committed and a\nretry is idempotent). Request validation still fails ahead of the stream\nwith the usual HTTP error.",
         "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
         "requestBody": {
           "content": {
@@ -10180,6 +10512,68 @@
         ]
       }
     },
+    "/v1/projects/order": {
+      "get": {
+        "description": "Read the caller's custom order.",
+        "operationId": "get_project_order_v1_projects_order_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOrderResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Project Order",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Save the caller's order and notify their connected clients.",
+        "operationId": "save_project_order_v1_projects_order_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOrderResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Project Order",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/projects/{project_id}": {
       "delete": {
         "description": "Delete one of the caller's projects.\n\nMember sessions are not deleted; they are left for the caller to\nunfile (clearing their `project_id`).\n\n**Returns:** `{\"id\": ..., \"object\": \"project.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
@@ -10464,6 +10858,75 @@
         ]
       }
     },
+    "/v1/sandbox-providers/{provider}/harnesses/{harness}/model-options": {
+      "get": {
+        "operationId": "model_options_v1_sandbox_providers__provider__harnesses__harness__model_options_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Model Options V1 Sandbox Providers  Provider  Harnesses  Harness  Model Options Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Model Options",
+        "tags": [
+          "sandbox inference"
+        ]
+      }
+    },
     "/v1/sessions": {
       "get": {
         "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-`None` `agent_id`\n\u2014 i.e. those created via `POST /v1/sessions`.\nConversations without an agent binding are excluded.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
@@ -10665,6 +11128,16 @@
             },
             "description": "Successful Response"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -10702,7 +11175,7 @@
     },
     "/v1/sessions/projects": {
       "get": {
-        "description": "Return the caller's projects as `{\"id\", \"name\"}` pairs, ordered\nalphabetically by name.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** List of `SessionProjectSummary` ordered by name.",
+        "description": "Return the caller's project summaries in their preferred display order.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** Project summaries in custom order, or alphabetical order by default.",
         "operationId": "list_session_projects_v1_sessions_projects_get",
         "responses": {
           "200": {
@@ -10826,6 +11299,17 @@
               "title": "Refresh State",
               "type": "boolean"
             }
+          },
+          {
+            "description": "When `False`, skip the subtree usage read and return null usage fields with `usage_included=False`. Display clients can independently request this route with `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
+            "in": "query",
+            "name": "include_usage",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Usage",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -10867,6 +11351,17 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "When `False`, skip usage aggregation in the response. Metadata writes during native launch do not need it.",
+            "in": "query",
+            "name": "include_usage",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Usage",
+              "type": "boolean"
             }
           }
         ],
@@ -10999,6 +11494,59 @@
           }
         },
         "summary": "Update Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/agent-title": {
+      "post": {
+        "description": "Apply title requirements to an agent proposal before a guarded rename.",
+        "operationId": "rename_session_from_agent_v1_sessions__session_id__agent_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Session From Agent",
         "tags": [
           "sessions"
         ]
@@ -11420,6 +11968,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
           },
           "422": {
             "content": {
@@ -12012,6 +12570,16 @@
             },
             "description": "Successful Response"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -12442,7 +13010,7 @@
     },
     "/v1/sessions/{session_id}/policies/evaluate": {
       "post": {
-        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.claude_native_hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
+        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.harnesses.claude_native.hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
         "operationId": "evaluate_policy_v1_sessions__session_id__policies_evaluate_post",
         "parameters": [
           {
@@ -13573,7 +14141,7 @@
     },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/shell": {
       "post": {
-        "description": "Execute a shell command in an environment.\n\n**Returns:** Shell result.",
+        "description": "Execute a shell command in an environment.\n\nOwner-only. A command has no path to inspect, so unlike the\nfilesystem proxy there is no workspace-relative form that could\nbe opened to collaborators: any command reaches the owner's own\nmachine, the same boundary `_browse_level` closes for absolute\npaths, and it passes no policy or approval gate on the way.\n\n**Returns:** Shell result.",
         "operationId": "run_environment_shell_v1_sessions__session_id__resources_environments__environment_id__shell_post",
         "parameters": [
           {
@@ -13994,6 +14562,22 @@
               "title": "Session Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pr Url"
+            }
           }
         ],
         "responses": {
@@ -14036,6 +14620,22 @@
               "title": "Session Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pr Url"
+            }
           }
         ],
         "responses": {
@@ -14059,6 +14659,88 @@
           }
         },
         "summary": "List Session Github Changes",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/preferences": {
+      "post": {
+        "description": "Apply the GitHub panel's account (and optional base) selection.\n\nPersists the choice \u2014 a per-workspace account preference in the user\nconfig, and `gh repo set-default` when a base is given \u2014 then returns the\nrefreshed `session.github.info`. Served by the runner when it's online,\nelse by the host over its tunnel (both run the same\n`github_resource.set_github_preference` against the local config +\nworkspace), so a preference change works with the runner asleep.\n\n**Returns:** The refreshed `session.github.info` object.",
+        "operationId": "set_session_github_preference_v1_sessions__session_id__resources_github_preferences_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Session Github Preference",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/prs": {
+      "post": {
+        "operationId": "update_session_github_pr_v1_sessions__session_id__resources_github_prs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Pr",
         "tags": [
           "session_resources"
         ]
@@ -14414,7 +15096,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, or `body.up_to_response_id` names no response in the source session.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {
@@ -14529,6 +15211,125 @@
         "summary": "Set Sharing",
         "tags": [
           "sharing"
+        ]
+      }
+    },
+    "/v1/skills": {
+      "get": {
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.",
+        "operationId": "get_skills_v1_skills_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "harness",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Harness"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Skills",
+        "tags": [
+          "skills"
         ]
       }
     },

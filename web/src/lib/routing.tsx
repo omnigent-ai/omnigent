@@ -29,7 +29,9 @@ import {
   type RefAttributes,
   createContext,
   forwardRef,
+  useCallback,
   useContext,
+  useRef,
 } from "react";
 import {
   Link as RRLink,
@@ -154,10 +156,15 @@ export function basenamedRouting(
     ...base,
     useNavigate: () => {
       const navigate = base.useNavigate();
-      return ((to: To | number, options?: NavigateOptions) => {
-        if (typeof to === "number") return navigate(to);
-        return navigate(rebaseTo(to, basename), options);
-      }) as ReturnType<typeof useRRNavigate>;
+      const basenameRef = useRef(basename);
+      basenameRef.current = basename;
+      return useCallback(
+        ((to: To | number, options?: NavigateOptions) => {
+          if (typeof to === "number") return navigate(to);
+          return navigate(rebaseTo(to, basenameRef.current), options);
+        }) as ReturnType<typeof useRRNavigate>,
+        [navigate],
+      );
     },
     Link: forwardRef<HTMLAnchorElement, OmnigentLinkProps>((props, ref) => {
       const Impl = base.Link;

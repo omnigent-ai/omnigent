@@ -1,9 +1,11 @@
-import { lazy, Suspense, type ComponentType } from "react";
+import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
-import { isFeatureEnabled } from "@/lib/capabilities";
+import { Spinner } from "@/components/ui/spinner";
+import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
+import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
@@ -49,6 +51,10 @@ const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
 );
+const CanvasPage = withPageView(
+  "canvas",
+  lazy(() => import("@/pages/CanvasPage").then((m) => ({ default: m.CanvasPage }))),
+);
 const TasksPage = withPageView(
   "tasks",
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
@@ -60,6 +66,21 @@ const UsagePage = withPageView(
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+
+// A release-feature route stays registered so a hard load never falls through
+// to the catch-all "Page not found" while the /v1/info probe is in flight; the
+// gate is decided inside once the probe resolves.
+function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children: ReactNode }) {
+  const info = useServerInfo();
+  if (info === "loading") {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center">
+        <Spinner className="size-5 text-muted-foreground" aria-label="Loading" />
+      </div>
+    );
+  }
+  return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
+}
 
 interface AppProps {
   /**
@@ -112,17 +133,12 @@ interface AppProps {
  * to the SPA, so unmatched paths land here after the bundle boots
  * rather than a server 404.
  */
-function App({ basename }: AppProps = {}) {
+function AppRoutes({ basename }: AppProps) {
   // Embedded: match the absolute pathname (`${basename}/...`). Standalone
   // (no basename): `prefix` is empty, so every `path` below is identical to
   // the original relative route table.
   const prefix = basename ?? "";
   const info = useServerInfo();
-  // While the probe is in flight, render nothing — first paint is
-  // ~30ms after boot anyway, and flashing the chrome we may
-  // immediately tear down once the probe returns is worse than a
-  // tiny blank moment.
-  if (info === "loading") return null;
 
   // First-run: accounts on but no admin claimed yet. Route EVERY path to
   // the Create-admin form so the first visitor lands on it no matter how
@@ -130,7 +146,7 @@ function App({ basename }: AppProps = {}) {
   // /auth/setup is server-gated to the zero-admin state, and needs_setup
   // flips false the instant it succeeds — so this whole branch disappears
   // after the first admin exists.
-  if (info.accounts_enabled && info.needs_setup) {
+  if (info !== "loading" && info.accounts_enabled && info.needs_setup) {
     return (
       <Suspense fallback={null}>
         <Routes>
@@ -143,7 +159,7 @@ function App({ basename }: AppProps = {}) {
   return (
     <Suspense fallback={null}>
       <Routes>
-        {info.accounts_enabled && (
+        {info !== "loading" && info.accounts_enabled && (
           <>
             <Route path={`${prefix}/login`} element={<LoginPage />} />
             <Route path={`${prefix}/register`} element={<RegisterPage />} />
@@ -154,10 +170,23 @@ function App({ basename }: AppProps = {}) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route
+            path={`${prefix}/canvas`}
+            element={
+              <FeatureGatedPage feature="canvas">
+                <CanvasPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
-          {isFeatureEnabled(info, "usage_page") && (
-            <Route path={`${prefix}/usage`} element={<UsagePage />} />
-          )}
+          <Route
+            path={`${prefix}/usage`}
+            element={
+              <FeatureGatedPage feature="usage_page">
+                <UsagePage />
+              </FeatureGatedPage>
+            }
+          />
           {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
@@ -167,7 +196,7 @@ function App({ basename }: AppProps = {}) {
             path={`${prefix}/settings`}
             element={<Navigate to={`${prefix}/settings/general`} replace />}
           />
-          <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+          <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
@@ -191,4 +220,10 @@ function App({ basename }: AppProps = {}) {
   );
 }
 
-export default App;
+export default function App(props: AppProps = {}) {
+  return (
+    <ChunkLoadErrorBoundary>
+      <AppRoutes {...props} />
+    </ChunkLoadErrorBoundary>
+  );
+}

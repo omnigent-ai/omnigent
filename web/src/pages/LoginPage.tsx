@@ -28,6 +28,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { useSearchParams } from "@/lib/routing";
 import { useAppName } from "@/lib/branding";
+import { withBasePath } from "@/lib/basePath";
 import { useLoginV2 } from "@/lib/useLoginV2";
 import { AuthCardShell } from "@/pages/onboarding/AuthCardShell";
 import { Button } from "@/components/ui/button";
@@ -253,21 +254,27 @@ export function LoginPage() {
  * trusting it.
  */
 function sanitizeReturnTo(raw: string | null): string {
-  if (raw === null || raw === "") return DEFAULT_RETURN_TO;
+  // The default lands the user at the app root under the active base path
+  // (e.g. `/proxy/6767/` behind a subpath proxy), not the origin root.
+  const fallback = withBasePath(DEFAULT_RETURN_TO);
+  if (raw === null || raw === "") return fallback;
   // Must be an absolute path, not protocol-relative (`//host`) or a
   // backslash variant (`/\host`) the URL parser rewrites to one.
   if (!raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/\\")) {
-    return DEFAULT_RETURN_TO;
+    return fallback;
   }
   try {
     const resolved = new URL(raw, window.location.origin);
-    if (resolved.origin !== window.location.origin) return DEFAULT_RETURN_TO;
+    if (resolved.origin !== window.location.origin) return fallback;
     // Re-serialize so the sink gets the parser's normalized path, never
-    // the raw backslash-laden input.
-    return resolved.pathname + resolved.search + resolved.hash;
+    // the raw backslash-laden input. `withBasePath` is idempotent, so a
+    // caller-supplied return_to that's already base-prefixed (e.g. one
+    // captured from the current page's own URL) is left unchanged, while
+    // one that isn't (e.g. a server-issued redirect) gets prefixed here.
+    return withBasePath(resolved.pathname + resolved.search + resolved.hash);
   } catch {
     // `new URL` throws on malformed input — treat anything unparseable
     // as untrusted and fall back to the safe default.
-    return DEFAULT_RETURN_TO;
+    return fallback;
   }
 }

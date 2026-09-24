@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sqlite3
 import sys
 import uuid
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import hermes_native_bridge as b
+from omnigent.harnesses.hermes_native import bridge as b
 
 
 def test_bridge_dir_is_per_session_and_under_root() -> None:
@@ -323,6 +324,41 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     assert len(bridge_config["token"]) > 0
 
 
+def _wrapper_hook_path(wrapper: Path) -> Path:
+    """The hook script the wrapper ``exec``s (the path after the interpreter)."""
+    for line in reversed(wrapper.read_text().splitlines()):
+        if line.startswith("exec "):
+            return Path(shlex.split(line)[-1])
+    raise AssertionError(f"no exec line in wrapper:\n{wrapper.read_text()}")
+
+
+def test_write_policy_hook_config_wrapper_execs_existing_hook(tmp_path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    hermes_home = b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "session-123")
+
+    hook = _wrapper_hook_path(hermes_home / "omnigent-policy-hook.sh")
+    assert hook.is_file(), f"wrapper execs a non-existent hook: {hook}"
+    from omnigent.inner import hermes_policy_hook
+
+    assert hook == Path(hermes_policy_hook.__file__).resolve()
+
+
+def test_inject_relay_into_policy_hook_wrapper_execs_existing_hook(tmp_path: Path) -> None:
+    hermes_home = b.write_policy_hook_config(tmp_path, "http://ap", "conv_h")
+    assert b.inject_relay_into_policy_hook(
+        tmp_path,
+        relay_url="http://127.0.0.1:9999",
+        relay_token="relay-tok",
+        server_url="http://ap",
+        session_id="conv_h",
+    )
+
+    hook = _wrapper_hook_path(hermes_home / "omnigent-policy-hook.sh")
+    assert hook.is_file(), f"relay-rewritten wrapper execs a non-existent hook: {hook}"
+
+
 def test_write_policy_hook_config_copies_user_files(tmp_path, monkeypatch) -> None:
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -484,7 +520,7 @@ def test_mint_hermes_session_id_returns_uuid() -> None:
 
 def test_inject_relay_into_policy_hook_rewrites_wrapper(tmp_path: Path) -> None:
     """inject_relay_into_policy_hook rewrites omnigent-policy-hook.sh with relay env vars."""
-    from omnigent.hermes_native_bridge import inject_relay_into_policy_hook
+    from omnigent.harnesses.hermes_native.bridge import inject_relay_into_policy_hook
 
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir(mode=0o700)
@@ -494,7 +530,7 @@ def test_inject_relay_into_policy_hook_rewrites_wrapper(tmp_path: Path) -> None:
 
     bridge_dir = tmp_path
     # put hermes_home under bridge_dir/_HERMES_HOME_SUBDIR
-    import omnigent.hermes_native_bridge as _b
+    import omnigent.harnesses.hermes_native.bridge as _b
 
     (bridge_dir / _b._HERMES_HOME_SUBDIR).mkdir(parents=True, exist_ok=True)
     real_wrapper = bridge_dir / _b._HERMES_HOME_SUBDIR / "omnigent-policy-hook.sh"
@@ -523,6 +559,6 @@ def test_inject_relay_into_policy_hook_returns_false_when_wrapper_absent(
     tmp_path: Path,
 ) -> None:
     """inject_relay_into_policy_hook returns False when wrapper script is missing."""
-    from omnigent.hermes_native_bridge import inject_relay_into_policy_hook
+    from omnigent.harnesses.hermes_native.bridge import inject_relay_into_policy_hook
 
     assert inject_relay_into_policy_hook(tmp_path, "http://x", "tok", "http://ap", "sid") is False

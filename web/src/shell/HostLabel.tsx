@@ -24,7 +24,7 @@ export function HostLabel({ host }: { host: Host }) {
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
-      <span className="font-mono text-sm">{host.name}</span>
+      <span className="text-ui">{host.name}</span>
       <span
         className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"

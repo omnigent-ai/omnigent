@@ -281,7 +281,10 @@ def _pane_text(base_url: str, session_id: str) -> str:
     :returns: The pane's visible text, or ``""`` before the terminal has
         been advertised (or if the capture fails).
     """
-    from omnigent.claude_native_bridge import BRIDGE_ID_LABEL_KEY, bridge_dir_for_bridge_id
+    from omnigent.harnesses.claude_native.bridge import (
+        BRIDGE_ID_LABEL_KEY,
+        bridge_dir_for_bridge_id,
+    )
 
     session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
     labels = session.get("labels") or {}
@@ -414,6 +417,7 @@ def _send_composer_turn(
     user_marker: str,
     assistant_token: str,
     expected_user_bubbles: int,
+    steer_queued: bool = False,
 ) -> None:
     """Send one composer turn and assert it landed as a chat turn, answered.
 
@@ -431,10 +435,20 @@ def _send_composer_turn(
     :param assistant_token: Unique token the agent must echo back.
     :param expected_user_bubbles: How many user bubbles the transcript must
         hold once this turn has landed.
+    :param steer_queued: Explicitly send a queued turn while a native dialog
+        keeps the session busy.
     """
     set_fallback_mock_llm(mock_llm_server_url, "default", assistant_token)
     set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, assistant_token)
+    if steer_queued:
+        expect(page.locator(_WORKING)).to_be_visible(timeout=30_000)
     _send(page, _turn_prompt(index, user_marker, assistant_token))
+    if steer_queued:
+        queued = page.get_by_test_id("composer-queued-strip")
+        expect(queued).to_contain_text(user_marker, timeout=30_000)
+        expect(page.locator(_USER)).to_have_count(expected_user_bubbles - 1)
+        queued.get_by_role("button", name="Send queued message now", exact=True).click()
+        expect(queued).to_be_hidden(timeout=30_000)
     expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
         timeout=_MOCK_TURN_TIMEOUT_MS
     )
@@ -460,7 +474,8 @@ def test_native_claude_composer_delivers_into_an_occupied_tui(
     bridge now reclaims the input box first. Each case opens its surface with
     real keystrokes through the xterm, verifies the TUI actually rendered it,
     then sends from the chat composer and asserts the message arrived as a
-    user turn and was answered.
+    user turn and was answered. Rewind reports a busy session, so its message
+    is explicitly steered from the queue to exercise bridge delivery.
     """
     base_url, session_id = native_claude_mock_session
     _log.info("occupied-composer journey: base_url=%s session_id=%s", base_url, session_id)
@@ -515,6 +530,7 @@ def test_native_claude_composer_delivers_into_an_occupied_tui(
             user_marker=user_marker,
             assistant_token=assistant_token,
             expected_user_bubbles=index,
+            steer_queued=label == "rewind dialog",
         )
         _log.info("%s: message delivered as a user turn and answered", label)
 

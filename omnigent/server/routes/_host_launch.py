@@ -18,6 +18,8 @@ Centralizing the checks here keeps the two call sites from drifting
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 from dataclasses import dataclass
 
 from fastapi import HTTPException
@@ -80,7 +82,24 @@ def resolve_host_owner(
     return host
 
 
-def host_absent_error(host: Host) -> OmnigentError:
+@functools.cache
+def _deployment_is_sharded() -> bool:
+    """Whether this deployment shards host traffic across replicas by host_id.
+
+    Only the Databricks managed deployment runs multiple replicas behind the
+    host_id-sharding router (Dicer); a single-process / OSS server has exactly
+    one replica, so an absent host is simply offline. The server can't see the
+    sharding layer directly (Dicer strips its routing header), so we detect the
+    managed deployment by the presence of the internal lakebox launcher module —
+    the same signal that gates ``databricks_features`` in ``server_info`` and
+    mirrors the client's own ``isDatabricksWorkspace()`` re-address gate. Cached:
+    ``find_spec`` is side-effect-free but the answer is fixed for the process
+    lifetime.
+    """
+    return importlib.util.find_spec("omnigent.onboarding.sandboxes.lakebox") is not None
+
+
+def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentError:
     """Classify a "host not on this replica" miss for a host-scoped route.
 
     Every route that reaches a host over its live tunnel looks it up in the
@@ -89,17 +108,28 @@ def host_absent_error(host: Host) -> OmnigentError:
     tunnel — the same wrong-replica case ``RunnerRouter`` handles for runner
     dispatch. Tell the two apart from the host record the caller already loaded:
 
-    - still **live** (online + fresh heartbeat) → up on some replica, just not
-      here → :data:`~ErrorCode.WRONG_REPLICA` (400) so the client re-addresses
-      WITHOUT the key.
-    - otherwise → genuinely offline → ``CONFLICT`` (409).
+    - **sharded** deployment and still **live** (online + fresh heartbeat) → up
+      on some replica, just not here → :data:`~ErrorCode.WRONG_REPLICA` (400) so
+      the client re-addresses WITHOUT the key.
+    - otherwise → genuinely unreachable here → ``CONFLICT`` (409).
+
+    On a single-replica deployment the local registry is authoritative: an
+    absent host is unreachable, full stop. Claiming ``WRONG_REPLICA`` there is a
+    lie the client can't satisfy — there is no other replica to re-address to,
+    so a stale-but-``online`` DB row (a host that went away without a clean
+    ``set_offline`` — version swap, crash) would drive an endless 400 poll loop.
+    So ``WRONG_REPLICA`` is emitted only when the deployment is actually sharded.
 
     :param host: The host's persistent record (owner-checked by the caller).
+    :param sharded: Whether this deployment shards by host_id. Defaults to
+        auto-detection (:func:`_deployment_is_sharded`); overridable for tests.
     :returns: The ``OmnigentError`` to raise; the global handler maps its code
         to the HTTP status and the ``{"error": {"code": ...}}`` body the
         client's re-address matches on.
     """
-    if host_is_live(host):
+    if sharded is None:
+        sharded = _deployment_is_sharded()
+    if sharded and host_is_live(host):
         return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
     return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 

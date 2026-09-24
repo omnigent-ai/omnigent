@@ -991,7 +991,7 @@ def test_settle_probe_reads_the_pane_for_claude_and_the_turn_id_for_codex(
     """
     asked: list[Path] = []
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.claude_pane_ready",
+        "omnigent.harnesses.claude_native.bridge.claude_pane_ready",
         lambda bridge_dir: bool(asked.append(bridge_dir)) or True,
     )
 
@@ -1033,10 +1033,10 @@ async def test_replay_switches_the_claude_pane_before_delivering(
         switched.append((bridge_dir, command, auto_confirm))
 
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_slash_command", _inject, raising=False
+        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _inject, raising=False
     )
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.read_model_env",
+        "omnigent.harnesses.claude_native.bridge.read_model_env",
         lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
     )
 
@@ -1077,9 +1077,11 @@ async def test_replay_still_delivers_when_the_claude_switch_fails(
         del command, auto_confirm, confirm_hint
         raise RuntimeError("tmux target is not advertised")
 
-    monkeypatch.setattr("omnigent.claude_native_bridge.inject_slash_command", _boom, raising=False)
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.read_model_env",
+        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _boom, raising=False
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.read_model_env",
         lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
     )
 
@@ -1112,12 +1114,12 @@ async def test_replay_skips_the_switch_for_an_unspeakable_model(
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_slash_command",
+        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
         lambda *a, **k: pytest.fail("must not touch the pane"),
         raising=False,
     )
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.read_model_env",
+        "omnigent.harnesses.claude_native.bridge.read_model_env",
         lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
     )
 
@@ -1145,7 +1147,7 @@ async def test_replay_leaves_the_model_alone_for_codex(
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_slash_command",
+        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
         lambda *a, **k: pytest.fail("codex must not drive the claude pane"),
         raising=False,
     )
@@ -1202,11 +1204,11 @@ async def test_replay_skips_the_switch_when_the_pane_is_already_there(
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.read_claude_status_model",
+        "omnigent.harnesses.claude_native.bridge.read_claude_status_model",
         lambda _dir: "databricks-claude-sonnet-5",
     )
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_slash_command",
+        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
         lambda *a, **k: pytest.fail("no switch when the pane is already on it"),
         raising=False,
     )
@@ -1910,7 +1912,7 @@ def _hook_settings_after_launch(
     session_id: str,
 ) -> dict[str, Any]:
     """Generate a native launch's hook settings for one session snapshot."""
-    from omnigent.codex_native_app_server import (
+    from omnigent.harnesses.codex_native.app_server import (
         _codex_policy_hooks_settings,
         _turn_router_advertised,
     )
@@ -1932,7 +1934,7 @@ def _hook_settings_after_launch(
             return _codex_policy_hooks_settings(
                 tmp_path, "/venv/bin/python", turn_routing=_turn_router_advertised(tmp_path)
             )
-        from omnigent.claude_native_bridge import build_hook_settings
+        from omnigent.harnesses.claude_native.bridge import build_hook_settings
 
         return build_hook_settings(tmp_path, turn_routing=router is not None)
     finally:
