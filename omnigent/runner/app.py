@@ -133,6 +133,7 @@ from omnigent.runner.native import (
     _codex_session_needs_runner_terminal,
     _CodexNativeModelOptionsNotReady,
     _delete_native_bridge_dirs,
+    _ensure_claude_forwarder_for_session,
     _ensure_native_terminal,
     _ensure_orchestrator_skills_in_bundle,
     _forward_harness_response,
@@ -10949,7 +10950,14 @@ def create_runner_app(
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None:
             if await instance.is_alive():
-                return  # pane is registered and alive — nothing to heal
+                # A live pane may have lost the forwarder that mirrors replies into Chat.
+                if terminal_name == "claude":
+                    await _ensure_claude_forwarder_for_session(
+                        conv_id,
+                        server_client=server_client,
+                        resource_registry=resource_registry,
+                    )
+                return  # pane is registered and alive — nothing else to heal
             _logger.info(
                 "native pane registered but dead for conv=%s harness=%s; closing stale entry",
                 conv_id,

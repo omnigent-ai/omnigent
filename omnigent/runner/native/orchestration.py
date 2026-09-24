@@ -328,6 +328,194 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     task.add_done_callback(_evict)
 
 
+async def _start_claude_transcript_forwarder_if_needed(
+    session_id: str,
+    bridge_dir: Path,
+    *,
+    start_at_end: bool,
+) -> bool:
+    """
+    Start ``supervise_forwarder`` when no live task is registered for *session_id*.
+
+    Daemon-owned claude-native sessions rely on the runner for transcript
+    forwarding. If that forwarder task dies while the tmux pane stays live,
+    the web Chat stops receiving assistant turns while the Terminal tab keeps
+    working. Unlike the launch-path start in ``_auto_create_claude_terminal``,
+    this restart owns no session routers, so the task runs bare — scoped router
+    teardown stays with the launch that created them.
+
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Claude bridge directory to tail.
+    :param start_at_end: Passed to ``supervise_forwarder``; only consulted on a
+        cold bridge with no persisted forward cursor.
+    :returns: ``True`` when a new forwarder task was started; ``False`` when a
+        live one already exists.
+    """
+    incumbent = _AUTO_FORWARDER_TASKS.get(session_id)
+    if incumbent is not None and not incumbent.done():
+        return False
+
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.harnesses.claude_native.forwarder import supervise_forwarder
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
+    auth_factory = _make_auth_token_factory()
+    auth_token = auth_factory() if auth_factory is not None else None
+    runner_headers = databricks_request_headers(server_url, bearer_token=auth_token)
+    runner_auth = _RunnerDatabricksAuth(auth_factory)
+
+    forwarder_task = asyncio.create_task(
+        supervise_forwarder(
+            base_url=server_url,
+            headers=runner_headers,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=start_at_end,
+            auth=runner_auth,
+        ),
+        name=f"claude-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, forwarder_task)
+    _logger.info(
+        "Restarted claude transcript forwarder for session %s task=%s",
+        session_id,
+        forwarder_task.get_name(),
+        extra={"session_id": session_id},
+    )
+    return True
+
+
+async def _claude_forwarder_start_at_end_for_heal(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+) -> bool:
+    """
+    Resume-aware ``start_at_end`` for restarting a dead claude forwarder.
+
+    ``supervise_forwarder`` only consults ``start_at_end`` on a cold bridge
+    with no persisted cursor, so a forwarder that ever ran resumes from its
+    on-disk cursor regardless of this answer. On a cold bridge, mirror the
+    launch path's resume decision read-only: a session bound to an external
+    Claude session whose assistant history already reached Omnigent has a
+    transcript synthesized FROM that history, so replaying it from offset 0
+    would double-post every record (the server has no dedup for external
+    conversation items); a fresh session whose replies exist only in the local
+    transcript must replay from the start so Chat can catch up.
+
+    :param server_client: Omnigent server client for session/item lookups.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :returns: ``True`` when a cold forwarder should start at the current
+        transcript end; ``False`` when it should replay from the beginning.
+    """
+    from omnigent.harnesses.claude_native.forwarder import _read_forward_state
+
+    if _read_forward_state(bridge_dir) is not None:
+        return False
+
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        return False
+    if resp.status_code != 200:
+        return False
+    snap = resp.json()
+    if not isinstance(snap, dict):
+        return False
+    external_session_id = snap.get("external_session_id")
+    if not isinstance(external_session_id, str) or not external_session_id:
+        return False
+
+    from omnigent.harnesses.claude_native.main import (
+        _CLAUDE_SESSION_ID_RE,
+        _claude_project_dir_for_cwd,
+        _fetch_all_session_items_for_claude_resume,
+    )
+
+    if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
+        return False
+    session_workspace = snap.get("workspace")
+    raw_workspace = (
+        session_workspace
+        if isinstance(session_workspace, str) and session_workspace
+        else os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    )
+    workspace = Path(raw_workspace.strip()).expanduser().resolve()
+    transcript_path = _claude_project_dir_for_cwd(workspace) / f"{external_session_id}.jsonl"
+    if not (transcript_path.is_file() and transcript_path.stat().st_size > 0):
+        return False
+    try:
+        items = await _fetch_all_session_items_for_claude_resume(server_client, session_id)
+    except Exception:  # noqa: BLE001 — best-effort heal decision
+        return False
+    return any(isinstance(item, dict) and item.get("role") == "assistant" for item in items)
+
+
+async def _ensure_claude_forwarder_for_session(
+    session_id: str,
+    *,
+    server_client: httpx.AsyncClient,
+    resource_registry: SessionResourceRegistry | None,
+) -> None:
+    """
+    Restart a claude-native session's transcript forwarder when it has died.
+
+    The web Chat renders from the server conversation store, which only the
+    runner-owned transcript forwarder fills; the Terminal tab reads the tmux
+    pane directly. A forwarder that dies while the pane stays alive therefore
+    desyncs the two surfaces: assistant replies keep appearing in the terminal
+    but never reach Chat. Pane (re)creation is the only other place a forwarder
+    starts, so a live pane needs this explicit heal. Best-effort: a heal
+    failure must never take the caller's turn down.
+
+    :param session_id: Omnigent session/conversation id.
+    :param server_client: Omnigent server client for bridge-id lookup.
+    :param resource_registry: Session resource registry; ``None`` skips.
+    :returns: None.
+    """
+    if resource_registry is None:
+        return
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is None:
+        return
+    if terminal_registry.get(session_id, "claude", "main") is None:
+        return
+    incumbent = _AUTO_FORWARDER_TASKS.get(session_id)
+    if incumbent is not None and not incumbent.done():
+        return  # live forwarder — skip the bridge-id/session lookups entirely
+    try:
+        from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=session_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        start_at_end = await _claude_forwarder_start_at_end_for_heal(
+            server_client,
+            session_id,
+            bridge_dir,
+        )
+        await _start_claude_transcript_forwarder_if_needed(
+            session_id,
+            bridge_dir,
+            start_at_end=start_at_end,
+        )
+    except Exception:  # noqa: BLE001 — the heal must not fail the turn
+        _logger.warning(
+            "claude transcript-forwarder heal failed for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+
+
 # Background tasks that re-pop a still-pending cost-budget approval on a
 # terminal client that attaches after the ASK fired. Kept referenced so
 # they aren't garbage-collected before they run.
