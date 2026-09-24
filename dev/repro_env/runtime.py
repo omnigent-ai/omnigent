@@ -188,7 +188,8 @@ def supervise(output: Path) -> None:
             "model",
             [
                 sys.executable,
-                str(root / "tests/server/integration/mock_llm_server.py"),
+                "-m",
+                "tests.server.integration.mock_llm_server",
                 str(mock_port),
             ],
             env,

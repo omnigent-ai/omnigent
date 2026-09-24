@@ -80,7 +80,7 @@ _evidence_journals = {}
 _evidence_journals_lock = threading.Lock()
 
 
-def _record_evidence(kind: str, body=None) -> None:
+def _record_evidence(kind: str, body=None, accepted_at_ns=None) -> None:
     attempt = os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR")
     runtime = os.environ.get("OMNIGENT_REPRO_EVIDENCE_ROOT")
     try:
@@ -96,6 +96,7 @@ def _record_evidence(kind: str, body=None) -> None:
         journal.emit(
             "provider_mock",
             action=kind,
+            accepted_at_ns=accepted_at_ns,
             body=body,
             boundary="model provider",
             correlation="timestamp and request content",
@@ -105,12 +106,12 @@ def _record_evidence(kind: str, body=None) -> None:
             print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
 
 
-async def _record_evidence_async(kind: str, body=None) -> None:
+async def _record_evidence_async(kind: str, body=None, accepted_at_ns=None) -> None:
     if os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR") or os.environ.get(
         "OMNIGENT_REPRO_EVIDENCE_ROOT"
     ):
         try:
-            await asyncio.to_thread(_record_evidence, kind, body)
+            await asyncio.to_thread(_record_evidence, kind, body, accepted_at_ns)
         except Exception as exc:
             with contextlib.suppress(Exception):
                 print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
@@ -1004,7 +1005,7 @@ class MockState:
             else:
                 del self.queues[key]
         if record_evidence:
-            _record_evidence("reset")
+            _record_evidence("reset", accepted_at_ns=_time_mod.time_ns())
         self.captured_requests.clear()
         self.request_count = 0
         self.served_models = []
@@ -1033,12 +1034,13 @@ async def create_response(
         parsed = {"raw": body.decode(errors="replace")}
 
     async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
-    await _record_evidence_async("request", parsed)
+    await _record_evidence_async("request", parsed, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1111,12 +1113,13 @@ async def create_message(
         parsed = {"raw": body.decode(errors="replace")}
 
     async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
-    await _record_evidence_async("request", parsed)
+    await _record_evidence_async("request", parsed, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1230,13 +1233,14 @@ async def create_chat_completion(
         parsed = {"raw": body.decode(errors="replace")}
 
     async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
         model = parsed.get("model") if isinstance(parsed, dict) else None
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
-    await _record_evidence_async("request", parsed)
+    await _record_evidence_async("request", parsed, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1457,8 +1461,9 @@ async def reset() -> dict[str, bool]:
     Fallbacks set via ``POST /mock/set_fallback`` are preserved.
     """
     async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
         _state.reset(record_evidence=False)
-    await _record_evidence_async("reset")
+    await _record_evidence_async("reset", accepted_at_ns=accepted_at_ns)
     return {"reset": True}
 
 

@@ -24,12 +24,15 @@ external servers, commands outside the wrapper,
 and arbitrary custom mocks are not fully covered. For browser capture, create an
 explicit `browser.new_context()` and then call `context.new_page()`. Collection errors, truncation,
 missing records and incomplete attempts remain explicit. Shared-runtime provider
-events have timestamps, not assumed ownership by a particular attempt. Do not
+events include request/reset acceptance times as well as journal write times; worker
+scheduling can reorder writes. They do not imply ownership by a particular attempt. Do not
 interpret missing events as proof an action did not happen. Trace text receives credential redaction and is stored uncompressed inside the ZIP
 so the existing bundle byte scan can inspect it. Screenshots/videos can still contain
 visible private data; neither redaction nor the byte scan inspects image pixels.
-An existing trace owner, an abruptly killed browser, or a driver that does not close
-its contexts can leave browser artifacts unavailable; collection errors remain explicit.
+If a driver starts its own trace, the collector saves its initial trace and yields
+ownership. Later tracing belongs to that driver; a `trace_owner` event records this
+coverage limit. An abruptly killed browser or unclosed context can leave artifacts
+unavailable; collection errors remain explicit.
 If trace redaction fails, the raw trace is deliberately removed from this automatically
 uploaded directory; renaming it here would still upload it. The collector records the
 failure without advertising a saved trace. Other observations remain available.

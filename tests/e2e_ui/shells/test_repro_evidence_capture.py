@@ -36,15 +36,19 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path, brows
 
     from websockets.sync.server import serve
 
+    final_items = []
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
-            if self.path == "/":
+            if self.path == "/c/shared":
                 self.send_header("Content-Type", "text/html")
                 body = b'<input aria-label="Input"><button>Observe</button>'
             else:
                 self.send_header("Content-Type", "application/json")
-                body = b'{"data":[],"has_more":false}'
+                import json
+
+                body = json.dumps({"data": final_items, "has_more": False}).encode()
             self.end_headers()
             self.wfile.write(body)
 
@@ -69,7 +73,10 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path, brows
         with browser.new_context(record_video_dir=str(tmp_path / "temporary-video")) as context:
             page = context.new_page()
             base = f"http://127.0.0.1:{server.server_port}"
-            page.goto(base)
+            page.goto(base + "/c/shared")
+            # A later test reuses the context without another navigation.
+            collector.node = "later-test"
+            collector.session(base + "/c/unrelated")
             page.get_by_label("Input").fill("actual input")
             page.route("**/v1/fake", lambda route: route.fulfill(json={"stand_in": True}))
             page.evaluate("fetch('/v1/fake').then(r => r.json())")
@@ -84,12 +91,18 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path, brows
             port = sockets.socket.getsockname()[1]
             result = exchange(page, f"ws://127.0.0.1:{port}/terminal")
             assert result == "observed-output"
+            final_items.append({"id": "final-turn", "text": result})
         shutil.rmtree(tmp_path / "temporary-video")
         saved = events(tmp_path / "saved")
         assert any(
             e["kind"] == "browser_fulfill" and e["json"] == {"stand_in": True} for e in saved
         )
         assert any(e["kind"] == "browser_route_registered" for e in saved)
+        snapshots = [e for e in saved if e["kind"] == "session_items"]
+        assert len(snapshots) == 1
+        assert snapshots[0]["session_id"] == "shared"
+        assert snapshots[0]["test_id"] == "later-test"
+        assert snapshots[0]["body"]["data"] == final_items
         fulfilled = [e for e in saved if e["kind"] == "browser_fulfill"]
         assert any(e["path"] == str(replacement) and e["source_sha256"] for e in fulfilled)
         assert any(
@@ -157,3 +170,38 @@ def test_websocket_exchange_finishes_when_server_does_not_reply_as_expected(mode
     finally:
         server.shutdown()
         thread.join(timeout=3)
+
+
+def test_driver_can_take_over_tracing(tmp_path, browser):
+    collector = Evidence(tmp_path / "saved")
+    try:
+        collector.install_browser()
+        with browser.new_context() as context:
+            page = context.new_page()
+            page.set_content('<input aria-label="Input">')
+            page.get_by_label("Input").fill("before driver trace")
+            context.tracing.start(screenshots=True, snapshots=True)
+            page.get_by_label("Input").fill("during driver trace")
+            context.tracing.stop(path=str(tmp_path / "driver.zip"))
+        assert (tmp_path / "driver.zip").is_file()
+        saved = events(tmp_path / "saved")
+        assert not [e for e in saved if e["kind"] == "collection_error"]
+        assert any(e["kind"] == "trace_owner" and e["owner"] == "driver" for e in saved)
+        assert len(list((tmp_path / "saved").glob("trace-*.zip"))) == 1
+    finally:
+        collector.patch.undo()
+
+
+def test_pytest_trace_and_evidence_can_share_a_context(tmp_path, browser, new_context):
+    collector = Evidence(tmp_path / "saved")
+    try:
+        collector.install_browser()
+        # new_context starts pytest-playwright's trace when --tracing=on is set.
+        context = new_context()
+        page = context.new_page()
+        page.set_content("<p>observed</p>")
+        assert page.get_by_text("observed").is_visible()
+        context.close()
+        assert not [e for e in events(tmp_path / "saved") if e["kind"] == "collection_error"]
+    finally:
+        collector.patch.undo()

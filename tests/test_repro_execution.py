@@ -43,8 +43,6 @@ def test_failed_and_successful_commands_keep_separate_records(tmp_path, monkeypa
 
 
 def test_start_failure_retains_incomplete_attempt(tmp_path, monkeypatch):
-    import pytest
-
     monkeypatch.chdir(tmp_path)
     (tmp_path / "execution-context.json").write_text("{}")
     with pytest.raises(FileNotFoundError):
@@ -54,8 +52,10 @@ def test_start_failure_retains_incomplete_attempt(tmp_path, monkeypatch):
     assert record["error_type"] == "FileNotFoundError"
 
 
-def test_snapshots_before_delete_and_reset(tmp_path):
+@pytest.mark.parametrize("userinfo", ["", "fixture-user:inline-password@"])
+def test_snapshots_before_delete_and_reset(tmp_path, userinfo):
     state = {"deleted": False, "reset": False}
+    origin = f"http://{userinfo}localhost"
 
     def handle(request):
         path = request.url.path
@@ -96,10 +96,12 @@ def test_snapshots_before_delete_and_reset(tmp_path):
     collector.patch.setattr(httpx.Client, "__init__", init)
     try:
         with httpx.Client() as client:
-            client.post("http://localhost/v1/sessions", json={"agent": "fixture"})
-            client.delete("http://localhost/v1/sessions/s")
+            client.post(f"{origin}/v1/sessions", json={"agent": "fixture"})
+            client.delete(f"{origin}/v1/sessions/s")
             client.post("http://localhost/mock/reset")
         saved = events(tmp_path)
+        assert "inline-password" not in json.dumps(saved)
+        assert "fixture-user" not in json.dumps(saved)
         assert state == {"deleted": True, "reset": True}
         items = next(e for e in saved if e["kind"] == "session_items")
         assert items["reason"] == "before_session_delete"
@@ -188,6 +190,10 @@ def test_unrelated():
     assert {e["reason"] for e in items} == {"after_test_before_teardown", "before_session_delete"}
     assert all("test_failed:" in e["test_id"] for e in items)
     assert all(e["body"]["data"][0]["id"] == "turn-observed" for e in items)
+    sources = [e for e in saved if e.get("kind_of_artifact") == "test_source"]
+    assert len(sources) == 2
+    assert len({e["path"] for e in sources}) == 1
+    assert len(list(attempt.parent.glob("source-*.py"))) == 1
     # This test runs outside a Git checkout; test-level collection must still work.
     assert {e["operation"] for e in saved if e["kind"] == "collection_error"} <= {
         "changed_files",
@@ -196,8 +202,6 @@ def test_unrelated():
 
 
 def test_execute_records_readiness_failure_before_command(tmp_path, monkeypatch):
-    import pytest
-
     from dev.repro_env.__main__ import execute
 
     monkeypatch.chdir(tmp_path)
@@ -470,8 +474,10 @@ def test_repeated_signals_defer_journal_io(tmp_path, monkeypatch):
             [
                 sys.executable,
                 "-c",
-                "import signal,time,pathlib; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "pathlib.Path('ready').touch(); time.sleep(30)",
+                (
+                    "import signal,time,pathlib; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "pathlib.Path('ready').touch(); time.sleep(30)"
+                ),
             ],
             dict(os.environ),
         )
@@ -753,3 +759,154 @@ def test_concurrent_mock_requests_share_one_journal(tmp_path, monkeypatch):
     assert len(journals) == 1
     assert len(list(tmp_path.glob("events-*.jsonl"))) == 1
     assert {e["body"]["index"] for e in events(tmp_path)} == set(range(8))
+
+
+def test_attempt_metadata_uses_the_same_redaction_as_events(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for name in ("execution-context.json", "launch-observations.json"):
+        (tmp_path / name).write_text(
+            json.dumps(
+                {
+                    "run_id": "retained-id",
+                    "headers": {"authorization": "Basic inline-credential"},
+                    "password": "metadata-password",
+                }
+            )
+        )
+    assert run(tmp_path, [sys.executable, "-c", "pass"]) == 0
+    path = next((tmp_path / "execution").glob("*/attempt.json"))
+    assert "inline-credential" not in path.read_text()
+    assert "metadata-password" not in path.read_text()
+    record = json.loads(path.read_text())
+    assert record["context"]["run_id"] == record["runtime_launch"]["run_id"] == "retained-id"
+
+
+@pytest.mark.parametrize("error", [ChildProcessError, OSError])
+def test_group_wait_failure_preserves_command_result(tmp_path, monkeypatch, error):
+    from dev.repro_env import execution
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "execution-context.json").write_text("{}")
+
+    def fail(*args):
+        raise error("group wait unavailable")
+
+    monkeypatch.setattr(execution.os, "waitid", fail)
+    monkeypatch.setattr(
+        execution.os, "killpg", lambda *args: pytest.fail("unowned group signaled")
+    )
+    assert (
+        run(tmp_path, [sys.executable, "-c", "import time; time.sleep(.1); raise SystemExit(7)"])
+        == 7
+    )
+    record = json.loads(next((tmp_path / "execution").glob("*/attempt.json")).read_text())
+    assert record["status"] == "finished"
+    assert {"operation": "group_wait", "error_type": error.__name__} in record["collection_errors"]
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n"])
+def test_trace_redaction_preserves_plaintext_line_boundaries(tmp_path, ending):
+    import zipfile
+
+    from dev.repro_env.execution import sanitize_trace
+
+    path = tmp_path / "trace.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("resources/text", f"password=inline-secret{ending}next-line{ending}")
+    sanitize_trace(path)
+    with zipfile.ZipFile(path) as archive:
+        assert (
+            archive.read("resources/text").decode()
+            == f"password=[redacted]{ending}next-line{ending}"
+        )
+
+
+def test_mock_acceptance_order_survives_reordered_writes(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+
+    from tests.server.integration import mock_llm_server as mock
+
+    monkeypatch.setenv("OMNIGENT_REPRO_ATTEMPT_DIR", str(tmp_path))
+    request_waiting = threading.Event()
+    reset_written = threading.Event()
+    record = mock._record_evidence
+
+    def reordered(kind, body, accepted_at_ns):
+        if kind == "request":
+            request_waiting.set()
+            assert reset_written.wait(timeout=5)
+        record(kind, body, accepted_at_ns)
+        if kind == "reset":
+            reset_written.set()
+
+    monkeypatch.setattr(mock, "_record_evidence", reordered)
+
+    async def check():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mock.app), base_url="http://localhost"
+        ) as client:
+            request = asyncio.create_task(client.post("/v1/responses", json={"stream": False}))
+            try:
+                assert await asyncio.to_thread(request_waiting.wait, 5)
+                assert (await client.post("/mock/reset")).status_code == 200
+                assert (await request).status_code == 200
+            finally:
+                reset_written.set()
+                await request
+
+    asyncio.run(check())
+    saved = events(tmp_path)
+    assert [e["action"] for e in saved] == ["reset", "request"]
+    assert saved[1]["accepted_at_ns"] < saved[0]["accepted_at_ns"]
+    assert all(e["accepted_at_ns"] <= e["time_ns"] for e in saved)
+
+
+def test_runtime_mock_module_records_without_pythonpath(tmp_path):
+    import socket
+    import subprocess
+    import time
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    (tmp_path / "execution-context.json").write_text("{}")
+    env = {**os.environ, "OMNIGENT_REPRO_EVIDENCE_ROOT": str(tmp_path)}
+    for key in ("PYTHONPATH", "OMNIGENT_REPRO_ATTEMPT_DIR"):
+        env.pop(key, None)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    with (tmp_path / "model.log").open("w") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "tests.server.integration.mock_llm_server", str(port)],
+            cwd=root,
+            env=env,
+            stdout=log,
+            stderr=log,
+        )
+        try:
+            with httpx.Client(
+                base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=1
+            ) as client:
+                deadline = time.monotonic() + 10
+                while True:
+                    assert process.poll() is None, (tmp_path / "model.log").read_text()
+                    try:
+                        if client.get("/stats").status_code == 200:
+                            break
+                    except httpx.TransportError:
+                        pass
+                    assert time.monotonic() < deadline
+                    time.sleep(0.05)
+                assert client.post("/v1/responses", json={"stream": False}).status_code == 200
+                assert client.post("/mock/reset").status_code == 200
+            saved = events(tmp_path / "execution/service")
+            assert [e["action"] for e in saved] == ["request", "reset"]
+            assert saved[0]["accepted_at_ns"] < saved[1]["accepted_at_ns"]
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)

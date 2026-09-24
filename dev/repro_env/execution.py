@@ -97,7 +97,7 @@ def clean(value, secrets=None):
                     return json.dumps(clean(parsed, secrets), ensure_ascii=False)
         key, separator, content = value.partition("=")
         if separator and not any(c.isspace() for c in key) and credential_field(key, content):
-            return key + "=[redacted]"
+            return key + "=[redacted]" + value[len(value.rstrip("\r\n")) :]
         for secret in secrets:
             value = value.replace(secret, "[redacted]")
         value = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[redacted]", value)
@@ -253,7 +253,9 @@ def run(
 
     def save_record():
         record["collection_errors"] = list(journal.errors)
-        journal.capture("attempt_write", lambda: write_json(directory / "attempt.json", record))
+        journal.capture(
+            "attempt_write", lambda: write_json(directory / "attempt.json", journal.clean(record))
+        )
 
     def fingerprint(path):
         return journal.capture(
@@ -419,10 +421,14 @@ def run(
             threads.append(thread)
         if group_owned:
             # Keep the leader unreaped until group cleanup: its PGID cannot be recycled.
-            os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
-            group_owned = False
+            try:
+                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+            except OSError as exc:
+                group_owned = False
+                journal.failure("group_wait", exc)
+            else:
+                journal.capture("process_group_terminate", lambda: deliver(signal.SIGTERM))
+                group_owned = False
         result = process.wait()
         record.update(
             status="incomplete" if pending_signals or result < 0 else "finished", exit_code=result

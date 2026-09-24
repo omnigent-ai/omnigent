@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tokenize
@@ -40,11 +41,12 @@ class Evidence:
 
         self.capture(operation, save)
 
-    def session(self, url, body=None):
+    def session(self, url, body=None, state=None):
         parts = urlsplit(url)
         # Follow only local test servers observed by the driver.
         if parts.hostname not in {"127.0.0.1", "localhost", "::1"}:
             return
+        # Keep authentication for snapshot requests; emitted origins always use safe_url.
         origin = f"{parts.scheme}://{parts.netloc}"
         match = re.match(r"^/v1/sessions/([^/]+)(?:/|$)", parts.path)
         if match is None:
@@ -57,16 +59,23 @@ class Evidence:
             else None
         )
         if sid and not sid.startswith("temp:"):
-            self.sessions.setdefault((origin, sid), set()).add(self.node)
+            key = (origin, sid)
+            self.sessions.setdefault(key, set()).add(self.node)
+            if state is not None:
+                state["sessions"].add(key)
             self.emit("product_session", server=safe_url(origin), session_id=sid)
 
-    def snapshot(self, reason):
+    def snapshot(self, reason, sessions=None):
         if self.busy:
             return
         self.busy = True
         try:
-            for base, sid in sorted(self.sessions):
-                if self.node is not None and self.node not in self.sessions[base, sid]:
+            for base, sid in sorted(self.sessions if sessions is None else sessions):
+                if (
+                    sessions is None
+                    and self.node is not None
+                    and self.node not in self.sessions[base, sid]
+                ):
                     continue
                 self.capture(
                     "session_snapshot",
@@ -82,7 +91,7 @@ class Evidence:
                 self.emit(
                     "session_snapshot",
                     session_id=sid,
-                    server=base,
+                    server=safe_url(base),
                     reason=reason,
                     observed_in_tests=sorted(n for n in self.sessions[base, sid] if n),
                     surface=suffix or "info",
@@ -97,7 +106,13 @@ class Evidence:
                 r = client.get(f"{base}/v1/sessions/{sid}/items", params=params)
                 r.raise_for_status()
                 body = r.json()
-                self.emit("session_items", server=base, session_id=sid, reason=reason, body=body)
+                self.emit(
+                    "session_items",
+                    server=safe_url(base),
+                    session_id=sid,
+                    reason=reason,
+                    body=body,
+                )
                 if not body.get("has_more"):
                     return
                 rows = body.get("data", [])
@@ -159,10 +174,33 @@ class Evidence:
 
         create, close, fulfill = Browser.new_context, BrowserContext.close, Route.fulfill
 
+        def save_trace(context, state):
+            state["tracing"] = False
+            path = self.directory / f"trace-{state['id']}.zip"
+
+            def save():
+                context.tracing.stop(path=str(path))
+                sanitize_trace(path, self.journal.secrets)
+
+            self.artifact(
+                "trace_stop",
+                path,
+                save,
+                context_id=state["id"],
+                created_in_test=state["created_in_test"],
+                kind_of_artifact="playwright_trace",
+            )
+
         def new_context(browser, *args, **kwargs):
             context = create(browser, *args, **kwargs)
             key = uuid.uuid4().hex
-            state = {"id": key, "tracing": False, "pages": [], "created_in_test": self.node}
+            state = {
+                "id": key,
+                "tracing": False,
+                "pages": [],
+                "sessions": set(),
+                "created_in_test": self.node,
+            }
             self.contexts[context] = state
 
             def start_trace():
@@ -170,13 +208,27 @@ class Evidence:
                 state["tracing"] = True
 
             self.capture("trace_start", start_trace)
+            start = context.tracing.start
+
+            def caller_start(*args, **kwargs):
+                if state["tracing"]:
+                    save_trace(context, state)
+                    self.emit(
+                        "trace_owner",
+                        context_id=state["id"],
+                        owner="driver",
+                        limitation="Subsequent tracing is owned and retained by the driver.",
+                    )
+                return start(*args, **kwargs)
+
+            self.patch.setattr(context.tracing, "start", caller_start)
             context.on(
                 "page", lambda page: self.capture("browser_page", lambda: self.page(page, state))
             )
             context.on(
                 "response",
                 lambda response: self.capture(
-                    "browser_response", lambda: self.response(response, key)
+                    "browser_response", lambda: self.response(response, key, state)
                 ),
             )
             self.emit(
@@ -189,7 +241,7 @@ class Evidence:
         def close_context(context, *args, **kwargs):
             state = self.contexts.pop(context, None)
             if state:
-                self.snapshot("before_browser_close")
+                self.snapshot("before_browser_close", sessions=state["sessions"])
                 for page in state["pages"]:
                     if not page.is_closed():
                         path = self.directory / f"screen-{uuid.uuid4().hex}.png"
@@ -203,20 +255,7 @@ class Evidence:
                             url=safe_url(page.url),
                         )
                 if state["tracing"]:
-                    path = self.directory / f"trace-{state['id']}.zip"
-
-                    def save_trace():
-                        context.tracing.stop(path=str(path))
-                        sanitize_trace(path, self.journal.secrets)
-
-                    self.artifact(
-                        "trace_stop",
-                        path,
-                        save_trace,
-                        context_id=state["id"],
-                        created_in_test=state["created_in_test"],
-                        kind_of_artifact="playwright_trace",
-                    )
+                    save_trace(context, state)
             result = close(context, *args, **kwargs)
             if state:
                 for page in state["pages"]:
@@ -302,10 +341,10 @@ class Evidence:
         )
 
     def navigation(self, frame, state):
-        self.session(frame.url)
+        self.session(frame.url, state=state)
         self.emit("navigation", context_id=state["id"], url=safe_url(frame.url))
 
-    def response(self, response, context_id):
+    def response(self, response, context_id, state=None):
         request = response.request
         parts = urlsplit(response.url)
         if parts.hostname not in {"127.0.0.1", "localhost", "::1"} or not parts.path.startswith(
@@ -313,7 +352,7 @@ class Evidence:
         ):
             return
         body = response.json() if "json" in response.headers.get("content-type", "") else None
-        self.session(response.url, body)
+        self.session(response.url, body, state=state)
         self.emit(
             "browser_response",
             context_id=context_id,
@@ -343,19 +382,18 @@ def pytest_runtest_protocol(item):
         collector.node = f"{item.nodeid}:{uuid.uuid4().hex}"
         collector.emit("test_start", nodeid=item.nodeid)
         source = Path(str(item.path))
-        target = collector.directory / f"source-{uuid.uuid4().hex}.py"
 
         def copy_source():
             with tokenize.open(source) as stream:
-                target.write_text(collector.journal.clean(stream.read()))
+                content = collector.journal.clean(stream.read()).encode("utf-8")
+            target = collector.directory / f"source-{hashlib.sha256(content).hexdigest()}.py"
+            if not target.is_file():
+                target.write_bytes(content)
+            collector.emit(
+                "artifact", path=target.name, source=str(source), kind_of_artifact="test_source"
+            )
 
-        collector.artifact(
-            "test_source",
-            target,
-            copy_source,
-            source=str(source),
-            kind_of_artifact="test_source",
-        )
+        collector.capture("test_source", copy_source)
     yield
     if collector:
         collector.emit("test_end", nodeid=item.nodeid)
