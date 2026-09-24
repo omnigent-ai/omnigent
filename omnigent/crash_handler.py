@@ -376,16 +376,16 @@ def _save_report(report_md: str) -> Path:
     path.write_text(report_md, encoding="utf-8")
     with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
-    _rotate(d, _CONFIG.get("keep_reports", 10))
+    _rotate(d, _CONFIG.get("keep_reports", 10), current=path)
     return path
 
 
-def _rotate(d: Path, keep: int) -> None:
+def _rotate(d: Path, keep: int, *, current: Path) -> None:
     """Keep only the newest ``keep`` ``crash-*.md`` reports."""
     with contextlib.suppress(Exception):
         files = sorted(
             d.glob("crash-*.md"),
-            key=lambda p: p.stat().st_mtime,
+            key=lambda p: (p == current, p.stat().st_mtime_ns),
             reverse=True,
         )
         for old in files[keep:]:
