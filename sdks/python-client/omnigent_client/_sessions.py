@@ -180,8 +180,8 @@ class Session:
     :param archived: Whether the session is archived. Archived
         sessions are hidden from the default ``list`` listing and
         returned with ``visibility="archived"`` or with
-        ``visibility="all", include_archived=True``. ``False`` for normal
-        sessions.
+        ``include_archived=True`` for ``visibility="mine"`` or
+        ``visibility="all"``. ``False`` for normal sessions.
     """
 
     id: str
@@ -277,8 +277,8 @@ class SessionListItem:
         the session has no outstanding prompts.
     :param archived: Whether the session is archived. Returned by
         ``list`` with ``visibility="archived"`` or with
-        ``visibility="all", include_archived=True``. ``False`` for normal
-        sessions.
+        ``include_archived=True`` for ``visibility="mine"`` or
+        ``visibility="all"``. ``False`` for normal sessions.
     """
 
     id: str
@@ -609,7 +609,7 @@ class SessionsNamespace:
         order: str = "desc",
         sort_by: str = "created_at",
         include_archived: bool = False,
-        visibility: Literal["all", "mine", "shared", "archived"] = "all",
+        visibility: Literal["all", "mine", "shared", "archived"] = "mine",
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -629,16 +629,17 @@ class SessionsNamespace:
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
-        :param include_archived: With ``visibility="all"``, include
-            archived sessions alongside active ones when ``True``.
-            Defaults to ``False``. Other visibility modes determine
-            archive filtering themselves.
-        :param visibility: ``"all"`` (default) returns all accessible
-            sessions. ``"mine"`` returns owned active sessions, and
-            ``"shared"`` returns accessible active sessions not owned
-            by the caller. ``"archived"`` returns only archived sessions.
-            Without server authentication, ``"mine"`` and ``"shared"``
-            behave like ``"all"``. Always sent explicitly to the server.
+        :param include_archived: With ``visibility="mine"`` or ``"all"``,
+            include archived sessions alongside active ones when ``True``.
+            Defaults to ``False``. ``"shared"`` remains active-only and
+            ``"archived"`` remains archived-only. Older servers that support
+            ``"mine"`` may ignore this flag for that visibility.
+        :param visibility: ``"mine"`` (default) returns sessions owned by the
+            caller. ``"all"`` returns all accessible sessions, ``"shared"``
+            returns accessible active sessions not owned by the caller, and
+            ``"archived"`` returns only archived sessions. Without server
+            authentication, ``"mine"`` and ``"shared"`` behave like ``"all"``.
+            Always sent explicitly to the server.
         :returns: List of :class:`SessionListItem`.
         :raises StaleCursorError: If ``after``/``before`` names a session
             that has since been deleted. The walk cannot continue from
@@ -813,7 +814,8 @@ class SessionsNamespace:
         ``{"archived": ...}``. Archived sessions are hidden from the
         default :meth:`list` listing and surfaced with
         ``visibility="archived"`` or with
-        ``visibility="all", include_archived=True``. Owner-only (the web
+        ``include_archived=True`` for ``visibility="mine"`` or
+        ``visibility="all"``. Owner-only (the web
         UI stops the session on archive, an owner-gated lifecycle action, so archive
         is held to the same gate); note this method only flips the
         archived flag — it does not stop the session.

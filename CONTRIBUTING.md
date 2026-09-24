@@ -141,7 +141,7 @@ uv run --no-sync pre-commit run --all-files
 The `session-list-visibility` custom rule checks Python, JavaScript/TypeScript,
 and shell clients for explicit visibility on session-list requests. It follows
 local query builders and same-file helpers; direct server tests and mock
-fixtures are excluded so they can exercise the API's compatibility default.
+fixtures are excluded so they can exercise the API's default behavior.
 Install web dependencies (`pnpm install --frozen-lockfile --filter web`) before
 running the full custom lint, then use
 `uv run --no-sync python -m dev.lint.custom_lint`. A request built outside the

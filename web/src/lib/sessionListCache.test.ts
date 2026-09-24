@@ -162,6 +162,27 @@ describe("mergeItemsIntoPages", () => {
     expect(needsRefetch).toBe(true);
   });
 
+  it.each([
+    ["mine", true, ["a"]],
+    ["mine", false, []],
+    ["shared", true, []],
+    ["shared", false, []],
+  ] as const)(
+    "applies archive updates for visibility=%s, includeArchived=%s",
+    (visibility, includeArchived, expectedIds) => {
+      const before = data([conv("a", { archived: false })]);
+      const items = new Map<string, SessionListWireItem>([["a", { id: "a", archived: true }]]);
+      const { data: after } = mergeItemsIntoPages(
+        before,
+        items,
+        { searchQuery: "", visibility, includeArchived },
+        NO_ACTIVE,
+      );
+      expect(after!.pages[0].data.map((row) => row.id)).toEqual(expectedIds);
+      if (expectedIds.length) expect(after!.pages[0].data[0].archived).toBe(true);
+    },
+  );
+
   it("does not refetch on a runner_online-only push delta", () => {
     // runner_online is no longer a list membership / sort dimension — the
     // sidebar fetches one undifferentiated session list, so a liveness

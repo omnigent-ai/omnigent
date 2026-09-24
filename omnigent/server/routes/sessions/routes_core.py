@@ -1279,7 +1279,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
-        visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
+        visibility: str = Query(default="mine", pattern="^(all|mine|shared|archived)$"),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -1311,11 +1311,11 @@ def register_core_routes(
             matches if its title contains the query or any of
             its conversation items' text does. Powers the
             sidebar's session search.
-        :param include_archived: When ``False`` (default), archived
-            sessions are omitted. When ``True``, archived sessions
-            are returned alongside active ones (the sidebar groups
-            them into an "Archived" section). Powers the sidebar's
-            "Show archived" toggle.
+        :param include_archived: With ``visibility="mine"`` (default)
+            or ``"all"``, include archived sessions alongside active
+            ones when ``True``. Defaults to ``False``. ``"shared"``
+            always returns active sessions; ``"archived"`` always
+            returns only archived sessions.
         :param kind: Conversation kind to return. ``"default"``
             (the default) returns only top-level user-initiated
             sessions — the sidebar's view. ``"sub_agent"`` returns
@@ -1328,11 +1328,13 @@ def register_core_routes(
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
         :param visibility: Ownership/archive filter for the sidebar tabs.
-            ``"mine"`` returns only sessions the caller owns (owner-level
+            ``"mine"`` (default) returns only sessions the caller owns (owner-level
             grant). ``"shared"`` returns only sessions accessible but not
             owned. ``"archived"`` returns only archived sessions.
-            ``"all"`` (default) returns all accessible non-archived
-            sessions, matching the legacy behaviour.
+            ``"all"`` returns all accessible sessions. ``"mine"`` and
+            ``"all"`` exclude archived sessions unless ``include_archived``
+            is ``True``. Without authentication, ``"mine"`` and ``"shared"``
+            behave like ``"all"``.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -1354,7 +1356,7 @@ def register_core_routes(
         #   because owner-level implies access.
         # "shared": sessions accessible but not owned — shared_only=True
         #   computes the set difference (accessible − owned).
-        # "all": all accessible sessions (legacy default). A project folder
+        # "all": all accessible sessions. A project folder
         #   additionally gates on owned_by so a shared session with a
         #   like-named project stays out of the viewer's own folder.
         # mine/shared require an identity anchor (owned_by / accessible_by).
@@ -1367,7 +1369,7 @@ def register_core_routes(
             accessible_by_param: str | None = None
             owned_by_param: str | None = user_id
             shared_only_param = False
-            include_archived_param = False
+            include_archived_param = include_archived
             archived_only_param = False
         elif effective_visibility == "shared":
             accessible_by_param = user_id

@@ -214,7 +214,7 @@ async def _list_one(
     capture.statements.clear()
     resp = await client.get(
         "/v1/sessions",
-        params={"limit": 1},
+        params={"limit": 1, "visibility": "all"},
         headers={"X-Forwarded-Email": user},
     )
     assert resp.status_code == 200, resp.text

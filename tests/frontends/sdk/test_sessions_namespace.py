@@ -1329,8 +1329,8 @@ async def test_subtree_busy_counts_awaiting_input_as_busy() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("include_archived", [False, True])
-async def test_list_defaults_to_all_visibility(include_archived: bool) -> None:
-    """Default requests preserve access to shared sessions and archive opt-in."""
+async def test_list_defaults_to_mine_visibility(include_archived: bool) -> None:
+    """Default requests select owned sessions and preserve archive opt-in."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
@@ -1339,7 +1339,7 @@ async def test_list_defaults_to_all_visibility(include_archived: bool) -> None:
             "limit": "20",
             "order": "desc",
             "sort_by": "created_at",
-            "visibility": "all",
+            "visibility": "mine",
         }
         if include_archived:
             expected["include_archived"] = "true"
@@ -1372,6 +1372,7 @@ async def test_list_visibility_preserves_pagination_and_filters(
             cursor: "conv_cursor",
             "agent_id": "ag_abc",
             "agent_name": "my agent",
+            "include_archived": "true",
         }
         return httpx.Response(200, json={"data": []})
 
@@ -1386,6 +1387,7 @@ async def test_list_visibility_preserves_pagination_and_filters(
             agent_name="my agent",
             order="asc",
             sort_by="updated_at",
+            include_archived=True,
         )
     finally:
         await client.aclose()

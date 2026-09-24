@@ -11055,7 +11055,7 @@
             }
           },
           {
-            "description": "When `False` (default), archived sessions are omitted. When `True`, archived sessions are returned alongside active ones (the sidebar groups them into an \"Archived\" section). Powers the sidebar's \"Show archived\" toggle.",
+            "description": "With `visibility=\"mine\"` (default) or `\"all\"`, include archived sessions alongside active ones when `True`. Defaults to `False`. `\"shared\"` always returns active sessions; `\"archived\"` always returns only archived sessions.",
             "in": "query",
             "name": "include_archived",
             "required": false,
@@ -11105,12 +11105,12 @@
             }
           },
           {
-            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
+            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` (default) returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions. `\"all\"` returns all accessible sessions. `\"mine\"` and `\"all\"` exclude archived sessions unless `include_archived` is `True`. Without authentication, `\"mine\"` and `\"shared\"` behave like `\"all\"`.",
             "in": "query",
             "name": "visibility",
             "required": false,
             "schema": {
-              "default": "all",
+              "default": "mine",
               "pattern": "^(all|mine|shared|archived)$",
               "title": "Visibility",
               "type": "string"

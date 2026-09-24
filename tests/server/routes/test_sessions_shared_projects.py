@@ -125,13 +125,13 @@ def test_shared_session_excluded_from_recipients_project_folder(db_uri: str) -> 
 
 
 def test_shared_session_still_visible_in_flat_list(db_uri: str) -> None:
-    """The fix is scoped to project surfaces: the shared session still shows up
-    in Alice's unfiltered session list, where the "Shared with me" tab reads it
-    (the frontend splits owned vs. shared by permission_level there)."""
+    """Project filtering must not hide shared sessions from an explicit all listing."""
     conv_id = _seed_shared_project_session(db_uri)
     app = _multi_user_app(db_uri)
 
-    resp = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+    resp = TestClient(app).get(
+        "/v1/sessions", params={"visibility": "all"}, headers={"X-Forwarded-Email": ALICE}
+    )
     assert resp.status_code == 200
     items = {s["id"]: s for s in resp.json()["data"]}
     assert conv_id in items

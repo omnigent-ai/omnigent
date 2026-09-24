@@ -386,6 +386,7 @@ async def _list_sessions_as(
     """
     resp = await client.get(
         "/v1/sessions",
+        params={"visibility": "all"},
         headers={"X-Forwarded-Email": user},
     )
     assert resp.status_code == 200, f"list sessions failed: {resp.status_code} {resp.text}"
@@ -1943,7 +1944,7 @@ async def test_pagination_with_permission_filter(
     pages_seen = 0
 
     while True:
-        params: dict[str, Any] = {"limit": 1}
+        params: dict[str, Any] = {"limit": 1, "visibility": "shared"}
         if after_cursor is not None:
             params["after"] = after_cursor
         resp = await auth_client.get(

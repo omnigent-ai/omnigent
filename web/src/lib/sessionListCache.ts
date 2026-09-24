@@ -199,8 +199,8 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
     // don't leave stale active sessions in this cache.
     return conv.archived !== true;
   }
-  if (filters.visibility === "mine" || filters.visibility === "shared") {
-    // Mine/shared caches hold only active (non-archived) sessions. Evict if archived.
+  if (filters.visibility === "shared") {
+    // Shared queries exclude archives even when includeArchived is true.
     if (conv.archived === true) return true;
   }
   if (!filters.includeArchived && conv.archived === true) return true;

@@ -751,7 +751,7 @@ async def test_read_only_grantee_can_pin_shared_session(db_uri: str, tmp_path: P
     assert conv.labels.get(pinned_label_key(_GRANTEE)) == "1721760000000"
 
     async with _client(app, _GRANTEE) as c:
-        listed = await c.get("/v1/sessions?pinned=true")
+        listed = await c.get("/v1/sessions?pinned=true&visibility=shared")
         assert listed.status_code == 200, listed.text
         assert conv.id in [s["id"] for s in listed.json()["data"]]
 

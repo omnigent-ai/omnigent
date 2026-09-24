@@ -364,7 +364,9 @@ async def test_session_list_includes_comments_fingerprint(
     headers = {"X-Forwarded-Email": ALICE}
 
     # Before any comments: fingerprint should show zero
-    list_resp = await auth_client.get("/v1/sessions", headers=headers)
+    list_resp = await auth_client.get(
+        "/v1/sessions", params={"visibility": "shared"}, headers=headers
+    )
     assert list_resp.status_code == 200
     items = list_resp.json()["data"]
     target = [s for s in items if s["id"] == session_id]
@@ -387,7 +389,9 @@ async def test_session_list_includes_comments_fingerprint(
     comment = add_resp.json()
 
     # After adding: count=1 and updated_at is set
-    list_resp2 = await auth_client.get("/v1/sessions", headers=headers)
+    list_resp2 = await auth_client.get(
+        "/v1/sessions", params={"visibility": "shared"}, headers=headers
+    )
     items2 = list_resp2.json()["data"]
     target2 = [s for s in items2 if s["id"] == session_id]
     assert len(target2) == 1
@@ -407,7 +411,9 @@ async def test_session_list_includes_comments_fingerprint(
         headers=headers,
     )
     assert add_resp2.status_code == 200, add_resp2.text
-    list_resp3 = await auth_client.get("/v1/sessions", headers=headers)
+    list_resp3 = await auth_client.get(
+        "/v1/sessions", params={"visibility": "shared"}, headers=headers
+    )
     items3 = list_resp3.json()["data"]
     target3 = [s for s in items3 if s["id"] == session_id]
     assert target3[0]["comments_count"] == 2
