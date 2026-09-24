@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 import tokenize
 import uuid
 from pathlib import Path
@@ -23,8 +24,18 @@ class Evidence:
         self.patch = pytest.MonkeyPatch()
         self.sessions: dict[tuple[str, str], set[str | None]] = {}
         self.contexts: dict = {}
-        self.busy = False
+        self.local = threading.local()
+        self.sessions_lock = threading.Lock()
+        self.snapshot_lock = threading.Lock()
         self.node = None
+
+    @property
+    def busy(self):
+        return getattr(self.local, "busy", False)
+
+    @busy.setter
+    def busy(self, value):
+        self.local.busy = value
 
     def emit(self, kind, **data):
         self.journal.emit(kind, test_id=self.node, **data)
@@ -60,9 +71,10 @@ class Evidence:
         )
         if sid and not sid.startswith("temp:"):
             key = (origin, sid)
-            self.sessions.setdefault(key, set()).add(self.node)
-            if state is not None:
-                state["sessions"].add(key)
+            with self.sessions_lock:
+                self.sessions.setdefault(key, set()).add(self.node)
+                if state is not None:
+                    state["sessions"].add(key)
             self.emit("product_session", server=safe_url(origin), session_id=sid)
 
     def snapshot(self, reason, sessions=None):
@@ -70,21 +82,26 @@ class Evidence:
             return
         self.busy = True
         try:
-            for base, sid in sorted(self.sessions if sessions is None else sessions):
-                if (
-                    sessions is None
-                    and self.node is not None
-                    and self.node not in self.sessions[base, sid]
-                ):
-                    continue
-                self.capture(
-                    "session_snapshot",
-                    lambda base=base, sid=sid: self.read_session(base, sid, reason),
-                )
+            with self.snapshot_lock:
+                with self.sessions_lock:
+                    selected = [
+                        (base, sid)
+                        for base, sid in sorted(self.sessions if sessions is None else sessions)
+                        if sessions is not None
+                        or self.node is None
+                        or self.node in self.sessions[base, sid]
+                    ]
+                for base, sid in selected:
+                    self.capture(
+                        "session_snapshot",
+                        lambda base=base, sid=sid: self.read_session(base, sid, reason),
+                    )
         finally:
             self.busy = False
 
     def read_session(self, base, sid, reason):
+        with self.sessions_lock:
+            observed_in_tests = sorted(n for n in self.sessions[base, sid] if n)
         with httpx.Client(trust_env=False, timeout=3) as client:
             for suffix in ("", "/resources"):
                 r = client.get(f"{base}/v1/sessions/{sid}{suffix}")
@@ -93,7 +110,7 @@ class Evidence:
                     session_id=sid,
                     server=safe_url(base),
                     reason=reason,
-                    observed_in_tests=sorted(n for n in self.sessions[base, sid] if n),
+                    observed_in_tests=observed_in_tests,
                     surface=suffix or "info",
                     status=r.status_code,
                     body=r.json() if r.is_success else None,
@@ -146,22 +163,32 @@ class Evidence:
                 finally:
                     self.busy = False
             response = send(client, request, *args, **kwargs)
-            if path.startswith(("/v1/sessions", "/mock/")) and not kwargs.get("stream"):
+            if path.startswith(("/v1/sessions", "/mock/")):
 
                 def record():
-                    body = (
-                        response.json()
-                        if "json" in response.headers.get("content-type", "")
-                        else None
-                    )
+                    body = None
+                    unavailable = {}
+                    if kwargs.get("stream"):
+                        unavailable["response"] = "streamed"
+                    elif "json" in response.headers.get("content-type", ""):
+                        try:
+                            body = response.json()
+                        except ValueError:
+                            unavailable["response"] = "invalid_json"
+                    try:
+                        request_body = request.content.decode(errors="replace")
+                    except httpx.RequestNotRead:
+                        request_body = None
+                        unavailable["request"] = "streamed"
                     self.session(str(request.url), body)
                     self.emit(
                         "http",
                         method=request.method,
                         url=safe_url(str(request.url)),
                         status=response.status_code,
-                        request=request.content.decode(errors="replace"),
+                        request=request_body,
                         response=body,
+                        body_unavailable=unavailable,
                     )
 
                 self.capture("http", record)

@@ -10,7 +10,8 @@ visible and are also retained. Failed commands retain their original exit status
 interrupted records remain incomplete. Without the context file, execution is
 unchanged.
 
-The wrapper loads `dev.repro_env.pytest_evidence` automatically for pytest. It
+The wrapper loads `dev.repro_env.pytest_evidence` through a guarded pytest loader.
+Missing optional dependencies produce a collection error while the tests continue. It
 records test outcomes, synchronous Playwright traces (including input actions),
 terminal WebSocket frames, observed browser response replacements, screenshots,
 and videos before fixture cleanup. Local synchronous HTTP session activity is
@@ -36,6 +37,11 @@ unavailable; collection errors remain explicit.
 If trace redaction fails, the raw trace is deliberately removed from this automatically
 uploaded directory; renaming it here would still upload it. The collector records the
 failure without advertising a saved trace. Other observations remain available.
+
+Output is redacted after complete lines are assembled. Lines exceeding the 8 MiB
+redaction buffer are omitted with an explicit incomplete-output record; fragments
+are never saved independently. This protects retained output, not the command's
+normal live console output.
 
 Collection errors are best-effort diagnostics: they do not replace command exit codes,
 test outcomes, or mock responses. If output writers have not stopped, the attempt marks

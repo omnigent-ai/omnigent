@@ -107,14 +107,15 @@ def _record_evidence(kind: str, body=None, accepted_at_ns=None) -> None:
 
 
 async def _record_evidence_async(kind: str, body=None, accepted_at_ns=None) -> None:
-    if os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR") or os.environ.get(
-        "OMNIGENT_REPRO_EVIDENCE_ROOT"
-    ):
-        try:
+    try:
+        runtime = os.environ.get("OMNIGENT_REPRO_EVIDENCE_ROOT")
+        if os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR") or (
+            runtime and (Path(runtime) / "execution-context.json").is_file()
+        ):
             await asyncio.to_thread(_record_evidence, kind, body, accepted_at_ns)
-        except Exception as exc:
-            with contextlib.suppress(Exception):
-                print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
 
 
 # Default queue key when none is specified or no model matches.

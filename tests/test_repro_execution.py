@@ -129,8 +129,6 @@ def test_mock_reset_cannot_erase_provider_evidence(tmp_path, monkeypatch):
 
 
 def test_pytest_plugin_autoload_preserves_failed_test_before_teardown(tmp_path, monkeypatch):
-    from pathlib import Path
-
     monkeypatch.chdir(tmp_path)
     (tmp_path / "execution-context.json").write_text('{"plan_sha256":"accepted"}')
     source = tmp_path / "test_journey.py"
@@ -170,7 +168,9 @@ def test_unrelated():
         run(
             tmp_path,
             [
-                str(Path(sys.executable).with_name("pytest")),
+                sys.executable,
+                "-m",
+                "pytest",
                 str(source),
                 "-q",
                 "-o",
@@ -853,7 +853,8 @@ def test_mock_acceptance_order_survives_reordered_writes(tmp_path, monkeypatch):
                 assert (await request).status_code == 200
             finally:
                 reset_written.set()
-                await request
+                response = await request
+                assert response.status_code == 200
 
     asyncio.run(check())
     saved = events(tmp_path)
@@ -895,6 +896,7 @@ def test_runtime_mock_module_records_without_pythonpath(tmp_path):
                         if client.get("/stats").status_code == 200:
                             break
                     except httpx.TransportError:
+                        # Startup can briefly refuse connections before the listener binds.
                         pass
                     assert time.monotonic() < deadline
                     time.sleep(0.05)
@@ -910,3 +912,207 @@ def test_runtime_mock_module_records_without_pythonpath(tmp_path):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("payload", ["known", "bearer", "json"])
+def test_output_redacts_across_read_boundaries(tmp_path, monkeypatch, stream, payload):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "execution-context.json").write_text("{}")
+    env = {**os.environ, "BOUNDARY_API_KEY": "synthetic-boundary-credential"}
+    expressions = {
+        "known": "'x' * 65530 + os.environ['BOUNDARY_API_KEY']",
+        "bearer": "'x' * 65525 + ' Bearer runtime-credential'",
+        "json": "json.dumps({'padding': 'x' * 65500, 'password': 'runtime-credential'})",
+    }
+    command = f"import sys,os,json; sys.{stream}.write({expressions[payload]})"
+    assert run(tmp_path, [sys.executable, "-c", command], env) == 0
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    text = (attempt / f"{stream}.txt").read_text()
+    assert "synthetic-boundary-credential" not in text
+    assert "runtime-credential" not in text
+    assert "[redacted]" in text
+
+
+def test_oversized_output_line_is_omitted_without_losing_following_lines(tmp_path, monkeypatch):
+    from dev.repro_env import execution
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(execution, "MAX_OUTPUT_LINE", 32)
+    (tmp_path / "execution-context.json").write_text("{}")
+    assert run(tmp_path, [sys.executable, "-c", "print('x' * 100); print('retained')"]) == 0
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    assert (attempt / "stdout.txt").read_text() == "retained\n"
+    assert any(e["kind"] == "output_omitted" and e["bytes"] == 101 for e in events(attempt))
+    assert not json.loads((attempt / "attempt.json").read_text())["output_complete"]
+
+
+def test_failed_output_storage_does_not_claim_truncation(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from dev.repro_env import execution
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(execution, "MAX_OUTPUT", 10)
+    (tmp_path / "execution-context.json").write_text("{}")
+    original = Path.open
+
+    def open_file(path, *args, **kwargs):
+        if path.name == "stdout.txt":
+            raise OSError("storage unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_file)
+    assert run(tmp_path, [sys.executable, "-c", "print('x' * 100)"]) == 0
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    assert not any(e["kind"] == "output_truncated" for e in events(attempt))
+
+
+def test_pretty_json_trace_redacts_nested_credentials(tmp_path):
+    import zipfile
+
+    from dev.repro_env.execution import sanitize_trace
+
+    path = tmp_path / "trace.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "resources/body",
+            json.dumps({"nested": {"password": "runtime-secret", "max_tokens": 17}}, indent=2),
+        )
+    sanitize_trace(path, secrets=())
+    with zipfile.ZipFile(path) as archive:
+        body = json.loads(archive.read("resources/body"))
+    assert body == {"nested": {"password": "[redacted]", "max_tokens": 17}}
+
+
+def test_text_redaction_keeps_counts_but_removes_url_and_header_credentials():
+    from dev.repro_env.execution import clean
+
+    assert clean("max_tokens=4096\r\n", ()) == "max_tokens=4096\r\n"
+    assert clean("http://user:pass@localhost/p?a=1&token=inline-value", ()) == "http://localhost/p"
+    assert clean("X-Api-Key: inline-value\n", ()) == "X-Api-Key: [redacted]\n"
+
+
+def test_missing_optional_plugin_dependency_does_not_fail_pytest(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "execution-context.json").write_text("{}")
+    (tmp_path / "sitecustomize.py").write_text("""
+import sys
+class BlockHttpx:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "httpx":
+            raise ModuleNotFoundError("optional httpx unavailable")
+sys.meta_path.insert(0, BlockHttpx())
+""")
+    source = tmp_path / "test_simple.py"
+    source.write_text("def test_simple():\n    assert True\n")
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(tmp_path),
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTEST_PLUGINS": "",
+    }
+    assert (
+        run(
+            tmp_path,
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                str(source),
+                "-q",
+                "-o",
+                "addopts=",
+                "--confcutdir",
+                str(tmp_path),
+            ],
+            env,
+        )
+        == 0
+    )
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    assert any(
+        e["kind"] == "collection_error" and e["operation"] == "pytest_plugin_load"
+        for e in events(attempt)
+    )
+    assert "1 passed" in (attempt / "stdout.txt").read_text()
+
+
+def test_worker_http_request_is_observed_during_snapshot(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, release = threading.Event(), threading.Event()
+    collector = Evidence(tmp_path)
+    original = httpx.Client.__init__
+
+    def handle(request):
+        if request.url.path == "/v1/sessions/first":
+            entered.set()
+            assert release.wait(timeout=5)
+        return httpx.Response(200, json={"id": "second", "data": [], "has_more": False})
+
+    def init(client, *args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handle)
+        original(client, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.Client, "__init__", init)
+    collector.install_http()
+    collector.session("http://localhost/c/first")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            snapshot = pool.submit(collector.snapshot, "test")
+            try:
+                assert entered.wait(timeout=5)
+                with httpx.Client() as client:
+                    client.post("http://localhost/v1/sessions", json={})
+                assert ("http://localhost", "second") in collector.sessions
+            finally:
+                release.set()
+                snapshot.result(timeout=5)
+        assert any(e["kind"] == "http" and e["method"] == "POST" for e in events(tmp_path))
+    finally:
+        collector.patch.undo()
+
+
+def test_streamed_http_keeps_metadata_without_consuming_response(tmp_path):
+    consumed = []
+
+    class Body(httpx.SyncByteStream):
+        def __iter__(self):
+            consumed.append(True)
+            yield b"response-body"
+
+    class Transport(httpx.BaseTransport):
+        def handle_request(self, request):
+            list(request.stream)
+            return httpx.Response(200, stream=Body())
+
+    collector = Evidence(tmp_path)
+    collector.install_http()
+    try:
+        with httpx.Client(transport=Transport()) as client:
+            with client.stream(
+                "POST", "http://localhost/v1/sessions/s/items", content=iter([b"input"])
+            ) as response:
+                assert not consumed
+                assert response.read() == b"response-body"
+        event = next(e for e in events(tmp_path) if e["kind"] == "http")
+        assert event["status"] == 200
+        assert event["body_unavailable"] == {"request": "streamed", "response": "streamed"}
+    finally:
+        collector.patch.undo()
+
+
+def test_disabled_mock_evidence_does_not_schedule_worker(tmp_path, monkeypatch):
+    import asyncio
+
+    from tests.server.integration import mock_llm_server as mock
+
+    monkeypatch.delenv("OMNIGENT_REPRO_ATTEMPT_DIR", raising=False)
+    monkeypatch.setenv("OMNIGENT_REPRO_EVIDENCE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        mock.asyncio, "to_thread", lambda *args: pytest.fail("disabled evidence scheduled work")
+    )
+    asyncio.run(mock._record_evidence_async("request", {}))
+    assert not list(tmp_path.glob("**/events-*.jsonl"))

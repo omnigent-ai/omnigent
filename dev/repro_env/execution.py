@@ -22,6 +22,7 @@ from .runtime import write_json
 
 MAX_EVENT = 256 * 1024
 MAX_OUTPUT = 8 * 1024 * 1024
+MAX_OUTPUT_LINE = 8 * 1024 * 1024
 OUTPUT_JOIN_TIMEOUT = 5
 PROCESS_CLEANUP_TIMEOUT = 5
 SECRET_NAME = re.compile(r"authorization|cookie|password|secret|api.?key|token", re.I)
@@ -96,11 +97,21 @@ def clean(value, secrets=None):
                 if isinstance(parsed, (dict, list)):
                     return json.dumps(clean(parsed, secrets), ensure_ascii=False)
         key, separator, content = value.partition("=")
-        if separator and not any(c.isspace() for c in key) and credential_field(key, content):
+        if (
+            separator
+            and not any(c.isspace() for c in key)
+            and credential_field(key, content.rstrip("\r\n"))
+        ):
             return key + "=[redacted]" + value[len(value.rstrip("\r\n")) :]
         for secret in secrets:
             value = value.replace(secret, "[redacted]")
         value = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[redacted]", value)
+        value = re.sub(r"https?://[^\s<>\"']+", lambda m: safe_url(m[0]), value)
+        value = re.sub(
+            r"(?im)\b((?:authorization|proxy-authorization|(?:x-)?api[-_]key|cookie|set-cookie|password|secret|(?:access[-_]|refresh[-_])?token)\s*:\s*)[^\r\n]+",
+            r"\1[redacted]",
+            value,
+        )
     return value
 
 
@@ -190,13 +201,16 @@ def sanitize_trace(path: Path, secrets=None) -> None:
                 except UnicodeDecodeError:
                     pass
                 else:
-                    lines = []
-                    for line in content.splitlines(keepends=True):
-                        try:
-                            lines.append(json.dumps(clean(json.loads(line), secrets)) + "\n")
-                        except ValueError:
-                            lines.append(clean(line, secrets))
-                    data = "".join(lines).encode()
+                    try:
+                        data = json.dumps(clean(json.loads(content), secrets)).encode()
+                    except ValueError:
+                        lines = []
+                        for line in content.splitlines(keepends=True):
+                            try:
+                                lines.append(json.dumps(clean(json.loads(line), secrets)) + "\n")
+                            except ValueError:
+                                lines.append(clean(line, secrets))
+                        data = "".join(lines).encode()
                 target.writestr(member.filename, data)
         temporary.replace(path)
     except BaseException:
@@ -349,27 +363,61 @@ def run(
         if saved is None:
             output_errors.append(name)
         total = 0
+        truncated = False
+        pending = bytearray()
+        omitted = 0
+
+        def save_line():
+            nonlocal total, saved, truncated
+            text = journal.clean(pending.decode(errors="replace"))
+            if saved is not None:
+                try:
+                    available = max(0, MAX_OUTPUT - total)
+                    saved.write(text[:available])
+                    saved.flush()
+                    truncated |= len(text) > available
+                    total += min(len(text), available)
+                except Exception as exc:  # noqa: BLE001 — keep draining even if storage fails.
+                    journal.failure("saved_output", exc)
+                    output_errors.append(name)
+                    with contextlib.suppress(Exception):
+                        saved.close()
+                    saved = None
+            pending.clear()
+
+        def finish_line():
+            nonlocal omitted
+            if omitted:
+                journal.emit(
+                    "output_omitted",
+                    stream=name,
+                    bytes=omitted,
+                    reason="Line exceeded the bounded redaction buffer",
+                )
+                output_errors.append(name)
+                omitted = 0
+            else:
+                save_line()
+
         try:
-            for line in iter(lambda: stream.readline(65536), b""):
-                text = journal.clean(line.decode(errors="replace"))
+            for chunk in iter(lambda: stream.readline(65536), b""):
                 if destination is not None:
                     try:
-                        destination.write(line.decode(errors="replace"))
+                        destination.write(chunk.decode(errors="replace"))
                         destination.flush()
                     except Exception as exc:  # noqa: BLE001 — keep draining the child's pipes.
                         journal.failure("console_output", exc)
                         destination = None
-                if saved is not None and total < MAX_OUTPUT:
-                    try:
-                        saved.write(text[: MAX_OUTPUT - total])
-                        saved.flush()
-                    except Exception as exc:  # noqa: BLE001 — keep draining even if storage fails.
-                        journal.failure("saved_output", exc)
-                        output_errors.append(name)
-                        with contextlib.suppress(Exception):
-                            saved.close()
-                        saved = None
-                total += len(text)
+                # Redact complete lines; never persist independently sanitized fragments.
+                if omitted or len(pending) + len(chunk) > MAX_OUTPUT_LINE:
+                    omitted += len(pending) + len(chunk)
+                    pending.clear()
+                else:
+                    pending.extend(chunk)
+                if chunk.endswith(b"\n"):
+                    finish_line()
+            if pending or omitted:
+                finish_line()
         except Exception as exc:  # noqa: BLE001 — expose partial output separately from child status.
             output_errors.append(name)
             journal.failure("output_read", exc)
@@ -377,8 +425,9 @@ def run(
             if saved is not None:
                 journal.capture("output_close", saved.close)
             journal.capture("pipe_close", stream.close)
-        if total > MAX_OUTPUT:
-            journal.emit("output_truncated", stream=name, original_characters=total)
+        if truncated:
+            output_errors.append(name)
+            journal.emit("output_truncated", stream=name, saved_characters=total)
 
     try:
         if prepare is not None:
@@ -388,8 +437,10 @@ def run(
         journal.secrets = secret_values({**os.environ, **env})
         child_env = {**env, "OMNIGENT_REPRO_ATTEMPT_DIR": str(directory.resolve())}
         plugins = [p for p in child_env.get("PYTEST_PLUGINS", "").split(",") if p]
-        if "dev.repro_env.pytest_evidence" not in plugins:
-            plugins.append("dev.repro_env.pytest_evidence")
+        if not {"dev.repro_env.pytest_evidence", "dev.repro_env.pytest_loader"}.intersection(
+            plugins
+        ):
+            plugins.append("dev.repro_env.pytest_loader")
         child_env["PYTEST_PLUGINS"] = ",".join(plugins)
         child_env["PYTHONPATH"] = os.pathsep.join(
             filter(
