@@ -341,9 +341,8 @@ jobs:
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             MARKER="$MARKER and not nightly"
           fi
-          # --splits/--group partition the suite via a strided slice (see
-          # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
-          # evens out wall-clock better than pytest-shard's hash-bucketing.
+          # Balance the collected suite using checked-in phase durations.
+          # New tests use the median estimate; every collected test still runs.
           # --group is 1-indexed, so map the 0-indexed shard_id with +1.
           # --durations surfaces the slowest test phases (setup/call/teardown)
           # at the end of each shard's log so we can see where the wall-clock
