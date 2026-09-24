@@ -18,7 +18,8 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -49,6 +50,34 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalRegistry
 
 _logger = logging.getLogger(__name__)
+
+_terminal_launch_guard: ContextVar[Callable[[], bool] | None] = ContextVar(
+    "terminal_launch_guard", default=None
+)
+
+
+@contextlib.contextmanager
+def terminal_launch_fence(is_current: Callable[[], bool] | None) -> Iterator[None]:
+    """Bind one runner request's reset fence to its terminal launch."""
+    _require_current_terminal_launch(is_current)
+    token = _terminal_launch_guard.set(is_current)
+    try:
+        yield
+    finally:
+        _terminal_launch_guard.reset(token)
+
+
+def _require_current_terminal_launch(is_current: Callable[[], bool] | None) -> None:
+    if is_current is not None and not is_current():
+        from omnigent.terminals.registry import TerminalLaunchSupersededError
+
+        raise TerminalLaunchSupersededError("session reset superseded this terminal launch")
+
+
+def require_current_terminal_launch() -> None:
+    """Reject side effects from a reset-superseded runner launch."""
+    _require_current_terminal_launch(_terminal_launch_guard.get())
+
 
 _DEFAULT_WORKSPACE_ROOT = os.path.join(
     os.environ.get("TMPDIR", "/tmp"),
@@ -1049,6 +1078,8 @@ class SessionResourceRegistry:
 
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
+        is_current = _terminal_launch_guard.get()
+        _require_current_terminal_launch(is_current)
         try:
             instance = await self._terminal_registry.launch(
                 conversation_id=session_id,
@@ -1070,6 +1101,7 @@ class SessionResourceRegistry:
                 before_observation=True,
             )
             raise
+        _require_current_terminal_launch(is_current)
         return await self._observe_terminal_with_lifecycle(
             lifecycle,
             session_id=session_id,
@@ -1077,6 +1109,7 @@ class SessionResourceRegistry:
             session_key=session_key,
             instance=instance,
             resource_role=resource_role,
+            registration_is_current=is_current,
         )
 
     async def observe_required_terminal(
@@ -1134,11 +1167,16 @@ class SessionResourceRegistry:
         session_key: str,
         instance: TerminalInstance,
         resource_role: str | None = None,
+        registration_is_current: Callable[[], bool] | None = None,
     ) -> SessionResourceView:
         """Project and observe an already-launched terminal instance."""
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
-        if not getattr(instance, "running", False) or not await instance.is_alive():
+        registration_is_current = registration_is_current or _terminal_launch_guard.get()
+        _require_current_terminal_launch(registration_is_current)
+        alive = bool(getattr(instance, "running", False)) and await instance.is_alive()
+        _require_current_terminal_launch(registration_is_current)
+        if not alive:
             from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
             await self._finalize_terminal_exit(
@@ -1698,6 +1736,44 @@ class SessionResourceRegistry:
                         self._terminal_lifecycles.pop((session_id, terminal_id), None)
                 return closed
         return False
+
+    async def close_terminal_if_matching_view(
+        self,
+        session_id: str,
+        view: SessionResourceView,
+    ) -> bool:
+        """Retract a terminal only while its exact pane still owns the slot."""
+        registry = self._terminal_registry
+        metadata = view.metadata
+        terminal_name = metadata.get("terminal_name")
+        session_key = metadata.get("session_key")
+        socket = metadata.get("tmux_socket")
+        target = metadata.get("tmux_target")
+        if (
+            registry is None
+            or view.type != "terminal"
+            or view.session_id != session_id
+            or not isinstance(terminal_name, str)
+            or not isinstance(session_key, str)
+            or not isinstance(socket, str)
+            or not isinstance(target, str)
+            or view.id != terminal_resource_id(terminal_name, session_key)
+        ):
+            return False
+
+        instance = registry.get(session_id, terminal_name, session_key)
+        if (
+            instance is None
+            or str(instance.socket_path) != socket
+            or instance.tmux_target != target
+        ):
+            return False
+        closed = await registry.close(session_id, terminal_name, session_key, expected=instance)
+        if closed and registry.get(session_id, terminal_name, session_key) is None:
+            with self._lock:
+                self._terminal_roles.pop((session_id, view.id), None)
+                self._terminal_lifecycles.pop((session_id, view.id), None)
+        return closed
 
     async def transfer_terminal(
         self,

@@ -40,6 +40,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.terminals.registry import TerminalLaunchSupersededError
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -411,7 +412,10 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
         (None, [], True),
     ],
 )
-@pytest.mark.parametrize("cancel_launch", [False, True])
+@pytest.mark.parametrize(
+    ("cancel_launch", "supersede_at_preload"),
+    [(False, False), (True, False), (False, True)],
+)
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -419,6 +423,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     permission_args: list[str],
     retain_subscription: bool,
     cancel_launch: bool,
+    supersede_at_preload: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -442,6 +447,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    generation = 0
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
@@ -650,6 +656,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
+        nonlocal generation
         assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
             "stale bridge state must be cleared until the new app-server has "
             "loaded the resume thread"
@@ -657,6 +664,17 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
         assert isinstance(cwd, Path)
         assert retain_client is retain_subscription
+        if supersede_at_preload:
+            generation = 1
+            codex_native_bridge.write_bridge_state(
+                bridge_dir,
+                codex_native_bridge.CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path="ws://127.0.0.1:9999",
+                    thread_id="successor-thread",
+                    codex_home=str(tmp_path / "successor-home"),
+                ),
+            )
         return retained_client if retain_client else None
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -698,6 +716,27 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
 
     try:
+        if supersede_at_preload:
+            with pytest.raises(TerminalLaunchSupersededError):
+                await _auto_create_codex_terminal(
+                    session_id,
+                    _FakeResourceRegistry(),  # type: ignore[arg-type]
+                    lambda _sid, event: published_events.append(event),
+                    agent_spec=agent_spec,
+                    server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+                    registration_is_current=lambda: generation == 0,
+                )
+            bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert bridge_state is not None
+            assert bridge_state.socket_path == "ws://127.0.0.1:9999"
+            assert bridge_state.thread_id == "successor-thread"
+            assert app_server.closed
+            assert retained_client.closed is retain_subscription
+            assert not launched_specs
+            assert not published_events
+            assert not forward_calls
+            assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            return
         if cancel_launch:
             with pytest.raises(asyncio.CancelledError):
                 await _auto_create_codex_terminal(
@@ -804,6 +843,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "bridge_dir": bridge_dir,
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
+            "app_server": app_server,
             "client": retained_client if retain_subscription else None,
         }
     ]
@@ -3391,12 +3431,14 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
     monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda: None)
     monkeypatch.setattr(codex_forwarder, "supervise_forwarder", forward)
     session_id = "conv_test_retained_preload"
-    orchestration._AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()  # type: ignore[assignment]
+    app_server = _AppServer()
+    orchestration._AUTO_CODEX_APP_SERVERS[session_id] = app_server  # type: ignore[assignment]
     operation = orchestration._codex_forward_known_thread(
         session_id=session_id,
         bridge_dir=tmp_path,
         codex_ws_url="ws://127.0.0.1:9876",
         thread_id="thread_test",
+        app_server=app_server,  # type: ignore[arg-type]
         client=client,  # type: ignore[arg-type]
     )
     if outcome == "success":
@@ -3407,6 +3449,50 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
             await operation
     assert closed == ["client", "server"]
     assert session_id not in orchestration._AUTO_CODEX_APP_SERVERS
+
+
+@pytest.mark.asyncio
+async def test_codex_known_thread_forwarder_preserves_replacement_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.runner import _entry
+    from omnigent.runner.native import orchestration
+
+    session_id = uuid.uuid4().hex
+
+    class _Server:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    old_server = _Server()
+    successor = _Server()
+    orchestration._AUTO_CODEX_APP_SERVERS[session_id] = old_server  # type: ignore[assignment]
+
+    async def _forward(**kwargs: Any) -> None:
+        assert kwargs["session_id"] == session_id
+        orchestration._AUTO_CODEX_APP_SERVERS[session_id] = successor  # type: ignore[assignment]
+
+    monkeypatch.setattr(orchestration, "_required_runner_env", lambda _name: "http://ap.test")
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(codex_forwarder, "supervise_forwarder", _forward)
+    try:
+        await orchestration._codex_forward_known_thread(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:9876",
+            thread_id="thread_test",
+            app_server=old_server,  # type: ignore[arg-type]
+        )
+        assert orchestration._AUTO_CODEX_APP_SERVERS[session_id] is successor
+        assert old_server.closed
+        assert not successor.closed
+    finally:
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
 @pytest.mark.asyncio

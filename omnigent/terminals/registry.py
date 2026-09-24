@@ -101,6 +101,10 @@ class TerminalListEntry:
     instance: TerminalInstance
 
 
+class TerminalLaunchSupersededError(RuntimeError):
+    """A session reset invalidated a launch before it registered."""
+
+
 class TerminalExitedDuringLaunch(RuntimeError):
     """Retain a dead launch's captured evidence after its private server is closed."""
 
@@ -150,6 +154,8 @@ class TerminalRegistry:
         # between them — plenty of room for another send to slip in).
         # See ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §9.1.
         self._instance_locks: dict[tuple[str, str, str], threading.Lock] = {}
+        # Reset generations fence launches across the lock-free spawn.
+        self._launch_generations: dict[str, int] = {}
         # Threading lock — see module docstring for the rationale.
         # Protects both ``_by_conversation`` and ``_instance_locks``.
         self._lock = threading.Lock()
@@ -213,16 +219,25 @@ class TerminalRegistry:
         :raises RuntimeError: If tmux isn't on PATH or the launch
             fails. Inner code surfaces a clear error; the caller
             tool wraps in a JSON error envelope.
+        :raises TerminalLaunchSupersededError: If a reset interrupts launch.
         """
         key = (terminal_name, session_key)
         with self._lock:
+            launch_generation = self._launch_generations.get(conversation_id, 0)
             existing = self._by_conversation.get(conversation_id, {}).get(key)
         if existing is not None and existing.running:
-            if await existing.is_alive():
+            alive = await existing.is_alive()
+            with self._lock:
+                superseded = self._launch_generations.get(conversation_id, 0) != launch_generation
+            if superseded:
+                raise TerminalLaunchSupersededError(
+                    f"terminal {terminal_name}:{session_key} was superseded by a reset"
+                )
+            if alive:
                 return existing
-            await self.close(conversation_id, terminal_name, session_key)
+            await self.close(conversation_id, terminal_name, session_key, expected=existing)
         elif existing is not None:
-            await self.close(conversation_id, terminal_name, session_key)
+            await self.close(conversation_id, terminal_name, session_key, expected=existing)
 
         # Lock-free section: ``create_terminal_instance`` and
         # ``launch`` may take real time (tmux spawn). Holding the
@@ -251,40 +266,63 @@ class TerminalRegistry:
                 )
             raise TerminalExitedDuringLaunch(created.instance)
 
+        superseded = False
         with self._lock:
-            slot = self._by_conversation.setdefault(conversation_id, {})
-            # Re-check: another concurrent launch for the same key may
-            # have raced ours. Take the second-arrival policy: close
-            # ours and return the racer's. Avoids two live tmux
-            # sessions for the same key.
-            racer = slot.get(key)
-            if racer is not None and racer.running:
-                # Close ours outside the lock; racer wins.
+            if self._launch_generations.get(conversation_id, 0) != launch_generation:
+                superseded = True
                 instance_to_close: TerminalInstance | None = created.instance
-                winning_instance = racer
-            else:
-                slot[key] = created.instance
-                instance_to_close = None
                 winning_instance = created.instance
-                # Allocate a per-instance lock alongside the
-                # registration. Tools fetch it via
-                # :meth:`get_instance_lock` to serialize concurrent
-                # tmux ops on this instance.
-                self._instance_locks[(conversation_id, terminal_name, session_key)] = (
-                    threading.Lock()
-                )
+            else:
+                slot = self._by_conversation.setdefault(conversation_id, {})
+                # Re-check: another concurrent launch for the same key may
+                # have raced ours. Take the second-arrival policy: close
+                # ours and return the racer's. Avoids two live tmux
+                # sessions for the same key.
+                racer = slot.get(key)
+                if racer is not None and racer.running:
+                    # Close ours outside the lock; racer wins.
+                    instance_to_close = created.instance
+                    winning_instance = racer
+                else:
+                    slot[key] = created.instance
+                    instance_to_close = None
+                    winning_instance = created.instance
+                    # Allocate a per-instance lock alongside the
+                    # registration. Tools fetch it via
+                    # :meth:`get_instance_lock` to serialize concurrent
+                    # tmux ops on this instance.
+                    self._instance_locks[(conversation_id, terminal_name, session_key)] = (
+                        threading.Lock()
+                    )
 
         if instance_to_close is not None:
             try:
                 await asyncio.wait_for(instance_to_close.close(), timeout=_CLOSE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Race-loser terminal close timed out for %s:%s in conv %s",
+                    "Discarded terminal close timed out for %s:%s in conv %s",
                     terminal_name,
                     session_key,
                     conversation_id,
                 )
+        if superseded:
+            raise TerminalLaunchSupersededError(
+                f"terminal {terminal_name}:{session_key} finished starting after a "
+                f"reset superseded conversation {conversation_id}'s launches"
+            )
         return winning_instance
+
+    def supersede_inflight_launches(self, conversation_id: str) -> None:
+        """Invalidate this conversation's launches still in progress."""
+        with self._lock:
+            self._launch_generations[conversation_id] = (
+                self._launch_generations.get(conversation_id, 0) + 1
+            )
+
+    def drop_launch_generation(self, conversation_id: str) -> None:
+        """Forget the generation of a deleted conversation."""
+        with self._lock:
+            self._launch_generations.pop(conversation_id, None)
 
     def get_instance_lock(
         self,
