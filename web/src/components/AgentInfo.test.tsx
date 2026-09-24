@@ -1,3 +1,4 @@
+import { registryRequest } from "@/lib/mcpRegistry";
 import type * as IdentityModule from "@/lib/identity";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -68,12 +69,18 @@ vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn() }));
 // renders deterministically without those providers; `versionEnv` lets each
 // case dial the values. Defaults (server null / host undefined) keep the
 // footer hidden, so the unrelated cases above are unaffected.
+vi.mock("@/lib/mcpRegistry", () => ({ registryRequest: vi.fn() }));
+
 const versionEnv = vi.hoisted(() => ({
+  enabledConnections: [] as string[],
   serverVersion: null as string | null,
   hostVersion: undefined as string | null | undefined,
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ server_version: versionEnv.serverVersion }),
+  useServerInfo: () => ({
+    server_version: versionEnv.serverVersion,
+    enabled_connections: versionEnv.enabledConnections,
+  }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostVersion: () => versionEnv.hostVersion,
@@ -89,6 +96,7 @@ import {
 
 afterEach(() => {
   cleanup();
+  versionEnv.enabledConnections = [];
   copyTextMock.mockClear();
   createMcpMutate.mockClear();
   updateMcpMutate.mockClear();
@@ -939,6 +947,32 @@ describe("McpServersSection", () => {
 
     expect(screen.getByRole("button", { name: "Manage MCP servers" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "slack" })).toBeInTheDocument();
+  });
+
+  it("makes the managed catalog the default and keeps custom configuration under advanced", async () => {
+    versionEnv.enabledConnections = ["mcp"];
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [
+        {
+          id: "tracker",
+          title: "Work tracker",
+          description: "Read tickets",
+          connected: true,
+          auth: "oauth",
+        },
+      ],
+    });
+    renderContent("conv_mcp");
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const checkbox = await screen.findByRole("checkbox", { name: "Work tracker" });
+    expect(screen.queryByLabelText("URL")).toBeNull();
+    fireEvent.click(checkbox);
+    expect(createMcpMutate).toHaveBeenCalledWith(
+      { name: "tracker", transport: "registry" },
+      expect.anything(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Advanced: custom MCP servers/ }));
+    expect(screen.getByLabelText("URL")).toBeInTheDocument();
   });
 
   it("creates an HTTP MCP server from the manager dialog", () => {
