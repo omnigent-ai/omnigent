@@ -61,6 +61,9 @@ def test_capabilities_defaults() -> None:
     # Off by default so a single-repo provider (and every out-of-tree one) is
     # never handed a multi-repo request; providers opt in explicitly.
     assert caps.multi_repo is False
+    # Off by default so a wake never re-prepares a workspace underneath a
+    # provider that did not ask for it; providers opt in explicitly.
+    assert caps.resume_requires_workspace_prep is False
 
 
 def test_capabilities_custom() -> None:
