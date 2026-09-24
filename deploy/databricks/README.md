@@ -166,9 +166,15 @@ apps that should show it.
 See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
 inventory and rollback procedure.
 
-> [!TIP]
-> To lock against a private PyPI mirror or proxy instead of public
-> PyPI, set `UV_INDEX_URL` before running `deploy.py`.
+> [!NOTE]
+> The generated app lock always resolves from public PyPI. Machine-level uv
+> index config and the `UV_INDEX*` environment variables are deliberately
+> ignored: the lock installs inside the Databricks Apps runtime, which can
+> only reach pypi.org, so locking against a private mirror would bake
+> unreachable hosts into the deployed app. Because config files are shut out
+> entirely (`--no-config`), non-index uv settings in them (TLS, timeouts) are
+> too; supply those through uv's environment variables (e.g. `UV_NATIVE_TLS`,
+> `SSL_CERT_FILE`, `UV_HTTP_TIMEOUT`), which the lock step passes through.
 
 ## Smoke check
 
