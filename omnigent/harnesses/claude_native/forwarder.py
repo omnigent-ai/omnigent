@@ -133,6 +133,13 @@ _MAX_SEEN_BTW_KEYS = 64
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
+# Ceiling for one post's response phase. The connect phase keeps the flat
+# timeout — an unreachable server must fail fast — but the response is a durable
+# write the server has to apply, and a large batch through a loaded gateway can
+# outlast the first budget. Retrying under the identical deadline that just
+# expired cannot succeed: it only re-sends the payload and burns the attempt
+# budget until the batch is dropped, so each retry gets a longer read instead.
+_POST_READ_TIMEOUT_CAP_S = 60.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
 _SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS = 12
@@ -981,6 +988,16 @@ class _PostRetryTracker:
     def has_retry_state(self, key: str) -> bool:
         """Return whether ``key`` has a recorded failure awaiting retry."""
         return key in self._entries
+
+    def attempts(self, key: str) -> int:
+        """
+        Return how many posts for ``key`` have already failed.
+
+        :param key: Stable retry key, e.g. ``"item:source-1"``.
+        :returns: Failed attempt count, ``0`` when ``key`` is untried.
+        """
+        entry = self._entries.get(key)
+        return 0 if entry is None else entry.attempts
 
     def clear(self, key: str) -> None:
         """
@@ -1962,11 +1979,27 @@ def _pending_items_from_records(
     return pending, safe_offset
 
 
+def _post_timeout_for_attempt(failed_attempts: int) -> httpx.Timeout:
+    """
+    Build a post timeout whose read budget grows with each failed attempt.
+
+    Connect, write and pool keep the flat budget so an unreachable server still
+    fails fast; only the response phase is extended, doubling per prior failure
+    up to :data:`_POST_READ_TIMEOUT_CAP_S`.
+
+    :param failed_attempts: Posts for this key that already failed.
+    :returns: Timeout for the next attempt.
+    """
+    read_s = min(_POST_TIMEOUT_S * 2 ** max(0, failed_attempts), _POST_READ_TIMEOUT_CAP_S)
+    return httpx.Timeout(_POST_TIMEOUT_S, read=read_s)
+
+
 async def _post_external_conversation_item_batch(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     items: Sequence[_PendingSubagentItem],
+    timeout: httpx.Timeout | httpx._client.UseClientDefault = httpx.USE_CLIENT_DEFAULT,
 ) -> None:
     """Post and validate one array of source-keyed child transcript items."""
     encoded = _encoded_subagent_batch(items)
@@ -1976,6 +2009,7 @@ async def _post_external_conversation_item_batch(
         f"/v1/sessions/{session_id}/events",
         content=encoded,
         headers={"content-type": "application/json"},
+        timeout=timeout,
     )
     response.raise_for_status()
     try:
@@ -1997,6 +2031,7 @@ async def _post_external_conversation_items(
     session_id: str,
     items: Sequence[_PendingSubagentItem],
     batch_capability: _SessionEventBatchCapability,
+    timeout: httpx.Timeout | httpx._client.UseClientDefault = httpx.USE_CLIENT_DEFAULT,
 ) -> None:
     """Post a child batch, falling back when an older server rejects arrays."""
 
@@ -2006,6 +2041,7 @@ async def _post_external_conversation_items(
                 client,
                 session_id=session_id,
                 item=entry.item,
+                timeout=timeout,
             )
 
     if batch_capability.supported is False:
@@ -2016,6 +2052,7 @@ async def _post_external_conversation_items(
             client,
             session_id=session_id,
             items=items,
+            timeout=timeout,
         )
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 422:
@@ -2139,6 +2176,7 @@ async def _forward_one_subagent(
                     session_id=entry.child_conversation_id,
                     items=batch,
                     batch_capability=batch_capability,
+                    timeout=_post_timeout_for_attempt(item_retry_tracker.attempts(retry_key)),
                 )
             except httpx.HTTPError as exc:
                 decision = item_retry_tracker.record_failure(
@@ -2230,6 +2268,9 @@ async def _forward_one_subagent(
                         client,
                         session_id=entry.child_conversation_id,
                         item=item,
+                        timeout=_post_timeout_for_attempt(
+                            item_retry_tracker.attempts(item_retry_key)
+                        ),
                     )
                 except httpx.HTTPError as item_exc:
                     item_decision = item_retry_tracker.record_failure(
@@ -5082,6 +5123,7 @@ async def _post_external_conversation_item(
     *,
     session_id: str,
     item: ClaudeTranscriptItem,
+    timeout: httpx.Timeout | httpx._client.UseClientDefault = httpx.USE_CLIENT_DEFAULT,
 ) -> None:
     """
     Post one mirrored transcript item to the Sessions API.
@@ -5089,6 +5131,7 @@ async def _post_external_conversation_item(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param item: Transcript-derived conversation item.
+    :param timeout: Per-attempt timeout; the default uses the client's own.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
@@ -5121,6 +5164,7 @@ async def _post_external_conversation_item(
                     "source_id": item.source_id,
                 },
             },
+            timeout=timeout,
         )
         resp.raise_for_status()
 
