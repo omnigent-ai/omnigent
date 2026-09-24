@@ -201,7 +201,10 @@ export const ReasoningContent = memo(({ className, children, ...props }: Reasoni
       {...props}
     >
       <MarkdownErrorBoundary source={normalizedChildren}>
+        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+            so remount on theme change to recolor already-rendered diagrams. */}
         <Streamdown
+          key={themeMode}
           plugins={STREAMDOWN_PLUGINS}
           mermaid={mermaidOptions}
           // Let links open on a plain click (and cmd/ctrl-click in a new tab)

@@ -650,7 +650,10 @@ export const MessageResponse = memo(
 
     return (
       <MarkdownErrorBoundary source={props.children}>
+        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+            so remount on theme change to recolor already-rendered diagrams. */}
         <Streamdown
+          key={themeMode}
           // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
           className={cn(
             "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
