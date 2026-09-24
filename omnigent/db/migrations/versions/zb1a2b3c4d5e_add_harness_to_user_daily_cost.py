@@ -119,16 +119,17 @@ def downgrade() -> None:
             )
         )
     elif dialect == "cockroachdb":
-        # CockroachDB: use raw DDL to ensure table always has a PK
-        # Add new PK first, then drop column
+        # CockroachDB: use separate statements to ensure table always has a PK
+        # First rebuild the PK without harness
         op.execute(
             sa.text(
                 "ALTER TABLE user_daily_cost "
                 "DROP CONSTRAINT pk_user_daily_cost, "
-                "ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc), "
-                "DROP COLUMN harness"
+                "ADD CONSTRAINT pk_user_daily_cost PRIMARY KEY (workspace_id, user_id, day_utc)"
             )
         )
+        # Then drop the harness column
+        op.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
     else:
         # PostgreSQL/SQLite: use batch_alter_table
         old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
