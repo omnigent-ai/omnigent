@@ -1976,9 +1976,7 @@ def test_stale_login_cache_cannot_shadow_claude_sdk_fallback(
     # binary path). Binary resolution is stubbed so the cache is hit — and the
     # status subprocess never spawns — on machines with no claude install.
     fake_binary = "/fake/bin/claude"
-    monkeypatch.setattr(
-        harness_install, "shutil", SimpleNamespace(which=lambda _name: fake_binary)
-    )
+    monkeypatch.setattr(harness_install, "resolve_harness_cli_binary", lambda _key: fake_binary)
     harness_install._LOGIN_PROBE_CACHE[("anthropic", fake_binary)] = time.monotonic() + 3600.0
     monkeypatch.setenv("HOME", str(config_home))
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)

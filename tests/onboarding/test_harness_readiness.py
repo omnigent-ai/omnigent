@@ -41,13 +41,14 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     import omnigent.onboarding.copilot_auth as _ca
 
     monkeypatch.setattr(_ca, "gh_cli_github_token", lambda host=None: None)
-    # Codex readiness resolves the binary via resolve_cli_binary, which honors
-    # an OMNIGENT_CODEX_PATH override and probes on-disk global install dirs.
-    # Clear the override and stub the fallback dirs so a developer's real codex
-    # install can't flip the binary-missing verdict these tests assert.
+    # Isolate readiness from ambient overrides and global installations.
+    import os
+
     import omnigent._platform as platform
 
-    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    for var in list(os.environ):
+        if var.endswith("_PATH") and var.startswith(("OMNIGENT_", "HARNESS_")):
+            monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
 
 
