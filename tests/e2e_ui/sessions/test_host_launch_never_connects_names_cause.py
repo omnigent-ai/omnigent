@@ -164,6 +164,8 @@ def _wait_for_host_online(base_url: str, host_id: str, timeout: float = 45.0) ->
                     if host["host_id"] == host_id and host["status"] == "online":
                         return
         except httpx.HTTPError:
+            # Transient connection/startup errors are expected while the
+            # server boots; keep polling until the deadline expires.
             pass
         time.sleep(0.25)
     raise AssertionError(f"host {host_id!r} never came online at {base_url}")

@@ -1202,7 +1202,7 @@ async def test_message_relaunch_never_connected_names_phase_and_logs_error(
         )
     finally:
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await launch_responder
+            _ = await launch_responder
 
     assert msg_resp.status_code == 503, msg_resp.text
     error = msg_resp.json()["error"]

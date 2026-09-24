@@ -26,6 +26,7 @@ from omnigent.host.connect import (
     HostProcess,
     HostRetryableConnectionError,
     _build_runner_env,
+    _runner_exit_error,
     _RunnerHandle,
     run_host_process,
 )
@@ -1473,6 +1474,34 @@ async def test_watch_runner_reports_unexpected_exit(
     assert "code 3" in report.error
     assert "tunnel rejected: crash-cause" in report.error
     assert maintenance_reasons == ["runner_exited"]
+
+
+def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
+    """Credential-shaped values in the surfaced log tail are masked.
+
+    The exit report travels past the host — into the server's ERROR
+    record, the ``runner_unavailable`` API detail, and the SPA's error
+    banner — so an env dump or auth header echoed by a dying runner
+    must not leak its value to every session viewer.
+    """
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "boot: starting\n"
+        "OPENAI_API_KEY=sk-live-abc123\n"
+        "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n"
+        "tunnel rejected: bad frame\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(3, log)
+
+    assert "sk-live-abc123" not in error
+    assert "eyJhbGciOiJIUzI1NiJ9" not in error
+    assert "OPENAI_API_KEY=[REDACTED]" in error
+    # Non-credential diagnostics stay verbatim — the report must still
+    # carry the actual cause.
+    assert "tunnel rejected: bad frame" in error
+    assert "code 3" in error
 
 
 async def test_watch_runner_silent_on_intentional_stop(
