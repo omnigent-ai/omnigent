@@ -200,7 +200,7 @@ async def test_literal_credentials_rejected_before_session_or_artifact_writes(en
     env.launch.assert_not_awaited()
 
 
-async def _multipart_create(env: _Env, **metadata: Any):
+async def _multipart_create(env: _Env, *, executor: dict[str, Any] | None = None, **metadata: Any):
     return await env.client.post(
         "/v1/sessions",
         data={
@@ -218,7 +218,7 @@ async def _multipart_create(env: _Env, **metadata: Any):
                 "agent.tar.gz",
                 build_agent_bundle(
                     "managed-codex",
-                    executor={"type": "omnigent", "config": {"harness": "codex"}},
+                    executor=executor or {"type": "omnigent", "config": {"harness": "codex"}},
                     include_llm=False,
                 ),
                 "application/gzip",
@@ -761,3 +761,133 @@ async def test_same_harness_fork_validates_model_against_saved_policy(
         assert fork is not None and original is not None
         assert fork.model_override == expected
         assert fork.inference_snapshot == original.inference_snapshot
+
+
+@pytest.mark.parametrize("multipart", [False, True])
+@pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])
+@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi-native", "acp:custom"])
+@pytest.mark.parametrize("pin", [None, "gateway/fast", "obsolete-agent-model"])
+async def test_create_validates_agent_pin_before_side_effects(
+    env, multipart, provider, harness, pin
+):
+    env.catalog.runtime_config["inference"]["harnesses"][harness] = {
+        "provider": "bifrost",
+        "default_model": "gateway/main",
+        "model_allowlist": ["gateway/main", "gateway/fast"],
+    }
+    env.app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            provider=provider,
+            server_url="http://test",
+            launcher_factory=lambda: None,
+            token_ttl_s=100,
+            host_config=env.catalog.runtime_config,
+        )
+    )
+    executor = {"type": "omnigent", "config": {"harness": harness}, "model": pin}
+    agent = await create_test_agent(env.client, executor=executor, include_llm=False)
+    before = env.persisted()
+    if multipart:
+        response = await _multipart_create(env, executor=executor, sandbox_provider=provider)
+    else:
+        response = await env.client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_type": "managed",
+                "sandbox_provider": provider,
+                "model_override": "gateway/main",
+                "inference_configuration_revision": "revision-1",
+            },
+        )
+    if pin == "obsolete-agent-model":
+        assert response.status_code == 400, response.text
+        assert pin in response.text and harness in response.text
+        assert "Remove executor.model" in response.text
+        assert env.persisted() == before
+        env.launch.assert_not_called()
+    else:
+        assert response.status_code == 201, response.text
+        saved = env.store.get_conversation(response.json()["session_id" if multipart else "id"])
+        assert saved.model_override == "gateway/main"
+
+
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("switching_agent", [False, True])
+async def test_fork_and_child_pin_use_saved_policy_before_writes(env, child, switching_agent):
+    agent = await create_test_agent(
+        env.client,
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "codex"},
+            "model": "obsolete-agent-model",
+        },
+        include_llm=False,
+    )
+    stored = env.app.state.agent_store.get(agent["id"])
+    target = env.app.state.agent_store.create(
+        generate_agent_id(), "pinned-builtin", stored.bundle_location
+    )
+    source_agent = await _builtin(env, "codex") if switching_agent else target.id
+    snapshot = await env.catalog.prepare("agent_sandbox", "codex", "local")
+    source = env.store.create_conversation(
+        agent_id=source_agent,
+        inference_snapshot=snapshot,
+    )
+    env.catalog.runtime_config["inference"]["harnesses"]["codex"]["model_allowlist"].append(
+        "obsolete-agent-model"
+    )
+    before = env.persisted()
+    if child:
+        response = await _multipart_create(
+            env,
+            parent_session_id=source.id,
+            executor={
+                "type": "omnigent",
+                "config": {"harness": "codex"},
+                "model": "obsolete-agent-model",
+            },
+        )
+    else:
+        response = await env.client.post(
+            f"/v1/sessions/{source.id}/fork",
+            json={
+                **({"agent_id": target.id} if switching_agent else {}),
+                "model_override": "gateway/main",
+            },
+        )
+    assert response.status_code == 400, response.text
+    assert "obsolete-agent-model" in response.text
+    assert env.persisted() == before
+    env.launch.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["ordinary-host", "unconfigured-target", "unbound-harness"])
+async def test_conflicting_pin_is_not_restricted_without_sandbox_binding(env, mode):
+    agent = await create_test_agent(
+        env.client,
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "codex"},
+            "model": "obsolete-agent-model",
+        },
+        include_llm=False,
+    )
+    if mode == "unconfigured-target":
+        env.catalog.runtime_config["inference"]["harnesses"].clear()
+    elif mode == "unbound-harness":
+        del env.catalog.runtime_config["inference"]["harnesses"]["codex"]
+    response = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "model_override": "gateway/main",
+            **(
+                {"host_type": "managed", "sandbox_provider": "agent_sandbox"}
+                if mode != "ordinary-host"
+                else {}
+            ),
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert env.store.get_conversation(response.json()["id"]).model_override == "gateway/main"
