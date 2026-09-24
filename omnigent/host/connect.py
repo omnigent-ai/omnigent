@@ -136,6 +136,7 @@ from omnigent.process_logging import (
     env_truthy,
     open_process_log_file,
     process_log_dir,
+    redact_log_text,
     should_log_to_stderr,
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
@@ -351,39 +352,23 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
         return ""
 
 
-# Credential-shaped ``key=value`` / ``key: value`` assignments in a runner
-# log tail, e.g. ``OPENAI_API_KEY=sk-...`` from an env dump or an
-# ``authorization: Bearer ...`` header echoed by a dying runner. The key is
-# kept (it names what was configured — the diagnostic part) and only the
-# value is masked.
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b([\w.-]*(?:token|secret|passw(?:or)?d|credential|api[_-]?key|"
-    r"access[_-]?key|private[_-]?key|client[_-]?secret|authorization|cookie)"
-    r"[\w.-]*)(\s*[=:]\s*)(\S+)"
-)
-
-# ``Bearer``/``Basic`` HTTP auth values wherever they appear in a line.
-_HTTP_AUTH_VALUE_RE = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9\-._~+/=]{8,})")
-
-
 def _redact_log_tail(tail: str) -> str:
     """Mask credential-shaped values before a log tail leaves the host.
 
     The exit report is surfaced verbatim well beyond the host's log dir —
     the server's ERROR record, the ``runner_unavailable`` API detail, and
     the SPA's error banner — so a secret echoed into the runner log must
-    not reach every session viewer. Key-based masking keeps the
-    diagnostic shape while hiding the value.
+    not reach every session viewer. Uses the shared
+    :func:`redact_log_text` (rather than bespoke patterns) so quoted
+    values, provider token shapes, JWTs, and standalone high-entropy
+    credentials are all covered; keys stay visible to keep the
+    diagnostic shape.
 
     :param tail: Trailing runner-log lines about to be surfaced.
     :returns: The tail with credential-shaped values replaced by
         ``[REDACTED]``.
     """
-    # Auth-header values first: ``authorization: Bearer <tok>`` must mask
-    # the token, not just the ``Bearer`` word the assignment rule would
-    # consume as the value.
-    tail = _HTTP_AUTH_VALUE_RE.sub(r"\1 [REDACTED]", tail)
-    return _SECRET_ASSIGNMENT_RE.sub(r"\1\2[REDACTED]", tail)
+    return redact_log_text(tail, include_whitespace_credentials=True)
 
 
 def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
