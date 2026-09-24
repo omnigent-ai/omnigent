@@ -51,23 +51,35 @@ def upgrade() -> None:
     harness column defaults to "__all__" for existing rows.
     """
     sqlite = _is_sqlite()
-    # On PostgreSQL/MySQL, get the current PK name; on SQLite, let batch recreate handle it
-    old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
+    is_mysql = op.get_bind().dialect.name == "mysql"
 
-    with op.batch_alter_table(
-        "user_daily_cost", recreate="always" if sqlite else "auto"
-    ) as batch_op:
-        # Add harness column with default value
-        batch_op.add_column(
-            sa.Column("harness", sa.String(64), nullable=False, server_default="__all__")
+    if is_mysql:
+        # MySQL: use raw DDL to avoid batch_alter_table complexities
+        op.execute(
+            sa.text(
+                "ALTER TABLE `user_daily_cost` "
+                "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__' AFTER day_utc, "
+                "DROP PRIMARY KEY, "
+                "ADD CONSTRAINT `pk_user_daily_cost` PRIMARY KEY (workspace_id, user_id, day_utc, harness)"
+            )
         )
-        # Drop old primary key if it exists
-        if old_pk_name is not None:
-            batch_op.drop_constraint(old_pk_name, type_="primary")
-        # Add new primary key including harness
-        batch_op.create_primary_key(
-            "pk_user_daily_cost", ["workspace_id", "user_id", "day_utc", "harness"]
-        )
+    else:
+        # PostgreSQL/SQLite: use batch_alter_table
+        old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
+        with op.batch_alter_table(
+            "user_daily_cost", recreate="always" if sqlite else "auto"
+        ) as batch_op:
+            # Add harness column with default value
+            batch_op.add_column(
+                sa.Column("harness", sa.String(64), nullable=False, server_default="__all__")
+            )
+            # Drop old primary key if it exists
+            if old_pk_name is not None:
+                batch_op.drop_constraint(old_pk_name, type_="primary")
+            # Add new primary key including harness
+            batch_op.create_primary_key(
+                "pk_user_daily_cost", ["workspace_id", "user_id", "day_utc", "harness"]
+            )
 
 
 def downgrade() -> None:
@@ -81,16 +93,28 @@ def downgrade() -> None:
     op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
 
     sqlite = _is_sqlite()
-    # On PostgreSQL/MySQL, get the current PK name; on SQLite, let batch recreate handle it
-    old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
+    is_mysql = op.get_bind().dialect.name == "mysql"
 
-    with op.batch_alter_table(
-        "user_daily_cost", recreate="always" if sqlite else "auto"
-    ) as batch_op:
-        # Drop current primary key if it exists
-        if old_pk_name is not None:
-            batch_op.drop_constraint(old_pk_name, type_="primary")
-        # Drop harness column
-        batch_op.drop_column("harness")
-        # Recreate original primary key without harness
-        batch_op.create_primary_key("pk_user_daily_cost", ["workspace_id", "user_id", "day_utc"])
+    if is_mysql:
+        # MySQL: use raw DDL to avoid batch_alter_table complexities
+        op.execute(
+            sa.text(
+                "ALTER TABLE `user_daily_cost` "
+                "DROP PRIMARY KEY, "
+                "DROP COLUMN harness, "
+                "ADD CONSTRAINT `pk_user_daily_cost` PRIMARY KEY (workspace_id, user_id, day_utc)"
+            )
+        )
+    else:
+        # PostgreSQL/SQLite: use batch_alter_table
+        old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
+        with op.batch_alter_table(
+            "user_daily_cost", recreate="always" if sqlite else "auto"
+        ) as batch_op:
+            # Drop current primary key if it exists
+            if old_pk_name is not None:
+                batch_op.drop_constraint(old_pk_name, type_="primary")
+            # Drop harness column
+            batch_op.drop_column("harness")
+            # Recreate original primary key without harness
+            batch_op.create_primary_key("pk_user_daily_cost", ["workspace_id", "user_id", "day_utc"])
