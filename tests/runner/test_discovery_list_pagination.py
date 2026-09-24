@@ -362,6 +362,7 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
     # so a continuation can't silently narrow back to top-level rows. The
     # template agent catalog stays unparameterized.
     assert session_queries and {query.get("kind") for query in session_queries} == {"any"}
+    assert {query.get("visibility") for query in session_queries} == {"all"}
     assert agent_queries and {query.get("kind") for query in agent_queries} == {None}
 
 
