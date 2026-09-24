@@ -37,11 +37,8 @@ const ROW_INTERACTIVE_CONTROL_SELECTOR =
 const ROW_KEYBOARD_INTERACTIVE_CONTROL_SELECTOR =
   'a[href], button, input, select, textarea, [role="button"], [role="link"], [contenteditable]:not([contenteditable="false"])';
 
-// How long a resolved gesture's trailing-click suppression stays armed. The
-// browser's synthesized click lands within the same task chain as the release
-// (milliseconds), so this window is generous for it — while an
-// assistive-technology activation that dispatches only `click` arrives on a
-// human timescale, well past it, and must NOT be consumed as "trailing".
+// Consume the browser's immediate trailing click, but leave later
+// assistive-technology click activations alone.
 export const ROW_CLICK_SUPPRESS_WINDOW_MS = 250;
 
 const ROW_SCROLL_ACTIVATE_PX = 25;
@@ -127,14 +124,8 @@ const rowGestureActivators = [
   },
 ];
 
-/**
- * A drag sensor that is instantiated only after the row recognizer chooses
- * drag. Based on PointerSensor, NOT TouchSensor: the gesture is tracked as a
- * pointer stream, and a TouchSensor base listens for touchmove/touchend —
- * in a Pointer-Events-only environment the release emits only pointerup, so
- * dnd-kit stayed active forever (row dimmed, later drags blocked).
- * PointerSensor ends and cancels on the document's pointerup / pointercancel,
- * which fire on real touch hardware too.
+/** Use pointer events for drags: TouchSensor misses pointer-only releases and
+ * leaves dnd-kit active after the row is released.
  */
 export class RowGesturePointerSensor extends PointerSensor {
   static override activators = rowGestureActivators as unknown as typeof PointerSensor.activators;
@@ -248,22 +239,15 @@ export function useRowGesture({
     holdTimer.current = null;
   }, []);
 
-  // Chrome samples touch-action at touchstart, so the armed-state class swap
-  // to touch-none can't stop an in-flight touch from being claimed as a native
-  // pan. A held finger hasn't started a scroll yet, so its touchmoves are
-  // still cancelable — preventDefault here forestalls the pan until the
-  // gesture resolves to drag or resets. React's delegated listeners are
-  // passive, so this has to be a real native listener.
+  // Chrome fixes touch-action at touchstart; a later class swap cannot stop pan.
+  // Cancel native touchmove while armed; React's passive listener cannot.
   const armTouchMoveGuard = useCallback(() => {
     if (touchMoveGuard.current) return;
     const handler = (event: TouchEvent) => {
       if (event.cancelable) event.preventDefault();
     };
-    // The OS long-press contextmenu hit-tests the element under the finger —
-    // once the row menu opens there, that is the menu itself, past every
-    // row-level guard. Unprevented it starts text selection and cancels the
-    // pointer stream, so suppress it document-wide while the gesture owns the
-    // touch. The recognizer's own tagged dispatch passes through.
+    // The OS long-press menu may target the portaled menu, bypassing row guards.
+    // Suppress it document-wide while armed, except for our tagged dispatch.
     const contextMenuHandler = (event: Event) => {
       if (ROW_MENU_SYNTHETIC in event) return;
       event.preventDefault();
@@ -313,10 +297,8 @@ export function useRowGesture({
     document.removeEventListener("keydown", keydown, true);
   }, []);
 
-  // Armed until the trailing click arrives, the next press/key clears it, or
-  // the bounded post-release window elapses. Cancellation can precede the
-  // actual finger lift (capture loss or dnd-kit Escape), so defer the timer
-  // until that pointer ends; otherwise a held finger can outlive the window.
+  // Cancellation may precede finger lift; start the suppression timeout only
+  // after that pointer ends so its trailing click remains blocked.
   const suppressTrailingClick = useCallback(
     (pendingPointerId?: number) => {
       clearClickSuppression();
@@ -357,11 +339,8 @@ export function useRowGesture({
     (cancelDrag = false, releasePending = cancelDrag, dispatchSensorCancel = cancelDrag) => {
       const gesture = state.current;
       if (!gesture) return;
-      // A cancellation that interrupts a resolved gesture (swipe, armed,
-      // drag) can still be followed by the browser's synthesized trailing
-      // click — e.g. mid-swipe capture loss — which would navigate into the
-      // row being swiped away. onPointerUp arms this itself for normal
-      // releases; cancel paths must too.
+      // A cancelled gesture may still emit a trailing click; block navigation
+      // after mid-swipe capture loss as well as after normal release.
       if (cancelDrag && gesture.phase !== "pending") {
         suppressTrailingClick(releasePending ? gesture.pointerId : undefined);
       }
@@ -375,11 +354,8 @@ export function useRowGesture({
       setActiveActions(null);
       if (cancelDrag) onCancel?.();
       if (dispatchSensorCancel && gesture.phase === "drag") {
-        // The sensor listens on the owner document, so dispatch the synthetic
-        // cancel there directly: when the row just unmounted (the main reason
-        // no native pointercancel will follow), an event dispatched on the
-        // detached element would never bubble to the document and dnd-kit
-        // would keep the drag alive.
+        // Detached rows cannot bubble a synthetic cancel to dnd-kit; dispatch
+        // it on the owner document so the drag can end.
         (gesture.sensorTarget.ownerDocument ?? document).dispatchEvent(
           new Event("pointercancel", { bubbles: true, cancelable: true }),
         );
@@ -451,12 +427,8 @@ export function useRowGesture({
         movementSamples: [{ x: event.clientX, at: event.timeStamp }],
       };
       state.current = gesture;
-      // The recognizer has claimed this touch: prevent the pointer-down
-      // default here — not unconditionally on the row link — so native
-      // claimants (anchor drag, focus flash) stand down only for pointers the
-      // recognizer actually tracks. When the recognizer is disabled or the
-      // press belongs to a nested control, the default (and the plain tap's
-      // compatibility click) is left alone.
+      // Only claimed touches suppress native anchor drag/focus; nested controls
+      // and ordinary taps keep their default behavior.
       event.preventDefault();
       setActiveActions(actions);
       setPhase("pending");

@@ -1,23 +1,10 @@
-// Persisted, per-device preference for what a horizontal finger swipe on a
-// session row does. Two independent travel directions each map to an action.
-// Modeled after the other `*Preferences`
-// helpers: a localStorage-backed value, SSR-safe reads, and writes that swallow
-// quota/access errors so a corrupt entry can't break app boot.
-//
-// Unlike the simpler helpers this one also exposes a live subscription
-// (useSwipeActions): Settings and every mounted session row read one source, so
-// changing the preference updates open rows in the same session without a
-// reload. writeSwipeActions notifies same-tab subscribers; a `storage` listener
-// covers other tabs.
-//
-// Defaults mirror phone mail apps: swiping right reveals Archive on the left;
-// swiping left reveals Delete on the right. Both directions stay configurable.
+// Per-device swipe actions; Settings and mounted rows share live preferences.
+// Defaults: right archives, left deletes. Both directions are configurable.
 
 import { useSyncExternalStore } from "react";
 
 const STORAGE_KEY = "omnigent:swipe-actions";
-// Same-tab change signal. The DOM `storage` event only fires in OTHER tabs, so
-// writeSwipeActions dispatches this to refresh subscribers in the writing tab.
+// DOM `storage` events fire only in other tabs; this signal reaches the writer.
 const SWIPE_ACTIONS_EVENT = "omnigent:swipe-actions-changed";
 
 export const swipeActions = ["archive", "delete", "none"] as const;
@@ -41,11 +28,7 @@ export function isSwipeAction(value: unknown): value is SwipeAction {
   return typeof value === "string" && (swipeActions as readonly string[]).includes(value);
 }
 
-/**
- * Normalize an arbitrary parsed value to a valid preferences object. Missing
- * directions use the defaults; present but unknown actions become inert.
- * Used both on read (localStorage drift / manual edits) and to sanitize writes.
- */
+/** Missing directions default; unknown present actions become inert. */
 export function normalizeSwipeActions(value: unknown): SwipeActionPreferences {
   const obj = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
   // An unrecognized stored direction stays inert rather than silently arming
@@ -58,11 +41,7 @@ export function normalizeSwipeActions(value: unknown): SwipeActionPreferences {
   return { left: actionFor("left"), right: actionFor("right") };
 }
 
-/**
- * Read the persisted swipe actions. Returns the defaults when nothing is
- * stored, on a server render, or when the stored JSON cannot be parsed.
- * Never throws, so a corrupt entry can't break app boot.
- */
+/** SSR-safe read; missing, corrupt, or inaccessible storage uses defaults. */
 export function readSwipeActions(): SwipeActionPreferences {
   if (typeof window === "undefined") return normalizeSwipeActions(null);
   try {
@@ -72,10 +51,7 @@ export function readSwipeActions(): SwipeActionPreferences {
   }
 }
 
-/**
- * Persist the swipe actions. Normalizes first so only valid values land in
- * storage. Swallows quota/access errors so a failed write can't break the app.
- */
+/** Persist sanitized actions without propagating storage errors. */
 export function writeSwipeActions(value: SwipeActionPreferences): void {
   if (typeof window === "undefined") return;
   try {
@@ -87,12 +63,8 @@ export function writeSwipeActions(value: SwipeActionPreferences): void {
   window.dispatchEvent(new Event(SWIPE_ACTIONS_EVENT));
 }
 
-// Cached snapshot so useSyncExternalStore's getSnapshot is a cheap identity
-// read on every render — a fresh object every call would loop it, and a
-// re-parse every call would tax every row render. Refreshed on the change
-// events and when a subscriber attaches (covering writes that happened while
-// nothing was mounted); swapped only on a real change so the reference is
-// stable between changes.
+// Keep a stable snapshot for useSyncExternalStore; refresh on changes or when
+// subscribing after a write made while no row was mounted.
 let snapshot: SwipeActionPreferences = readSwipeActions();
 
 function refreshSnapshot(): void {
@@ -104,8 +76,7 @@ function getSnapshot(): SwipeActionPreferences {
   return snapshot;
 }
 
-// One module-level window listener pair fanning out to a shared set (the
-// useMediaQuery shape): N mounted rows cost one registration, not 2N.
+// One window listener pair serves all mounted rows.
 const listeners = new Set<() => void>();
 
 function handleChange(e: Event): void {
@@ -120,8 +91,7 @@ function subscribe(onChange: () => void): () => void {
   if (listeners.size === 0) {
     window.addEventListener("storage", handleChange);
     window.addEventListener(SWIPE_ACTIONS_EVENT, handleChange);
-    // Catch up on writes made while no subscriber was mounted (React re-checks
-    // the snapshot right after subscribing, so a change here still renders).
+    // Catch up on writes made with no subscribers mounted.
     refreshSnapshot();
   }
   listeners.add(onChange);
@@ -134,12 +104,7 @@ function subscribe(onChange: () => void): () => void {
   };
 }
 
-/**
- * Subscribe to the live swipe-action preference. Returns the current value and
- * re-renders on same-tab writes (via writeSwipeActions) and cross-tab `storage`
- * events, so Settings and every mounted session row share one source of truth.
- * SSR-safe: renders the defaults on the server.
- */
+/** Live same-tab/cross-tab preference subscription; SSR renders defaults. */
 export function useSwipeActions(): SwipeActionPreferences {
   return useSyncExternalStore(subscribe, getSnapshot, () => DEFAULT_SWIPE_ACTIONS);
 }
