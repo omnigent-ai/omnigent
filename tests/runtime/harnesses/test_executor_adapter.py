@@ -2624,3 +2624,64 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
         "https://github.com/example/sdk/pull/42"
     ]
+
+
+def test_stringify_tool_payload_unwraps_acp_content_union() -> None:
+    """ACP ``content``-variant results render as the nested block's text,
+    for both an inner dict and an inner block array."""
+    from omnigent.runtime.harnesses._executor_adapter import _stringify_tool_payload
+
+    wrapped = [{"type": "content", "content": {"type": "text", "text": "keys: ['token']"}}]
+    assert _stringify_tool_payload(wrapped) == "keys: ['token']"
+
+    inner_array = [
+        {
+            "type": "content",
+            "content": [
+                {"type": "text", "text": "first "},
+                {"type": "text", "text": "second"},
+            ],
+        }
+    ]
+    assert _stringify_tool_payload(inner_array) == "first second"
+
+
+def test_stringify_tool_payload_renders_diff_and_terminal_variants() -> None:
+    """ACP ``diff`` / ``terminal`` results render as readable summaries,
+    never as a raw JSON dump of the union."""
+    from omnigent.runtime.harnesses._executor_adapter import _stringify_tool_payload
+
+    diff_result = _stringify_tool_payload(
+        [
+            {
+                "type": "diff",
+                "path": "/work/config.py",
+                "oldText": "timeout = 30\n",
+                "newText": "timeout = 60\n",
+            }
+        ]
+    )
+    assert "diff /work/config.py" in diff_result
+    assert "timeout = 60" in diff_result
+    assert '"oldText"' not in diff_result
+
+    assert _stringify_tool_payload([{"type": "terminal", "terminalId": "term-1"}]) == (
+        "[terminal term-1]"
+    )
+    assert _stringify_tool_payload([{"type": "terminal"}]) == "[terminal]"
+
+
+def test_stringify_tool_payload_preserves_flat_blocks_and_fallbacks() -> None:
+    """Anthropic-style flat blocks, plain strings, and the JSON fallback
+    for non-text payloads keep their existing rendering."""
+    import json
+
+    from omnigent.runtime.harnesses._executor_adapter import _stringify_tool_payload
+
+    flat = [{"type": "text", "text": "alpha"}, {"type": "text", "text": "beta"}]
+    assert _stringify_tool_payload(flat) == "alphabeta"
+
+    assert _stringify_tool_payload("plain string") == "plain string"
+
+    non_text = [{"type": "image", "source": {"data": "..."}}]
+    assert _stringify_tool_payload(non_text) == json.dumps(non_text)
