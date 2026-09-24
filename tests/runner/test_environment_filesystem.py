@@ -2279,12 +2279,11 @@ async def test_search_picks_up_a_repo_created_mid_session(
         assert body["truncated"] is True
 
 
-def test_search_indexed_paths_never_follows_symlinks_out_of_the_root(tmp_path: Path) -> None:
-    """Index paths are stat'ed in the unsandboxed runner, so a tracked symlink
-    (or a directory swapped for one after it was indexed) must not disclose its
-    outside target's metadata — the sandboxed walk could not have read it. A
-    link whose target is inside the workspace is described as that target, so
-    a directory symlink stays a folder like the tree shows it."""
+def test_search_indexed_paths_never_describes_a_symlink(tmp_path: Path) -> None:
+    """Index paths are stat'ed in the unsandboxed runner, so a symlink — as the
+    leaf or as any parent, wherever it points, and even if swapped mid-search —
+    must never be followed: the sandboxed walk is the only thing that describes
+    links. Regular files beneath real directories are described as before."""
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "b.txt").write_text("12345")
@@ -2293,16 +2292,12 @@ def test_search_indexed_paths_never_follows_symlinks_out_of_the_root(tmp_path: P
     (root / "b-link").symlink_to(outside / "b.txt")
     (root / "a").symlink_to(outside)
     (root / "real").mkdir()
+    (root / "real" / "b.md").write_text("md")
     (root / "b-docs").symlink_to(root / "real")
 
-    entries = search_indexed_paths(root, ["b-link", "a/b.txt", "b-docs"], "b")
+    entries = search_indexed_paths(root, ["b-link", "a/b.txt", "b-docs", "real/b.md"], "b")
 
-    # Outside link: reported as itself, no target size. Path through the
-    # symlinked parent: dropped. In-workspace directory link: a folder.
-    assert [(e.path, e.type, e.bytes) for e in entries] == [
-        ("b-docs", "directory", None),
-        ("b-link", "file", None),
-    ]
+    assert [(e.path, e.type, e.bytes) for e in entries] == [("real/b.md", "file", 2)]
 
 
 @pytest.mark.asyncio
@@ -2337,8 +2332,9 @@ async def test_search_follows_a_repository_created_inside_an_outer_one(
 @pytest.mark.asyncio
 async def test_search_keeps_a_tracked_directory_symlink_a_folder(tmp_path: Path) -> None:
     """A tracked symlink to an in-workspace directory must come back as a
-    folder row: the index answer merges over the walk's, so a file
-    classification there would turn a reveal into a broken file open."""
+    folder row. The index leaves symlinks to the sandboxed walk, whose
+    classification is the one shown; describing them from the index once
+    turned this reveal into a broken file open."""
     env = _git_env()
     ws = tmp_path / "repo"
     ws.mkdir()
@@ -2357,3 +2353,37 @@ async def test_search_keeps_a_tracked_directory_symlink_a_folder(tmp_path: Path)
         body = resp.json()
 
     assert [(e["path"], e["type"]) for e in body["data"]] == [("docs", "directory")], body
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_reaches_snapshot_files_past_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inside a nested scope, an untracked file the scoped walk cannot reach
+    must still come from the Changed tab's snapshot, re-rooted at the scope.
+    (On Windows the scope arrives with native separators while snapshot paths
+    are normalized to '/'; the two must be compared alike.)"""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    filler = ws / "src" / "app" / "aaa"
+    filler.mkdir(parents=True)
+    for i in range(60):
+        (filler / f"f{i:02d}.txt").write_text("x")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "src" / "app" / "zzz").mkdir()
+    (ws / "src" / "app" / "zzz" / "new.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_scoped/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_scoped") as client:
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search/src/app", params={"q": "new"})
+        body = resp.json()
+
+    assert [e["path"] for e in body["data"]] == ["zzz/new.txt"], body
+    assert body["truncated"] is True

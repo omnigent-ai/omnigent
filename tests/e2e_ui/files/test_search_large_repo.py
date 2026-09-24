@@ -10,7 +10,9 @@ and the panel does not report a definitive ``No files match``.
 from __future__ import annotations
 
 import re
+import shutil
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -46,12 +48,21 @@ def _shell(base_url: str, session_id: str, command: str, timeout: int = 600) -> 
 
 @pytest.fixture
 def large_repo_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
-    """Seed a >50k-entry git workspace with a tracked file that sorts last."""
+    """Seed a >50k-entry git workspace with a tracked file that sorts last.
+
+    The seeded tree (filler, target and the repository) is removed afterwards;
+    the session's workspace is otherwise left to the session fixture.
+    """
     base_url, session_id = seeded_session
-    result = _shell(base_url, session_id, _SEED_SCRIPT)
+    result = _shell(base_url, session_id, _SEED_SCRIPT + "\npwd\n")
     if result["exit_code"] != 0 or "TRACKED=yes" not in result.get("stdout", ""):
         pytest.skip(f"could not seed git workspace in runner env: {result!r}")
-    yield (base_url, session_id)
+    workspace = Path(result["stdout"].strip().splitlines()[-1])
+    try:
+        yield (base_url, session_id)
+    finally:
+        for name in ("aaa_filler", "zzz_target", ".git"):
+            shutil.rmtree(workspace / name, ignore_errors=True)
 
 
 def _row(rail: Locator, name: str) -> Locator:

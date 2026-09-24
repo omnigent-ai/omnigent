@@ -180,6 +180,55 @@ def split_glob_list(raw: str | None) -> list[str]:
     return [p.strip() for p in patterns if p.strip()]
 
 
+_BENEATH_SUPPORTED = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+
+
+def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
+    """``lstat`` *root*/*rel* without letting any component be a symlink.
+
+    Every parent is opened with ``O_NOFOLLOW`` relative to the previous one,
+    so a directory swapped for a symlink cannot route the read outside
+    *root*, even between the check and the read. The leaf is never
+    followed. Platforms without ``dir_fd`` support fall back to a plain
+    ``lstat`` after checking the parent's resolved location.
+
+    :param root: Absolute directory the path is relative to.
+    :param rel: ``/``-separated path relative to *root*.
+    :returns: The leaf's own ``stat`` result, or ``None`` when any component
+        is missing, is a symlink, or cannot be opened.
+    """
+    parts = rel.split("/")
+    if not _BENEATH_SUPPORTED:
+        full = root / rel
+        real_root = os.path.realpath(root)
+        parent = os.path.realpath(full.parent)
+        if parent != real_root and not parent.startswith(real_root.rstrip(os.sep) + os.sep):
+            return None
+        try:
+            return full.lstat()
+        except OSError:
+            return None
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        for name in parts[:-1]:
+            nfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
 def search_indexed_paths(
     root: Path,
     paths: Iterable[str],
@@ -195,12 +244,12 @@ def search_indexed_paths(
     — case-insensitive substring on the path, include/exclude globs — and
     reports a matching path's ancestor directories as directory entries, so
     a query like ``"src"`` still surfaces the ``src`` folder. Only the
-    entries returned are stat'ed, and a symlink is followed only when its
-    target stays inside *root*: such a link is described as its target (a
-    directory symlink stays a folder, as the tree shows it), a link elsewhere
-    reports only its own attributes, a path routed through a symlinked parent
-    is dropped, and so is a path that no longer exists (indexed but deleted
-    from the working tree). Nothing outside *root* is ever described.
+    entries returned are stat'ed, and never through a symlink: parents are
+    opened without following links and the leaf is ``lstat``-ed, so nothing
+    outside *root* is ever described, even if a link is swapped mid-search.
+    A leaf that is itself a symlink is left out — the sandboxed walk, which
+    can follow links safely, describes those — and so is a path that no
+    longer exists (indexed but deleted from the working tree).
 
     :param root: Absolute directory the paths are relative to.
     :param paths: File paths relative to *root*, e.g. from ``git ls-files``.
@@ -242,41 +291,23 @@ def search_indexed_paths(
                 candidates[ancestor] = True
             cut = p.rfind("/", 0, cut)
 
-    # Metadata is read outside the sandbox, so symlinks are never followed.
-    real_root = os.path.realpath(root)
-    root_prefix = real_root.rstrip(os.sep) + os.sep
+    # Metadata is read outside the sandbox, so nothing here follows a symlink.
     entries: list[FilesystemEntry] = []
     for rel in sorted(candidates):
         if not kept(rel):
             continue
-        full = root / rel
-        try:
-            st = full.lstat()
-        except OSError:
+        st = _lstat_beneath(root, rel)
+        if st is None or stat.S_ISLNK(st.st_mode):
             continue
-        parent = os.path.realpath(full.parent)
-        if parent != real_root and not parent.startswith(root_prefix):
-            continue
-        is_link = stat.S_ISLNK(st.st_mode)
-        if is_link:
-            target = os.path.realpath(full)
-            if target == real_root or target.startswith(root_prefix):
-                # Safe to describe: the target is inside the workspace, and the
-                # tree shows the link as that target.
-                try:
-                    st = full.stat()
-                except OSError:
-                    continue
-                is_link = False
         # A submodule is one index entry but a directory on disk.
-        is_dir = candidates[rel] or (not is_link and stat.S_ISDIR(st.st_mode))
+        is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)
         entries.append(
             FilesystemEntry(
                 id=rel,
                 name=rel.rsplit("/", 1)[-1],
                 path=rel,
                 type="directory" if is_dir else "file",
-                bytes=None if is_dir or is_link else st.st_size,
+                bytes=None if is_dir else st.st_size,
                 modified_at=int(st.st_mtime),
             )
         )
@@ -348,7 +379,7 @@ def index_search(
         # everything here (and git's index output) speaks '/'.
         if os.sep != "/":
             snapshot = [p.replace(os.sep, "/") for p in snapshot]
-        tracked += paths_under(snapshot, subdir)
+        tracked += paths_under(snapshot, subdir.replace(os.sep, "/"))
     return search_indexed_paths(
         root, tracked, query, include=include, exclude=exclude, limit=limit
     )
