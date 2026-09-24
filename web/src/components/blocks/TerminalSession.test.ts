@@ -13,6 +13,7 @@ import {
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
+  compositionOwnsKeyEvent,
   decodeTerminalClipboardBase64,
   hadRecentTerminalInput,
   isUnexpectedTerminalClose,
@@ -366,6 +367,54 @@ describe("terminalKeyEventPayload", () => {
     expect(
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
+  });
+});
+
+describe("compositionOwnsKeyEvent", () => {
+  function keyEvent(init: KeyboardEventInit): KeyboardEvent {
+    return new KeyboardEvent("keydown", init);
+  }
+
+  it("claims printable keys typed mid-composition", () => {
+    // A Shift-typed ASCII run, plain romaji, and candidate-cycling space are
+    // all preedit input the IME integrates; xterm must not finalize on them.
+    expect(compositionOwnsKeyEvent(keyEvent({ key: "A", shiftKey: true, isComposing: true }))).toBe(
+      true,
+    );
+    expect(compositionOwnsKeyEvent(keyEvent({ key: "d", isComposing: true }))).toBe(true);
+    expect(compositionOwnsKeyEvent(keyEvent({ key: " ", isComposing: true }))).toBe(true);
+  });
+
+  it("leaves keyCode-229 keydowns on xterm's continue-composing path", () => {
+    // keyCode cannot be set through the constructor init dict, so stub it.
+    expect(
+      compositionOwnsKeyEvent({
+        key: "d",
+        isComposing: true,
+        keyCode: 229,
+      } as unknown as KeyboardEvent),
+    ).toBe(false);
+  });
+
+  it("leaves functional keys mid-composition on xterm's finalize path", () => {
+    expect(compositionOwnsKeyEvent(keyEvent({ key: "Enter", isComposing: true }))).toBe(false);
+    expect(
+      compositionOwnsKeyEvent(keyEvent({ key: "Enter", shiftKey: true, isComposing: true })),
+    ).toBe(false);
+    expect(compositionOwnsKeyEvent(keyEvent({ key: "Escape", isComposing: true }))).toBe(false);
+  });
+
+  it("ignores keys outside a composition and modifier chords", () => {
+    expect(compositionOwnsKeyEvent(keyEvent({ key: "A", shiftKey: true }))).toBe(false);
+    expect(compositionOwnsKeyEvent(keyEvent({ key: "c", ctrlKey: true, isComposing: true }))).toBe(
+      false,
+    );
+    expect(compositionOwnsKeyEvent(keyEvent({ key: "v", metaKey: true, isComposing: true }))).toBe(
+      false,
+    );
+    expect(compositionOwnsKeyEvent(keyEvent({ key: "a", altKey: true, isComposing: true }))).toBe(
+      false,
+    );
   });
 });
 
