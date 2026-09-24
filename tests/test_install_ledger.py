@@ -197,6 +197,38 @@ def test_deep_backfill_observes_external_config_and_launch_agents(
     assert launch_agent.exists()
 
 
+def test_deep_backfill_ignores_third_party_units_named_like_omnigent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    launch_dir = home / "Library" / "LaunchAgents"
+    systemd_dir = home / ".config" / "systemd" / "user"
+    state.mkdir(parents=True)
+    launch_dir.mkdir(parents=True)
+    systemd_dir.mkdir(parents=True)
+    (state / "installation_id").write_text("install-123\n")
+    own_plist = launch_dir / "ai.omnigent.host.plist"
+    own_plist.write_text("plist\n")
+    (launch_dir / "com.example.omnigent-handoff.plist").write_text("plist\n")
+    own_service = systemd_dir / "omnigent-host.service"
+    own_service.write_text("[Unit]\n")
+    (systemd_dir / "com.example.omnigent-handoff.service").write_text("[Unit]\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.chdir(tmp_path)
+
+    ledger = install_ledger.backfill_install_ledger(deep=True, apply=False)
+
+    assert ledger is not None
+    observed = {(entry.kind, entry.path) for entry in ledger.entries.launch_agents}
+    assert observed == {
+        ("launchd", str(own_plist)),
+        ("systemd_user", str(own_service)),
+    }
+
+
 def test_record_and_remove_launch_agent_preserves_other_entries(
     tmp_path: Path, monkeypatch
 ) -> None:
