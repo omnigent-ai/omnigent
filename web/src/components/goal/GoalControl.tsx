@@ -91,8 +91,8 @@ export function GoalControl(props: GoalControlProps) {
   );
 }
 
-/** Icon-only workspace-bar indicator for the current goal; details on hover. */
-export function GoalStatusPill({ goal }: { goal: Goal }) {
+/** Icon-only workspace-bar indicator for the current goal; details on hover, dialog on click. */
+export function GoalStatusPill({ goal, onOpen }: { goal: Goal; onOpen?: () => void }) {
   const done = goal.status === "complete";
   const Icon = done ? CircleCheckIcon : GoalIcon;
   const label = `Goal ${formatGoalStatus(goal.status)}`;
@@ -103,13 +103,14 @@ export function GoalStatusPill({ goal }: { goal: Goal }) {
           type="button"
           data-testid="composer-goal-mode"
           data-state={done ? "done" : "working"}
+          onClick={onOpen}
           aria-label={`${label}: ${goal.objective}`}
-          className="flex shrink-0 items-center rounded-full bg-transparent px-1 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 md:px-2"
+          className="flex shrink-0 items-center rounded-full bg-transparent px-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 md:px-2"
         >
           <Icon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
         </button>
       </TooltipTrigger>
-      <TooltipContent side="top" align="end" className="max-w-xs">
+      <TooltipContent side="top" align="end" className="flex-col items-start gap-0.5">
         <div className="font-medium">{label}</div>
         <div className="line-clamp-3">{goal.objective}</div>
       </TooltipContent>

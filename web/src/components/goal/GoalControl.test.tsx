@@ -121,4 +121,16 @@ describe("GoalControl", () => {
 
     expect(screen.getByTestId("composer-goal-mode")).toHaveAttribute("data-state", "done");
   });
+
+  it("opens the goal dialog on click", () => {
+    const onOpen = vi.fn();
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={GOAL} onOpen={onOpen} />
+      </TooltipProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("composer-goal-mode"));
+    expect(onOpen).toHaveBeenCalledOnce();
+  });
 });

@@ -3634,7 +3634,7 @@ function ComposerImpl(
             >
               <BackgroundTaskIndicator />
               <SubagentTaskIndicator conversationId={conversationId} />
-              {goal && <GoalStatusPill goal={goal} />}
+              {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
             </div>
             <ComposerContextRing
               contextWindow={composerContextWindow}
