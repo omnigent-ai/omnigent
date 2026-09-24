@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from omnigent.runtime.prompt import build_instructions
@@ -6,9 +7,45 @@ from omnigent.spec import load
 _RESOLVE_AGENT = Path(__file__).resolve().parents[2] / "dev" / "resolve-agent"
 
 
+def _resolve_procedures() -> str:
+    spec = load(_RESOLVE_AGENT)
+    skills = {skill.name: skill.content for skill in spec.skills}
+
+    def resource(skill: str, name: str) -> str:
+        return (_RESOLVE_AGENT / "skills" / skill / name).read_text(encoding="utf-8")
+
+    return "\n".join(
+        [
+            build_instructions(spec, None, []),
+            skills["resolve-inputs"],
+            resource("resolve-inputs", "review-remediation.md"),
+            resource("resolve-inputs", "ticket-only.md"),
+            resource("resolve-inputs", "reproduction.md"),
+            skills["resolve-impact-assessment"],
+            skills["resolve-repro-audit"],
+            resource("resolve-inputs", "existing-fix.md"),
+            skills["resolve-review-pr"],
+            skills["resolve-author-fix"],
+            skills["resolve-publish"],
+            skills["resolve-drive-pr"],
+            *(
+                resource("resolve-drive-pr", name)
+                for name in (
+                    "preview.md",
+                    "ci.md",
+                    "polly.md",
+                    "validation-prompt.md",
+                    "final-review.md",
+                )
+            ),
+            skills["resolve-handoff"],
+        ]
+    )
+
+
 def test_resolve_agent_delegates_independent_review_to_polly() -> None:
     spec = load(_RESOLVE_AGENT)
-    instructions = (_RESOLVE_AGENT / "AGENTS.md").read_text(encoding="utf-8")
+    instructions = _resolve_procedures()
 
     assert spec.spawn is False
     assert "cross_review" not in instructions
@@ -16,12 +53,13 @@ def test_resolve_agent_delegates_independent_review_to_polly() -> None:
 
 
 def test_resolve_agent_bounds_local_validation() -> None:
-    instructions = (_RESOLVE_AGENT / "AGENTS.md").read_text(encoding="utf-8")
+    instructions = _resolve_procedures()
     normalized = " ".join(instructions.split())
 
-    assert "Run only the directly affected test file/module" in normalized
+    assert "Run the directly affected test modules and the focused checks" in normalized
     assert "Do not run the full repository suite" in normalized
     assert "GitHub CI owns that exhaustive coverage after publication" in normalized
+    assert "run only that module" not in normalized
 
 
 def test_resolve_agent_stages_the_ci_bundle_inside_the_worktree() -> None:
@@ -31,7 +69,7 @@ def test_resolve_agent_stages_the_ci_bundle_inside_the_worktree() -> None:
     /tmp or $RUNNER_TEMP errors every file-tool read and forces shell
     fallbacks; the instructions must point the download inside the worktree.
     """
-    instructions = (_RESOLVE_AGENT / "AGENTS.md").read_text(encoding="utf-8")
+    instructions = _resolve_procedures()
     normalized = " ".join(instructions.split())
 
     assert ".omnigent/repro-bundle" in normalized
@@ -40,7 +78,7 @@ def test_resolve_agent_stages_the_ci_bundle_inside_the_worktree() -> None:
 
 
 def _normalized_resolve_instructions() -> str:
-    text = build_instructions(load(_RESOLVE_AGENT), None, [])
+    text = _resolve_procedures()
     return " ".join(text.split())
 
 
@@ -49,7 +87,81 @@ def _shared_repro_audit() -> str:
     return instructions.split("## Shared repro audit", 1)[1].split("## Step 1", 1)[0]
 
 
-def test_repro_audit_precedes_author_and_reviewer_paths_in_loaded_prompt() -> None:
+def _shared_impact_assessment() -> str:
+    instructions = _normalized_resolve_instructions()
+    return instructions.split("## Shared impact assessment", 1)[1].split(
+        "## Shared repro audit", 1
+    )[0]
+
+
+def test_impact_assessment_applies_to_all_resolution_paths() -> None:
+    instructions = _normalized_resolve_instructions()
+    for start, end in (
+        ("### Review-remediation mode", "### Ticket-only mode"),
+        ("### Ticket-only mode", "### Recovering the handoff"),
+        ("## Step 2A", "## Step 2B"),
+        ("### 2B.5", "## Step 3"),
+        ("## Step 3", "## Step 4"),
+        ("### 4.5", "## Output"),
+    ):
+        path = instructions.split(start, 1)[1].split(end, 1)[0]
+        assert "shared impact assessment" in path, start
+
+    assessment = _shared_impact_assessment()
+    assert "including `skip_push` and workflow-owned publication" in assessment
+    assert "the whole PR, not only edits made in this run" in assessment
+    assert "review-remediation still skips fail-before proof" in assessment
+    assert "pass on both base and candidate" in assessment
+
+
+def test_impact_assessment_requires_current_boundary_evidence_before_fixed() -> None:
+    assessment = _shared_impact_assessment()
+    for requirement in (
+        "configuration creation, transport/decoding, and real process startup together",
+        "real OS sandbox",
+        "candidate build",
+        "simulated-clock tests from elapsed-time measurements",
+        "dependency pins",
+        "uncommitted source/test/support files and their content hashes",
+        "live GitHub base/head SHAs, not just local refs",
+        "rebuild the assessment and rerun affected checks",
+        "original identity rather than relabeling old evidence",
+        "Commit hooks can change tested files",
+        "unrun, skipped, xfailed, or setup-failing required check is not a pass",
+        "no uncovered required boundary",
+        "`partially_fixed`",
+        "`remaining_work`",
+        "`needs_more_info`",
+        "not an execution recorder",
+    ):
+        assert requirement in assessment
+
+
+def test_handoff_skill_includes_impact_assessment_and_remaining_work() -> None:
+    instructions = _resolve_procedures()
+    output = instructions.split("## Output —", 1)[1]
+    handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
+    assessment = handoff["impact_assessment"]
+
+    assert handoff["test_audit"]
+    assert handoff["remaining_work"] == []
+    assert assessment["base_sha"]
+    assert assessment["head_sha"]
+    assert assessment["worktree_state"]
+    assert assessment["uncovered_boundaries"] == []
+    assert assessment["not_applicable_reason"] == ""
+    assert assessment["risks"]
+    for risk in assessment["risks"]:
+        for key in ("files", "behavior", "consumers", "invariant", "check", "evidence"):
+            assert risk[key]
+        assert risk["result"] == "passed"
+
+    fields = " ".join(output.split("Field meanings:", 1)[1].split())
+    assert "`impact_assessment` — required in every mode" in fields
+    assert "shared impact assessment has no unresolved required checks" in fields
+
+
+def test_repro_audit_precedes_author_and_reviewer_procedures() -> None:
     instructions = _normalized_resolve_instructions()
     assert instructions.index("## Shared repro audit") < instructions.index("## Step 1")
     assert instructions.index("## Step 1") < instructions.index("## Step 2A")

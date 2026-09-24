@@ -5569,11 +5569,14 @@ class _HostLaunchAttempt:
     :param error: Human-readable failure message from the host, e.g.
         ``"harness 'codex' is not configured on host 'laptop' — run
         `omnigent setup` ..."``; ``None`` when there was no error.
+    :param acknowledged: Whether the host confirmed ``status="launched"``;
+        timeout and lost-connection attempts remain unconfirmed.
     """
 
     runner_id: str
     error_code: str | None = None
     error: str | None = None
+    acknowledged: bool = False
 
 
 async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttempt:
@@ -5840,7 +5843,7 @@ async def _launch_runner_on_host_locked(
                 error_code=result.get("error_code"),
                 error=result.get("error"),
             )
-        return _HostLaunchAttempt(runner_id=new_runner_id)
+        return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 
 
 async def cancel_managed_launch_tasks() -> None:

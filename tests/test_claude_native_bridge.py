@@ -7662,6 +7662,64 @@ def test_hook_record_todo_write_with_non_list_todos_gives_none() -> None:
     assert record.todos is None
 
 
+def test_hook_record_parses_stop_failure_reason() -> None:
+    """``StopFailure`` keeps its error category and rendered error text."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": " server_error ",
+                "last_assistant_message": "API Error: 500 " + "x" * 5000,
+            }
+        )
+    )
+    assert record.failure_category == "server_error"
+    assert record.failure_message is not None
+    assert record.failure_message.startswith("API Error: 500 x")
+    assert len(record.failure_message) == 4000
+
+
+def test_hook_record_failure_fields_none_when_blank_or_not_stop_failure() -> None:
+    """Blank, non-string, or non-``StopFailure`` fields are not a failure reason."""
+    blank = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "StopFailure", "error": "  ", "last_assistant_message": 7}
+        )
+    )
+    assert blank.failure_category is None
+    assert blank.failure_message is None
+    stop = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "Stop", "error": "rate_limit", "last_assistant_message": "done"}
+        )
+    )
+    assert stop.failure_category is None
+    assert stop.failure_message is None
+
+
+def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
+    """The failure card rewrites dead-end CLI remedies like the mirrored message."""
+    overflow = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "StopFailure", "last_assistant_message": "Prompt is too long"}
+        )
+    )
+    assert overflow.failure_message is not None
+    assert overflow.failure_message.startswith("Context limit reached")
+    login = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "last_assistant_message": "Login expired · Please run /login",
+            }
+        )
+    )
+    assert login.failure_message is not None
+    assert login.failure_message.startswith("Login expired · Please run /login\n\n")
+    assert "omni setup" in login.failure_message
+
+
 # ── stop_hook_seen_since: subagent filtering ─────────────────────────
 
 

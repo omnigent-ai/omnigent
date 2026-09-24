@@ -664,7 +664,7 @@ export function composerWorktreeHeaderState({
       : `main repository${selectedWorktree.branch ? ` branch: ${selectedWorktree.branch}` : ""}`;
     return {
       repositoryLabel,
-      branchLabel: "New",
+      branchLabel: "Choose",
       branchDescription: `Create or select a worktree from ${mainState}`,
     };
   }

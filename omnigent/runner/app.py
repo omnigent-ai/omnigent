@@ -447,10 +447,8 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-# Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
-# that has produced NO edge at all (no running/waiting/terminal status, no
-# in-flight response) within this window never started — fail it loudly
-# instead of letting the dispatched work wedge forever with no error surfaced.
+# Bound how long a sub-agent dispatch can wait for a start acknowledgment.
+# A timeout reports uncertain launch status, not proof that the process is dead.
 _SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
 _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
 # Interval for the background sweep in the runner entrypoint.
@@ -2238,9 +2236,9 @@ def reap_stalled_subagent_launches(
     """
     Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
 
-    A child that has produced no edge at all (no running/waiting/terminal
-    status) within the budget never started; without this sweep the dispatched
-    work wedges forever and the parent is never told. Each reaped entry is
+    A dispatch with no running/waiting/terminal status acknowledgment can
+    otherwise remain pending forever. Missing acknowledgment does not prove
+    that the child process never started. Each reaped entry is
     marked ``failed`` and its failure is delivered to the parent inbox through
     ``mark_terminal``.
 
@@ -2275,9 +2273,9 @@ def reap_stalled_subagent_launches(
             entry.child_session_id,
             status="failed",
             output=(
-                f"Error: sub-agent {entry.agent!r} title {entry.title!r} produced no "
-                f"activity within {budget:.0f}s of dispatch; the child session never "
-                "started. The dispatched message was not processed."
+                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
+                f"title {entry.title!r} within {budget:.0f}s of dispatch. "
+                "The child may still be running; inspect its session before retrying."
             ),
         )
         reaped.append(entry)
