@@ -195,6 +195,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
+    _wire_turn_error_code,
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
 )
@@ -1550,9 +1551,12 @@ def register_events_routes(
                     error_code = "codex_reauth_required"
                 else:
                     # Store-enriched failures are harness-neutral; wire output
-                    # retains the Codex fallback unless a rate limit is known.
+                    # is attributed to the session's harness so a Claude
+                    # failure is never labeled as a Codex error.
                     error_code = (
-                        "codex_turn_error" if body.data.get("output") else "native_turn_error"
+                        await asyncio.to_thread(_wire_turn_error_code, conv)
+                        if body.data.get("output")
+                        else "native_turn_error"
                     )
                 status_error = ErrorDetail(
                     code=classify_native_turn_error(error_code, output),

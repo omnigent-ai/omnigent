@@ -7662,6 +7662,36 @@ def test_hook_record_todo_write_with_non_list_todos_gives_none() -> None:
     assert record.todos is None
 
 
+def test_hook_record_parses_stop_failure_category() -> None:
+    """
+    ``StopFailure`` → ``record.failure_category`` is the hook's ``error`` field.
+
+    This is the category the forwarder turns into the failed edge's detail;
+    dropping it here leaves the session failing with no cause at all.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "StopFailure", "error": "authentication_failed"})
+    )
+    assert record.event_name == "StopFailure"
+    assert record.failure_category == "authentication_failed"
+
+
+def test_hook_record_failure_category_none_when_absent_or_foreign() -> None:
+    """No ``error`` field, a blank one, or a non-StopFailure event → ``None``."""
+    without_error = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "StopFailure"})
+    )
+    assert without_error.failure_category is None
+    blank = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "StopFailure", "error": "   "})
+    )
+    assert blank.failure_category is None
+    stop = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "Stop", "error": "authentication_failed"})
+    )
+    assert stop.failure_category is None
+
+
 # ── stop_hook_seen_since: subagent filtering ─────────────────────────
 
 

@@ -67,6 +67,7 @@ from omnigent.harness_plugins import (
 )
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
+    NATIVE_CODING_AGENTS,
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
@@ -6314,6 +6315,35 @@ def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | 
     return native_coding_agent_for_harness(_resolve_harness(conv))
 
 
+def _wire_turn_error_code(conv: Conversation) -> str:
+    """
+    Attribute a wire-supplied turn failure to the session's harness.
+
+    Historically every ``external_session_status`` failure that carried its
+    own ``output`` was labeled ``codex_turn_error``, so a Claude (or any
+    non-Codex native) session's failure card read as a Codex error.
+
+    :param conv: Conversation row for the failed session.
+    :returns: ``"codex_turn_error"`` when the session resolves to the Codex
+        harness — or to no native harness at all, preserving the code
+        existing clients see — else the harness-neutral
+        ``"native_turn_error"``.
+    """
+    native_agent = _native_coding_agent_for_session(conv)
+    if native_agent is None:
+        # Native sub-agent sessions carry the sub-agent wrapper label, which
+        # the session-level resolver above does not map.
+        wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        if wrapper:
+            native_agent = next(
+                (a for a in NATIVE_CODING_AGENTS if a.subagent_wrapper_label == wrapper),
+                None,
+            )
+    if native_agent is None or native_agent.harness == _CODEX_NATIVE_HARNESS:
+        return "codex_turn_error"
+    return "native_turn_error"
+
+
 def _native_terminal_name_for_harness(harness: str) -> str:
     """
     Return the runner terminal resource name for a native harness.
@@ -11498,6 +11528,7 @@ __all__ = [
     "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
+    "_wire_turn_error_code",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
     "prefetch_session_routing_catalogs",

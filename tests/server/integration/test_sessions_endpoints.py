@@ -5218,6 +5218,90 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_codex_c
     assert error["message"] == "You've hit your usage limit."
 
 
+async def test_post_external_session_status_failed_wire_output_not_codex_on_claude(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A claude-native session's wire-carried failure detail is not labeled Codex.
+
+    The wire-output path used to hardcode ``codex_turn_error`` regardless of
+    harness, so a Claude session's failure card read \"Codex ran into an
+    error during this turn.\".
+    """
+    from omnigent._wrapper_labels import CLAUDE_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "output": "Claude hit an unrecoverable error."},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
+    assert failed_events, f"no failed status was published: {published}"
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == "native_turn_error"
+    assert error["message"] == "Claude hit an unrecoverable error."
+
+
+async def test_post_external_session_status_failed_wire_output_not_codex_on_claude_subagent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A claude-native sub-agent session's failure detail is not labeled Codex.
+
+    Sub-agent sessions carry the sub-agent wrapper label, which the
+    session-level native resolver does not map, so the attribution helper
+    must resolve it explicitly.
+    """
+    from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    subagent_label = CLAUDE_NATIVE_CODING_AGENT.subagent_wrapper_label
+    assert subagent_label is not None
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={WRAPPER_LABEL_KEY: subagent_label},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "output": "Claude hit an unrecoverable error."},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
+    assert failed_events, f"no failed status was published: {published}"
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == "native_turn_error"
+
+
 @pytest.mark.parametrize("wire_output", [False, True])
 async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     client: httpx.AsyncClient,

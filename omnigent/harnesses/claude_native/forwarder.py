@@ -190,6 +190,49 @@ _HOOK_EVENT_TO_STATUS: dict[str, str] = {
     "StopFailure": "failed",
 }
 
+# Fixed human-readable detail for the error categories Claude Code's
+# ``StopFailure`` hook reports. The server persists this text as
+# ``last_task_error.message`` (the failure card), so each entry names the
+# action the user can take. The rate-limit wording deliberately matches the
+# server's rate-limit classifier so that category keeps its retryable code.
+_STOP_FAILURE_DETAILS: dict[str, str] = {
+    "authentication_failed": (
+        "Claude Code reported an authentication failure for this turn. "
+        "Re-authenticate (run /login in the Claude terminal) and retry."
+    ),
+    "model_not_found": (
+        "Claude Code reported that the selected model was not found. "
+        "Pick a different model and retry this turn."
+    ),
+    "rate_limit": (
+        "Claude Code was rate limited during this turn. "
+        "Wait for the limit to reset, then retry."
+    ),
+}
+
+_MAX_STOP_FAILURE_CATEGORY_LEN = 100
+
+
+def _stop_failure_detail(failure_category: str | None) -> str | None:
+    """
+    Human-readable failure detail for a ``StopFailure`` error category.
+
+    :param failure_category: Category from the hook payload's ``error`` field,
+        e.g. ``"authentication_failed"``, or ``None`` when the hook carried
+        none.
+    :returns: Fixed text for a recognized category, a bounded generic label
+        naming an unrecognized one, or ``None`` when there is no category
+        (the server's transcript-based enrichment stays the fallback).
+    """
+    if failure_category is None:
+        return None
+    known = _STOP_FAILURE_DETAILS.get(failure_category)
+    if known is not None:
+        return known
+    category = failure_category[:_MAX_STOP_FAILURE_CATEGORY_LEN]
+    return f"Claude Code reported an error during this turn ({category})."
+
+
 _logger = logging.getLogger(__name__)
 
 
@@ -4005,6 +4048,14 @@ async def _forward_available_status_events(
                 session_id=session_id,
                 status=status,
                 response_id=response_id,
+                # A ``StopFailure`` category rides the failed edge as its
+                # detail; without it the session fails with no cause at all
+                # (``last_task_error`` null, an empty failure card).
+                output=(
+                    _stop_failure_detail(record.failure_category)
+                    if status == "failed"
+                    else None
+                ),
                 # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
                 # This is the one thing the status file cannot report: its

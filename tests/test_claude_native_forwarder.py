@@ -51,6 +51,7 @@ from omnigent.harnesses.claude_native.forwarder import (
     _prescan_precompact_edges,
     _read_compaction_state,
     _reset_compaction_skip_stats,
+    _stop_failure_detail,
     forward_claude_transcript_to_session,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
@@ -2486,6 +2487,85 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
         "type": "external_session_status",
         "data": {"status": "failed"},
     }
+
+
+@pytest.mark.asyncio
+async def test_forwarder_attaches_stop_failure_category_as_failed_detail(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``StopFailure`` ``error`` category rides the failed edge as its detail.
+
+    Without it the server persists a bare ``failed`` with no cause
+    (``last_task_error`` null) and the web failure card has nothing to show.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "claude-session",
+            "error": "authentication_failed",
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        request = await _get_recorded_request(server)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert request["body"]["type"] == "external_session_status"
+    data = request["body"]["data"]
+    assert data["status"] == "failed"
+    assert "authentication failure" in data["output"]
+
+
+def test_stop_failure_detail_maps_categories_to_readable_text() -> None:
+    """Known categories get fixed text; unknown ones a bounded generic label."""
+    assert _stop_failure_detail(None) is None
+    auth = _stop_failure_detail("authentication_failed")
+    assert auth is not None and "authentication failure" in auth
+    unknown = _stop_failure_detail("sandbox_denied")
+    assert unknown == "Claude Code reported an error during this turn (sandbox_denied)."
+    bounded = _stop_failure_detail("x" * 500)
+    assert bounded is not None
+    assert "x" * 100 in bounded
+    assert "x" * 101 not in bounded
+
+
+def test_stop_failure_rate_limit_detail_keeps_retryable_code() -> None:
+    """The rate-limit wording must classify to the retryable failure code."""
+    from omnigent.runner.launch_failure import classify_native_turn_error
+
+    detail = _stop_failure_detail("rate_limit")
+    assert detail is not None
+    assert classify_native_turn_error("native_turn_error", detail) == "rate_limit_exceeded"
 
 
 @pytest.mark.asyncio
