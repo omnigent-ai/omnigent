@@ -435,14 +435,31 @@ before Step 1.
 ## Step 1 — Look for an existing fix PR (this decides your path)
 
 Before writing any code, find out whether someone is **already fixing this bug**.
-When `bug_url` is a GitHub issue, search for an open PR that fixes it:
+Do this for GitHub issues **and Linear tickets, including tickets without a
+GitHub mirror**, against `target_repo` (default `omnigent-ai/omnigent`):
 
-- `gh issue view <bug_url> --json ...` to see linked/closing PRs, and
-  `gh pr list --search "<issue-number>"` (and a keyword search on the bug title)
-  to catch PRs that reference the issue without a formal link.
-- Consider a PR a **candidate fix** only if it is **open** and actually targets
-  this bug's behavior. Ignore merged/closed PRs (if a merged PR were the fix,
-  repro-agent would have returned `already_fixed`) and unrelated PRs.
+- Read the issue/ticket's linked PRs. For Linear, inspect `/pull/` attachments
+  as candidates and recover any GitHub mirror using the procedure below.
+- Search open PRs by issue number or ticket key, distinctive symptom words,
+  and the affected component. Use `gh pr list --repo <repo> --state open
+  --search "<query>" --json number,url,title,headRefOid,updatedAt`. Component
+  searches catch broader fixes and migrations linked to other tickets. If a
+  result set reaches the requested limit, paginate or narrow the query before
+  concluding there is no candidate. A failed search is not an empty result.
+- **Inspect plausible matches before dismissing them.** Read the full PR body
+  (`gh pr view <n> --repo <repo> --json body,headRefOid`) and relevant diff
+  (`gh pr diff <n> --repo <repo>`), plus discussion that explains its scope.
+  Do not decide from its title, a truncated body, or a different issue link.
+  Compare the changed behavior with each reported symptom; a broader fix may
+  remove the cause without using the same implementation you had in mind.
+- Record the search time (UTC), queries, and each plausible candidate's URL,
+  checked head SHA, covered symptoms, and reason to review or dismiss it.
+  Summarize the relevant candidates and decision in `fix_summary`, including
+  why a separate PR is needed if you take the author path. An upcoming migration
+  is relevant context, but does not by itself prove the current bug is fixed.
+
+An open PR is work in progress, not an `already_fixed` verdict. The shared repro
+audit establishes whether the bug still exists on current main.
 
 Branch on what you find:
 
@@ -816,6 +833,7 @@ then goes straight to Step 4 to land it.) Once the set is genuinely green:
   `.omnigent/pr-body.md` using the body-writing instructions in Step 3.4, but do
   not run its `gh pr create` command. Complete the deferred live-validation
   preparation described in Step 4.4, then write the final handoff and stop. The
+  candidate refresh below must run immediately before that handoff. The
   publisher performs the GitHub writes; do not run the PR-facing
   CI/preview/review loop in the rest of Step 4.
 - **Direct publication (no publisher contract)** — perform all of Step 3, then
@@ -828,6 +846,36 @@ checkpoint, then restores it into the publication worktree before running the PR
 finalizer. The finalizer validates and uses that restored file as the PR
 description; without it, the publisher can only construct a less readable
 fallback from machine-oriented handoff fields.
+
+### Refresh the candidate search before publication
+
+Another author or resolve run may open a fix while you are working. After the
+fix, validation, and PR body are ready, repeat Step 1's searches and linked-PR
+lookup **immediately before `gh pr create`**, or **before the final handoff to a
+workflow-owned publisher**. Skip this refresh for `skip_push: true` and when
+updating an already-open PR. Review-remediation keeps its dedicated procedure.
+
+- Keep this lightweight: compare results with the first check and inspect only
+  new candidates or candidates whose head, description, discussion, or state
+  changed. Recheck the state of previously considered PRs, since merged PRs
+  disappear from open-only search results. Do not repeat unchanged tests.
+- If a new or changed candidate may cover the bug, preserve your local commit
+  and evaluate it through Step 2A before publishing a competing PR. Prefer
+  reviewing or extending a sound existing fix. If a separate PR is still needed,
+  explain the remaining symptoms or why that approach is not a viable base in
+  `fix_summary` and the PR description. Update the handoff's mode, PR references,
+  and prepared body to match the decision; obey the CI contract on GitHub writes.
+- If a candidate merged during the run, refresh main and use the shared repro
+  audit to check the reported symptoms there. Return `nothing_to_fix` only with
+  evidence that the landed fix covers every live facet; name any remaining gap.
+- Record the refresh time (UTC) and result in `fix_summary`, even when there
+  are no new candidates. If GitHub reads fail, retry; if they remain unavailable,
+  preserve the checkpoint and return `needs_more_info` with the failed check
+  instead of claiming no competing fix exists.
+
+This is a final check within the agent run, not a publisher lock. A delayed
+workflow publication or retry can still race with another PR; do not claim the
+recorded search happened at publication time when it happened at handoff.
 
 ### Get the GitHub write token (needed for every push / `gh` write)
 
@@ -949,7 +997,8 @@ Once the set is genuinely green:
      python .github/scripts/pr-template/validate.py
    ```
 
-   Fix every validation error before `gh pr create`. In **Related issue**, use a
+   Fix every validation error, then run the candidate refresh above immediately
+   before `gh pr create`. In **Related issue**, use a
    GitHub closing keyword **only against a GitHub issue number** —
    `Resolve #<closing_issue_number>` (equivalently `Closes #<n>`), using the
    `closing_issue_number` you determined in Step 1 (the `bug_url` issue, or the
