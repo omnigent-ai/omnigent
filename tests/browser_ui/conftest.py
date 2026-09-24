@@ -7,6 +7,7 @@ an unregistered same-origin API, SSE, or WebSocket request reach a server.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import subprocess
@@ -16,7 +17,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from re import Pattern
 from typing import Any
 from urllib.parse import urlparse
 
@@ -117,24 +117,26 @@ class BrowserContract:
     base_url: str
     violations: list[str] = field(default_factory=list)
 
-    def route(self, url: str | Pattern[str], handler: RouteHandler) -> None:
+    def _matcher(self, path: str | re.Pattern[str]) -> re.Pattern[str]:
+        """Anchor string paths to this origin; regexes are used as given."""
+        if isinstance(path, re.Pattern):
+            return path
+        return re.compile(rf"^{re.escape(self.base_url + path)}(?:\?.*)?$")
+
+    def route(self, url: str | re.Pattern[str], handler: RouteHandler) -> None:
         """Register an HTTP mock; later registrations win over the deny route."""
         self.context.route(url, handler)
 
     def json(
         self,
-        path: str | Pattern[str],
+        path: str | re.Pattern[str],
         body: Any,
         *,
         method: str = "GET",
         status: int = 200,
     ) -> None:
         """Register a method-specific JSON response for a path or regex."""
-        matcher: str | Pattern[str]
-        if isinstance(path, str):
-            matcher = re.compile(rf"{re.escape(path)}(?:\?.*)?$")
-        else:
-            matcher = path
+        matcher = self._matcher(path)
 
         def fulfill(route: Route) -> None:
             if route.request.method != method:
@@ -145,11 +147,10 @@ class BrowserContract:
 
         self.route(matcher, fulfill)
 
-    def sse(self, path: str | Pattern[str], body: str = "data: [DONE]\n\n") -> None:
+    def sse(self, path: str | re.Pattern[str], body: str = "data: [DONE]\n\n") -> None:
         """Register a deterministic server-sent event response."""
-        matcher = re.compile(rf"{re.escape(path)}(?:\?.*)?$") if isinstance(path, str) else path
         self.route(
-            matcher,
+            self._matcher(path),
             lambda route: route.fulfill(
                 status=200,
                 content_type="text/event-stream",
@@ -159,14 +160,13 @@ class BrowserContract:
 
     def response(
         self,
-        path: str | Pattern[str],
+        path: str | re.Pattern[str],
         *,
         method: str = "GET",
         status: int = 204,
         body: str = "",
     ) -> None:
         """Register a method-specific response that does not need JSON."""
-        matcher = re.compile(rf"{re.escape(path)}(?:\?.*)?$") if isinstance(path, str) else path
 
         def fulfill(route: Route) -> None:
             if route.request.method != method:
@@ -174,9 +174,9 @@ class BrowserContract:
                 return
             route.fulfill(status=status, body=body)
 
-        self.route(matcher, fulfill)
+        self.route(self._matcher(path), fulfill)
 
-    def websocket(self, url: str | Pattern[str], handler: WebSocketHandler) -> None:
+    def websocket(self, url: str | re.Pattern[str], handler: WebSocketHandler) -> None:
         """Register an in-page WebSocket mock."""
         self.context.route_web_socket(url, handler)
 
@@ -208,10 +208,13 @@ def browser_contract(
     def deny_websocket(socket: WebSocketRoute) -> None:
         if _same_origin(socket.url, browser_base_url):
             contract.violations.append(f"WEBSOCKET {socket.url}")
-            # Not connecting is the WebSocket equivalent of aborting an HTTP
-            # route: no packet can reach a backend. The teardown assertion
-            # turns the recorded dependency into a deterministic test failure.
-            socket.on_message(lambda _message: None)
+            # Never connect to a backend. Playwright opens the mock only after
+            # this handler returns, so schedule the close for after that.
+            asyncio.get_running_loop().create_task(
+                socket._impl_obj.close(
+                    code=1008, reason="Browser-contract WebSocket must be mocked"
+                )
+            )
             return
         socket.connect_to_server()
 
