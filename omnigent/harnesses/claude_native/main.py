@@ -741,17 +741,41 @@ def claude_config_with_launch_model_pinned(
 def _claude_model_display_name(tier: str, model_id: str) -> str:
     """Build a friendly family/version label from a routable model id."""
     normalized = model_id.lower().removesuffix("[1m]")
+    family = tier.replace("_", " ").title()
+    version_parts: list[str] = []
     marker = f"claude-{tier}-"
     marker_index = normalized.find(marker)
-    if marker_index < 0:
-        return tier.replace("_", " ").title()
-    version_parts: list[str] = []
-    for part in normalized[marker_index + len(marker) :].split("-"):
-        if not part.isdigit() or len(version_parts) == 2:
+    if marker_index >= 0:
+        for part in normalized[marker_index + len(marker) :].split("-"):
+            if not part.isdigit() or len(version_parts) == 2:
+                break
+            version_parts.append(part)
+    elif (generation_index := normalized.find("claude-")) >= 0:
+        # Claude 3.x ids version the generation before the family token
+        # (claude-3-7-sonnet); keep the digits only when this family follows.
+        for part in normalized[generation_index + len("claude-") :].split("-"):
+            if part.isdigit() and len(version_parts) < 2:
+                version_parts.append(part)
+                continue
+            if part != tier:
+                version_parts = []
             break
-        version_parts.append(part)
-    family = tier.replace("_", " ").title()
+        else:
+            version_parts = []
     return f"{family} {'.'.join(version_parts)}" if version_parts else family
+
+
+def _claude_model_id_display_name(model_id: str) -> str:
+    """Format a raw Claude model id when no probe-supplied label exists."""
+    normalized = model_id.lower().removesuffix("[1m]")
+    tier = next(
+        (family for family in _UCODE_CLAUDE_TIER_TO_ENV if family in normalized.split("-")),
+        None,
+    )
+    if tier is None:
+        return model_id
+    label = _claude_model_display_name(tier, model_id)
+    return f"{label} (1M context)" if model_id.lower().endswith("[1m]") else label
 
 
 def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
@@ -1383,7 +1407,7 @@ async def claude_model_catalog(
             label = (
                 probe.default_label
                 if default_model == probe.default_model and probe.default_label
-                else default_model
+                else _claude_model_id_display_name(default_model)
             )
             out.append(
                 {
@@ -3445,20 +3469,38 @@ def resolve_native_claude_config(
         return resolved
 
     # 1. Spec-driven: reuse the harness routing precedence verbatim. A
-    #    non-None entry decides the config (including a deliberate None for a
-    #    subscription); a None entry means the spec routed to databricks /
-    #    global auth → fall back to the spec's own ucode profile.
+    #    non-None entry decides the config. A None entry may mean legacy
+    #    Databricks auth, whose profile is resolved below.
     if spec is not None:
         entry = _resolve_provider_for_build(
             spec, harness_type="claude-sdk", actual_harness="claude-native"
         )
         if entry is not None:
             return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-        ucode_config = _ucode_config_for_profile(
-            spec.executor.profile, refresh_models=refresh_models
-        )
-        if ucode_config is not None:
-            return ucode_config
+
+        spec_auth = getattr(spec.executor, "auth", None)
+        executor_config = getattr(spec.executor, "config", {})
+        legacy_profile = getattr(spec.executor, "profile", None) or executor_config.get("profile")
+        if isinstance(spec_auth, DatabricksAuth):
+            ucode_config = _ucode_config_for_profile(
+                spec_auth.profile, refresh_models=refresh_models
+            )
+            if ucode_config is not None:
+                return ucode_config
+        elif spec_auth is None and legacy_profile:
+            ucode_config = _ucode_config_for_profile(
+                str(legacy_profile), refresh_models=refresh_models
+            )
+            if ucode_config is not None:
+                return ucode_config
+        elif spec_auth is None:
+            global_auth = _load_global_auth()
+            if isinstance(global_auth, DatabricksAuth):
+                # A profile-less wrapper inherits the same global Databricks
+                # route used by the pre-launch host picker.
+                return _ucode_config_for_profile(
+                    global_auth.profile, refresh_models=refresh_models
+                )
         # The spec named no provider and no usable ucode profile — fall through to
         # the managed-connect-host broker fallback (step 4) rather than giving up.
     else:
