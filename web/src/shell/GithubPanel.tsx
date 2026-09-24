@@ -24,8 +24,10 @@ import {
   ChevronsDownUpIcon,
   ChevronsUpDownIcon,
   AlertCircleIcon,
+  BanIcon,
   CircleCheckIcon,
   CircleDotIcon,
+  CircleMinusIcon,
   CircleXIcon,
   Columns2Icon,
   DownloadIcon,
@@ -578,6 +580,20 @@ function GithubSummaryTab({
               runs={checks.runs.filter((r) => r.bucket === "failing")}
               icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
               className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+            />
+            <CheckPill
+              label="cancelled"
+              count={checks.cancelled ?? 0}
+              runs={checks.runs.filter((r) => r.bucket === "cancelled")}
+              icon={<BanIcon className="size-2.5 text-muted-foreground" />}
+              className="border-border bg-muted text-muted-foreground"
+            />
+            <CheckPill
+              label="skipped"
+              count={checks.skipped ?? 0}
+              runs={checks.runs.filter((r) => r.bucket === "skipped")}
+              icon={<CircleMinusIcon className="size-2.5 text-muted-foreground" />}
+              className="border-border bg-muted text-muted-foreground"
             />
           </div>
         </section>
