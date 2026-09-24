@@ -9920,12 +9920,8 @@ async def _child_session_summaries_from_conversations(
     """
     Build child summaries with batched preview and agent-name lookups.
 
-    ``ChildSessionSummary.last_message_preview`` needs the latest visible
-    message per child, and ``agent_name`` needs the bound agent's name.
-    Loading those per child blocks the event loop and creates N+1
-    database traffic. This helper reads newest message items for all
-    child ids and the names for all distinct bound agents in worker
-    threads, then builds summaries without further store access.
+    Read previews and bound-agent names in batches to avoid blocking
+    the event loop with per-child store calls.
 
     :param children: Child conversation rows from
         ``list_conversations(kind="sub_agent")``.
@@ -9938,8 +9934,7 @@ async def _child_session_summaries_from_conversations(
     if not children:
         return []
     child_ids = [child.id for child in children]
-    # Legacy/unbound children carry agent_id=None; drop those before the
-    # lookup so a null never reaches the store's id filter.
+    # Exclude unbound children from the agent lookup.
     unique_agent_ids = list({child.agent_id for child in children if child.agent_id is not None})
     message_items_by_child, agent_names_by_id = await asyncio.gather(
         asyncio.to_thread(

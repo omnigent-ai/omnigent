@@ -4564,10 +4564,7 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             return
         parent_id = conv.parent_conversation_id
         items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
-        # Resolve the durable agent binding's name so a status edge
-        # carries the same ``agent_name`` the list and initial snapshot
-        # populate — the event replaces the whole child summary, so a
-        # ``None`` here would blank the field the rail just rendered.
+        # Status events replace the whole summary, including its bound agent name.
         agent_name: str | None = None
         if conv.agent_id is not None:
             from omnigent.runtime._globals import _agent_store
@@ -10351,12 +10348,7 @@ def _child_session_summary_from_conversation(
         tool = _devin_subagent_display_tool(labels)
         session_name = labels.get(_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY)
     elif is_title_verbatim(labels):
-        # ``sys_session_create`` child: the title is the caller's verbatim
-        # string (possibly colon-bearing), never a framework
-        # ``"{agent_type}:{session_name}"`` name. Keep it whole as
-        # ``session_name`` and derive no ``tool`` from it — attribution
-        # comes from the durable ``agent_name`` binding resolved by the
-        # batched caller.
+        # Keep caller titles whole; attribution uses the bound agent name.
         tool = None
         session_name = display_title or None
     elif display_title and ":" in display_title:
@@ -10406,8 +10398,7 @@ def _child_session_summary_from_conversation(
         session_name=session_name,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        # agent_id comes from the conversation row; agent_name is resolved
-        # from it by the batch caller. task_id has no source (tasks removed).
+        # The tasks table is gone; agent_name comes from the batch lookup.
         agent_id=conv.agent_id,
         agent_name=agent_name,
         current_task_id=None,

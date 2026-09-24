@@ -3158,10 +3158,7 @@ async def _send_to_existing_session(
             }
         )
     display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
-    # A sys_session_create child keeps its verbatim title (marked by the
-    # ``omnigent.title_verbatim`` label, and possibly colon-bearing), so
-    # its identity comes from the snapshot's agent fields; only
-    # framework-named "<agent>:<title>" titles are parsed.
+    # Verbatim titles may contain colons; use the agent binding instead.
     if is_title_verbatim(_string_mapping(snap_data.get("labels"))):
         parsed = _ParsedTitle(agent=None, title=None)
     else:
@@ -3301,11 +3298,7 @@ def _build_session_create_body(
     body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
-        # sys_session_create stores the caller's title verbatim (no
-        # "<agent>:<title>" framework prefix), so mark the child durably:
-        # readers must not split a colon-bearing verbatim title into a
-        # phantom agent name, and instead attribute the child from its
-        # agent binding.
+        # Preserve verbatim titles, including colons, across readers.
         "labels": {VERBATIM_TITLE_LABEL_KEY: VERBATIM_TITLE_LABEL_VALUE},
     }
     if isinstance(title, str) and title:
@@ -3388,17 +3381,7 @@ def _finalize_created_session(
 
 
 def _reserved_title_error(title: object) -> str | None:
-    """
-    Reject a caller title that carries the closed lifecycle marker.
-
-    ``:closed:`` is how a tombstoned title is written and recognized, so
-    a session created with it in its title would read as already closed
-    everywhere and vanish from ``sys_session_list``.
-
-    :param title: The caller-supplied ``title`` argument, any type.
-    :returns: A JSON tool-error string when the title is reserved, else
-        ``None``.
-    """
+    """Reject titles containing the closed-session marker."""
     if not isinstance(title, str) or _CLOSED_TITLE_INFIX not in title:
         return None
     return json.dumps(
@@ -3476,7 +3459,6 @@ async def _execute_session_create(
                 )
             }
         )
-    # Guards both modes: the config-path create is dispatched from here.
     reserved_title = _reserved_title_error(args.get("title"))
     if reserved_title is not None:
         return reserved_title
@@ -3673,10 +3655,7 @@ async def _upload_config_bundle(
 
     metadata: _JsonObject = {
         "parent_session_id": conversation_id,
-        # Same durable marker as the agent_id create path: the child's
-        # title is the caller's verbatim string, never a framework
-        # "<agent>:<title>" name, so readers attribute it from the
-        # agent binding instead of splitting the title.
+        # Match the agent-id create path for verbatim titles.
         "labels": {VERBATIM_TITLE_LABEL_KEY: VERBATIM_TITLE_LABEL_VALUE},
     }
     title = args.get("title")
@@ -5632,8 +5611,7 @@ async def _agent_list_via_rest(
             server_client,
             after=cursor_state["session_agents"][1],
             limit=source_limit,
-            # The server lists only top-level sessions by default, which
-            # would hide the agents bound solely to a sub-agent session.
+            # Include agents bound only to child sessions.
             params_extra={"kind": "any"},
         )
     )
@@ -5986,10 +5964,7 @@ async def _collect_global_sessions(
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
-    # ``kind=any``: the server lists only top-level sessions by default,
-    # which would strand every child created by ``sys_session_create``
-    # once its conversation_id is lost. Their ``parent_session_id`` marks
-    # them apart from the top-level rows.
+    # The server defaults to top-level sessions; include children for recovery.
     params: dict[str, str | int] = {
         "limit": limit,
         "order": "desc",
@@ -6043,15 +6018,9 @@ def _child_rows_to_entries(
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
 
-    Skips only closed and id-less rows. Framework-named children carry
-    a ``session_name`` the server parsed off the ``"<agent>:<title>"``
-    title (including the ``"ui:<agent>:<label>"`` form), and keep that
-    title-derived agent so ``sys_session_send`` named mode still
-    resolves them. ``sys_session_create`` children instead store the
-    caller's title verbatim (or none) and carry the
-    ``omnigent.title_verbatim`` label, so they keep the whole title and
-    are named from the durable ``agent_name`` binding — even when the
-    verbatim title happens to contain a ``":"``.
+    Skips closed or id-less rows. Framework-named children use the
+    title-derived agent for named sends; verbatim-titled children use
+    their bound agent and retain the whole title.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
@@ -6065,10 +6034,7 @@ def _child_rows_to_entries(
             continue
         session_name = _optional_string(row.get("session_name"))
         if is_title_verbatim(labels):
-            # ``sys_session_create`` child: the title is the caller's
-            # verbatim string (possibly colon-bearing), so keep it whole
-            # and attribute the child from its durable agent binding,
-            # never a title parse.
+            # Keep the caller's title whole; attribute from the agent binding.
             agent = _optional_string(row.get("agent_name")) or _optional_string(row.get("tool"))
             entry_title: str | None = title
         elif session_name is not None:
@@ -6079,8 +6045,7 @@ def _child_rows_to_entries(
             entry_title = title
         entries.append(
             {
-                # Hide the internal ``-native-ui`` wrapper name, matching
-                # the global listing and ``sys_session_get_info``.
+                # Hide the internal ``-native-ui`` wrapper name.
                 "agent": public_agent_name(agent),
                 "title": entry_title,
                 "conversation_id": conversation_id,
@@ -6326,11 +6291,7 @@ async def _session_close_via_rest(
     if scope_error is not None:
         return scope_error
     raw_title = _optional_string(target_snap.get("title"))
-    # A verbatim-titled child (``sys_session_create``, marked by the
-    # ``omnigent.title_verbatim`` label) has no agent prefix to recover,
-    # even when its title contains a ``":"``; the parent check above
-    # already proved it is a sub-agent. Tombstone its display title
-    # as-is, like any colonless title.
+    # Verbatim titles have no agent prefix, even when they contain a colon.
     if is_title_verbatim(_string_mapping(target_snap.get("labels"))):
         parsed = _ParsedTitle(agent=None, title=None)
     else:
@@ -6419,11 +6380,7 @@ async def _fetch_peek_meta(
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
     title_value = _optional_string(body.get("title"))
     if is_title_verbatim(_string_mapping(body.get("labels"))):
-        # A sys_session_create child (marked by the
-        # ``omnigent.title_verbatim`` label) keeps its verbatim title
-        # whole — possibly colon-bearing — and takes its identity from
-        # the snapshot's durable agent fields, matching the send/list
-        # readers.
+        # Preserve the whole title and use the bound agent for identity.
         agent = _optional_string(body.get("sub_agent_name")) or _optional_string(
             body.get("agent_name")
         )

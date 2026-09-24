@@ -610,9 +610,7 @@ class SysSessionListTool(Tool):
         """
         Return the open sub-agent sessions under the caller's conversation.
 
-        Covers both framework-named children (``"<agent>:<title>"``) and
-        ``sys_session_create`` children, whose title is the caller's
-        verbatim string and whose agent comes from the durable binding.
+        Verbatim-titled children take their agent from the durable binding.
 
         In-process path: returns the ``sub_agents`` children view with an
         empty ``sessions`` list — the global, permission-bounded session
@@ -646,9 +644,7 @@ class SysSessionListTool(Tool):
             # Closed rows must never re-surface to the LLM.
             if not is_session_closed(child.labels, child.title)
         ]
-        # Children created by ``sys_session_create`` store the caller's
-        # title verbatim, with no agent to recover from it; resolve
-        # those names from the durable agent binding in one query.
+        # Resolve names for children without a title-derived agent in one query.
         agent_names = _agent_names_for_untyped(open_children)
         result: list[dict[str, str | None]] = []
         for child in open_children:
@@ -1244,14 +1240,8 @@ def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
     """
     Split a child conversation's stored title into agent + title.
 
-    Named sub-agents persist ``"<agent>:<title>"`` in
-    ``Conversation.title`` (and internally rewrite to
-    ``"<agent>:<title>:closed:<conv_id>"`` when closed); both forms
-    split on the first ``":"``. ``sys_session_create`` instead stores
-    the caller's title verbatim — possibly colonless, possibly absent —
-    and stamps the ``omnigent.title_verbatim`` label, so those yield
-    ``agent=None`` with the whole display title even when the verbatim
-    title happens to contain a ``":"``.
+    Framework titles carry an agent prefix. Verbatim titles do not,
+    even when they contain a colon.
 
     :param child: The child :class:`Conversation`.
     :returns: An :class:`_AgentTitle` with the closed marker stripped
@@ -1259,9 +1249,7 @@ def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
     """
     display_title = title_without_closed_marker(child.title)
     if is_title_verbatim(child.labels):
-        # A sys_session_create child: the title is the caller's verbatim
-        # string, never a framework "<agent>:<title>" name — keep it
-        # whole and let identity come from the durable agent binding.
+        # Keep caller-supplied titles whole; resolve the agent separately.
         return _AgentTitle(agent=None, title=display_title)
     if not display_title or ":" not in display_title:
         return _AgentTitle(agent=None, title=display_title)
@@ -1270,16 +1258,7 @@ def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
 
 
 def _agent_names_for_untyped(children: list[Conversation]) -> dict[str, str]:
-    """
-    Batch-resolve agent names for children with no agent in their title.
-
-    Only ``sys_session_create`` children need this — framework-named
-    children carry the agent in ``"<agent>:<title>"``. Returns empty
-    without touching the agent store when none do.
-
-    :param children: Candidate child conversations.
-    :returns: Mapping of ``{agent_id: agent_name}``.
-    """
+    """Batch-resolve names for children without a title-derived agent."""
     from omnigent.runtime import get_agent_store
 
     agent_ids = [
@@ -1387,10 +1366,7 @@ def _resolve_session_call(
             }
         )
     if target.parent_conversation_id is None:
-        # Peek/close only operate on sub-agents, and a missing
-        # parent is what proves a row is not one. Refuse with a
-        # typed error rather than tombstoning a user's own
-        # top-level conversation.
+        # A missing parent identifies a top-level session, not a child.
         return json.dumps(
             {
                 "error": "session_not_a_sub_agent",
@@ -1817,10 +1793,7 @@ class SysSessionCloseTool(Tool):
         if busy_error is not None:
             return busy_error
         labelled = _agent_title_from_conversation(resolution.child)
-        # Re-build the tombstoned title from the parsed components so
-        # the marker lands in the canonical position even if the
-        # original title used uncommon characters around the colon. A
-        # verbatim-titled child has no agent prefix to restore.
+        # Tombstone framework titles with their agent prefix, verbatim titles without it.
         prefix = (
             f"{labelled.agent}:{labelled.title}"
             if labelled.agent is not None
