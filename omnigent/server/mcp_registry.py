@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 import os
 import secrets
 import time
+from builtins import ExceptionGroup
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
@@ -21,6 +23,51 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from omnigent.entities import ProviderConnection
 from omnigent.server.routes.connections_base import ConnectionError, ConnectStart
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+
+_logger = logging.getLogger(__name__)
+
+
+class McpUpstreamError(ConnectionError):
+    """Credential-safe diagnosis of an upstream request failure."""
+
+    def __init__(self, message: str, *, kind: str, status_code: int | None = None) -> None:
+        super().__init__(message + " The operation was not retried.")
+        self.kind = kind
+        self.status_code = status_code
+
+
+def _upstream_error(exc: Exception) -> McpUpstreamError:
+    # MCP's task groups wrap HTTP failures, sometimes alongside closed-stream errors.
+    errors = [exc]
+    for error in errors:
+        if isinstance(error, ExceptionGroup):
+            errors.extend(error.exceptions)
+    for error in errors:
+        if isinstance(error, httpx.HTTPStatusError):
+            status = error.response.status_code
+            detail = {
+                401: "MCP service rejected the credential (HTTP 401). Reconnect the account.",
+                403: (
+                    "MCP service denied access (HTTP 403). Check the account's scopes, app "
+                    "permissions, and organization access; reconnect if the grant changes."
+                ),
+                429: "MCP service rate limit reached (HTTP 429). Wait before trying again.",
+            }.get(
+                status,
+                f"MCP service returned HTTP {status}. "
+                "Check service configuration and availability.",
+            )
+            return McpUpstreamError(detail, kind="http", status_code=status)
+    if any(isinstance(error, (TimeoutError, httpx.TimeoutException)) for error in errors):
+        return McpUpstreamError("MCP request timed out; completion is unknown.", kind="timeout")
+    if any(isinstance(error, httpx.RequestError) for error in errors):
+        return McpUpstreamError(
+            "MCP transport failed; completion is unknown. Check service connectivity.",
+            kind="transport",
+        )
+    return McpUpstreamError(
+        "MCP request failed. Ask the server operator to check diagnostics.", kind="unexpected"
+    )
 
 
 class OAuthConfig(BaseModel):
@@ -210,7 +257,9 @@ class McpRegistry:
         if oauth.resource:
             data["resource"] = oauth.resource
         async with httpx.AsyncClient(follow_redirects=False, timeout=20) as client:
-            response = await client.post(oauth.token_url, data=data)
+            response = await client.post(
+                oauth.token_url, data=data, headers={"Accept": "application/json"}
+            )
         if response.status_code != 200:
             raise ConnectionError("MCP authorization failed; reconnect the account")
         tokens = response.json()
@@ -235,28 +284,41 @@ class McpRegistry:
             raise ConnectionError("Tool is not allowed by the MCP registry")
         token = await self.token(service, user_id, app_state)
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        async with asyncio.timeout(service.timeout):
-            async with httpx.AsyncClient(
-                headers=headers, follow_redirects=False, timeout=service.timeout
-            ) as client:
-                async with streamable_http_client(service.url, http_client=client) as (
-                    read,
-                    write,
-                    _,
-                ):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        if tool is not None:
-                            return await session.call_tool(tool, arguments or {})
-                        tools = []
-                        cursor = None
-                        for _ in range(100):
-                            result = await session.list_tools(cursor=cursor)
-                            tools.extend(t for t in result.tools if t.name in service.tools)
-                            cursor = result.nextCursor
-                            if not cursor:
-                                return tools
-                        raise ConnectionError("MCP tool catalog exceeded the pagination limit")
+        try:
+            async with asyncio.timeout(service.timeout):
+                async with httpx.AsyncClient(
+                    headers=headers, follow_redirects=False, timeout=service.timeout
+                ) as client:
+                    async with streamable_http_client(service.url, http_client=client) as (
+                        read,
+                        write,
+                        _,
+                    ):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            if tool is not None:
+                                return await session.call_tool(tool, arguments or {})
+                            tools = []
+                            cursor = None
+                            for _ in range(100):
+                                result = await session.list_tools(cursor=cursor)
+                                tools.extend(t for t in result.tools if t.name in service.tools)
+                                cursor = result.nextCursor
+                                if not cursor:
+                                    return tools
+                            raise ConnectionError("MCP tool catalog exceeded the pagination limit")
+        except ConnectionError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — transport errors may contain credentials
+            failure = _upstream_error(exc)
+            _logger.warning(
+                "Registry MCP request failed service=%s tool=%s failure=%s http_status=%s",
+                service.id,
+                tool or "tools/list",
+                failure.kind,
+                failure.status_code,
+            )
+            raise failure from None
 
 
 class McpOAuthHooks:

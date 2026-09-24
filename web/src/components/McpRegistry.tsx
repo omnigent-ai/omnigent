@@ -146,7 +146,9 @@ function ServiceConnection({
                 const result = await registryRequest<{ tools: string[] }>(`/${service.id}/test`, {
                   method: "POST",
                 });
-                setNotice(`Connection works. Tools: ${result.tools.join(", ") || "none"}`);
+                setNotice(
+                  `Tool discovery succeeded. Tools: ${result.tools.join(", ") || "none"}. Individual calls may require additional permissions.`,
+                );
               })
             }
           >
@@ -220,11 +222,13 @@ export function McpRegistryPicker({
   reservedNames,
   onToggle,
   busy,
+  onAuthorizingChange,
 }: {
   attached: string[];
   reservedNames?: string[];
   onToggle: (id: string, enabled: boolean) => void;
   busy: boolean;
+  onAuthorizingChange?: (pending: boolean) => void;
 }) {
   const { services, error, loading, refresh } = useCatalog();
   const [authorizing, setAuthorizing] = useState<string | null>(null);
@@ -232,7 +236,13 @@ export function McpRegistryPicker({
     null,
   );
   const authorization = useRef<AbortController | null>(null);
-  useEffect(() => () => authorization.current?.abort(), []);
+  useEffect(
+    () => () => {
+      authorization.current?.abort();
+      onAuthorizingChange?.(false);
+    },
+    [onAuthorizingChange],
+  );
 
   async function enable(service: RegistryService) {
     setConnectionError(null);
@@ -243,6 +253,7 @@ export function McpRegistryPicker({
     const controller = new AbortController();
     authorization.current = controller;
     setAuthorizing(service.id);
+    onAuthorizingChange?.(true);
     try {
       await authorizeRegistryService(service, controller.signal);
       const updated = await refresh();
@@ -258,7 +269,10 @@ export function McpRegistryPicker({
         });
       }
     } finally {
-      if (!controller.signal.aborted) setAuthorizing(null);
+      if (!controller.signal.aborted) {
+        setAuthorizing(null);
+        onAuthorizingChange?.(false);
+      }
     }
   }
 
@@ -360,7 +374,12 @@ export function McpRegistryPicker({
             </label>
           ))}
       </div>
-      <a className="text-xs underline" href={withBasePath("/settings/integrations")}>
+      <a
+        className="text-xs underline"
+        href={withBasePath("/settings/integrations")}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
         Manage account connections
       </a>
     </div>

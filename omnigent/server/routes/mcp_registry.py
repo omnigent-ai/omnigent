@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.mcp_registry import McpOAuthHooks, McpRegistry
+from omnigent.server.mcp_registry import McpOAuthHooks, McpRegistry, McpUpstreamError
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.connections_base import ConnectionError, create_connection_router
 
@@ -99,6 +99,8 @@ def create_mcp_registry_router(
         entry = service(request, service_id)
         try:
             tools = await registry.execute(entry.id, user(request), request.app.state)
+        except McpUpstreamError as exc:
+            raise HTTPException(502, str(exc)) from None
         except ConnectionError as exc:
             raise HTTPException(400, str(exc)) from exc
         except Exception as exc:
