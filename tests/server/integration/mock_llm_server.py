@@ -64,6 +64,7 @@ import contextlib
 import json
 import os
 import sys
+import threading
 import time as _time_mod
 import uuid as _uuid_mod
 from collections.abc import AsyncIterator
@@ -76,6 +77,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI()
 _evidence_journals = {}
+_evidence_journals_lock = threading.Lock()
 
 
 def _record_evidence(kind: str, body=None) -> None:
@@ -87,9 +89,11 @@ def _record_evidence(kind: str, body=None) -> None:
         from dev.repro_env.execution import Journal
 
         directory = Path(attempt) if attempt else Path(runtime) / "execution/service"
-        if directory not in _evidence_journals:
-            _evidence_journals[directory] = Journal(directory)
-        _evidence_journals[directory].emit(
+        with _evidence_journals_lock:
+            if directory not in _evidence_journals:
+                _evidence_journals[directory] = Journal(directory)
+            journal = _evidence_journals[directory]
+        journal.emit(
             "provider_mock",
             action=kind,
             body=body,

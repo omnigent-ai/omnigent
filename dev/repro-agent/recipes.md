@@ -106,7 +106,8 @@ Independent execution collection and claim verification remain separate work.
 When the workflow supplies `execution-context.json`, `dev.repro_env exec`
 automatically saves each command under `.omnigent/repro-env/execution/<attempt-id>`.
 Pytest loads the evidence collector for supported browser and local HTTP paths;
-keep using the existing drivers. Close browser contexts before the command exits
+keep using the existing drivers with explicit `browser.new_context()` contexts
+(`browser.new_page()` alone bypasses detailed capture). Close contexts before the command exits
 so traces and videos finish writing. Cite the attempt artifacts in the account
 and retain discovered product session IDs. Collection errors and unsupported paths
 stay unverified; an exit code or saved trace is not a verdict. Keep failed attempts.

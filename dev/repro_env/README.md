@@ -19,8 +19,10 @@ mock provider journals requests before reset, including outside pytest. The
 workflow bundles these files and independently hashes the retained copies.
 
 These are agent-workspace observations, not a protected or independently verified
-account. Async browser/HTTP clients, external servers, commands outside the wrapper,
-and arbitrary custom mocks are not fully covered. Collection errors, truncation,
+account. Implicit contexts created by `browser.new_page()`, async browser/HTTP clients,
+external servers, commands outside the wrapper,
+and arbitrary custom mocks are not fully covered. For browser capture, create an
+explicit `browser.new_context()` and then call `context.new_page()`. Collection errors, truncation,
 missing records and incomplete attempts remain explicit. Shared-runtime provider
 events have timestamps, not assumed ownership by a particular attempt. Do not
 interpret missing events as proof an action did not happen. Trace text receives credential redaction and is stored uncompressed inside the ZIP

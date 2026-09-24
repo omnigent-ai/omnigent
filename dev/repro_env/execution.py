@@ -23,13 +23,42 @@ from .runtime import write_json
 MAX_EVENT = 256 * 1024
 MAX_OUTPUT = 8 * 1024 * 1024
 OUTPUT_JOIN_TIMEOUT = 5
+PROCESS_CLEANUP_TIMEOUT = 5
 SECRET_NAME = re.compile(r"authorization|cookie|password|secret|api.?key|token", re.I)
+
+
+TOKEN_COUNT = re.compile(
+    r"(?:max_)?(?:input_|output_|prompt_|completion_|total_|cached_|reasoning_|cache_read_|cache_creation_)?tokens",
+    re.I,
+)
+TOKEN_DETAILS = {
+    "token_usage",
+    "input_tokens_details",
+    "output_tokens_details",
+    "prompt_tokens_details",
+    "completion_tokens_details",
+}
+
+
+def credential_field(name, value=None):
+    name = str(name).lstrip("-").replace("-", "_")
+    if TOKEN_COUNT.fullmatch(name) and (
+        isinstance(value, (int, float)) or (isinstance(value, str) and value.isdecimal())
+    ):
+        return False
+    if name.lower() in TOKEN_DETAILS and isinstance(value, dict):
+        return False
+    return bool(SECRET_NAME.search(name))
 
 
 def secret_values(env):
     return tuple(
         sorted(
-            {value for name, value in env.items() if len(value) >= 8 and SECRET_NAME.search(name)},
+            {
+                value
+                for name, value in env.items()
+                if len(value) >= 8 and credential_field(name, value)
+            },
             key=len,
             reverse=True,
         )
@@ -41,17 +70,34 @@ def clean(value, secrets=None):
     if secrets is None:
         secrets = secret_values(os.environ)
     if isinstance(value, dict):
-        if SECRET_NAME.search(str(value.get("name", ""))) and "value" in value:
+        if "value" in value and credential_field(value.get("name", ""), value["value"]):
             value = {**value, "value": "[redacted]"}
         return {
-            k: "[redacted]" if SECRET_NAME.search(k) else clean(v, secrets)
+            k: "[redacted]" if credential_field(k, v) else clean(v, secrets)
             for k, v in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [clean(v, secrets) for v in value]
+        return [
+            "[redacted]"
+            if i
+            and isinstance(value[i - 1], str)
+            and value[i - 1].startswith("--")
+            and "=" not in value[i - 1]
+            and credential_field(value[i - 1], v)
+            else clean(v, secrets)
+            for i, v in enumerate(value)
+        ]
     if isinstance(value, bytes):
         value = value.decode(errors="replace")
     if isinstance(value, str):
+        if value.lstrip().startswith(("{", "[")):
+            with contextlib.suppress(ValueError):
+                parsed = json.loads(value)
+                if isinstance(parsed, (dict, list)):
+                    return json.dumps(clean(parsed, secrets), ensure_ascii=False)
+        key, separator, content = value.partition("=")
+        if separator and not any(c.isspace() for c in key) and credential_field(key, content):
+            return key + "=[redacted]"
         for secret in secrets:
             value = value.replace(secret, "[redacted]")
         value = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[redacted]", value)
@@ -61,7 +107,9 @@ def clean(value, secrets=None):
 def safe_url(url: str) -> str:
     parts = urlsplit(url)
     host = parts.hostname or ""
-    if parts.port:
+    if ":" in host:
+        host = f"[{host}]"
+    if parts.port is not None:
         host += f":{parts.port}"
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
@@ -266,18 +314,33 @@ def run(
     process = None
     group_owned = False
     pending_signals = []
+    startup_signals = []
     old_signals = {}
     threads = []
     output_errors = []
 
+    def deliver(signum):
+        with contextlib.suppress(ProcessLookupError):
+            if group_owned:
+                os.killpg(process.pid, signum)
+            else:
+                process.send_signal(signum)
+
     def forward(signum, _frame):
         pending_signals.append(signum)
-        if process is not None:
-            with contextlib.suppress(ProcessLookupError):
-                if group_owned:
-                    os.killpg(process.pid, signum)
-                else:
-                    process.send_signal(signum)
+        requested = signum if len(pending_signals) == 1 else signal.SIGKILL
+        if process is None:
+            startup_signals.append(requested)
+        else:
+            deliver(requested)
+
+    def reap_child():
+        process.terminate()
+        try:
+            process.wait(timeout=PROCESS_CLEANUP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=PROCESS_CLEANUP_TIMEOUT)
 
     def copy(stream, destination, name):
         saved = journal.capture("output_open", lambda: (directory / name).open("w"))
@@ -337,6 +400,7 @@ def run(
         )
         for sig in (signal.SIGTERM, signal.SIGINT):
             old_signals[sig] = signal.signal(sig, forward)
+        group_owned = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
         process = subprocess.Popen(
             command,
             env=child_env,
@@ -344,9 +408,8 @@ def run(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        group_owned = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
-        if pending_signals:
-            forward(pending_signals[-1], None)
+        while startup_signals:
+            deliver(startup_signals.pop(0))
         for stream, destination, name in (
             (process.stdout, sys.stdout, "stdout.txt"),
             (process.stderr, sys.stderr, "stderr.txt"),
@@ -372,9 +435,11 @@ def run(
     finally:
         if process is not None:
             if group_owned:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGTERM)
+                journal.capture("process_group_terminate", lambda: deliver(signal.SIGTERM))
                 group_owned = False
+            if "exit_code" not in record:
+                journal.capture("process_cleanup", reap_child)
+                record["cleanup_exit_code"] = process.returncode
             for thread in threads:
                 thread.join(timeout=OUTPUT_JOIN_TIMEOUT)
             record["output_complete"] = not output_errors and all(
@@ -382,13 +447,18 @@ def run(
             )
         for sig, handler in old_signals.items():
             signal.signal(sig, handler)
-        for sig in pending_signals:
-            journal.emit("signal", number=sig)
+        for index, sig in enumerate(pending_signals):
+            journal.emit(
+                "signal", number=sig, requested_delivery=sig if index == 0 else signal.SIGKILL
+            )
         journal.capture("environment_close", stack.close)
         record["ended_at_ns"] = time.time_ns()
         # Preserve the outcome before optional hashing, which can fail independently.
         save_record()
         stable = all(not thread.is_alive() for thread in threads)
+        if stable and process is not None:
+            for stream in (process.stdout, process.stderr):
+                journal.capture("pipe_close", stream.close)
         artifacts = journal.capture("inventory", lambda: inventory(directory)) if stable else None
         record["artifacts"] = artifacts or []
         record["artifacts_complete"] = artifacts is not None

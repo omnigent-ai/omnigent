@@ -1,7 +1,31 @@
 """Exercise evidence collection with a real browser and local test server."""
 
+import pytest
+
 from dev.repro_env.pytest_evidence import Evidence
-from tests.test_repro_execution import events
+from tests._helpers.repro_evidence import events
+
+
+def exchange(page, url, timeout=5000):
+    return page.evaluate(
+        """({url, timeout}) => new Promise((resolve, reject) => {
+                const socket = new WebSocket(url);
+                const timer = setTimeout(() => {
+                    socket.close(); reject(new Error('WebSocket response timed out'));
+                }, timeout);
+                socket.onopen = () => socket.send('native-input');
+                socket.onerror = () => {
+                    clearTimeout(timer); reject(new Error('WebSocket error'));
+                };
+                socket.onclose = () => {
+                    clearTimeout(timer); reject(new Error('WebSocket closed before response'));
+                };
+                socket.onmessage = event => {
+                    clearTimeout(timer); resolve(event.data); socket.close();
+                };
+            })""",
+        {"url": url, "timeout": timeout},
+    )
 
 
 def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
@@ -33,8 +57,8 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
     thread.start()
 
     def echo(socket):
-        assert socket.recv() == "native-input"
-        socket.send("observed-output")
+        received = socket.recv(timeout=5)
+        socket.send("observed-output" if received == "native-input" else f"unexpected:{received}")
 
     sockets = serve(echo, "127.0.0.1", 0)
     socket_thread = threading.Thread(target=sockets.serve_forever, daemon=True)
@@ -61,14 +85,7 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
             page.route("**/v1/from-response", lambda route: route.fulfill(response=route.fetch()))
             page.evaluate("fetch('/v1/from-response').then(r => r.json())")
             port = sockets.socket.getsockname()[1]
-            result = page.evaluate(
-                """url => new Promise(resolve => {
-                const socket = new WebSocket(url);
-                socket.onopen = () => socket.send('native-input');
-                socket.onmessage = event => { socket.close(); resolve(event.data); };
-            })""",
-                f"ws://127.0.0.1:{port}/terminal",
-            )
+            result = exchange(page, f"ws://127.0.0.1:{port}/terminal")
             assert result == "observed-output"
             context.close()
             browser.close()
@@ -109,4 +126,43 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path):
         socket_thread.join(timeout=3)
         server.shutdown()
         server.server_close()
+        thread.join(timeout=3)
+
+
+@pytest.mark.parametrize("mode", ["close", "silent", "mismatch"])
+def test_websocket_exchange_finishes_when_server_does_not_reply_as_expected(mode):
+    import contextlib
+    import threading
+
+    from playwright.sync_api import Error, sync_playwright
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.server import serve
+
+    def handle(socket):
+        socket.recv(timeout=5)
+        if mode == "mismatch":
+            socket.send("unexpected:wrong-input")
+        elif mode == "silent":
+            with contextlib.suppress(ConnectionClosed):
+                socket.recv(timeout=5)
+
+    server = serve(handle, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(args=["--no-sandbox"])
+            context = browser.new_context()
+            page = context.new_page()
+            url = f"ws://127.0.0.1:{server.socket.getsockname()[1]}/terminal"
+            if mode == "mismatch":
+                assert exchange(page, url) == "unexpected:wrong-input"
+            else:
+                expected = "closed before response" if mode == "close" else "timed out"
+                with pytest.raises(Error, match=expected):
+                    exchange(page, url, timeout=1000)
+            context.close()
+            browser.close()
+    finally:
+        server.shutdown()
         thread.join(timeout=3)

@@ -9,14 +9,7 @@ import pytest
 
 from dev.repro_env.execution import Journal, inventory, run
 from dev.repro_env.pytest_evidence import Evidence
-
-
-def events(path):
-    return [
-        json.loads(line)
-        for file in path.glob("events-*.jsonl")
-        for line in file.read_text().splitlines()
-    ]
+from tests._helpers.repro_evidence import events
 
 
 def test_failed_and_successful_commands_keep_separate_records(tmp_path, monkeypatch):
@@ -441,6 +434,7 @@ def test_cleanup_signals_only_while_child_identity_is_reserved(tmp_path, monkeyp
 @pytest.mark.skipif(not hasattr(os, "WNOWAIT"), reason="requires waitid with WNOWAIT")
 def test_repeated_signals_defer_journal_io(tmp_path, monkeypatch):
     import signal
+    import time
 
     from dev.repro_env import execution
 
@@ -455,6 +449,10 @@ def test_repeated_signals_defer_journal_io(tmp_path, monkeypatch):
 
     def interrupt(*args):
         nonlocal inside_handler
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "ready").exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
         handler = signal.getsignal(signal.SIGTERM)
         inside_handler = True
         try:
@@ -467,8 +465,17 @@ def test_repeated_signals_defer_journal_io(tmp_path, monkeypatch):
     monkeypatch.setattr(Journal, "emit", checked_emit)
     monkeypatch.setattr(execution.os, "waitid", interrupt)
     assert (
-        run(tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"], dict(os.environ))
-        == -signal.SIGTERM
+        run(
+            tmp_path,
+            [
+                sys.executable,
+                "-c",
+                "import signal,time,pathlib; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "pathlib.Path('ready').touch(); time.sleep(30)",
+            ],
+            dict(os.environ),
+        )
+        == -signal.SIGKILL
     )
     attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
     assert len([e for e in events(attempt) if e["kind"] == "signal"]) == 2
@@ -589,3 +596,160 @@ def test_unsanitizable_trace_is_explicitly_unavailable(tmp_path):
         e["kind"] == "collection_error" and e["operation"] == "trace_stop"
         for e in events(tmp_path)
     )
+
+
+def test_startup_signal_is_recorded_and_delivered_once(tmp_path, monkeypatch):
+    import signal
+
+    from dev.repro_env import execution
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "execution-context.json").write_text("{}")
+    popen = execution.subprocess.Popen
+
+    def during_spawn(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        # Arrival before run() receives the Popen result must be queued once.
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        return process
+
+    # Metadata uses subprocess.run/Popen too; only interrupt the actual command.
+    def spawn(*args, **kwargs):
+        return (
+            during_spawn(*args, **kwargs)
+            if kwargs.get("start_new_session")
+            else popen(*args, **kwargs)
+        )
+
+    monkeypatch.setattr(execution.subprocess, "Popen", spawn)
+    assert (
+        run(tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"], dict(os.environ))
+        == -signal.SIGTERM
+    )
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    signals = [e for e in events(attempt) if e["kind"] == "signal"]
+    assert len(signals) == 1
+    assert signals[0]["number"] == signals[0]["requested_delivery"] == signal.SIGTERM
+
+
+@pytest.mark.parametrize("supports_waitid", [True, False])
+def test_exception_after_spawn_terminates_and_reaps_child(tmp_path, monkeypatch, supports_waitid):
+    from dev.repro_env import execution
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "execution-context.json").write_text("{}")
+    popen = execution.subprocess.Popen
+    children = []
+
+    def spawn(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        if kwargs.get("start_new_session"):
+            children.append(process)
+        return process
+
+    def fail_start(thread):
+        raise RuntimeError("output thread could not start")
+
+    monkeypatch.setattr(execution.subprocess, "Popen", spawn)
+    monkeypatch.setattr(execution.threading.Thread, "start", fail_start)
+    if not supports_waitid:
+        monkeypatch.delattr(execution.os, "WNOWAIT", raising=False)
+    with pytest.raises(RuntimeError, match="could not start"):
+        run(tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"], dict(os.environ))
+    assert len(children) == 1
+    assert children[0].returncode is not None
+    with pytest.raises(ChildProcessError):
+        os.waitpid(children[0].pid, os.WNOHANG)
+    record = json.loads(next((tmp_path / "execution").glob("*/attempt.json")).read_text())
+    assert record["status"] == "incomplete"
+    assert record["error_type"] == "RuntimeError"
+    assert record["cleanup_exit_code"] is not None
+
+
+def test_safe_url_preserves_ipv6_and_removes_credentials():
+    from dev.repro_env.execution import safe_url
+
+    assert (
+        safe_url("http://user:password@[::1]:8080/v1/sessions/s?token=hidden#part")
+        == "http://[::1]:8080/v1/sessions/s"
+    )
+    assert safe_url("http://[::1]/c/s") == "http://[::1]/c/s"
+
+
+def test_inline_credentials_are_redacted_but_token_counts_survive(tmp_path):
+    journal = Journal(tmp_path)
+    journal.emit(
+        "input",
+        command=[
+            "tool",
+            "--password",
+            "inline-password",
+            "--api-key=inline-key",
+            "--max-tokens",
+            "4096",
+        ],
+        body=json.dumps(
+            {
+                "password": "json-password",
+                "access_token": "json-token",
+                "max_tokens": 1024,
+                "max_output_tokens": 256,
+                "usage": {
+                    "input_tokens": 17,
+                    "output_tokens": 11,
+                    "input_tokens_details": {"cached_tokens": 3},
+                },
+            }
+        ),
+    )
+    raw = journal.path.read_text()
+    for secret in ("inline-password", "inline-key", "json-password", "json-token"):
+        assert secret not in raw
+    event = events(tmp_path)[0]
+    assert event["command"] == [
+        "tool",
+        "--password",
+        "[redacted]",
+        "--api-key=[redacted]",
+        "--max-tokens",
+        "4096",
+    ]
+    body = json.loads(event["body"])
+    assert body["max_tokens"] == 1024
+    assert body["max_output_tokens"] == 256
+    assert body["usage"] == {
+        "input_tokens": 17,
+        "output_tokens": 11,
+        "input_tokens_details": {"cached_tokens": 3},
+    }
+
+
+def test_concurrent_mock_requests_share_one_journal(tmp_path, monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dev.repro_env import execution
+    from tests.server.integration import mock_llm_server as mock
+
+    monkeypatch.setenv("OMNIGENT_REPRO_ATTEMPT_DIR", str(tmp_path))
+    barrier = threading.Barrier(8)
+    journals = []
+
+    class SlowJournal(Journal):
+        def __init__(self, *args):
+            time.sleep(0.01)
+            super().__init__(*args)
+            journals.append(self)
+
+    monkeypatch.setattr(execution, "Journal", SlowJournal)
+
+    def request(index):
+        barrier.wait(timeout=5)
+        mock._record_evidence("request", {"index": index})
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        list(workers.map(request, range(8)))
+    assert len(journals) == 1
+    assert len(list(tmp_path.glob("events-*.jsonl"))) == 1
+    assert {e["body"]["index"] for e in events(tmp_path)} == set(range(8))
