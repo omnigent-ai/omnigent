@@ -393,7 +393,11 @@ describe("useSlashCompletion Escape", () => {
       text: "/rev",
       escapeClearsOnlyWithContent: true,
     });
-    expect(view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE)).toBe(true);
+    let consumed = false;
+    act(() => {
+      consumed = view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE);
+    });
+    expect(consumed).toBe(true);
     expect(clearText).toHaveBeenCalledOnce();
   });
 
