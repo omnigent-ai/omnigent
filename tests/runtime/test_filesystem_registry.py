@@ -1517,6 +1517,10 @@ def test_git_list_tracked_files_is_relative_to_the_requested_subdir(tmp_path: Pa
     # Anchored at the repository root, a missing directory is just an empty
     # scope, not a git failure.
     assert reg.list_tracked_files("missing-dir") == []
+    # A scope that cannot be resolved (a symlink loop) is a failure the caller
+    # falls back from, not an exception that would abort the search.
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    assert reg.list_tracked_files("loop") is None
 
 
 def test_agent_edit_registry_has_no_index_to_consult(

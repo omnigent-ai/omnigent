@@ -195,11 +195,12 @@ def search_indexed_paths(
     — case-insensitive substring on the path, include/exclude globs — and
     reports a matching path's ancestor directories as directory entries, so
     a query like ``"src"`` still surfaces the ``src`` folder. Only the
-    entries returned are stat'ed, without following symlinks: a path that no
-    longer exists (indexed but deleted from the working tree) is dropped, a
-    link reports its own attributes rather than its target's, and a path
-    routed through a symlinked parent is dropped, so nothing outside *root*
-    is ever described.
+    entries returned are stat'ed, and a symlink is followed only when its
+    target stays inside *root*: such a link is described as its target (a
+    directory symlink stays a folder, as the tree shows it), a link elsewhere
+    reports only its own attributes, a path routed through a symlinked parent
+    is dropped, and so is a path that no longer exists (indexed but deleted
+    from the working tree). Nothing outside *root* is ever described.
 
     :param root: Absolute directory the paths are relative to.
     :param paths: File paths relative to *root*, e.g. from ``git ls-files``.
@@ -257,6 +258,16 @@ def search_indexed_paths(
         if parent != real_root and not parent.startswith(root_prefix):
             continue
         is_link = stat.S_ISLNK(st.st_mode)
+        if is_link:
+            target = os.path.realpath(full)
+            if target == real_root or target.startswith(root_prefix):
+                # Safe to describe: the target is inside the workspace, and the
+                # tree shows the link as that target.
+                try:
+                    st = full.stat()
+                except OSError:
+                    continue
+                is_link = False
         # A submodule is one index entry but a directory on disk.
         is_dir = candidates[rel] or (not is_link and stat.S_ISDIR(st.st_mode))
         entries.append(

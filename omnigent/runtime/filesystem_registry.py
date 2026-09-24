@@ -1054,7 +1054,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
         scope = self._cwd / subdir if subdir else self._cwd
         try:
             pathspec = scope.resolve().relative_to(self._git_root).as_posix()
-        except ValueError:
+        except (ValueError, OSError, RuntimeError):
+            # Outside the repository, or unresolvable (a symlink loop raises
+            # RuntimeError on Python 3.12 and OSError on later versions).
             return None
         argv = ["git", "-C", str(self._git_root), "-c", "core.fsmonitor=false", "ls-files", "-z"]
         if pathspec != ".":

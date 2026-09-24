@@ -2282,7 +2282,9 @@ async def test_search_picks_up_a_repo_created_mid_session(
 def test_search_indexed_paths_never_follows_symlinks_out_of_the_root(tmp_path: Path) -> None:
     """Index paths are stat'ed in the unsandboxed runner, so a tracked symlink
     (or a directory swapped for one after it was indexed) must not disclose its
-    outside target's metadata — the sandboxed walk could not have read it."""
+    outside target's metadata — the sandboxed walk could not have read it. A
+    link whose target is inside the workspace is described as that target, so
+    a directory symlink stays a folder like the tree shows it."""
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "b.txt").write_text("12345")
@@ -2290,12 +2292,17 @@ def test_search_indexed_paths_never_follows_symlinks_out_of_the_root(tmp_path: P
     root.mkdir()
     (root / "b-link").symlink_to(outside / "b.txt")
     (root / "a").symlink_to(outside)
+    (root / "real").mkdir()
+    (root / "b-docs").symlink_to(root / "real")
 
-    entries = search_indexed_paths(root, ["b-link", "a/b.txt"], "b")
+    entries = search_indexed_paths(root, ["b-link", "a/b.txt", "b-docs"], "b")
 
-    # The link is reported as itself (no target size); the path routed through
-    # the symlinked parent is dropped entirely.
-    assert [(e.path, e.type, e.bytes) for e in entries] == [("b-link", "file", None)]
+    # Outside link: reported as itself, no target size. Path through the
+    # symlinked parent: dropped. In-workspace directory link: a folder.
+    assert [(e.path, e.type, e.bytes) for e in entries] == [
+        ("b-docs", "directory", None),
+        ("b-link", "file", None),
+    ]
 
 
 @pytest.mark.asyncio
@@ -2325,3 +2332,28 @@ async def test_search_follows_a_repository_created_inside_an_outer_one(
 
         resp = await client.get(f"{base}/search", params={"q": "target"})
         assert [e["path"] for e in resp.json()["data"]] == ["zzz/target.jsonnet"], resp.json()
+
+
+@pytest.mark.asyncio
+async def test_search_keeps_a_tracked_directory_symlink_a_folder(tmp_path: Path) -> None:
+    """A tracked symlink to an in-workspace directory must come back as a
+    folder row: the index answer merges over the walk's, so a file
+    classification there would turn a reveal into a broken file open."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "real").mkdir()
+    (ws / "real" / "x.txt").write_text("x")
+    (ws / "docs").symlink_to(ws / "real")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    base = f"/v1/sessions/conv_dirlink/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_dirlink") as client:
+        resp = await client.get(f"{base}/search", params={"q": "docs"})
+        body = resp.json()
+
+    assert [(e["path"], e["type"]) for e in body["data"]] == [("docs", "directory")], body
