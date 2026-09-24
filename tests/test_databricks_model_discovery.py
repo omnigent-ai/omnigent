@@ -337,6 +337,8 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
     """
     servable = _discover_codex(
         [
+            {"name": "model-services/system.ai.gpt-6-luna"},
+            {"name": "model-services/system.ai.gpt-6-sol"},
             {"name": "model-services/system.ai.gpt-5-5"},
             {"name": "model-services/system.ai.gpt-5-6-luna"},
             {"name": "model-services/system.ai.gpt-5-6-sol"},
@@ -347,13 +349,41 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
     )
 
     assert servable == (
-        # Curated (cheapest-safe-first) beats a newer non-curated generation.
+        # The current economical Codex model leads when the workspace serves it.
+        "system.ai.gpt-6-luna",
+        "system.ai.gpt-6-sol",
+        # Existing models remain available as ordered fallbacks.
         "system.ai.gpt-5-6-sol",
         "system.ai.gpt-5-6-luna",
         "system.ai.gpt-5-5",
         # Non-curated GPT, newest generation next.
         "system.ai.gpt-6-1",
         # Codex-compatible but unversioned, last.
+        "system.ai.kimi-k2",
+    )
+
+
+def test_discover_codex_models_ranks_uncurated_major_only_tier_by_generation() -> None:
+    """A major-only tiered id outside the curated table ranks with its generation.
+
+    Codex's id grammar makes the minor version optional (``gpt-6-terra``), so
+    such an id belongs in the versioned tier — newest generation first, an
+    untiered id ahead of a same-generation tier — not in the unranked name
+    tail below every older versioned GPT (and below kimi by name).
+    """
+    servable = _discover_codex(
+        [
+            {"name": "model-services/system.ai.gpt-5-4-mini"},
+            {"name": "model-services/system.ai.gpt-6-terra"},
+            {"name": "model-services/system.ai.gpt-6"},
+            {"name": "model-services/system.ai.kimi-k2"},
+        ]
+    )
+
+    assert servable == (
+        "system.ai.gpt-6",
+        "system.ai.gpt-6-terra",
+        "system.ai.gpt-5-4-mini",
         "system.ai.kimi-k2",
     )
 

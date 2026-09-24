@@ -28,8 +28,8 @@ _GLM_SLUG = EXTENDED_CATALOG_MODELS["glm-5-2"]
 
 def _catalog(**overrides: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
     luna: dict[str, Any] = {  # type: ignore[explicit-any]
-        "slug": "gpt-5.6-luna",
-        "display_name": "GPT-5.6-Luna",
+        "slug": "gpt-6-luna",
+        "display_name": "GPT-6-Luna",
         "description": "Fast and affordable agentic coding model.",
         "visibility": "list",
         "context_window": 272000,
@@ -41,11 +41,11 @@ def _catalog(**overrides: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
             {"effort": "xhigh"},
         ],
         "availability_nux": {"seen": 3},
-        "upgrade": {"to": "gpt-5.6-sol"},
+        "upgrade": None,
         "base_instructions": "You are Codex...",
         **overrides,
     }
-    return {"models": [{"slug": "gpt-5.6-sol", "visibility": "list"}, luna]}
+    return {"models": [{"slug": "gpt-6-sol", "visibility": "list"}, luna]}
 
 
 def test_the_added_entry_carries_the_clone_sources_fields() -> None:
@@ -62,6 +62,25 @@ def test_the_added_entry_carries_the_clone_sources_fields() -> None:
     # Upsell metadata described the cloned arm, not this one.
     assert glm["availability_nux"] is None
     assert glm["upgrade"] is None
+
+
+def test_older_codex_catalog_uses_legacy_luna_as_clone_source() -> None:
+    catalog = {
+        "models": [
+            {
+                "slug": "gpt-5.6-luna",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                "context_window": 128000,
+            }
+        ]
+    }
+
+    extended = extended_model_catalog(catalog)
+
+    assert extended is not None
+    glm = next(model for model in extended["models"] if model["slug"] == _GLM_SLUG)
+    assert glm["context_window"] == 128000
+    assert glm["supported_reasoning_levels"] == [{"effort": "low"}, {"effort": "high"}]
 
 
 def test_the_added_entry_declares_only_the_efforts_glm_accepts() -> None:
@@ -87,8 +106,8 @@ def test_the_bundled_arms_survive() -> None:
 
     assert extended is not None
     assert [m["slug"] for m in extended["models"]] == [
-        "gpt-5.6-sol",
-        "gpt-5.6-luna",
+        "gpt-6-sol",
+        "gpt-6-luna",
         _GLM_SLUG,
     ]
 

@@ -45,7 +45,11 @@ from omnigent.models.codex_model_vocabulary import (
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
 )
-from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.models.model_fallbacks import (
+    CODEX_CATALOG_CLONE_SOURCE_FALLBACK_SLUGS,
+    CODEX_CATALOG_CLONE_SOURCE_SLUG,
+    CODEX_DEFAULT_MODEL,
+)
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -1527,6 +1531,17 @@ def extended_model_catalog(
         return None
     by_slug = {m.get("slug"): m for m in models if isinstance(m, dict)}
     template = by_slug.get(clone_source)
+    if template is None:
+        # Older installed Codex CLIs may not ship the current clone source yet.
+        # Keep gateway-only arms spawnable from a compatible older catalog row.
+        template = next(
+            (
+                by_slug[slug]
+                for slug in CODEX_CATALOG_CLONE_SOURCE_FALLBACK_SLUGS
+                if slug in by_slug
+            ),
+            None,
+        )
     if template is None:
         return None
     added: list[dict[str, Any]] = []
