@@ -2753,6 +2753,67 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
     assert compactions[0]["data"]["last_item_id"] == "item_latest"
 
 
+@pytest.mark.asyncio
+async def test_native_session_create_pre_writes_onboarding_for_subagent_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sub-agent claude-native launch must pre-accept onboarding, same as top-level.
+
+    Claude Code's first-run theme/login onboarding and per-directory trust
+    dialogs have no ``PermissionRequest`` hook, so a host-spawned terminal
+    with nobody at the keyboard hangs on them (``ensure_claude_workspace_trusted``).
+    A codex parent dispatching a ``claude_code`` sub-agent (``sys_session_send``)
+    creates its child through the same ``POST /v1/sessions`` session-init path
+    as a top-level session — this pins that the pre-write actually runs for
+    both, so a future refactor that special-cases sub-agent init can't
+    silently drop it and reintroduce the onboarding-dialog stall.
+    """
+    import omnigent.harnesses.claude_native.bridge as claude_native_bridge
+
+    calls: list[str] = []
+
+    def _recording_pre_write(workspace: Path) -> None:
+        calls.append(str(workspace))
+
+    monkeypatch.setattr(
+        claude_native_bridge, "ensure_claude_workspace_trusted", _recording_pre_write
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    for sub_agent_name, parent_session_id in [(None, None), ("claude_code", "parent-conv-id")]:
+        session_id = uuid.uuid4().hex
+        payload: dict[str, Any] = {"session_id": session_id, "agent_id": "agentid"}
+        if sub_agent_name is not None:
+            payload["sub_agent_name"] = sub_agent_name
+        if parent_session_id is not None:
+            payload["parent_session_id"] = parent_session_id
+        before = len(calls)
+        async with _runner_client(app) as client:
+            resp = await client.post("/v1/sessions", json=payload)
+        assert resp.status_code == 201, resp.text
+        assert len(calls) > before, (
+            f"ensure_claude_workspace_trusted was not called for "
+            f"sub_agent_name={sub_agent_name!r}; onboarding dialogs would hang "
+            "a host-spawned terminal with nobody to answer them."
+        )
+
+
 def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
     """Every kimi forwarder start must be preceded by a bridge-state clear.
 

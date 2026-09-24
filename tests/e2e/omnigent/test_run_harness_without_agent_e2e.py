@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pexpect
 import pytest
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
@@ -113,7 +114,18 @@ def test_run_harness_without_agent_live_repl_round_trip(
         # changed in #783), so sync on the marker text the model returns —
         # that landing in stdout is the load-bearing proof the no-AGENT
         # launcher reached the model and rendered the reply.
-        child.expect(marker, timeout=_COMPLETION_TIMEOUT)
+        try:
+            child.expect(marker, timeout=_COMPLETION_TIMEOUT)
+        except pexpect.TIMEOUT as exc:
+            # A bare pexpect.TIMEOUT only shows the last 100 raw (ANSI-laden)
+            # chars, which is next to useless for a full-screen TUI render.
+            # Surface the full stripped buffer so the next regression is
+            # diagnosable instead of a bare timeout.
+            tail = strip_ansi(child.before or "")[-4000:]
+            raise AssertionError(
+                f"[{probe.harness}] marker {marker!r} never appeared within "
+                f"{_COMPLETION_TIMEOUT}s; REPL output tail:\n{tail}"
+            ) from exc
         output = strip_ansi(child.before or "") + marker
     finally:
         # Drive the exit. The one-shot process does not always terminate

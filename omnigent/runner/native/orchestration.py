@@ -2665,35 +2665,58 @@ async def _post_pi_native_credential_warning(
     event persists without queuing an agent turn, so it's safe on a session
     whose model is unreachable.
 
+    This is the fail-loud signal for a cross-family model/gateway misroute
+    (e.g. a Claude id served over an openai-only gateway): losing it to one
+    transient blip would silently turn "fail loud" back into "fail silent"
+    while every future turn keeps 404ing with no explanation. A bounded
+    retry (the post is idempotent — the same notice either way) rides out a
+    runner->server hiccup during boot without blocking the launch itself.
+
     :param session_id: Session/conversation identifier.
     :param server_client: Runner Omnigent server client (``None`` in tests).
     :param warning: The user-facing warning text to surface.
     """
     if server_client is None:
         return
-    try:
-        resp = await server_client.post(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "error",
-                    "item_data": {
-                        "source": "execution",
-                        "code": "pi_credentials_unresolved",
-                        "message": warning,
-                    },
-                },
+    path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events"
+    body = {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "error",
+            "item_data": {
+                "source": "execution",
+                "code": "pi_credentials_unresolved",
+                "message": warning,
             },
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "pi-native: failed to surface credential warning for session %s",
-            session_id,
-            exc_info=True,
-        )
+        },
+    }
+    for attempt in range(1, _LAUNCH_CONFIG_FETCH_ATTEMPTS + 1):
+        last_attempt = attempt == _LAUNCH_CONFIG_FETCH_ATTEMPTS
+        try:
+            resp = await server_client.post(path, json=body, timeout=30.0)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            transient = (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code in _LAUNCH_CONFIG_RETRYABLE_STATUS
+            ) or _launch_config_fetch_is_transient(exc)
+            if last_attempt or not transient:
+                _logger.warning(
+                    "pi-native: failed to surface credential warning for session %s "
+                    "(attempt %d/%d)",
+                    session_id,
+                    attempt,
+                    _LAUNCH_CONFIG_FETCH_ATTEMPTS,
+                    exc_info=True,
+                )
+                return
+            backoff = min(
+                _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S * (2 ** (attempt - 1)),
+                _LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S,
+            )
+            await _launch_config_retry_sleep(backoff)
+        else:
+            return
 
 
 async def _post_pi_native_effort_notice(

@@ -420,14 +420,25 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
         # THE RESUME: bind the session to the runner (what the web UI / a
         # daemon relaunch does) -> the runner auto-creates the Claude
         # terminal, deciding whether to pass --resume.
-        # The bind can block on the runner-side terminal bring-up (the model
-        # catalog probe alone holds a 20-30s budget against the parked stub),
-        # so give it the same generous budget as the argv wait.
-        _http.patch(
-            f"{base_url}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-            timeout=_ARGV_TIMEOUT_S,
-        ).raise_for_status()
+        # The bind blocks on the runner-side terminal bring-up: the model
+        # catalog probe (20-30s against the parked stub) plus the retried
+        # item-history fetch (2 failing pages at limit=1000/500, then
+        # several successful floor-sized pages) plus tmux boot. Under CI
+        # load that chain can genuinely outlast the HTTP client's read
+        # timeout, or the connection can get reset mid-request (observed:
+        # ``httpx.ReadError: Connection reset by peer``), without the bind
+        # itself having failed server-side. Catch the whole transport-error
+        # family and fall through to the argv poll below (an observable
+        # state transition) instead of trusting a flaky transport signal.
+        bind_transport_error: str | None = None
+        try:
+            _http.patch(
+                f"{base_url}/v1/sessions/{session_id}",
+                json={"runner_id": runner_id},
+                timeout=_ARGV_TIMEOUT_S,
+            ).raise_for_status()
+        except httpx.TransportError as exc:
+            bind_transport_error = f"{type(exc).__name__}: {exc}"
 
         deadline = time.monotonic() + _ARGV_TIMEOUT_S
         argv: list[str] | None = None
@@ -436,9 +447,17 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
             if argv is not None:
                 break
             time.sleep(_POLL_S)
+        bind_note = (
+            f"bind request failed client-side ({bind_transport_error}) but the "
+            "runner-side auto-create may still be in flight; "
+            if bind_transport_error
+            else ""
+        )
         assert argv is not None, (
-            f"claude terminal never launched; runner log:\n"
-            f"{(tmp_path / 'runner.log').read_text()[-3000:]}"
+            f"claude terminal never launched ({bind_note}terminal bring-up "
+            f"never completed); "
+            f"server log:\n{(tmp_path / 'server.log').read_text()[-3000:]}\n"
+            f"runner log:\n{(tmp_path / 'runner.log').read_text()[-3000:]}"
         )
 
         # The bug: with the item history fully recoverable at smaller page
