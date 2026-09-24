@@ -1,35 +1,7 @@
-"""E2E UI guard: a host launch that never connects must name its cause.
+"""Browser journey for a host-launched runner that never connects.
 
-The user journey: a session is created on an online host, the host spawns
-the runner and reports "launched", but the runner never connects its
-tunnel. The session page never becomes ready, and the user's send fails.
-
-Before the fix, the only feedback was a generic, cause-free error block —
-collapsed headline "Something went wrong", expanding to only "The runner
-didn't come online in time" — with no hint of which phase failed. The
-send-failure path now keeps the ``runner_unavailable`` code (so the
-headline names the runner-connect failure) and surfaces the server's
-detail verbatim: which runner the host launched and that it never
-connected to the server within the grace. This test walks the user's
-view and asserts that cause-naming feedback; on the unfixed tree the
-headline assertion fails against "Something went wrong".
-
-The companion guard
-``tests/e2e/test_host_launch_never_connects_emits_correlated_error.py``
-asserts the operator side of the same failure (a correlated ERROR-level
-log record).
-
-This drives the real stack end to end in the browser: a real host
-daemon registers with the UI suite's live server, the session create
-launches a real runner subprocess, and a wedger freezes that runner
-before its tunnel dial (``SIGSTOP`` — standing in for whatever starves
-or hangs runners in the field). The test then walks the user's view:
-open the session, send a message, read the failure.
-
-Run it directly (mock mode, spawns its own server)::
-
-    .venv/bin/python -m pytest \
-        tests/e2e_ui/sessions/test_host_launch_never_connects_names_cause.py -v
+A real host spawns a runner that SIGSTOP freezes before its tunnel dial.
+After the send fails, check the error headline and expanded server cause.
 """
 
 from __future__ import annotations
@@ -55,14 +27,9 @@ from tests.e2e_ui.conftest import _register_extra_agent
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# When POST /events 503s because a host-bound runner never came online, the
-# SPA renders an ErrorBanner (web/src/components/blocks/StatusBlocks.tsx).
-# The send-failure path keeps the server's `runner_unavailable` code, so the
-# collapsed headline is the code's description (FAILURE_CODE_DESCRIPTIONS)
-# instead of the cause-free "Something went wrong".
+# The error code determines the banner headline.
 _EXPECTED_HEADLINE = "The session's runner isn't connected to the server."
-# The expanded body carries the server's phase-naming detail verbatim: which
-# runner the host launched, and that it never connected within the grace.
+# The expanded body names the failed connection phase.
 _EXPECTED_CAUSE_SUBSTRING = "never connected to the server"
 _RUNNER_TOKEN_PATTERN = re.compile(r"runner_token_[0-9a-f]+")
 
@@ -107,15 +74,7 @@ class _RunnerWedger:
 
 
 def _spawn_host_daemon(tmp_path: Path, base_url: str) -> tuple[subprocess.Popen[bytes], str, Path]:
-    """Start a real host daemon registered against *base_url*.
-
-    ``HOME`` is the per-test temp dir, so the daemon's config, runner
-    logs, and workspace all stay isolated. The zygote is disabled so
-    runners pay the full interpreter boot before their tunnel dial —
-    the window the wedger's SIGSTOP lands in.
-
-    :returns: ``(daemon_process, host_id, daemon_log_path)``.
-    """
+    """Start an isolated host; direct spawn gives SIGSTOP time to land."""
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
     host_id = uuid.uuid4().hex
@@ -164,8 +123,7 @@ def _wait_for_host_online(base_url: str, host_id: str, timeout: float = 45.0) ->
                     if host["host_id"] == host_id and host["status"] == "online":
                         return
         except httpx.HTTPError:
-            # Transient connection/startup errors are expected while the
-            # server boots; keep polling until the deadline expires.
+            # The server may still be starting.
             pass
         time.sleep(0.25)
     raise AssertionError(f"host {host_id!r} never came online at {base_url}")
@@ -186,15 +144,7 @@ def test_host_session_that_never_connects_names_the_cause(
     live_server: str,
     tmp_path: Path,
 ) -> None:
-    """The stuck-session journey ends in an error that names the cause.
-
-    Journey: host online → create a session on it (the SPA's Start
-    click does this same POST) → the launched runner wedges before
-    connecting → open the session page → send a message → the failure
-    block's headline names the runner-connect failure, and expanding it
-    reveals the server's detail: which runner the host launched and
-    that it never connected to the server within the grace.
-    """
+    """The stuck-session error names the failed runner-connect phase."""
     daemon: subprocess.Popen[bytes] | None = None
     wedger: _RunnerWedger | None = None
     try:
@@ -221,8 +171,7 @@ def test_host_session_that_never_connects_names_the_cause(
         create.raise_for_status()
         session_id = create.json()["id"]
 
-        # The launch happened; the wedge must have frozen the runner
-        # before its tunnel dial, or this run proves nothing.
+        # Reject runs where SIGSTOP lost the pre-connect race.
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline and not wedger.wedged:
             time.sleep(0.05)
@@ -235,16 +184,11 @@ def test_host_session_that_never_connects_names_the_cause(
                 "before the SIGSTOP landed"
             )
 
-        # The user opens their new session: it sits in the starting
-        # state — no error, nothing actionable.
         page.goto(f"{live_server}/c/{session_id}")
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=30_000)
 
-        # The user sends a message. The server relaunches (the wedger
-        # freezes that generation too), waits out its connect grace, and
-        # 503s — the SPA renders an error block whose collapsed headline
-        # names the runner-connect failure (not "Something went wrong").
+        # The send relaunches; the wedger freezes that runner too.
         composer.fill("hello? is anything happening?")
         composer.press("Enter")
         error_pill = page.get_by_test_id("error-pill")
@@ -253,9 +197,7 @@ def test_host_session_that_never_connects_names_the_cause(
             _EXPECTED_HEADLINE, timeout=15_000
         )
 
-        # Expand it: the detail names the phase — the host launched a
-        # specific runner (its token is shown) and it never connected to
-        # the server. End the recording on that revealed cause.
+        # Keep the named runner and phase visible for the recording.
         error_pill.click()
         expect(page.get_by_text(_EXPECTED_CAUSE_SUBSTRING)).to_be_visible(timeout=15_000)
         expect(page.get_by_text(_RUNNER_TOKEN_PATTERN)).to_be_visible()

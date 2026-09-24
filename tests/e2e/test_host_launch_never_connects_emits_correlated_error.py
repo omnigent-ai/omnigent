@@ -1,47 +1,7 @@
-"""End-to-end guard: a launch that never connects must emit a correlated ERROR.
+"""Check correlated launch diagnostics across a real server, host, and runner.
 
-The creation funnel logs a launch on the host (``_handle_launch``'s
-``Launched runner runner_token_<hex> ...`` line) and a connect on the
-runner (``_serve_tunnel_once``). When the launched runner never
-connects its tunnel, no phase of the funnel emits an ERROR-level log
-record correlated with the launch (the ``runner_token_<hex>`` runner id
-or the session id) within the triage window (launch + 5 minutes):
-
-- the host has no connect-deadline watchdog at all — ``_watch_runner``
-  only fires when the runner process *exits* (and then logs WARNING,
-  not ERROR; a clean exit is deliberately silent),
-- the server's create-time launch does not wait for the connect, and
-  its message-path connect wait logs INFO then raises a generic
-  ``RUNNER_UNAVAILABLE`` without any ERROR-level record.
-
-So the user's session hangs with a generic failure, and operators get
-zero correlated ERROR telemetry — the never-connected launch signature
-the creation-funnel triage aggregates.
-
-This test drives the real stack (server subprocess, host daemon, real
-runner subprocess) through the journey:
-
-1. bring a host online against the server,
-2. create a session on that host (the host spawns a runner and reports
-   "launched"),
-3. wedge the runner before it dials its tunnel (``SIGSTOP`` — the fault
-   injection standing in for whatever starves/hangs runners in the
-   field: resource exhaustion, a blocked egress, a wedged boot),
-4. message the stuck session like a user would (fails generically),
-5. assert that, within the funnel's launch+5m correlation window, at
-   least one ERROR-level log record correlated with the launch (runner
-   token or session id) appears in the host daemon log, the runner
-   logs, or the server log.
-
-Before a fix lands, step 5 finds nothing — the test FAILS, reproducing
-the bug. A fix that adds bounded lifecycle diagnostics (or repairs
-readiness attribution) makes step 5 find the diagnostic and the test
-passes as soon as it is emitted.
-
-Run it directly (mock mode, no credentials needed)::
-
-    .venv/bin/python -m pytest \
-        tests/e2e/test_host_launch_never_connects_emits_correlated_error.py -v
+SIGSTOP freezes each launched runner before its tunnel connects. A correlated
+ERROR must appear in the host, runner, or server logs within five minutes.
 """
 
 from __future__ import annotations
@@ -71,35 +31,21 @@ from tests.e2e.test_host_e2e import (
     _write_smoke_agent_yaml,
 )
 
-# The funnel's correlation window: an ERROR only counts as evidence for a
-# never-connected launch attempt when it lands within five minutes of the
-# launch. A bounded lifecycle diagnostic must therefore fire inside this
-# window; poll a little past it before declaring the funnel silent.
+# Correlate launch errors within five minutes, with slack for log polling.
 _FUNNEL_ERROR_WINDOW_S = 300.0
 _WINDOW_SLACK_S = 30.0
 
-# How often the wedger thread scans the daemon log for freshly spawned
-# runner pids. Must be far below the runner's boot time (a direct-Popen
-# runner pays multi-second interpreter + import startup before it dials
-# the tunnel) so the SIGSTOP always lands pre-connect.
+# Poll well below direct-spawn boot time so SIGSTOP lands pre-connect.
 _WEDGE_POLL_S = 0.02
 
-# Process-log lines are "LEVELNAME <timestamp> <source> <func> | <msg>",
-# uncolored when writing to a file — an ERROR-level record starts the
-# line with "ERROR". (The debug-log sink ships these same records with
-# ``level = record.levelname``, so this is the local mirror of the
-# ``omnigent_debug_logs.level = 'ERROR'`` correlation the triage ran.)
+# Process-log files start ERROR records with the level name.
 _ERROR_LINE = re.compile(r"^ERROR\b")
 
 _LAUNCH_LINE = re.compile(r"Launched runner (\S+) for workspace .*?\(pid=(\d+)\)")
 
 
 def _launches(log_path: Path) -> list[tuple[str, int]]:
-    """Parse every runner the host daemon spawned, in launch order.
-
-    :param log_path: Path to the captured daemon stderr/process log.
-    :returns: ``(runner_id, pid)`` pairs, oldest first.
-    """
+    """Parse launched runner IDs and PIDs in order."""
     if not log_path.exists():
         return []
     return [
@@ -108,14 +54,7 @@ def _launches(log_path: Path) -> list[tuple[str, int]]:
 
 
 def _wait_for(predicate, *, timeout: float, what: str):  # type: ignore[no-untyped-def]
-    """Poll ``predicate`` until it returns a truthy value.
-
-    :param predicate: Zero-arg callable polled every :data:`POLL_INTERVAL_S`.
-    :param timeout: Maximum seconds to wait.
-    :param what: Description used in the failure message.
-    :returns: The first truthy value the predicate returned.
-    :raises AssertionError: If the predicate never went truthy.
-    """
+    """Return the first truthy poll result or fail after the timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = predicate()
@@ -126,12 +65,7 @@ def _wait_for(predicate, *, timeout: float, what: str):  # type: ignore[no-untyp
 
 
 def _runner_online(client: httpx.Client, runner_id: str) -> bool:
-    """Return whether the server holds an open tunnel for a runner.
-
-    :param client: HTTP client pointed at the server.
-    :param runner_id: Runner id to probe, e.g. ``"runner_token_0123..."``.
-    :returns: The endpoint's ``online`` verdict (``False`` on any error).
-    """
+    """Return the server's online verdict, or false on HTTP failure."""
     try:
         resp = client.get(f"/v1/runners/{runner_id}/status")
     except httpx.HTTPError:
@@ -140,14 +74,7 @@ def _runner_online(client: httpx.Client, runner_id: str) -> bool:
 
 
 class _RunnerWedger:
-    """SIGSTOPs every runner the host daemon spawns, before it can connect.
-
-    A daemon thread polls the daemon log for ``Launched runner ...
-    (pid=NNNN)`` lines and stops each new pid the moment it appears —
-    the persistent host-side condition the funnel aggregates (runners
-    that consistently fail to come up), applied to every generation so
-    a message-path relaunch cannot quietly heal the session.
-    """
+    """SIGSTOP every launched runner, including message-path relaunches."""
 
     def __init__(self, daemon_log: Path) -> None:
         self._daemon_log = daemon_log
@@ -179,19 +106,7 @@ def _correlated_error_lines(
     log_files: list[Path],
     correlation_keys: list[str],
 ) -> list[tuple[Path, str]]:
-    """Find ERROR-level log lines correlated with the launch.
-
-    Mirrors the operators' triage query: an ERROR record counts as
-    evidence for a never-connected launch attempt when it names the
-    launch's ``runner_token_<hex>`` runner id (the query's only
-    correlation key for never-connected attempts) — accepting the
-    session id too, so a fix that attributes its diagnostic by session
-    instead of token also satisfies the guard.
-
-    :param log_files: Log files to scan (host daemon, runners, server).
-    :param correlation_keys: Runner token ids and the session id.
-    :returns: ``(file, line)`` pairs for every correlated ERROR line.
-    """
+    """Find ERROR records naming a runner token or the session."""
     hits: list[tuple[Path, str]] = []
     for path in log_files:
         if not path.exists():
@@ -207,26 +122,15 @@ def _correlated_error_lines(
 
 
 def _funnel_log_files(daemon_log: Path, host_home: Path, basetemp: Path) -> list[Path]:
-    """Collect every funnel phase's log file.
-
-    :param daemon_log: The host daemon's captured stderr/process log.
-    :param host_home: The daemon's ``HOME`` — runner process logs land
-        under ``<home>/.omnigent/**``.
-    :param basetemp: The pytest session basetemp — the shared
-        ``live_server`` fixture writes ``e2e_logs*/server.log`` there.
-    :returns: Existing log files, host first.
-    """
+    """Collect host, runner, and server logs, host first."""
     files = [daemon_log]
-    # Runner process logs land under ``<home>/.omnigent/logs/runner/`` (the
-    # host opens them via open_process_log_file → logs_root() → HOME); glob
-    # the whole home so they are picked up wherever the runtime data dir
-    # resolves them.
+    # Runner-log location depends on the host's runtime data dir.
     if host_home.exists():
         files.extend(
             sorted(p for p in host_home.rglob("*.log") if p.is_file() and p != daemon_log)
         )
     files.extend(sorted(basetemp.glob("e2e_logs*/server.log")))
-    # De-dup while preserving order (host first).
+    # De-dup while preserving host-first order.
     seen: set[Path] = set()
     ordered: list[Path] = []
     for path in files:
@@ -244,22 +148,10 @@ def test_never_connected_launch_emits_correlated_error(
     mock_llm_server_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A launch whose runner never connects must emit a correlated ERROR.
-
-    Journey: host online → create a session on the host (runner spawns,
-    host reports "launched") → the runner wedges before dialing its
-    tunnel → the user messages the stuck session and gets only a
-    generic failure → within launch+5m, the funnel must contain at
-    least one ERROR-level record correlated with the launch (runner
-    token or session id). Before the fix there was none — the funnel was
-    mute about never-connected launches — so this assertion failed.
-    """
+    """A never-connected launch emits a correlated ERROR within five minutes."""
     configure_mock_llm(mock_llm_server_url, [{"text": "NEVER_REACHED"}])
 
-    # Direct-Popen spawn (no zygote): the runner pays the full
-    # interpreter + import boot before its tunnel dial, giving the
-    # wedger a multi-second window; a zygote-forked runner is
-    # pre-imported and could connect between wedger polls.
+    # Direct spawn gives SIGSTOP time to land before the tunnel dial.
     monkeypatch.setenv("OMNIGENT_RUNNER_ZYGOTE", "0")
 
     daemon = _spawn_host_daemon(
@@ -271,7 +163,6 @@ def test_never_connected_launch_emits_correlated_error(
     try:
         _wait_for_host_online(http_client, daemon.host_id, timeout=30.0)
 
-        # Arm the wedge before anything can launch a runner.
         wedger = _RunnerWedger(daemon.daemon_log)
 
         agent_name = upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
@@ -279,8 +170,6 @@ def test_never_connected_launch_emits_correlated_error(
         workspace = tmp_path / "project"
         workspace.mkdir()
 
-        # 1-2. The user creates a session on the host. The host spawns
-        # the runner and answers "launched"; the create succeeds.
         create = http_client.post(
             "/v1/sessions",
             json={
@@ -308,9 +197,7 @@ def test_never_connected_launch_emits_correlated_error(
             what="the wedger to freeze the launched runner",
         )
 
-        # 3. Injection validity: the wedged runner must never connect.
-        # (If it connected, the SIGSTOP lost the race and this run
-        # proves nothing about the never-connect funnel.)
+        # Discard runs where SIGSTOP lost the pre-connect race.
         time.sleep(3.0)
         if _runner_online(http_client, gen1_id):
             pytest.fail(
@@ -318,12 +205,7 @@ def test_never_connected_launch_emits_correlated_error(
                 "its tunnel before the SIGSTOP landed"
             )
 
-        # 4. The user acts on the stuck session. The message takes the
-        # relaunch branch (which spawns another runner — the wedger
-        # freezes that generation too, like a persistently failing
-        # host), waits out the connect grace, and must NOT be accepted
-        # as a normal live turn. Today it surfaces only a generic
-        # RUNNER_UNAVAILABLE-style failure.
+        # The send relaunches; the wedger freezes that runner too.
         message = http_client.post(
             f"/v1/sessions/{session_id}/events",
             json={
@@ -345,9 +227,7 @@ def test_never_connected_launch_emits_correlated_error(
             f"{message.text[:500]}"
         )
 
-        # 5. The regression guard: within the funnel's launch+5m
-        # correlation window, some phase (host daemon, runner, server)
-        # must emit an ERROR-level record correlated with the launch.
+        # Check every phase for a launch-correlated ERROR.
         deadline = t_launch + _FUNNEL_ERROR_WINDOW_S + _WINDOW_SLACK_S
         basetemp = tmp_path.parent
         hits: list[tuple[Path, str]] = []
@@ -401,8 +281,7 @@ def test_never_connected_launch_emits_correlated_error(
         except subprocess.TimeoutExpired:
             daemon.proc.kill()
             daemon.proc.wait()
-        # A SIGSTOPped runner can't act on the daemon's shutdown
-        # cascade; make sure nothing frozen outlives the test.
+        # SIGSTOPped runners cannot respond to daemon shutdown.
         if wedger is not None:
             for pid in wedger.wedged.values():
                 if _pid_alive(pid):

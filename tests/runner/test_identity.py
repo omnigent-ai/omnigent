@@ -148,32 +148,19 @@ def test_importing_identity_does_not_pull_in_fastapi() -> None:
 
 
 def test_touch_connect_marker_creates_the_stamped_file(tmp_path) -> None:
-    """The runner records its first tunnel connect at the host-stamped path.
-
-    The launching host arms a connect-deadline watchdog on this file; a
-    missing touch turns every healthy launch into a false never-connected
-    ERROR on the host.
-
-    :param tmp_path: Pytest temp dir.
-    :returns: None.
-    """
+    """Touch the host-stamped marker on a tunnel connect."""
     marker = tmp_path / "runner-abc.connected"
 
     touch_connect_marker({RUNNER_CONNECT_MARKER_ENV_VAR: str(marker)})
 
     assert marker.exists()
-    # Reconnects re-touch the same file without erroring.
+    # Reconnects may touch the same marker.
     touch_connect_marker({RUNNER_CONNECT_MARKER_ENV_VAR: str(marker)})
     assert marker.exists()
 
 
 def test_touch_connect_marker_noop_without_env(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A CLI-local runner (no host, no marker env) touches nothing.
-
-    :param tmp_path: Pytest temp dir.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
+    """Do not create a marker for a CLI-local runner."""
     monkeypatch.delenv(RUNNER_CONNECT_MARKER_ENV_VAR, raising=False)
     monkeypatch.chdir(tmp_path)
 
@@ -183,11 +170,7 @@ def test_touch_connect_marker_noop_without_env(tmp_path, monkeypatch: pytest.Mon
 
 
 def test_touch_connect_marker_survives_unwritable_path(tmp_path) -> None:
-    """A failed touch is logged, never raised — the tunnel connect must win.
-
-    :param tmp_path: Pytest temp dir.
-    :returns: None.
-    """
+    """Do not fail the tunnel when the marker cannot be written."""
     marker = tmp_path / "missing-dir" / "runner.connected"
 
     touch_connect_marker({RUNNER_CONNECT_MARKER_ENV_VAR: str(marker)})

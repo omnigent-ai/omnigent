@@ -1938,10 +1938,7 @@ def register_events_routes(
                 # For SDK/non-native sub-agents the parent runner already
                 # holds the child's state — no re-initialization needed.
                 _runner_needs_session_init = _is_native_terminal_session(conv)
-        # Launch verdict from the relaunch path below, driving the
-        # diagnostics at the unavailable raise: the runner id minted for
-        # the attempt, whether the host confirmed the launch, and whether
-        # it answered "failed" without a safe categorical refusal.
+        # Track the host's launch verdict for the unavailable response below.
         relaunched_runner_id: str | None = None
         relaunched_launch_acknowledged = False
         relaunched_launch_refused = False
@@ -2158,23 +2155,14 @@ def register_events_routes(
             # runner is bound — item events can't, because that
             # would desync conversation store and harness state.
             if relaunched_runner_id:
-                # The relaunch ran but no runner became usable. Name the
-                # failed phase in the user-facing detail (the SPA surfaces
-                # it verbatim — see describeSendFailure in
-                # web/src/store/chatStore.ts) and leave an ERROR correlated
-                # by runner token + session id: every other funnel phase
-                # records this outcome at INFO or below, leaving operators
-                # nothing to find.
+                # Name the failed phase to users and log a correlated ERROR.
                 exit_report = (
                     runner_exit_reports.get(relaunched_runner_id)
                     if runner_exit_reports is not None
                     else None
                 )
-                # The report can embed host-produced text (a raw runner-log
-                # tail, or the daemon's launch-failure reason), so the API
-                # message only carries it verbatim for the host's owner
-                # (get_visible); other session viewers get the phase-level
-                # cause. The ERROR log keeps the full report for operators.
+                # Host-produced log tails are owner-visible only; other
+                # viewers receive the phase, while operators get the full log.
                 visible_report = (
                     runner_exit_reports.get_visible(relaunched_runner_id, user_id)
                     if runner_exit_reports is not None
@@ -2229,10 +2217,7 @@ def register_events_routes(
                         f"this session, but {launch_detail}"
                     )
                 else:
-                    # The host never answered the launch request: a launch
-                    # cannot be claimed, though a slow host may still be
-                    # spawning one — the connect wait above already gave it
-                    # the full grace.
+                    # No host acknowledgment: do not claim a launch happened.
                     event_name = "runner_never_connected"
                     launch_detail = (
                         "the host never confirmed the launch and no runner "

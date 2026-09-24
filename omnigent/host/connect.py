@@ -270,26 +270,13 @@ _LOG_TAIL_MAX_LINES = 15
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
-# Deadline for a launched runner's first tunnel connect. A healthy runner
-# dials within seconds (zygote fork) to ~20s (direct spawn on a loaded
-# machine); one silent past this is hung, exited pre-connect, or unable to
-# reach the server, and no other funnel phase says so at ERROR level —
-# _watch_runner fires only on process exit (and a clean pre-connect exit is
-# deliberately quiet), while the server's connect wait logs INFO before
-# failing the send generically. Kept well under the 5-minute window
-# operators use to correlate launch-time telemetry.
+# The server's 30s send wait handles user feedback; this host check also
+# covers create-time launches and stays inside the 5m triage window.
 _RUNNER_CONNECT_DEADLINE_S = 120.0
 
 
 def _connect_marker_path(log_path: Path) -> Path:
-    """Marker file the runner touches on its first tunnel connect.
-
-    Lives next to the runner's log so it shares the log dir's lifecycle
-    and is unique per launch.
-
-    :param log_path: The runner's process log file.
-    :returns: The sibling marker path, e.g. ``runner-ab12-….connected``.
-    """
+    """Return this launch's marker path next to its process log."""
     return log_path.with_suffix(".connected")
 
 
@@ -353,20 +340,9 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
 
 
 def _redact_log_tail(tail: str) -> str:
-    """Mask credential-shaped values before a log tail leaves the host.
+    """Mask credentials before runner-log excerpts reach the API or SPA.
 
-    The exit report is surfaced verbatim well beyond the host's log dir —
-    the server's ERROR record, the ``runner_unavailable`` API detail, and
-    the SPA's error banner — so a secret echoed into the runner log must
-    not reach every session viewer. Uses the shared
-    :func:`redact_log_text` (rather than bespoke patterns) so quoted
-    values, provider token shapes, JWTs, and standalone high-entropy
-    credentials are all covered; keys stay visible to keep the
-    diagnostic shape.
-
-    :param tail: Trailing runner-log lines about to be surfaced.
-    :returns: The tail with credential-shaped values replaced by
-        ``[REDACTED]``.
+    Reuse the shared redactor, including whitespace-separated credentials.
     """
     return redact_log_text(tail, include_whitespace_credentials=True)
 
@@ -1071,15 +1047,10 @@ class _RunnerHandle:
         previous runner (the server rotates the binding token per
         attempt, so the runner id alone can't identify a predecessor).
         ``None`` for frames from servers that predate ``session_id``.
-    :param connect_marker: File the runner touches on its first tunnel
-        connect (see :data:`RUNNER_CONNECT_MARKER_ENV_VAR`). Checked by
-        :meth:`HostProcess._watch_runner_connect` at the connect
-        deadline. ``None`` disables that watchdog for this handle.
-    :param stop_requested: Set when the runner is stopped or superseded
-        on purpose, so :meth:`HostProcess._watch_runner_connect` does
-        not report the resulting pre-connect exit as a launch failure.
-        (``self._runners`` membership can't discriminate: the exit
-        watcher also pops genuinely dead runners.)
+    :param connect_marker: First-connect marker watched by the host;
+        ``None`` disables the watchdog.
+    :param stop_requested: Suppress diagnostics for intentional stops
+        or superseded launches, even after the exit watcher pops them.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
@@ -2058,8 +2029,7 @@ class HostProcess:
         log_path, log_fh = open_process_log_file("runner", prefix=f"runner-{session_slug}")
         try:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
-            # The runner touches this on its first tunnel connect;
-            # _watch_runner_connect checks it at the connect deadline.
+            # The runner and host watchdog share this per-launch marker.
             env[RUNNER_CONNECT_MARKER_ENV_VAR] = str(_connect_marker_path(log_path))
 
             zygote = self._ensure_zygote_started()
@@ -2367,19 +2337,10 @@ class HostProcess:
                 handle.connect_marker.exists
             )
             if not never_connected:
-                # A clean exit (code 0) after connecting is a graceful
-                # shutdown, not a crash — the idle reaper shutting an
-                # inactive runner down, or any orderly self-exit. Reporting
-                # it as host.runner_exited would attach a scary "runner
-                # process exited" error to a session the user only has to
-                # message to reactivate, so stay silent. A non-zero exit
-                # below is a genuine crash and still reports its cause.
+                # Post-connect code 0 includes graceful idle-reaper exits.
                 _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
                 return
-            # A clean exit BEFORE ever connecting is a failed launch, not a
-            # graceful shutdown: without a report the session's send fails
-            # with a cause-free timeout. The connect watchdog owns the
-            # host-side ERROR; this report carries the cause to the server.
+            # Pre-connect code 0 is a failed launch; send its cause to the server.
             error = _runner_exit_error(handle.proc.returncode, handle.log_path)
             _logger.info(
                 "Runner %s exited cleanly (code 0) before connecting; reporting exit",
@@ -2410,38 +2371,21 @@ class HostProcess:
     async def _watch_runner_connect(
         self, runner_id: str, *, exit_watcher: asyncio.Task[None]
     ) -> None:
-        """Emit one ERROR when a launched runner never connects its tunnel.
+        """Log one correlated ERROR if a launched runner never connects.
 
-        The launch funnel is otherwise silent about this failure:
-        :meth:`_watch_runner` fires only when the runner process *exits*
-        (and a clean pre-connect exit is deliberately quiet), and the
-        server's connect wait logs INFO before failing the send with a
-        generic ``runner_unavailable``. A runner that is launched but
-        never dials — hung at boot, blocked egress, silent self-exit —
-        left the user's session stuck with zero ERROR-level records
-        correlated with the launch. This watchdog is that bounded
-        diagnostic: one check when the connect deadline expires (or as
-        soon as the runner exits, since an exited runner can never
-        connect), at most one ERROR naming the runner token and session.
-
-        :param runner_id: The runner to watch, e.g.
-            ``"runner_token_abc123..."``.
-        :param exit_watcher: This runner's :meth:`_watch_runner` task.
-            Awaited (bounded by the deadline) instead of polling the
-            process again, so the zygote's control socket sees no extra
-            traffic and this task ends promptly once the runner exits.
+        Wait for exit or the deadline without polling the zygote socket.
+        Intentional stops and superseded launches stay quiet.
         """
         handle = self._runners.get(runner_id)
         if handle is None or handle.connect_marker is None:  # pragma: no cover
             return
         await asyncio.wait({exit_watcher}, timeout=_RUNNER_CONNECT_DEADLINE_S)
         if handle.stop_requested:
-            # Stopped or superseded on purpose — nothing to report.
             return
         if await asyncio.to_thread(handle.connect_marker.exists):
             return
         if handle.stop_requested:
-            # Stopped while the marker check ran off-loop — still intent.
+            # A stop may arrive while the marker check runs off-loop.
             return
         _logger.error(
             "Runner %s for session %s never connected its tunnel within "

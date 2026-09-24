@@ -1163,23 +1163,13 @@ async def test_message_relaunch_never_connected_names_phase_and_logs_error(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A launched-but-never-connected runner fails the send with its phase named.
-
-    The host accepts the relaunch ("launched") but the runner never
-    connects its tunnel. The 503 must carry the failed phase — which
-    runner was launched and that it never connected within the grace —
-    instead of the bare "No runner bound for session", and the server
-    must record one ERROR-level line correlated with the launch (runner
-    token + session id). Before this, every phase of that funnel logged
-    INFO or below, so a stuck session left operators nothing to find.
-    Mutation check: restore the bare raise and both assertions fail.
-    """
+    """Name the failed phase in the 503 and log a correlated ERROR."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
-    # Shrink the post-launch connect wait so the POST settles fast.
+    # Bound the connect wait for this test.
     monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
 
     comm = await _connect_host(app)
@@ -1187,8 +1177,7 @@ async def test_message_relaunch_never_connected_names_phase_and_logs_error(
     session_id = session["id"]
     await _stop_host_session(client, comm, session_id)
 
-    # No runner client resolves: the message path relaunches on the host;
-    # the fake host answers "launched" and the runner then never connects.
+    # Force a host relaunch that never gains a runner connection.
     set_runner_client(None)
     caplog.set_level(logging.INFO)
     launch_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
@@ -1207,7 +1196,7 @@ async def test_message_relaunch_never_connected_names_phase_and_logs_error(
     assert msg_resp.status_code == 503, msg_resp.text
     error = msg_resp.json()["error"]
     assert error["code"] == "runner_unavailable"
-    # The detail names the failed phase, not the bare generic.
+    # Keep the phase-specific detail.
     assert "never connected to the server" in error["message"], error["message"]
     assert "runner_token_" in error["message"], error["message"]
 
@@ -1234,19 +1223,9 @@ async def _relaunch_then_report_exit(
     session_id: str,
     daemon_report: str,
 ) -> httpx.Response:
-    """Send a message that relaunches, then report the runner dead pre-connect.
+    """Relaunch, then send a pre-connect exit report over the host tunnel.
 
-    Answers the host's stat + launch round-trips with ``launched`` and
-    immediately follows with a ``host.runner_exited`` frame carrying
-    *daemon_report*, so the pending send's connect wait ends on the
-    crash report rather than the timeout.
-
-    :param client: Test HTTP client bound to the host-wired app.
-    :param comm: Connected host communicator.
-    :param session_id: Session to message, e.g. ``"conv_abc123"``.
-    :param daemon_report: Exit-report text the fake daemon sends, e.g.
-        including a log tail.
-    :returns: The settled ``POST /events`` response (expected 503).
+    The exit report should settle the pending send before its timeout.
     """
 
     async def _launch_then_report() -> None:
@@ -1276,14 +1255,7 @@ async def test_message_relaunch_host_failure_uncategorized_reports_startup_failu
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An uncategorized host launch failure is reported as a failed start.
-
-    When the host answers ``failed`` without a safe categorical refusal,
-    no runner process ever started — the 503 must say the host could not
-    start the runner (with the host's reason, visible here because no
-    owner scoping applies) instead of claiming a launch that never
-    connected.
-    """
+    """Report an uncategorized host refusal as a failed start, not launch."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -1340,12 +1312,7 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A launch the host never acknowledged is not reported as launched.
-
-    The host answers the workspace stat but never the launch request, so
-    the server cannot prove a runner process exists. The 503 must say the
-    launch was never confirmed instead of "The host launched runner…".
-    """
+    """Do not claim a launch when the host never acknowledged it."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
@@ -1414,20 +1381,13 @@ async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A pre-connect runner exit surfaces the daemon's report in the 503.
-
-    The host accepts the relaunch, then reports the runner dead before
-    it ever connects. With no owner scoping in play (single-user mode:
-    unauthenticated requester, unowned report), the 503 detail must
-    carry the daemon's actual cause — exit code and log tail — instead
-    of the generic never-connected copy.
-    """
+    """Include a visible pre-connect exit report in the 503 detail."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
-    # Generous: the crash report, not this timeout, ends the connect wait.
+    # Let the report, not the timeout, settle the send.
     monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
 
     comm = await _connect_host(app)
@@ -1456,13 +1416,9 @@ async def test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_own
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Another user's send never sees the host owner's runner log tail.
+    """Hide the host owner's log tail from another session viewer.
 
-    The exit report embeds a raw runner-log tail, which only the host
-    owner may read (the same ``get_visible`` posture as the runner
-    status endpoint). A different authenticated session viewer gets the
-    phase-level cause pointing at the host log, while the server's
-    correlated ERROR keeps the full report for operators.
+    Operators still receive the full report in the correlated ERROR.
     """
     from omnigent.runtime import set_runner_client
     from omnigent.server.host_registry import RunnerExitReports
@@ -1477,9 +1433,8 @@ async def test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_own
     session_id = session["id"]
     await _stop_host_session(client, comm, session_id)
 
-    # Identity seams: this fixture's tunnel and HTTP requests are
-    # unauthenticated, so pin the report's owner and the requester to two
-    # different users; the real get_visible scoping decides what surfaces.
+    # The fixture is unauthenticated; pin distinct identities and use the
+    # real get_visible owner check.
     real_record = RunnerExitReports.record
 
     def _record_as_host_owner(

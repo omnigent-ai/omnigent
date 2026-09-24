@@ -5569,11 +5569,8 @@ class _HostLaunchAttempt:
     :param error: Human-readable failure message from the host, e.g.
         ``"harness 'codex' is not configured on host 'laptop' — run
         `omnigent setup` ..."``; ``None`` when there was no error.
-    :param acknowledged: ``True`` only when the host answered
-        ``status="launched"``. ``False`` for refusals AND for attempts
-        whose verdict was never observed (result timeout, connection
-        lost mid-request, riding another flight's binding) — the
-        caller's failure copy must not claim a launch it cannot prove.
+    :param acknowledged: Whether the host confirmed ``status="launched"``;
+        timeout and lost-connection attempts remain unconfirmed.
     """
 
     runner_id: str

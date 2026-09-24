@@ -2889,9 +2889,7 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
     expect(state.sessionStatus).toBe("idle");
-    // A standalone error block is appended carrying the friendly, retryable
-    // copy — NOT the server's terse "No runner bound for session". The code
-    // is kept so the banner headline and Retry affordance classify it.
+    // Use friendly copy for the no-context fallback, but retain its code.
     const errorBlocks = state.blocks.filter((b) => b.type === "error");
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0]).toMatchObject({
@@ -2902,11 +2900,7 @@ describe("chatStore — send (first-send ordering)", () => {
   });
 
   it("surfaces the server's runner-unavailable cause verbatim when it names one", async () => {
-    // When the send 503s after a host launch that never connected, the
-    // server's detail names the failed phase (which runner, that it never
-    // connected within the grace). Swallowing it behind generic copy left
-    // users with a cause-free "something went wrong" for a diagnosable
-    // failure — the detail must reach the error block verbatim.
+    // Preserve the server's phase-specific detail in the error block.
     const causefulDetail =
       "The host launched runner runner_token_abc123 for this session, but it " +
       "never connected to the server within 30s — the runner process may be " +

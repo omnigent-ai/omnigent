@@ -1477,13 +1477,7 @@ async def test_watch_runner_reports_unexpected_exit(
 
 
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
-    """Credential-shaped values in the surfaced log tail are masked.
-
-    The exit report travels past the host — into the server's ERROR
-    record, the ``runner_unavailable`` API detail, and the SPA's error
-    banner — so an env dump or auth header echoed by a dying runner
-    must not leak its value to every session viewer.
-    """
+    """Redact credentials before exit reports reach the server or SPA."""
     log = tmp_path / "runner-x.log"
     log.write_text(
         "boot: starting\n"
@@ -1501,8 +1495,7 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     # Standalone provider-shaped tokens are masked even without a key label.
     assert "ghp_0123456789abcdef0123456789abcdef" not in error
     assert "OPENAI_API_KEY=[REDACTED]" in error
-    # Non-credential diagnostics stay verbatim — the report must still
-    # carry the actual cause.
+    # Keep the diagnostic cause.
     assert "tunnel rejected: bad frame" in error
     assert "code 3" in error
 
@@ -1642,14 +1635,7 @@ async def test_watch_runner_reports_clean_exit_before_connect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A clean exit that never connected IS reported with its cause.
-
-    A runner that self-exits with code 0 before ever dialing its tunnel
-    is a failed launch, not an idle-reaper shutdown: staying silent
-    would leave the session's send to fail with a cause-free timeout.
-    The exit watcher must send ``host.runner_exited`` so the server can
-    name the failed phase.
-    """
+    """Report a clean pre-connect exit as a failed launch."""
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
     host = _make_host_process()
@@ -1663,12 +1649,7 @@ async def test_watch_runner_reports_clean_exit_before_connect(
     original_popen = subprocess.Popen
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-        """Spawn a runner that lives briefly, then exits 0 pre-connect.
-
-        :param args: Command args (ignored).
-        :param kwargs: Popen kwargs from production, including log handles.
-        :returns: A live subprocess handle.
-        """
+        """Exit cleanly before touching the connect marker."""
         return original_popen(
             ["sh", "-c", "echo 'boot aborted: nothing to do' >&2; sleep 0.2; exit 0"],
             stdin=subprocess.DEVNULL,
@@ -1698,12 +1679,7 @@ async def test_watch_runner_reports_clean_exit_before_connect(
 async def _wait_for_error_record(
     caplog: pytest.LogCaptureFixture, *, timeout_s: float
 ) -> list[logging.LogRecord]:
-    """Poll caplog until an ERROR-level record appears (or the timeout).
-
-    :param caplog: The capture fixture to scan.
-    :param timeout_s: Maximum seconds to wait, e.g. ``5.0``.
-    :returns: All ERROR-level records seen (possibly empty on timeout).
-    """
+    """Poll captured logs for ERROR records until timeout."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
@@ -1718,15 +1694,7 @@ async def test_connect_watchdog_errors_when_runner_never_connects(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A launched runner that never dials its tunnel gets one correlated ERROR.
-
-    Every other funnel phase is silent about this failure: the exit
-    watcher only fires when the process exits, and the server's connect
-    wait fails the send generically. The watchdog's ERROR must name the
-    runner token AND the session id so operators can correlate it with
-    the failed launch attempt — without it, a hung runner strands the
-    user's session with zero launch-correlated ERROR telemetry.
-    """
+    """Log a runner- and session-correlated ERROR for a hung launch."""
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.05)
     host = _make_host_process()
@@ -1737,12 +1705,7 @@ async def test_connect_watchdog_errors_when_runner_never_connects(
     spawned_env: dict[str, str] = {}
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-        """Spawn a stand-in runner that stays alive but never connects.
-
-        :param args: Command args (ignored).
-        :param kwargs: Popen kwargs from production (env captured).
-        :returns: A live subprocess handle.
-        """
+        """Keep a stand-in runner alive without connecting."""
         spawned_env.update(kwargs.get("env", {}))  # type: ignore[arg-type]
         return original_popen(
             ["sleep", "60"],
@@ -1764,8 +1727,7 @@ async def test_connect_watchdog_errors_when_runner_never_connects(
         errors = await _wait_for_error_record(caplog, timeout_s=5.0)
 
     runner_id = token_bound_runner_id("tok_conn_watch")
-    # The spawn env carries the marker path the runner must touch — the
-    # host→runner half of the watchdog contract.
+    # Check the host-to-runner marker handoff.
     handle = host._runners[runner_id]
     assert handle.connect_marker is not None
     assert spawned_env.get(RUNNER_CONNECT_MARKER_ENV_VAR) == str(handle.connect_marker)
@@ -1783,18 +1745,10 @@ async def test_connect_watchdog_errors_on_silent_pre_connect_exit(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A runner that exits cleanly BEFORE connecting is reported promptly.
-
-    A zero exit is deliberately quiet in the exit watcher (a graceful
-    idle-reaper shutdown), but a runner that exits before EVER connecting
-    left the session stuck with no ERROR anywhere. The connect watchdog
-    must fire as soon as the exit watcher settles — an exited runner can
-    never connect — rather than waiting out the full deadline.
-    """
+    """Log a clean pre-connect exit without waiting for the deadline."""
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
-    # Deadline far beyond the test budget: only the early exit-settled
-    # path can produce the ERROR in time.
+    # A long deadline distinguishes exit-triggered logging from timeout.
     monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 60.0)
     host = _make_host_process()
     workspace = tmp_path / "project"
@@ -1803,12 +1757,7 @@ async def test_connect_watchdog_errors_on_silent_pre_connect_exit(
     original_popen = subprocess.Popen
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-        """Spawn a runner that lives briefly, then exits 0 pre-connect.
-
-        :param args: Command args (ignored).
-        :param kwargs: Popen kwargs from production, including log handles.
-        :returns: A live subprocess handle.
-        """
+        """Exit cleanly before touching the connect marker."""
         return original_popen(
             ["sh", "-c", "sleep 0.2; exit 0"],
             stdin=subprocess.DEVNULL,
@@ -1844,11 +1793,7 @@ async def test_connect_watchdog_silent_when_runner_connects(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A runner that touches its connect marker in time is NOT reported.
-
-    A false ERROR here would fire for every healthy launch, drowning the
-    real never-connected signal the watchdog exists to surface.
-    """
+    """Suppress the watchdog ERROR after a timely tunnel connect."""
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.15)
     host = _make_host_process()
@@ -1858,12 +1803,7 @@ async def test_connect_watchdog_silent_when_runner_connects(
     original_popen = subprocess.Popen
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-        """Spawn a long-lived stand-in runner.
-
-        :param args: Command args (ignored).
-        :param kwargs: Popen kwargs (ignored beyond stdio defaults).
-        :returns: A live subprocess handle.
-        """
+        """Keep a stand-in runner alive."""
         return original_popen(
             ["sleep", "60"],
             stdin=subprocess.DEVNULL,
@@ -1882,8 +1822,7 @@ async def test_connect_watchdog_silent_when_runner_connects(
             result = await host._handle_launch(frame)
         assert result.status == "launched", result.error
 
-        # The "runner" connects: touch the marker the way the real tunnel
-        # loop does, well inside the deadline.
+        # Mirror the real tunnel's marker touch.
         handle = host._runners[token_bound_runner_id("tok_conn_ok")]
         assert handle.connect_marker is not None
         handle.connect_marker.touch()
@@ -1900,12 +1839,7 @@ async def test_connect_watchdog_silent_on_intentional_stop(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A runner stopped before the connect deadline is NOT reported.
-
-    ``_handle_stop`` pops the handle first (same protocol the exit
-    watcher relies on); a session the user deleted right after creating
-    must not surface as a never-connected launch failure.
-    """
+    """Suppress the watchdog ERROR after an intentional stop."""
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.2)
     host = _make_host_process()
@@ -1915,12 +1849,7 @@ async def test_connect_watchdog_silent_on_intentional_stop(
     original_popen = subprocess.Popen
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-        """Spawn a long-lived stand-in runner.
-
-        :param args: Command args (ignored).
-        :param kwargs: Popen kwargs (ignored beyond stdio defaults).
-        :returns: A live subprocess handle.
-        """
+        """Keep a stand-in runner alive."""
         return original_popen(
             ["sleep", "60"],
             stdin=subprocess.DEVNULL,
