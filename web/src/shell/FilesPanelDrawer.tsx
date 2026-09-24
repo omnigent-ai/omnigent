@@ -20,6 +20,7 @@ import { FilesPanel } from "./FilesPanel";
 import type { ChangedSort } from "./FlatFileList";
 
 interface FilesPanelDrawerProps {
+  conversationId: string | undefined;
   open: boolean;
   onClose: () => void;
   /**
@@ -49,6 +50,7 @@ interface FilesPanelDrawerProps {
 }
 
 export function FilesPanelDrawer({
+  conversationId,
   open,
   onClose,
   onFileSelect,
@@ -108,6 +110,7 @@ export function FilesPanelDrawer({
           folder tree initializes from the latest inline-panel state. */}
       {open && (
         <FilesPanel
+          conversationId={conversationId}
           onFileSelect={onFileSelect}
           flatView={flatView}
           showHidden={showHidden}

@@ -1313,6 +1313,7 @@ function WorkspacePanelImpl({
         ) : (
           showFilesPanel && (
             <FilesPanel
+              conversationId={conversationId}
               frameless
               onFileSelect={openFileViewer}
               flatView={rightRailTab === "changes"}
