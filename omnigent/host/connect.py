@@ -2915,7 +2915,7 @@ class HostProcess:
         """
         from pathlib import Path
 
-        from omnigent.runtime.filesystem_registry import _find_git_root
+        from omnigent.runtime.filesystem_registry import detect_git_root
         from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
         try:
@@ -2939,10 +2939,7 @@ class HostProcess:
 
         # Re-detect the repository every time: a workspace that gains or loses
         # a .git after its first request needs a reader of the matching kind.
-        try:
-            repo_root = _find_git_root(Path(expanded))
-        except OSError:
-            repo_root = None
+        repo_root = detect_git_root(Path(expanded))
         with self._fs_readers_lock:
             cached = self._fs_readers.get(expanded)
             if cached is None or cached[0] != repo_root:

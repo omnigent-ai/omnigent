@@ -19,7 +19,7 @@ from omnigent.entities.environment_filesystem import FilesystemPathNotFound
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests.runner.helpers import NullServerClient
@@ -2277,3 +2277,51 @@ async def test_search_picks_up_a_repo_created_mid_session(
         body = resp.json()
         assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
         assert body["truncated"] is True
+
+
+def test_search_indexed_paths_never_follows_symlinks_out_of_the_root(tmp_path: Path) -> None:
+    """Index paths are stat'ed in the unsandboxed runner, so a tracked symlink
+    (or a directory swapped for one after it was indexed) must not disclose its
+    outside target's metadata — the sandboxed walk could not have read it."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-link").symlink_to(outside / "b.txt")
+    (root / "a").symlink_to(outside)
+
+    entries = search_indexed_paths(root, ["b-link", "a/b.txt"], "b")
+
+    # The link is reported as itself (no target size); the path routed through
+    # the symlinked parent is dropped entirely.
+    assert [(e.path, e.type, e.bytes) for e in entries] == [("b-link", "file", None)]
+
+
+@pytest.mark.asyncio
+async def test_search_follows_a_repository_created_inside_an_outer_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that starts inside an outer repository and later becomes its
+    own must be searched through its own index — the outer index never lists a
+    nested repository's files — so the cached registry has to be replaced when
+    the repository boundary moves."""
+    env = _git_env()
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "init"], cwd=outer, check=True, capture_output=True, env=env)
+    ws = outer / "ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws, commit=False)
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_nested/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_nested", runner_workspace=outer) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        assert resp.json()["data"] == [], resp.json()
+
+        for args in (["init"], ["add", "-A"], ["commit", "-m", "init"]):
+            subprocess.run(["git", *args], cwd=ws, check=True, capture_output=True, env=env)
+
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        assert [e["path"] for e in resp.json()["data"]] == ["zzz/target.jsonnet"], resp.json()

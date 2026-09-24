@@ -3535,8 +3535,8 @@ def create_runner_app(
 
     from omnigent.runtime.filesystem_registry import (
         FilesystemRegistry,
-        GitFilesystemRegistry,
         create_filesystem_registry,
+        detect_git_root,
     )
 
     if runner_workspace is not None:
@@ -3558,9 +3558,10 @@ def create_runner_app(
         The session registry watches the session's stored workspace (or the
         runner's), which is not necessarily the environment root the search
         walks — runner-managed sessions get a generated per-session workspace
-        no other registry covers. Non-git roots are re-detected on every call,
-        so a repository cloned into the workspace mid-session gains index
-        coverage on the next search. The registry is never started: startup
+        no other registry covers. The repository root is re-detected on every
+        call, so a repository created or removed mid-session — including one
+        nested at the workspace root inside an outer repository — is read on
+        the next search. The registry is never started: startup
         runs ``git update-index`` inside the repository, and a repository at a
         generated workspace root may be the agent's own. Search needs only
         the anchored index read.
@@ -3570,7 +3571,7 @@ def create_runner_app(
         """
         key = str(root)
         registry = _search_fs_registries.get(key)
-        if registry is None or not isinstance(registry, GitFilesystemRegistry):
+        if registry is None or registry.git_root != detect_git_root(root):
             registry = create_filesystem_registry(watch_path=root)
             _search_fs_registries[key] = registry
             while len(_search_fs_registries) > _search_registry_cache_size:
@@ -11264,10 +11265,15 @@ def create_runner_app(
             if not fs._absolute(path):
                 env_root = fs._resolve("")
                 registry = await _resolve_session_fs_registry(session_id)
-                if registry is None or registry.cwd != env_root:
+                if (
+                    registry is None
+                    or registry.cwd != env_root
+                    or registry.git_root != detect_git_root(env_root)
+                ):
                     # The session registry watches a different tree than this
-                    # walk covers, so its index would answer for the wrong
-                    # files; consult one rooted where the search actually runs.
+                    # walk covers, or a repository boundary moved since it was
+                    # built; either way its index would answer for the wrong
+                    # files. Consult one rooted where the search actually runs.
                     registry = _search_registry_for_root(env_root)
             if registry is not None:
                 indexed = await _asyncio.to_thread(

@@ -284,6 +284,22 @@ def _resolve_gitfile(git_entry: Path) -> Path | None:
     return git_dir if git_dir.is_dir() else None
 
 
+def detect_git_root(path: Path) -> Path | None:
+    """Return the root of the repository containing *path*, if any.
+
+    Callers that cache a registry compare this against the registry's
+    ``git_root`` to notice a repository created or removed since.
+
+    :param path: Directory to start discovery from.
+    :returns: The repository root, or ``None`` when there is none or its
+        metadata cannot be read.
+    """
+    try:
+        return _find_git_root(path)
+    except OSError:
+        return None
+
+
 def _is_git_repo(git_root: Path) -> bool:
     """Return True when *git_root*'s ``.git`` entry forms a working repository.
 
@@ -515,6 +531,11 @@ class FilesystemRegistry(ABC):
     def cwd(self) -> Path:
         """The workspace root directory being watched."""
         return self._cwd
+
+    @property
+    def git_root(self) -> Path | None:
+        """Root of the repository this registry reads, or ``None`` without one."""
+        return None
 
     # ── Concrete: record_change (no-op default) ────────────────────
 
@@ -887,6 +908,10 @@ class GitFilesystemRegistry(FilesystemRegistry):
         self._optimization_start_lock = threading.Lock()
         self._optimization_started = False
         self._last_changes: list[str] | None = None
+
+    @property
+    def git_root(self) -> Path:
+        return self._git_root
 
     def start(self) -> None:
         """Start optional Git performance setup without blocking the caller."""

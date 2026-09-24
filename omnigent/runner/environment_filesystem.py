@@ -195,8 +195,11 @@ def search_indexed_paths(
     — case-insensitive substring on the path, include/exclude globs — and
     reports a matching path's ancestor directories as directory entries, so
     a query like ``"src"`` still surfaces the ``src`` folder. Only the
-    entries returned are stat'ed; a path that no longer exists (indexed but
-    deleted from the working tree) is dropped.
+    entries returned are stat'ed, without following symlinks: a path that no
+    longer exists (indexed but deleted from the working tree) is dropped, a
+    link reports its own attributes rather than its target's, and a path
+    routed through a symlinked parent is dropped, so nothing outside *root*
+    is ever described.
 
     :param root: Absolute directory the paths are relative to.
     :param paths: File paths relative to *root*, e.g. from ``git ls-files``.
@@ -238,23 +241,31 @@ def search_indexed_paths(
                 candidates[ancestor] = True
             cut = p.rfind("/", 0, cut)
 
+    # Metadata is read outside the sandbox, so symlinks are never followed.
+    real_root = os.path.realpath(root)
+    root_prefix = real_root.rstrip(os.sep) + os.sep
     entries: list[FilesystemEntry] = []
     for rel in sorted(candidates):
         if not kept(rel):
             continue
+        full = root / rel
         try:
-            st = (root / rel).stat()
+            st = full.lstat()
         except OSError:
             continue
+        parent = os.path.realpath(full.parent)
+        if parent != real_root and not parent.startswith(root_prefix):
+            continue
+        is_link = stat.S_ISLNK(st.st_mode)
         # A submodule is one index entry but a directory on disk.
-        is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)
+        is_dir = candidates[rel] or (not is_link and stat.S_ISDIR(st.st_mode))
         entries.append(
             FilesystemEntry(
                 id=rel,
                 name=rel.rsplit("/", 1)[-1],
                 path=rel,
                 type="directory" if is_dir else "file",
-                bytes=None if is_dir else st.st_size,
+                bytes=None if is_dir or is_link else st.st_size,
                 modified_at=int(st.st_mtime),
             )
         )
