@@ -133,6 +133,9 @@ _MAX_SEEN_BTW_KEYS = 64
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
+# A child-history POST carries up to 100 items and can outlast the live lane's
+# budget; that lane runs off the latency-sensitive path, so it gets more room.
+_SUBAGENT_POST_TIMEOUT_S = 30.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
 _SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS = 12
@@ -1215,13 +1218,14 @@ async def forward_claude_transcript_to_session(
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    subagent_timeout = httpx.Timeout(_SUBAGENT_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with (
         _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s),
         open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
         open_server_client(
-            base_url, headers=headers, auth=auth, timeout=timeout
+            base_url, headers=headers, auth=auth, timeout=subagent_timeout
         ) as subagent_client,
     ):
         while True:
