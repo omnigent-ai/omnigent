@@ -6,7 +6,7 @@ import base64
 
 from playwright.sync_api import Page, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
+from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item, model_option
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
@@ -116,6 +116,82 @@ def test_contract_can_hold_and_release_session_skills(
 
     assert response_info.value.json() == {
         "skills": [{"name": "review", "description": "Review the current change."}]
+    }
+
+
+def test_contract_set_items_replaces_history_with_copies(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.set_items([message_item("old", "user", "Old", response_id="old-response")])
+    replacement = message_item("replacement", "user", "New", response_id="new-response")
+    chat.set_items([replacement])
+    replacement["role"] = "assistant"
+    page.goto(chat.url)
+
+    history = page.evaluate(
+        """async sessionId => {
+            const response = await fetch(`/v1/sessions/${sessionId}/items`);
+            return response.json();
+        }""",
+        chat.session_id,
+    )
+
+    assert [item["id"] for item in history["data"]] == ["replacement"]
+    assert history["data"][0]["role"] == "user"
+
+
+def test_contract_updates_session_and_health_before_and_after_navigation(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.update_session(
+        created_at=123,
+        sandbox_status={"stage": "provisioning"},
+        permission_level="view",
+        runner_id="runner-starting",
+        host_id=None,
+        workspace=None,
+    )
+    chat.set_health(runner_online=False, host_online=False)
+    page.goto(chat.url)
+
+    before = page.evaluate(
+        """async sessionId => ({
+            session: await fetch(`/v1/sessions/${sessionId}`).then(response => response.json()),
+            health: await fetch("/health").then(response => response.json()),
+        })""",
+        chat.session_id,
+    )
+    assert before["session"]["created_at"] == 123
+    assert before["session"]["sandbox_status"] == {"stage": "provisioning"}
+    assert before["session"]["permission_level"] == "view"
+    assert before["session"]["runner_id"] == "runner-starting"
+    assert before["session"]["host_id"] is None
+    assert before["session"]["workspace"] is None
+    assert before["health"]["sessions"][chat.session_id] == {
+        "runner_online": False,
+        "host_online": False,
+    }
+
+    chat.update_session(sandbox_status={"stage": "failed", "error": "launch failed"})
+    chat.set_health(runner_online=True)
+    after = page.evaluate(
+        """async sessionId => ({
+            session: await fetch(`/v1/sessions/${sessionId}`).then(response => response.json()),
+            health: await fetch("/health").then(response => response.json()),
+        })""",
+        chat.session_id,
+    )
+    assert after["session"]["sandbox_status"] == {
+        "stage": "failed",
+        "error": "launch failed",
+    }
+    assert after["health"]["sessions"][chat.session_id] == {
+        "runner_online": True,
+        "host_online": False,
     }
 
 
