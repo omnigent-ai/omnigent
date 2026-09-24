@@ -30,7 +30,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TextIO
+from typing import TYPE_CHECKING, Literal, Protocol, TextIO
 
 if TYPE_CHECKING:
     from omnigent_client import OmnigentClient
@@ -911,6 +911,7 @@ async def _list_sessions_with_retry(
     agent_id: str | None = None,
     agent_name: str | None = None,
     order: str = "desc",
+    kind: Literal["default", "sub_agent", "any"] | None = None,
 ) -> list[SessionListItem]:
     """List the caller's own sessions with bounded retries on 429.
 
@@ -926,6 +927,7 @@ async def _list_sessions_with_retry(
     :param agent_id: Scope to this agent; ``None`` lists across agents.
     :param agent_name: Scope to sessions whose bound agent has this name.
     :param order: Sort order forwarded to ``list``.
+    :param kind: Session kind filter; ``None`` keeps the server default.
     :returns: The session rows.
     :raises omnigent_client.RateLimitedError: When every attempt was
         rate-limited.
@@ -940,11 +942,17 @@ async def _list_sessions_with_retry(
                 agent_name=agent_name,
                 order=order,
                 visibility="mine",
+                kind=kind,
             )
         except RateLimitedError:
             await asyncio.sleep(delay_s)
     return await client.sessions.list(
-        limit=limit, agent_id=agent_id, agent_name=agent_name, order=order, visibility="mine"
+        limit=limit,
+        agent_id=agent_id,
+        agent_name=agent_name,
+        order=order,
+        visibility="mine",
+        kind=kind,
     )
 
 
@@ -993,7 +1001,8 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     Wrapper invocations (claude-native today) upload a fresh agent
     bundle per session, so ``agents.get_by_name`` returns no canonical
     record — agent-id filtering can't be used. List the caller's own
-    sessions and filter by the wrapper label client-side.
+    sessions, including native subagents, and filter by the wrapper label
+    client-side.
 
     Renders workspace metadata so the user can see which cwd each
     session was launched from -- claude --resume requires cwd parity
@@ -1003,24 +1012,35 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     (``~/.omnigent/claude-native/``); sessions created on a
     different machine will show as having no recorded cwd.
 
-    :param host_id: When set, keep only rows bound to this host (the
+    :param host_id: When set, keep only rows running on this host (the
         invoking machine). Native transcript and workspace state are
         host-local, so a wrapper session bound to another host is a
-        dead end in this picker — resuming it cannot work here. Rows
-        without a recorded ``host_id`` (never bound, or an older
+        dead end in this picker — resuming it cannot work here. A native
+        child inherits its parent's host when the parent row is listed. Rows
+        without a recorded host (never bound, or an older
         server that predates the field) are kept: dropping them would
         hide resumable local sessions. ``None`` disables host
         filtering (explicit ``--resume <id>`` stays unrestricted for
         diagnostics / migration workflows — it never routes through
         this picker).
     """
-    all_convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
+    all_convos = await _list_sessions_with_retry(
+        client, limit=200, agent_id=None, order="desc", kind="any"
+    )
+    # A native child carries no host of its own: it runs on its parent's runner,
+    # so its resumable host is the parent's (when the parent is in this page).
+    hosts_by_id = {c.id: getattr(c, "host_id", None) for c in all_convos}
+
+    def _host_of(c: SessionListItem) -> str | None:
+        parent_id = getattr(c, "parent_session_id", None)
+        return getattr(c, "host_id", None) or (hosts_by_id.get(parent_id) if parent_id else None)
+
     convos = [
         c
         for c in all_convos
         if getattr(c, "labels", None)
         and c.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == wrapper_value
-        and (host_id is None or getattr(c, "host_id", None) is None or c.host_id == host_id)
+        and (host_id is None or _host_of(c) in (None, host_id))
     ]
     previews = await _collect_previews_async(client, convos)
     return pick_conversation(
