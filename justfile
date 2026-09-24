@@ -167,11 +167,22 @@ electron-run *flags:
     pkill -x Omnigent 2>/dev/null || true
     sleep 1
     if [ "$reset_state" = 1 ]; then
-        # Uninstall the CLI (best-effort: the shared uninstaller exits non-zero
-        # when no CLI is present — fine, we still want a fresh state)…
+        # Uninstall the CLI. The shared uninstaller exits non-zero both when no
+        # install exists (fine) and on a genuine failure (e.g. removal blocked) —
+        # and its exit codes don't distinguish those. So verify the OUTCOME
+        # instead: after running it, if the binary is still resolvable the
+        # uninstall really failed — abort BEFORE deleting data or launching, so a
+        # half-reset can't masquerade as a clean fresh-user state.
         sh scripts/uninstall_oss.sh cli --yes || true
-        # …then wipe the desktop app data directly, so it works even with no CLI
-        # installed (the uninstaller's global guard skips desktop-data in that case).
+        hash -r 2>/dev/null || true
+        if command -v omnigent >/dev/null 2>&1; then
+            echo "CLI uninstall did not remove 'omnigent' (still on PATH). Aborting" >&2
+            echo "before touching app data. Remove it manually, then retry." >&2
+            exit 1
+        fi
+        # Wipe the desktop app data directly so a fresh-user reset works even with
+        # no CLI installed (the uninstaller's global guard skips desktop-data in
+        # that case). Intentional destroy — see the confirmation above.
         rm -rf "$HOME/Library/Application Support/Omnigent" \
                "$HOME/Library/Caches/Omnigent" \
                "$HOME/Library/Logs/Omnigent"
