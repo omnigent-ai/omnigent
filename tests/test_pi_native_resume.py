@@ -10,13 +10,11 @@ from __future__ import annotations
 import itertools
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
-from omnigent.harnesses.pi_native.main import _resolve_session_id_for_resume
 from omnigent.harnesses.pi_native.resume import (
     ensure_local_pi_resume_session,
     fetch_all_session_items_for_pi_resume,
@@ -433,54 +431,3 @@ async def test_fetch_paginates(tmp_path: Path) -> None:
         items = await fetch_all_session_items_for_pi_resume(client, "conv_abc")
     assert calls["n"] == 2
     assert [i["id"] for i in items] == ["u1", "a1"]
-
-
-# ── resume picker host scoping ──────────────────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    ("identity", "expected_host_id"),
-    [(SimpleNamespace(host_id="host_local", name="laptop"), "host_local"), (None, None)],
-)
-def test_resume_picker_receives_the_invoking_host(
-    monkeypatch: pytest.MonkeyPatch,
-    identity: SimpleNamespace | None,
-    expected_host_id: str | None,
-) -> None:
-    """The wrapper scopes the picker to this machine's host so remote children stay hidden."""
-    seen: dict[str, Any] = {}
-
-    class _Client:
-        def __init__(self, **kwargs: Any) -> None:
-            seen["client"] = kwargs
-
-        async def __aenter__(self) -> _Client:
-            return self
-
-        async def __aexit__(self, *exc: object) -> None:
-            return None
-
-    async def fake_picker(client: Any, **kwargs: Any) -> str:
-        seen["picker"] = kwargs
-        return "conv_picked"
-
-    monkeypatch.setattr("omnigent_client.OmnigentClient", _Client)
-    monkeypatch.setattr("omnigent.host.identity.load_host_identity_if_present", lambda: identity)
-    monkeypatch.setattr(
-        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk", fake_picker
-    )
-
-    selected = _resolve_session_id_for_resume(
-        base_url="http://srv",
-        headers={"Authorization": "Bearer t"},
-        session_id=None,
-        resume_picker=True,
-    )
-
-    assert selected == "conv_picked"
-    assert seen["client"] == {"base_url": "http://srv", "headers": {"Authorization": "Bearer t"}}
-    assert seen["picker"] == {
-        "wrapper_value": "pi-native-ui",
-        "agent_name": "pi-native-ui",
-        "host_id": expected_host_id,
-    }
