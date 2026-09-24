@@ -126,6 +126,7 @@ class _ChatSseStream:
         self._lock = threading.Lock()
         self._pending: list[bytes] = []
         self._ever_connected = False
+        self._connection_generation = 0
         self._connected = threading.Event()
         stream = self
 
@@ -146,6 +147,7 @@ class _ChatSseStream:
                     stream._pending.clear()
                     stream._ever_connected = True
                     stream._clients.add(messages)
+                    stream._connection_generation += 1
                     stream._connected.set()
                 try:
                     self.wfile.write(b": browser chat stream ready\n\n")
@@ -160,10 +162,13 @@ class _ChatSseStream:
                         self.wfile.write(event)
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
+                    # Browser reloads close the old SSE socket while the handler is writing.
                     pass
                 finally:
                     with stream._lock:
                         stream._clients.discard(messages)
+                        if not stream._clients:
+                            stream._connected.clear()
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
@@ -180,6 +185,11 @@ class _ChatSseStream:
     @property
     def connected(self) -> bool:
         return self._connected.is_set()
+
+    @property
+    def connection_generation(self) -> int:
+        with self._lock:
+            return self._connection_generation
 
     def emit(self, event: Mapping[str, Any]) -> None:
         """Queue pre-connect events once, then broadcast only to live clients."""
@@ -234,6 +244,7 @@ class ChatSessionContract:
         default_factory=lambda: {"queued": True, "item_id": "browser-queued-item"}
     )
     reject_uploads: bool = True
+    _stream_generation: int = 0
 
     @property
     def url(self) -> str:
@@ -247,11 +258,15 @@ class ChatSessionContract:
     def wait_for_stream(self, timeout: float = 10) -> None:
         """Wait until the SPA has opened its live event stream."""
         deadline = time.monotonic() + timeout
-        while not self.stream.connected:
+        while (
+            not self.stream.connected
+            or self.stream.connection_generation <= self._stream_generation
+        ):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for the chat event stream")
             self.page.wait_for_timeout(min(10, max(1, remaining * 1000)))
+        self._stream_generation = self.stream.connection_generation
 
     def seed_transcript(self, turns: int) -> None:
         """Replace history with ``turns`` user/assistant markdown pairs."""
@@ -441,6 +456,44 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
                 body=json.dumps({"detail": "Session patch must be a JSON object"}),
             )
             return
+        allowed_fields = {
+            "approval_mode",
+            "archived",
+            "collaboration_mode",
+            "cost_control_mode_override",
+            "external_session_id",
+            "labels",
+            "model_override",
+            "permission_mode",
+            "project_id",
+            "reasoning_effort",
+            "runner_id",
+            "share_workspace_files",
+            "silent",
+            "subagent_routing_override",
+            "terminal_launch_args",
+            "title",
+        }
+        unknown_fields = body.keys() - allowed_fields
+        if unknown_fields:
+            route.fulfill(
+                status=422,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "detail": [
+                            {
+                                "type": "extra_forbidden",
+                                "loc": ["body", key],
+                                "msg": "Extra inputs are not permitted",
+                                "input": body[key],
+                            }
+                            for key in sorted(unknown_fields)
+                        ]
+                    }
+                ),
+            )
+            return
         handle.session_patches.append(body)
         handle._session_updates.update(
             {key: value for key, value in body.items() if key != "silent"}
@@ -517,16 +570,20 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             filename, size = _multipart_file_metadata(request)
             upload_id = f"browser-upload-{len(handle.upload_requests)}"
             route.fulfill(
-                status=200,
+                status=201,
                 content_type="application/json",
                 body=json.dumps(
                     {
                         "id": upload_id,
+                        "object": "session.resource",
+                        "type": "file",
+                        "session_id": handle.session_id,
                         "name": filename,
                         "metadata": {
                             "filename": filename,
                             "bytes": size,
                             "created_at": 1_704_067_200,
+                            "source_metadata": None,
                         },
                     }
                 ),

@@ -88,6 +88,21 @@ def test_contract_drives_history_catalog_and_live_status(
     expect(working).to_be_hidden(timeout=10_000)
 
 
+def test_wait_for_stream_waits_for_reconnect_after_reload(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    page.goto(chat.url)
+    chat.wait_for_stream()
+
+    page.reload()
+    chat.wait_for_stream()
+    chat.emit_busy("reloaded-turn")
+
+    expect(page.get_by_test_id("working-indicator")).to_be_visible(timeout=10_000)
+
+
 def test_contract_can_hold_and_release_session_skills(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -222,6 +237,41 @@ def test_contract_records_and_persists_session_patches(
     assert sessions["current"]["model_override"] == "opus"
 
 
+def test_contract_rejects_unknown_session_patch_fields(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    page.goto(chat.url)
+
+    result = page.evaluate(
+        """async sessionId => {
+            const response = await fetch(`/v1/sessions/${sessionId}`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: "ignored", unexpected: true }),
+            });
+            return { status: response.status, body: await response.json() };
+        }""",
+        chat.session_id,
+    )
+
+    assert result == {
+        "status": 422,
+        "body": {
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "unexpected"],
+                    "msg": "Extra inputs are not permitted",
+                    "input": True,
+                }
+            ]
+        },
+    }
+    assert chat.session_patches == []
+
+
 def test_contract_records_binary_upload_and_returns_file_resource(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -246,11 +296,15 @@ def test_contract_records_binary_upload_and_returns_file_resource(
 
     assert resource == {
         "id": "browser-upload-1",
+        "object": "session.resource",
+        "type": "file",
+        "session_id": chat.session_id,
         "name": "pixel.png",
         "metadata": {
             "filename": "pixel.png",
             "bytes": len(_PNG),
             "created_at": 1_704_067_200,
+            "source_metadata": None,
         },
     }
     assert len(chat.upload_requests) == 1
