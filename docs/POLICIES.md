@@ -290,13 +290,13 @@ Scans user messages and LLM prompts for PII patterns (SSN, credit card, email, p
 
 #### `cost_budget`
 
-Gates a session on cumulative LLM spend, at the **request** phase (before the LLM turn, so text-only turns are budgeted too) and the **tool-call** phase. ASKs the first time spend crosses each soft warning threshold. At the hard limit it acts as a **downgrade gate**, not a hard stop: it DENYs (the whole turn on `request`, or each tool call on `tool_call`) only while the session is on an expensive model -- telling the user to switch to a cheaper one with `/model` -- and allows them again once the session has switched.
+Gates a session on cumulative LLM spend, at the **request** phase (before the LLM turn, so text-only turns are budgeted too) and the **tool-call** phase. ASKs the first time spend crosses each soft warning threshold. By default, the hard limit is a **hard stop**: it DENYs the whole turn on `request`, or each tool call on `tool_call`, for all models once the limit is reached. Omitting `expensive_models` or passing `[]` selects this behavior. A non-empty `expensive_models` list instead makes it a **downgrade gate**: it blocks matching models and allows the session to continue once the user switches to a non-matching model with `/model`.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_cost_usd` | number | (required) | Hard spend limit in USD. Once reached, the turn / tool calls are blocked while the session is on an expensive model. |
+| `max_cost_usd` | number | (required) | Hard spend limit in USD. Once reached, the turn / tool calls are blocked for all models by default, or only matching models when `expensive_models` is a non-empty list. |
 | `ask_thresholds_usd` | number[] | `null` | Soft warning checkpoints that ASK the first time spend crosses each (each must be < `max_cost_usd`) |
-| `expensive_models` | string[] | Fable + Opus + GPT-5 (excl. `-mini`/`-nano`) | Case-insensitive substring tokens for the model tiers blocked once over budget (e.g. `"opus"` matches any Opus deployment). The default's broad `gpt-5` token matches the whole GPT-5 family except the cheap `-mini`/`-nano` variants; an explicit list is matched literally with no exclusions. `[]` disables the hard limit, leaving only the soft thresholds. |
+| `expensive_models` | string[] | omitted (all models blocked) | Omitted or `[]`: block all models once the hard limit is reached. A non-empty list blocks models matching its case-insensitive substring tokens (e.g. `"opus"` matches any Opus deployment), with no exclusions: `"gpt-5"` also matches `gpt-5-mini` and `gpt-5-nano`. |
 
 ```yaml
 budget:
@@ -310,13 +310,13 @@ budget:
 
 #### `user_daily_cost_budget`
 
-Same ASK / downgrade-gate behavior as `cost_budget`, but the budget is the **session owner's cumulative spend across all their sessions for the current UTC day**. The soft-threshold approval is remembered per user+day, so an approved checkpoint won't re-prompt that user again today -- even from a different session. Useful as a server-wide per-user daily cap.
+Same soft warnings and hard-stop / downgrade-gate behavior as `cost_budget`, but the budget is the **session owner's cumulative spend across all their sessions for the current UTC day**. The hard limit blocks all models by default; a non-empty `expensive_models` list restricts it to matching models. The soft-threshold approval is remembered per user+day, so an approved checkpoint won't re-prompt that user again today -- even from a different session. Useful as a server-wide per-user daily cap.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_cost_usd` | number | (required) | Hard daily limit in USD. Once the owner's spend for the day reaches it, the turn / tool calls are blocked while on an expensive model. |
+| `max_cost_usd` | number | (required) | Hard daily limit in USD. Once the owner's spend for the day reaches it, the turn / tool calls are blocked for all models by default, or only matching models when `expensive_models` is a non-empty list. |
 | `ask_thresholds_usd` | number[] | `null` | Soft daily warning checkpoints that ASK the first time the owner's daily spend crosses each (each must be < `max_cost_usd`) |
-| `expensive_models` | string[] | Fable + Opus + GPT-5 (excl. `-mini`/`-nano`) | Case-insensitive substring tokens for the model tiers blocked once over the daily budget. An explicit list is matched literally with no exclusions. `[]` disables the hard limit, leaving only the soft thresholds. |
+| `expensive_models` | string[] | omitted (all models blocked) | Omitted or `[]`: block all models once the daily hard limit is reached. A non-empty list blocks models matching its case-insensitive substring tokens, with no exclusions, just as in `cost_budget`. |
 
 ```yaml
 # server_config.yaml -- a per-user daily cap applied to every session
