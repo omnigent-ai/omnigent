@@ -779,6 +779,9 @@ export async function describeCreateError(res: Response): Promise<string> {
   return `Couldn't create the session (HTTP ${res.status}).`;
 }
 
+// Explicit foreground keeps warning commands readable on the muted chip.
+const HARNESS_WARNING_CODE_CLASS = "rounded bg-muted px-1 py-0.5 font-mono text-foreground";
+
 /**
  * The pre-feature "run omni setup" guidance (ReactNode), shown under the
  * composer when the UI-driven setup feature is OFF.
@@ -800,16 +803,16 @@ function harnessWarningMessage(
   if (reason === "needs-auth" && isCodex) {
     return (
       <>
-        {agentName} needs Codex authentication on {hostName} — run <code>codex login</code> on that
-        machine.
+        {agentName} needs Codex authentication on {hostName} — run{" "}
+        <code className={HARNESS_WARNING_CODE_CLASS}>codex login</code> on that machine.
       </>
     );
   }
   if (reason === "needs-auth" && !!harness && isNativeCursorHarness(harness)) {
     return (
       <>
-        {agentName} needs Cursor login on {hostName} — run <code>cursor-agent login</code> on that
-        machine.
+        {agentName} needs Cursor login on {hostName} — run{" "}
+        <code className={HARNESS_WARNING_CODE_CLASS}>cursor-agent login</code> on that machine.
       </>
     );
   }
@@ -819,14 +822,16 @@ function harnessWarningMessage(
   if (reason === "version-too-low") {
     return (
       <>
-        {agentName} has an outdated CLI on {hostName} — run <code>omni setup</code>, or upgrade the
-        CLI directly on that machine.
+        {agentName} has an outdated CLI on {hostName} — run{" "}
+        <code className={HARNESS_WARNING_CODE_CLASS}>omni setup</code>, or upgrade the CLI directly
+        on that machine.
       </>
     );
   }
   return (
     <>
-      {agentName} isn&apos;t configured on {hostName} — run <code>omni setup</code> on that machine.
+      {agentName} isn&apos;t configured on {hostName} — run{" "}
+      <code className={HARNESS_WARNING_CODE_CLASS}>omni setup</code> on that machine.
     </>
   );
 }

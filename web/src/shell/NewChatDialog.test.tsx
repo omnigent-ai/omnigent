@@ -6106,6 +6106,17 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-harness-setup")).toBeNull();
   });
 
+  it("renders the inline command as a chip, not bare amber text", () => {
+    renderLanding();
+    breakSelectedHarness("a2", "codex-native", "needs-auth");
+
+    const warning = screen.getByTestId("new-chat-landing-harness-warning");
+    const code = warning.querySelector("code");
+    expect(code?.textContent).toBe("codex login");
+    // Explicit foreground avoids inheriting the low-contrast warning color.
+    expect(code?.className).toBe("rounded bg-muted px-1 py-0.5 font-mono text-foreground");
+  });
+
   it("suppresses the conflict banner once a git branch is named", async () => {
     useDirectorySessionsMock.mockReturnValue({
       data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo" })],
