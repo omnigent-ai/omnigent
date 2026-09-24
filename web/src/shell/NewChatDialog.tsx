@@ -95,6 +95,7 @@ import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/ide
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
+import { isAbsoluteComposerPath } from "@/lib/composerContext";
 import { randomUUID } from "@/lib/randomUUID";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
@@ -548,7 +549,8 @@ export function ConnectHostInstructions({
  * @returns true when ``workspace.trim()`` starts with ``/``.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  const trimmed = workspace.trim();
+  return isAbsoluteComposerPath(trimmed);
 }
 
 /**
@@ -566,9 +568,11 @@ export function isValidWorkspace(workspace: string): boolean {
 export function normalizeWorkspacePath(path: string): string | null {
   const trimmed = path.trim();
   if (trimmed === "") return null;
-  const stripped = trimmed.replace(/\/+$/, "");
+  const stripped = trimmed.replace(/[\\/]+$/, "");
   // All-slashes input (e.g. "///") collapses to the root.
-  return stripped === "" ? "/" : stripped;
+  if (stripped === "") return "/";
+  if (/^[A-Za-z]:$/.test(stripped)) return `${stripped}\\`;
+  return stripped;
 }
 
 /**
