@@ -21,6 +21,10 @@ export interface ActiveResponse {
   /** Free-form error message (HTTP error, parse error, abort). Empty
    *  for non-failure states. */
   error: string | null;
+  /** Failure code paired with `error`, e.g. ``executor_error``. Keys the
+   *  client's failure-description lookup; `null` when the failure carried
+   *  none. */
+  errorCode?: string | null;
   /** Epoch ms when a terminal edge finalized the turn. Bounds the
    *  stray-idle revive: deltas shortly after a finalize contradict it
    *  (revive); a scheduled wake's deltas arrive minutes later and
