@@ -182,12 +182,7 @@ def _build_error_with_usage() -> Executor:
 
 def _build_notice() -> Executor:
     """
-    MockExecutor scripted with a :class:`TurnNotice` + clean completion.
-
-    Mirrors a native executor answering an intercepted command with
-    guidance: the adapter must surface the notice as an info-level error
-    item and let the turn end with ``response.completed`` — never
-    ``response.failed``.
+    MockExecutor scripted with a :class:`TurnNotice` and a clean completion.
 
     :returns: A configured :class:`MockExecutor` instance.
     """

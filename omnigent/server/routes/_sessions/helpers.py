@@ -7535,10 +7535,10 @@ def _extract_persistent_item_from_sse(
     Returns a ``NewConversationItem`` for:
 
     - ``response.output_item.done`` events carrying an assistant
-      message, function_call, function_call_output, or error item
-      (e.g. a harness notice with ``level: "info"`` — turn failures
-      arrive as ``response.failed``/``response.error`` instead and
-      persist via ``_error_item_from_sse``).
+      message, function_call, function_call_output, or an info-level
+      error item (a harness notice). Turn failures arrive as
+      ``response.failed``/``response.error`` and persist through
+      ``_error_item_from_sse`` instead.
     - ``compaction`` events carrying a conversation summary from
       the runner's compaction system.
 
@@ -7578,6 +7578,10 @@ def _extract_persistent_item_from_sse(
         return None
     item_type = item.get("type")
     if item_type not in ("message", "function_call", "function_call_output", "error"):
+        return None
+    # Only notices ride as durable output items; a destructive error item
+    # would double up with the deduplicated ``response.failed`` banner.
+    if item_type == "error" and item.get("level") != "info":
         return None
     # Skip transient observed function_call events (status
     # ``in_progress`` / ``action_required``).  Only ``completed``

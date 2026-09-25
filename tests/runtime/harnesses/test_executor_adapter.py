@@ -508,14 +508,10 @@ async def test_turn_notice_emits_info_error_item_and_completes(
     use_notice: None,
     manager: HarnessProcessManager,
 ) -> None:
-    """TurnNotice → info-level error item + response.completed.
+    """TurnNotice → one info-level error item, then response.completed.
 
-    A user-remediable answer (e.g. an intercepted ``/login`` on a native
-    harness) must reach the user as a neutral notice WITHOUT the turn
-    being classified failed. Pre-fix, the only channel for such guidance
-    was ExecutorError — which the adapter re-raises, so the scaffold ends
-    the turn with ``response.failed`` and the runner counts it in the
-    failed-turn KPI.
+    Guidance such as an intercepted ``/login`` must reach the user without
+    the turn being classified as failed (the ExecutorError path does that).
     """
     conv_id = "conv_notice"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)

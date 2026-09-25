@@ -79,10 +79,7 @@ def test_function_call_output_is_persisted() -> None:
 def test_info_level_error_item_is_persisted() -> None:
     """A harness notice (``error`` item with ``level: "info"``) is durable.
 
-    The adapter emits a TurnNotice as an info-level error item so guidance
-    like "run omni setup on the host" reaches the user without failing the
-    turn. Dropping it here would make the notice vanish on reload while the
-    session shows a completed turn with no visible answer.
+    Dropping it would leave a completed turn with no visible answer after reload.
     """
     result = _extract_persistent_item_from_sse(
         _output_item_done(
@@ -101,6 +98,22 @@ def test_info_level_error_item_is_persisted() -> None:
     assert result.type == "error"
     assert getattr(result.data, "level", None) == "info"
     assert getattr(result.data, "code", None) == "claude_native_auth_command"
+
+
+def test_destructive_error_item_is_not_persisted() -> None:
+    """Only notices persist as output items; failures ride ``response.failed``."""
+    result = _extract_persistent_item_from_sse(
+        _output_item_done(
+            {
+                "id": "err_3",
+                "type": "error",
+                "source": "harness",
+                "code": "native_turn_error",
+                "message": "the turn blew up",
+            }
+        )
+    )
+    assert result is None
 
 
 def test_malformed_error_item_is_dropped() -> None:
