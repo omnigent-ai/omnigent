@@ -7807,14 +7807,18 @@ async def _codex_bridge_torn_down_for_live_pane(
     boot that has not yet written ``state.json`` still has its launch-seeded
     ``bridge.json``, and a recorded startup failure keeps
     ``startup_error.json``, so neither is flagged. The session-id-keyed dir is
-    checked first (a stat-only fast path); a rotated bridge-id label is
-    resolved only when that dir is already torn down, so a healthy turn never
-    pays the label lookup.
+    checked first (a stat-only fast path); a rotated bridge-id label (a ``/new``
+    fork) is resolved only when that dir is already torn down, and a rotated
+    session is deliberately not flagged: the relaunch this heal triggers seeds
+    the session-id dir, so it cannot restore the executor's rotated dir and
+    would only kill a live pane. A healthy non-forked turn never pays the label
+    lookup.
 
     :param server_client: Omnigent server client used to resolve a rotated
         bridge-id label. ``None`` checks only the session-id-keyed dir.
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
-    :returns: ``True`` when the executor's bridge dir was torn down.
+    :returns: ``True`` only for a non-forked session whose session-id bridge
+        dir was torn down (the case the session-id relaunch can restore).
     """
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -7831,9 +7835,14 @@ async def _codex_bridge_torn_down_for_live_pane(
         session_id=session_id,
     )
     bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
-    if not bridge_id or bridge_id == session_id:
-        return True
-    return bridge_torn_down(bridge_dir_for_bridge_id(bridge_id))
+    if bridge_id and bridge_id != session_id:
+        # A rotated label (a /new fork) points the executor at
+        # bridge_dir_for_bridge_id(bridge_id), but the relaunch this heal
+        # triggers seeds the session-id dir (prepare_bridge_dir(session_id)).
+        # Relaunching cannot restore the rotated dir and would only close a
+        # live pane, so leave a forked session to its existing path.
+        return False
+    return True
 
 
 async def _claude_native_bridge_id_for_session(

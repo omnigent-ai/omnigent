@@ -275,25 +275,36 @@ class _LabelServerClient:
 
 
 @pytest.mark.asyncio
-async def test_torn_down_check_resolves_rotated_bridge_id_label(
+async def test_torn_down_check_does_not_flag_rotated_bridge_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A rotated bridge id whose dir is intact is not flagged as torn down."""
+    """A rotated bridge id (a ``/new`` fork) is never flagged for the heal.
+
+    The heal's relaunch seeds the session-id dir (``_auto_create_codex_terminal``
+    -> ``prepare_bridge_dir(session_id)``), so it cannot restore a forked
+    session's rotated executor dir. Firing it would close a live pane without
+    fixing delivery, so the detector leaves a rotated session unflagged whether
+    or not its rotated dir is torn down; forked recovery needs a rotated-dir-aware
+    relaunch that this heal does not provide.
+    """
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
     conv_id = "b3c4d5e6f708192a3b4c5d6e7f8091a2"
     client = _LabelServerClient({CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: "rotated-bridge"})
 
-    assert await _codex_bridge_torn_down_for_live_pane(
+    # No dir under either key: the pre-fix detector flagged this and relaunched
+    # into the wrong (session-id) dir, killing the live pane for nothing.
+    assert not await _codex_bridge_torn_down_for_live_pane(
         server_client=client,  # type: ignore[arg-type]
         session_id=conv_id,
-    ), "no dir under either key means torn down"
+    ), "a rotated session must not trigger the session-id relaunch heal"
 
+    # An intact rotated dir is likewise left to its normal delivery path.
     write_mcp_bridge_config(prepare_bridge_dir("rotated-bridge"))
     assert not await _codex_bridge_torn_down_for_live_pane(
         server_client=client,  # type: ignore[arg-type]
         session_id=conv_id,
-    ), "the rotated label's intact dir must count as the executor's bridge"
+    ), "an intact rotated dir is not a teardown the session-id heal handles"
 
 
 @pytest.mark.asyncio

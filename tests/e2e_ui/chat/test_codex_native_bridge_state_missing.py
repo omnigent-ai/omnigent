@@ -40,7 +40,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent.harnesses.codex_native.bridge import bridge_root
+from omnigent.harnesses.codex_native.bridge import bridge_root, bridge_torn_down
 from tests.e2e_ui.conftest import (
     configure_mock_llm,
     reset_mock_llm,
@@ -105,11 +105,17 @@ def _wait_for_state_file(state_file: Path, timeout_s: float) -> None:
 
 
 def _tear_down_bridge_dir(bridge_dir: Path, timeout_s: float = 10.0) -> None:
-    """Remove *bridge_dir* even while the live TUI is still writing into it.
+    """Remove the runner-written bridge files even while the TUI writes into the dir.
+
+    Success is the production teardown signature (``bridge_torn_down``): none of
+    ``state.json`` / ``startup_error.json`` / ``bridge.json`` remain. The live
+    CLI may resurrect the dir with ``codex-home`` content (no bridge files),
+    which the predicate tolerates, so this does not require full dir absence.
 
     :param bridge_dir: The session's Codex bridge directory.
     :param timeout_s: Max seconds to keep retrying the removal.
-    :raises AssertionError: If the dir cannot be removed within *timeout_s*.
+    :raises AssertionError: If a runner-written bridge file is still present
+        after *timeout_s* (the live TUI rewrote it faster than removal).
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -121,11 +127,16 @@ def _tear_down_bridge_dir(bridge_dir: Path, timeout_s: float = 10.0) -> None:
             time.sleep(0.25)
             continue
         time.sleep(0.5)
-        if not bridge_dir.exists():
+        if bridge_torn_down(bridge_dir):
             return
-    recreated = [str(p.relative_to(bridge_dir)) for p in bridge_dir.rglob("*")][:20]
+    remaining = [
+        name
+        for name in ("state.json", "startup_error.json", "bridge.json")
+        if (bridge_dir / name).is_file()
+    ]
     raise AssertionError(
-        f"could not remove the bridge dir at {bridge_dir}; recreated contents: {recreated!r}"
+        f"bridge files were rewritten faster than they could be removed at "
+        f"{bridge_dir}; still present: {remaining!r}"
     )
 
 
@@ -195,7 +206,7 @@ def test_codex_native_turn_delivers_after_bridge_dir_teardown(
     # dir concurrently (exactly the race the production teardown tolerates),
     # so retry until the removal wins.
     _tear_down_bridge_dir(bridge_dir)
-    assert not bridge_dir.exists()
+    assert bridge_torn_down(bridge_dir)
 
     # Deliver a web turn through the composer. Turn delivery must detect the
     # torn-down bridge, relaunch Codex, and inject into the fresh thread.
