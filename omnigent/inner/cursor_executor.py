@@ -47,7 +47,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypedDict
@@ -121,6 +121,11 @@ class _CursorAgent(Protocol):
 _DEFAULT_CURSOR_MODEL = "auto-smart"
 _LEGACY_AUTO_MODEL = "auto"
 
+
+class UnresolvableCursorModelError(ValueError):
+    """A requested model id cannot be resolved to a Cursor model id."""
+
+
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
 # instead of blocking the SDK's daemon callback thread forever.
@@ -156,6 +161,59 @@ def _resolve_model(model: str | None) -> str:
     if model == _LEGACY_AUTO_MODEL:
         return _DEFAULT_CURSOR_MODEL
     return model
+
+
+async def _resolve_model_against_catalog(
+    client: object, requested: str, api_key: str | None
+) -> str:
+    """Resolve *requested* against the account's live model catalog."""
+    if requested == _DEFAULT_CURSOR_MODEL:
+        return requested
+    list_models = getattr(client, "list_models", None)
+    if not callable(list_models):
+        logger.warning(
+            "CursorExecutor: SDK client exposes no list_models(); dispatching %r unverified.",
+            requested,
+        )
+        return requested
+    try:
+        listing = list_models(api_key=api_key)
+        raw = await listing if isinstance(listing, Awaitable) else listing
+        catalog: list[object] = list(raw) if isinstance(raw, Iterable) else []
+    except Exception:  # noqa: BLE001 — any listing failure degrades to backend-side validation
+        logger.warning(
+            "CursorExecutor: model listing failed; dispatching %r unverified.",
+            requested,
+            exc_info=True,
+        )
+        return requested
+    requested_cf = requested.casefold()
+    ids = [mid for entry in catalog if (mid := str(getattr(entry, "id", "") or ""))]
+    for mid in ids:
+        if mid.casefold() == requested_cf:
+            return mid
+    label_matches = sorted(
+        {
+            mid
+            for entry in catalog
+            if (mid := str(getattr(entry, "id", "") or ""))
+            and (name_cf := str(getattr(entry, "display_name", "") or "").casefold())
+            and (name_cf == requested_cf or name_cf.startswith(requested_cf + " "))
+        }
+    )
+    if len(label_matches) == 1:
+        logger.warning(
+            "CursorExecutor: resolved display label %r to model id %r.",
+            requested,
+            label_matches[0],
+        )
+        return label_matches[0]
+    ambiguous = f" (ambiguous label: matches {', '.join(label_matches)})" if label_matches else ""
+    raise UnresolvableCursorModelError(
+        f"{requested!r} is not a model id this Cursor account serves{ambiguous}. "
+        f"Available models: {', '.join(sorted(ids))}. Pick a model from the "
+        "model picker (or `cursor-agent models`)."
+    )
 
 
 def _first_of(data: Mapping[str, object], *keys: str, default: int = 0) -> int:
@@ -523,6 +581,7 @@ class _CursorSessionState:
     client: object | None = None  # cursor_sdk.AsyncClient
     agent: _CursorAgent | None = None  # cursor_sdk.AsyncAgent
     system_prompt: str | None = None
+    requested_model: str | None = None
     model: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
@@ -790,6 +849,7 @@ class CursorExecutor(Executor):
         async with _bridge_spawn_in_cwd(cwd):
             client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
+            model = await _resolve_model_against_catalog(client, model, self._api_key)
             local_kwargs: _JsonObject = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
@@ -816,6 +876,7 @@ class CursorExecutor(Executor):
             raise
         state.client = client
         state.agent = agent
+        state.model = model
 
     async def run_turn(
         self,
@@ -825,32 +886,39 @@ class CursorExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         session_key = self._session_key(messages)
-        model = _resolve_model((config.model if config else None) or self._model_override)
+        requested_model = _resolve_model(
+            (config.model if config else None) or self._model_override
+        )
+        model = requested_model
         tools_fp = _tools_fingerprint(tools)
         state = self._session_states.setdefault(session_key, _CursorSessionState())
 
-        # System prompt, model, and tool set are all fixed at agent creation, so
-        # a change to any of them means a fresh agent (otherwise a changed tool
-        # set would leave the initial custom_tools stale for the conversation).
-        if state.agent is not None and (
-            state.system_prompt != system_prompt
-            or state.model != model
-            or state.tools_fingerprint != tools_fp
-        ):
-            await self._close_state(state)
-            state = _CursorSessionState()
-            self._session_states[session_key] = state
-        is_first_turn = not state.has_sent_prompt
-        state.system_prompt = system_prompt
-        state.model = model
-        state.tools_fingerprint = tools_fp
-
         try:
+            if state.agent is not None and model not in (state.requested_model, state.model):
+                model = await _resolve_model_against_catalog(state.client, model, self._api_key)
+            if state.agent is not None and (
+                state.system_prompt != system_prompt
+                or model not in (state.requested_model, state.model)
+                or state.tools_fingerprint != tools_fp
+            ):
+                await self._close_state(state)
+                state = _CursorSessionState()
+                self._session_states[session_key] = state
+            is_first_turn = not state.has_sent_prompt
+            state.system_prompt = system_prompt
+            state.tools_fingerprint = tools_fp
             await self._ensure_session(state, model, tools)
+            state.requested_model = requested_model
+        except UnresolvableCursorModelError as exc:
+            await self.close_session(session_key)
+            yield ExecutorError(message=str(exc))
+            return
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
             await self.close_session(session_key)
             yield ExecutorError(message=f"Failed to start cursor-sdk agent: {exc}")
             return
+
+        model = state.model or model
 
         prompt = _build_cursor_prompt(
             messages, is_first_turn=is_first_turn, system_prompt=system_prompt

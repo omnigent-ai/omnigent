@@ -58,7 +58,10 @@ vi.mock("./MarkdownEditorToolbar", () => ({ ToolbarPlugin: () => null }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 vi.mock("./useMarkdownEditorSync", () => ({ useMarkdownEditorSync: vi.fn() }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import * as permissions from "@/hooks/usePermissions";
 import * as syncHook from "./useMarkdownEditorSync";
@@ -217,11 +220,12 @@ describe("MarkdownRichTextViewer dirty banners", () => {
     expect(screen.queryByText(/Unsaved changes/)).toBeNull();
   });
 
-  it("shows the offline banner when dirty and the runner is offline", () => {
-    // saveDisabled = runnerOnline === false: autosave can't run, so the
-    // banner explains edits will flush on reconnect rather than "Saving…".
+  it("shows the offline banner when dirty and the workspace is unreachable", () => {
+    // Runner down with no host to serve the workspace: autosave can't run, so
+    // the banner explains edits will flush on reconnect rather than "Saving…".
     setupEditHooks({ isDirty: true, hasExternalUpdate: false });
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
+    vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(null);
     renderViewer("content");
     expect(screen.getByText(/Runner offline/)).toBeDefined();
     expect(screen.queryByText(/Saving…/)).toBeNull();

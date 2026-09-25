@@ -763,3 +763,210 @@ def test_resolve_harness_returns_none_on_exception() -> None:
 
     with patch("omnigent.runtime._globals._agent_store", mock_store):
         assert _resolve_harness(conv) is None
+
+
+# ── anon_user_id ─────────────────────────────────────────────────────────────
+
+
+def test_anon_user_id_none_user() -> None:
+    """No authenticated user → no anonymous id."""
+    from omnigent.telemetry.anon import anon_user_id
+
+    assert anon_user_id(None, "inst-abc") is None
+
+
+def test_anon_user_id_salted_by_installation() -> None:
+    """The same user hashes differently per installation."""
+    import hashlib
+
+    from omnigent.telemetry.anon import anon_user_id
+
+    got = anon_user_id("alice@example.com", "inst-abc")
+    assert got == hashlib.sha256(b"inst-abc:alice@example.com").hexdigest()[:16]
+    assert got != anon_user_id("alice@example.com", "inst-xyz")
+
+
+def test_anon_user_id_without_installation_id() -> None:
+    """Missing installation id → the user id is hashed unsalted."""
+    import hashlib
+
+    from omnigent.telemetry.anon import anon_user_id
+
+    assert (
+        anon_user_id("alice@example.com", None)
+        == hashlib.sha256(b"alice@example.com").hexdigest()[:16]
+    )
+
+
+def test_current_anon_user_id_hashes_the_request_user() -> None:
+    """The request-scoped user bound by the server middleware is hashed."""
+    from omnigent.debug_logging import current_user_id_scope
+    from omnigent.telemetry.anon import anon_user_id, current_anon_user_id
+
+    with (
+        patch(
+            "omnigent.telemetry.installation_id.get_installation_id",
+            return_value="inst-abc",
+        ),
+        current_user_id_scope("alice@example.com"),
+    ):
+        got = current_anon_user_id()
+    assert got == anon_user_id("alice@example.com", "inst-abc")
+
+
+def test_current_anon_user_id_none_without_a_request_user() -> None:
+    """No bound request user (single-user mode, or outside a request) → ``None``."""
+    from omnigent.debug_logging import USER_ID_ENV_VAR, current_user_id_scope
+    from omnigent.telemetry.anon import current_anon_user_id
+
+    with (
+        patch.dict("os.environ", {USER_ID_ENV_VAR: ""}),
+        current_user_id_scope(None),
+    ):
+        assert current_anon_user_id() is None
+
+
+# ── TurnEndEvent / NativeSessionUsageEvent ───────────────────────────────────
+
+
+def test_build_record_turn_end_event_promotes_anon_user_id() -> None:
+    """``anon_user_id`` / ``host_installation_id`` are top-level on ``TurnEndEvent``."""
+    import omnigent.telemetry.client as _mod
+    from omnigent.telemetry.events import TurnEndEvent
+
+    event = TurnEndEvent(
+        installation_id="inst-abc",
+        session_id="sess_abc123",
+        anon_user_id="deadbeef01234567",
+        host_installation_id="host-inst-abc",
+        status="completed",
+        latency_ms=1234.5,
+        model="claude-sonnet-4-6",
+        input_tokens=100,
+        output_tokens=20,
+        cost_usd=0.5,
+    )
+    data = _mod._build_record(event)["data"]
+
+    assert data["event_name"] == "TurnEndEvent"
+    assert data["anon_user_id"] == "deadbeef01234567"
+    assert data["host_installation_id"] == "host-inst-abc"
+    params = json.loads(data["params"]) if data["params"] else {}
+    assert params["status"] == "completed"
+    assert "anon_user_id" not in params
+    assert "host_installation_id" not in params
+
+
+def test_build_record_native_session_usage_event_promotes_anon_user_id() -> None:
+    """``anon_user_id`` / ``host_installation_id`` are top-level on the usage event."""
+    import omnigent.telemetry.client as _mod
+    from omnigent.telemetry.events import NativeSessionUsageEvent
+
+    event = NativeSessionUsageEvent(
+        installation_id="inst-abc",
+        session_id="sess_abc123",
+        anon_user_id="deadbeef01234567",
+        host_installation_id="host-inst-abc",
+        input_tokens=1000,
+        output_tokens=200,
+        cost_usd=1.25,
+        model="claude-opus-4-5",
+    )
+    data = _mod._build_record(event)["data"]
+
+    assert data["event_name"] == "NativeSessionUsageEvent"
+    assert data["anon_user_id"] == "deadbeef01234567"
+    assert data["host_installation_id"] == "host-inst-abc"
+    params = json.loads(data["params"]) if data["params"] else {}
+    assert params["cost_usd"] == 1.25
+    assert "anon_user_id" not in params
+    assert "host_installation_id" not in params
+
+
+# ── telemetry_request_headers ────────────────────────────────────────────────
+
+
+def test_telemetry_request_headers_carries_this_machines_installation_id() -> None:
+    """A client stamps its installation ID so the server needs no lookup."""
+    from omnigent.telemetry.request_headers import (
+        INSTALLATION_ID_HEADER,
+        telemetry_request_headers,
+    )
+
+    with (
+        patch("omnigent.telemetry.client.is_disabled", return_value=False),
+        patch(
+            "omnigent.telemetry.installation_id.get_installation_id",
+            return_value="inst-machine-1",
+        ),
+    ):
+        assert telemetry_request_headers() == {INSTALLATION_ID_HEADER: "inst-machine-1"}
+
+
+def test_telemetry_request_headers_empty_when_telemetry_is_disabled() -> None:
+    """An opted-out client sends no installation ID at all."""
+    from omnigent.telemetry.request_headers import telemetry_request_headers
+
+    with (
+        patch("omnigent.telemetry.client.is_disabled", return_value=True),
+        patch(
+            "omnigent.telemetry.installation_id.get_installation_id",
+            return_value="inst-machine-1",
+        ),
+    ):
+        assert telemetry_request_headers() == {}
+
+
+def test_telemetry_request_headers_empty_without_an_installation_id() -> None:
+    """No installation ID (unwritable data dir) means no header, not an empty one."""
+    from omnigent.telemetry.request_headers import telemetry_request_headers
+
+    with (
+        patch("omnigent.telemetry.client.is_disabled", return_value=False),
+        patch("omnigent.telemetry.installation_id.get_installation_id", return_value=None),
+    ):
+        assert telemetry_request_headers() == {}
+
+
+def test_telemetry_request_headers_survives_a_failing_lookup() -> None:
+    """The header builder must never raise into the request path."""
+    from omnigent.telemetry.request_headers import telemetry_request_headers
+
+    with patch("omnigent.telemetry.client.is_disabled", side_effect=RuntimeError("boom")):
+        assert telemetry_request_headers() == {}
+
+
+def test_server_request_headers_fold_in_the_installation_id() -> None:
+    """Every request opened through the shared builder carries the header."""
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.telemetry.request_headers import INSTALLATION_ID_HEADER
+
+    with (
+        patch("omnigent.telemetry.client.is_disabled", return_value=False),
+        patch(
+            "omnigent.telemetry.installation_id.get_installation_id",
+            return_value="inst-machine-1",
+        ),
+    ):
+        headers = databricks_request_headers("http://127.0.0.1:8000")
+
+    assert headers[INSTALLATION_ID_HEADER] == "inst-machine-1"
+
+
+def test_parse_installation_id_header_accepts_a_uuid() -> None:
+    """A well-formed client-sent ID is taken as-is."""
+    from omnigent.telemetry.request_headers import parse_installation_id_header
+
+    value = str(uuid.uuid4())
+    assert parse_installation_id_header(f" {value} ") == value
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, "", "not-a-uuid", "x" * 5000, "1234"],
+)
+def test_parse_installation_id_header_rejects_junk(raw: str | None) -> None:
+    """The header is attacker-controlled, so only a UUID reaches telemetry."""
+    from omnigent.telemetry.request_headers import parse_installation_id_header
+
+    assert parse_installation_id_header(raw) is None

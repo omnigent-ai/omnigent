@@ -124,6 +124,100 @@ class _ReturnsTextClient:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "openai-agents-sdk"])
+async def test_downscaled_images_preserve_compaction_boundaries(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
+    from omnigent.runtime import workflow
+    from omnigent.runtime.compaction import _CompactionState
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import ExecutorSpec
+
+    stored = StoredFile(
+        id="file_image",
+        created_at=1000,
+        filename="photo.png",
+        bytes=3,
+        content_type="image/png",
+        source_metadata={"width": 6000, "height": 4000},
+    )
+    monkeypatch.setattr(
+        workflow, "get_file_store", lambda: SimpleNamespace(get=lambda file_id: stored)
+    )
+    monkeypatch.setattr(
+        workflow, "get_artifact_store", lambda: SimpleNamespace(get=lambda file_id: b"png")
+    )
+    older = _user_msg("older", "older image")
+    older.data.content.extend(
+        [
+            {"type": "input_image", "file_id": stored.id},
+            {"type": "input_image", "file_id": stored.id},
+        ]
+    )
+    history = [
+        older,
+        _assistant_msg("reply1"),
+        _user_msg("middle", "middle message"),
+        _assistant_msg("reply2"),
+        _user_msg("recent", "recent message"),
+        _assistant_msg("reply3"),
+    ]
+    config = LLMConfig(model="test-model")
+    _, messages, _ = workflow._prepare_messages(
+        AgentSpec(
+            spec_version=1,
+            name="test",
+            skills_filter="none",
+            executor=ExecutorSpec(config={"harness": harness}),
+        ),
+        config,
+        history,
+        None,
+        [],
+        _CompactionState(context_window=None, last_summary=None, config=None, model=config.model),
+        {},
+    )
+    assert len(messages) == len(history)
+    assert len(older.data.content) == 3
+
+    async def create(**kwargs: Any) -> Response:
+        blocks = [
+            block
+            for message in kwargs["input"]
+            if isinstance(message.get("content"), list)
+            for block in message["content"]
+        ]
+        assert all(block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE for block in blocks)
+        texts = [block.get("text", "") for block in blocks]
+        assert "older image" in texts
+        assert "middle message" in texts
+        assert "recent message" not in texts
+        assert sum("6000×4000" in text for text in texts) == 2
+        return Response(
+            output=[MessageOutput(content=[OutputText(text="summary")])], model="test-model"
+        )
+
+    result = await compact(
+        messages,
+        history,
+        config=CompactionConfig(recent_window=2),
+        context_window=10000,
+        system_token_budget=0,
+        model=config.model,
+        task_id=f"resize-{harness}",
+        llm_client=SimpleNamespace(responses=SimpleNamespace(create=create)),
+        force=True,
+        fail_on_summary_error=True,
+    )
+    assert result.summary_metadata is not None
+    assert result.summary_metadata.last_item_id == "middle"
+    assert result.messages[2:] == messages[3:]
+
+
 def _make_conv_item(
     item_id: str,
     item_type: str,
@@ -522,7 +616,7 @@ def test_resolver_parameterized_image_is_cleared_before_token_counting() -> None
             assert file_id == stored.id
             return payload
 
-    resolved = _resolve_file_id_block(
+    resolved, _ = _resolve_file_id_block(
         {"type": "input_image", "file_id": stored.id, "filename": stored.filename},
         _FileStore(),  # type: ignore[arg-type]
         _ArtifactStore(),  # type: ignore[arg-type]

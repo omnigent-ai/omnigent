@@ -44,6 +44,11 @@ def test_linkify_leaves_headings_alone() -> None:
     assert mod.linkify_pr_refs("# v0.3.0", "o/o") == "# v0.3.0"
 
 
+def test_linkify_preserves_linked_prs_and_author_credits() -> None:
+    body = "Fix ([#123](https://github.com/o/o/pull/123), [@alice](https://github.com/alice))"
+    assert mod.linkify_pr_refs(body, "o/o") == body
+
+
 def test_release_body_to_mdx_structure() -> None:
     body = "### Major new features\n\n* Seven harnesses (#1132, #330)\n"
     page = mod.release_body_to_mdx("v0.3.0", "2026-06-27", body, "omnigent-ai/omnigent")

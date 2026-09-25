@@ -26,6 +26,10 @@ Backend-specific emit assertions live in the per-backend modules
 
 from __future__ import annotations
 
+import json
+import os
+import shlex
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
@@ -35,11 +39,71 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.sandbox import create_exec_launcher, resolve_sandbox
 from tests.inner.sandbox.conftest import run_async
 
 # ---------------------------------------------------------------------------
 # Filesystem isolation
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("launch_path", ["helper", "launcher"])
+def test_sandbox_uses_private_desktop_runtime(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_path: str,
+) -> None:
+    desktop = tmp_path / "desktop"
+    desktop.mkdir(mode=0o700)
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={desktop}/bus")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(desktop))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(workspace),
+        sandbox=active_sandbox_spec_factory(
+            env_passthrough=["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]
+        ),
+    )
+    probe = """
+import json, os, socket, stat
+from pathlib import Path
+runtime = Path(os.environ['XDG_RUNTIME_DIR'])
+with socket.socket(socket.AF_UNIX) as sock:
+    sock.bind(str(runtime / 'probe.sock'))
+print(json.dumps({
+    'runtime': str(runtime),
+    'mode': stat.S_IMODE(runtime.stat().st_mode),
+    'bus': os.environ.get('DBUS_SESSION_BUS_ADDRESS'),
+}))
+"""
+    if launch_path == "helper":
+        helper = create_os_environment(spec)
+        try:
+            result = run_async(helper.shell(shlex.join([sys.executable, "-c", probe])))
+        finally:
+            helper.close()
+        assert result["exit_code"] == 0, result
+        output = str(result["stdout"])
+    else:
+        launcher = create_exec_launcher(sys.executable, resolve_sandbox(spec, workspace))
+        try:
+            completed = subprocess.run(
+                [launcher, "-c", probe], cwd=workspace, capture_output=True, text=True, timeout=30
+            )
+        finally:
+            Path(launcher).unlink(missing_ok=True)
+        assert completed.returncode == 0, completed.stderr
+        output = completed.stdout
+    observed = json.loads(output)
+    assert observed["bus"] is None
+    assert observed["runtime"] != str(desktop)
+    assert observed["mode"] == 0o700
+    assert os.environ["XDG_RUNTIME_DIR"] == str(desktop)
+    assert not (desktop / "probe.sock").exists()
 
 
 def test_sandbox_blocks_shell_write_outside_cwd(

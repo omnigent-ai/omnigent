@@ -28,10 +28,11 @@ import hmac
 import secrets
 from typing import cast
 
-from sqlalchemy import and_, delete, or_, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import SqlDeviceGrant, current_workspace_id
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
 from omnigent.db.utils import (
@@ -74,6 +75,7 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         expires_at=row.expires_at,
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
+        account_generation=row.account_generation,
     )
 
 
@@ -186,7 +188,9 @@ class DeviceGrantStore:
         user_code = secrets.token_urlsafe(16)
 
         def write(session: Session) -> DeviceGrant:
+            generation = require_active_account(session, user_id)
             row = SqlDeviceGrant(
+                account_generation=generation,
                 id=grant_id,
                 device_code_hash=device_code_hash,
                 user_code=user_code,
@@ -209,6 +213,33 @@ class DeviceGrantStore:
             "insert_redeemed_device_grant",
             write,
         )
+
+    def authorize_access(self, grant_id: str) -> DeviceGrant | None:
+        """Admit an access-token renewal under the same lock as deletion."""
+
+        def write(session: Session) -> DeviceGrant | None:
+            snapshot = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            if snapshot is None or snapshot.user_id is None:
+                return None
+            require_active_account(
+                session, snapshot.user_id, generation=snapshot.account_generation
+            )
+            # A locking read avoids a stale MySQL repeatable-read snapshot after
+            # waiting for deletion's account lock.
+            row = session.execute(
+                select(SqlDeviceGrant)
+                .where(
+                    SqlDeviceGrant.workspace_id == current_workspace_id(),
+                    SqlDeviceGrant.id == grant_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalar_one_or_none()
+            if row is None or row.status != encode_device_grant_status("redeemed"):
+                return None
+            return _to_device_grant(row)
+
+        return run_write_transaction(self._session_immediate, "authorize_grant_access", write)
 
     def get_by_user_code(self, user_code: str) -> DeviceGrant | None:
         """Look up a grant by its short verification code.
@@ -277,6 +308,7 @@ class DeviceGrantStore:
         """
 
         def write(session: Session) -> DeviceGrant | None:
+            generation = require_active_account(session, user_id)
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -292,6 +324,7 @@ class DeviceGrantStore:
                     .values(
                         status=encode_device_grant_status("approved"),
                         user_id=user_id,
+                        account_generation=generation,
                         approved_at=now_epoch_seconds,
                     )
                 ),
