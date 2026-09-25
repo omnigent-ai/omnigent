@@ -33,6 +33,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 # Stubbed host the composer auto-selects (the tunneled runner registers no
 # host). Keyed identically in the recent-workspaces localStorage seed.
 _HOST_ID = "host_e2e"
@@ -99,6 +101,30 @@ def _hosts_body() -> str:
     )
 
 
+def _hosts_body_omitting_goose() -> str:
+    """Stub body for ``GET /v1/hosts`` where the host OMITS the goose key.
+
+    A version-skewed host (a build predating a harness) reports the harnesses it
+    knows but leaves newer ones out of its ``configured_harnesses`` map entirely —
+    the shape behind the reported jcode bug. ``goose-native`` is absent (not
+    ``False``), so this exercises the missing-key path: the picker must still treat
+    it as unconfigured, not fail open and show it.
+    """
+    return json.dumps(
+        {
+            "hosts": [
+                {
+                    "host_id": _HOST_ID,
+                    "name": _HOST_NAME,
+                    "owner": "e2e",
+                    "status": "online",
+                    "configured_harnesses": {"claude-native": True},
+                }
+            ]
+        }
+    )
+
+
 def _agents_body() -> str:
     """Stub body for ``GET /v1/agents``: the Claude and Goose native agents."""
     return json.dumps(
@@ -125,14 +151,17 @@ def _agents_body() -> str:
     )
 
 
-async def _register_routes(page) -> None:
+async def _register_routes(page, hosts_body=_hosts_body) -> None:
     """Register the host/agent stubs and neutralize agent discovery.
 
     :param page: The Playwright page to install routes on.
+    :param hosts_body: Factory for the ``GET /v1/hosts`` body — defaults to the
+        host that reports ``goose-native`` explicitly ``False``; pass
+        :func:`_hosts_body_omitting_goose` for the missing-key (version-skew) case.
     """
 
     async def handle_hosts(route: Route) -> None:
-        await route.fulfill(status=200, content_type="application/json", body=_hosts_body())
+        await route.fulfill(status=200, content_type="application/json", body=hosts_body())
 
     async def handle_agents(route: Route) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_agents_body())
@@ -146,8 +175,11 @@ async def _register_routes(page) -> None:
         )
 
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
 
 
 async def _open_picker(page) -> None:
@@ -156,7 +188,7 @@ async def _open_picker(page) -> None:
 
 
 def test_hide_unconfigured_harnesses_filters_the_picker(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Off shows every harness; flipping the setting hides host-unconfigured ones.
 
@@ -165,8 +197,7 @@ def test_hide_unconfigured_harnesses_filters_the_picker(
     2. **toggle on** — flipping the real Settings → Appearance Switch persists
        the preference; the picker now drops the Goose row while keeping Claude.
     """
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive(base_url))
 
 
@@ -228,6 +259,56 @@ async def _drive(base_url: str) -> None:
             ).to_be_visible(timeout=30_000)
             # count()==0 (not "not visible"): the row is conditionally rendered,
             # never just hidden.
+            await expect(
+                page.get_by_test_id(f"new-chat-landing-agent-{_GOOSE_AGENT_ID}")
+            ).to_have_count(0)
+        finally:
+            await browser.close()
+
+
+def test_hide_unconfigured_hides_a_harness_missing_from_the_host_map(
+    live_server: str,
+) -> None:
+    """A harness the host omits from a non-empty map is hidden under the toggle.
+
+    Regression for the reported jcode bug: a version-skewed host reports the
+    harnesses it knows (Claude) but leaves a newer one (Goose) out of its
+    ``configured_harnesses`` map. Before the fix the picker failed open on the
+    missing key and showed Goose despite "hide unconfigured"; now the missing key
+    reads as unconfigured, so Goose is hidden while Claude stays.
+    """
+    base_url = live_server
+    _run_in_fresh_loop(_drive_missing_key(base_url))
+
+
+async def _drive_missing_key(base_url: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            # Host OMITS the goose key entirely (version-skew shape).
+            await _register_routes(page, hosts_body=_hosts_body_omitting_goose)
+            # Seed the recent workspace AND pre-enable "hide unconfigured" so the
+            # picker mounts already filtering — the toggle-flip UI itself is covered
+            # by the sibling test; here we assert the missing-key filter behavior.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );
+                window.localStorage.setItem("{_TOGGLE_KEY}", "true");"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_picker(page)
+            # Claude (reported available) stays; Goose (key absent) is filtered out,
+            # not merely folded into "More" — count()==0 everywhere.
+            await expect(
+                page.get_by_test_id(f"new-chat-landing-agent-{_CLAUDE_AGENT_ID}")
+            ).to_be_visible(timeout=30_000)
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_GOOSE_AGENT_ID}")
             ).to_have_count(0)

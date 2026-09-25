@@ -131,6 +131,8 @@ async def run() -> None:
         server_url=settings.server_url,
         auth_manager=auth_manager,
         enrollment_url=enrollment_url,
+        default_agent_id=settings.default_agent_id,
+        default_host_type=settings.default_host_type,
     )
     service = SlackOmnigentService(
         store=store,

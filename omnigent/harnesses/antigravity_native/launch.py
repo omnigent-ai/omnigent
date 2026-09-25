@@ -38,6 +38,7 @@ Key design points:
 from __future__ import annotations
 
 import logging
+import secrets
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -199,8 +200,12 @@ def build_agy_launch(
     permission_mode: str | None = None,
     headless: bool = False,
     extra_args: tuple[str, ...] = (),
+    log_dir: Path | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Build the argv and environment overrides for an agy launch.
+
+    Each launch receives a fresh CSRF token for its local RPC server unless
+    the caller supplies one in ``extra_args``.
 
     Two launch modes are supported:
 
@@ -248,6 +253,7 @@ def build_agy_launch(
         answer. See :func:`should_skip_permissions`.
     :param extra_args: Additional raw CLI args appended after all generated
         flags, e.g. ``("--print-timeout", "30")``.
+    :param log_dir: Private directory for this launch's RPC discovery log.
     :returns: A ``(argv, env_overrides)`` tuple where *argv* is the full
         command list starting with the agy binary path and *env_overrides*
         is a dict of env variables to layer on top of the process
@@ -256,6 +262,10 @@ def build_agy_launch(
         or empty (agy needs a real id to resume).
     """
     argv: list[str] = [agy_binary_path()]
+    if not any(arg == "--csrf_token" or arg.startswith("--csrf_token=") for arg in extra_args):
+        argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
+    if log_dir is not None:
+        argv.append(f"--log-file={log_dir / f'agy-{secrets.token_hex(16)}.log'}")
     if resume:
         if not conversation_id:
             raise ValueError("Resuming an agy conversation requires a conversation id.")
