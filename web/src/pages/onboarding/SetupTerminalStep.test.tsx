@@ -69,6 +69,11 @@ describe("SetupTerminalStep", () => {
         await vi.advanceTimersByTimeAsync(1);
       });
       expect(onInstallCli).toHaveBeenCalledOnce();
+      // The log stream is subscribed before install starts, so no early output
+      // is lost during the beat.
+      expect(onInstallLog.mock.invocationCallOrder[0]).toBeLessThan(
+        onInstallCli.mock.invocationCallOrder[0],
+      );
     } finally {
       vi.useRealTimers();
     }
