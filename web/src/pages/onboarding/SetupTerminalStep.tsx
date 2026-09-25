@@ -8,9 +8,14 @@
 // No stream available (older shell / browser preview) → a single phase line.
 
 import { useEffect, useRef, useState } from "react";
+import { RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 type Phase = "installing" | "running" | "ready" | "failed";
+
+// Empty-terminal beat before the first install commands stream in, so the
+// install step doesn't flash straight from empty into output.
+const WARMUP_MS = 600;
 
 export function SetupTerminalStep({
   onInstallCli,
@@ -71,8 +76,10 @@ export function SetupTerminalStep({
   // effect and launch a SECOND install. The sequence runs once per attempt.
   const onInstallCliRef = useRef(onInstallCli);
   const onRunRef = useRef(onRun);
+  const onInstallLogRef = useRef(onInstallLog);
   onInstallCliRef.current = onInstallCli;
   onRunRef.current = onRun;
+  onInstallLogRef.current = onInstallLog;
 
   // Install (if needed) → run, once per attempt (retry bumps `attempt`).
   useEffect(() => {
@@ -83,6 +90,14 @@ export function SetupTerminalStep({
       const install = onInstallCliRef.current;
       if (install) {
         setPhase("installing");
+        // Hold the empty loader + terminal for a beat before the first install
+        // commands stream in — only when there's a stream to show it against.
+        if (onInstallLogRef.current) {
+          await new Promise((resolve) => {
+            setTimeout(resolve, WARMUP_MS);
+          });
+          if (canceled || !alive.current) return;
+        }
         const res = await install();
         if (canceled || !alive.current) return;
         if (!res.ok) {
@@ -173,6 +188,7 @@ export function SetupTerminalStep({
             Back
           </Button>
           <Button className="flex-1" onClick={() => setAttempt((n) => n + 1)}>
+            <RotateCw className="size-4" aria-hidden />
             Retry
           </Button>
         </div>

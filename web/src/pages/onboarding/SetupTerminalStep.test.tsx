@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SetupTerminalStep } from "./SetupTerminalStep";
 
@@ -42,6 +42,23 @@ describe("SetupTerminalStep", () => {
 
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
     expect(calls).toEqual(["install", "run"]);
+  });
+
+  it("holds the empty terminal for a beat before streaming install output", async () => {
+    // With a log stream to show, the install (and its output) is deferred so the
+    // empty loader/terminal show first — install isn't called synchronously.
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onInstallLog = vi.fn(() => () => {});
+    render(
+      <SetupTerminalStep
+        onInstallCli={onInstallCli}
+        onInstallLog={onInstallLog}
+        onRun={vi.fn().mockResolvedValue({ ok: true })}
+        onBack={vi.fn()}
+      />,
+    );
+    expect(onInstallCli).not.toHaveBeenCalled();
+    await waitFor(() => expect(onInstallCli).toHaveBeenCalledOnce(), { timeout: 2000 });
   });
 
   it("installs once even when re-rendered with fresh callbacks mid-install", async () => {
