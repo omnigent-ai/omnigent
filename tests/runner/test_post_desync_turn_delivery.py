@@ -71,6 +71,7 @@ Run::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -521,8 +522,9 @@ async def test_cancelling_reconciliation_releases_the_background_turn_slot(
         try:
             await asyncio.wait_for(entered.wait(), timeout=2)
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
+            assert task.cancelled()
             assert _CONV_ID not in app.state.active_turns
             assert _CONV_ID in app.state.desynced_sessions
 
@@ -534,7 +536,7 @@ async def test_cancelling_reconciliation_releases_the_background_turn_slot(
             release.set()
             if not task.done():
                 task.cancel()
-                with pytest.raises(asyncio.CancelledError):
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
 
 
@@ -567,7 +569,8 @@ async def test_failed_reconciliation_preserves_retry_without_delivering_into_sta
         )
         if streaming:
             assert response.status_code == 503
-            assert response.json()["error"]["code"] == "harness_reconciliation_failed"
+            assert response.json()["error"] == "harness_reconciliation_failed"
+            assert "Please retry your message" in response.json()["detail"]
         else:
             assert response.status_code == 202
             task = app.state.active_turns.get(_CONV_ID)

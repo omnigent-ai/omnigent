@@ -7300,7 +7300,8 @@ def create_runner_app(
         runner-side floor does not depend on this succeeding.
 
         :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-        :returns: Whether interruption was acknowledged or no live harness remains.
+        :returns: Whether the harness acknowledged the interrupt or had nothing left to
+            interrupt (no live harness process, or no in-flight turn).
         """
         if process_manager is None:
             return True
@@ -7312,6 +7313,14 @@ def create_runner_app(
                 # Bounded under the Omnigent server's 5s stop deadline.
                 timeout=3.0,
             )
+            if response.status_code == 404:
+                # The harness has no in-flight turn: nothing left to interrupt.
+                _logger.debug(
+                    "Interrupt forward for %s found no in-flight harness turn",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                return True
             response.raise_for_status()
             return True
         except NoLiveHarnessError:
@@ -8527,7 +8536,10 @@ def create_runner_app(
         # Direct-stream turns don't pass through _run_turn_bg — reconcile a
         # desynced harness here so the fresh delivery isn't 204-rejected.
         if recovery_error := await _reconcile_desynced_harness(conv_id):
-            return JSONResponse(status_code=503, content={"error": recovery_error})
+            return JSONResponse(
+                status_code=503,
+                content={"error": recovery_error["code"], "detail": recovery_error["message"]},
+            )
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
