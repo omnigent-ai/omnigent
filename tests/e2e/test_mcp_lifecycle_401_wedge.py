@@ -155,6 +155,7 @@ def _wait_ready(port: int, timeout_s: float = 30.0) -> None:
                 if resp.status_code == 200:
                     return
             except httpx.HTTPError:
+                # Server still starting; keep polling until the deadline.
                 pass
             time.sleep(0.2)
     raise TimeoutError(f"MCP server on 127.0.0.1:{port} not ready after {timeout_s}s")

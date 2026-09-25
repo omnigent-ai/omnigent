@@ -57,9 +57,6 @@ _PROBE = "steady-state-recovery-probe"
 # doomed by the mid-session transport crash.
 _MCP_TIMEOUT_S = 8
 
-# Hard cap on each driven call so a regression can't hang the suite.
-_CALL_DEADLINE_S = 60
-
 
 def _free_port() -> int:
     """Reserve an ephemeral localhost port and return it."""
