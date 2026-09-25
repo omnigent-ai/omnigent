@@ -13216,7 +13216,10 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
-        from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
+        from omnigent.native.native_cost_popup import (
+            _tmux_last_client_input_at,
+            _tmux_window_activity_at,
+        )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,
@@ -13247,8 +13250,18 @@ def create_runner_app(
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
                 return True
-            clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
-            if clients:
+            # An attached viewer alone does not spare the pane (a tab left open
+            # overnight kept idle native stacks resident). Count it only when a
+            # human drove it recently: a CLI keypress, or any web-bridge event.
+            input_at = await asyncio.to_thread(
+                _tmux_last_client_input_at, str(pane.socket_path), "main"
+            )
+            if input_at is not None and time.time() - input_at < PANE_OUTPUT_BUSY_WINDOW_S:
+                return True
+            instance = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+            if instance is not None and instance.client_interaction_within(
+                PANE_OUTPUT_BUSY_WINDOW_S
+            ):
                 return True
             # Primary evidence: tmux stamps window_activity on every byte the
             # pane emits, so a producing terminal stays busy even when the

@@ -463,3 +463,115 @@ def test_tmux_window_activity_at_none_on_unparseable_output(
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
     assert native_cost_popup._tmux_window_activity_at("/tmp/x.sock", "main") is None
+
+
+def _wait_for_tmux_clients(socket_path: str, count: int, pty_fd: int | None = None) -> None:
+    """Poll until *count* clients are attached, draining *pty_fd* so tmux never blocks."""
+    import os
+    import select
+    import time
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if pty_fd is not None:
+            while select.select([pty_fd], [], [], 0)[0]:
+                if not os.read(pty_fd, 65536):
+                    break
+        if len(native_cost_popup._list_tmux_clients(socket_path, "main")) >= count:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"expected {count} tmux clients on {socket_path}")
+
+
+def test_tmux_last_client_input_at_tracks_keypresses_not_control_clients() -> None:
+    """
+    Only a regular client's attach or keypress moves the reading.
+
+    The pane reaper uses this as its "a human is typing here" signal: a
+    control-mode (web bridge) client alone must read as no input, a fresh CLI
+    attach as recent input, a later keypress must advance it, and a dead
+    server must read as "no evidence", never as an error.
+    """
+    import contextlib
+    import os
+    import pty
+    import shutil
+    import signal
+    import subprocess
+    import tempfile
+    import time
+
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux not installed")
+    tmp_dir = tempfile.mkdtemp(prefix="omni-ci-")
+    socket_path = str(Path(tmp_dir) / "t.sock")
+    tmux = ["tmux", "-S", socket_path, "-f", "/dev/null"]
+    control: subprocess.Popen[bytes] | None = None
+    pty_pid: int | None = None
+    try:
+        subprocess.run(
+            [*tmux, "new-session", "-d", "-s", "main", "-x", "20", "-y", "5"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        assert native_cost_popup._tmux_last_client_input_at(socket_path, "main") is None
+
+        control = subprocess.Popen(
+            [*tmux, "-C", "attach", "-t", "main"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_for_tmux_clients(socket_path, 1)
+        assert native_cost_popup._tmux_last_client_input_at(socket_path, "main") is None
+
+        pty_pid, pty_fd = pty.fork()
+        if pty_pid == 0:  # pragma: no cover - child process
+            os.execvp("tmux", [*tmux, "attach", "-t", "main"])
+        _wait_for_tmux_clients(socket_path, 2, pty_fd)
+        attached_at = native_cost_popup._tmux_last_client_input_at(socket_path, "main")
+        assert attached_at is not None
+        assert abs(time.time() - attached_at) < 120.0
+
+        time.sleep(1.1)  # client_activity has one-second resolution
+        os.write(pty_fd, b"x")
+        deadline = time.monotonic() + 5.0
+        typed_at = attached_at
+        while time.monotonic() < deadline and typed_at <= attached_at:
+            _wait_for_tmux_clients(socket_path, 2, pty_fd)
+            typed_at = native_cost_popup._tmux_last_client_input_at(socket_path, "main") or 0.0
+            time.sleep(0.1)
+        assert typed_at > attached_at
+    finally:
+        subprocess.run([*tmux, "kill-server"], check=False, capture_output=True, timeout=10)
+        if control is not None:
+            control.kill()
+            control.wait(timeout=10)
+        if pty_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pty_pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pty_pid, 0)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    assert native_cost_popup._tmux_last_client_input_at(socket_path, "main") is None
+
+
+def test_tmux_last_client_input_at_none_on_unparseable_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Garbage from tmux is treated as "no evidence", not a crash.
+
+    An old tmux echoes unknown format variables back verbatim; the reaper must
+    fall back to its other signals rather than read that as a keypress.
+    """
+    import subprocess
+
+    def _fake_run(*_a: Any, **_k: Any) -> Any:
+        return types.SimpleNamespace(
+            returncode=0, stdout="#{client_control_mode} #{client_activity}\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    assert native_cost_popup._tmux_last_client_input_at("/tmp/x.sock", "main") is None
