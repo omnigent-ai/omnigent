@@ -4845,3 +4845,48 @@ def test_run_turn_prompt_command_includes_streaming_behavior():
         "residual race against a still-alive Pi process queues instead of "
         f"surfacing the raw protocol error; got {cmd!r}"
     )
+
+
+def test_build_models_json_catalog_reasoning_models_get_reasoning_flag() -> None:
+    """Catalog-reasoning GPT/Gemini entries get ``reasoning: true``; catalog False stays off."""
+    from omnigent.models.model_metadata import ModelCapability
+
+    reasoning = frozenset({ModelCapability.REASONING})
+    catalog_models = (
+        ModelEntry(
+            id="system.ai.gpt-6-luna",
+            family="openai",
+            metadata=ModelMetadata(
+                supported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES, ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+        ModelEntry(
+            id="system.ai.gemini-3-8-flash",
+            family="other",
+            metadata=ModelMetadata(
+                supported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+        ModelEntry(
+            id="system.ai.llama-4-maverick",
+            family="other",
+            metadata=ModelMetadata(
+                unsupported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+    )
+
+    result = _build_models_json("https://host.example.com", "tok", catalog_models=catalog_models)
+
+    providers = result["providers"]
+    by_id = {
+        entry["id"]: entry
+        for name in ("databricks-openai", "databricks-mlflow")
+        for entry in providers[name]["models"]
+    }
+    assert by_id["system.ai.gpt-6-luna"].get("reasoning") is True
+    assert by_id["system.ai.gemini-3-8-flash"].get("reasoning") is True
+    assert "reasoning" not in by_id["system.ai.llama-4-maverick"]
