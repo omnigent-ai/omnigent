@@ -103,6 +103,24 @@ def _isolated_model_catalog_store(
 
 
 @pytest.fixture(autouse=True)
+def _isolated_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep the machine's ambient provider state out of these tests.
+
+    Model-options frames decorate every row with the host's resolved provider
+    ``source``, read from ``~/.omnigent/config.yaml`` via ``load_config()``
+    and from ambient-credential detection (CLI logins, vendor env keys). On a
+    machine with subscription defaults or detectable credentials, that
+    decoration leaks into the exact-frame assertions here and fails a pristine
+    tree. Relocate the config home to an empty per-test directory and stub the
+    detection sweep, the way neighboring suites isolate the same seams.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path_factory.mktemp("config_home")))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep these tests from forking a real runner zygote.
 
