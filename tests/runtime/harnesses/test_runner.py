@@ -9,6 +9,8 @@ ground here would just duplicate.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi import FastAPI
 
@@ -171,6 +173,39 @@ def test_create_uvicorn_config_for_tcp_bind() -> None:
 def test_create_uvicorn_config_requires_endpoint() -> None:
     with pytest.raises(SystemExit, match="exactly one of --socket or --bind"):
         _runner._create_uvicorn_config(FastAPI(), None, None)
+
+
+@pytest.mark.parametrize(
+    ("socket_path", "bind"), [("/tmp/runner.sock", None), (None, "127.0.0.1:8765")]
+)
+def test_create_uvicorn_config_preserves_existing_log_handlers(
+    socket_path: str | None, bind: str | None
+) -> None:
+    class TrackingHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.was_closed = False
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.messages.append(record.getMessage())
+
+        def close(self) -> None:
+            self.was_closed = True
+            super().close()
+
+    handler = TrackingHandler()
+    logger = logging.getLogger("omnigent.harness_logging_test")
+    logger.addHandler(handler)
+    try:
+        _runner._create_uvicorn_config(FastAPI(), socket_path, bind)
+
+        assert not handler.was_closed
+        logger.warning("harness ready")
+        assert handler.messages == ["harness ready"]
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
 
 
 # ---------------------------------------------------------------------------

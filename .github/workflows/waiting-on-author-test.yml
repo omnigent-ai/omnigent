@@ -8,6 +8,7 @@ on:
     paths:
       - .github/scripts/waiting_on_author.py
       - .github/scripts/waiting_on_author_test.py
+      - .github/areas.json
       - .github/workflows/waiting-on-author.yml
       - .github/workflows/waiting-on-author-review.yml
       - .github/workflows/waiting-on-author-review-run.yml

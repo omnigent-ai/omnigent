@@ -115,7 +115,14 @@ vi.mock("@tanstack/react-virtual", () => ({
       getOffsetForIndex: (index: number) => [index * ROW, "start"] as const,
       takeSnapshot: () => items,
       scrollOffset: 0,
+      scrollAdjustments: 0,
+      scrollDirection: null,
       range: count > 0 ? { startIndex: 0, endIndex: count - 1 } : null,
+      // The transcript's prepend hold measures fresh rows itself and reads the
+      // raw measurements back; sizes never change under jsdom.
+      measurementsCache: items,
+      itemSizeCache: new Map(),
+      resizeItem: () => {},
     };
   },
 }));

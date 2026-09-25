@@ -268,10 +268,13 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     assert len(error_id) == 36
     int(error_id.removeprefix("err_"), 16)
     assert error["message"] == (
-        "Native Claude terminal failed to start; "
+        "Native Claude terminal failed to start (ImportError); "
         f"see the runner log for details: {pinned_runner_log} Error ID: {error_id}."
     )
     assert "requires the 'claude' CLI" not in error["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in error["message"]
 
 
 @dataclass
@@ -886,6 +889,10 @@ async def test_create_session_repl_terminal_dispatch(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_args, **_kwargs: None
+    )
     # Keep the codex-native branch's bridge writes inside tmp_path.
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 

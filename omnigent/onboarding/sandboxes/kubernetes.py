@@ -55,7 +55,7 @@ import shlex
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import click
 
@@ -499,18 +499,30 @@ def _render_workspace_prep_command(
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repos:
-        # Prefer the owner's per-user credential for the clone: when they've
-        # connected GitHub, wire the broker as the sole github.com helper so a
-        # private clone authenticates as *them*. Wired ONCE (it configures the
-        # global github.com helper for every clone below). When they haven't
-        # connected this is a no-op that leaves the image's shared ``$GIT_TOKEN``
-        # helper in place; ``|| true`` keeps a broker hiccup from failing the
-        # clone (it then falls back to ``$GIT_TOKEN``). Needs OMNIGENT_HOST_TOKEN.
-        wire = (
-            "from omnigent.git_credential_github import configure_clone_credentials; "
-            f"configure_clone_credentials({server_url!r}, {host_id!r})"
+        # Keep the launch token in the init container's environment: the helper
+        # reads it in-process instead of persisting it or putting it in argv.
+        helper_source = (
+            "import os,sys; from omnigent.git_credential_github import main; "
+            f"sys.exit(main(['--server',{server_url!r},'--host-id',{host_id!r},"
+            f"'--host-token',os.environ[{HOST_TOKEN_ENV_VAR!r}],*sys.argv[1:]]))"
         )
-        script += f"python3 -c {shlex.quote(wire)} || true\n"
+        helper = f"!python3 -Ic {shlex.quote(helper_source)}"
+        helper_key = "credential.https://github.com.helper"
+        expected_helpers = ["", helper]
+        wire = (
+            "import os,subprocess,sys; import omnigent.git_credential_github as g; "
+            "cfg=g._git_config; _=g._install_broker_helper; "
+            "g._install_broker_helper=lambda *_:("
+            f"cfg('--replace-all',{helper_key!r},''),"
+            f"cfg('--add',{helper_key!r},{helper!r})); "
+            f"token=(os.environ.get({HOST_TOKEN_ENV_VAR!r}) or '').strip(); "
+            f"wired=g.configure_clone_credentials({server_url!r},{host_id!r}); "
+            "helpers=(subprocess.run(['git','config','--global','--get-all',"
+            f"{helper_key!r}],check=True,capture_output=True,text=True).stdout.splitlines() "
+            "if wired is True else []); "
+            f"verified=(bool(token) and wired is True and helpers=={expected_helpers!r}); "
+            "sys.exit(10 if bool(token) and wired is False else 0 if verified else 1)"
+        )
         # Clone every repo concurrently, then wait on each and fail the init
         # container if ANY clone failed — a half-populated workspace must abort
         # the launch loudly, not boot the host on it. ``set -e`` stays on, but a
@@ -520,20 +532,108 @@ def _render_workspace_prep_command(
         # branch-pinned clones fast.
         # ponytail: unbounded fan-out; add `xargs -P <n>` if huge repo sets on a
         # 2-vCPU pod ever thrash.
-        script += "pids=''\n"
+        script += "pids=''\nwired=''\ncredential_config=''\n"
+        script += (
+            "cleanup_credentials() {\n"
+            '  if [ -n "$credential_config" ]; then rm -f -- "$credential_config"; fi\n'
+            "}\n"
+            "trap cleanup_credentials EXIT\n"
+        )
+        # One guarded ``python3 -c`` wiring call serves every clone; preserved
+        # workspaces never call it.
+        script += (
+            "wire_credentials() {\n"
+            "  credential_config=$(mktemp)\n"
+            "  wire_rc=0\n"
+            f'  GIT_CONFIG_GLOBAL="$credential_config" PYTHONSAFEPATH=1 '
+            f"PYTHONNOUSERSITE=1 PYTHONPATH= python3 -c {shlex.quote(wire)} || wire_rc=$?\n"
+            '  if [ "$wire_rc" -eq 0 ]; then\n'
+            '    export GIT_CONFIG_GLOBAL="$credential_config"\n'
+            '  elif [ "$wire_rc" -eq 10 ]; then\n'
+            '    rm -f -- "$credential_config"\n'
+            "    credential_config=''\n"
+            "  else\n"
+            '    exit "$wire_rc"\n'
+            "  fi\n"
+            "}\n"
+        )
+        # Replacing an empty reserved directory is atomic; a writer that adds
+        # anything to it makes os.rename fail instead of nesting the clone.
+        script += (
+            "replace_empty_dir() {\n"
+            '  python3 - "$1" "$2" <<\'PY\'\n'
+            "import os\n"
+            "import sys\n"
+            "os.rename(sys.argv[1], sys.argv[2])\n"
+            "PY\n"
+            "}\n"
+        )
         # Distinct URLs can derive the same repo_name (e.g. two orgs' "api"); a
         # shared clone dir would fail the concurrent clones, so disambiguate.
-        for repo, dirname in zip(repos, clone_dir_names(repos), strict=True):
+        dirnames = clone_dir_names(repos)
+        # Keep each staging name distinct from every clone destination and
+        # sibling staging path so cleanup cannot target another checkout.
+        taken = set(dirnames)
+        staging_names: list[str] = []
+        for dirname in dirnames:
+            staging, n = f"{dirname}.tmp", 2
+            while staging in taken:
+                staging = f"{dirname}.tmp{n}"
+                n += 1
+            taken.add(staging)
+            staging_names.append(staging)
+        for repo, dirname, staging in zip(repos, dirnames, staging_names, strict=True):
             clone_dir = f"{workspace}/{dirname}"
+            staging_dir = f"{workspace}/{staging}"
             branch = (
                 f"--branch {shlex.quote(repo.branch)} --single-branch "
                 if repo.branch is not None
                 else ""
             )
-            script += (
-                f"git clone {branch}-- {shlex.quote(repo.url)} "
-                f'{shlex.quote(clone_dir)} & pids="$pids $!"\n'
+            target = shlex.quote(clone_dir)
+            gitfile = shlex.quote(f"{clone_dir}/.git")
+            temporary = shlex.quote(staging_dir)
+            marker = shlex.quote(f"{staging_dir}/.omnigent-workspace-prep")
+            staged_clone = shlex.quote(f"{staging_dir}/clone")
+            error = shlex.quote(
+                f"Workspace {clone_dir} has no Git checkout and is not an empty directory; "
+                "refusing to overwrite it"
             )
+            staging_error = shlex.quote(
+                f"Staging path {staging_dir} is not owned by workspace prep; refusing to remove it"
+            )
+            script += (
+                f"if ! {{ [ ! -f {gitfile} ] || "
+                f"awk 'END {{ exit (NR == 1 ? 0 : 1) }}' {gitfile}; }} ||\n"
+                f"   ! {{ [ -e {gitfile} ] && ( unset GIT_DIR GIT_WORK_TREE; "
+                f"target_dir=$(cd -P -- {target} && pwd) || exit 1; "
+                f"git_dir=$(git -C {target} rev-parse --absolute-git-dir 2>/dev/null) || exit 1; "
+                'case "$git_dir" in "$target_dir"/*) ;; *) exit 1;; esac; '
+                f"prefix=$(git -C {target} rev-parse --show-prefix 2>/dev/null) || exit 1; "
+                '[ -z "$prefix" ] ); }; then\n'
+            )
+            script += f"  if [ -e {target} ] || [ -L {target} ]; then\n"
+            script += f"    if ! rmdir -- {target}; then\n"
+            script += f"      printf '%s\\n' {error} >&2\n"
+            script += "      exit 1\n    fi\n  fi\n"
+            script += f"  if [ -e {temporary} ] || [ -L {temporary} ]; then\n"
+            script += (
+                f"    if [ -d {temporary} ] && [ ! -L {temporary} ] && [ -f {marker} ]; then\n"
+            )
+            script += f"      rm -rf -- {temporary}\n"
+            script += "    else\n"
+            script += f"      printf '%s\\n' {staging_error} >&2\n"
+            script += "      exit 1\n    fi\n  fi\n"
+            script += f"  mkdir -- {target}\n  mkdir -- {temporary}\n  touch -- {marker}\n"
+            script += '  if [ -z "$wired" ]; then wire_credentials; wired=1; fi\n'
+            script += (
+                f"  (git clone {branch}-- {shlex.quote(repo.url)} {staged_clone} "
+                f"&& replace_empty_dir {staged_clone} {target} "
+                f"&& rm -f -- {marker} && rmdir -- {temporary} "
+                f"|| {{ rmdir -- {target} 2>/dev/null || true; exit 1; }}) "
+                f'& pids="$pids $!"\n'
+            )
+            script += "fi\n"
         script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
         script += '[ "$rc" -eq 0 ]\n'
     if host_config is not None:
@@ -1782,12 +1882,15 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         try:
-            log: str = self._load_core().read_namespaced_pod_log(
-                pod_name,
-                namespace,
-                container=container,
-                tail_lines=_LOG_TAIL_LINES,
-                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+            log = cast(
+                str,
+                self._load_core().read_namespaced_pod_log(
+                    pod_name,
+                    namespace,
+                    container=container,
+                    tail_lines=_LOG_TAIL_LINES,
+                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                ),
             )
         except (ApiException, HTTPError):
             return ""

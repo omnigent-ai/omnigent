@@ -185,6 +185,11 @@ def validate_omnigent_executor(
             " — harness manages context internally",
         )
     harness = spec.executor.config.get("harness")
+    if "context_files" in spec.executor.config:
+        if not isinstance(spec.executor.config["context_files"], bool):
+            result.add("executor.config.context_files", "must be a boolean")
+        if harness != "pi":
+            result.add("executor.config.context_files", "only supported with harness 'pi'")
     if not harness:
         result.add(
             "executor.config.harness",
@@ -417,4 +422,9 @@ def load_omnigent_yaml(
                 "the spec — upgrade the runner to pick up newer harnesses."
             )
         raise OmnigentError(message, code=ErrorCode.INVALID_INPUT)
+    if enforce_handler_allowlist:
+        # Apply the parsed-spec guard to both uploaded bundle formats.
+        from omnigent.spec import _reject_unregistered_spec_policy_handlers
+
+        _reject_unregistered_spec_policy_handlers(spec)
     return spec

@@ -38,6 +38,35 @@ def test_create_identity_when_no_config(tmp_path: Path) -> None:
     assert identity.name == socket.gethostname()
 
 
+def test_default_config_path_honors_config_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default identity lookup must stay inside ``OMNIGENT_CONFIG_HOME``."""
+    from omnigent.host import identity as identity_module
+
+    fallback_path = tmp_path / "fallback" / "config.yaml"
+    fallback_path.parent.mkdir(parents=True)
+    fallback_path.write_text(
+        yaml.safe_dump(
+            {
+                "host": {
+                    "host_id": "d6d0ccebce7b4b706d21e23696bb462a",
+                    "name": "fallback-host",
+                }
+            }
+        )
+    )
+    config_home = tmp_path / "isolated"
+    monkeypatch.setattr(identity_module, "CONFIG_PATH", fallback_path)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    identity = load_or_create_host_identity()
+
+    assert identity.name == socket.gethostname()
+    assert (config_home / "config.yaml").exists()
+    assert yaml.safe_load(fallback_path.read_text())["host"]["name"] == "fallback-host"
+
+
 def test_load_existing_identity(tmp_path: Path) -> None:
     """
     Verify that load_or_create reads the host section from an

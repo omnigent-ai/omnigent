@@ -45,13 +45,32 @@ from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
+def _cancel_all_tasks(loop):
+    """Cancel and drain leftover tasks, the way :func:`asyncio.run` does.
+
+    A task still pending when the loop closes has its callbacks invoked
+    against a dead loop and raises "Event loop is closed" from the loop's
+    exception handler. Under pytest-xdist that surfaces as an INTERNALERROR
+    which kills the whole worker instead of failing one test.
+    """
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+
 def _run(coro):
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
+        try:
+            _cancel_all_tasks(loop)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
 
 
 # ---------------------------------------------------------------------------

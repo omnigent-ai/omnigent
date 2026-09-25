@@ -26,6 +26,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { setup as setupRequest } from "@/lib/accountsApi";
+import { withBasePath } from "@/lib/basePath";
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -59,13 +60,13 @@ export function SetupPage() {
     const result = await setupRequest({ username, password });
     if (result.ok) {
       // Hard-navigate so identity.ts re-runs against the new session.
-      window.location.href = "/";
+      window.location.href = withBasePath("/");
       return;
     }
     setSubmitting(false);
     // A 409 means someone else just claimed the admin — send them to login.
     if (result.status === 409) {
-      window.location.href = "/login";
+      window.location.href = withBasePath("/login");
       return;
     }
     setError(result.error);

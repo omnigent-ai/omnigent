@@ -4,9 +4,28 @@
 
 import { createContext, useContext } from "react";
 
+/**
+ * A 1-based citation target. Object identity is the navigation request key:
+ * preserve it when forwarding or remounting; create a fresh object for each click.
+ */
+export interface FilePosition {
+  line: number;
+  column?: number;
+}
+
+export type OpenFileOptions = Partial<FilePosition>;
+
+export type FileNavigationGuard = (
+  path: string,
+  options: OpenFileOptions | undefined,
+  navigate: () => void,
+) => void;
+
 interface FileViewerContextType {
-  openFile: (path: string) => void;
-  /** Reveal the workspace rail and switch it to the GitHub tab. */
+  openFile: (path: string, options?: OpenFileOptions) => void;
+  /** The mounted viewer confirms dirty navigation before selection or URL changes. */
+  registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
+  /** Open GitHub in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
   /**
    * Returns true when `path` is a known workspace file (present in the
@@ -40,12 +59,12 @@ export const FileViewerContext = createContext<FileViewerContextType | null>(nul
  * Returns the `openFile` callback when rendered inside AppShell, or
  * `null` when used outside of it (tests, Storybook, etc.).
  */
-export function useFileViewer(): ((path: string) => void) | null {
+export function useFileViewer(): ((path: string, options?: OpenFileOptions) => void) | null {
   return useContext(FileViewerContext)?.openFile ?? null;
 }
 
 /**
- * Returns a callback that reveals the workspace rail's GitHub tab, or `null`
+ * Returns a callback that opens the GitHub rail tab or mobile drawer, or `null`
  * when used outside AppShell (tests, Storybook).
  */
 export function useOpenGithubTab(): (() => void) | null {
