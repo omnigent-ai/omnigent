@@ -144,7 +144,9 @@ describe("ServerSelectorV2", () => {
     // Returning to setup after the app set Dark: the radio reflects Dark, not
     // the "system" default.
     render(
-      <ServerSelectorV2 setup={makeSetup({ onSetColorScheme: vi.fn(), initialColorScheme: "dark" })} />,
+      <ServerSelectorV2
+        setup={makeSetup({ onSetColorScheme: vi.fn(), initialColorScheme: "dark" })}
+      />,
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
       button: 0,

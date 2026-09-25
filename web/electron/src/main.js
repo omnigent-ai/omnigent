@@ -3424,10 +3424,7 @@ function registerIpc() {
     if (!isSetupPageSender(event)) return;
     if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
     nativeTheme.themeSource = scheme;
-    event.sender.send(
-      "omnigent:setup-theme",
-      nativeTheme.shouldUseDarkColors ? "dark" : "light",
-    );
+    event.sender.send("omnigent:setup-theme", nativeTheme.shouldUseDarkColors ? "dark" : "light");
   });
 
   // Track OS appearance changes once, and push to every WebContents CURRENTLY
