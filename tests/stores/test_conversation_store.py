@@ -6968,6 +6968,59 @@ def test_item_search_text_seam_none_persists_null(db_uri: str) -> None:
     assert item.data.content[0]["text"] == "opaque body"
 
 
+def test_fork_copies_items_without_search_text(db_uri: str) -> None:
+    """Forking items stored with a NULL ``search_text`` copies them and adds no FTS rows."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+    from omnigent.db.utils import _supports_fts5
+
+    class _SearchTextlessStore(SqlAlchemyConversationStore):
+        def _item_search_text(self, item: NewConversationItem) -> str | None:
+            return None
+
+    store = _SearchTextlessStore(db_uri)
+    source = store.create_conversation()
+    store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_opaque",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "opaque body"}]
+                ),
+            )
+        ],
+    )
+
+    fork = store.fork_conversation(source.id, title="fork")
+
+    [item] = store.list_items(fork.id).data
+    assert item.data.content[0]["text"] == "opaque body"
+    with store._conv_session("test_setup") as session:
+        stored = list(
+            session.execute(
+                select(SqlConversationItem.search_text).where(
+                    SqlConversationItem.conversation_id == fork.id
+                )
+            ).scalars()
+        )
+    assert stored == [None]
+
+    # The FTS mirror only exists on the SQLite family; NULL rows must not be indexed.
+    if _supports_fts5(store._conv_engine.dialect.name):
+        with store._conv_session("test_setup") as session:
+            fts_rows = session.execute(
+                text(
+                    "SELECT count(*) FROM conversation_items_fts "
+                    "WHERE conversation_id IN (:source_id, :fork_id)"
+                ),
+                {"source_id": source.id, "fork_id": fork.id},
+            ).scalar_one()
+        assert fts_rows == 0
+
+
 def _acl_perms(db_uri: str):
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
