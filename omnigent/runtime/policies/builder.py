@@ -160,22 +160,21 @@ def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
     )
 
 
-def _get_period_cost_requirements(specs: list[PolicySpec]) -> list[tuple[str, str | None]]:
+def _get_period_cost_requirements(specs: list[PolicySpec]) -> list[str]:
     """
     Extract all period cost requirements from the policy specs.
 
     Scans the specs for any user_period_cost_budget policies and returns a
-    list of (period, harness) tuples for which the engine needs to load cost
-    data. NOTE: Currently only ONE period cost policy is supported per engine;
+    list of periods for which the engine needs to load cost data.
+    NOTE: Currently only ONE period cost policy is supported per engine;
     callers must validate ``len(result) <= 1`` or raise an error.
 
     :param specs: The merged policy specs for the engine.
-    :returns: List of ``(period, harness)`` tuples, e.g.
-        ``[("month", None)]`` or ``[("week", "codex-native")]``. Empty when no
-        period cost policies are configured. Contains at most one element in
-        current implementation.
+    :returns: List of periods, e.g. ``["month"]`` or ``["week"]``. Empty
+        when no period cost policies are configured. Contains at most one
+        element in current implementation.
     """
-    requirements: list[tuple[str, str | None]] = []
+    requirements: list[str] = []
     for s in specs:
         if not isinstance(s, FunctionPolicySpec) or s.function is None:
             continue
@@ -183,9 +182,8 @@ def _get_period_cost_requirements(specs: list[PolicySpec]) -> list[tuple[str, st
         if s.function.path == _USER_PERIOD_COST_POLICY_PATH:
             args = s.function.arguments or {}
             period = args.get("period")
-            harness = args.get("harness")
             if period and period != "day":  # day uses user_daily_cost
-                requirements.append((period, harness))
+                requirements.append(period)
     return requirements
 
 
@@ -254,7 +252,7 @@ def _load_user_daily_cost(
     today = utc_day(now_epoch())
     # Use list_daily_cost_states to get today's record in the same format
     # as period budgets, so both can consume the same context field
-    return conversation_store.list_daily_cost_states(owner, today, harness=None)
+    return conversation_store.list_daily_cost_states(owner, today)
 
 
 def _utc_day(epoch: int) -> str:
@@ -320,14 +318,13 @@ def _load_user_period_cost(
     conversation_id: str,
     conversation_store: ConversationStore,
     period: str,
-    harness: str | None = None,
 ) -> list[DailyCostState]:
     """
     Read the session owner's daily cost records for the current period.
 
     Resolves the owner (cached) and queries all daily cost records for the
     current period's date range. Returns a list of daily cost dicts, each
-    containing ``{cost_usd, ask_approved_usd, user_id, day_utc, harness}``.
+    containing ``{cost_usd, ask_approved_usd, user_id, day_utc}``.
     The policy function aggregates these to compute the period total.
 
     When the session has no owner grant (single-user mode), returns an
@@ -337,9 +334,6 @@ def _load_user_period_cost(
     :param conversation_store: Store for the owner + daily-cost lookups.
     :param period: Time period granularity: ``"day"``, ``"week"``,
         ``"month"``, ``"quarter"``, or ``"year"``.
-    :param harness: Optional harness filter. ``None`` sums across all
-        harnesses; a specific value (e.g. ``"codex-native"``) reads only
-        that harness.
     :returns: List of daily cost dicts, one per day in the period. Empty
         in single-user mode.
     """
@@ -375,7 +369,7 @@ def _load_user_period_cost(
     start_date = start.isoformat()
 
     # Query daily cost records for the period
-    return conversation_store.list_daily_cost_states(owner, start_date, harness)
+    return conversation_store.list_daily_cost_states(owner, start_date)
 
 
 def any_policies_apply(
@@ -809,16 +803,16 @@ def build_policy_engine(
         raise ValueError(
             f"Multiple period cost policies are not yet supported. "
             f"Found {len(period_requirements)} policies with periods: "
-            f"{[p for p, _ in period_requirements]}. "
+            f"{period_requirements}. "
             "Configure at most one period cost policy (day, week, month, quarter, or year)."
         )
     initial_user_period_cost = None
     if period_requirements:
         # Use only the first (and validated-to-be-only) period requirement.
         # The validation above ensures len(period_requirements) <= 1.
-        period, harness = period_requirements[0]
+        period = period_requirements[0]
         initial_user_period_cost = _load_user_period_cost(
-            conversation_id, conversation_store, period=period, harness=harness
+            conversation_id, conversation_store, period=period
         )
     # Session model: the conversation's model_override (set when a user
     # picks a model mid-session) wins over the spec's llm.model; None when

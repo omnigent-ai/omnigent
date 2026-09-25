@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from omnigent.spec.types import AgentSpec, ToolRuntime
+from omnigent.spec.types import AgentSpec, FunctionPolicySpec, ToolRuntime
 from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
 
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
@@ -26,6 +26,7 @@ _SKILL_NAME_MAX_LEN = 64
 _SKILL_DESC_MAX_LEN = 1024
 _VALID_INPUT_MODALITIES = {"text", "image", "audio", "video", "file"}
 _VALID_OUTPUT_MODALITIES = {"text", "image", "audio"}
+_USER_PERIOD_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_period_cost_budget"
 
 
 @dataclass
@@ -75,6 +76,46 @@ class ValidationResult:
         self.errors.append(ValidationError(path=path, message=message))
 
 
+def _validate_guardrails(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate guardrails configuration.
+
+    Checks for invalid policy combinations that would fail at runtime:
+
+    - **Multiple period cost policies**: Only ONE non-day period cost
+      policy is currently supported. Multiple period policies (e.g.,
+      weekly + monthly) would require seeding separate context keys and
+      updating each policy to read its specific context. This validation
+      rejects such configurations early, before engine build time.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.guardrails is None or spec.guardrails.policies is None:
+        return
+
+    # Find all period cost policies with period != "day"
+    period_policies: list[tuple[str, str]] = []
+    for policy in spec.guardrails.policies:
+        if not isinstance(policy, FunctionPolicySpec) or policy.function is None:
+            continue
+        if policy.function.path == _USER_PERIOD_COST_POLICY_PATH:
+            args = policy.function.arguments or {}
+            period = args.get("period")
+            # "day" uses user_daily_cost context, not user_period_cost
+            if period and period != "day":
+                period_policies.append((period, policy.name))
+
+    if len(period_policies) > 1:
+        periods_str = ", ".join(f"{p!r} ({n})" for p, n in period_policies)
+        result.add(
+            "guardrails.policies",
+            f"Multiple period cost policies are not yet supported. "
+            f"Found {len(period_policies)} policies with periods: {periods_str}. "
+            "Configure at most one period cost policy (day, week, month, quarter, or year).",
+        )
+
+
 def validate(spec: AgentSpec) -> ValidationResult:
     """
     Validate an :class:`AgentSpec` against AGENTSPEC.md rules.
@@ -95,6 +136,7 @@ def validate(spec: AgentSpec) -> ValidationResult:
     _validate_sub_agents(spec, result)
     _validate_compaction(spec, result)
     _validate_os_env(spec, result)
+    _validate_guardrails(spec, result)
     return result
 
 

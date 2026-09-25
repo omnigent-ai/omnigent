@@ -34,7 +34,6 @@ from omnigent.db.account_authority import AccountAuthority, require_active_accou
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
-    CROSS_HARNESS_SENTINEL,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlComment,
@@ -1694,14 +1693,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             # single-writer semantics).
             existing = session.get(
                 SqlUserDailyCost,
-                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+                (current_workspace_id(), user_id, day_utc),
             )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
                         user_id=user_id,
                         day_utc=day_utc,
-                        harness=CROSS_HARNESS_SENTINEL,
                         cost_usd=delta_usd,
                         updated_at=now,
                     )
@@ -1765,7 +1763,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         stmt = stmt.values(
             user_id=user_id,
             day_utc=day_utc,
-            harness=CROSS_HARNESS_SENTINEL,
             cost_usd=delta_usd,
             updated_at=now,
         )
@@ -1791,7 +1788,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session("get_daily_cost") as session:
             row = session.get(
                 SqlUserDailyCost,
-                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+                (current_workspace_id(), user_id, day_utc),
             )
             return float(row.cost_usd) if row is not None else 0.0
 
@@ -1803,9 +1800,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         lexicographically (zero-padded ``"YYYY-MM-DD"``), so the range is
         a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
         an empty range, coalesced to ``0.0``.
-
-        Filters to daily rows only (``LENGTH(day_utc) = 10``) to exclude
-        period rollup rows (week/month/quarter/year) stored in the same table.
         """
         with self._session("sum_daily_cost") as session:
             total = session.execute(
@@ -1852,7 +1846,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session("get_daily_cost_state") as session:
             row = session.get(
                 SqlUserDailyCost,
-                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+                (current_workspace_id(), user_id, day_utc),
             )
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
@@ -1899,7 +1893,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.values(
                     user_id=user_id,
                     day_utc=day_utc,
-                    harness=CROSS_HARNESS_SENTINEL,
                     cost_usd=0.0,
                     ask_approved_usd=ask_approved_usd,
                     updated_at=now,
@@ -1918,13 +1911,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
             existing = session.get(
                 SqlUserDailyCost,
-                (current_workspace_id(), user_id, day_utc, CROSS_HARNESS_SENTINEL),
+                (current_workspace_id(), user_id, day_utc),
             )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
                         user_id=user_id,
-                        harness=CROSS_HARNESS_SENTINEL,
                         day_utc=day_utc,
                         cost_usd=0.0,
                         ask_approved_usd=ask_approved_usd,
@@ -1945,23 +1937,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         user_id: str,
         since_day_utc: str,
-        harness: str | None = None,
     ) -> list[DailyCostState]:
         """
         Return daily cost states for a user from since_day_utc onward.
 
-        Reads cost_usd, ask_approved_usd, day_utc, and harness for each
-        day >= since_day_utc. Used by period cost policies to aggregate
+        Reads cost_usd, ask_approved_usd, and day_utc for each day
+        >= since_day_utc. Used by period cost policies to aggregate
         daily records at read time.
         """
-        harness_filter = CROSS_HARNESS_SENTINEL if harness is None else harness
         with self._session("list_daily_cost_states") as session:
             rows = session.execute(
                 select(SqlUserDailyCost)
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
-                .where(SqlUserDailyCost.harness == harness_filter)
                 .order_by(SqlUserDailyCost.day_utc.asc())
             ).scalars()
             return [
@@ -1970,7 +1959,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "ask_approved_usd": float(row.ask_approved_usd or 0.0),
                     "day_utc": row.day_utc,
                     "user_id": row.user_id,
-                    "harness": None if row.harness == CROSS_HARNESS_SENTINEL else row.harness,
                 }
                 for row in rows
             ]

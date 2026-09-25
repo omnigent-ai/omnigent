@@ -99,9 +99,9 @@ USER_DAILY_ASK_APPROVED_STATE_KEY = "_policy_user_daily_ask_approved_usd"
 SESSION_COST_ASK_APPROVED_STATE_KEY = "_policy_cost_ask_approved_usd"
 
 # Reserved ``state_updates`` key the per-user period cost-budget policy emits
-# on an ASK to record the highest soft checkpoint approved for a period+harness.
+# on an ASK to record the highest soft checkpoint approved for a period.
 # Routed by :class:`PolicyEngine.apply_state_updates` to
-# ``user_period_cost.ask_approved_usd`` (per user+period+harness) instead of
+# ``user_period_cost.ask_approved_usd`` (per user+period) instead of
 # the per-conversation ``session_state``. Shared by the policy (emits it) and
 # the engine (intercepts it) so a period approval persists across the user's
 # sessions, not just the one conversation.

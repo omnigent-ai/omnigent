@@ -1,7 +1,6 @@
 """Tests for user_period_cost_budget policy.
 
-Covers all period types (day, week, month, quarter, year) with both
-cross-harness and per-harness budget modes.
+Covers all period types (day, week, month, quarter, year).
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ def _event(
     period_cost: list[dict[str, float | str | None]] | None = None,
     usage: dict[str, float] | None = None,
     model: str | None = "opus",
-    harness: str | None = None,
     session_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a policy event for testing."""
@@ -26,7 +24,6 @@ def _event(
             "user_daily_cost": period_cost or [],
             "usage": usage or {},
             "model": model,
-            "harness": harness,
         },
         "session_state": session_state or {},
     }
@@ -46,12 +43,6 @@ class TestPeriodValidation:
         with pytest.raises(ValueError, match="period must be"):
             user_period_cost_budget(period="invalid", max_cost_usd=10.0)
 
-    def test_harness_not_supported(self):
-        """Per-harness budgets are not yet supported for any period."""
-        for period in ["day", "week", "month", "quarter", "year"]:
-            with pytest.raises(ValueError, match="per-harness budgets are not yet supported"):
-                user_period_cost_budget(period=period, max_cost_usd=10.0, harness="codex-native")
-
 
 class TestMonthlyBudget:
     """Test monthly period budgets."""
@@ -66,7 +57,6 @@ class TestMonthlyBudget:
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ]
         )
@@ -85,7 +75,6 @@ class TestMonthlyBudget:
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ],
             model="opus",
@@ -107,7 +96,6 @@ class TestMonthlyBudget:
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ],
             model="haiku",
@@ -127,7 +115,6 @@ class TestMonthlyBudget:
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ]
         )
@@ -150,7 +137,6 @@ class TestMonthlyBudget:
                     "ask_approved_usd": 25.0,  # Already approved
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ]
         )
@@ -171,7 +157,6 @@ class TestWeeklyBudget:
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ],
             model="opus",
@@ -192,7 +177,6 @@ class TestWeeklyBudget:
                     "ask_approved_usd": 0.0,
                     "user_id": "bob@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ]
         )
@@ -214,7 +198,6 @@ class TestQuarterlyBudget:
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ],
             model="opus",
@@ -237,7 +220,6 @@ class TestYearlyBudget:
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ],
             model="opus",
@@ -247,48 +229,32 @@ class TestYearlyBudget:
         assert "yearly cost budget" in result["reason"]
 
 
-class TestPerHarnessBudget:
-    """Test per-harness budget rejection (not yet implemented)."""
+class TestAggregation:
+    """Test cost aggregation across days."""
 
-    def test_per_harness_budget_raises(self):
-        """Per-harness budgets should raise ValueError (not yet supported)."""
-        with pytest.raises(ValueError, match="per-harness budgets are not yet supported"):
-            user_period_cost_budget(period="month", max_cost_usd=100.0, harness="codex-native")
-
-    def test_per_harness_with_thresholds_raises(self):
-        """Per-harness budgets with thresholds should raise ValueError."""
-        with pytest.raises(ValueError, match="per-harness budgets are not yet supported"):
-            user_period_cost_budget(
-                period="month",
-                max_cost_usd=100.0,
-                ask_thresholds_usd=[25.0],
-                harness="codex-native",
-            )
-
-
-class TestCrossHarnessBudget:
-    """Test cross-harness budget mode (harness=None)."""
-
-    def test_cross_harness_no_mention(self):
-        """Cross-harness budgets should not mention harness."""
+    def test_aggregates_multiple_days(self):
+        """Should aggregate costs from multiple days in the period."""
         policy = user_period_cost_budget(
             period="month", max_cost_usd=100.0, ask_thresholds_usd=[25.0]
         )
         event = _event(
             period_cost=[
                 {
-                    "cost_usd": 30.0,
+                    "cost_usd": 15.0,
+                    "ask_approved_usd": 0.0,
+                    "user_id": "alice@example.com",
+                    "day_utc": "2026-08-24",
+                },
+                {
+                    "cost_usd": 15.0,
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,  # Cross-harness
-                }
+                },
             ]
         )
         result = policy(event)
         assert result["result"] == "ASK"
-        # Should not mention harness
-        assert " on " not in result["reason"] or "on an expensive" in result["reason"]
 
 
 class TestBlockAllModels:
@@ -304,7 +270,6 @@ class TestBlockAllModels:
                     "ask_approved_usd": 0.0,
                     "user_id": "alice@example.com",
                     "day_utc": "2026-08-25",
-                    "harness": None,
                 }
             ],
             model="haiku",  # Even cheap model
@@ -331,12 +296,10 @@ class TestToolCallPhase:
                         "ask_approved_usd": 0.0,
                         "user_id": "alice@example.com",
                         "day_utc": "2026-08-25",
-                        "harness": None,
                     }
                 ],
                 "usage": {},
                 "model": "opus",
-                "harness": None,
             },
             "session_state": {},
         }
@@ -357,7 +320,6 @@ class TestToolCallPhase:
                         "ask_approved_usd": 0.0,
                         "user_id": "alice@example.com",
                         "day_utc": "2026-08-25",
-                        "harness": None,
                     }
                 ],
                 "usage": {},
@@ -381,7 +343,6 @@ class TestSingleUserMode:
                 "ask_approved_usd": 0.0,
                 # No user_id field
                 "period": "2026-08",
-                "harness": None,
             }
         )
         result = policy(event)

@@ -99,14 +99,12 @@ class DailyCostState(TypedDict):
     :param ask_approved_usd: Highest soft-limit checkpoint the user approved.
     :param day_utc: The UTC day as "YYYY-MM-DD".
     :param user_id: The user this record belongs to.
-    :param harness: Harness this spending applies to, or "__all__" for cross-harness.
     """
 
     cost_usd: float
     ask_approved_usd: float
     day_utc: str
     user_id: str
-    harness: str | None
 
 
 # Reserved label-key PREFIX that records whether a session is "pinned" in the
@@ -1306,23 +1304,16 @@ class ConversationStore(ABC):
         self,
         user_id: str,
         since_day_utc: str,
-        harness: str | None = None,
     ) -> list[DailyCostState]:
         """
         Return daily cost states for a user from since_day_utc onward.
 
-        Reads the full state (cost_usd, ask_approved_usd, day_utc, harness)
-        for each day with recorded cost >= since_day_utc. Used by both daily
+        Reads the full state (cost_usd, ask_approved_usd, day_utc) for
+        each day with recorded cost >= since_day_utc. Used by both daily
         and period-based cost-budget policies.
-
-        Per-harness spending is stored in the ``harness`` column of the
-        ``user_daily_cost`` table. Cross-harness budgets use the sentinel
-        value ``"__all__"`` to aggregate cost across all harnesses.
 
         :param user_id: The user to read, e.g. ``"alice@example.com"``.
         :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
-        :param harness: Harness to filter by (e.g. ``"codex-native"``), or
-            ``None`` for cross-harness budgets (filters to ``harness="__all__"``).
         :returns: List of :class:`DailyCostState` dicts. Days with no spend
             are omitted. Sorted ascending by day_utc.
         """

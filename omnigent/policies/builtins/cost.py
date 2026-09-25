@@ -976,13 +976,12 @@ def user_period_cost_budget(
     max_cost_usd: float,
     ask_thresholds_usd: list[float] | None = None,
     expensive_models: list[str] | None = None,
-    harness: str | None = None,
 ) -> PolicyCallable:
     """Factory: gate on the session OWNER's per-period LLM spend (USD).
 
     Unified policy that supports different time periods (day, week, month,
-    quarter, year) with optional per-harness budgets. Identical gating logic to
-    :func:`user_daily_cost_budget`, but configurable for different granularities.
+    quarter, year). Identical gating logic to :func:`user_daily_cost_budget`,
+    but configurable for different granularities.
 
     The budget is the session owner's **cumulative spend across all their
     sessions for the current period (UTC)** instead of this one session's
@@ -992,21 +991,15 @@ def user_period_cost_budget(
     - **Soft (`ask_thresholds_usd`)**: the first time the owner's period
       spend crosses a checkpoint, the turn (request phase) or tool call
       (tool-call phase) is parked for approval (ASK). The approval is
-      recorded **per user+period+harness** (in the appropriate store table
-      via a reserved ``state_updates`` key the engine routes), so an
-      approved checkpoint won't re-prompt the user again that period —
-      including from a different session. A decline blocks that one turn /
-      tool call and re-asks next time.
+      recorded **per user+period** (in the appropriate store table via a
+      reserved ``state_updates`` key the engine routes), so an approved
+      checkpoint won't re-prompt the user again that period — including
+      from a different session. A decline blocks that one turn / tool
+      call and re-asks next time.
     - **Hard (`max_cost_usd`)**: once the owner's period spend reaches
       the limit, DENY every tool call while the session is on an
       ``expensive_models`` model (a ``/model`` downgrade gate, not a
       stop); ALLOW once on a cheaper model.
-
-    Currently only **cross-harness** budgets are supported (``harness=None``,
-    the default): cost is summed across all harnesses. Per-harness budgets
-    (``harness="codex-native"``) are not yet implemented because the cost
-    write path does not detect harness identity. Setting ``harness``
-    raises ``ValueError``.
 
     Abstains (ALLOW) on every other phase, and whenever the period cost
     is ``0.0`` (no spend recorded, no owner, or pricing unavailable).
@@ -1032,27 +1025,15 @@ def user_period_cost_budget(
         all models are blocked once the limit is reached. Pass an
         explicit non-empty list for a downgrade gate that only blocks the
         named tiers.
-    :param harness: **Not yet supported.** Reserved for future per-harness
-        budgets. Must be ``None`` (the default). Setting this parameter
-        raises ``ValueError`` because the cost write path does not yet
-        detect harness identity — all daily costs are recorded as
-        cross-harness (``"__all__"`` sentinel).
     :returns: A policy callable implementing the per-user period budget.
     :raises ValueError: If ``period`` is not valid, if ``max_cost_usd`` is
         not positive, if any ``ask_thresholds_usd`` value is not in
-        ``(0, max_cost_usd)``, if any ``expensive_models`` entry is not a
-        non-empty string, or if ``harness`` is set (per-harness budgets
-        not yet implemented).
+        ``(0, max_cost_usd)``, or if any ``expensive_models`` entry is
+        not a non-empty string.
     """
     if period not in ("day", "week", "month", "quarter", "year"):
         raise ValueError(
             f"period must be 'day', 'week', 'month', 'quarter', or 'year', got {period!r}"
-        )
-    if harness is not None:
-        raise ValueError(
-            "per-harness budgets are not yet supported; "
-            "cost write path records only daily costs with cross-harness sentinel. "
-            "Omit the harness parameter for cross-harness budgets (default)."
         )
     if max_cost_usd <= 0:
         raise ValueError(f"max_cost_usd must be > 0, got {max_cost_usd!r}")
@@ -1207,11 +1188,10 @@ def user_period_cost_budget(
                         if owner
                         else f"This {period_noun}'s spend"
                     )
-                    harness_note = f" on {harness}" if harness else ""
                     return {
                         "result": "ASK",
                         "reason": (
-                            f"{spend_subject}{harness_note} ${cost:.2f} passed the ${crossed:.2f} "
+                            f"{spend_subject} ${cost:.2f} passed the ${crossed:.2f} "
                             f"{period_label} warning threshold "
                             f"({period_label} limit ${max_cost_usd:.2f}). Continue?"
                         ),
