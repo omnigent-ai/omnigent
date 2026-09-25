@@ -57,7 +57,13 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
   // yields below `minPx` rather than let the chat break its minimum. Clamping
   // the floor to the ceiling keeps the range valid so `Math.max` can't push the
   // width back up past the chat-preserving cap.
-  return Math.max(Math.min(minPx, ceiling), Math.min(w, ceiling));
+  // A raised minimum keeps the rail's base width when the chat must shrink;
+  // its extra comfort width still yields to the chat.
+  const floor =
+    minPx > MIN_WIDTH_PX
+      ? Math.min(MIN_WIDTH_PX, Math.max(0, window.innerWidth - reservedPx - GAP_PX))
+      : 0;
+  return Math.max(floor, Math.min(minPx, ceiling), Math.min(w, ceiling));
 }
 
 // ---------------------------------------------------------------------------

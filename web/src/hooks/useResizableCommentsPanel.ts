@@ -14,7 +14,14 @@
 // file is opened, matching the other panel-resize hooks. Explicit user
 // resizes are also persisted so a full page reload restores the width.
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
@@ -22,8 +29,8 @@ const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
 const MIN_VIEWER_PX = 240;
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
+/** Matches the `@md/viewer` (28rem) container breakpoint. */
+const SIDE_BY_SIDE_MIN_PX = 448;
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)
@@ -83,16 +90,8 @@ export function resetCommentsWidthStoreForTesting(): void {
 }
 
 /**
- * Makes the CommentsPanel resizable via a drag handle on its left edge.
- *
- * On desktop (`≥ md`) returns a pixel `width` to apply as an inline style
- * plus `handleProps` for the drag handle. On mobile (`< md`) the panel is
- * stacked full-width below the viewer, so `width` is `undefined` (the
- * `w-full` class wins) and the handle should not be rendered.
- *
- * `containerRef` must be attached to the panel root so drag math can anchor
- * to the panel's right edge, and the dynamic max can leave room for the
- * sibling viewer.
+ * Stack comments when the viewer row is too narrow for side-by-side panes.
+ * Attach `containerRef` to the panel to measure the row and anchor drag math.
  */
 export function useResizableCommentsPanel() {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
@@ -119,16 +118,7 @@ export function useResizableCommentsPanel() {
     overlayRef.current = null;
   }, []);
 
-  const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
-  );
-
-  useEffect(() => {
-    const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
-  }, []);
+  const [sideBySide, setSideBySide] = useState(false);
 
   // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
   // the sibling code/diff viewer so the panel can't swallow the whole row.
@@ -138,6 +128,25 @@ export function useResizableCommentsPanel() {
     const max = Math.max(MIN_WIDTH_PX, Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX));
     return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
   }, []);
+
+  // A rail resize changes row width without resizing the window.
+  useLayoutEffect(() => {
+    const row = containerRef.current?.parentElement;
+    if (!row) return;
+    const update = () => {
+      setSideBySide(row.getBoundingClientRect().width >= SIDE_BY_SIDE_MIN_PX);
+      // Restore the preferred width as space returns.
+      setStoredWidth((prev) => {
+        const base = preferredWidth ?? prev;
+        return base !== null ? clampWidth(base) : prev;
+      });
+    };
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(update);
+    ro.observe(row);
+    return () => ro.disconnect();
+  }, [clampWidth]);
 
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
@@ -211,12 +220,12 @@ export function useResizableCommentsPanel() {
   }, [clampWidth]);
 
   return {
-    /** Pixel width to apply as an inline style (undefined on mobile). */
-    width: isDesktop ? width : undefined,
+    /** Pixel width to apply as an inline style while side-by-side. */
+    width,
     /** Attach to the panel root to anchor drag math and the dynamic max. */
     containerRef,
-    /** Whether the resize handle should render (desktop only). */
-    isDesktop,
+    /** Whether the panel sits beside the viewer (apply width, show handle). */
+    sideBySide,
     /** Props to spread onto the resize handle element. */
     handleProps: {
       onMouseDown,
