@@ -502,7 +502,12 @@ class OpenCodeNativeServer:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        await self._wait_until_ready()
+        try:
+            await self._wait_until_ready()
+        except BaseException:
+            # No caller owns the child until startup succeeds.
+            await self.close()
+            raise
 
     async def _wait_until_ready(self, *, attempts: int = 60, delay: float = 0.5) -> None:
         """

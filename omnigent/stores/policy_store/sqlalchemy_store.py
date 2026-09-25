@@ -50,6 +50,7 @@ def _to_entity(row: SqlPolicy) -> Policy:
         enabled=bool(row.enabled),
         updated_at=row.updated_at,
         created_by=row.created_by,
+        workspace_id=row.workspace_id,
     )
 
 

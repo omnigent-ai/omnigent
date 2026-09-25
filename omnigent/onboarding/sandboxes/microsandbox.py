@@ -53,6 +53,7 @@ from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
     RemoteProcess,
+    SandboxGoneError,
     SandboxLauncher,
     host_image_wheel_install_command,
 )
@@ -1013,13 +1014,13 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
 
             try:
                 handle = await msb.Sandbox.get(sandbox_id)
+                if handle.status == msb.SandboxStatus.RUNNING:
+                    return  # already running - resume is a no-op
+                sandbox = await msb.Sandbox.start(sandbox_id, detached=True)
             except msb.SandboxNotFoundError as exc:
-                raise click.ClickException(
-                    f"microsandbox sandbox '{sandbox_id}' not found - it may have been removed."
+                raise SandboxGoneError(
+                    f"microsandbox sandbox '{sandbox_id}' no longer exists"
                 ) from exc
-            if handle.status == msb.SandboxStatus.RUNNING:
-                return  # already running - resume is a no-op
-            sandbox = await msb.Sandbox.start(sandbox_id, detached=True)
             self._connections[sandbox_id] = sandbox
 
         self._forget(sandbox_id)

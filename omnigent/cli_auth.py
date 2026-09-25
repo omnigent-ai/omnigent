@@ -33,6 +33,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent.process_logging import data_dir
 from omnigent.util.server_url import is_workspace_hosted_url
 
 if TYPE_CHECKING:
@@ -58,9 +59,7 @@ def _token_file_path() -> Path:
 
     :returns: Path to ``<data-dir>/auth_tokens.json``.
     """
-    from omnigent_ui_sdk.terminal._config import state_dir
-
-    return Path(state_dir()) / _TOKEN_FILE_NAME
+    return data_dir() / _TOKEN_FILE_NAME
 
 
 def _normalize_server_url(server_url: str) -> str:
@@ -680,6 +679,10 @@ def databricks_request_headers(
     Both values are omitted when absent, so single-workspace and
     local-unauthenticated callers get ``{}`` and are unaffected.
 
+    Also folds in this machine's telemetry installation ID (omitted when
+    telemetry is opted out of), so a server-side emitter can attribute an event
+    to the machine that produced it without a lookup.
+
     Also folds in any opaque dev/test headers from
     :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR` (request-routing selectors set by
     some Databricks deployments) so every chokepoint that builds headers through
@@ -701,10 +704,15 @@ def databricks_request_headers(
         server URL. When omitted, the selector from the stored login record is
         used. An explicit value wins over stored state.
     :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
-        ``X-Databricks-Omnigent-Slice-Key``, and/or the configured extra headers
-        as available, possibly empty.
+        ``X-Databricks-Omnigent-Slice-Key``, ``X-Omnigent-Installation-Id``,
+        and/or the configured extra headers as available, possibly empty.
     """
-    headers: dict[str, str] = {}
+    from omnigent.telemetry.request_headers import telemetry_request_headers
+
+    # This machine's installation ID, so a server-side telemetry emitter can
+    # name the machine an event came from without a lookup. Empty when
+    # telemetry is opted out of.
+    headers: dict[str, str] = telemetry_request_headers()
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
     org_id = org_id or load_databricks_org_id(server_url)

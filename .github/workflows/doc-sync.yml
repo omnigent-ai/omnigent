@@ -234,7 +234,7 @@ jobs:
 
       - name: Set up uv
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
@@ -252,17 +252,9 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          # Install outside the checked-out tree: a repo-root package.json would
-          # otherwise capture this bare `npm install` and hoist it there, leaving
-          # this dir's node_modules empty.
-          CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-          mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
-          node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        with:
+          harness: claude
 
       - name: Write Omnigent provider config
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'

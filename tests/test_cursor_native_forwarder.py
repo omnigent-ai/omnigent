@@ -12,8 +12,10 @@ cursor-agent path is exercised by the e2e gate, not here.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -640,6 +642,7 @@ async def _drive_forwarder(
     *,
     until,
     max_ticks: int = 2000,
+    claim=None,
 ) -> Path:
     """Run the real poll loop against *store* + *poster* until *until* holds.
 
@@ -647,11 +650,12 @@ async def _drive_forwarder(
     POST through *poster*, then polls ``until(bridge_dir)`` (which inspects the
     persisted cursor and/or *poster*) and cancels the loop. Raises if the
     condition is never reached within *max_ticks* — i.e. the loop wedged.
+    *claim* overrides the default never-claimed stub (e.g. to inject failures).
     """
     bridge_dir = tmp_path / "cursor-native" / "sess"
     bridge_dir.mkdir(parents=True)
     monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
-    monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+    monkeypatch.setattr(fwd, "_chat_claimed_by_other", claim or (lambda *a, **k: False))
     monkeypatch.setattr(fwd, "_post_conversation_item", poster)
     task = asyncio.create_task(
         fwd.forward_cursor_store_to_session(
@@ -802,6 +806,136 @@ class TestForwardLoopPostFailures:
         # Retried well past the skip bound, yet never advanced — not quarantined.
         assert fwd._read_state(bridge).last_rowid == 0
         assert not poster.delivered
+
+
+class TestFdExhaustionErrno:
+    """``_fd_exhaustion_errno`` classifies fd-table exhaustion, nothing else."""
+
+    def test_direct_emfile_and_enfile(self) -> None:
+        assert fwd._fd_exhaustion_errno(OSError(errno.EMFILE, "too many")) == errno.EMFILE
+        assert fwd._fd_exhaustion_errno(OSError(errno.ENFILE, "table full")) == errno.ENFILE
+
+    def test_wrapped_cause_chain_is_classified(self) -> None:
+        # httpx wraps the socket-level OSError via ``raise … from exc``.
+        outer = httpx.ConnectError("all connection attempts failed")
+        outer.__cause__ = OSError(errno.EMFILE, "too many open files")
+        assert fwd._fd_exhaustion_errno(outer) == errno.EMFILE
+
+    def test_other_oserror_is_not_classified(self) -> None:
+        assert fwd._fd_exhaustion_errno(OSError(errno.EACCES, "denied")) is None
+        assert fwd._fd_exhaustion_errno(ValueError("nope")) is None
+
+    def test_implicit_context_is_not_classified(self) -> None:
+        # An unrelated error raised WHILE HANDLING an fd failure is a real bug.
+        try:
+            try:
+                raise OSError(errno.EMFILE, "too many open files")
+            except OSError:
+                raise ValueError("unrelated failure during handling") from None
+        except ValueError as exc:
+            assert fwd._fd_exhaustion_errno(exc) is None
+
+    def test_cause_cycle_is_bounded(self) -> None:
+        first, second = ValueError("a"), ValueError("b")
+        first.__cause__, second.__cause__ = second, first
+        assert fwd._fd_exhaustion_errno(first) is None
+
+
+class TestForwardLoopFdExhaustion:
+    """fd exhaustion is environmental: pause with a rate-limited WARNING, resume.
+
+    On the unfixed loop every poll under EMFILE/ENFILE logged the unstructured
+    per-poll ``cursor forwarder poll failed`` ERROR (flooding telemetry) while
+    mirroring silently skipped. The loop must instead warn once per window,
+    keep polling, and note recovery when descriptors free up.
+    """
+
+    @staticmethod
+    def _seed(store: Path) -> None:
+        writer = _make_store(store, [("b1", _user("<user_query>\nhello\n</user_query>"))])
+        writer.close()
+
+    @staticmethod
+    def _poll_failed_errors(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+        return [
+            rec
+            for rec in caplog.records
+            if rec.levelno >= logging.ERROR
+            and rec.getMessage().startswith("cursor forwarder poll failed")
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("code", [errno.EMFILE, errno.ENFILE])
+    async def test_exhaustion_warns_once_then_mirror_recovers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        code: int,
+    ) -> None:
+        store = tmp_path / "store.db"
+        self._seed(store)
+        # The claim check raises fd exhaustion for the first polls (the field
+        # raise site: its iterdir is the poll body's first unguarded fd open),
+        # then the pressure clears.
+        remaining_failures = iter(range(5))
+
+        def claim(*args: object, **kwargs: object) -> bool:
+            if next(remaining_failures, None) is not None:
+                raise OSError(code, "too many open files")
+            return False
+
+        poster = _FakePoster(lambda item: None)
+        with caplog.at_level(logging.DEBUG, logger=fwd._logger.name):
+            bridge = await _drive_forwarder(
+                monkeypatch,
+                tmp_path,
+                store,
+                poster,
+                until=lambda b: any(
+                    "recovered after fd exhaustion" in rec.getMessage() for rec in caplog.records
+                ),
+                claim=claim,
+            )
+        # Mirroring resumed once the pressure cleared.
+        assert [item.rowid for item in poster.delivered] == [1]
+        assert fwd._read_state(bridge).last_rowid == 1
+        # No unstructured per-poll ERROR for the environmental condition…
+        assert not self._poll_failed_errors(caplog)
+        # …one rate-limited WARNING for the whole multi-poll window…
+        warnings = [
+            rec
+            for rec in caplog.records
+            if rec.levelno == logging.WARNING and "fd exhaustion" in rec.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_other_poll_failures_still_log_the_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # The classification must not swallow real defects: a non-fd OSError
+        # keeps the loud per-poll ERROR.
+        store = tmp_path / "store.db"
+        self._seed(store)
+
+        def claim(*args: object, **kwargs: object) -> bool:
+            raise OSError(errno.EACCES, "permission denied")
+
+        poster = _FakePoster(lambda item: None)
+        with caplog.at_level(logging.DEBUG, logger=fwd._logger.name):
+            await _drive_forwarder(
+                monkeypatch,
+                tmp_path,
+                store,
+                poster,
+                until=lambda b: bool(self._poll_failed_errors(caplog)),
+                claim=claim,
+            )
+        assert not [rec for rec in caplog.records if "fd exhaustion" in rec.getMessage()]
 
 
 # ---------------------------------------------------------------------------

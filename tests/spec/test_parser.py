@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import ntpath
+from functools import partialmethod
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
 
-from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _parse_skill, discover_host_skills, parse
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner import sandbox
+from omnigent.spec import parser
+from omnigent.spec.parser import (
+    AgentImageConfigMissingError,
+    _parse_skill,
+    discover_host_skills,
+    parse,
+)
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
@@ -47,6 +58,21 @@ def test_parse_minimal(agent_dir: Path) -> None:
 def test_parse_missing_config_yaml(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match=r"config.yaml not found"):
         parse(tmp_path)
+
+
+def test_parse_missing_config_yaml_is_a_coded_not_found(tmp_path: Path) -> None:
+    """A missing config.yaml must not reach the server as an unhandled 500.
+
+    Kept a ``FileNotFoundError`` as well, so the documented contract and any
+    caller already catching that still hold.
+    """
+    with pytest.raises(AgentImageConfigMissingError) as caught:
+        parse(tmp_path)
+
+    assert isinstance(caught.value, OmnigentError)
+    assert isinstance(caught.value, FileNotFoundError)
+    assert caught.value.code == ErrorCode.NOT_FOUND
+    assert caught.value.http_status == 404
 
 
 def test_parse_non_mapping_config(tmp_path: Path) -> None:
@@ -426,6 +452,76 @@ def test_parse_instructions_file_reference(agent_dir: Path) -> None:
     (agent_dir / "config.yaml").write_text(yaml.dump(config))
     spec = parse(agent_dir)
     assert spec.instructions == "Custom system prompt from file."
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_embedded_nul_stays_literal(
+    agent_dir: Path, instruction_key: str
+) -> None:
+    value = "invalid\0instructions.md"
+    config = {"spec_version": 1, instruction_key: value}
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    (agent_dir / "AGENTS.md").write_text("Lower-priority instructions.")
+
+    assert parse(agent_dir).instructions == value
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt", None])
+def test_parse_instructions_decode_error_propagates(
+    agent_dir: Path, monkeypatch: pytest.MonkeyPatch, instruction_key: str | None
+) -> None:
+    """Decode real files as UTF-8 regardless of the test machine's locale."""
+    monkeypatch.setattr(Path, "read_text", partialmethod(Path.read_text, encoding="utf-8"))
+    config = {"spec_version": 1}
+    if instruction_key is not None:
+        config[instruction_key] = "AGENTS.md"
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    (agent_dir / "AGENTS.md").write_bytes(b"\xff")
+    (agent_dir / "CLAUDE.md").write_text("Lower-priority instructions.")
+
+    with pytest.raises(UnicodeDecodeError):
+        parse(agent_dir)
+
+
+@pytest.mark.parametrize(
+    "resolved_root",
+    [
+        pytest.param(r"\\server\share", id="unc-share"),
+        pytest.param("\\\\server\\share\\", id="unc-share-trailing-separator"),
+        pytest.param(r"\\?\UNC\server\share", id="extended-unc-share"),
+        pytest.param(r"C:\bundle", id="drive-directory"),
+    ],
+)
+@pytest.mark.parametrize("outside", [False, True], ids=["contained", "sibling"])
+def test_read_contained_file_windows_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolved_root: str, outside: bool
+) -> None:
+    """Simulate Windows canonical paths without requiring a live network share."""
+    resolved_candidate = (
+        resolved_root.rstrip(ntpath.sep) + ("-other" if outside else "") + r"\AGENTS.md"
+    )
+    realpath = Mock(side_effect=[resolved_root, resolved_candidate])
+    windows_os = SimpleNamespace(
+        path=SimpleNamespace(realpath=realpath, join=ntpath.join), sep=ntpath.sep
+    )
+    candidate = Mock(spec=Path)
+    candidate.is_file.return_value = True
+    candidate.read_text.return_value = "Instruction file contents."
+    path_factory = Mock(return_value=candidate)
+    monkeypatch.setattr(parser, "os", windows_os)
+    monkeypatch.setattr(sandbox, "os", windows_os)
+    monkeypatch.setattr(parser, "Path", path_factory)
+
+    result = parser._read_contained_file(tmp_path, "AGENTS.md")
+
+    assert realpath.call_count == 2
+    if outside:
+        assert result is None
+        path_factory.assert_not_called()
+    else:
+        assert result == "Instruction file contents."
+        path_factory.assert_called_once_with(resolved_candidate)
+        candidate.read_text.assert_called_once_with(encoding="utf-8")
 
 
 def test_parse_instructions_rejects_path_traversal(tmp_path: Path) -> None:
@@ -3154,6 +3250,87 @@ def test_parse_mcp_http_rejects_stdio_fields(agent_dir: Path) -> None:
         parse(agent_dir)
 
 
+def test_parse_mcp_stdio_tools_whitelist(agent_dir: Path) -> None:
+    """A per-server ``tools:`` whitelist on a sidecar stdio MCP propagates to
+    ``MCPServerConfig.tools`` (regression: the sidecar parsers dropped the
+    key entirely, so a restrictive allow-list in ``tools/mcp/*.yaml`` was a
+    silent no-op — the agent got every tool despite the YAML on disk saying
+    otherwise. Same allow-list, same bug class as the inline form fixed in
+    ``test_parse_inline_mcp_tools_whitelist``.)
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "github",
+        "transport": "stdio",
+        "command": "npx",
+        "tools": ["search_issues", "get_pull_request"],
+    }
+    (mcp_dir / "github.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    mcp = spec.mcp_servers[0]
+    assert mcp.tools == ["search_issues", "get_pull_request"]
+
+
+def test_parse_mcp_http_tools_whitelist(agent_dir: Path) -> None:
+    """Same regression as ``test_parse_mcp_stdio_tools_whitelist``, for the
+    sidecar HTTP transport.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "docs",
+        "transport": "http",
+        "url": "https://mcp.example.com/sse",
+        "tools": ["search_docs"],
+    }
+    (mcp_dir / "docs.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    mcp = spec.mcp_servers[0]
+    assert mcp.tools == ["search_docs"]
+
+
+def test_parse_mcp_sidecar_tools_absent_is_none(agent_dir: Path) -> None:
+    """Omitting ``tools:`` on a sidecar MCP leaves the allow-list as ``None``
+    (expose all) — mirrors ``test_parse_inline_mcp_tools_absent_is_none``.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "github.yaml").write_text(
+        yaml.dump({"name": "github", "transport": "stdio", "command": "npx"})
+    )
+    mcp = parse(agent_dir).mcp_servers[0]
+    assert mcp.tools is None
+
+
+def test_parse_mcp_sidecar_tools_non_list_raises(agent_dir: Path) -> None:
+    """A non-list ``tools:`` value on a sidecar MCP is a clear error, not a
+    silent type bug — mirrors ``test_parse_inline_mcp_tools_non_list_raises``.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "github.yaml").write_text(
+        yaml.dump(
+            {
+                "name": "github",
+                "transport": "stdio",
+                "command": "npx",
+                "tools": "search_issues",
+            }
+        )
+    )
+    with pytest.raises(OmnigentError, match=r"'tools' must be a list"):
+        parse(agent_dir)
+
+
 def test_parse_mcp_unknown_transport_raises(agent_dir: Path) -> None:
     """
     ``transport: grpc`` or any other value fails loud with a
@@ -4080,7 +4257,7 @@ def test_parse_credential_proxy_databricks_cli_rejected_on_macos(tmp_path: Path)
                     "source": {"env": "X", "file": "/tmp/s"},
                 }
             ],
-            r"exactly one of 'env', 'file', or 'command'",
+            r"exactly one of 'env', 'file', 'command', or 'unix_socket'",
         ),
         # Malformed ``env`` injection-shim name.
         (

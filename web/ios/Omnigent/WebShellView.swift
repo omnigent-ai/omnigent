@@ -4,8 +4,9 @@ struct WebShellView: View {
   let initialURL: URL
   let connectToNewServer: () -> Void
   let switchToServer: (URL) -> Void
-  let loadFailed: (URL, String) -> Void
+  let loadFailed: (URL, String?) -> Void
   let loadSucceeded: () -> Void
+  var signedOut: ((DatabricksWebContext, Task<Void, Error>) -> Void)?
 
   @Environment(\.colorScheme) private var colorScheme
   @EnvironmentObject private var settings: SettingsStore
@@ -17,6 +18,18 @@ struct WebShellView: View {
   /// link to the current server isn't lost (its `onOpenPath` subscriber isn't
   /// mounted until the SPA finishes booting).
   @State private var deferredOpenPath: String?
+  @State private var deferredNotificationPath: String?
+  @State private var connectionID = UUID()
+  @State private var connectionIntent: DatabricksConnectionIntent = .connect
+  @State private var recoveryPageURL: URL?
+  @State private var recoveryPolicy = DatabricksRecoveryPolicy()
+  @State private var needsReauthentication = false
+  @State private var workspacePageLoaded = false
+
+  private var isWorkspace: Bool {
+    ServerAuthentication(origin: initialURL.omnigentOrigin) == .databricksWorkspace
+  }
+  private var showsServerSwitcher: Bool { isWorkspace || !model.serverSwitcherHidden }
 
   var body: some View {
     GeometryReader { geometry in
@@ -25,29 +38,53 @@ struct WebShellView: View {
           initialURL: initialURL,
           model: model,
           settings: settings,
+          databricksInternalFeaturesEnabled: managedConfiguration.databricksInternalFeaturesEnabled,
           loadFailed: loadFailed,
-          loadSucceeded: loadSucceeded,
+          loadSucceeded: {
+            workspacePageLoaded = true
+            loadSucceeded()
+          },
           pushServerPicker: pushServerPicker,
           requestSwitchServer: switchServerIfListed,
-          openServerSetup: connectToNewServer
+          openServerSetup: connectToNewServer,
+          connectionIntent: connectionIntent,
+          recoveryPageURL: recoveryPageURL,
+          recoverWorkspace: recoverWorkspace,
+          workspaceReady: { recoveryPolicy.markReady() },
+          reauthenticateWorkspace: { page in
+            recoveryPageURL = page
+            needsReauthentication = true
+          },
+          signedOut: signedOut
         )
+        .id(DatabricksWebContext.viewIdentity(for: initialURL) + connectionID.uuidString)
         .ignoresSafeArea()
 
+        if model.isAuthenticating {
+          VStack(spacing: 16) {
+            ProgressView("Connecting to workspace…")
+            Button("Cancel") { model.cancelAuthentication?() }
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .background(DesignTokens.background(colorScheme))
+        }
+
         ServerSwitcher(
-          currentURL: model.currentURL ?? initialURL,
+          currentURL: initialURL,
           recents: ManagedServers.merged(
             managed: managedConfiguration.serverURLs, recents: settings.recentServers),
           isLoading: model.isLoading,
           maxWidth: ServerSwitcherMetrics.maxWidth(for: geometry.size.width),
           switchServer: switchServer,
           connectToNewServer: connectToNewServer,
-          reload: model.reload
+          reload: reload,
+          signOut: model.signOut
         )
         .padding(.top, InsetMetrics.serverSwitcherTopPadding)
-        .opacity(model.serverSwitcherHidden ? 0 : 1)
-        .scaleEffect(model.serverSwitcherHidden ? 0.96 : 1, anchor: .top)
-        .allowsHitTesting(!model.serverSwitcherHidden)
-        .accessibilityHidden(model.serverSwitcherHidden)
+        .opacity(showsServerSwitcher ? 1 : 0)
+        .scaleEffect(showsServerSwitcher ? 1 : 0.96, anchor: .top)
+        .allowsHitTesting(showsServerSwitcher)
+        .accessibilityHidden(!showsServerSwitcher)
       }
       .animation(.easeInOut(duration: 0.16), value: model.serverSwitcherHidden)
       .ignoresSafeArea(.keyboard)
@@ -73,10 +110,30 @@ struct WebShellView: View {
         .animation(.easeInOut(duration: 0.2), value: model.bottomBarVisible)
       }
       .ignoresSafeArea(.keyboard)
+      #if DEBUG
+        .overlay(alignment: .bottomLeading) {
+          if isWorkspace, !model.isAuthenticating {
+            WorkspaceDebugMenu(inject: { await model.injectDebugFault?($0) })
+            .padding(.leading, 12)
+            .padding(.bottom, InsetMetrics.bottomBarFootprint + 10)
+          }
+        }
+      #endif
+    }
+    .alert("Sign in again?", isPresented: $needsReauthentication) {
+      Button("Sign In") {
+        connectionIntent = .connect
+        workspacePageLoaded = false
+        connectionID = UUID()
+      }
+      Button("Cancel", role: .cancel) { loadFailed(initialURL, nil) }
+    } message: {
+      Text(DatabricksSessionError.reauthenticationRequired.localizedDescription)
     }
     .onChange(of: router.pendingNotificationPath) { _, _ in
       if let path = router.consumeNotificationPath() {
-        model.emitNotificationActivation(path)
+        deferredNotificationPath = path
+        flushDeferredNavigation()
       }
     }
     .onChange(of: router.pendingOpenPath) { _, _ in
@@ -85,18 +142,11 @@ struct WebShellView: View {
       // server, or one that arrived mid-navigation), defer the path until the
       // page finishes loading — emitting now would fire into a page whose
       // `onOpenPath` subscriber isn't mounted yet and be lost.
-      if model.isLoading {
-        deferredOpenPath = path
-      } else {
-        model.emitOpenPath(path)
-      }
+      deferredOpenPath = path
+      flushDeferredNavigation()
     }
-    .onChange(of: model.isLoading) { _, loading in
-      if !loading, let path = deferredOpenPath {
-        deferredOpenPath = nil
-        model.emitOpenPath(path)
-      }
-    }
+    .onChange(of: model.isLoading) { _, _ in flushDeferredNavigation() }
+    .onChange(of: workspacePageLoaded) { _, _ in flushDeferredNavigation() }
     .onChange(of: model.isLoading) { _, loading in
       // Re-push the native bar footprints and the server-picker payload once
       // each load completes; the JS bridge caches both so later-mounting
@@ -109,6 +159,43 @@ struct WebShellView: View {
         pushServerPicker()
       }
     }
+  }
+
+  private func flushDeferredNavigation() {
+    guard !model.isLoading, !model.isAuthenticating, !needsReauthentication,
+      !isWorkspace || workspacePageLoaded
+    else { return }
+    if let path = deferredOpenPath {
+      deferredOpenPath = nil
+      model.emitOpenPath(path)
+    }
+    if let path = deferredNotificationPath {
+      deferredNotificationPath = nil
+      model.emitNotificationActivation(path)
+    }
+  }
+
+  private func recoverWorkspace(_ pageURL: URL) {
+    guard recoveryPolicy.begin() else {
+      loadFailed(initialURL, DatabricksSessionError.recoveryExhausted.localizedDescription)
+      return
+    }
+    recoveryPageURL = pageURL
+    connectionIntent = .recover
+    workspacePageLoaded = false
+    connectionID = UUID()
+  }
+
+  private func reload() {
+    guard isWorkspace else {
+      model.reload()
+      return
+    }
+    recoveryPageURL = model.currentURL ?? initialURL
+    recoveryPolicy = DatabricksRecoveryPolicy()
+    connectionIntent = .connect
+    workspacePageLoaded = false
+    connectionID = UUID()
   }
 
   /// Every server the picker may offer or switch to — administrator-preset
@@ -149,6 +236,7 @@ private struct ServerSwitcher: View {
   let switchServer: (String) -> Void
   let connectToNewServer: () -> Void
   let reload: () -> Void
+  let signOut: (() -> Void)?
 
   @Environment(\.colorScheme) private var colorScheme
 
@@ -156,12 +244,17 @@ private struct ServerSwitcher: View {
     Menu {
       Button {
       } label: {
-        Label(currentURL.omnigentHostLabel, systemImage: "checkmark")
+        Label(DatabricksWebContext.serverLabel(for: currentURL), systemImage: "checkmark")
       }
       .disabled(true)
 
       let otherServers = recents.filter {
-        URL(string: $0)?.omnigentOrigin != currentURL.omnigentOrigin
+        guard let url = URL(string: $0) else { return false }
+        if ServerAuthentication(origin: currentURL.omnigentOrigin) == .databricksWorkspace {
+          return DatabricksWebContext.contextIdentity(for: url)
+            != DatabricksWebContext.contextIdentity(for: currentURL)
+        }
+        return url.omnigentOrigin != currentURL.omnigentOrigin
       }
       if !otherServers.isEmpty {
         Divider()
@@ -169,7 +262,7 @@ private struct ServerSwitcher: View {
           Button {
             switchServer(recent)
           } label: {
-            Text(URL(string: recent)?.omnigentHostLabel ?? recent)
+            Text(URL(string: recent).map { DatabricksWebContext.serverLabel(for: $0) } ?? recent)
           }
         }
       }
@@ -185,9 +278,15 @@ private struct ServerSwitcher: View {
       Button(action: connectToNewServer) {
         Label("Connect to New Server", systemImage: "plus")
       }
+      if let signOut {
+        Divider()
+        Button(role: .destructive, action: signOut) {
+          Label("Sign Out of Workspace", systemImage: "rectangle.portrait.and.arrow.right")
+        }
+      }
     } label: {
       HStack(spacing: 6) {
-        Text(currentURL.omnigentHostLabel)
+        Text(DatabricksWebContext.serverLabel(for: currentURL))
           .fontWeight(.medium)
           .lineLimit(1)
           .truncationMode(.middle)
@@ -224,6 +323,81 @@ private struct ServerSwitcher: View {
     .accessibilityLabel("Switch server")
   }
 }
+
+#if DEBUG
+  /// Breaks one piece of the live workspace session on demand so recovery, refresh, and the sign-in
+  /// prompt can be exercised by hand. Compiled out of release builds.
+  private struct WorkspaceDebugMenu: View {
+    let inject: (DatabricksDebugFault) async -> String?
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var status: String?
+    @State private var busy = false
+
+    var body: some View {
+      VStack(alignment: .leading, spacing: 6) {
+        if let status {
+          Text(status)
+            .font(.system(size: 11))
+            .foregroundStyle(DesignTokens.foreground(colorScheme))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .frame(maxWidth: 240, alignment: .leading)
+            .background(
+              .ultraThinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+            )
+            .onTapGesture { self.status = nil }
+            .accessibilityHint("Tap to dismiss")
+        }
+
+        Menu {
+          ForEach(DatabricksDebugFault.allCases) { fault in
+            Button(role: .destructive) {
+              run(fault)
+            } label: {
+              Label(fault.title, systemImage: fault.systemImage)
+            }
+          }
+        } label: {
+          HStack(spacing: 5) {
+            Image(systemName: "ladybug")
+              .font(.system(size: 11, weight: .semibold))
+            Text("Debug")
+              .font(.system(size: 12))
+            if busy {
+              ProgressView().controlSize(.mini)
+            }
+          }
+          .foregroundStyle(DesignTokens.foreground(colorScheme))
+          .padding(.horizontal, 10)
+          .frame(height: InsetMetrics.serverSwitcherHeight)
+          .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+        // Chrome stays outside the label closure; see ServerSwitcher for why.
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay {
+          RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.08), radius: 10, y: 4)
+        .accessibilityLabel("Break workspace session for testing")
+      }
+    }
+
+    private func run(_ fault: DatabricksDebugFault) {
+      guard !busy else { return }
+      busy = true
+      status = nil
+      Task {
+        let message = await inject(fault)
+        busy = false
+        status = message ?? "The workspace view is not ready yet."
+      }
+    }
+  }
+#endif
 
 private enum ServerSwitcherMetrics {
   static func maxWidth(for containerWidth: CGFloat) -> CGFloat {

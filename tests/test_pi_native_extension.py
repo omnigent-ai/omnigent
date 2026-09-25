@@ -3047,6 +3047,48 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
+def test_bound_models_use_literal_ids_and_only_managed_providers() -> None:
+    """A raw gateway selection cannot switch to an ambient vendor provider."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  process.env.OMNIGENT_PI_INFERENCE_BOUND = "1";
+  catalog.unshift({ provider: "anthropic", id: "databricks-claude-opus-4-1", hasKey: true });
+  catalog.push({ provider: "omnigent", id: "foo", hasKey: true });
+  catalog.push({ provider: "omnigent-completions", id: "omnigent/foo", hasKey: true });
+  await handlers.session_start({}, ctx);
+  await deliverModelChange("databricks-claude-opus-4-1");
+  await deliverModelChange("omnigent/foo");
+  assert.deepEqual(setModelCalls.map((model) => [model.provider, model.id]), [
+    ["omnigent", "databricks-claude-opus-4-1"],
+    ["omnigent-completions", "omnigent/foo"],
+  ]);
+  const options = posted.find((event) => event.type === "external_model_options").data.models;
+  assert.deepEqual(options.map((model) => model.id), [
+    "databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1", "foo", "omnigent/foo",
+  ]);
+  await handlers.model_select({ source: "set", model: setModelCalls[1] }, ctx);
+  const changes = posted.filter((event) => event.type === "external_model_change");
+  assert.equal(changes[0].data.model, "databricks-claude-sonnet-4-6");
+  assert.equal(changes[1].data.model, "omnigent/foo");
+  await deliverModelChange("anthropic/databricks-claude-opus-4-1");
+  assert.equal(setModelCalls.length, 2);
+  assert.equal(errorItems().length, 1);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
     """A user ``/model`` pick inside Pi posts ``external_model_change`` (two-way sync).
 
@@ -3223,6 +3265,159 @@ def test_session_start_empty_registry_posts_no_model_options(tmp_path: Path) -> 
   finish();
 })().catch((error) => {
   finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+_SEND_DELIVERY_HARNESS = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+const extensionPath = process.argv[1];
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-send-delivery-"));
+const inboxDir = path.join(tmpDir, "inbox");
+const configPath = path.join(tmpDir, "config.json");
+fs.mkdirSync(inboxDir, { recursive: true });
+fs.writeFileSync(configPath, JSON.stringify({ inboxDir }));
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+let pollInbox = null;
+global.setInterval = (fn, _ms) => {
+  pollInbox = fn;
+  return { fakeInterval: true };
+};
+
+const handlers = {};
+const sends = [];
+const pi = {
+  registerCommand() {},
+  on(eventName, handler) {
+    handlers[eventName] = handler;
+  },
+  sendUserMessage(content, options) {
+    sends.push({ content, options });
+  },
+};
+
+require(extensionPath)(pi);
+
+let seq = 0;
+function enqueue(content) {
+  seq += 1;
+  fs.writeFileSync(
+    path.join(inboxDir, `00${seq}-msg.json`),
+    JSON.stringify({ id: `msg-${seq}`, type: "user_message", content }),
+  );
+}
+
+async function drain() {
+  pollInbox();
+  await new Promise((resolve) => setImmediate(resolve));
+}
+"""
+
+
+def test_mid_turn_send_now_is_steered_into_active_turn() -> None:
+    """
+    A user message polled while a turn is ACTIVE must be steered.
+
+    The Pi SDK holds ``deliverAs: "followUp"`` until the whole agent loop
+    finishes, so a mid-turn web "Send now" delivered as a follow-up stays
+    visibly queued in the Pi CLI while the web UI reports success. The inbox
+    poller must deliver it with ``deliverAs: "steer"`` instead.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _SEND_DELIVERY_HARNESS
+        + r"""
+(async () => {
+  // A live turn: the context reports not-idle throughout.
+  await handlers.session_start({}, { isIdle: () => false, abort() {} });
+  enqueue("steer me");
+  await drain();
+  assert.deepEqual(sends, [
+    { content: "steer me", options: { deliverAs: "steer" } },
+  ]);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_idle_send_stays_a_follow_up() -> None:
+    """
+    A user message polled while the agent is IDLE keeps follow-up delivery.
+
+    With no active turn there is nothing to steer into; ``followUp`` starts
+    the next turn immediately, preserving initiating-message behavior.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _SEND_DELIVERY_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, { isIdle: () => true, abort() {} });
+  enqueue("start a new turn");
+  await drain();
+  assert.deepEqual(sends, [
+    { content: "start a new turn", options: { deliverAs: "followUp" } },
+  ]);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_send_delivery_falls_back_to_agent_loop_state() -> None:
+    """
+    Without ``isIdle()`` the delivery mode follows the agent loop state.
+
+    Older Pi SDKs expose no ``isIdle()``; the poller must then steer between
+    ``agent_start`` and ``agent_end`` and fall back to follow-up delivery once
+    the loop has ended -- the same fallback ``requestInterrupt`` uses.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _SEND_DELIVERY_HARNESS
+        + r"""
+(async () => {
+  // Context without isIdle(): the loop-state flag is the only signal.
+  const ctx = { abort() {} };
+  await handlers.session_start({}, ctx);
+  await handlers.agent_start({}, ctx);
+  enqueue("mid-loop");
+  await drain();
+
+  await handlers.agent_end({}, ctx);
+  enqueue("after-loop");
+  await drain();
+
+  assert.deepEqual(sends, [
+    { content: "mid-loop", options: { deliverAs: "steer" } },
+    { content: "after-loop", options: { deliverAs: "followUp" } },
+  ]);
+})().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
 });
