@@ -220,6 +220,8 @@ def pi_session_records_from_session_items(
     - ``function_call`` -> Pi ``message`` with ``role: "assistant"`` whose
       content carries a ``toolCall`` block.
     - ``function_call_output`` -> Pi ``message`` with ``role: "toolResult"``.
+      Only the first output committed for a ``call_id`` is replayed: Anthropic
+      rejects a history with two ``tool_result`` blocks for one ``tool_use``.
 
     Interrupted assistant turns (and the rest of their response group) are
     skipped so a cancelled turn isn't restored as completed history.
@@ -248,11 +250,20 @@ def pi_session_records_from_session_items(
     records: list[_JsonObject] = [header]
     parent_id: str | None = None
     skip_response_ids = _interrupted_response_ids(items)
+    replayed_call_ids: set[str] = set()
 
     for index, item in enumerate(items):
         response_id = item.get("response_id")
         if isinstance(response_id, str) and response_id in skip_response_ids:
             continue
+        if item.get("type") == "function_call_output":
+            call_id = item.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                # Replay one result per call: a repeated output would make the
+                # next model turn fail with "each tool_use must have a single result".
+                if call_id in replayed_call_ids:
+                    continue
+                replayed_call_ids.add(call_id)
         entries = _pi_entries_from_session_item(
             item,
             session_id=session_id,
