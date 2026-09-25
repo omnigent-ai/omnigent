@@ -303,6 +303,94 @@ def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> 
     assert sent == []
 
 
+def _spawn_with_detached_child(tmp_path: Path) -> tuple[subprocess.Popen, int]:
+    """Start a group-leader parent whose child detaches into its own group.
+
+    Mimics a Codex app server launching a stdio MCP wrapper: the parent is
+    spawned with :func:`_proc.spawn_kwargs` (own session/group) and the child
+    calls ``start_new_session=True``, so ``killpg`` on the parent's group
+    cannot reach the child. Returns the parent handle and the child's pid.
+    """
+    import sys
+
+    pid_file = tmp_path / "detached_child.pid"
+    script = (
+        "import subprocess, sys, time, pathlib\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+    parent = subprocess.Popen([sys.executable, "-c", script], **_proc.spawn_kwargs())
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if pid_file.exists() and pid_file.read_text().strip():
+            return parent, int(pid_file.read_text().strip())
+        time.sleep(0.1)
+    _proc.kill_tree(parent)
+    raise AssertionError("detached child never started")
+
+
+def _assert_reaped(pid: int, what: str) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if not _proc.process_alive(pid):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"{what} (pid {pid}) survived tree teardown")
+
+
+@pytest.mark.posix_only
+def test_terminate_tree_reaps_detached_group_descendants(tmp_path: Path) -> None:
+    """A descendant in its own POSIX group dies with the tree on SIGTERM."""
+    parent, child_pid = _spawn_with_detached_child(tmp_path)
+    try:
+        assert os.getpgid(child_pid) != os.getpgid(parent.pid)
+        _proc.terminate_tree(parent, grace=5)
+        parent.wait(timeout=5)
+        _assert_reaped(child_pid, "detached-group child")
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child_pid, signal.SIGKILL)
+        _proc.kill_tree(parent)
+
+
+@pytest.mark.posix_only
+def test_kill_tree_reaps_detached_group_descendants(tmp_path: Path) -> None:
+    """A descendant in its own POSIX group dies with the tree on SIGKILL."""
+    parent, child_pid = _spawn_with_detached_child(tmp_path)
+    try:
+        assert os.getpgid(child_pid) != os.getpgid(parent.pid)
+        _proc.kill_tree(parent)
+        parent.wait(timeout=5)
+        _assert_reaped(child_pid, "detached-group child")
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child_pid, signal.SIGKILL)
+        _proc.kill_tree(parent)
+
+
+def test_detached_group_pgids_excludes_guarded_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The detached-group collector never yields our own group, the root's
+    group, or pgid <= 1 (the ``kill(-1)`` broadcast)."""
+
+    class _Fake:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+    groups = {0: 500, 100: 200, 101: 200, 102: 500, 103: 1, 104: 300}
+    monkeypatch.setattr(_proc, "IS_POSIX", True)
+    monkeypatch.setattr(_proc, "_getpgid_fn", lambda pid: groups[pid])
+    procs = [_Fake(pid) for pid in (100, 101, 102, 103, 104)]
+    # root=100 (group 200): 101 shares the root group, 102 is ours, 103 is
+    # the broadcast group -- only 104's group 300 is a detached target.
+    assert _proc._detached_group_pgids(100, procs) == {300}
+
+
 def test_terminate_tree_stops_the_process() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
     # Bind to the live PID so psutil pins its creation time; a recycled PID

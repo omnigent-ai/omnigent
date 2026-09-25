@@ -175,13 +175,56 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def _detached_group_pgids(pid: int, procs: list[psutil.Process]) -> set[int]:
+    """
+    Process groups of descendants that detached from ``pid``'s own group.
+
+    A descendant that started its own POSIX group (e.g. each stdio MCP server
+    a Codex app server launches) is not reached by ``killpg`` on the root's
+    group, and once the root dies it reparents to init and can no longer be
+    found from the tree — so these groups must be collected while the tree is
+    still intact and signaled explicitly. Excludes the root's group, our own
+    group, and pgid <= 1 (the ``kill(-1)`` broadcast), mirroring the
+    :func:`_killpg` guards.
+    """
+    if not IS_POSIX or _getpgid_fn is None:
+        return set()
+    try:
+        root_pgid = _getpgid_fn(pid)
+        own_pgid = _getpgid_fn(0)
+    except OSError:
+        return set()
+    pgids: set[int] = set()
+    for proc in procs:
+        if proc.pid == pid:
+            continue
+        try:
+            pgid = _getpgid_fn(proc.pid)
+        except OSError:
+            continue
+        if pgid > 1 and pgid not in (root_pgid, own_pgid):
+            pgids.add(pgid)
+    return pgids
+
+
+def _signal_pgids(pgids: set[int], sig: int) -> None:
+    """Best-effort ``killpg`` of each group; "gone / not permitted" is a no-op."""
+    if _killpg_fn is None:
+        return
+    for pgid in pgids:
+        with suppress(OSError):
+            _killpg_fn(pgid, sig)
+
+
 def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     """
     Gracefully stop ``process`` and all of its descendants.
 
     Sends ``SIGTERM`` (POSIX) / ``terminate()`` (Windows ``TerminateProcess``)
     to the whole tree. On POSIX the process-group fast path is tried first;
-    otherwise (and on Windows) the tree is walked with :mod:`psutil`. Already
+    otherwise (and on Windows) the tree is walked with :mod:`psutil`.
+    Descendants that started their own POSIX process group are signaled too
+    (``killpg`` on the root's group cannot reach them). Already
     exited processes are no-ops. All "process gone / not permitted" errors are
     swallowed — teardown is best-effort.
 
@@ -196,15 +239,18 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
             process.terminate()
         return
 
+    procs = _walk_descendants(pid)
+    detached_pgids = _detached_group_pgids(pid, procs)
     if _killpg(pid, signal.SIGTERM):
+        _signal_pgids(detached_pgids, signal.SIGTERM)
         if grace:
             _wait_gone(pid, grace)
         return
 
-    procs = _walk_descendants(pid)
     for proc in procs:
         with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.terminate()
+    _signal_pgids(detached_pgids, signal.SIGTERM)
     if not procs:
         with suppress(Exception):
             process.terminate()
@@ -228,13 +274,16 @@ def kill_tree(process: _ProcessLike | None) -> None:
             process.kill()
         return
 
+    procs = _walk_descendants(pid)
+    detached_pgids = _detached_group_pgids(pid, procs)
     if _killpg(pid, _SIGKILL):
+        _signal_pgids(detached_pgids, _SIGKILL)
         return
 
-    procs = _walk_descendants(pid)
     for proc in procs:
         with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.kill()
+    _signal_pgids(detached_pgids, _SIGKILL)
     if not procs:
         with suppress(Exception):
             process.kill()
