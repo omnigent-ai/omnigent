@@ -8366,7 +8366,7 @@ describe("NewChatLandingScreen agent picker + Edit settings", () => {
     fireEvent.pointerMove(screen.getByRole("menuitemradio", { name: "Plan" }));
     closeMenu();
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Manual",
+      "Permission mode: Default",
     );
   });
 
@@ -9525,7 +9525,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     );
     selectAgent("a1");
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Manual",
+      "Permission mode: Default",
     );
   });
 
