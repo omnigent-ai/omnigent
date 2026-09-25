@@ -903,6 +903,11 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param failure_category: ``StopFailure`` error category, e.g.
+        ``"rate_limit"``. ``None`` for other events or when absent.
+    :param failure_message: ``StopFailure`` error text Claude Code rendered
+        for the turn (the payload's ``last_assistant_message``), e.g.
+        ``"API Error: 500 Internal server error"``. ``None`` when absent.
     """
 
     event_cursor: int
@@ -923,6 +928,8 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_category: str | None = None
+    failure_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3709,6 +3716,18 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 if (detail := _normalize_background_task(task)) is not None
             ]
             background_tasks = details or None
+    failure_category: str | None = None
+    failure_message: str | None = None
+    if event_name == "StopFailure" and isinstance(payload, dict):
+        failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
+        # The CLI renders this text for its own error, so it reads like the
+        # mirrored API-error message.
+        raw_message = _bounded_hook_text(
+            payload.get("last_assistant_message"), _FAILURE_MESSAGE_MAX_CHARS
+        )
+        failure_message = (
+            _display_text(raw_message, is_api_error=True) if raw_message is not None else None
+        )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -3752,7 +3771,28 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        failure_category=failure_category,
+        failure_message=failure_message,
     )
+
+
+# Bounds on ``StopFailure`` text copied into the failed status edge.
+_FAILURE_CATEGORY_MAX_CHARS = 100
+_FAILURE_MESSAGE_MAX_CHARS = 4000
+
+
+def _bounded_hook_text(value: object, max_chars: int) -> str | None:
+    """
+    Return a stripped, length-bounded hook string field.
+
+    :param value: Raw payload value, e.g. ``"rate_limit"``.
+    :param max_chars: Maximum characters kept, e.g. ``100``.
+    :returns: The trimmed text, or ``None`` when absent, blank, or not a string.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:max_chars] if text else None
 
 
 def _read_complete_jsonl_records(
@@ -5937,6 +5977,7 @@ def start_tool_relay(
     loop: asyncio.AbstractEventLoop,
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
+    file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
 ) -> ClaudeNativeToolRelay:
     """
     Start a relay for Omnigent tool calls from Claude.
@@ -5959,6 +6000,10 @@ def start_tool_relay(
     :param policy_client: Runner's async httpx client for policy eval proxy.
     :param session_id: Session id written into ``tool_relay.json`` so hook
         subprocesses can construct the correct ``/policies/evaluate`` URL.
+    :param file_change_observer: Optional coroutine callback run on *loop*
+        for each ``/hook/observe-tool`` payload; the runner uses it to
+        record native file-mutating tool calls in the session's filesystem
+        registry.
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
@@ -5969,6 +6014,7 @@ def start_tool_relay(
         policy_client=policy_client,
         session_id=session_id,
         bridge_dir=bridge_dir,
+        file_change_observer=file_change_observer,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
@@ -6246,6 +6292,12 @@ def _handler_factory(
 # never cut mid-reason by the truncation.
 _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 
+# How long /hook/observe-tool waits for the file-change observer before
+# answering. Generous enough for a first-call registry resolution (one server
+# round trip); each request runs on its own ThreadingHTTPServer thread, so
+# waiting never stalls other relay traffic.
+_FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
+
 
 def _tool_relay_handler_factory(
     token: str,
@@ -6255,6 +6307,7 @@ def _tool_relay_handler_factory(
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
     bridge_dir: Path | None = None,
+    file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -6266,6 +6319,10 @@ def _tool_relay_handler_factory(
     :param policy_client: Optional async httpx client for proxying
         ``/policies/evaluate`` to the Omnigent server.
     :param session_id: Session id for the ``/policies/evaluate`` path.
+    :param file_change_observer: Optional coroutine callback run on *loop*
+        for each ``/hook/observe-tool`` payload, so the runner can record
+        native file-mutating tool calls in the session's filesystem
+        registry.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
@@ -6309,6 +6366,16 @@ def _tool_relay_handler_factory(
 
                 if session_id is not None:
                     observe_hook(session_id, payload)
+                    if file_change_observer is not None:
+                        # Wait so the record lands before the hook returns and
+                        # the panel's next fetch can see it; the observer owns
+                        # its own error handling, so a timeout only means the
+                        # recording finishes in the background.
+                        future = asyncio.run_coroutine_threadsafe(
+                            _await_tool_result(file_change_observer(payload)), loop
+                        )
+                        with contextlib.suppress(Exception):
+                            future.result(timeout=_FILE_CHANGE_OBSERVER_TIMEOUT_S)
                 self._send_json({})
                 return
             if self.path == "/hook/claude/evaluate-policy":
@@ -8636,22 +8703,35 @@ def _assistant_message_item(
         text.
     :returns: Parsed transcript item.
     """
-    display_text = text
-    stripped = text.strip()
-    if _CONTEXT_OVERFLOW_RE.match(stripped):
-        display_text = _CONTEXT_OVERFLOW_REPLACEMENT
-    elif is_api_error and _LOGIN_COMMAND_RE.search(stripped):
-        display_text = f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return ClaudeTranscriptItem(
         source_id=_source_id(source_key, item_index, "message"),
         item_type="message",
         data={
             "role": "assistant",
             "agent": agent_name,
-            "content": [{"type": "output_text", "text": display_text}],
+            "content": [
+                {"type": "output_text", "text": _display_text(text, is_api_error=is_api_error)}
+            ],
         },
         response_id=response_id,
     )
+
+
+def _display_text(text: str, *, is_api_error: bool) -> str:
+    """
+    Rewrite Claude text whose own remedy is a dead end in the web chat.
+
+    :param text: Assistant or CLI error text, e.g. ``"Prompt is too long"``.
+    :param is_api_error: Whether Claude Code authored the text as its own
+        error; gates the ``/login`` guidance append.
+    :returns: The text to show, e.g. the context-overflow guidance.
+    """
+    stripped = text.strip()
+    if _CONTEXT_OVERFLOW_RE.match(stripped):
+        return _CONTEXT_OVERFLOW_REPLACEMENT
+    if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
+        return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
+    return text
 
 
 def _stripped_image_placeholder(source: _JsonObject) -> str:

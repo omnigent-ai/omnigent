@@ -1,9 +1,66 @@
 # Prepared reproduction environment
 
+## Execution evidence (opt-in)
+
+With the coordinated workflow enabled, preparation writes `execution-context.json`
+containing the run, accepted-plan and report identities. Each subsequent `exec`
+creates an `execution/<attempt-id>/attempt.json`: command, times, checkout and
+changed-file fingerprints, exit status, and artifact hashes. Stdout/stderr remain
+visible and are also retained. Failed commands retain their original exit status;
+interrupted records remain incomplete. Without the context file, execution is
+unchanged.
+
+The wrapper loads `dev.repro_env.pytest_evidence` through a guarded pytest loader.
+Missing optional dependencies produce a collection error while the tests continue. It
+records test outcomes, synchronous Playwright traces (including input actions),
+terminal WebSocket frames, observed browser response replacements, screenshots,
+and videos before fixture cleanup. Local synchronous HTTP session activity is
+recorded, with session items/resources captured before deletion. The existing
+mock provider journals requests before reset, including outside pytest. The
+workflow bundles these files and independently hashes the retained copies.
+
+These are agent-workspace observations, not a protected or independently verified
+account. Implicit contexts created by `browser.new_page()`, async browser/HTTP clients,
+external servers, commands outside the wrapper,
+and arbitrary custom mocks are not fully covered. For browser capture, create an
+explicit `browser.new_context()` and then call `context.new_page()`. Collection errors, truncation,
+missing records and incomplete attempts remain explicit. Shared-runtime provider
+events include request/reset acceptance times as well as journal write times; worker
+scheduling can reorder writes. They do not imply ownership by a particular attempt. Do not
+interpret missing events as proof an action did not happen. Trace text receives credential redaction and is stored uncompressed inside the ZIP
+so the existing bundle byte scan can inspect it. Screenshots/videos can still contain
+visible private data; neither redaction nor the byte scan inspects image pixels.
+If a driver starts its own trace, the collector saves its initial trace and yields
+ownership. Later tracing belongs to that driver; a `trace_owner` event records this
+coverage limit. An abruptly killed browser or unclosed context can leave artifacts
+unavailable; collection errors remain explicit.
+Raw traces are sanitized in a private temporary directory outside the retained
+evidence tree. Only sanitized copies enter the bundle. If redaction fails, cleanup
+is attempted and the collector records the failure without advertising a saved trace. Other observations remain available.
+
+Output is redacted after complete lines are assembled. Lines exceeding the 8 MiB
+redaction buffer are omitted with an explicit incomplete-output record; fragments
+are never saved independently. This protects retained output, not the command's
+normal live console output.
+
+Collection errors are best-effort diagnostics: they do not replace command exit codes,
+test outcomes, or mock responses. If output writers have not stopped, the attempt marks
+its artifact inventory incomplete and omits hashes. Provider journaling runs outside the
+model-state lock on a worker thread. These records can add I/O latency; they are not a
+zero-overhead measurement of the original journey.
+
+## Runtime
+
 CI starts the product server, runner and mock model server in a persistent
 sandbox before repro-agent launches. It configures both real native CLIs with
 mock providers and isolated product/CLI state. The workflow owns their lifetime;
 they survive the agent CLI disconnecting and individual shell calls ending.
+
+For ticket-specific setup, see [environment preparation](../repro-agent/recipes.md).
+The optional `doctor --plan PATH` command records current facts against the
+existing plan's environment/setup IDs. Missing dependencies remain preparation
+work; the command refreshes observations after installation and never grants a
+reproduction verdict. The existing wrapper and fixtures below drive the journey.
 
 Run each journey in the foreground through the connection wrapper:
 

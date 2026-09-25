@@ -4324,6 +4324,44 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
         )
 
 
+def test_resolve_databricks_codex_model_discovery_failure_warns_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ucode-state fallback warns in one actionable line, frame-free."""
+    import logging
+    from unittest.mock import patch
+
+    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+
+    def _raise(profile: str | None) -> None:
+        raise OSError(
+            "token-less profile; run `databricks auth login --profile prof` "
+            "to refresh the OAuth session"
+        )
+
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            side_effect=_raise,
+        ),
+        patch("omnigent.onboarding.ucode_state.read_ucode_state", return_value=None),
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"),
+    ):
+        resolved = _resolve_databricks_codex_model(
+            "https://h.example.com", "prof", "databricks-gpt-9-9"
+        )
+
+    assert resolved == "databricks-gpt-9-9"
+    warning = next(
+        r for r in caplog.records if "live Databricks model discovery failed" in r.getMessage()
+    )
+    assert not warning.exc_info, (
+        "a recoverable ucode-state fallback must not log a traceback at WARNING; "
+        "host logging mirrors it to the user's terminal"
+    )
+    assert "databricks auth login --profile prof" in warning.getMessage()
+
+
 def test_probe_codex_home_bridges_provider_tables_and_credential(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

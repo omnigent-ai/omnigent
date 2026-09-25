@@ -106,15 +106,21 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   // show alongside the "main" row.
   if (isLoading && children.length === 0) {
     return (
-      <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground bg-card">
-        Loading…
+      <div className="flex h-full min-h-0 flex-col bg-card">
+        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <div className="flex flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground">
+          Loading…
+        </div>
       </div>
     );
   }
   if (error && children.length === 0) {
     return (
-      <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground bg-card">
-        Failed to load agents.
+      <div className="flex h-full min-h-0 flex-col bg-card">
+        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <div className="flex flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground">
+          Failed to load agents.
+        </div>
       </div>
     );
   }
@@ -178,27 +184,30 @@ function ViewModeToggle({
   onViewModeChange: (mode: ViewMode) => void;
 }) {
   return (
-    <div className="flex shrink-0 items-center justify-end gap-0.5 border-b px-2 py-1">
-      <Button
-        variant={viewMode === "list" ? "secondary" : "ghost"}
-        size="icon-xs"
-        onClick={() => onViewModeChange("list")}
-        aria-label="List view"
-        title="List view"
-        data-testid="view-mode-list"
-      >
-        <ListIcon className="size-3.5" />
-      </Button>
-      <Button
-        variant={viewMode === "graph" ? "secondary" : "ghost"}
-        size="icon-xs"
-        onClick={() => onViewModeChange("graph")}
-        aria-label="Graph view"
-        title="Graph view"
-        data-testid="view-mode-graph"
-      >
-        <NetworkIcon className="size-3.5" />
-      </Button>
+    <div className="flex h-11 shrink-0 items-center gap-0.5 border-b px-2">
+      <h2 className="font-medium text-ui">Agents</h2>
+      <div className="ml-auto flex items-center gap-0.5">
+        <Button
+          variant={viewMode === "list" ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={() => onViewModeChange("list")}
+          aria-label="List view"
+          title="List view"
+          data-testid="view-mode-list"
+        >
+          <ListIcon className="size-3.5" />
+        </Button>
+        <Button
+          variant={viewMode === "graph" ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={() => onViewModeChange("graph")}
+          aria-label="Graph view"
+          title="Graph view"
+          data-testid="view-mode-graph"
+        >
+          <NetworkIcon className="size-3.5" />
+        </Button>
+      </div>
     </div>
   );
 }

@@ -52,7 +52,6 @@ const {
   isDatabricksManagedServerUrl,
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
-  LOCAL_HOSTS,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
@@ -69,6 +68,7 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
@@ -2888,28 +2888,6 @@ function registerIpc() {
       const target = await expandDatabricksWorkspaceUrl(normalized, { signal });
       signal.throwIfAborted();
 
-      // Guard against navigating to (and pinning as trusted) a non-Omnigent site
-      // the user typed by mistake. Managed choices are pre-validated; local hosts
-      // are the user's own machine — both skip the check. For a remote URL we
-      // probe the well-known manifest; if it doesn't look like an Omnigent server
-      // and the user hasn't confirmed, ask the page to warn before proceeding.
-      // Soft (not a hard block): older Omnigent servers predate the manifest, so
-      // a second click must still let them through. force skips the re-probe.
-      //
-      // ONLY when the server selector is active: the classic static setup page
-      // calls setServerUrl(url) with no opts and can't handle a {needsConfirm}
-      // reply (it just expects navigation), so guarding it there would silently
-      // swallow the connect. The server selector is the only caller that
-      // understands the confirm handshake.
-      const isLocal = LOCAL_HOSTS.has(new URL(target).hostname);
-      if (serverSelectorV2Enabled() && !managedTarget && !isLocal && !opts?.force) {
-        const manifest = await fetchServerManifest(target, { signal });
-        signal.throwIfAborted();
-        if (manifest.manifestVersion < 1) {
-          return { needsConfirm: true, url: target };
-        }
-      }
-
       // Multi-server windows connect without touching the saved server —
       // the connection lives and dies with the window.
       const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
@@ -3259,6 +3237,9 @@ function registerIpc() {
     return {
       ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
       customizationDisabled: databricksInternalFeaturesEnabled(),
+      // In-app install is macOS-only; the renderer must not route connect/local
+      // through an install step on platforms where it can't run.
+      installSupported: process.platform === "darwin",
     };
   });
 
@@ -3315,6 +3296,34 @@ function registerIpc() {
       }
     };
     return serverManager.startLocalServer(cliPath, onLine);
+  });
+
+  // Setup page → install the omnigent CLI (macOS). Runs the bundled
+  // install_oss.sh (ensuring uv first) and streams its output to the page, then
+  // re-probes status so the caller learns whether the binary is now resolvable.
+  // Single-flight guard: a duplicate cli-install (e.g. a renderer effect that
+  // re-fired) joins the in-flight install instead of spawning a second one.
+  let cliInstallInFlight = null;
+  ipcMain.handle("omnigent:cli-install", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("cli-install is only available to the setup page");
+    }
+    if (cliInstallInFlight) return cliInstallInFlight;
+    const onOutput = (text) => {
+      try {
+        event.sender.send("omnigent:cli-install-log", { line: text });
+      } catch {
+        /* window torn down mid-install */
+      }
+    };
+    cliInstallInFlight = (async () => {
+      const result = await cliInstall.installCli({ onOutput });
+      const status = await omnigentCli.getCliStatus(loadSettings().omnigent_path);
+      return { ...result, installed: status.installed === true };
+    })().finally(() => {
+      cliInstallInFlight = null;
+    });
+    return cliInstallInFlight;
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both

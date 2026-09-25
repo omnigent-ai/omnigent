@@ -3000,12 +3000,15 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
-    except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
+    except Exception as exc:  # noqa: BLE001 — cached ucode state is the launch fallback
+        # Recoverable fallback; frames are debug-only so a TTY-mirrored
+        # host console stays concise.
         _logger.warning(
             "native-codex: live Databricks model discovery failed for profile %r; "
-            "falling back to ucode state",
+            "falling back to ucode state (%s)",
             profile,
-            exc_info=True,
+            exc,
+            exc_info=_logger.isEnabledFor(logging.DEBUG),
         )
         try:
             from omnigent.onboarding.ucode_state import read_ucode_state
