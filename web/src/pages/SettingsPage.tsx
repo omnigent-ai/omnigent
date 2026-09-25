@@ -1,4 +1,3 @@
-import { McpRegistryConnections } from "@/components/McpRegistry";
 /**
  * Settings page (``/settings``).
  *
@@ -76,6 +75,7 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
@@ -341,6 +341,19 @@ export function SettingsPage() {
       {section === "custom-agents" && <SettingsCustomAgentsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
+      {section === "mcp" && (
+        <Section title="MCP">
+          {info !== "loading" && info.enabled_connections?.includes("mcp") ? (
+            <McpRegistryConnections />
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {info === "loading"
+                ? "Loading MCP services…"
+                : "MCP services are not configured on this server."}
+            </p>
+          )}
+        </Section>
+      )}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
@@ -1136,13 +1149,11 @@ function GithubMark({ className }: { className?: string }) {
 }
 
 /**
-/**
  * Which panel connects/disconnects each provider. The server's
  * ``enabled_connections`` list says WHICH panels to show; this map says HOW to
  * render each. Adding a provider is one entry here plus one string server-side.
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
-  mcp: McpRegistryConnections,
   github: GithubIntegrationControl,
   databricks: DatabricksIntegrationControl,
 };
@@ -1150,7 +1161,7 @@ const CONNECTION_PANELS: Record<string, ComponentType> = {
 /**
  * Sandbox Integrations settings. Renders one connect/disconnect panel per
  * provider the server reports in ``enabled_connections``, in that order. The
- * nav hides the section entirely when the list is empty.
+ * MCP accounts have their own page; the nav hides this section without other providers.
  */
 function IntegrationsSection() {
   const info = useServerInfo();

@@ -1,8 +1,8 @@
 # Managed MCP registry and gateway prototype
 
-Connect an external account once in **Settings → Sandbox Integrations**, then
-add its tools to sessions on different sandboxes. The server holds and refreshes
-the upstream credentials. Sandboxes receive a catalog reference and tool schemas.
+Connect an external account once in **Settings → MCP**, then add its tools to
+sessions on local machines, remote hosts or sandboxes. The server holds and
+refreshes upstream credentials. Runners receive a catalog reference and tool schemas.
 
 The **registry** is administrator-owned configuration: service IDs, destinations,
 authentication and allowed tools/users. The **gateway** executes requests through
@@ -10,6 +10,8 @@ the existing session MCP endpoint and its authentication and tool policies.
 
 See the [architecture overview](../../designs/MCP_REGISTRY_GATEWAY.md) for component
 ownership and the OAuth, launch, tool-call, refresh and credential-broker diagrams.
+The [API reference](../../designs/MCP_REGISTRY_API.md) covers HTTP requests,
+existing Python hooks and bringing your own registry or gateway.
 
 ```mermaid
 flowchart LR
@@ -17,7 +19,7 @@ flowchart LR
     settings[Account connections]
     picker[Session tool picker]
   end
-  subgraph sandbox[Docker sandbox / execution host]
+  subgraph runner[Local machine / remote host / sandbox]
     harness[Agent harness]
     proxy[Existing ProxyMcpManager]
     harness --> proxy
@@ -90,18 +92,18 @@ sequenceDiagram
   participant UI as Browser / New session
   participant Server as Omnigent server
   participant Store as Agent + session stores
-  participant Sandbox as Sandbox / harness
+  participant Sandbox as Execution host / harness
   participant MCP as Remote MCP service
   UI->>Server: GET registry catalog
   Server-->>UI: Allowed services + connection status (no tokens)
   UI->>Server: Create session + selected registry IDs
-  Server->>Server: Authorize IDs; prepare session bundle
+  Server->>Server: Authorize IDs and prepare session bundle
   Server->>Store: Persist session-scoped agent + session
   Server->>Sandbox: Launch with session identity
   UI->>Server: First message
   Server->>Sandbox: Dispatch first turn
   Sandbox->>Server: Session MCP tools/call
-  Server->>Server: Validate tool + policies; resolve/refresh credential
+  Server->>Server: Validate tool and policies, resolve/refresh credential
   Server->>MCP: Call with server-held access token
   MCP-->>Server: Result
   Server-->>Sandbox: Policy-checked result
@@ -180,7 +182,7 @@ docker compose -f examples/mcp-registry/compose.yaml --profile sandbox up --buil
    popup: it closes and the service becomes checked. Cancelling leaves it unchecked.
    The dialog shows the administrator’s catalog; URL/header/command configuration
    is under **Advanced: custom MCP servers**. You can also connect and test accounts
-   separately in **Settings → Sandbox Integrations**.
+   separately in **Settings → MCP**.
 3. Queue a deterministic model turn with the command below, then send
    `Show my tracker account and read TEST-123` in the chat. Expand **Called 2 tools**
    to see the actual upstream account and ticket results.
@@ -214,6 +216,25 @@ Stop the foreground processes and run
 `docker compose -f examples/mcp-registry/compose.yaml --profile sandbox down`
 when finished. Keep the isolated state directory only if you need its logs.
 
+### Use a local machine instead of Docker
+
+Keep terminals 1–3 running and replace terminal 4 with a local host process:
+
+```bash
+export OMNIGENT_DATA_DIR="$MCP_DEMO_STATE/local-host-data"
+export OMNIGENT_CONFIG_HOME="$MCP_DEMO_STATE/local-host-config"
+export OMNIGENT_LOCAL_SINGLE_USER=1
+export OPENAI_BASE_URL=http://127.0.0.1:18783/v1
+export OPENAI_API_KEY=mock-key
+uv run --no-sync omnigent host --server http://localhost:18780 --no-open --non-interactive
+```
+
+Set `MCP_DEMO_STATE` to the directory created in terminal 1. In New session, choose
+this local host and workspace `/tmp`, then select **Demo work tracker** under
+**MCPs** before sending. Use the same OpenAI Agents harness, model and queued
+responses above. The saved account is reused across both hosts. No sandbox provider
+is needed for this path; the local host still needs a connection to the server.
+
 ## Administrator configuration
 
 Set `OMNIGENT_MCP_REGISTRY` to a YAML file and restart the server after editing it.
@@ -241,7 +262,7 @@ PKCE S256 is used. Confidential clients send the secret named by
 Personal bearer/OAuth connections require the existing KMS or Vault cipher;
 there is no plaintext fallback. Connections are scoped to workspace and user.
 The new `mcp:<id>` records do not register a credential-vending provider.
-For an already-supported identity provider, reuse its configured connection:
+For an already-supported credential provider, reuse its configured connection:
 
 ```yaml
 services:
@@ -273,7 +294,7 @@ rejected. The administrator's allowlist always applies.
 
 ```mermaid
 sequenceDiagram
-  participant H as Harness in sandbox
+  participant H as Harness on local / remote / sandbox host
   participant G as Omnigent session MCP gateway
   participant P as Existing policy layer
   participant C as Encrypted credential store
@@ -282,7 +303,7 @@ sequenceDiagram
   H->>G: tools/call tracker__read_ticket + session authentication
   G->>P: Existing tool-call policy / approval
   P-->>G: Allow
-  G->>G: Resolve trusted actor; check service and tool allowlists
+  G->>G: Resolve trusted actor and check service and tool allowlists
   G->>C: Load this workspace/user/service connection
   opt Token expires soon
     G->>O: Refresh token exchange
@@ -317,9 +338,9 @@ existing hosted connections must not be reinterpreted as registry IDs.
   unavailable services are omitted from discovery; Settings provides a test/error.
 - Text output follows existing result policies. Non-text blocks are serialized
   as text; native image/resource streaming needs a later extension.
-- No automatic retries of tool calls. Disconnect prevents future credential
-  resolution; an already-authorized in-flight request may complete. Disconnect
-  deletes the local connection, not the provider's grant.
+- No automatic retries of tool calls. Disconnect deletes the local connection,
+  not the provider's grant. An already-authorized request may complete; an OAuth
+  callback already exchanging its code may save a connection after disconnect.
 - Existing session authentication, actor selection, access rules and approval
   behavior apply. This is a prototype for authenticated deployments or explicit
   local single-user mode, not a replacement for sandbox isolation.
@@ -335,3 +356,5 @@ pnpm --dir web exec vitest run src/components/McpRegistry.test.tsx
 The HTTP/OAuth test uses a real local MCP provider and a test cipher. The browser
 regression test intercepts catalog/account APIs. The manual walkthrough additionally
 exercises real Vault encryption, UI OAuth redirects, the Docker host, and a harness.
+Browser launch tests cover local-host and sandbox selections on desktop and mobile;
+the local-host integration also discovers and calls tools through `ProxyMcpManager`.

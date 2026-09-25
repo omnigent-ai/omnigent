@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
   importSessionsPanel: vi.fn(() => null),
+  enabledConnections: [] as string[],
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -56,6 +57,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    enabled_connections: mocks.enabledConnections,
   }),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
@@ -186,6 +188,9 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+vi.mock("@/components/McpRegistry", () => ({
+  McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
+}));
 
 import { SettingsPage } from "./SettingsPage";
 
@@ -229,6 +234,7 @@ beforeEach(() => {
   mocks.theme = "system";
   mocks.accountsEnabled = true;
   mocks.importSessionsPanel.mockClear();
+  mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -261,6 +267,21 @@ describe("Import sessions", () => {
     expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
     expect(mocks.importSessionsPanel).toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
+});
+
+describe("MCP settings", () => {
+  it("renders configured MCP accounts at their own URL", () => {
+    mocks.enabledConnections = ["mcp"];
+    renderPage("/settings/mcp");
+    expect(screen.getByText("mcp-accounts-stub")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "MCP" })).toBeInTheDocument();
+  });
+
+  it("explains a deep link when MCP is not configured", () => {
+    renderPage("/settings/mcp");
+    expect(screen.getByText("MCP services are not configured on this server.")).toBeInTheDocument();
+    expect(screen.queryByText("mcp-accounts-stub")).not.toBeInTheDocument();
   });
 });
 
