@@ -42,6 +42,7 @@ from omnigent.onboarding.provider_config import (
     KEY_KIND,
     LOCAL_KIND,
     OPENAI_FAMILY,
+    OPENCODE_SURFACE,
     PI_SURFACE,
     SUBSCRIPTION_KIND,
     ProviderEntry,
@@ -108,6 +109,7 @@ _FAMILY_LABEL: dict[str, str] = {
     OPENAI_FAMILY: "Codex",
     GEMINI_FAMILY: "Gemini",
     PI_SURFACE: "Pi",
+    OPENCODE_SURFACE: "OpenCode",
 }
 
 # The concrete harness ids each surface powers, shown as a dim annotation
@@ -118,6 +120,7 @@ _FAMILY_HARNESS_IDS: dict[str, str] = {
     OPENAI_FAMILY: "codex, native-codex, openai-agents",
     GEMINI_FAMILY: "antigravity, antigravity-native",
     PI_SURFACE: "pi",
+    OPENCODE_SURFACE: "opencode-native",
 }
 
 
@@ -557,7 +560,14 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     :returns: The surfaces this option can configure — a subset of
         ``{"anthropic", "openai", "gemini", "pi"}``.
     """
-    if opt.kind == GATEWAY_KIND or opt.kind == DATABRICKS_KIND:
+    if opt.kind == GATEWAY_KIND:
+        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
+    if opt.kind == DATABRICKS_KIND:
+        # OpenCode launch consumes config gateway/key/local providers and explicit
+        # profiles / managed hosts, not a saved config ``databricks``-kind default
+        # (the resolver excludes that kind), so offering it here would let setup
+        # save an OpenCode default that launch silently ignores. Pi/Claude/Codex
+        # still drive Databricks.
         return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
     if opt.kind == BEDROCK_KIND:
         # Bedrock mode drives only the native Claude terminal (anthropic
@@ -574,16 +584,14 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     if opt.kind == KEY_KIND:
         if opt.other:
             # The catch-all tail (Groq, DeepSeek, …) are all openai-family.
-            return frozenset({OPENAI_FAMILY, PI_SURFACE})
+            return frozenset({OPENAI_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
         if opt.provider is not None:
             family = family_for_key_provider(opt.provider)
-            # The Gemini surface (antigravity) is not a pi model family — pi
-            # consumes the anthropic / openai families only. So a gemini key
-            # serves ONLY the Gemini surface; anthropic / openai keys also drive
-            # pi.
+            # Gemini keys serve ONLY the Gemini surface (antigravity/antigravity-
+            # native); anthropic / openai keys also drive pi and opencode.
             if family == GEMINI_FAMILY:
                 return frozenset({GEMINI_FAMILY})
-            return frozenset({family, PI_SURFACE})
+            return frozenset({family, PI_SURFACE, OPENCODE_SURFACE})
     return frozenset()
 
 

@@ -48,11 +48,13 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.models.databricks_model_discovery import resolve_model_services_parent
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
     ModelIntent,
     ModelMetadata,
+    ModelReasoningMetadata,
     ModelWireAPI,
 )
 from omnigent.models.model_override import is_codex_compatible_model, model_family_mismatch
@@ -102,12 +104,6 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
 
-# DATABRICKS-PATCH(model-services-scoped-listing): scope + page the Unity
-# Catalog model-services listing. Mirrors
-# ``databricks_model_discovery._MODEL_SERVICES_PARENT`` /
-# ``_MODEL_SERVICES_MAX_RESULTS`` — including the parameter *name*, so both
-# callers of this endpoint ask for a page size the API actually honors.
-_MODEL_SERVICES_PARENT = "schemas/system.ai"
 _MODEL_SERVICES_MAX_RESULTS = 100
 _MODEL_SERVICES_MAX_PAGES = 100
 
@@ -1554,11 +1550,42 @@ def _fetch_databricks_uc_listing(
     )
 
 
+# Gateway effort ceilings inferred from each Bedrock routing target.
+_GPT_RESPONSES_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_XAI_RESPONSES_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_DEFAULT_RESPONSES_EFFORTS = frozenset({"low", "medium", "high"})
+
+
+def _responses_efforts_for_target(target: str) -> frozenset[str]:
+    """Return the reasoning efforts a single routing target's family accepts."""
+    lowered = target.lower()
+    if "openai" in lowered or "gpt" in lowered:
+        return _GPT_RESPONSES_EFFORTS
+    if "xai" in lowered or "grok" in lowered:
+        return _XAI_RESPONSES_EFFORTS
+    return _DEFAULT_RESPONSES_EFFORTS
+
+
+def _responses_reasoning_efforts(targets: list[str]) -> frozenset[str]:
+    """Return the efforts a weighted Responses route accepts across all destinations.
+
+    A weighted route only truly accepts the efforts EVERY active destination
+    supports, so intersect the per-destination ladders rather than trusting the
+    first (whose order in the destination list is not significant).
+    """
+    if not targets:
+        return _DEFAULT_RESPONSES_EFFORTS
+    ladders = [_responses_efforts_for_target(target) for target in targets]
+    return frozenset(ladders[0]).intersection(*ladders[1:])
+
+
 def fetch_databricks_model_service_entries(
     workspace_url: str,
     token: str,
     *,
     transport: httpx.BaseTransport | None = None,
+    model_services_parent: str | None = None,
+    strict_details: bool = False,
 ) -> tuple[ModelEntry, ...]:
     """Fetch normalized Unity Catalog model-service metadata.
 
@@ -1569,6 +1596,11 @@ def fetch_databricks_model_service_entries(
     :param workspace_url: Databricks workspace base URL.
     :param token: Workspace bearer token.
     :param transport: Optional httpx transport override for tests.
+    :param strict_details: When ``True``, a failed per-service detail request
+        raises instead of being swallowed, so a caller that treats a successful
+        listing as authoritative (e.g. opencode gateway discovery) can fall back
+        to configured tiers rather than silently dropping incompletely-classified
+        services. Defaults to ``False`` to preserve the lenient shared behavior.
     :returns: LLM model-service entries with normalized wire metadata.
     :raises httpx.HTTPError: On transport or HTTP failures.
     """
@@ -1585,7 +1617,7 @@ def fetch_databricks_model_service_entries(
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
         for _ in range(_MODEL_SERVICES_MAX_PAGES):
             params = {
-                "parent": _MODEL_SERVICES_PARENT,
+                "parent": resolve_model_services_parent(model_services_parent),
                 "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
             }
             if page_token is not None:
@@ -1625,6 +1657,43 @@ def fetch_databricks_model_service_entries(
                 "the model list may be incomplete",
                 _MODEL_SERVICES_MAX_PAGES,
             )
+    bedrock_metadata: dict[str, ModelMetadata] | None = None
+
+    def routing_target_metadata(targets: tuple[str, ...]) -> ModelMetadata | None:
+        """Return conservative limits for the service's Bedrock route targets."""
+        nonlocal bedrock_metadata
+        if not targets:
+            return None
+        if bedrock_metadata is None:
+            try:
+                bedrock_metadata = {
+                    entry.id.lower(): entry.metadata for entry in catalog_model_entries("bedrock")
+                }
+            except Exception:  # noqa: BLE001 — catalog enrichment is best-effort
+                _logger.info(
+                    "could not load Bedrock metadata for model-service routes", exc_info=True
+                )
+                bedrock_metadata = {}
+        # A weighted route is only as large as its smallest destination, so a
+        # limit is trustworthy only when every destination supplies it. A single
+        # uncatalogued (or limit-less) destination could hide a smaller ceiling,
+        # so leave that limit unset rather than advertise an unverified maximum.
+        metadatas = [bedrock_metadata.get(target.lower()) for target in targets]
+        context_windows = [
+            m.context_window for m in metadatas if m is not None and m.context_window
+        ]
+        output_limits = [
+            m.max_output_tokens for m in metadatas if m is not None and m.max_output_tokens
+        ]
+        context_window = min(context_windows) if len(context_windows) == len(targets) else None
+        max_output_tokens = min(output_limits) if len(output_limits) == len(targets) else None
+        if context_window is None and max_output_tokens is None:
+            return None
+        return ModelMetadata(
+            context_window=context_window,
+            max_output_tokens=max_output_tokens,
+        )
+
     models: list[ModelEntry] = []
     for service in services:
         if not isinstance(service, dict):
@@ -1639,7 +1708,40 @@ def fetch_databricks_model_service_entries(
         )
         if not name:
             continue
+        detail: object = service
         api_types = service.get("supported_api_types")
+        if not (isinstance(api_types, list) and api_types) or not name.startswith("system.ai."):
+            try:
+                with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as svc_client:
+                    svc_resp = svc_client.get(
+                        f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/{raw_name}",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    svc_resp.raise_for_status()
+                    detail = svc_resp.json()
+                    if isinstance(detail, dict):
+                        api_types = detail.get("supported_api_types", api_types)
+            except httpx.HTTPError:
+                if strict_details:
+                    # Incomplete listing: let the caller keep its configured tiers
+                    # rather than treat the partial result as authoritative.
+                    raise
+                detail = service
+        targets: list[str] = []
+        routing = detail.get("config", {}).get("routing", {}) if isinstance(detail, dict) else {}
+        destinations = routing.get("destinations", []) if isinstance(routing, dict) else []
+        for destination in destinations if isinstance(destinations, list) else []:
+            if not isinstance(destination, dict) or destination.get("is_deleted") is True:
+                continue
+            traffic_percentage = destination.get("traffic_percentage")
+            if isinstance(traffic_percentage, (int, float)) and traffic_percentage <= 0:
+                continue
+            config = destination.get("external_model_config")
+            target = config.get("target") if isinstance(config, dict) else None
+            target_model = target.get("model") if isinstance(target, dict) else None
+            if isinstance(target_model, str) and target_model:
+                targets.append(target_model)
+        target_metadata = routing_target_metadata(tuple(targets))
         normalized_api_types = {
             api_type.lower()
             for api_type in (api_types if isinstance(api_types, list) else [])
@@ -1656,11 +1758,31 @@ def fetch_databricks_model_service_entries(
             wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
         if not wire_apis:
             continue
+        # Reasoning support follows the advertised wire protocol.
+        supported_capabilities: set[ModelCapability] = set()
+        reasoning_metadata: ModelReasoningMetadata | None = None
+        if ModelWireAPI.OPENAI_RESPONSES in wire_apis:
+            supported_capabilities.add(ModelCapability.REASONING)
+            reasoning_metadata = ModelReasoningMetadata(
+                efforts=_responses_reasoning_efforts(targets)
+            )
+        elif ModelWireAPI.ANTHROPIC_MESSAGES in wire_apis:
+            supported_capabilities.add(ModelCapability.REASONING)
         models.append(
             ModelEntry(
                 id=name,
                 family=model_family_token(name),
-                metadata=ModelMetadata(wire_apis=frozenset(wire_apis)),
+                metadata=ModelMetadata(
+                    context_window=(
+                        target_metadata.context_window if target_metadata is not None else None
+                    ),
+                    max_output_tokens=(
+                        target_metadata.max_output_tokens if target_metadata is not None else None
+                    ),
+                    wire_apis=frozenset(wire_apis),
+                    supported_capabilities=frozenset(supported_capabilities),
+                    reasoning=reasoning_metadata,
+                ),
             )
         )
     return tuple(models)

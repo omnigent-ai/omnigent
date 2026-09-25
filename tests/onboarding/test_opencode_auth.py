@@ -12,8 +12,10 @@ import omnigent.onboarding.opencode_auth as oc
 
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Point XDG_DATA_HOME at a tmp dir and clear provider env keys."""
+    """Point XDG_DATA_HOME at a tmp dir, clear provider env keys, and isolate
+    OMNIGENT_CONFIG_HOME so tests never read the developer's real config.yaml."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent"))
     for _provider_id, _label, var in oc._ENV_PROVIDER_VARS:
         monkeypatch.delenv(var, raising=False)
 
@@ -89,6 +91,17 @@ def test_describe_lists_stored_and_env(monkeypatch: pytest.MonkeyPatch, tmp_path
     text = oc.opencode_auth_summary().describe()
     assert "1 stored (anthropic)" in text
     assert "env: OpenAI" in text
+
+
+def test_summary_ready_via_config_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config.yaml gateway provider makes opencode ready without auth.json or env keys."""
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setattr(oc, "_config_gateway_provider_name", lambda: "my-gateway")
+    summary = oc.opencode_auth_summary()
+    assert summary.ready is True
+    assert summary.has_provider is True
+    assert summary.config_gateway == "my-gateway"
+    assert "gateway: my-gateway" in summary.describe()
 
 
 def test_reachable_provider_ids_merges_stored_and_env(

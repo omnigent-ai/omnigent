@@ -1884,6 +1884,313 @@ def test_model_services_listing_stops_on_repeated_page_token(
     assert any("repeated a page token" in record.message for record in caplog.records)
 
 
+def test_model_services_parent_override_is_used() -> None:
+    """An explicit parent schema is passed straight through to the listing call."""
+    from omnigent.models import model_catalog
+
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    {
+                        "name": "model-services/eng_dev.ai_gateway.omni-gpt",
+                        "supported_api_types": ["openai/v1/responses"],
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert requests_seen[0].url.params["parent"] == "schemas/eng_dev.ai_gateway"
+    assert [entry.id for entry in entries] == ["eng_dev.ai_gateway.omni-gpt"]
+
+
+def test_responses_wire_marks_reasoning_capability() -> None:
+    """Derive reasoning capability from advertised Responses or Messages wires."""
+    from omnigent.models import model_catalog
+    from omnigent.models.model_metadata import ModelCapability
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    _uc_service(
+                        "eng_dev.ai_gateway.omni-gpt-med",
+                        ["openai/v1/chat/completions", "openai/v1/responses"],
+                    ),
+                    _uc_service("eng_dev.ai_gateway.plain-chat", ["openai/v1/chat/completions"]),
+                ]
+            },
+            request=request,
+        )
+
+    entries = {
+        entry.id: entry
+        for entry in model_catalog.fetch_databricks_model_service_entries(
+            "https://workspace.example.com",
+            "token",
+            transport=httpx.MockTransport(_handler),
+            model_services_parent="schemas/eng_dev.ai_gateway",
+        )
+    }
+
+    gpt = entries["eng_dev.ai_gateway.omni-gpt-med"]
+    assert gpt.metadata.supports(ModelCapability.REASONING) is True
+
+    chat_only = entries["eng_dev.ai_gateway.plain-chat"]
+    assert chat_only.metadata.supports(ModelCapability.REASONING) is None
+
+
+def test_responses_reasoning_effort_ceiling_by_target_family() -> None:
+    """The effort ladder is derived from the Bedrock routing target family."""
+    from omnigent.models.model_catalog import _responses_reasoning_efforts
+
+    assert "max" in _responses_reasoning_efforts(["us.openai.gpt-5.6-luna"])
+    grok = _responses_reasoning_efforts(["us.xai.grok-4.6"])
+    assert "xhigh" in grok and "max" not in grok
+    other = _responses_reasoning_efforts(["us.z-ai.glm-5"])
+    assert other == frozenset({"low", "medium", "high"})
+    for targets in (["us.openai.gpt-5.6-luna"], ["us.xai.grok-4.6"], ["us.z-ai.glm-5"]):
+        assert "minimal" not in _responses_reasoning_efforts(targets)
+
+
+def test_missing_api_types_fetched_per_service() -> None:
+    """Fetch a complete service record when list metadata omits API types."""
+    from omnigent.models import model_catalog
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [{"name": "model-services/eng_dev.ai_gateway.omni-claude"}]
+                },
+                request=request,
+            )
+        assert request.url.path.endswith("/model-services/eng_dev.ai_gateway.omni-claude")
+        return httpx.Response(
+            200,
+            json={"supported_api_types": ["anthropic/v1/messages"]},
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert [entry.id for entry in entries] == ["eng_dev.ai_gateway.omni-claude"]
+
+
+def test_gateway_model_service_inherits_limits_from_routing_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway alias advertises the limits of its live Bedrock destination."""
+    target = "us.anthropic.claude-opus-4-8"
+    monkeypatch.setattr(
+        model_catalog,
+        "catalog_model_entries",
+        lambda provider: (
+            (
+                ModelEntry(
+                    id=target,
+                    family="claude",
+                    metadata=ModelMetadata(context_window=1_000_000, max_output_tokens=128_000),
+                ),
+            )
+            if provider == "bedrock"
+            else ()
+        ),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [
+                        {"name": "model-services/eng_dev.ai_gateway.omni-claude-high"}
+                    ]
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "supported_api_types": ["anthropic/v1/messages"],
+                "config": {
+                    "routing": {
+                        "destinations": [
+                            {
+                                "external_model_config": {"target": {"model": target}},
+                                "traffic_percentage": 100,
+                            }
+                        ]
+                    }
+                },
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert len(entries) == 1
+    assert entries[0].id == "eng_dev.ai_gateway.omni-claude-high"
+    assert entries[0].metadata.context_window == 1_000_000
+    assert entries[0].metadata.max_output_tokens == 128_000
+
+
+def test_gateway_model_service_omits_limits_when_route_partly_uncatalogued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A weighted route with an uncatalogued destination advertises no limits.
+
+    A single unknown destination could hide a smaller ceiling, so each limit is
+    left unset rather than inheriting the one catalogued destination's maximum.
+    """
+    known = "us.anthropic.claude-opus-4-8"
+    monkeypatch.setattr(
+        model_catalog,
+        "catalog_model_entries",
+        lambda provider: (
+            (
+                ModelEntry(
+                    id=known,
+                    family="claude",
+                    metadata=ModelMetadata(context_window=1_000_000, max_output_tokens=128_000),
+                ),
+            )
+            if provider == "bedrock"
+            else ()
+        ),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [
+                        {"name": "model-services/eng_dev.ai_gateway.omni-claude-mix"}
+                    ]
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "supported_api_types": ["anthropic/v1/messages"],
+                "config": {
+                    "routing": {
+                        "destinations": [
+                            {
+                                "external_model_config": {"target": {"model": known}},
+                                "traffic_percentage": 50,
+                            },
+                            {
+                                "external_model_config": {
+                                    "target": {"model": "us.anthropic.uncatalogued-model"}
+                                },
+                                "traffic_percentage": 50,
+                            },
+                        ]
+                    }
+                },
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert len(entries) == 1
+    assert entries[0].metadata.context_window is None
+    assert entries[0].metadata.max_output_tokens is None
+
+
+def test_responses_reasoning_efforts_intersect_across_destinations() -> None:
+    """A weighted Responses route advertises only efforts every destination supports.
+
+    Mixing an OpenAI destination (accepts ``max``) with an xAI one (does not) must
+    drop ``max`` regardless of destination order, while a single destination keeps
+    its full ladder.
+    """
+    from omnigent.models.model_catalog import _responses_reasoning_efforts
+
+    mixed = ["us.openai.gpt-5", "us.xai.grok-4"]
+    efforts = _responses_reasoning_efforts(mixed)
+    assert "max" not in efforts
+    assert "high" in efforts and "xhigh" in efforts
+    # Order of destinations must not change the advertised ladder.
+    assert _responses_reasoning_efforts(list(reversed(mixed))) == efforts
+    # A single OpenAI destination keeps ``max``.
+    assert "max" in _responses_reasoning_efforts(["us.openai.gpt-5"])
+
+
+def test_fetch_model_services_strict_details_raises_on_detail_failure() -> None:
+    """``strict_details`` surfaces an incomplete listing instead of dropping services.
+
+    A listing without ``supported_api_types`` triggers a per-service detail
+    request; when that fails, the lenient default silently drops the service
+    (returning an empty catalog), while ``strict_details`` raises so a caller can
+    keep its configured tiers rather than treat the empty result as authoritative.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={"model_services": [{"name": "model-services/eng_dev.ai_gateway.omni-x"}]},
+                request=request,
+            )
+        return httpx.Response(403, json={"message": "forbidden"}, request=request)
+
+    # Lenient default: the undetailed service is dropped, yielding an empty catalog
+    # that a naive caller would wrongly treat as authoritative.
+    assert (
+        model_catalog.fetch_databricks_model_service_entries(
+            "https://ws.example.com",
+            "tok",
+            transport=httpx.MockTransport(_handler),
+            model_services_parent="schemas/eng_dev.ai_gateway",
+        )
+        == ()
+    )
+
+    # Strict: the detail failure is propagated so the caller can fall back.
+    with pytest.raises(httpx.HTTPError):
+        model_catalog.fetch_databricks_model_service_entries(
+            "https://ws.example.com",
+            "tok",
+            transport=httpx.MockTransport(_handler),
+            model_services_parent="schemas/eng_dev.ai_gateway",
+            strict_details=True,
+        )
+
+
 # ── Generic ACP curation (acp_curated_models) ───────────────────────────────
 
 

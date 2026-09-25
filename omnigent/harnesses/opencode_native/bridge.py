@@ -190,6 +190,66 @@ export const OmnigentPolicyPlugin = async () => ({
 """
 
 
+# Filename of the opencode plugin that refreshes gateway bearer tokens.
+_GATEWAY_AUTH_PLUGIN_FILE = "omnigent-gateway-auth.js"
+
+# Refresh auth_command credentials for each gateway request.
+_GATEWAY_AUTH_PLUGIN = r"""
+// Omnigent gateway bearer refresh for opencode-native (generated; do not edit).
+// Uses the @opencode-ai/plugin chat.headers hook to inject a fresh
+// Authorization: Bearer token per request for each configured gateway provider.
+import { execSync } from "node:child_process";
+let COMMANDS = {};
+try {
+  COMMANDS = JSON.parse(process.env.OMNIGENT_OPENCODE_AUTH_COMMAND || "{}") || {};
+} catch (e) {
+  COMMANDS = {};
+}
+
+function mintToken(providerId) {
+  const cmd = COMMANDS[providerId];
+  if (!cmd) return null;
+  try {
+    const t = String(execSync(cmd, { encoding: "utf8", timeout: 15000 }) || "").trim();
+    return t || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+export const server = async () => ({
+  "chat.headers": async (input, output) => {
+    // The hook's input.provider is the provider info record (id is a direct
+    // field); older builds nested it under .info.
+    const pid = input?.provider?.id ?? input?.provider?.info?.id;
+    if (!pid || !Object.prototype.hasOwnProperty.call(COMMANDS, pid)) return;
+    const token = mintToken(pid);
+    if (token) output.headers["Authorization"] = "Bearer " + token;
+  },
+});
+"""
+
+
+def build_gateway_auth_plugin_js() -> str:
+    """Render the gateway-auth plugin source."""
+    return _GATEWAY_AUTH_PLUGIN
+
+
+def write_opencode_gateway_auth_plugin(bridge_dir: Path) -> Path:
+    """Write the gateway-auth refresh plugin into *bridge_dir*; return its path."""
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _GATEWAY_AUTH_PLUGIN_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_GATEWAY_AUTH_PLUGIN_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(build_gateway_auth_plugin_js())
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return path
+
+
 def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
     """
     Write the Omnigent policy-bridge plugin into *bridge_dir* and return its path.

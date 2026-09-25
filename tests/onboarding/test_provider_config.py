@@ -11,6 +11,7 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
     OPENAI_FAMILY,
+    OPENCODE_SURFACE,
     PI_SURFACE,
     FamilyConfig,
     default_provider_for_harness,
@@ -114,6 +115,35 @@ def test_resolve_secret_env_ref_accepts_omnigent_prefixed_alias(
 
     assert resolve_secret("env:ANTHROPIC_API_KEY") == "sk-ant-prefixed"
     assert resolve_secret("$ANTHROPIC_API_KEY") == "sk-ant-prefixed"
+
+
+def test_default_provider_for_opencode_uses_openai_family_default() -> None:
+    """OpenCode must resolve the configured gateway instead of falling back to free models."""
+    config = {
+        "providers": {
+            "databricks": {
+                "kind": "databricks",
+                "default": ["anthropic", "pi"],
+                "profile": "p1",
+            },
+            "gateway": {
+                "kind": "gateway",
+                "default": ["openai"],
+                "openai": {
+                    "base_url": "https://gateway.example/v1",
+                    "auth_command": "gateway-token",
+                    "wire_api": "chat",
+                    "models": {"default": "eng_dev.ai_gateway.omni-gpt-high"},
+                },
+            },
+        }
+    }
+
+    resolved = default_provider_for_harness(config, "opencode")
+
+    assert resolved is not None
+    assert resolved.name == "gateway"
+    assert resolved.kind == "gateway"
 
 
 def test_default_provider_for_pi_skips_subscription_defaults() -> None:
@@ -399,8 +429,11 @@ def test_databricks_does_not_serve_gemini_surface() -> None:
     """
     config = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": True}}}
     entry = load_providers(config)["dbx"]
+    # NOT opencode: the opencode launch resolver rejects a config databricks-kind
+    # provider, so it must not be advertised as an OpenCode default.
     assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
     assert GEMINI_FAMILY not in provider_families(entry)
+    assert OPENCODE_SURFACE not in provider_families(entry)
     # A default databricks profile does NOT become the gemini-surface default.
     assert default_provider_for_harness(config, "antigravity-native") is None
     # And a databricks profile cannot name the gemini scope at parse.
@@ -429,8 +462,8 @@ def test_gateway_local_does_not_serve_gemini_surface(kind: str) -> None:
     entry = load_providers({"providers": {"gw": raw}})["gw"]
     served = provider_families(entry)
     assert GEMINI_FAMILY not in served
-    # The real (anthropic) surface — and its pi capability — are untouched.
-    assert served == frozenset({ANTHROPIC_FAMILY, PI_SURFACE})
+    # The real (anthropic) surface — and its pi/opencode capability — are untouched.
+    assert served == frozenset({ANTHROPIC_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
     # And it can never become the gemini-surface default…
     cfg = {"providers": {"gw": {**raw, "default": True}}}
     assert default_provider_for_harness(cfg, "antigravity-native") is None
@@ -468,6 +501,95 @@ def test_gemini_auth_command_rejected_at_parse() -> None:
     raw = {"kind": "key", "gemini": {"base_url": "https://x/v1beta", "auth_command": "echo tok"}}
     with pytest.raises(OmnigentError, match="auth_command is not allowed on a 'gemini' family"):
         load_providers({"providers": {"google": raw}})
+
+
+@pytest.mark.parametrize("kind", ["gateway", "local"])
+def test_openai_responses_gateway_does_not_serve_opencode_surface(kind: str) -> None:
+    """An openai-only gateway with ``wire_api: responses`` must NOT claim the OpenCode surface.
+
+    OpenCode requires Chat Completions (opencode_native/provider.py raises on
+    ``wire_api == "responses"`` at launch). Allowing a Responses-only gateway to
+    claim ``OPENCODE_SURFACE`` lets onboarding save a provider that will always
+    fail at runtime — a silent dead-end. The invariant must be enforced at the
+    data-model level so every surface that reads ``provider_families()`` (setup
+    menus, default-resolution, readiness) agrees with what the harness can
+    actually use.
+    """
+    raw = {
+        "kind": kind,
+        "openai": {
+            "base_url": "https://gw/v1",
+            "auth_command": "mint-tok",
+            "wire_api": "responses",
+        },
+    }
+    entry = load_providers({"providers": {"gw": raw}})["gw"]
+    served = provider_families(entry)
+    # Pi can still consume a responses endpoint; opencode cannot.
+    assert OPENCODE_SURFACE not in served
+    assert PI_SURFACE in served
+    # A mixed anthropic+openai-responses gateway keeps opencode via anthropic.
+    mixed_raw = {
+        "kind": kind,
+        "anthropic": {"base_url": "https://gw", "auth_command": "mint-anth"},
+        "openai": {
+            "base_url": "https://gw/v1",
+            "auth_command": "mint-tok",
+            "wire_api": "responses",
+        },
+    }
+    mixed_entry = load_providers({"providers": {"m": mixed_raw}})["m"]
+    assert OPENCODE_SURFACE in provider_families(mixed_entry)
+
+
+def test_default_provider_for_opencode_skips_responses_only_gateway() -> None:
+    """``default_provider_for_harness("opencode")`` skips a responses-only openai gateway.
+
+    An openai-family gateway with ``wire_api: responses`` cannot serve OpenCode
+    (provider.py raises at launch). The resolver must fall through to the next
+    family rather than returning an unusable provider.
+    """
+    config = {
+        "providers": {
+            "responses-gw": {
+                "kind": "gateway",
+                "default": ["openai"],
+                "openai": {
+                    "base_url": "https://gw/v1",
+                    "auth_command": "mint-openai-tok",
+                    "wire_api": "responses",
+                },
+            },
+            "anthropic-gw": {
+                "kind": "gateway",
+                "default": ["anthropic"],
+                "anthropic": {
+                    "base_url": "https://gw",
+                    "auth_command": "mint-anthropic-tok",
+                },
+            },
+        }
+    }
+    resolved = default_provider_for_harness(config, "opencode")
+    # Falls through the responses gateway and picks up the anthropic one.
+    assert resolved is not None
+    assert resolved.name == "anthropic-gw"
+
+    # When there is no fallback, returns None rather than the unusable provider.
+    no_fallback = {
+        "providers": {
+            "responses-gw": {
+                "kind": "gateway",
+                "default": ["openai"],
+                "openai": {
+                    "base_url": "https://gw/v1",
+                    "auth_command": "mint-openai-tok",
+                    "wire_api": "responses",
+                },
+            }
+        }
+    }
+    assert default_provider_for_harness(no_fallback, "opencode") is None
 
 
 def test_auth_command_still_valid_for_non_gemini_families() -> None:
@@ -509,7 +631,9 @@ def test_key_with_gemini_block_still_serves_gemini() -> None:
         "gemini": {"base_url": "https://y/v1beta", "api_key_ref": "env:G"},
     }
     multi_entry = load_providers({"providers": {"multi": multi}})["multi"]
-    assert provider_families(multi_entry) == frozenset({OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
+    assert provider_families(multi_entry) == frozenset(
+        {OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OPENCODE_SURFACE}
+    )
 
 
 def test_subscription_cannot_claim_pi_scope() -> None:
@@ -1016,6 +1140,34 @@ def test_claude_sdk_resolution_survives_stray_cli_config_claude_entry() -> None:
     }
     entry = default_provider_for_harness(config, "claude-sdk")  # must NOT raise
     assert entry is not None and entry.name == "vendor-anthropic"
+
+
+def test_databricks_parses_model_services_parent() -> None:
+    config = {
+        "providers": {
+            "dbx": {
+                "kind": "databricks",
+                "profile": "ws",
+                "model_services_parent": "schemas/eng_dev.ai_gateway",
+            }
+        }
+    }
+    assert load_providers(config)["dbx"].model_services_parent == "schemas/eng_dev.ai_gateway"
+
+
+def test_databricks_model_services_parent_defaults_to_none() -> None:
+    config = {"providers": {"dbx": {"kind": "databricks", "profile": "ws"}}}
+    assert load_providers(config)["dbx"].model_services_parent is None
+
+
+def test_databricks_model_services_parent_rejects_blank() -> None:
+    bad = {
+        "providers": {
+            "dbx": {"kind": "databricks", "profile": "ws", "model_services_parent": "   "}
+        }
+    }
+    with pytest.raises(OmnigentError):
+        load_providers(bad)
 
 
 def test_resolve_model_tier_follows_alias_chain() -> None:

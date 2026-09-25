@@ -969,6 +969,15 @@ class OpenCodeNativeForwarder:
         When the user switches model in the opencode TUI, reflect it to Omnigent
         (``external_model_change`` → the session's ``model_override``) so the
         web model pill stays in sync. Deduped against the last mirrored model.
+
+        Known limitation (cross-family switch): switching between an OpenAI and
+        an Anthropic gateway model mid-session can 400 the next turn — opencode
+        replays the prior transcript (including OpenAI-shaped tool-call ids) to
+        the new family's API, which the Anthropic surface rejects. This
+        forwarder only observes the switch; opencode owns the transcript, so a
+        safe context reset / compaction-on-family-change is not available here
+        and is deferred. Workaround: ``/summarize`` (compact) before switching
+        families, or start a fresh session for the other family.
         """
         model = event.properties.get("model")
         if not isinstance(model, Mapping):

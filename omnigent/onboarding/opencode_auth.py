@@ -93,6 +93,30 @@ def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[s
     return frozenset(ids)
 
 
+def _config_gateway_provider_name() -> str | None:
+    """Return the config.yaml gateway/key/local provider name for opencode, or None.
+
+    Best-effort: any load or resolution error yields None. Deliberately
+    lightweight — no subprocess auth, no network discovery.
+    """
+    try:
+        from omnigent.onboarding.provider_config import (
+            GATEWAY_KIND,
+            KEY_KIND,
+            LOCAL_KIND,
+            default_provider_for_harness,
+            load_config,
+        )
+
+        config = load_config()
+        entry = default_provider_for_harness(config, "opencode")
+        if entry is not None and entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+            return entry.name
+    except Exception:
+        pass
+    return None
+
+
 @dataclass(frozen=True)
 class OpenCodeAuthSummary:
     """What setup needs to know about the local OpenCode credentials.
@@ -100,16 +124,21 @@ class OpenCodeAuthSummary:
     :param installed: ``opencode`` binary present on ``PATH``.
     :param stored_providers: Provider ids with credentials in ``auth.json``.
     :param env_providers: Provider labels whose API-key env var is set.
+    :param config_gateway: Name of the config.yaml gateway/key/local provider
+        for opencode, or ``None`` when not set. Users who route opencode
+        through Omnigent's AI Gateway do not have entries in ``auth.json`` or
+        the standard env vars, so this field bridges that gap.
     """
 
     installed: bool
     stored_providers: tuple[str, ...]
     env_providers: tuple[str, ...]
+    config_gateway: str | None = None
 
     @property
     def has_provider(self) -> bool:
-        """Whether any provider is reachable (stored credential or env key)."""
-        return bool(self.stored_providers or self.env_providers)
+        """Whether any provider is reachable (stored credential, env key, or gateway)."""
+        return bool(self.stored_providers or self.env_providers or self.config_gateway)
 
     @property
     def ready(self) -> bool:
@@ -118,7 +147,7 @@ class OpenCodeAuthSummary:
 
     def describe(self) -> str:
         """A short human summary of configured providers, e.g.
-        ``"2 stored (anthropic, openai) + env: OpenAI"``.
+        ``"2 stored (anthropic, openai) · env: OpenAI"``.
         """
         parts: list[str] = []
         if self.stored_providers:
@@ -127,6 +156,8 @@ class OpenCodeAuthSummary:
             )
         if self.env_providers:
             parts.append(f"env: {', '.join(self.env_providers)}")
+        if self.config_gateway:
+            parts.append(f"gateway: {self.config_gateway}")
         return " · ".join(parts) if parts else "no provider configured yet"
 
 
@@ -136,4 +167,5 @@ def opencode_auth_summary() -> OpenCodeAuthSummary:
         installed=harness_cli_installed(OPENCODE_KEY),
         stored_providers=_stored_providers(),
         env_providers=_env_providers(),
+        config_gateway=_config_gateway_provider_name(),
     )

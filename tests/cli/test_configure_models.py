@@ -3700,3 +3700,26 @@ def test_render_listing_default_marker_survives_non_utf8_console(
     out = buffer.getvalue().decode("cp1252")
     assert "anthropic" in out
     assert "* default" in out
+
+
+def test_add_option_families_excludes_opencode_for_databricks() -> None:
+    """Databricks add-menu options don't offer the OpenCode surface (launch ignores it).
+
+    A gateway option still offers OpenCode; only the ``databricks`` kind is
+    withheld, because a saved config ``databricks``-kind OpenCode default is
+    excluded by the launch resolver. Pi still consumes Databricks.
+    """
+    from omnigent.onboarding.configure_models import AddOption, _add_option_families
+    from omnigent.onboarding.provider_config import (
+        DATABRICKS_KIND,
+        GATEWAY_KIND,
+        OPENCODE_SURFACE,
+        PI_SURFACE,
+    )
+
+    gateway = _add_option_families(AddOption(label="GW", description="", kind=GATEWAY_KIND))
+    databricks = _add_option_families(AddOption(label="DB", description="", kind=DATABRICKS_KIND))
+
+    assert OPENCODE_SURFACE in gateway
+    assert OPENCODE_SURFACE not in databricks
+    assert PI_SURFACE in databricks  # pi still drives Databricks

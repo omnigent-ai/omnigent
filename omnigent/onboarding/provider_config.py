@@ -102,6 +102,11 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # pi default wins; otherwise pi falls back to the anthropic then openai family
 # default, skipping the non-pi kinds (see :func:`default_provider_for_harness`).
 PI_SURFACE = "pi"
+# Explicit surface name for the opencode-native harness, mirroring PI_SURFACE.
+# Added to provider_families() for gateway/key/local/databricks providers so
+# the setup wizard's credential-row helper finds providers serving opencode and
+# _manage_harness_providers("opencode") / set_default_provider work correctly.
+OPENCODE_SURFACE = "opencode"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
 # ``chat`` is Chat Completions. Only meaningful for the ``openai`` family
@@ -409,6 +414,10 @@ class ProviderEntry:
         ``None`` otherwise.
     :param profile: For ``kind="databricks"`` only: the Databricks profile
         name from ``~/.databrickscfg``, e.g. ``"oss"``. ``None`` otherwise.
+    :param model_services_parent: For ``kind="databricks"`` only: the Unity
+        Catalog parent schema to list model-services under, e.g.
+        ``"schemas/eng_dev.ai_gateway"``. ``None`` (the default) lists
+        ``schemas/system.ai``.
     :param connection: For managed ``kind="databricks"`` providers, ``"databricks"``
         selects the session owner's connection. Mutually exclusive with ``profile``.
     :param model_provider: For ``kind="cli-config"`` only: the custom
@@ -440,6 +449,7 @@ class ProviderEntry:
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
+    model_services_parent: str | None = None
 
     @property
     def default(self) -> bool:
@@ -875,15 +885,14 @@ def _parse_default_families(
             f"or a list of family names, got {default_raw!r}.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # pi is a valid default scope only when the provider is a pi-capable KIND
-    # (``pi_capable``) AND serves a pi-capable FAMILY (anthropic/openai). A
-    # gemini-only key is an inline kind (``pi_capable=True``) but serves only
-    # the Gemini surface, so it must NOT accept a pi scope — this mirrors
+    # pi and opencode are valid default scopes only when the provider is a
+    # capable KIND (``pi_capable``) AND serves a compatible FAMILY
+    # (anthropic/openai). A gemini-only key rejects both — this mirrors
     # ``provider_families`` and rejects a hand-edited ``default: ["gemini",
-    # "pi"]`` at parse time (parity with how a subscription's pi scope is
-    # rejected), rather than failing loudly only at pi launch.
+    # "pi"]`` at parse time, rather than failing loudly only at launch.
     pi_ok = pi_capable and (bool(served & frozenset(_PI_FALLBACK_FAMILIES)) or not served)
-    allowed = served | {PI_SURFACE} if pi_ok else served
+    extra = {PI_SURFACE, OPENCODE_SURFACE} if pi_ok else set()
+    allowed = served | extra
     invalid = requested - allowed
     if invalid:
         raise OmnigentError(
@@ -910,10 +919,11 @@ def _default_raw_value(default_families: frozenset[str], served: set[str]) -> ob
     if not default_families:
         return None
     # ``True`` round-trips as "all model families served" and never claims
-    # the pi scope (see _parse_default_families), so a default set that
-    # includes pi must stay explicit — rendering it as ``True`` would drop
-    # the pi scope on the next parse.
-    if PI_SURFACE not in default_families and default_families == frozenset(served) - {PI_SURFACE}:
+    # meta-surfaces (pi, opencode) — see _parse_default_families. A default
+    # set that includes either must stay explicit or the scope is lost on
+    # the next parse.
+    _meta = frozenset({PI_SURFACE, OPENCODE_SURFACE})
+    if not (default_families & _meta) and default_families == frozenset(served) - _meta:
         return True
     if len(default_families) == 1:
         return next(iter(default_families))
@@ -1039,6 +1049,12 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 f"provider {name!r}: a profile or connection: databricks is required.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        parent_raw = raw.get("model_services_parent")
+        if parent_raw is not None and (not isinstance(parent_raw, str) or not parent_raw.strip()):
+            raise OmnigentError(
+                f"provider {name!r}: 'model_services_parent' must be a non-empty string.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
         # gemini: the antigravity harness drives Gemini via the dedicated google
         # SDK + GEMINI_API_KEY, not an OpenAI-compatible gateway, so a databricks
@@ -1048,6 +1064,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             kind=kind,
             profile=profile_raw if isinstance(profile_raw, str) else None,
             connection=connection_raw,
+            model_services_parent=parent_raw.strip() if isinstance(parent_raw, str) else None,
             default_families=_parse_default_families(
                 name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
             ),
@@ -1256,6 +1273,21 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
     return cli_config_pi_provider_capable(entry)
 
 
+def provider_serves_opencode(entry: ProviderEntry) -> bool:
+    """Whether OpenCode can actually launch *entry*.
+
+    OpenCode drives an ``anthropic`` family (Messages) or a Chat-Completions
+    ``openai`` family; a Responses-only ``openai`` family with no ``anthropic``
+    family is not launchable there (the launch resolver skips it). The single
+    predicate keeps setup defaults, readiness, the picker, and launch consistent
+    so none advertises a provider the others cannot use.
+    """
+    if ANTHROPIC_FAMILY in entry.families:
+        return True
+    openai = entry.families.get(OPENAI_FAMILY)
+    return openai is not None and openai.wire_api in (None, CHAT_WIRE_API)
+
+
 def provider_families(entry: ProviderEntry) -> frozenset[str]:
     """Return the model families *entry* can serve.
 
@@ -1305,7 +1337,13 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         # break pi launch. A multi-family key keeps pi via its anthropic/openai
         # family.
         if served & frozenset(_PI_FALLBACK_FAMILIES):
-            return served | {PI_SURFACE}
+            surfaces = served | {PI_SURFACE}
+            # Only claim the OpenCode surface when OpenCode can actually launch it
+            # (a Responses-only openai family cannot), so readiness/defaults don't
+            # advertise a provider launch would skip.
+            if provider_serves_opencode(entry):
+                surfaces = surfaces | {OPENCODE_SURFACE}
+            return surfaces
         return served
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
@@ -1333,8 +1371,11 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        # ucode routes anthropic/openai + pi, never the Gemini surface (which
-        # needs the antigravity SDK + GEMINI_API_KEY, not a gateway).
+        # ucode routes anthropic/openai + pi, never the Gemini surface (needs the
+        # antigravity SDK + GEMINI_API_KEY). NOT opencode: the opencode launch
+        # resolver rejects a config ``databricks``-kind provider and the profile
+        # fallback ignores the entry's stored profile, so a databricks OpenCode
+        # default would be saved but never used.
         return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE}
     return frozenset()
 
@@ -1423,6 +1464,21 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     family = _HARNESS_FAMILY.get(harness)
     if family is not None:
         return get_default_provider(config, family)
+    # An explicit ``default: opencode`` scope wins first (the setup menu saves the
+    # OpenCode default there), then the OpenAI and Anthropic family defaults — but
+    # only a default OpenCode can actually launch. Skipping an ineligible default
+    # (an undriveable kind, or a Responses-only openai family) lets a usable
+    # gateway marked ``default: anthropic`` still win rather than resolving None.
+    if harness == "opencode":
+        for family_name in (OPENCODE_SURFACE, OPENAI_FAMILY, ANTHROPIC_FAMILY):
+            provider = get_default_provider(config, family_name)
+            if (
+                provider is not None
+                and provider.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND)
+                and provider_serves_opencode(provider)
+            ):
+                return provider
+        return None
     # Unmapped (e.g. pi): an explicit pi-scope default is authoritative.
     explicit = get_default_provider(config, PI_SURFACE)
     if explicit is not None:
@@ -1475,6 +1531,8 @@ def surface_default_provider(config: dict[str, object], surface: str) -> Provide
     """
     if surface == PI_SURFACE:
         return default_provider_for_harness(config, PI_SURFACE)
+    if surface == OPENCODE_SURFACE:
+        return default_provider_for_harness(config, OPENCODE_SURFACE)
     return get_default_provider(config, surface)
 
 
@@ -1493,12 +1551,19 @@ def surface_default_model(entry: ProviderEntry, surface: str) -> str | None:
         ``subscription`` / ``databricks`` kinds, always — the CLI /
         profile picks the model).
     """
-    if surface != PI_SURFACE:
-        return entry.family_default_model(surface)
-    for family_name in _PI_FALLBACK_FAMILIES:
-        if family_name in entry.families:
-            return entry.family_default_model(family_name)
-    return None
+    if surface == PI_SURFACE:
+        for family_name in _PI_FALLBACK_FAMILIES:
+            if family_name in entry.families:
+                return entry.family_default_model(family_name)
+        return None
+    if surface == OPENCODE_SURFACE:
+        # opencode prefers OpenAI first, then Anthropic (same order as
+        # default_provider_for_harness for the opencode harness).
+        for family_name in (OPENAI_FAMILY, ANTHROPIC_FAMILY):
+            if family_name in entry.families:
+                return entry.family_default_model(family_name)
+        return None
+    return entry.family_default_model(surface)
 
 
 def _family_for_harness(provider: ProviderEntry, harness: str) -> str | None:

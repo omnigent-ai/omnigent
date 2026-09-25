@@ -542,6 +542,35 @@ class TestBuildModelsJson(unittest.TestCase):
             entry = next(e for e in provider["models"] if e["id"] == model)
             self.assertEqual(entry.get("input"), ["text", "image"], model)
 
+    def test_responses_gateway_advertises_reasoning_effort(self):
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://host.example.com/ai-gateway/codex/v1"},
+            model="eng_dev.ai_gateway.omni-gpt-6-luna",
+        )
+        providers = result["providers"]
+        self.assertIs(
+            providers["databricks-openai"]["compat"]["supportsReasoningEffort"], True
+        )
+        entry = next(
+            item
+            for item in providers["databricks-openai"]["models"]
+            if item["id"] == "eng_dev.ai_gateway.omni-gpt-6-luna"
+        )
+        self.assertEqual(entry.get("input"), ["text", "image"])
+
+    def test_generic_responses_gateway_does_not_advertise_reasoning_effort(self):
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://api.openai.com/v1"},
+            model="gpt-5.6-sol",
+        )
+        self.assertFalse(
+            result["providers"]["databricks-openai"]["compat"]["supportsReasoningEffort"]
+        )
+
     def test_base_urls_use_host(self):
         result = _build_models_json("https://host.example.com/", "tok")
         p = result["providers"]

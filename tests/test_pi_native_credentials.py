@@ -337,9 +337,9 @@ def test_provider_launch_effort_edge_values(
 def test_provider_launch_gateway_routed_model_keeps_thinking_off(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The gateway-routed pin wins over the user's effort, with a warning.
+    """Completions-routed models remain off because Pi can hide response text.
 
-    Those models' ``reasoning_tokens`` break pi's completions handler so text
+    Those models' ``reasoning_tokens`` break Pi's completions handler so text
     never surfaces; honouring the effort would reintroduce that.
     """
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
@@ -354,6 +354,36 @@ def test_provider_launch_gateway_routed_model_keeps_thinking_off(
     assert args[-2:] == ["--thinking", "off"]
     assert warning is not None
     assert "databricks-glm-5-2" in warning
+
+
+def test_provider_launch_responses_gateway_passes_requested_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reasoning-capable Databricks Responses model receives the effort.
+
+    This covers both catalog-listed and selected Responses models: Pi's launch
+    flag must not be forced off after config marks the model and provider as
+    reasoning-capable.
+    """
+    model = "eng_dev.ai_gateway.omni-gpt-6-luna"
+    provider = _databricks_provider_without_catalog(monkeypatch, model)
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        lambda *_args, **_kwargs: None,
+    )
+
+    config = provider.to_models_config()
+    responses = config["providers"]["omnigent-openai"]
+    assert responses["api"] == "openai-responses"
+    assert responses["compat"]["supportsReasoningEffort"] is True
+    assert responses["models"][0]["reasoning"] is True
+
+    _env, args, warning = creds.pi_native_provider_launch(
+        tmp_path / "pi-agent", provider, "max"
+    )
+
+    assert args[-2:] == ["--thinking", "max"]
+    assert warning is None
 
 
 def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
@@ -1641,11 +1671,13 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     )
     assert openai_entry["baseUrl"] == "https://wkspc.example.com/ai-gateway/codex/v1"
     assert openai_entry["api"] == "openai-responses"
+    assert openai_entry["compat"]["supportsReasoningEffort"] is True
     assert any(m["id"] == "databricks-gpt-5-5" for m in openai_entry["models"])
     completions_entry = cfg["providers"].get("omnigent-completions")
     assert completions_entry is not None, "omnigent-completions provider missing from models.json"
     assert completions_entry["api"] == "openai-completions"
     assert any(m["id"] == "databricks-gpt-5-4" for m in completions_entry["models"])
+    assert completions_entry["compat"]["supportsReasoningEffort"] is False
 
 
 def test_cli_config_databricks_registers_gpt_provider(
@@ -1700,6 +1732,7 @@ def test_cli_config_databricks_registers_gpt_provider(
         == "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
     )
     assert openai_entry["api"] == "openai-responses"
+    assert openai_entry["compat"]["supportsReasoningEffort"] is True
     assert any(m["id"] == "databricks-gpt-5-4" for m in openai_entry["models"])
 
 

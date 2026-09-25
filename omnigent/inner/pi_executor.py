@@ -794,7 +794,10 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "openai-responses",
                 "authHeader": True,
-                "compat": _openai_responses_compat,
+                "compat": {
+                    **_openai_responses_compat,
+                    "supportsReasoningEffort": is_databricks_openai_gateway,
+                },
                 "models": provider_models["databricks-openai"],
             },
             # Older GPT models → OpenAI Chat Completions at serving-endpoints.

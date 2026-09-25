@@ -391,6 +391,11 @@ class PiProviderConfig:
         # the model entry declares reasoning.
         if "deepseek" in self.model.lower():
             entry["reasoning"] = True
+        # The Codex/Responses gateway supports the OpenAI reasoning effort field.
+        # Mark only Responses-routed models as reasoning-capable; Completions and
+        # MLflow endpoints still need thinking disabled for Pi text surfacing.
+        if surface is DatabricksPiSurface.RESPONSES:
+            entry["reasoning"] = True
         existing = additional.get(provider_id)
         if existing is not None:
             # Copy rather than mutate: the payload is shared with
@@ -751,6 +756,10 @@ def _databricks_openai_provider(
     ``authHeader`` sends ``Authorization: Bearer {token}`` (Databricks requires
     this; without it the OpenAI SDK uses ``api-key`` which is rejected).
     """
+    is_databricks_responses_gateway = (
+        api_type == "openai-responses"
+        and ("/ai-gateway/codex/" in base_url or base_url.rstrip("/").endswith("/codex/v1"))
+    )
     return {
         "baseUrl": base_url,
         "apiKey": api_key,
@@ -760,7 +769,9 @@ def _databricks_openai_provider(
             "supportsDeveloperRole": False,
             "supportsStore": False,
             "supportsStrictMode": False,
-            "supportsReasoningEffort": False,
+            # Only the Databricks Codex/Responses surface enables this;
+            # generic gateways and Completions remain conservative.
+            "supportsReasoningEffort": is_databricks_responses_gateway,
             # stream_options is OpenAI-specific; Gemini and other non-OpenAI
             # models reject it with 400.
             "supportsUsageInStreaming": False,
@@ -1760,9 +1771,9 @@ def pi_native_provider_launch(
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
     :param reasoning_effort: Canonical omnigent effort for the session, e.g.
-        ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
-        (with a warning) on a gateway-routed model, whose thinking must stay
-        off for text to surface.
+        ``"high"``. Passed as ``--thinking`` on providers and model surfaces
+        that declare reasoning support; ignored with a warning on unsupported
+        gateway routes whose thinking must stay off for text to surface.
     :param selection: Optional picker value used to select a generated provider.
     :returns: The launch env, CLI args and any effort warning.
     """
@@ -1836,17 +1847,31 @@ def pi_native_provider_launch(
             _LOGGER.warning("pi-native: %s", exc)
         if effort is not None:
             thinking = to_pi_thinking_level(effort)
-    # For non-Claude models on openai-completions/responses, disable thinking.
-    # Gemini and other Databricks models return reasoning_tokens in their
-    # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null
-    # in settings, causing the agent loop to complete without surfacing the text
-    # content to the extension. Explicitly passing --thinking off ensures the
-    # completions handler doesn't activate the thinking path.
-    if model_provider_id != provider.provider_id:
+    # Pi's OpenAI Responses provider carries Databricks reasoning outputs and
+    # supports reasoning effort. Preserve the requested effort only when the
+    # selected model is registered on that Responses surface with reasoning:true.
+    # Other gateway routes (Completions/MLflow) must keep thinking off: enabling
+    # Pi's thinking path there has previously prevented response text surfacing.
+    selected_provider = rendered["providers"].get(model_provider_id, {})
+    selected_entry = next(
+        (
+            model
+            for model in selected_provider.get("models", [])
+            if model.get("id") == selected_model
+        ),
+        {},
+    )
+    supports_gateway_effort = (
+        model_provider_id != provider.provider_id
+        and selected_provider.get("api") == "openai-responses"
+        and selected_provider.get("compat", {}).get("supportsReasoningEffort") is True
+        and selected_entry.get("reasoning") is True
+    )
+    if model_provider_id != provider.provider_id and not supports_gateway_effort:
         args.extend(["--thinking", PI_THINKING_OFF])
         if thinking is not None and thinking != PI_THINKING_OFF:
             effort_warning = (
-                f"effort ignored for gateway-routed model {provider.model}: "
+                f"effort ignored for gateway-routed model {selected_model}: "
                 "thinking disabled to keep text surfacing"
             )
             _LOGGER.warning("pi-native: %s", effort_warning)

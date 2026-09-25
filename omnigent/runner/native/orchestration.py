@@ -1339,6 +1339,8 @@ class _OpenCodeNativeLaunchConfig:
         transcript should be seeded as a text preamble
         (``omnigent.fork.carry_history``); opencode has no native session to
         clone, so the runner rehydrates from the copied Omnigent transcript.
+    :param reasoning_effort: Persisted per-session reasoning effort (canonical,
+        e.g. ``"max"``), applied to the gateway Responses models, or ``None``.
     """
 
     workspace: Path
@@ -1347,6 +1349,7 @@ class _OpenCodeNativeLaunchConfig:
     model_override: str | None
     external_session_id: str | None
     fork_carry_history: bool = False
+    reasoning_effort: str | None = None
 
 
 async def _opencode_native_launch_config(
@@ -1402,6 +1405,7 @@ async def _opencode_native_launch_config(
     fork_carry_history = (
         isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
     )
+    reasoning_effort = snapshot.get("reasoning_effort")
     return _OpenCodeNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -1409,6 +1413,9 @@ async def _opencode_native_launch_config(
         model_override=model_override,
         external_session_id=external_session_id,
         fork_carry_history=fork_carry_history,
+        reasoning_effort=(
+            reasoning_effort if isinstance(reasoning_effort, str) and reasoning_effort else None
+        ),
     )
 
 
@@ -1488,15 +1495,20 @@ async def _auto_create_opencode_terminal(
     # server boots. Best-effort: if the gateway can't be resolved (no profile,
     # databricks-sdk absent, auth failure), opencode falls back to whatever
     # provider config the ambient env/global config already gives it.
-    from omnigent.harnesses.opencode_native.bridge import xdg_config_home_for_bridge_dir
+    from omnigent.harnesses.opencode_native.bridge import (
+        write_opencode_gateway_auth_plugin,
+        xdg_config_home_for_bridge_dir,
+    )
     from omnigent.harnesses.opencode_native.provider import (
         build_opencode_mcp_block,
         build_opencode_model_default_config,
         build_opencode_omnigent_mcp_server,
         build_opencode_provider_config,
+        disable_autoloaded_free_providers,
         managed_connect_opencode_config,
         maybe_merge_user_provider_config,
         resolve_bound_opencode_gateway,
+        resolve_config_gateway_providers,
         resolve_databricks_gateway,
         write_opencode_provider_config,
     )
@@ -1506,21 +1518,47 @@ async def _auto_create_opencode_terminal(
     config: dict[str, object] = {}
     xdg_config_home = xdg_config_home_for_bridge_dir(bridge_dir)
     managed_opencode_broker_cmd: str | None = None
-    # A spec/CLI-selected Databricks gateway wins first (an explicit ``--model``
-    # that names a gateway endpoint, or a spec profile), exactly as claude/codex/pi
-    # resolve the spec provider before their broker fallback.
-    # ``resolve_databricks_gateway`` returns None when no profile is selected (the
-    # bare managed-connect host); the ucode-config path below is then the last
-    # resort. On that bare host it adopts ucode's pinned served model — replacing an
-    # unrecognized explicit ``--model`` (logged below), since the workspace gateway
-    # is the only working provider there.
+    config_gateway_auth_commands: dict[str, str] = {}
     opencode_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     gateway = await asyncio.to_thread(
         resolve_bound_opencode_gateway,
         model=model_override,
         auth=opencode_spec.executor.auth if opencode_spec is not None else None,
     )
+
+    # Resolution precedence (parity with the explicit-profile contract): session
+    # binding → explicit spec profile → configured default → ambient/managed
+    # fallback. Each resolver does synchronous discovery/auth work, so offload it
+    # to keep the runner's event loop responsive.
+    #
+    # An explicit ``executor.config.profile`` beats the global config gateway: the
+    # session owner named that workspace deliberately, so it must not be silently
+    # replaced by a differently-configured default.
+    explicit_profile = _opencode_native_explicit_profile(agent_spec)
+    if gateway is None and explicit_profile:
+        gateway = await asyncio.to_thread(
+            resolve_databricks_gateway, explicit_profile, model_id=model_override
+        )
+
+    config_gateway = None
     if gateway is None:
+        config_gateway = await asyncio.to_thread(
+            resolve_config_gateway_providers,
+            model_override=model_override,
+            reasoning_effort=launch_config.reasoning_effort,
+        )
+    if config_gateway is not None:
+        config = dict(config_gateway.config)
+        model_override = config_gateway.model
+        config_gateway_auth_commands = dict(config_gateway.auth_commands)
+        if config_gateway_auth_commands:
+            auth_plugin = write_opencode_gateway_auth_plugin(bridge_dir)
+            existing_plugins = config.get("plugin")
+            config["plugin"] = (
+                [*existing_plugins] if isinstance(existing_plugins, list) else []
+            ) + [str(auth_plugin)]
+    elif gateway is None:
+        # Ambient (host-linked) Databricks profile, below the configured default.
         gateway = resolve_databricks_gateway(
             _opencode_native_profile_from_spec(agent_spec), model_id=model_override
         )
@@ -1530,7 +1568,7 @@ async def _auto_create_opencode_terminal(
         model_override = gateway.qualified_model
         config = dict(build_opencode_provider_config(gateway))
         config["model"] = model_override
-    else:
+    elif config_gateway is None:
         # Managed connect host (last resort): reuse ucode's generated opencode
         # config (provider block + served model + refreshing auth plugin), the
         # same artifact lakebox and ucode itself use. The plugin mints per request
@@ -1612,6 +1650,8 @@ async def _auto_create_opencode_terminal(
         # ucode's auth plugin runs ``ucode auth-token`` → get_databricks_token,
         # which mints from this broker command (databricks/ucode#531).
         policy_env["DATABRICKS_BEARER_COMMAND"] = managed_opencode_broker_cmd
+    if config_gateway_auth_commands:
+        policy_env["OMNIGENT_OPENCODE_AUTH_COMMAND"] = json.dumps(config_gateway_auth_commands)
     runner_server_url = os.environ.get("RUNNER_SERVER_URL")
     if server_client is not None and runner_server_url:
         plugin_path = write_opencode_policy_plugin(bridge_dir)
@@ -1648,6 +1688,7 @@ async def _auto_create_opencode_terminal(
     config = maybe_merge_user_provider_config(config)
 
     if config:
+        disable_autoloaded_free_providers(config)
         write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
 
     # The server runs with a per-session XDG_DATA_HOME, so copy the user's
@@ -2044,6 +2085,29 @@ def _opencode_native_profile_from_spec(
         return str(profile) if profile else env_profile
     except Exception:  # noqa: BLE001 - profile resolution is best effort.
         return env_profile
+
+
+def _opencode_native_explicit_profile(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
+    """Resolve ONLY an explicitly-declared spec Databricks profile.
+
+    Unlike :func:`_opencode_native_profile_from_spec`, this ignores the ambient
+    ``DATABRICKS_CONFIG_PROFILE`` env: an explicit ``executor.config.profile``
+    takes precedence over the configured default, whereas the ambient profile is
+    a fallback below it.
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's ``executor.config.profile`` when set, else ``None``.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    try:
+        profile = spec.executor.config.get("profile")
+        return str(profile) if profile else None
+    except Exception:  # noqa: BLE001 - profile resolution is best effort.
+        return None
 
 
 def _opencode_native_mcp_servers_from_spec(

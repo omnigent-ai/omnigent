@@ -617,6 +617,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         CLI_CONFIG_KIND,
         DATABRICKS_KIND,
         OPENAI_FAMILY,
+        OPENCODE_SURFACE,
         PI_SURFACE,
         RESPONSES_WIRE_API,
         SUBSCRIPTION_KIND,
@@ -1025,7 +1026,14 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         #    name) and 2. run `ucode configure` against it for model serving —
         #    scoped to the harness the user drilled into (or both when added
         #    from the un-scoped menu), so ucode configures only what's needed.
-        if family is not None:
+        if family == OPENCODE_SURFACE:
+            # OpenCode drives the gateway's Anthropic + OpenAI surfaces and has no
+            # ucode agent of its own, so configure both underlying agents.
+            ucode_agents = [
+                _FAMILY_UCODE_AGENT[ANTHROPIC_FAMILY],
+                _FAMILY_UCODE_AGENT[OPENAI_FAMILY],
+            ]
+        elif family is not None:
             ucode_agents = [_FAMILY_UCODE_AGENT[family]]
         else:
             ucode_agents = sorted(_FAMILY_UCODE_AGENT.values())
@@ -1049,8 +1057,24 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.provider_config import (
         provider_families,
+        provider_serves_opencode,
         surface_default_provider,
     )
+
+    # An OpenCode-scoped add must produce a provider OpenCode can actually launch:
+    # an Anthropic gateway, or a Chat-Completions OpenAI gateway. A Responses-only
+    # OpenAI gateway is unusable there (readiness/picker/launch all decline it), so
+    # refuse it before persisting rather than saving a dead-end the user's chosen
+    # harness can never use.
+    if family == OPENCODE_SURFACE:
+        candidate = load_providers({"providers": {name: entry}})[name]
+        if not provider_serves_opencode(candidate):
+            console.print(
+                "[red]OpenCode can't use this provider: it needs an Anthropic gateway or a "
+                "Chat-Completions OpenAI gateway, not a Responses-only one. Nothing was saved — "
+                "re-add it with an anthropic family or wire_api: chat.[/red]"
+            )
+            return None
 
     # Persist the entry (deep-merge — doesn't disturb sibling entries).
     _save_global_config(
@@ -3370,6 +3394,58 @@ def _run_opencode_auth_list() -> None:
         subprocess.run([spec.binary, "auth", "list"], check=False)
 
 
+def _list_config_gateway_opencode_models() -> list[str]:
+    """Return synthesized ``provider/model`` ids from the config.yaml gateway for opencode.
+
+    Reads family model tiers from config.yaml directly — no subprocess, no
+    network discovery — so the model picker is fast even when the gateway's
+    auth_command is slow. Returns ``[]`` when no driveable gateway is set.
+    """
+    try:
+        from omnigent.harnesses.opencode_native.provider import _config_gateway_provider_id
+        from omnigent.onboarding.provider_config import (
+            ANTHROPIC_FAMILY,
+            CHAT_WIRE_API,
+            GATEWAY_KIND,
+            KEY_KIND,
+            LOCAL_KIND,
+            OPENAI_FAMILY,
+            default_provider_for_harness,
+            load_config,
+        )
+
+        config = load_config()
+        entry = default_provider_for_harness(config, "opencode")
+        if entry is None or entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+            return []
+        models: list[str] = []
+        for family_name in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
+            try:
+                family = entry.family(family_name)
+            except Exception:  # noqa: BLE001 - unresolved $VAR in unused family
+                continue
+            if family is None:
+                continue
+            # Skip a Responses-only openai family: OpenCode drives only the
+            # chat-completions surface, so its models must not appear in the
+            # picker (launch would refuse them).
+            if family_name == OPENAI_FAMILY and family.wire_api not in (None, CHAT_WIRE_API):
+                continue
+            provider_id = _config_gateway_provider_id(entry.name, family_name)
+            seen: set[str] = set()
+            for raw_model in family.models.values():
+                # Resolve alias tiers (``default: pro`` → ``pro: <endpoint>``) to
+                # the concrete endpoint id, so the picker never offers an alias the
+                # gateway would reject; dedupe collapsed aliases.
+                model_id = family.resolve_model_tier(raw_model).split("[")[0].strip()
+                if model_id and model_id not in seen:
+                    seen.add(model_id)
+                    models.append(f"{provider_id}/{model_id}")
+        return models
+    except Exception:  # noqa: BLE001 - never break the picker on a config error
+        return []
+
+
 def _list_opencode_models() -> list[str]:
     """Return the ``provider/model`` ids OpenCode can launch (``opencode models``).
 
@@ -3407,9 +3483,12 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     from omnigent.onboarding.interactive import console, select
     from omnigent.onboarding.opencode_auth import reachable_provider_ids
 
+    # Gateway models from config.yaml (no subprocess/discovery — fast). These
+    # are prepended so they appear at the top of the picker: a user with a
+    # gateway configured should reach their models without scrolling past the
+    # opencode.ai catalog.
+    gateway_models = _list_config_gateway_opencode_models()
     models = _list_opencode_models()
-    if not models:
-        return "✗ no models — sign in to a provider first (opencode auth login)"
     # `opencode models` can list hundreds of `provider/model` ids across every
     # provider on models.dev — too long for the picker (it overflows the
     # viewport and flickers). Narrow to the providers the user can actually
@@ -3419,6 +3498,13 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     if reachable:
         scoped = [m for m in models if m.split("/", 1)[0] in reachable]
         models = scoped or models
+    # Merge: gateway models first (they are always usable when configured),
+    # then whatever opencode's own CLI reports (deduped).
+    seen = set(gateway_models)
+    merged = list(gateway_models) + [m for m in models if m not in seen]
+    models = merged
+    if not models:
+        return "✗ no models — add a gateway provider or sign in (opencode auth login)"
     options = list(models)
     clear_index = -1
     if current is not None:
@@ -3455,11 +3541,12 @@ def _print_opencode_auth_help() -> None:
 
     console.print(
         "  OpenCode resolves a model from the provider its agent uses:\n"
-        "    • [bold]opencode auth login[/bold] — sign in to a provider (OpenAI, Anthropic, …);\n"
+        "    • [bold]Manage gateway providers[/bold] — add/remove a Databricks AI Gateway\n"
+        "      or API-key provider; Omnigent synthesizes opencode's per-session config from it.\n"
+        "    • [bold]opencode auth login[/bold] — sign in to OpenAI, Anthropic, etc. directly;\n"
         "      stored in ~/.local/share/opencode/auth.json.\n"
-        "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are auto-detected.\n"
-        "    • Databricks gateway: set an agent ``profile`` (configured under Claude / Codex);\n"
-        "      Omnigent synthesizes opencode's per-session provider config from it.\n"
+        "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are also "
+        "auto-detected.\n"
         "  Omnigent stores no OpenCode credential of its own.\n"
         f"  [dim]Tip:[/dim] 'Set default model' picks which model "
         f"`{cli_invocation(name='omni')} opencode` launches on\n"
@@ -3548,6 +3635,9 @@ def _manage_opencode_harness() -> None:
             _HarnessMenuRow(model_label, action="model"),
             _HarnessMenuRow("List providers & credentials", action="list"),
             _HarnessMenuRow("Show provider options", action="help"),
+            # Gateway management is the advanced/less-common path, so it sits at
+            # the bottom of the actionable options (just above Back).
+            _HarnessMenuRow("Manage gateway providers", action="gateway"),
             _HarnessMenuRow("← Back", action="back"),
         ]
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
@@ -3556,7 +3646,10 @@ def _manage_opencode_harness() -> None:
         action = rows[idx].action
         if action == "back":
             return
-        if action == "login":
+        if action == "gateway":
+            _manage_harness_providers("opencode")
+            status = None
+        elif action == "login":
             status = _launch_opencode_auth_login()
         elif action == "model":
             status = _set_opencode_default_model(default_model)
