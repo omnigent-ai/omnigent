@@ -34,6 +34,7 @@ CANARY_SECRETS = {
     "GITHUB_TOKEN": "canary-github",
     "SLACK_BOT_TOKEN": "canary-slack",
     "OPENROUTER_API_KEY": "canary-openrouter",
+    "PYTHON_KEYRING_BACKEND": "test_keyring_backend.FileKeyring",
 }
 
 # The per-harness families, matching the decision table on #3445.
@@ -187,6 +188,57 @@ def test_real_builders_pass_ssh_auth_sock(monkeypatch):
     monkeypatch.setattr("os.environ", {"SSH_AUTH_SOCK": sock})
     for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
         assert build().get("SSH_AUTH_SOCK") == sock, harness
+
+
+def test_real_builders_strip_desktop_session(monkeypatch):
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr("os.environ", {**session_env, "XDG_CONFIG_HOME": "/home/test/.config"})
+
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert session_env.keys().isdisjoint(env), harness
+        assert env["XDG_CONFIG_HOME"] == "/home/test/.config", harness
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_desktop_session_requires_explicit_cli_passthrough(explicit):
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+
+    env = clean_agent_env(
+        allow_prefixes=("DBUS_", "XDG_"),
+        allow_exact=session_env,
+        extra_allowed=session_env if explicit else (),
+        source=session_env,
+    )
+
+    assert env == (session_env if explicit else {})
+
+
+def test_goose_receives_declared_desktop_session(monkeypatch):
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.goose_executor import GooseExecutor
+
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr("os.environ", session_env)
+    executor = _bare(
+        GooseExecutor,
+        _provider_env=dict,
+        _os_env=OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(type="none", env_passthrough=list(session_env)),
+        ),
+    )
+
+    assert executor._build_spawn_env() == session_env
 
 
 @pytest.mark.parametrize("harness", sorted(HARNESS_PREFIXES))

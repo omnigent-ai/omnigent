@@ -68,6 +68,8 @@ export interface ResponseCompleted {
 export interface ResponseFailed {
   type: "response_failed";
   response: Response;
+  /** Where the failure originated, when supplied by the server. */
+  source?: string;
 }
 
 /** `response.incomplete` — stopped early. */
@@ -886,20 +888,6 @@ export interface SessionTerminalActivityEvent {
 }
 
 /**
- * `session.skills` — the session's runner-owned skills just resolved
- * (the server's background fetch populated its per-session skills cache).
- * Skills are fetched off the snapshot hot path, so the snapshot serves
- * an empty list until the fetch lands; this event is the "skills are
- * ready, re-read the snapshot" nudge. Consumers refetch the session
- * snapshot and apply its now-populated `skills` to fill the composer's
- * slash-command menu. Carries no payload beyond the conversation id.
- */
-export interface SessionSkillsEvent {
-  type: "session_skills";
-  conversationId: string;
-}
-
-/**
  * `session.model_options` — a runner-owned native model catalog just resolved.
  * Consumers refetch the session snapshot and apply its now-populated options.
  */
@@ -1041,7 +1029,6 @@ export type StreamEvent =
   | SessionChildSessionUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
-  | SessionSkillsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent

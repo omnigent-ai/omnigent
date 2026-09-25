@@ -77,6 +77,10 @@ QWEN_NATIVE_WRAPPER_VALUE = "qwen-native-ui"
 # Value the ``omnigent kimi`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 KIMI_NATIVE_WRAPPER_VALUE = "kimi-native-ui"
+
+# Value the ``omnigent devin`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+DEVIN_NATIVE_WRAPPER_VALUE = "devin-native-ui"
 # Value the ``omnigent hermes`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"

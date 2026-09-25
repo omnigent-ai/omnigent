@@ -9,9 +9,12 @@ here with a store stub that hands back controlled pages.
 
 from __future__ import annotations
 
-from omnigent.entities.conversation import ConversationItem, MessageData
+import pytest
+
+from omnigent.entities.conversation import CompactionData, ConversationItem, MessageData
 from omnigent.entities.pagination import PagedList
-from omnigent.runtime.workflow import fetch_all_items
+from omnigent.errors import _STALE_CURSOR_ATTEMPTS, StaleCursorError
+from omnigent.runtime.workflow import _load_initial_history, fetch_all_items
 
 
 def _item(item_id: str) -> ConversationItem:
@@ -94,3 +97,81 @@ def test_empty_conversation_returns_empty_list() -> None:
     store = _PagedStore([PagedList(data=[], last_id=None, has_more=False)])
     assert fetch_all_items(store, "conv_1") == [], "An empty conversation should drain to []."
     assert store.after_calls == [None]
+
+
+def test_stale_initial_cursor_propagates_after_futile_restarts() -> None:
+    """A caller-supplied cursor that is already gone cannot be recovered by
+    restarting — every attempt re-issues it — so it must surface for the
+    caller to handle."""
+    calls: list[str | None] = []
+
+    class _DeadCursorStore:
+        def list_items(
+            self, conversation_id: str, **kwargs: object
+        ) -> PagedList[ConversationItem]:
+            calls.append(kwargs.get("after"))  # type: ignore[arg-type]
+            raise StaleCursorError(conversation_id)
+
+    with pytest.raises(StaleCursorError):
+        fetch_all_items(_DeadCursorStore(), "conv_1", after="msg_gone")
+    assert calls == ["msg_gone"] * _STALE_CURSOR_ATTEMPTS, (
+        f"Every attempt re-issues the dead seed unchanged, got {calls!r}."
+    )
+
+
+class _CompactionStore:
+    """Store stub whose compaction anchor no longer resolves.
+
+    ``list_items`` answers the ``type="compaction"`` probe with one compaction
+    item, raises :class:`StaleCursorError` for the anchored read, and drains
+    the whole conversation when asked without a cursor.
+    """
+
+    def __init__(self, anchor: str) -> None:
+        self._anchor = anchor
+        self.cursors: list[str | None] = []
+
+    def list_items(
+        self,
+        conversation_id: str,
+        limit: int = 100,
+        after: str | None = None,
+        before: str | None = None,
+        order: str = "asc",
+        type: str | None = None,
+    ) -> PagedList[ConversationItem]:
+        if type == "compaction":
+            item = ConversationItem(
+                id="cmp_1",
+                type="compaction",
+                status="completed",
+                response_id="resp_1",
+                created_at=1,
+                data=CompactionData(
+                    summary="earlier turns",
+                    last_item_id=self._anchor,
+                    token_count=10,
+                ),
+            )
+            return PagedList(data=[item], last_id=item.id, has_more=False)
+        self.cursors.append(after)
+        if after is not None:
+            raise StaleCursorError(conversation_id)
+        return PagedList(data=[_item("a"), _item("b")], last_id="b", has_more=False)
+
+
+def test_deleted_compaction_anchor_falls_back_to_full_history() -> None:
+    """A deleted anchor makes the "everything after it" slice unrecoverable,
+    so the loader reloads the whole conversation instead of raising."""
+    store = _CompactionStore(anchor="msg_gone")
+    loaded = _load_initial_history(store, "conv_1")
+    assert [i.id for i in loaded.items] == ["a", "b"], (
+        "The full conversation should stand in for the unrecoverable slice."
+    )
+    assert loaded.last_compaction_created_at is None, (
+        "The summary was not used, so it must not be reported as the boundary."
+    )
+    assert store.cursors == ["msg_gone"] * _STALE_CURSOR_ATTEMPTS + [None], (
+        "Expected the anchored read (restarted futilely) then one full "
+        f"reload, got {store.cursors!r}."
+    )

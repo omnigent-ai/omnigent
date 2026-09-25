@@ -34,6 +34,15 @@ final class SettingsStore: ObservableObject {
     recentServers = defaults.stringArray(forKey: Keys.recentServers) ?? []
   }
 
+  func stopAutoOpening(_ context: DatabricksWebContext) {
+    guard let saved = serverURL, let url = URL(string: saved),
+      let scope = try? DatabricksCredentialScope(
+        workspaceURL: url, configuration: context.configuration),
+      scope == context.scope
+    else { return }
+    serverURL = nil
+  }
+
   func rememberRecentServer(_ url: URL) {
     let value = url.absoluteString
     let deduped: [String] = [value] + recentServers.filter { $0 != value }

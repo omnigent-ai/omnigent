@@ -1,8 +1,8 @@
 name: Benchmark (PR)
 
 # Runs a lightweight SQLite benchmark when a PR touches migration files or
-# store-layer code and compares against the latest nightly benchmark artifact
-# as a baseline. Posts results as a PR comment and blocks the PR if a
+# store-layer or project API code and compares against the latest nightly
+# benchmark artifact as a baseline. Posts results as a PR comment and blocks the PR if a
 # regression is detected.
 #
 # Only runs on PRs to the main repo (not forks without secrets). Skips
@@ -14,6 +14,10 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "omnigent/db/migrations/**"
+      - "omnigent/db/db_models.py"
+      - "omnigent/server/routes/projects.py"
+      - "omnigent/server/routes/sessions/**"
+      - "omnigent/server/schemas.py"
       - "omnigent/stores/**"
       - "dev/benchmarks/**"
       - ".github/workflows/benchmark-pr.yml"
@@ -50,7 +54,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
