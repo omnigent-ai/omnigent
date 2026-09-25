@@ -60,7 +60,7 @@ _DUE_TOLERANCE_S = 1.0
 
 # ``on_fire(workspace_id, scheduled_task_id)`` — invoked when a task is due. The
 # caller creates the agent session under the provided workspace scope.
-OnFire = Callable[[int, str], Awaitable[None]]
+OnFire = Callable[[int, str], Awaitable[bool | None]]
 _JobKey = tuple[int, str]
 
 
@@ -105,6 +105,7 @@ class ScheduledTaskScheduler:
     :param on_fire: Async callback invoked with ``(workspace_id,
         scheduled_task_id)`` when a task is due. Exceptions are caught and
         logged so a failing fire never stops the timer from re-arming.
+        Returning False unregisters the job; True or None keeps it armed.
     :param now: Returns the current epoch seconds. Injectable for tests;
         defaults to :func:`time.time`.
     :param schedule_call: Arms a timer: ``(delay_s, factory) -> handle`` where
@@ -302,7 +303,12 @@ class ScheduledTaskScheduler:
             return False
         job.running = True
         try:
-            await self._on_fire(job.workspace_id, job.task_id)
+            keep_registered = await self._on_fire(job.workspace_id, job.task_id)
+            key = (job.workspace_id, job.task_id)
+            if keep_registered is False and self._jobs.get(key) is job:
+                self._jobs.pop(key)
+                if job.timer is not None:
+                    self._cancel_call(job.timer)
             return True
         except Exception:
             _logger.exception("scheduler: on_fire for task %s failed", job.task_id)
@@ -314,6 +320,7 @@ class ScheduledTaskScheduler:
 # Strong references to in-flight fire coroutines. ``loop.create_task`` only
 # holds a weak reference, so without this a fire could be garbage-collected
 # mid-flight; we discard each task from the set when it completes.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _PENDING_FIRES: set[Any] = set()
 
 

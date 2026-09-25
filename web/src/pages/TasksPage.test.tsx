@@ -63,6 +63,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     permissionMode: null,
     workspace: null,
     hostId: null,
+    executionTarget: "connected_host",
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,

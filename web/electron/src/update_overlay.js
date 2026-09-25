@@ -131,6 +131,20 @@ function createUpdateOverlay({
     const existing = overlays.get(parent);
     if (existing && !existing.isDestroyed()) return existing;
 
+    // macOS otherwise presents this helper as a peer app window in Mission
+    // Control and screen-share pickers. Keep the update card mouse-actionable
+    // without letting it take focus from its parent. Do not apply focusable:
+    // false on Linux: Electron documents that as making the window unmanaged,
+    // always-on-top, and visible across every workspace.
+    const macOverlayOptions =
+      platform === "darwin"
+        ? {
+            focusable: false,
+            hiddenInMissionControl: true,
+            acceptFirstMouse: true,
+          }
+        : {};
+
     const overlay = new BrowserWindow({
       parent,
       frame: false,
@@ -143,6 +157,7 @@ function createUpdateOverlay({
       transparent: true,
       hasShadow: false, // the card draws its own shadow
       show: false,
+      ...macOverlayOptions,
       width: OVERLAY_WIDTH,
       height: 1,
       webPreferences: {

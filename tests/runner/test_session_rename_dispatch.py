@@ -43,15 +43,17 @@ def test_native_relay_exposes_session_rename(spec: AgentSpec | None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_rename_dispatches_repeatable_patch_to_current_session() -> None:
-    patch_requests: list[httpx.Request] = []
+async def test_session_rename_dispatches_repeatable_policy_aware_request() -> None:
+    rename_requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         probe = _top_level_session_handler(request)
         if probe is not None:
             return probe
-        patch_requests.append(request)
-        return httpx.Response(200, json={"id": "conv_current", **json.loads(request.content)})
+        rename_requests.append(request)
+        return httpx.Response(
+            200, json={"renamed": True, "reason": None, **json.loads(request.content)}
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
@@ -72,13 +74,58 @@ async def test_session_rename_dispatches_repeatable_patch_to_current_session() -
         {"renamed": True, "title": "Debug auth timeout", "reason": None},
         {"renamed": True, "title": "Verify auth timeout fix", "reason": None},
     ]
-    assert len(patch_requests) == 2
-    assert all(request.method == "PATCH" for request in patch_requests)
-    assert all(request.url.path == "/v1/sessions/conv_current" for request in patch_requests)
-    assert [json.loads(request.content) for request in patch_requests] == [
+    assert len(rename_requests) == 2
+    assert all(request.method == "POST" for request in rename_requests)
+    assert all(
+        request.url.path == "/v1/sessions/conv_current/agent-title" for request in rename_requests
+    )
+    assert [json.loads(request.content) for request in rename_requests] == [
         {"title": "Debug auth timeout"},
         {"title": "Verify auth timeout fix"},
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["generation_failed", "title_changed", "not_top_level"])
+async def test_session_rename_preserves_server_refusal(reason: str) -> None:
+    result = {"renamed": False, "title": None, "reason": reason}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _top_level_session_handler(request) or httpx.Response(200, json=result)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "Resolve PR 123 conflict"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+        )
+
+    assert json.loads(output) == result
+
+
+@pytest.mark.asyncio
+async def test_session_rename_does_not_bypass_policy_on_older_servers() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _top_level_session_handler(request) or httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "Resolve PR 123 conflict"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+        )
+
+    assert "returned 404" in json.loads(output)["error"]
+    assert [request.method for request in requests] == ["GET", "POST"]
 
 
 @pytest.mark.asyncio
@@ -87,7 +134,7 @@ async def test_session_rename_refuses_child_sessions() -> None:
 
     A child's ``(parent, title)`` pair is how ``sys_session_send``
     continuations find it, so a self-rename would corrupt sibling
-    addressing. The dispatcher refuses before issuing any PATCH.
+    addressing. The dispatcher refuses before issuing any rename request.
     """
     patch_requests: list[httpx.Request] = []
 

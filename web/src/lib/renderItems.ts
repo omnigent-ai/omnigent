@@ -20,6 +20,7 @@
 
 import type {
   AnyBlock,
+  ErrorBlock,
   MessageContentBlock,
   RoutingDecisionBlock,
   ToolExecution,
@@ -51,6 +52,20 @@ export type ToolState =
   | "no-output"; // turn finished (completed/incomplete) but no result was ever recorded
 
 /** A single rendered item inside an assistant bubble. */
+export interface RenderErrorDetails {
+  message: string;
+  source: string;
+  code: string;
+  level?: "error" | "info";
+  title?: string;
+  cause?: string;
+  remediation?: string;
+}
+
+export interface RelatedRenderError extends RenderErrorDetails {
+  itemId: string | null;
+}
+
 export type RenderItem =
   | { kind: "text"; itemId: string | null; text: string; final: boolean }
   | {
@@ -93,17 +108,11 @@ export type RenderItem =
       stderr: string | null;
     }
   | { kind: "policy_denied"; itemId: string | null; reason: string; phase: string }
-  | {
+  | ({
       kind: "error";
       itemId: string | null;
-      message: string;
-      source: string;
-      code: string;
-      level?: "error" | "info";
-      title?: string;
-      cause?: string;
-      remediation?: string;
-    }
+      relatedErrors?: RelatedRenderError[];
+    } & RenderErrorDetails)
   | {
       kind: "retry";
       itemId: string | null;
@@ -148,6 +157,8 @@ export type Bubble =
   | {
       kind: "user";
       itemId: string;
+      /** Queued input that does not yet have a persisted transcript item. */
+      pending?: boolean;
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
@@ -537,6 +548,29 @@ export function liveCandidateAssistantIndex(bubbles: readonly Bubble[]): number 
  */
 function isAnonymousRid(rid: string): boolean {
   return rid === "" || rid.startsWith(LIVE_ITEM_PREFIX);
+}
+
+function errorDetails(block: ErrorBlock): RelatedRenderError {
+  return {
+    itemId: block.ctx.itemId,
+    message: block.message,
+    source: block.source,
+    code: block.code,
+    ...(block.level ? { level: block.level } : {}),
+    ...(block.title ? { title: block.title } : {}),
+    ...(block.cause ? { cause: block.cause } : {}),
+    ...(block.remediation ? { remediation: block.remediation } : {}),
+  };
+}
+
+/** Errors are related only when the transcript gives them the same causal identity. */
+function errorsShareCausalBoundary(first: ErrorBlock, next: ErrorBlock): boolean {
+  return (
+    !isAnonymousRid(first.ctx.responseId) &&
+    first.ctx.responseId === next.ctx.responseId &&
+    first.ctx.turn === next.ctx.turn &&
+    first.ctx.agent === next.ctx.agent
+  );
 }
 
 /**
@@ -1554,18 +1588,19 @@ function buildAssistantItems(
     }
 
     if (b.type === "error") {
+      const relatedErrors: RelatedRenderError[] = [];
+      i += 1;
+      while (i < blocks.length) {
+        const next = blocks[i]!;
+        if (next.type !== "error" || !errorsShareCausalBoundary(b, next)) break;
+        relatedErrors.push(errorDetails(next));
+        i += 1;
+      }
       items.push({
         kind: "error",
-        itemId: b.ctx.itemId,
-        message: b.message,
-        source: b.source,
-        code: b.code,
-        ...(b.level ? { level: b.level } : {}),
-        ...(b.title ? { title: b.title } : {}),
-        ...(b.cause ? { cause: b.cause } : {}),
-        ...(b.remediation ? { remediation: b.remediation } : {}),
+        ...errorDetails(b),
+        ...(relatedErrors.length > 0 ? { relatedErrors } : {}),
       });
-      i += 1;
       continue;
     }
 
@@ -1785,6 +1820,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "user" && b.kind === "user") {
     if (
       a.itemId !== b.itemId ||
+      Boolean(a.pending) !== Boolean(b.pending) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||

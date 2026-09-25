@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 
 import pytest
 from sqlalchemy import event, update
@@ -10,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
     Host,
@@ -43,6 +46,52 @@ def _set_updated_at(db_uri: str, host_id: str, value: int) -> None:
     with Session(engine) as session:
         session.execute(update(SqlHost).where(SqlHost.host_id == host_id).values(updated_at=value))
         session.commit()
+
+
+@pytest.mark.parametrize("provider", [None, "kubernetes", "agent_sandbox", "modal", "lakebox"])
+@pytest.mark.parametrize("saved_profile", [False, True])
+@pytest.mark.parametrize("binding", ["unbound", "same-host", "transfer"])
+def test_launch_admission_keeps_saved_profiles_on_managed_hosts(
+    host_store: HostStore, db_uri: str, provider: str | None, saved_profile: bool, binding: str
+) -> None:
+    host_id, source_id = uuid.uuid4().hex, uuid.uuid4().hex
+    if provider is None:
+        host_store.upsert_on_connect(host_id, "laptop", "alice")
+    else:
+        host_store.register_managed_host(
+            host_id=host_id,
+            name="sandbox",
+            user_id="alice",
+            token="test-launch-token",
+            provider=provider,
+            sandbox_id="test-sandbox",
+            token_expires_at=now_epoch() + 100,
+        )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation(
+        inference_snapshot={"runtime_config": {}} if saved_profile else None
+    )
+    if binding != "unbound":
+        conversations.set_host_id(
+            conv.id, host_id if binding == "same-host" else source_id, workspace="/tmp"
+        )
+
+    def admit() -> None:
+        host_store.admit_launch(
+            host_id,
+            conv.id,
+            "alice",
+            None,
+            allow_unbound=binding == "unbound",
+            transfer_from_host_id=source_id if binding == "transfer" else None,
+        )
+
+    if saved_profile and provider is None:
+        with pytest.raises(OmnigentError, match="saved sandbox inference profile") as error:
+            admit()
+        assert error.value.code == ErrorCode.INVALID_INPUT
+    else:
+        admit()
 
 
 def test_upsert_creates_host_on_first_connect(
