@@ -20,6 +20,7 @@ see.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from os import PathLike
@@ -137,6 +138,7 @@ class HostFrameKind(str, Enum):
     IMPORT_LOCAL = "host.import_local"
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
+    IMPORT_LOCAL_SESSION_CHUNK = "host.import_local_session_chunk"
     IMPORT_LOCAL_DONE = "host.import_local_done"
 
 
@@ -1071,6 +1073,30 @@ class HostImportLocalSessionFrame:
 
 
 @dataclass
+class HostImportLocalSessionChunkFrame:
+    """Host → server: one ordered slice of an oversized streamed session.
+
+    A session whose single ``host.import_local_session`` frame would exceed
+    the tunnel's WebSocket message cap rides as consecutive slices of that
+    frame's ``session`` object JSON instead; the server reassembles them and
+    then treats the result exactly like a regular session frame. The host
+    streams sessions one at a time, so one session's slices are contiguous.
+
+    :param request_id: Correlates to the :class:`HostImportLocalFrame`.
+    :param total: Total sessions the host will stream for this request.
+    :param seq: 0-based position of this slice within its session.
+    :param last: ``True`` on the session's final slice.
+    :param data: This slice of the session-object JSON.
+    """
+
+    request_id: str
+    total: int
+    seq: int
+    last: bool
+    data: str
+
+
+@dataclass
 class HostImportLocalDoneFrame:
     """Host → server: the import stream for a request has ended.
 
@@ -1131,6 +1157,7 @@ HostFrame = (
     | HostImportLocalFrame
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
+    | HostImportLocalSessionChunkFrame
     | HostImportLocalDoneFrame
 )
 
@@ -1554,19 +1581,23 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostImportLocalSessionFrame):
-        s = frame.session
         return _encode_payload(
             {
                 "kind": HostFrameKind.IMPORT_LOCAL_SESSION.value,
                 "request_id": frame.request_id,
                 "total": frame.total,
-                "session": {
-                    "external_session_id": s.external_session_id,
-                    "workspace": s.workspace,
-                    "items": s.items,
-                    "title": s.title,
-                    "source": s.source,
-                },
+                "session": _imported_local_session_payload(frame.session),
+            }
+        )
+    if isinstance(frame, HostImportLocalSessionChunkFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_SESSION_CHUNK.value,
+                "request_id": frame.request_id,
+                "total": frame.total,
+                "seq": frame.seq,
+                "last": frame.last,
+                "data": frame.data,
             }
         )
     if isinstance(frame, HostImportLocalDoneFrame):
@@ -1581,6 +1612,130 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
+
+
+def _imported_local_session_payload(session: HostImportedLocalSession) -> _JsonObject:
+    """Build the wire ``session`` object shared by whole and chunked frames."""
+    return {
+        "external_session_id": session.external_session_id,
+        "workspace": session.workspace,
+        "items": session.items,
+        "title": session.title,
+        "source": session.source,
+    }
+
+
+# Sessions whose JSON runs past this many characters are streamed as
+# ``host.import_local_session_chunk`` slices of this size instead of one
+# ``host.import_local_session`` frame, which would otherwise exceed the
+# tunnel's WebSocket message cap (RUNNER_TUNNEL_MAX_MESSAGE_BYTES, 100 MiB)
+# and drop the whole host connection. json.dumps output is ASCII, so an
+# encoded slice frame stays under ~2x this size even with worst-case JSON
+# string escaping.
+IMPORT_SESSION_CHUNK_CHARS = 8 * 1024 * 1024
+
+# Reassembly cap for one chunked session, enforced server-side so a buggy or
+# hostile host can't buffer unbounded data; a session past it is counted as
+# failed instead of imported.
+IMPORT_SESSION_MAX_REASSEMBLED_CHARS = 512 * 1024 * 1024
+
+# Bound all in-flight chunk buffers on one host connection. A host may serve
+# several concurrent import requests, so the per-session cap alone is not an
+# aggregate memory bound.
+IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS = 512 * 1024 * 1024
+
+
+def encode_import_local_session_frames(
+    request_id: str,
+    total: int,
+    session: HostImportedLocalSession,
+) -> Iterator[str]:
+    """Encode one streamed session, slicing it into chunks when oversized.
+
+    Yields a single ``host.import_local_session`` frame when the session's
+    JSON fits in one tunnel message, otherwise consecutive
+    ``host.import_local_session_chunk`` frames for the server to reassemble.
+    """
+    session_json = json.dumps(_imported_local_session_payload(session))
+    if len(session_json) <= IMPORT_SESSION_CHUNK_CHARS:
+        yield encode_host_frame(
+            HostImportLocalSessionFrame(request_id=request_id, total=total, session=session)
+        )
+        return
+    end = len(session_json)
+    for seq, start in enumerate(range(0, end, IMPORT_SESSION_CHUNK_CHARS)):
+        stop = start + IMPORT_SESSION_CHUNK_CHARS
+        yield encode_host_frame(
+            HostImportLocalSessionChunkFrame(
+                request_id=request_id,
+                total=total,
+                seq=seq,
+                last=stop >= end,
+                data=session_json[start:stop],
+            )
+        )
+
+
+class ImportLocalSessionChunkAssembler:
+    """Reassemble one import request's chunked sessions, in arrival order.
+
+    The host streams sessions sequentially and one session's slices
+    contiguously, so a single buffer per request suffices. :meth:`add`
+    returns ``None`` while a session is incomplete and the reassembled
+    session once its last slice lands. The buffer resets after every final
+    slice, so one assembler serves all of a request's sessions.
+    """
+
+    def __init__(self, max_chars: int = IMPORT_SESSION_MAX_REASSEMBLED_CHARS) -> None:
+        self._max_chars = max_chars
+        self._parts: list[str] = []
+        self._chars = 0
+        self._next_seq = 0
+        self._corrupt: str | None = None
+
+    @property
+    def buffered_chars(self) -> int:
+        """Characters currently retained by this assembler."""
+        return self._chars
+
+    @property
+    def in_progress(self) -> bool:
+        """Whether a session started but has not received its final slice."""
+        return bool(self._parts or self._corrupt is not None or self._next_seq)
+
+    def add(self, frame: HostImportLocalSessionChunkFrame) -> HostImportedLocalSession | None:
+        """Fold in one slice; return the session on its final slice.
+
+        :raises ValueError: On the final slice when the sequence had a gap,
+            grew past the size cap, or did not reassemble into a valid
+            session object. The buffered data is discarded either way, so the
+            caller can count one failed session and keep the stream alive.
+        """
+        if self._corrupt is None:
+            if frame.seq != self._next_seq:
+                self._corrupt = f"slice out of order (got seq {frame.seq}, want {self._next_seq})"
+                self._parts.clear()
+                self._chars = 0
+            else:
+                self._next_seq += 1
+                self._chars += len(frame.data)
+                if self._chars > self._max_chars:
+                    self._corrupt = f"chunked session exceeds {self._max_chars} characters"
+                    self._parts.clear()
+                    self._chars = 0
+                else:
+                    self._parts.append(frame.data)
+        if not frame.last:
+            return None
+        parts, corrupt = self._parts, self._corrupt
+        self._parts, self._chars, self._next_seq, self._corrupt = [], 0, 0, None
+        if corrupt is not None:
+            raise ValueError(corrupt)
+        try:
+            raw = json.loads("".join(parts))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"chunked session is not valid JSON: {exc}") from exc
+        return _decode_imported_local_session(raw)
 
 
 def decode_host_frame(text: str) -> HostFrame:
@@ -1737,6 +1892,8 @@ def _decode_known_host_frame(
             return _decode_import_local_by_id(msg)
         case HostFrameKind.IMPORT_LOCAL_SESSION:
             return _decode_import_local_session(msg)
+        case HostFrameKind.IMPORT_LOCAL_SESSION_CHUNK:
+            return _decode_import_local_session_chunk(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
@@ -2364,6 +2521,17 @@ def _decode_import_local_session(msg: _JsonObject) -> HostImportLocalSessionFram
         request_id=_required_str(msg, "request_id"),
         total=_required_int(msg, "total"),
         session=_decode_imported_local_session(msg.get("session")),
+    )
+
+
+def _decode_import_local_session_chunk(msg: _JsonObject) -> HostImportLocalSessionChunkFrame:
+    """Decode a host.import_local_session_chunk frame (one session slice)."""
+    return HostImportLocalSessionChunkFrame(
+        request_id=_required_str(msg, "request_id"),
+        total=_required_int(msg, "total"),
+        seq=_required_int(msg, "seq"),
+        last=_required_bool(msg, "last"),
+        data=_required_str(msg, "data"),
     )
 
 

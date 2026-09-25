@@ -82,6 +82,26 @@ def _canonical_host_id(host_id: str) -> str:
         return host_id
 
 
+def _fail_pending_imports(conn: HostConnection) -> None:
+    """Fail the connection's in-flight import streams immediately.
+
+    A dead tunnel can never deliver another session frame; without this
+    signal the import request only learns of the drop by waiting out its
+    per-frame timeout (60s of "Importing…" in the UI).
+    """
+    while conn.pending_import_local:
+        _request_id, queue = conn.pending_import_local.popitem()
+        queue.put_nowait(
+            (
+                "done",
+                {
+                    "status": "failed",
+                    "error": f"host '{conn.host_id}' disconnected mid-import",
+                },
+            )
+        )
+
+
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
 # come online (a 60s window today); 10 minutes covers slow retries with
@@ -443,6 +463,7 @@ class HostRegistry:
                     host_id,
                 )
                 old.outbound_queue.put_nowait(None)
+                _fail_pending_imports(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -484,6 +505,7 @@ class HostRegistry:
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
+        _fail_pending_imports(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

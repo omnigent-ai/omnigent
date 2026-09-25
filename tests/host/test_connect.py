@@ -7557,6 +7557,82 @@ async def test_handle_import_local_send_connection_closed_aborts_batch(
         )
 
 
+async def test_handle_import_local_slices_oversized_session_into_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An oversized session streams as chunk frames instead of one giant frame.
+
+    A single whole-session frame past the tunnel's message cap would drop the
+    host connection, killing the oversized session's import and the rest of
+    the batch with it.
+    """
+    import omnigent.host.frames as frames_module
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionChunkFrame,
+        HostImportLocalSessionFrame,
+        ImportLocalSessionChunkAssembler,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+    monkeypatch.setattr(frames_module, "IMPORT_SESSION_CHUNK_CHARS", 256)
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "small"), ("claude", "giant")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        payload = {"text": "x" * 2000} if session_id == "giant" else {"role": "user"}
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: payload),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=f"{session_id} title",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_big", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    chunk_frames = [f for f in frames if isinstance(f, HostImportLocalSessionChunkFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # The small session still rides whole; the giant one rides as slices.
+    assert [f.session.external_session_id for f in session_frames] == ["small"]
+    assert len(chunk_frames) > 1
+    assert [f.seq for f in chunk_frames] == list(range(len(chunk_frames)))
+    assert chunk_frames[-1].last is True
+
+    assembler = ImportLocalSessionChunkAssembler()
+    reassembled = None
+    for chunk in chunk_frames:
+        reassembled = assembler.add(chunk)
+    assert reassembled is not None
+    assert reassembled.external_session_id == "giant"
+    assert reassembled.items[0]["data"] == {"text": "x" * 2000}
+    assert len(done_frames) == 1 and done_frames[0].status == "ok"
+
+
 async def test_dispatch_fs_write_op_routes_github_set_preference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
