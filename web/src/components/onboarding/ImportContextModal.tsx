@@ -241,7 +241,7 @@ function ImportContextBody({
       </DialogClose>
 
       {/* On short viewports the body scrolls so the Confirm footer stays reachable. */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pt-5">
+      <div className="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pt-5">
         <div className="flex flex-col items-center gap-1 py-2 text-center">
           <DialogTitle className="min-h-0 pr-0 text-2xl leading-8 font-normal tracking-[-0.02em]">
             Your imports are ready
@@ -270,7 +270,7 @@ function ImportContextBody({
               Skills
             </TabsTrigger>
           </TabsList>
-          <div className="min-h-0 flex-1 overflow-y-auto pt-2">
+          <div className="no-scrollbar min-h-0 flex-1 overflow-y-auto pt-2">
             <TabsContent value="credentials">
               <CredentialRows credentials={context.credentials} />
             </TabsContent>
