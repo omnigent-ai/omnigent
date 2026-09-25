@@ -5693,6 +5693,9 @@ def create_runner_app(
         *,
         source_error: Mapping[str, object] | None = None,
     ) -> None:
+        # Native bridges inject out of process, so turn start must wake their watcher.
+        if status == "running":
+            resource_registry.wake_session_terminal_watchers(conv_id)
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
         ):

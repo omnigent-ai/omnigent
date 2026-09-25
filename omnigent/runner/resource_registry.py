@@ -485,6 +485,18 @@ class SessionResourceRegistry:
         """
         self._terminal_exit_publisher = publisher
 
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """Pull this session's status-driving pane watchers back to base rate."""
+        registry = self._terminal_registry
+        if registry is None:
+            return
+        for entry in registry.list_for_conversation(session_id):
+            resource_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+            with self._lock:
+                role = self._terminal_roles.get((session_id, resource_id))
+            if role in _STATUS_EMITTING_TERMINAL_ROLES:
+                entry.instance.wake_idle_watcher(expect_output=True)
+
     async def wait_for_terminal_exit_cleanup(self) -> None:
         """Await the scheduled terminal-exit cleanup to completion so its
         ``session.resource.deleted`` publish is observable without polling.
@@ -1194,37 +1206,7 @@ class SessionResourceRegistry:
         *,
         replace: bool = False,
     ) -> None:
-        """Start (idempotently) the per-terminal pane-activity watcher.
-
-        Drives the runner-determined "PTY had output" signal that powers
-        the web terminal-activity badge, replacing the removed
-        per-terminal client WS attach. The same watcher also reports
-        unexpected terminal exit so resource/session lifecycle stays
-        aligned with the underlying tmux process. No-op when no publisher
-        is installed (e.g. embedded/test runners).
-
-        For the claude-native *agent* terminal (``resource_role`` ==
-        :data:`CLAUDE_NATIVE_TERMINAL_ROLE` or
-        :data:`PI_NATIVE_TERMINAL_ROLE`) the same watcher also drives the
-        session's working status: pane activity → ``running`` and a short
-        quiescence → ``idle``, emitted via the session-status publisher.
-        This PTY-derived status catches cases lifecycle hooks can miss
-        because it observes the terminal directly. The status edges are
-        gated to these roles so a side shell's output never flips the
-        session's status.
-
-        :param session_id: Session/conversation identifier.
-        :param terminal_name: Terminal name from the agent spec.
-        :param session_key: Per-launch session key.
-        :param instance: The launched :class:`TerminalInstance`.
-        :param resource_role: Runner-private role marker for this
-            terminal, e.g. :data:`CLAUDE_NATIVE_TERMINAL_ROLE`, or
-            ``None`` for a generic terminal (activity badge only).
-        :param lifecycle: Required/auxiliary relationship between this
-            terminal and the owning session.
-        :param replace: Whether to replace an existing watcher so callbacks
-            can be rebound after terminal ownership transfer.
-        """
+        """Start (idempotently) the per-terminal pane-activity watcher."""
         activity_publisher = self._terminal_activity_publisher
         status_publisher = self._session_status_publisher
         exit_publisher = self._terminal_exit_publisher
@@ -1276,12 +1258,19 @@ class SessionResourceRegistry:
             # ``idle`` and needed a freshness window to arbitrate.
             return status_poller is not None and status_poller.active
 
+        def _idle_poll_backoff_allowed() -> bool:
+            # The file rides this tick: back off only when it owns status and says idle.
+            if not _file_owns_status():
+                return True
+            assert status_poller is not None  # implied by _file_owns_status()
+            return status_poller.reports_idle
+
         # claude-native additionally reads Claude's own ``sessions/<pid>.json``
         # status (present since Claude Code v2.1.139): it flips on the real
         # turn edge and knows when a dialog owns the input, neither of which
-        # the PTY frame-diff can see. It supplements the PTY watcher rather
-        # than replacing it — the file is written only on a value *change*, so
-        # it cannot be trusted to re-assert a status it already holds. Built
+        # the PTY frame-diff can see. Once resolved it replaces the PTY as the
+        # status publisher while continuing to ride the watcher tick; before
+        # resolution or after retirement the pane remains the fallback. Built
         # only for the claude-native role; other native roles stay PTY-only.
         status_poller = (
             self._build_claude_native_status_poller(
@@ -1453,6 +1442,9 @@ class SessionResourceRegistry:
             on_idle=_on_idle,
             on_exit=_on_exit,
             on_tick=_on_tick,
+            idle_poll_backoff_allowed=(
+                _idle_poll_backoff_allowed if status_poller is not None else None
+            ),
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,
