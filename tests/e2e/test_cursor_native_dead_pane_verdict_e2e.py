@@ -1,57 +1,24 @@
-"""E2E (backend): a Cursor approval verdict sent to a torn-down TUI pane.
+"""E2E guard: a Cursor approval verdict delivered to a torn-down TUI pane must
+not be logged as an operational error.
 
-Journey the user hits (no live cursor-agent needed to exercise the failing
-code path — see below):
+The cursor-native harness answers a web approval card by sending tmux keystrokes
+into the runner-owned pane that hosts cursor-agent. When that pane has already
+exited (session teardown, runner disconnect, or the user ending the run) its
+tmux socket is gone, so the keystroke cannot land. That is expected teardown:
+dropping the verdict is the only possible outcome and belongs below ERROR, not
+at it.
 
-1. A cursor-native session is working in its embedded terminal.
-2. ``cursor-agent`` raises a per-tool approval prompt, which the runner-side
-   mirror (:mod:`omnigent.harnesses.cursor_native.permissions`) surfaces as a
-   web ``ApprovalCard``.
-3. The session's terminal pane exits / is torn down (session end, runner
-   disconnect, or the pane simply dying) — so its ``tmux`` socket is gone.
-4. The user clicks **Reject** on the still-parked card. The mirror delivers the
-   decline sequence ``("Escape", "Enter")`` to the pane via
-   :func:`omnigent.harnesses.cursor_native.permissions._send_cursor_keys`.
-
-Because the pane's socket no longer exists,
-:func:`omnigent.harnesses.cursor_native.bridge.send_cursor_pane_keys` runs
-``tmux send-keys`` against a dead socket and ``_run_tmux`` raises::
-
-    RuntimeError: tmux command failed (rc=1): error connecting to
-    <tmpdir>/tmux.sock (No such file or directory)
-
-On the buggy build ``_send_cursor_keys`` catches that and logs it at **ERROR**
-as the tracked signature::
-
-    failed to send cursor keystroke 'Escape' (of ('Escape', 'Enter')); session=...
-
-then returns ``False`` (aborting before ``Enter``) — i.e. a plain teardown /
-disconnect consequence is surfaced as an ERROR-level defect signature instead
-of being handled as an expected consequence of the pane going away.
-
-The failing delivery path (bridge + real ``tmux``) is entirely independent of
-whether ``cursor-agent`` is logged in — it just sends keys to whatever pane the
-bridge advertises — so this drives the **real** product functions against a
-**real** ``tmux`` pane that is then torn down, reproducing the reported error
-faithfully without a Cursor account.
-
-Assertion (keyed to the tracked ERROR signature, fix-agnostic): delivering an
-approval verdict to a cursor session whose TUI pane has already exited must NOT
-emit the ERROR-level ``failed to send cursor keystroke`` record. This FAILS on
-the buggy build (the ERROR is logged) and must PASS once the dead-pane teardown
-case is handled as a non-error condition.
-
-Gated: needs a real ``tmux`` on ``PATH`` (the runner-owned TUI pane transport);
-skipped (not failed) otherwise.
+This drives the real bridge + permissions delivery path against a real tmux pane
+that is created, advertised exactly as the runner advertises it, and then torn
+down mid-flight. Delivering the decline sequence (Escape, Enter) that a Reject
+verdict sends must report the keystroke as undelivered without logging the
+tracked error signature.
 """
-
-from __future__ import annotations
 
 import logging
 import shutil
 import subprocess
 import tempfile
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -66,46 +33,40 @@ from omnigent.harnesses.cursor_native.permissions import _send_cursor_keys
 
 pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
-    reason="cursor-native keystroke delivery needs a real `tmux` on PATH.",
+    reason="requires the tmux binary to stand up and tear down a real cursor pane",
 )
 
-# The tracked ERROR signature: the message prefix `_send_cursor_keys` emits when
-# a keystroke cannot be delivered.
-_ERROR_SIGNATURE = "failed to send cursor keystroke"
-# The exact decline sequence `_run_one_approval` sends for a Reject verdict
-# (`prompt.decline_key` == "Escape", then "Enter" to submit an empty reason).
-_DECLINE_SEQUENCE = ("Escape", "Enter")
-# A representative cursor chat/session id.
-_SESSION_ID = "1080588264878826"
-# Logger `_send_cursor_keys` uses (module logger); the ERROR record lands here.
 _PERMISSIONS_LOGGER = "omnigent.harnesses.cursor_native.permissions"
+_ERROR_SIGNATURE = "failed to send cursor keystroke"
+_SESSION_ID = "1080588264878826"
+# What _run_one_approval sends for a Reject verdict: the decline key then Enter.
+_DECLINE_SEQUENCE = ("Escape", "Enter")
 
 
-def _kill_tmux_socket(socket_path: Path) -> None:
-    """Tear the pane down: kill the tmux server and remove its socket file."""
+class _RecordCollector(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _kill_tmux_pane(socket_path: Path) -> None:
     subprocess.run(
         ["tmux", "-S", str(socket_path), "kill-server"],
         check=False,
         capture_output=True,
     )
-    if socket_path.exists():
-        socket_path.unlink()
+    socket_path.unlink(missing_ok=True)
 
 
 @pytest.fixture
-def cursor_pane_then_torn_down() -> Iterator[tuple[Path, Path]]:
-    """A real cursor-native bridge dir + tmux pane, torn down mid-test.
-
-    Yields ``(bridge_dir, socket_path)`` with a live pane advertised in
-    ``tmux.json`` exactly as the runner's launch path does
-    (:func:`omnigent.harnesses.cursor_native.bridge.write_tmux_target`). The
-    test kills the socket to reach the reported teardown state; the fixture's
-    teardown is idempotent (kills again + removes the temp dirs).
-    """
-    # Shape the socket dir like the runner's (`omnigent-terminal-*`).
+def cursor_bridge_with_live_pane() -> Iterator[tuple[Path, Path]]:
+    """A cursor-native bridge dir advertising a real, live tmux pane."""
     socket_dir = Path(tempfile.mkdtemp(prefix="omnigent-terminal-"))
-    socket_path = socket_dir / "tmux.sock"
     bridge_dir = Path(tempfile.mkdtemp(prefix="cursor-native-bridge-"))
+    socket_path = socket_dir / "tmux.sock"
     subprocess.run(
         ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", "cursor", "sleep 600"],
         check=True,
@@ -115,55 +76,45 @@ def cursor_pane_then_torn_down() -> Iterator[tuple[Path, Path]]:
     try:
         yield bridge_dir, socket_path
     finally:
-        _kill_tmux_socket(socket_path)
+        _kill_tmux_pane(socket_path)
         shutil.rmtree(socket_dir, ignore_errors=True)
         shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
 async def test_cursor_decline_verdict_to_dead_pane_is_not_an_error_signature(
-    cursor_pane_then_torn_down: tuple[Path, Path],
-    caplog: pytest.LogCaptureFixture,
+    cursor_bridge_with_live_pane: tuple[Path, Path],
 ) -> None:
-    """A Reject verdict to a torn-down cursor pane must not log the tracked ERROR.
+    bridge_dir, socket_path = cursor_bridge_with_live_pane
 
-    With the pane's tmux socket gone (a teardown / disconnect consequence),
-    delivering the ``("Escape", "Enter")`` decline sequence emitted the tracked
-    ERROR signature on the buggy build. After a fix that treats a dead pane as
-    a non-error teardown case, no such ERROR is logged.
-    """
-    bridge_dir, socket_path = cursor_pane_then_torn_down
-
-    # Control: while the pane is live, the bridge advertises it and a real
-    # keystroke lands — so the failure below is the teardown, not a broken rig.
+    # The pane is advertised and a verdict lands while it is alive.
     assert read_tmux_info(bridge_dir) is not None
     send_cursor_pane_keys(bridge_dir, "Escape")
 
-    # The reported trigger: the pane exits / is torn down, so its socket is gone.
-    _kill_tmux_socket(socket_path)
-    time.sleep(0.2)
+    # The pane exits before the web Reject verdict is delivered.
+    _kill_tmux_pane(socket_path)
+    assert not socket_path.exists()
 
-    # The user's Reject verdict is delivered to the (now dead) pane, exactly as
-    # `_run_one_approval` does for a decline: send "Escape", then "Enter".
-    with caplog.at_level(logging.ERROR, logger=_PERMISSIONS_LOGGER):
+    collector = _RecordCollector()
+    logger = logging.getLogger(_PERMISSIONS_LOGGER)
+    previous_level = logger.level
+    logger.addHandler(collector)
+    logger.setLevel(logging.DEBUG)
+    try:
         delivered = await _send_cursor_keys(bridge_dir, _SESSION_ID, *_DECLINE_SEQUENCE)
+    finally:
+        logger.removeHandler(collector)
+        logger.setLevel(previous_level)
 
-    # The keystroke genuinely cannot reach a pane that no longer exists — that
-    # much is expected on both the buggy and fixed builds.
     assert delivered is False
 
-    # THE BUG: the teardown consequence is surfaced as the tracked ERROR
-    # signature. Fails on the buggy build (the ERROR is present); must pass
-    # once a dead pane is handled without emitting this Omnigent-owned ERROR.
-    kpi_errors = [
+    error_signatures = [
         record
-        for record in caplog.records
-        if record.levelno >= logging.ERROR
-        and record.name == _PERMISSIONS_LOGGER
-        and _ERROR_SIGNATURE in record.getMessage()
+        for record in collector.records
+        if record.levelno >= logging.ERROR and _ERROR_SIGNATURE in record.getMessage()
     ]
-    assert not kpi_errors, (
-        "delivering a Cursor approval verdict to a torn-down TUI pane logged "
-        f"the tracked ERROR signature ({_ERROR_SIGNATURE!r}) instead of "
-        "handling the dead pane as a teardown consequence: "
-        f"{kpi_errors[0].getMessage()!r}"
+    assert not error_signatures, (
+        "delivering a Cursor decline verdict (Escape, Enter) to a torn-down tmux "
+        f"pane logged the tracked error signature {_ERROR_SIGNATURE!r}; a gone pane "
+        "is expected teardown and the dropped keystroke should be recorded below "
+        f"ERROR: {[r.getMessage() for r in error_signatures]}"
     )

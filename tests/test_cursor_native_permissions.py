@@ -28,6 +28,7 @@ import contextlib
 import json as _json
 import logging
 import sqlite3 as _sqlite3
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -157,7 +158,7 @@ def test_send_cursor_pane_keys_invokes_tmux_send_keys(
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
-    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: True)
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: True)
     monkeypatch.setattr(cnb, "_run_tmux", lambda sp, *a: calls.append((sp, a)))
 
     cnb.send_cursor_pane_keys(tmp_path, "y")
@@ -183,7 +184,7 @@ def test_send_cursor_pane_keys_dead_pane_raises_pane_gone(
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
-    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: False)
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: False)
     with pytest.raises(cnb.CursorPaneGoneError):
         cnb.send_cursor_pane_keys(tmp_path, "Escape")
 
@@ -200,7 +201,7 @@ def test_send_cursor_pane_keys_teardown_race_raises_pane_gone(
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
-    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: next(alive))
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: next(alive))
     monkeypatch.setattr(cnb, "_run_tmux", _connect_error)
     with pytest.raises(cnb.CursorPaneGoneError):
         cnb.send_cursor_pane_keys(tmp_path, "Escape")
@@ -217,11 +218,42 @@ def test_send_cursor_pane_keys_live_pane_failure_stays_an_error(
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
-    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: True)
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: True)
     monkeypatch.setattr(cnb, "_run_tmux", _tmux_error)
     with pytest.raises(RuntimeError) as excinfo:
         cnb.send_cursor_pane_keys(tmp_path, "Escape")
     assert not isinstance(excinfo.value, cnb.CursorPaneGoneError)
+
+
+def test_send_cursor_pane_keys_unanswered_probe_keeps_delivery_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unanswered liveness probe (hung tmux) does not turn a send failure into teardown."""
+
+    def _timed_out(_sp: str, *_a: str) -> None:
+        raise RuntimeError("tmux command timed out after 10.0s")
+
+    monkeypatch.setattr(
+        cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: None)
+    monkeypatch.setattr(cnb, "_run_tmux", _timed_out)
+    with pytest.raises(RuntimeError) as excinfo:
+        cnb.send_cursor_pane_keys(tmp_path, "Escape")
+    assert not isinstance(excinfo.value, cnb.CursorPaneGoneError)
+
+
+def test_probe_session_reports_unanswered_probe_as_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung ``has-session`` is indeterminate for the probe and not-alive for callers."""
+
+    def _hang(*_a: object, **_k: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="tmux", timeout=1.0)
+
+    monkeypatch.setattr(cnb.subprocess, "run", _hang)
+    assert cnb._probe_session("sock", "main") is None
+    assert cnb._session_alive("sock", "main") is False
 
 
 # ── Transcript-based detector ────────────────────────────────────────────────
