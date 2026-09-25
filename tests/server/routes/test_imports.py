@@ -401,6 +401,30 @@ async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
     assert conn.pending_import_local == {}
 
 
+async def test_stream_local_sessions_treats_chunk_progress_as_liveness() -> None:
+    """Chunk heartbeats reset the wait without yielding malformed sessions."""
+    conn = SimpleNamespace(host_id="h1", pending_import_local={})
+
+    class _Reg:
+        def send_text(self, host_conn: object, frame: str) -> None:
+            (queue,) = conn.pending_import_local.values()
+            queue.put_nowait(("progress", {}))
+            queue.put_nowait(("done", {"status": "ok", "error": None}))
+
+    got = [
+        session
+        async for session in _stream_local_sessions_from_host(
+            host_registry=_Reg(),  # type: ignore[arg-type]
+            host_conn=conn,  # type: ignore[arg-type]
+            source="claude",
+            limit=1,
+        )
+    ]
+
+    assert got == []
+    assert conn.pending_import_local == {}
+
+
 async def test_stream_local_sessions_sends_exact_session_id() -> None:
     """The server carries an exact id through the host tunnel request."""
     from omnigent.host.frames import HostImportLocalByIdFrame, decode_host_frame

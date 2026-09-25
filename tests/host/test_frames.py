@@ -25,6 +25,7 @@ from omnigent.host.frames import (
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
+    HostImportLocalSessionChunkFrame,
     HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
@@ -50,9 +51,11 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    ImportLocalSessionChunkAssembler,
     classify_launch_refusal,
     decode_host_frame,
     encode_host_frame,
+    encode_import_local_session_frames,
     workspace_missing_message,
 )
 
@@ -178,6 +181,134 @@ def test_skills_result_rejects_malformed_catalog(skills: object) -> None:
         decode_host_frame(
             json.dumps(
                 {"kind": "host.skills_result", "request_id": "r", "status": "ok", "skills": skills}
+            )
+        )
+
+
+def test_import_local_session_chunk_frame_round_trip() -> None:
+    """A session slice survives the tunnel with its ordering metadata."""
+    chunk = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionChunkFrame(
+                request_id="req_imp", total=3, seq=2, last=True, data='{"partial": tru'
+            )
+        )
+    )
+    assert chunk == HostImportLocalSessionChunkFrame(
+        request_id="req_imp", total=3, seq=2, last=True, data='{"partial": tru'
+    )
+
+
+def _session_with_payload(payload: str) -> HostImportedLocalSession:
+    """A one-item session whose size is driven by *payload*."""
+    return HostImportedLocalSession(
+        external_session_id="s_big",
+        workspace="/repo",
+        items=[{"type": "message", "response_id": "r1", "data": {"text": payload}}],
+        title="big session",
+        source="claude",
+    )
+
+
+def test_encode_import_local_session_frames_small_session_is_one_frame() -> None:
+    """A session under the chunk threshold rides in one whole-session frame."""
+    frames = list(encode_import_local_session_frames("req_one", 1, _session_with_payload("hi")))
+
+    assert len(frames) == 1
+    decoded = decode_host_frame(frames[0])
+    assert isinstance(decoded, HostImportLocalSessionFrame)
+    assert decoded.session.external_session_id == "s_big"
+
+
+def test_encode_import_local_session_frames_slices_oversized_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An oversized session is sliced into ordered chunk frames that reassemble."""
+    import omnigent.host.frames as frames_module
+
+    monkeypatch.setattr(frames_module, "IMPORT_SESSION_CHUNK_CHARS", 64)
+    session = _session_with_payload("x" * 500)
+
+    frames = [
+        decode_host_frame(text)
+        for text in encode_import_local_session_frames("req_big", 2, session)
+    ]
+
+    assert len(frames) > 1
+    assert all(isinstance(f, HostImportLocalSessionChunkFrame) for f in frames)
+    assert [f.seq for f in frames] == list(range(len(frames)))
+    assert [f.last for f in frames] == [False] * (len(frames) - 1) + [True]
+    assert all(f.request_id == "req_big" and f.total == 2 for f in frames)
+    # Every slice respects the configured size, so no frame can grow past
+    # the tunnel's message cap however large the session is.
+    assert all(len(f.data) <= 64 for f in frames)
+
+    assembler = ImportLocalSessionChunkAssembler()
+    reassembled = [assembler.add(f) for f in frames]
+    assert reassembled[:-1] == [None] * (len(frames) - 1)
+    assert reassembled[-1] == session
+
+
+def test_chunk_assembler_recovers_after_corrupt_sequence() -> None:
+    """A slice gap fails that one session, then the next session assembles."""
+    assembler = ImportLocalSessionChunkAssembler()
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(request_id="r", total=1, seq=1, last=False, data="{}")
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="out of order"):
+        assembler.add(
+            HostImportLocalSessionChunkFrame(request_id="r", total=1, seq=2, last=True, data="")
+        )
+
+    # The buffer reset on the failed final slice, so a following well-formed
+    # chunked session on the same request still assembles.
+    session = _session_with_payload("ok")
+    session_json = json.dumps(
+        {
+            "external_session_id": session.external_session_id,
+            "workspace": session.workspace,
+            "items": session.items,
+            "title": session.title,
+            "source": session.source,
+        }
+    )
+    half = len(session_json) // 2
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=0, last=False, data=session_json[:half]
+            )
+        )
+        is None
+    )
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=1, last=True, data=session_json[half:]
+            )
+        )
+        == session
+    )
+
+
+def test_chunk_assembler_enforces_size_cap() -> None:
+    """A chunked session past the reassembly cap fails without buffering it."""
+    assembler = ImportLocalSessionChunkAssembler(max_chars=10)
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=0, last=False, data="x" * 8
+            )
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="exceeds"):
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=1, last=True, data="x" * 8
             )
         )
 

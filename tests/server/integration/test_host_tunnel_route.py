@@ -16,9 +16,13 @@ from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalDoneFrame,
+    HostImportLocalSessionChunkFrame,
     HostLaunchRunnerResultFrame,
     decode_host_frame,
     encode_host_frame,
+    encode_import_local_session_frames,
 )
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
@@ -577,6 +581,175 @@ async def test_host_tunnel_routes_launch_result_to_future(
     assert result["status"] == "launched"
     assert result["runner_id"] == "runner_token_xyz"
     assert result["error"] is None
+
+
+async def test_host_tunnel_reassembles_chunked_import_session(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verify that an import session sliced into chunk frames lands on the
+    pending import queue as one whole session, identical to the payload a
+    single ``host.import_local_session`` frame would deliver.
+    """
+    import omnigent.host.frames as frames_module
+
+    monkeypatch.setattr(frames_module, "IMPORT_SESSION_CHUNK_CHARS", 64)
+
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local["req_chunked"] = queue
+
+    session = HostImportedLocalSession(
+        external_session_id="s_giant",
+        workspace="/repo",
+        items=[{"type": "message", "response_id": "r1", "data": {"text": "x" * 400}}],
+        title="giant",
+        source="claude",
+    )
+    texts = list(encode_import_local_session_frames("req_chunked", 1, session))
+    assert len(texts) > 1  # actually exercised the chunk path
+    for text in texts:
+        await comm.send_input({"type": "websocket.receive", "text": text})
+
+    received = [await asyncio.wait_for(queue.get(), timeout=2.0) for _ in range(len(texts) + 1)]
+    kind, payload = next(entry for entry in received if entry[0] == "session")
+    assert kind == "session"
+    assert payload["external_session_id"] == "s_giant"
+    assert payload["items"] == session.items
+    assert payload["total"] == 1
+
+
+async def test_host_tunnel_counts_corrupt_chunked_session_as_failed(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """
+    Verify that a corrupt chunk sequence yields a session payload the import
+    loop counts as failed (no ``external_session_id``) instead of stalling or
+    killing the stream.
+    """
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local["req_corrupt"] = queue
+
+    # A final slice arriving with a sequence gap can never reassemble.
+    frame = encode_host_frame(
+        HostImportLocalSessionChunkFrame(
+            request_id="req_corrupt", total=1, seq=5, last=True, data="{}"
+        )
+    )
+    await comm.send_input({"type": "websocket.receive", "text": frame})
+
+    assert (await asyncio.wait_for(queue.get(), timeout=2.0))[0] == "progress"
+    kind, payload = await asyncio.wait_for(queue.get(), timeout=2.0)
+    assert kind == "session"
+    assert "external_session_id" not in payload
+    assert payload["total"] == 1
+
+
+async def test_host_tunnel_counts_incomplete_chunked_session_as_failed(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A done frame cannot silently discard a session missing its final slice."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local["req_incomplete"] = queue
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostImportLocalSessionChunkFrame(
+                    request_id="req_incomplete", total=1, seq=0, last=False, data="{"
+                )
+            ),
+        }
+    )
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostImportLocalDoneFrame(request_id="req_incomplete", status="ok")
+            ),
+        }
+    )
+
+    received = [await asyncio.wait_for(queue.get(), timeout=2.0) for _ in range(3)]
+    assert [kind for kind, _payload in received] == ["progress", "session", "done"]
+    assert "external_session_id" not in received[1][1]
+
+
+async def test_host_tunnel_caps_aggregate_chunk_reassembly_memory(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-request chunk buffers share one connection-level memory cap."""
+    import omnigent.server.routes.host_tunnel as host_tunnel_module
+
+    monkeypatch.setattr(host_tunnel_module, "IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS", 10)
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    first: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    second: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local.update({"req_first": first, "req_second": second})
+
+    # An unsolicited request must not allocate any chunk buffer. If it did,
+    # the first legitimate 6-character chunk below would exceed the 10-char cap.
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostImportLocalSessionChunkFrame(
+                    request_id="req_unknown",
+                    total=1,
+                    seq=0,
+                    last=False,
+                    data="x" * 6,
+                )
+            ),
+        }
+    )
+
+    for request_id in ("req_first", "req_second"):
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostImportLocalSessionChunkFrame(
+                        request_id=request_id,
+                        total=1,
+                        seq=0,
+                        last=False,
+                        data="x" * 6,
+                    )
+                ),
+            }
+        )
+
+    assert (await asyncio.wait_for(first.get(), timeout=2.0))[0] == "progress"
+    assert (await asyncio.wait_for(second.get(), timeout=2.0))[0] == "progress"
+    kind, payload = await asyncio.wait_for(second.get(), timeout=2.0)
+    assert kind == "session"
+    assert "external_session_id" not in payload
 
 
 # ── Cross-owner re-registration rejection ───────────────────

@@ -295,6 +295,8 @@ async def _stream_local_sessions_from_host(
                     f"(no session within {_HOST_IMPORT_TIMEOUT_S:.0f}s)",
                     code=ErrorCode.CONFLICT,
                 ) from exc
+            if kind == "progress":
+                continue
             if kind == "session":
                 yield data
             else:  # "done"
