@@ -644,6 +644,110 @@ async def test_provisionally_stalled_task_stays_cancellable(
     assert "cancel_requested" in result or "best_effort" in result or "cancelled" in result
 
 
+@pytest.mark.asyncio
+async def test_grandchild_activity_keeps_the_waiting_orchestrator_alive(
+    _clean_subagent_registry: None,
+) -> None:
+    """P -> C -> G: a productive grandchild keeps its waiting parent C alive.
+
+    C dispatched G and is parked awaiting its result, so C emits no edges of
+    its own. G's activity must refresh C up the ancestor chain, or the watchdog
+    would falsely reap a healthy orchestrator.
+    """
+    child_c = "conv_orchestrator_c"
+    child_g = "conv_grandchild_g"
+    entry_c = runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID, child_session_id=child_c, agent="c", title="mid"
+    )
+    entry_c.status = "running"
+    entry_g = runner_app.register_subagent_work(
+        parent_session_id=child_c, child_session_id=child_g, agent="g", title="leaf"
+    )
+    entry_g.status = "running"
+    stale = entry_c.last_activity_at - STALL_TIMEOUT_S * 9
+    entry_c.last_activity_at = stale
+    entry_g.last_activity_at = stale
+
+    # The grandchild reports in through the runner's child-event funnel.
+    runner_app.note_subagent_activity(child_g)
+    assert entry_g.last_activity_at > stale
+    assert entry_c.last_activity_at > stale, "grandchild activity must refresh its parent"
+
+    # A sweep within a budget of that fresh edge reaps neither: C is alive.
+    assert (
+        await runner_app.reap_stalled_subagent_dispatches(
+            now=entry_c.last_activity_at + STALL_TIMEOUT_S - 1,
+            timeout_s=STALL_TIMEOUT_S,
+            read_child=_forbidden_reader(),
+        )
+        == []
+    )
+    assert entry_c.status == "running"
+    assert entry_g.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_sweep_adjudicates_a_bounded_batch_per_tick(
+    _clean_subagent_registry: None,
+) -> None:
+    """More stale entries than the per-sweep cap yield only a bounded read batch."""
+    cap = runner_app._SUBAGENT_STALL_ADJUDICATIONS_PER_SWEEP
+    now = 1_000_000.0
+    stale = now - STALL_TIMEOUT_S * 2
+    for i in range(cap + 5):
+        entry = runner_app.register_subagent_work(
+            parent_session_id=PARENT_SESSION_ID,
+            child_session_id=f"conv_child_{i}",
+            agent="worker",
+            title=f"task {i}",
+        )
+        entry.status = "running"
+        entry.last_activity_at = stale
+
+    reads: list[str] = []
+
+    async def _read(child_id: str) -> dict[str, Any]:
+        reads.append(child_id)
+        return _snapshot(status="idle")  # terminal -> demote to waiting, non-destructive
+
+    await runner_app.reap_stalled_subagent_dispatches(
+        now=now, timeout_s=STALL_TIMEOUT_S, read_child=_read
+    )
+    assert len(reads) == cap, f"sweep must cap reads at {cap}, issued {len(reads)}"
+
+
+@pytest.mark.asyncio
+async def test_approval_parked_child_is_not_re_read_every_sweep(
+    _clean_subagent_registry: None,
+) -> None:
+    """An approval-parked child is re-adjudicated once per budget, not every sweep."""
+    entry = _dispatch_running_child()
+    reads: list[str] = []
+
+    async def _read(child_id: str) -> dict[str, Any]:
+        reads.append(child_id)
+        return _snapshot(status="running", pending=[{"elicitation_id": "e1"}])
+
+    now0 = entry.last_activity_at + STALL_TIMEOUT_S + 1
+    await runner_app.reap_stalled_subagent_dispatches(
+        now=now0, timeout_s=STALL_TIMEOUT_S, read_child=_read
+    )
+    assert len(reads) == 1
+    assert entry.last_activity_at == now0  # refreshed, so no longer freshly silent
+
+    # An immediate next sweep must not re-read the parked child.
+    await runner_app.reap_stalled_subagent_dispatches(
+        now=now0 + 1, timeout_s=STALL_TIMEOUT_S, read_child=_read
+    )
+    assert len(reads) == 1
+
+    # A whole budget later, it is adjudicated again.
+    await runner_app.reap_stalled_subagent_dispatches(
+        now=now0 + STALL_TIMEOUT_S + 1, timeout_s=STALL_TIMEOUT_S, read_child=_read
+    )
+    assert len(reads) == 2
+
+
 def test_stall_timeout_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
     """The budget is env-configurable with a sane default."""
     monkeypatch.delenv("OMNIGENT_SUBAGENT_STALL_TIMEOUT_S", raising=False)

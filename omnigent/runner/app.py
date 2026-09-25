@@ -441,6 +441,10 @@ _SILENT_CHILD_APPROVAL = "approval"  # parked on a human approval; silence is ex
 _SILENT_CHILD_TERMINAL = "terminal"  # server already holds a real terminal result
 _SILENT_CHILD_STUCK = "stuck"  # genuinely wedged; warn the parent provisionally
 _SILENT_CHILD_UNKNOWN = "unknown"  # server unreadable; do not fail on a guess
+# Cap on authoritative child reads per stall sweep. Silent candidates past this
+# many (oldest silence first) wait for the next sweep, so a burst of stale
+# entries never issues an unbounded batch of snapshot reads in one tick.
+_SUBAGENT_STALL_ADJUDICATIONS_PER_SWEEP = 25
 # Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
 # that has produced NO edge at all (no running/waiting/terminal status, no
 # in-flight response) within this window never started — fail it loudly
@@ -1831,12 +1835,26 @@ def note_subagent_activity(child_session_id: str) -> None:
     Keeps the stall sweep keyed on silence rather than on wall-clock since
     dispatch, so a healthy long-running child is never reaped.
 
+    Activity also refreshes every tracked ancestor of the emitting session.
+    A parent that dispatched a child and is now parked awaiting its result
+    emits no edges of its own; without this, a nested orchestrator (P → C → G)
+    whose grandchild G is productively working would see C's timestamp expire
+    and be falsely reaped. Walking the ``parent_session_id`` chain keeps the
+    whole waiting spine alive as long as any descendant is active.
+
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :returns: None.
     """
-    entry = _subagent_work_by_child.get(child_session_id)
-    if entry is not None:
-        entry.last_activity_at = time.time()
+    now = time.time()
+    seen: set[str] = set()
+    session_id: str | None = child_session_id
+    while session_id is not None and session_id not in seen:
+        seen.add(session_id)
+        entry = _subagent_work_by_child.get(session_id)
+        if entry is None:
+            break
+        entry.last_activity_at = now
+        session_id = entry.parent_session_id
 
 
 def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | None:
@@ -2416,12 +2434,20 @@ async def reap_stalled_subagent_dispatches(
     is still the same live ``running`` dispatch — so a real terminal result
     (or a newer dispatch) is never overwritten.
 
+    Each sweep adjudicates at most
+    :data:`_SUBAGENT_STALL_ADJUDICATIONS_PER_SWEEP` candidates (oldest silence
+    first), each with a single metadata-only child read, so the periodic
+    workload stays bounded no matter how many entries have gone stale; the rest
+    are picked up on later ticks. An approval-parked candidate has its activity
+    refreshed so it is not re-read every sweep.
+
     A ``launching`` entry belongs to the launch sweep; a ``waiting`` entry is
-    a restart-recovered dispatch the reconcile loop owns; terminal entries
-    are done. A quiet-but-healthy child with no execution heartbeat can still
-    be classified ``stuck`` once past the (default 900s) budget; the interrupt
-    is best effort and the failure provisional, so a genuine late result still
-    supersedes it.
+    a restart-recovered dispatch the reconcile loop owns (its registry state,
+    not its server status — a recovered child stays ``waiting`` here until
+    reconciliation sees it turn terminal); terminal entries are done. A
+    quiet-but-healthy child with no execution heartbeat can still be classified
+    ``stuck`` once past the (default 900s) budget; the interrupt is best effort
+    and the failure provisional, so a genuine late result still supersedes it.
 
     :param now: Clock override for tests, e.g. ``time.time()``.
     :param timeout_s: Budget override for tests; defaults to
@@ -2462,6 +2488,10 @@ async def reap_stalled_subagent_dispatches(
         and not pending_approvals.has_pending(entry.child_session_id)
         and current - entry.last_activity_at >= budget
     ]
+    # Oldest silence first, and only a bounded batch per sweep: a burst of stale
+    # entries is worked off over several ticks, never one unbounded read storm.
+    candidates.sort(key=lambda entry: entry.last_activity_at)
+    candidates = candidates[:_SUBAGENT_STALL_ADJUDICATIONS_PER_SWEEP]
     reaped: list[_SubagentWorkEntry] = []
     for entry in candidates:
         if read_child is None:
@@ -2474,7 +2504,14 @@ async def reap_stalled_subagent_dispatches(
             if not _still_silent_running(entry):
                 continue
             verdict = _classify_silent_child_from_snapshot(snapshot)
-        if verdict in (_SILENT_CHILD_APPROVAL, _SILENT_CHILD_UNKNOWN):
+        if verdict == _SILENT_CHILD_APPROVAL:
+            # An approval wait is expected silence with its own long budget.
+            # Refresh activity so it is not re-read on every single sweep —
+            # it is re-adjudicated once a whole budget later instead.
+            entry.last_activity_at = current
+            continue
+        if verdict == _SILENT_CHILD_UNKNOWN:
+            # The server was unreadable; retry on the next sweep.
             continue
         if verdict == _SILENT_CHILD_TERMINAL:
             # The server has the real result; hand it to the reconcile pass.
@@ -5739,7 +5776,14 @@ def create_runner_app(
         :returns: The child's ``SessionResponse`` dict, or ``None`` on failure.
         """
         try:
-            resp = await server_client.get(f"/v1/sessions/{child_id}", timeout=30.0)
+            # Metadata only: skip the transcript read (the snapshot's most
+            # expensive step) and the runner/host liveness lookup. The verdict
+            # only needs ``status`` and any replayed ``pending_elicitations``.
+            resp = await server_client.get(
+                f"/v1/sessions/{child_id}",
+                params={"include_items": "false", "include_liveness": "false"},
+                timeout=30.0,
+            )
         except httpx.HTTPError:
             return None
         if resp.status_code != 200:
