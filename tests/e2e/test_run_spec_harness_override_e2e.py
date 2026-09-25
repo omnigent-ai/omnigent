@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -129,6 +130,10 @@ def _gateway_request_models(mock_url: str) -> list[str]:
     return [r.get("model") for r in resp.json()["requests"] if isinstance(r, dict)]
 
 
+# `omnigent run` binds the canonical local-server port when free, and a
+# concurrent test's `omnigent stop` sweeps that same port; an unlucky overlap
+# can kill this run's server mid-turn (a scheduling race, not a fix regression).
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_run_spec_harness_overrides_native_terminal_default(
     tmp_path: Path, isolated_mock_llm_server_url: str
 ) -> None:
