@@ -399,6 +399,33 @@ async def test_multi_model_child_same_harness_as_parent_inherits(
 
 
 @pytest.mark.asyncio
+async def test_multi_model_child_native_variant_of_parent_inherits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Same vendor across the native/SDK split still inherits: a ``pi-native``
+    parent and a ``pi`` child share Pi's provider vocabulary, so the ``-native``
+    distinction must not make them count as different harnesses.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("pi"),
+        conv_id="conv_parent_pi_native",
+        parent_snapshot={
+            "id": "conv_parent_pi_native",
+            "agent_id": "ag_parent",
+            "harness": "pi-native",
+            "model_override": "databricks-claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "databricks-claude-opus-5"
+
+
+@pytest.mark.asyncio
 async def test_opencode_worker_with_binding_inherits_bare_bound_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

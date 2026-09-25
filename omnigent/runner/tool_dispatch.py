@@ -49,7 +49,11 @@ if TYPE_CHECKING:
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
-from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_aliases import (
+    canonicalize_harness,
+    is_native_harness,
+    native_terminal_name,
+)
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -2343,11 +2347,13 @@ def _child_is_foreign_multi_model_harness(child_harness: str, parent_harness: ob
     A multi-model harness (``ModelFamily.MULTI`` — pi, opencode, openai-agents,
     …) accepts any validated id but routes it to *its own* configured provider,
     where the parent's model id need not be servable. So the parent's selection
-    is only safe to inherit when the child is literally the same harness as the
-    parent (same provider vocabulary). Single-vendor children are handled by the
-    family check in :func:`_dispatch_model_mismatch`, and a child whose binding
-    validated the id is exempted upstream by :func:`_harness_has_inference_binding`
-    — neither is gated here.
+    is only safe to inherit when the child shares the parent's harness *vendor*
+    (same provider vocabulary). Vendor is compared with the ``-native`` distinction
+    dropped, so an SDK/native pair of one vendor (``pi`` ↔ ``pi-native``) counts
+    as the same. Single-vendor children are handled by the family check in
+    :func:`_dispatch_model_mismatch`, and a child whose binding validated the id
+    is exempted upstream by :func:`_harness_has_inference_binding` — neither is
+    gated here.
 
     :param child_harness: The child's resolved harness, alias or canonical.
     :param parent_harness: The parent session's ``harness`` field from its
@@ -2366,7 +2372,13 @@ def _child_is_foreign_multi_model_harness(child_harness: str, parent_harness: ob
     parent_canon = (
         canonicalize_harness(parent_harness) if isinstance(parent_harness, str) else None
     )
-    return parent_canon != child_canon
+    if parent_canon is None:
+        return True
+    # Collapse the native/SDK split so one vendor's two harnesses (``pi`` and
+    # ``pi-native``) share a key; native_terminal_name drops ``-native``.
+    child_vendor = native_terminal_name(child_canon) or child_canon
+    parent_vendor = native_terminal_name(parent_canon) or parent_canon
+    return parent_vendor != child_vendor
 
 
 def _normalize_subagent_model(
