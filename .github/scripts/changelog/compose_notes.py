@@ -96,10 +96,12 @@ def compose_notes(
         [
             "### 💜 Thanks to our community",
             "",
-            "This release was shaped by the people who filed issues, opened PRs, and "
-            "talked through feature requests with us on our Discord! Thank you for "
-            "building omnigent with us, keep the bug reports, ideas and contributions "
-            "coming :)",
+            (
+                "This release was shaped by the people who filed issues, opened PRs, and "
+                + "talked through feature requests with us on our Discord! Thank you for "
+                + "building omnigent with us, keep the bug reports, ideas and contributions "
+                + "coming :)"
+            ),
             "",
         ]
     )
