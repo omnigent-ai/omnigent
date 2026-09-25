@@ -1,46 +1,13 @@
 """E2E: cursor-native transcript elicitation polling under fd exhaustion.
 
-Reported failure (telemetry, macOS dev build): the cursor-native
-transcript-elicitation supervisor's poll pass dies in chat-store discovery with
-``OSError: [Errno 24] Too many open files`` (``hash_dir.iterdir()`` inside
-``forwarder._scan_hash_dir``, via ``_discover_store``) and is logged at ERROR as
-``cursor transcript elicitation poll failed; session=…`` — the measured KPI
-signature. The loop retries every ``poll_interval_s``, so one fd-exhaustion
-episode emits an ERROR-traceback storm (one per pass), and while the fault
-holds a Cursor tool-approval gate waiting in the chat store cannot surface as a
-web approval card.
-
-This test drives the reported journey end-to-end against a real server, with
-the runner-side supervisor running unmocked in its own process (the deployed
-topology) and a *genuine* transient fd-exhaustion window (``RLIMIT_NOFILE``
-lowered, descriptors hoarded until ``EMFILE``):
-
-1. a session exists on the live server;
-2. the supervisor polls with the session's chat store not yet bound (the
-   discovery phase the observed traceback fired in);
-3. the process's fd budget is exhausted for a bounded window, then freed;
-4. a pending gated tool call is waiting in the (real, on-disk) cursor chat
-   store; after the fault clears it must surface as a real pending elicitation
-   on the server and be resolvable through the web approval path.
-
-Assertions:
-
-* **regression guard (red on the reported bug)** — a *transient* fd-exhaustion
-  window must not emit the ERROR-level KPI signature
-  ``cursor transcript elicitation poll failed``; transient OS resource
-  exhaustion is an environmental condition, not an omnigent-error per pass;
-* **behavior guard (must stay green)** — the supervisor survives the window
-  and the pending gate still surfaces to the web session once fds recover, so
-  a fix cannot simply swallow poll failures and break approval mirroring.
-
-The real ``cursor-agent`` TUI is not in the loop: CI's ``cursor-agent`` is
-unauthenticated (the TUI hangs without an interactive login — see
-``test_cursor_native_cli_e2e``), and organic runner-process fd exhaustion is
-not externally injectable. The chat store is fabricated on disk in the exact
-shape cursor writes (the same fixture shape ``tests/test_cursor_native_permissions``
-uses), and everything downstream of it — discovery, store parsing, settling,
-the hook POST, the server's elicitation registry, the web approval path — is
-real.
+The real elicitation supervisor runs unmocked in a child process against a live
+server with the chat store not yet bound, then that process genuinely exhausts
+its descriptor table for a bounded window. The window must not emit the
+ERROR-level ``cursor transcript elicitation poll failed`` signature, and a gated
+tool call written to the on-disk cursor chat store afterward must still surface
+as a web approval card and be resolvable. The ``cursor-agent`` TUI is not in the
+loop (CI's copy is unauthenticated), so the store is fabricated in cursor's
+on-disk shape; everything downstream of it is real.
 """
 
 from __future__ import annotations
@@ -97,10 +64,9 @@ _SURFACE_WAIT_S = 20.0
 _RESULT_WAIT_S = 60.0
 _ELICITATION_WAIT_S = 30.0
 
-# Runs the REAL supervisor loop (unmocked discovery / store parsing / HTTP) in
-# a separate process — the runner's topology — so the genuine fd exhaustion is
-# contained and cannot destabilize pytest or the server. Reads its scenario
-# from argv, reports as JSON (atomic rename), never asserts itself.
+# Runs the REAL supervisor loop, unmocked, in a separate process (the runner's
+# topology) so genuine fd exhaustion cannot destabilize pytest or the server;
+# reads its scenario from argv and reports JSON (atomic rename), never asserts.
 _DRIVER = r'''
 """Repro driver: real elicitation supervisor + genuine EMFILE window."""
 

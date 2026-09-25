@@ -502,23 +502,38 @@ async def _await_log_count(
     pytest.fail(f"expected {count} level-{level} records containing {needle!r}, got {_count()}")
 
 
+def _wrapped_emfile() -> Exception:
+    """EMFILE reaching the poll loop through an explicit cause chain."""
+    outer = RuntimeError("wrapped socket failure")
+    outer.__cause__ = OSError(errno.EMFILE, "Too many open files")
+    return outer
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param(lambda: OSError(errno.EMFILE, "Too many open files"), id="emfile"),
+        pytest.param(lambda: OSError(errno.ENFILE, "File table overflow"), id="enfile"),
+        pytest.param(_wrapped_emfile, id="wrapped-emfile"),
+    ],
+)
 async def test_supervise_transcript_fd_exhaustion_warns_once_per_episode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    fault: Callable[[], Exception],
 ) -> None:
-    """Transient fd exhaustion is one WARNING per episode + an INFO on recovery.
-
-    The loop keeps retrying through the episode (never dies), emits NO
-    ERROR-level 'poll failed' records for it, and a later episode warns anew.
-    """
+    """One WARNING per fd-exhaustion episode, DEBUG while held, INFO on recovery, no ERROR."""
     caplog.set_level(logging.DEBUG, logger=cnp.__name__)
     state = {"faulting": True, "clean_passes": 0}
     store = tmp_path / "store.db"
 
+    def _count(level: int, needle: str) -> int:
+        return sum(1 for r in caplog.records if r.levelno == level and needle in r.getMessage())
+
     def _discover(*_a: object, **_k: object) -> Path:
         if state["faulting"]:
-            raise OSError(errno.EMFILE, "Too many open files")
+            raise fault()
         store.write_bytes(b"")
         return store
 
@@ -544,17 +559,23 @@ async def test_supervise_transcript_fd_exhaustion_warns_once_per_episode(
         )
     )
     try:
-        # Episode 1: the first faulting pass warns; further passes must not.
+        # Episode 1: the first faulting pass warns; further passes only DEBUG.
         await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 1)
-        await asyncio.sleep(0.1)  # many more faulting passes
-        # Recovery: a clean pass logs the episode's end at INFO.
+        await _await_log_count(caplog, logging.DEBUG, "still fd-exhausted", 3)
+        assert _count(logging.WARNING, "degraded by fd exhaustion") == 1
+        # Recovery: a clean pass logs the episode's end at INFO, exactly once.
         state["faulting"] = False
         await _await_log_count(caplog, logging.INFO, "recovered from fd exhaustion", 1)
         assert state["clean_passes"] >= 1
+        await asyncio.sleep(0.05)  # several clean passes
+        assert _count(logging.INFO, "recovered from fd exhaustion") == 1
         # Episode 2: a fresh episode warns again (per-episode state was reset).
+        debug_before = _count(logging.DEBUG, "still fd-exhausted")
         store.unlink()  # unbind so the next pass re-enters discovery
         state["faulting"] = True
         await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 2)
+        await _await_log_count(caplog, logging.DEBUG, "still fd-exhausted", debug_before + 2)
+        assert _count(logging.WARNING, "degraded by fd exhaustion") == 2
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
