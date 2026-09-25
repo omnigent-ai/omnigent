@@ -343,27 +343,45 @@ function cachedArcaBinary() {
 }
 
 /**
+ * Feature flag for Arca auto-connect, off by default. `OMNIGENT_ARCA_AUTO_CONNECT`
+ * ("1" / "0") overrides settings.json `features.arca_auto_connect`.
+ *
+ * @returns {boolean}
+ */
+function arcaAutoConnectFeatureEnabled() {
+  const env = process.env.OMNIGENT_ARCA_AUTO_CONNECT;
+  if (env === "1") return true;
+  if (env === "0") return false;
+  return loadSettings().features?.arca_auto_connect === true;
+}
+
+/**
  * Whether Arca connect (manual and automatic) is offered for `serverUrl`:
- * a Databricks-managed server, and either an installed arca CLI or the MDM
- * internal-features flag. The arca CLI alone qualifies so Arca doesn't wait
- * on an MDM rollout.
+ * a Databricks-managed server and the MDM internal-features flag. With the
+ * auto-connect feature on, an installed arca CLI qualifies too, so Arca
+ * doesn't wait on an MDM rollout.
  *
  * @param {string | null | undefined} serverUrl
  * @returns {boolean}
  */
 function arcaEligible(serverUrl) {
   if (!isDatabricksManagedServerUrl(serverUrl)) return false;
-  return databricksInternalFeaturesEnabled() || cachedArcaBinary() !== null;
+  if (databricksInternalFeaturesEnabled()) return true;
+  return arcaAutoConnectFeatureEnabled() && cachedArcaBinary() !== null;
 }
 
 /**
- * Launch-time Arca auto-connect. On by default; settings.json
- * `arca_auto_connect: false` (the host menu toggle) turns it off.
+ * Launch-time Arca auto-connect, behind the feature flag above. Once the
+ * feature is on, settings.json `arca_auto_connect: false` (the host menu
+ * toggle) turns it off for this user.
  */
 const arcaAutoConnect = createArcaAutoConnect({
   // Auto-connect needs arca itself: the MDM flag alone keeps the manual item
   // (which explains what's missing) but shouldn't fail on every launch.
-  isEligible: (serverUrl) => isDatabricksManagedServerUrl(serverUrl) && cachedArcaBinary() !== null,
+  isEligible: (serverUrl) =>
+    arcaAutoConnectFeatureEnabled() &&
+    isDatabricksManagedServerUrl(serverUrl) &&
+    cachedArcaBinary() !== null,
   isEnabled: () => loadSettings().arca_auto_connect !== false,
   setEnabled: (enabled) => {
     const settings = loadSettings();
