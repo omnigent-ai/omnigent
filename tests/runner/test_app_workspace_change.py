@@ -178,3 +178,79 @@ async def test_new_terminal_opens_in_the_changed_workspace(
         f"New terminal must root at the changed workspace, got {env_spec.os_env.cwd!r}"
     )
     assert captured["cwd_override"] is None
+
+
+async def test_absolute_target_outside_the_agent_boundary_is_rejected(tmp_path: Path) -> None:
+    """A pinned agent cwd bounds online changes exactly like create/offline.
+
+    Browse reach (here: unconfined, so the whole filesystem) is a viewing
+    grant; the working directory must stay inside the agent's pinned
+    ``os_env.cwd``. The refusal must also leave the live session workdir
+    untouched, so the previously persisted workspace keeps applying.
+    """
+    root = tmp_path / "boundary"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    app = _app_rooted_at(root)
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        create = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": uuid.uuid4().hex},
+        )
+        assert create.status_code == 201, create.text
+        refused = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "workspace_change", "workspace": str(outside)},
+        )
+        assert refused.status_code == 400, refused.text
+        assert "boundary" in refused.json()["detail"]
+        # The refused change left no live override: an empty-location reset
+        # still lands on the environment root, not the outside target.
+        reset = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "workspace_change", "workspace": ""},
+        )
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["workspace"] == str(root.resolve())
+
+
+async def test_absolute_target_inside_the_agent_boundary_is_accepted(tmp_path: Path) -> None:
+    """An absolute target under the pinned agent cwd still resolves."""
+    root = tmp_path / "boundary"
+    sub = root / "sub"
+    sub.mkdir(parents=True)
+    resp = await _post_workspace_change(_app_rooted_at(root), str(sub))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["workspace"] == str(sub.resolve())
+
+
+async def test_relative_agent_cwd_places_no_workdir_boundary(tmp_path: Path) -> None:
+    """Agents without a pinned cwd keep the unconfined browse-anywhere reach."""
+    target = tmp_path / "anywhere"
+    target.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="workdir-probe-unbounded",
+        executor=ExecutorSpec(type="omnigent", config={}),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resp = await _post_workspace_change(app, str(target))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["workspace"] == str(target.resolve())

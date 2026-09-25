@@ -157,11 +157,15 @@ def _path_query(q: str) -> str | None:
     name/relative-path substring semantics — matching them against absolute
     paths would make any word from the root's own prefix match everything.
 
+    A backslash counts as path-shaped too, so a pasted Windows path
+    (``C:\\repo\\src\\main.py``, a UNC share) gets the same treatment where
+    the platform's ``normpath``/``abspath`` speak backslashes.
+
     :param q: Stripped, lowercased query.
     :returns: The normalized path form, or ``None`` when the query is not
         path-shaped or normalizes to ``.``.
     """
-    if "/" not in q:
+    if "/" not in q and "\\" not in q:
         return None
     normalized = os.path.normpath(q)
     return None if normalized == "." else normalized
@@ -572,6 +576,7 @@ def resolve_workdir_target(
     roots: Sequence[ReachableRoot],
     *,
     unconfined: bool,
+    boundary: Path | None = None,
 ) -> Path:
     """Resolve a wire-form working-directory target and authorize it.
 
@@ -588,13 +593,26 @@ def resolve_workdir_target(
     :param root: Environment root directory.
     :param roots: Grants from :func:`omnigent.inner.sandbox.reachable_roots`.
     :param unconfined: Result of :func:`omnigent.inner.sandbox.is_unconfined`.
+    :param boundary: The agent's pinned ``os_env.cwd`` directory, or ``None``
+        when the agent places no boundary. An absolute target must stay
+        inside it — the same containment session create, relaunch, and the
+        offline change path enforce — because browse reach alone (which the
+        unconfined widening extends to the whole filesystem) is a viewing
+        grant, not permission to move the session's working directory.
     :returns: The resolved absolute directory path.
-    :raises InvalidPath: On a malformed or escaping path, or a target
-        that is not an existing directory.
+    :raises InvalidPath: On a malformed or escaping path, a target that is
+        not an existing directory, or an absolute target outside *boundary*.
     :raises PathUnreachable: When an absolute target is out of reach.
     """
     if is_absolute_request(location):
         resolved = resolve_browse_target(location, roots, unconfined=unconfined)
+        if boundary is not None:
+            target = os.path.realpath(resolved)
+            prefix = containment_prefix(os.path.realpath(boundary))
+            if target.rstrip(os.sep) + os.sep != prefix and not target.startswith(prefix):
+                raise InvalidPath(
+                    f"Path {location!r} is outside this agent's working-directory boundary"
+                )
     else:
         root_resolved = root.resolve()
         validated = _validate_path(location)

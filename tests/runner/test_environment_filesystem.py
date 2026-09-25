@@ -20,7 +20,11 @@ from omnigent.entities.environment_filesystem import FilesystemPathNotFound
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
+from omnigent.runner.environment_filesystem import (
+    CallerProcessFilesystem,
+    _path_query,
+    search_indexed_paths,
+)
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests.runner.helpers import NullServerClient
@@ -2488,3 +2492,16 @@ async def test_scoped_search_reaches_snapshot_files_past_the_budget(
 
     assert [e["path"] for e in body["data"]] == ["zzz/new.txt"], body
     assert body["truncated"] is True
+
+
+def test_path_query_recognizes_windows_separators() -> None:
+    """Backslash queries are path-shaped; plain words stay name matches.
+
+    A pasted ``C:\\repo\\src\\main.py`` must reach the absolute-path matcher
+    on platforms whose ``normpath``/``abspath`` speak backslashes, instead of
+    silently degrading to a name-substring match that can never contain a
+    drive prefix.
+    """
+    assert _path_query("plainword") is None
+    assert _path_query("c:\\repo\\src\\main.py") == os.path.normpath("c:\\repo\\src\\main.py")
+    assert _path_query("src/app.py") == os.path.normpath("src/app.py")
