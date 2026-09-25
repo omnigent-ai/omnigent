@@ -22,22 +22,17 @@ function fakeConnects() {
   return { runs, startConnect };
 }
 
-function harness({ eligible = true, enabled = true } = {}) {
+function harness({ eligible = true } = {}) {
   const connects = fakeConnects();
   const events = [];
-  const settings = { enabled };
   const auto = createArcaAutoConnect({
     isEligible: () => eligible,
-    isEnabled: () => settings.enabled,
-    setEnabled: (value) => {
-      settings.enabled = value;
-    },
     startConnect: connects.startConnect,
     commandLine: () => "arca ssh isaac omni host",
     onStatus: (origin, status) => events.push({ origin, status }),
     now: () => 1000,
   });
-  return { auto, events, settings, runs: connects.runs };
+  return { auto, events, runs: connects.runs };
 }
 
 describe("arca auto-connect", () => {
@@ -45,13 +40,6 @@ describe("arca auto-connect", () => {
     const { auto, runs } = harness({ eligible: false });
     const status = await auto.ensure(SERVER);
     assert.equal(status.state, "unavailable");
-    assert.equal(runs.length, 0);
-  });
-
-  it("does nothing when turned off", async () => {
-    const { auto, runs } = harness({ enabled: false });
-    const status = await auto.ensure(SERVER);
-    assert.equal(status.state, "disabled");
     assert.equal(runs.length, 0);
   });
 
@@ -132,24 +120,6 @@ describe("arca auto-connect", () => {
     runs[0].finish({ ok: true });
     assert.equal((await shared).state, "online");
     assert.equal(auto.inFlight(SERVER), null);
-  });
-
-  it("persists the toggle and republishes status without starting a run", async () => {
-    const { auto, runs, settings, events } = harness();
-    const pending = auto.ensure(SERVER);
-    runs[0].finish({ ok: true });
-    await pending;
-
-    const status = auto.setAutoConnect(SERVER, false);
-    assert.equal(settings.enabled, false);
-    assert.equal(status.autoConnect, false);
-    assert.equal(status.state, "online");
-    assert.equal(events.at(-1).status.autoConnect, false);
-
-    // Off for a never-run origin reads as disabled.
-    assert.equal(auto.getStatus("https://other.cloud.databricks.com").state, "disabled");
-    auto.setAutoConnect(SERVER, true);
-    assert.equal(runs.length, 1);
   });
 
   it("treats an unparseable server URL as unavailable", async () => {

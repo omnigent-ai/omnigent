@@ -183,8 +183,6 @@ interface ElectronDesktopApi extends NativeShellApi {
   getArcaStatus?: () => Promise<ArcaStatus | null>;
   /** Retry a failed Arca auto-connect. No-op unless the last run failed. */
   retryArcaConnect?: () => Promise<ArcaStatus | null>;
-  /** Turn Arca auto-connect on or off. Republishes the new status. */
-  setArcaAutoConnect?: (enabled: boolean) => Promise<ArcaStatus | null>;
   /** Subscribe to Arca status changes for this window's server. Returns an unsubscribe. */
   onArcaStatusChanged?: (callback: (status: ArcaStatus) => void) => () => void;
 
@@ -246,8 +244,9 @@ export interface DesktopFeatures {
    */
   databricksInternalFeatures?: boolean;
   /**
-   * Arca auto-connect is available for this window. True when the arca CLI is
-   * installed OR the MDM flag is set, and the server is Databricks-managed.
+   * Arca connect is offered for this window: the server is Databricks-managed
+   * and either the MDM flag is set, or the auto-connect feature flag is on and
+   * the arca CLI is installed.
    * Older shells omit this field — treat absence as false.
    */
   arca?: boolean;
@@ -255,9 +254,7 @@ export interface DesktopFeatures {
 
 /** Live status of the Arca auto-connect for the window's server. */
 export interface ArcaStatus {
-  state: "unavailable" | "disabled" | "idle" | "starting" | "online" | "failed";
-  /** Whether auto-connect is toggled on. */
-  autoConnect: boolean;
+  state: "unavailable" | "idle" | "starting" | "online" | "failed";
   /** Exact `arca ssh …` command line the shell uses. */
   command: string | null;
   /** Online because the daemon was already running (warm launch). */
@@ -952,21 +949,6 @@ export async function retryArcaConnect(): Promise<ArcaStatus | null> {
     return await electron.retryArcaConnect();
   } catch (err) {
     console.warn("[nativeBridge] electron retryArcaConnect failed:", err);
-    return null;
-  }
-}
-
-/**
- * Turn Arca auto-connect on or off. The shell republishes the updated status.
- * Resolves the new status, or `null` outside the shell.
- */
-export async function setArcaAutoConnect(enabled: boolean): Promise<ArcaStatus | null> {
-  const electron = electronApi();
-  if (!electron?.setArcaAutoConnect) return null;
-  try {
-    return await electron.setArcaAutoConnect(enabled);
-  } catch (err) {
-    console.warn("[nativeBridge] electron setArcaAutoConnect failed:", err);
     return null;
   }
 }

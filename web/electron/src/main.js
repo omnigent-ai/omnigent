@@ -318,6 +318,8 @@ let arcaProbe = null;
  * @returns {Promise<string | null>}
  */
 function refreshArcaBinary() {
+  // Only auto-connect uses the cached binary; with the feature off, don't probe.
+  if (!arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
   if (cachedArcaPath.path && arca.isExecutableFile(cachedArcaPath.path)) {
     return Promise.resolve(cachedArcaPath.path);
   }
@@ -343,16 +345,17 @@ function cachedArcaBinary() {
 }
 
 /**
- * Feature flag for Arca auto-connect, off by default. `OMNIGENT_ARCA_AUTO_CONNECT`
- * ("1" / "0") overrides settings.json `features.arca_auto_connect`.
+ * Feature flag for Arca auto-connect, off by default: `OMNIGENT_ARCA_AUTO_CONNECT=1`
+ * forces it on, otherwise settings.json `arca_auto_connect: true` enables it.
+ * Owner: desktop. Review by 0.16.0: make it default-on and delete this flag,
+ * or remove the feature.
  *
  * @returns {boolean}
  */
 function arcaAutoConnectFeatureEnabled() {
-  const env = process.env.OMNIGENT_ARCA_AUTO_CONNECT;
-  if (env === "1") return true;
-  if (env === "0") return false;
-  return loadSettings().features?.arca_auto_connect === true;
+  return (
+    process.env.OMNIGENT_ARCA_AUTO_CONNECT === "1" || loadSettings().arca_auto_connect === true
+  );
 }
 
 /**
@@ -370,11 +373,7 @@ function arcaEligible(serverUrl) {
   return arcaAutoConnectFeatureEnabled() && cachedArcaBinary() !== null;
 }
 
-/**
- * Launch-time Arca auto-connect, behind the feature flag above. Once the
- * feature is on, settings.json `arca_auto_connect: false` (the host menu
- * toggle) turns it off for this user.
- */
+/** Launch-time Arca auto-connect, behind the feature flag above. */
 const arcaAutoConnect = createArcaAutoConnect({
   // Auto-connect needs arca itself: the MDM flag alone keeps the manual item
   // (which explains what's missing) but shouldn't fail on every launch.
@@ -382,12 +381,6 @@ const arcaAutoConnect = createArcaAutoConnect({
     arcaAutoConnectFeatureEnabled() &&
     isDatabricksManagedServerUrl(serverUrl) &&
     cachedArcaBinary() !== null,
-  isEnabled: () => loadSettings().arca_auto_connect !== false,
-  setEnabled: (enabled) => {
-    const settings = loadSettings();
-    settings.arca_auto_connect = enabled;
-    saveSettings(settings);
-  },
   startConnect: (serverUrl, onOutput) =>
     arca.startArcaConnect(serverUrl, { onOutput, resolveArcaPath: cachedArcaBinary }),
   commandLine: (serverUrl) => {
@@ -3569,8 +3562,8 @@ function registerIpc() {
   });
 
   // SPA → Arca auto-connect status for the window's server. Read-only except
-  // for a retry after a failed run and the on/off toggle; the run itself is
-  // only ever started by the main process (arca_autoconnect.js).
+  // for a retry after a failed run; the run itself is only ever started by
+  // the main process (arca_autoconnect.js).
   ipcMain.handle("omnigent:arca-status", async (event) => {
     if (!isPinnedOriginSender(event)) return null;
     await refreshArcaBinary();
@@ -3579,11 +3572,6 @@ function registerIpc() {
   ipcMain.handle("omnigent:arca-retry", async (event) => {
     if (!isPinnedOriginSender(event)) return null;
     return arcaAutoConnect.retry(senderServerUrl(event));
-  });
-  ipcMain.handle("omnigent:arca-set-auto-connect", async (event, enabled) => {
-    if (!isPinnedOriginSender(event)) return null;
-    await refreshArcaBinary();
-    return arcaAutoConnect.setAutoConnect(senderServerUrl(event), enabled === true);
   });
 
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to

@@ -86,7 +86,6 @@ import {
   isElectronShell,
   onHostStatusChanged,
   retryArcaConnect,
-  setArcaAutoConnect,
 } from "@/lib/nativeBridge";
 import { useArcaStatus } from "@/hooks/useArcaAutoConnect";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
@@ -187,7 +186,6 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   getDesktopFeatures: vi.fn(async () => null),
   connectArcaHost: vi.fn(async () => ({ ok: false })),
   retryArcaConnect: vi.fn(async () => null),
-  setArcaAutoConnect: vi.fn(async () => null),
 }));
 // useArcaStatus: default null (outside Electron); Arca tests override per-test.
 vi.mock("@/hooks/useArcaAutoConnect", () => ({
@@ -3093,7 +3091,6 @@ describe("Run on Arca — auto-connect UI extensions", () => {
   it("disables the Arca row and names the running command while auto-connect is starting", async () => {
     vi.mocked(useArcaStatus).mockReturnValue({
       state: "starting",
-      autoConnect: true,
       command:
         "arca ssh isaac omni host --server https://example.com --background --non-interactive",
     });
@@ -3108,7 +3105,6 @@ describe("Run on Arca — auto-connect UI extensions", () => {
   it("labels the Arca row as retry and calls retryArcaConnect when failed", async () => {
     vi.mocked(useArcaStatus).mockReturnValue({
       state: "failed",
-      autoConnect: true,
       command:
         "arca ssh isaac omni host --server https://example.com --background --non-interactive",
       errorKind: "timeout",
@@ -3128,31 +3124,6 @@ describe("Run on Arca — auto-connect UI extensions", () => {
     fireEvent.click(item);
     await waitFor(() => expect(vi.mocked(retryArcaConnect)).toHaveBeenCalledTimes(1));
     expect(vi.mocked(connectArcaHost)).not.toHaveBeenCalled();
-  });
-
-  it("shows the auto-connect toggle and calls setArcaAutoConnect on toggle", async () => {
-    vi.mocked(useArcaStatus).mockReturnValue({
-      state: "idle",
-      autoConnect: true,
-      command: null,
-    });
-    renderLanding();
-    await openHostMenu();
-
-    const toggle = await screen.findByTestId("new-chat-landing-arca-autoconnect-toggle");
-    expect(toggle).toBeTruthy();
-
-    fireEvent.click(toggle);
-    await waitFor(() => expect(vi.mocked(setArcaAutoConnect)).toHaveBeenCalledWith(false));
-  });
-
-  it("does not show the toggle when arcaAutoConnectStatus is null", async () => {
-    vi.mocked(useArcaStatus).mockReturnValue(null);
-    renderLanding();
-    await openHostMenu();
-
-    await screen.findByTestId("new-chat-landing-connect-host");
-    expect(screen.queryByTestId("new-chat-landing-arca-autoconnect-toggle")).toBeNull();
   });
 });
 

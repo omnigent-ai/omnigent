@@ -253,7 +253,6 @@ import {
   isElectronShell,
   onHostStatusChanged,
   retryArcaConnect,
-  setArcaAutoConnect,
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import { useArcaStatus } from "@/hooks/useArcaAutoConnect";
@@ -6674,20 +6673,6 @@ export function NewChatLandingScreen() {
                           <PlusIcon className="size-4" />
                           Connect new host
                         </DropdownMenuItem>
-                        {arcaEnabled &&
-                          arcaAutoConnectStatus !== null &&
-                          arcaAutoConnectStatus.state !== "unavailable" && (
-                            <>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuCheckboxItem
-                                checked={arcaAutoConnectStatus.autoConnect}
-                                onCheckedChange={(checked) => void setArcaAutoConnect(checked)}
-                                data-testid="new-chat-landing-arca-autoconnect-toggle"
-                              >
-                                Connect Arca at launch
-                              </DropdownMenuCheckboxItem>
-                            </>
-                          )}
                       </DropdownMenuContent>
                     </DropdownMenu>
 

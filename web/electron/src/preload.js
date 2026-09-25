@@ -129,15 +129,12 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
   /**
    * Launch-time Arca auto-connect status for the window's server —
-   * `{ state, autoConnect, command, errorKind?, error?, output? }`, or null
-   * off a connected server. The main process starts the run; the SPA only
-   * reads it, retries a failed run, or toggles it for future launches.
+   * `{ state, command, errorKind?, error?, output? }`, or null off a
+   * connected server. The main process starts the run; the SPA only reads
+   * it or retries a failed run.
    */
   getArcaStatus: () => ipcRenderer.invoke("omnigent:arca-status"),
   retryArcaConnect: () => ipcRenderer.invoke("omnigent:arca-retry"),
-  /** @param {boolean} enabled */
-  setArcaAutoConnect: (enabled) =>
-    ipcRenderer.invoke("omnigent:arca-set-auto-connect", enabled === true),
   /**
    * Subscribe to Arca auto-connect status changes. Returns an unsubscribe.
    * @param {(status: object) => void} callback

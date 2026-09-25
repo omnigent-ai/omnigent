@@ -382,11 +382,8 @@ describe("Arca auto-connect wiring", () => {
       setImmediate(resolve);
     });
   const serverEvent = (h) => ({ sender: h.webContents, senderFrame: { url: workspace } });
-  const enableFeature = (h, settings = {}) =>
-    fs.writeFileSync(
-      h.settingsPath,
-      JSON.stringify({ ...settings, features: { arca_auto_connect: true } }),
-    );
+  const enableFeature = (h) =>
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: true }));
 
   it("connects Arca once per launch after loading a managed server with arca installed", async (t) => {
     const h = loadNavigationHarness({
@@ -431,23 +428,6 @@ describe("Arca auto-connect wiring", () => {
     assert.equal(status.state, "unavailable");
   });
 
-  it("honors the settings toggle and persists changes to it", async (t) => {
-    const h = loadNavigationHarness({
-      serverUrl: workspace,
-      databricksMode: "browser",
-      arcaPath: "/usr/local/bin/arca",
-    });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    enableFeature(h);
-    const off = await h.ipc.get("omnigent:arca-set-auto-connect")(serverEvent(h), false);
-    assert.equal(off.state, "disabled");
-    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_auto_connect, false);
-    await h.api.loadServerUrl(h.win, workspace);
-    await tick();
-    assert.deepEqual(h.calls.arcaConnects, []);
-  });
-
   it("retries only a failed run", async (t) => {
     const h = loadNavigationHarness({
       serverUrl: workspace,
@@ -483,11 +463,11 @@ describe("Arca auto-connect wiring", () => {
     assert.equal(status.state, "unavailable");
   });
 
-  it("turns on with OMNIGENT_ARCA_AUTO_CONNECT=1 and off with =0", async (t) => {
+  it("turns on with OMNIGENT_ARCA_AUTO_CONNECT=1 without the settings key", async (t) => {
     process.env.OMNIGENT_ARCA_AUTO_CONNECT = "1";
-    let on;
+    let h;
     try {
-      on = loadNavigationHarness({
+      h = loadNavigationHarness({
         serverUrl: workspace,
         databricksMode: "browser",
         arcaPath: "/usr/local/bin/arca",
@@ -495,27 +475,10 @@ describe("Arca auto-connect wiring", () => {
     } finally {
       delete process.env.OMNIGENT_ARCA_AUTO_CONNECT;
     }
-    t.after(on.cleanup);
-    await on.api.loadServerUrl(on.win, workspace);
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, workspace);
     await tick();
-    assert.deepEqual(on.calls.arcaConnects, [workspace]);
-
-    process.env.OMNIGENT_ARCA_AUTO_CONNECT = "0";
-    let off;
-    try {
-      off = loadNavigationHarness({
-        serverUrl: workspace,
-        databricksMode: "browser",
-        arcaPath: "/usr/local/bin/arca",
-      });
-    } finally {
-      delete process.env.OMNIGENT_ARCA_AUTO_CONNECT;
-    }
-    t.after(off.cleanup);
-    enableFeature(off);
-    await off.api.loadServerUrl(off.win, workspace);
-    await tick();
-    assert.deepEqual(off.calls.arcaConnects, []);
+    assert.deepEqual(h.calls.arcaConnects, [workspace]);
   });
 
   it("ignores Arca status IPC from an untrusted frame", async (t) => {
@@ -524,7 +487,7 @@ describe("Arca auto-connect wiring", () => {
     h.api.registerIpc();
     const foreign = { sender: h.webContents, senderFrame: { url: "https://evil.example/" } };
     assert.equal(await h.ipc.get("omnigent:arca-retry")(foreign), null);
-    assert.equal(await h.ipc.get("omnigent:arca-set-auto-connect")(foreign, false), null);
+    assert.equal(await h.ipc.get("omnigent:arca-status")(foreign), null);
   });
 });
 

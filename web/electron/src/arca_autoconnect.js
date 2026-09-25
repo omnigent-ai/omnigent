@@ -10,7 +10,8 @@
  * The command exits once the remote daemon is up (or reports it was already
  * running), and the daemon then keeps its own outbound tunnel, so nothing here
  * outlives the run. The renderer only reads status and may ask for a retry
- * after a failure; it can never start a run on its own.
+ * after a failure; it can never start a run on its own. Whether the feature
+ * is on at all is part of `isEligible`.
  *
  * Electron-free: every dependency is injected so the state machine is
  * unit-testable.
@@ -21,8 +22,7 @@ const OUTPUT_TAIL_CHARS = 8000;
 
 /**
  * @typedef {{
- *   state: "unavailable" | "disabled" | "idle" | "starting" | "online" | "failed",
- *   autoConnect: boolean,
+ *   state: "unavailable" | "idle" | "starting" | "online" | "failed",
  *   command: string | null,
  *   alreadyRunning?: boolean,
  *   errorKind?: import("./arca").ArcaErrorKind,
@@ -36,8 +36,6 @@ const OUTPUT_TAIL_CHARS = 8000;
 /**
  * @param {{
  *   isEligible: (serverUrl: string) => boolean,
- *   isEnabled: () => boolean,
- *   setEnabled: (enabled: boolean) => void,
  *   startConnect: (serverUrl: string, onOutput: (text: string) => void) =>
  *     ReturnType<typeof import("./arca").startArcaConnect>,
  *   commandLine: (serverUrl: string) => string | null,
@@ -48,8 +46,6 @@ const OUTPUT_TAIL_CHARS = 8000;
  */
 function createArcaAutoConnect({
   isEligible,
-  isEnabled,
-  setEnabled,
   startConnect,
   commandLine,
   onStatus,
@@ -68,13 +64,8 @@ function createArcaAutoConnect({
   }
 
   function baseStatus(serverUrl) {
-    if (!isEligible(serverUrl)) return { state: "unavailable", autoConnect: false, command: null };
-    const autoConnect = isEnabled();
-    return {
-      state: autoConnect ? "idle" : "disabled",
-      autoConnect,
-      command: commandLine(serverUrl),
-    };
+    if (!isEligible(serverUrl)) return { state: "unavailable", command: null };
+    return { state: "idle", command: commandLine(serverUrl) };
   }
 
   function publish(origin, status) {
@@ -87,20 +78,20 @@ function createArcaAutoConnect({
 
   /**
    * The current status for `serverUrl`. A server that was never run reports
-   * its eligibility/toggle state; eligibility is re-checked so removing arca
-   * or the MDM profile hides the status without a restart.
+   * its eligibility; eligibility is re-checked so turning the feature off or
+   * removing arca hides the status without a restart.
    *
    * @param {string | null | undefined} serverUrl
    * @returns {ArcaStatus}
    */
   function getStatus(serverUrl) {
     const origin = serverUrl ? originOf(serverUrl) : null;
-    if (!origin) return { state: "unavailable", autoConnect: false, command: null };
+    if (!origin) return { state: "unavailable", command: null };
     const base = baseStatus(serverUrl);
     if (base.state === "unavailable") return base;
     const entry = byOrigin.get(origin);
     if (!entry) return base;
-    return { ...entry.status, autoConnect: base.autoConnect };
+    return entry.status;
   }
 
   function runConnect(serverUrl, origin) {
@@ -108,7 +99,6 @@ function createArcaAutoConnect({
     let output = "";
     const status = {
       state: "starting",
-      autoConnect: isEnabled(),
       command,
       startedAt: now(),
     };
@@ -120,7 +110,7 @@ function createArcaAutoConnect({
       if (entry?.status.state === "starting") entry.status = { ...entry.status, output };
     });
     const run = connect.promise.then((result) => {
-      const base = { autoConnect: isEnabled(), command, startedAt: status.startedAt };
+      const base = { command, startedAt: status.startedAt };
       const finishedAt = now();
       const next = result.ok
         ? { ...base, state: "online", alreadyRunning: result.alreadyRunning === true, finishedAt }
@@ -143,7 +133,7 @@ function createArcaAutoConnect({
 
   /**
    * Launch-time entry point: connect Arca for `serverUrl` unless it isn't
-   * eligible, is turned off, or already ran for this origin this launch. A
+   * eligible or already ran for this origin this launch. A
    * second window or a reload shares the in-flight run.
    *
    * @param {string | null | undefined} serverUrl
@@ -185,24 +175,7 @@ function createArcaAutoConnect({
     return (origin && byOrigin.get(origin)?.run) || null;
   }
 
-  /**
-   * Turn auto-connect on or off for future launches. Doesn't start or cancel
-   * a run; the current status is republished with the new toggle value.
-   *
-   * @param {string | null | undefined} serverUrl
-   * @param {boolean} enabled
-   * @returns {ArcaStatus}
-   */
-  function setAutoConnect(serverUrl, enabled) {
-    setEnabled(enabled === true);
-    for (const [origin, entry] of byOrigin) {
-      entry.status = { ...entry.status, autoConnect: enabled === true };
-      onStatus(origin, entry.status);
-    }
-    return getStatus(serverUrl);
-  }
-
-  return { ensure, retry, getStatus, inFlight, setAutoConnect };
+  return { ensure, retry, getStatus, inFlight };
 }
 
 module.exports = { OUTPUT_TAIL_CHARS, createArcaAutoConnect };

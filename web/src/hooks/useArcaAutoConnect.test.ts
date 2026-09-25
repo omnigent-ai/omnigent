@@ -45,7 +45,7 @@ async function flushAsync() {
 
 describe("useArcaStatus", () => {
   it("returns null initially and then the fetched status", async () => {
-    const status: ArcaStatus = { state: "idle", autoConnect: true, command: null };
+    const status: ArcaStatus = { state: "idle", command: null };
     vi.mocked(getArcaStatus).mockResolvedValue(status);
     vi.mocked(onArcaStatusChanged).mockImplementation(() => () => {});
 
@@ -67,7 +67,7 @@ describe("useArcaStatus", () => {
     const { result } = renderHook(() => useArcaStatus());
     await flushAsync();
 
-    const online: ArcaStatus = { state: "online", autoConnect: true, command: null };
+    const online: ArcaStatus = { state: "online", command: null };
     act(() => {
       pushStatus(online);
     });
@@ -101,8 +101,8 @@ function renderWithPush() {
   return { push: (s: ArcaStatus) => act(() => pushStatus(s)), invalidate };
 }
 
-const starting: ArcaStatus = { state: "starting", autoConnect: true, command: null };
-const online: ArcaStatus = { state: "online", autoConnect: true, command: null };
+const starting: ArcaStatus = { state: "starting", command: null };
+const online: ArcaStatus = { state: "online", command: null };
 
 describe("useArcaAutoConnect", () => {
   it("records the newly-online host as the Arca instance after a fresh connect", async () => {
@@ -167,7 +167,7 @@ describe("useArcaAutoConnect", () => {
 
     push(starting);
     await act(() => vi.runAllTimersAsync());
-    push({ state: "failed", autoConnect: true, command: null, errorKind: "timeout", error: "x" });
+    push({ state: "failed", command: null, errorKind: "timeout", error: "x" });
     await act(() => vi.runAllTimersAsync());
 
     expect(invalidate).not.toHaveBeenCalled();
