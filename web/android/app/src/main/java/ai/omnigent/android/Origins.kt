@@ -36,39 +36,51 @@ fun isHttpScheme(scheme: String?): Boolean {
     return normalized == "http" || normalized == "https"
 }
 
-/**
- * Server domains whose IdP permits embedded user-agents. Their login redirect
- * chain runs inside the WebView and the server sets the session cookie on its
- * own domain, so no system-browser hop is needed.
- */
-private val IN_WEBVIEW_AUTH_DOMAINS =
-    listOf("databricks.com", "azuredatabricks.net", "databricksapps.com")
+/** Authentication strategy for a pinned Omnigent server. */
+enum class ServerAuthentication {
+    /** A Databricks workspace, where Omnigent is mounted at `/omnigent`. */
+    DATABRICKS_WORKSPACE,
 
-/**
- * True when [origin]'s host is, or sits under, a domain that authenticates in
- * the WebView. Matches on a dot boundary so a lookalike host like
- * `databricks.com.example.org` does not qualify.
- */
-fun usesInWebViewAuth(origin: String?): Boolean {
-    val host = origin?.let(Uri::parse)?.host?.lowercase() ?: return false
-    return IN_WEBVIEW_AUTH_DOMAINS.any { host == it || host.endsWith(".$it") }
+    /** A Databricks App, which serves the app at its own root. */
+    DATABRICKS_APP,
+
+    /** Omnigent's generic OIDC flow for every other server. */
+    OIDC,
+    ;
+
+    /**
+     * Current routing policy. Workspace native OAuth is activated separately;
+     * until then this preserves the existing inline Databricks authentication.
+     */
+    val usesInWebViewAuth: Boolean
+        get() = this != OIDC
 }
 
 /** Path the Omnigent SPA is mounted at inside a Databricks workspace. */
 const val WORKSPACE_UI_PATH = "/omnigent"
 
-/**
- * Databricks domains that serve a workspace, and therefore mount the SPA at
- * [WORKSPACE_UI_PATH]. `databricksapps.com` is deliberately absent: Apps share
- * the workspace login story (see [IN_WEBVIEW_AUTH_DOMAINS]) but serve their own
- * app at the root, with no workspace mount to redirect to.
- */
 private val WORKSPACE_DOMAINS = listOf("databricks.com", "azuredatabricks.net")
+private const val DATABRICKS_APP_DOMAIN = "databricksapps.com"
+
+/** Classify [origin] without treating lookalike suffixes as Databricks hosts. */
+fun serverAuthentication(origin: String?): ServerAuthentication {
+    val host = origin?.let(Uri::parse)?.host?.lowercase()
+    return when {
+        matchesDomain(host, WORKSPACE_DOMAINS) -> ServerAuthentication.DATABRICKS_WORKSPACE
+        matchesDomain(host, listOf(DATABRICKS_APP_DOMAIN)) -> ServerAuthentication.DATABRICKS_APP
+        else -> ServerAuthentication.OIDC
+    }
+}
 
 /** True when [host] is, or sits under, a Databricks workspace domain. */
-private fun isDatabricksWorkspaceHost(host: String?): Boolean {
+fun isDatabricksWorkspaceHost(host: String?): Boolean = matchesDomain(host, WORKSPACE_DOMAINS)
+
+private fun matchesDomain(
+    host: String?,
+    domains: List<String>,
+): Boolean {
     val normalized = host?.lowercase() ?: return false
-    return WORKSPACE_DOMAINS.any { normalized == it || normalized.endsWith(".$it") }
+    return domains.any { normalized == it || normalized.endsWith(".$it") }
 }
 
 /**

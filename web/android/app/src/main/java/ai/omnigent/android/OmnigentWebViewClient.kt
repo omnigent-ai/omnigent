@@ -12,8 +12,9 @@ import android.webkit.WebViewClient
 
 /**
  * Signals [onPageReady] once a pinned-origin page finishes loading and decides
- * where the login flow runs: inline for servers matching [usesInWebViewAuth],
- * otherwise handed to the system browser via [onLoginRequired]. A landing on a
+ * where the login flow runs: inline for server strategies whose
+ * [ServerAuthentication.usesInWebViewAuth] is true, otherwise handed to the
+ * system browser via [onLoginRequired]. A landing on a
  * bare Databricks workspace root is bounced to the workspace's `/omnigent`
  * mount (see [workspaceRootTarget]).
  *
@@ -64,7 +65,11 @@ class OmnigentWebViewClient(
         // load of the pinned server (e.g. it's offline), NOT an IdP redirect —
         // don't misread it as a bounce and pop the browser. Mirror the http(s)
         // gate in shouldOverrideUrlLoading.
-        if (isHttpScheme(scheme) && origin != pinned && !usesInWebViewAuth(pinned)) {
+        if (
+            isHttpScheme(scheme) &&
+            origin != pinned &&
+            !serverAuthentication(pinned).usesInWebViewAuth
+        ) {
             // Log origin only, never the full URL (carries OAuth state/PKCE).
             authLog("off-origin landing $origin -> login")
             view.stopLoading()
@@ -165,7 +170,7 @@ class OmnigentWebViewClient(
         // an external link; once we're on the IdP's own pages its navigations
         // (sign-in buttons, form posts, tenant hops) are all gesture-driven and
         // must stay inline or the flow ejects to the browser mid-login.
-        if (usesInWebViewAuth(pinned)) {
+        if (serverAuthentication(pinned).usesInWebViewAuth) {
             if (originOf(view.url) == pinned && request.hasGesture()) {
                 runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
                 return true
