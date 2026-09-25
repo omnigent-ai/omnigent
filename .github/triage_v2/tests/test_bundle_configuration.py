@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from issue_prioritization.comments import COMMENT_MARKER
+
 ROOT = Path(__file__).parents[1]
 WORKFLOWS = ROOT.parent / "workflows"
 
@@ -37,6 +39,8 @@ def test_github_events_share_one_v2_workflow() -> None:
     assert "--remove-label needs-info" not in response
     assert "reopen_closed:" in response
     assert "reopen_closed: true" in response
+    response_guard = response.split("    if: >-\n", 1)[1].split("    uses:", 1)[0]
+    assert f"!startsWith(github.event.comment.body, '<!-- {COMMENT_MARKER} ') &&" in response_guard
     assert "group: issue-prioritization-v2-${{ inputs.issue_number }}" in reusable
     assert "  prioritize:\n    if: vars.ISSUE_PRIORITIZATION_V2_ENABLED" not in reusable
     assert reusable.count("if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'") == 3

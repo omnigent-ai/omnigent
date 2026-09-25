@@ -19,6 +19,21 @@ async def _manager(tmp_path: Path) -> tuple[AuthManager, TokenStore]:
     return AuthManager(store), store
 
 
+async def _wait_for(filled: list[object], *, timeout: float = 30.0) -> None:
+    """
+    Wait until a background login task appends to *filled*.
+
+    The budget is deliberately far larger than any poll interval these tests
+    mock: a loaded CI runner must not turn "the callback hasn't fired yet"
+    into a failure. The assertion on *filled* after the wait is what proves
+    the behaviour, so a generous timeout costs nothing on the happy path.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not filled and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+
+
 def test_slack_client_id_format() -> None:
     assert slack_client_id("Acme Corp") == "Slack-Omnigent-Acme Corp"
     # Missing/blank workspace name falls back to the bare label.
@@ -81,10 +96,7 @@ async def test_authorize_returns_link_and_await_persists_on_approval(tmp_path: P
         on_success=on_success,
         on_failure=on_failure,
     )
-    for _ in range(50):
-        if succeeded:
-            break
-        await asyncio.sleep(0.05)
+    await _wait_for(succeeded)
 
     assert succeeded == [True]
     rec = await store.get("T1", "U1", _BASE)
@@ -116,10 +128,7 @@ async def test_await_authorization_denied_calls_on_failure(tmp_path: Path) -> No
         on_success=on_success,
         on_failure=on_failure,
     )
-    for _ in range(50):
-        if failures:
-            break
-        await asyncio.sleep(0.05)
+    await _wait_for(failures)
 
     assert failures and "denied" in failures[0].lower()
     assert await store.get("T1", "U1", _BASE) is None
@@ -158,10 +167,7 @@ async def test_login_fires_token_changed_hook(tmp_path: Path) -> None:
         on_success=_noop,
         on_failure=_noop_fail,
     )
-    for _ in range(50):
-        if changed:
-            break
-        await asyncio.sleep(0.05)
+    await _wait_for(changed)
     assert changed == [("T1", "U1", _BASE)]
 
 
@@ -265,10 +271,7 @@ async def test_oidc_login_stores_session_jwt_no_refresh(tmp_path: Path) -> None:
         on_success=on_success,
         on_failure=on_failure,
     )
-    for _ in range(50):
-        if done:
-            break
-        await asyncio.sleep(0.05)
+    await _wait_for(done)
 
     assert done == [True]
     rec = await store.get("T1", "U1", _BASE)

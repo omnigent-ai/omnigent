@@ -23,6 +23,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
+from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
@@ -1052,18 +1053,19 @@ def test_forward_failures_escalate_to_degraded_once() -> None:
     re-fire per dropped item.
     """
     fwd._reset_forward_health()
+    result = fwd._PostResult(response=None, transport_error="ConnectError")
 
     for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD - 1):
-        fwd._note_forward_failure("external_output_text_delta")
+        fwd._note_forward_failure("external_output_text_delta", result, "conv_x")
     # Below threshold: not yet degraded.
     assert fwd._forward_health.degraded_logged is False
 
-    fwd._note_forward_failure("external_output_text_delta")  # crosses threshold
+    fwd._note_forward_failure("external_output_text_delta", result, "conv_x")  # crosses threshold
     assert fwd._forward_health.degraded_logged is True
     assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD
 
     # The latch holds — further failures keep counting but don't re-escalate.
-    fwd._note_forward_failure("external_output_text_delta")
+    fwd._note_forward_failure("external_output_text_delta", result, "conv_x")
     assert fwd._forward_health.degraded_logged is True
     assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD + 1
 
@@ -1075,8 +1077,9 @@ def test_forward_success_resets_degraded_state() -> None:
     Recovery must re-arm the indicator so a later outage escalates again.
     """
     fwd._reset_forward_health()
+    result = fwd._PostResult(response=None, transport_error="ConnectError")
     for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD):
-        fwd._note_forward_failure("external_session_usage")
+        fwd._note_forward_failure("external_session_usage", result, "conv_x")
     assert fwd._forward_health.degraded_logged is True
 
     fwd._note_forward_success()
@@ -1166,6 +1169,50 @@ def test_classify_codex_error_auth_vs_generic() -> None:
     assert fwd._classify_codex_error({}, "Please run codex login") == auth
     assert fwd._classify_codex_error({}, "ChatGPT session expired") == auth
     assert fwd._classify_codex_error({"codexErrorInfo": "Other"}, "disk full") == generic
+
+
+def test_classify_codex_error_budget_exhausted_not_auth() -> None:
+    """AI-gateway budget exhaustion (HTTP 403) must not classify as auth.
+
+    The gateway returns PERMISSION_DENIED with HTTP 403 when a spending budget
+    is exhausted.  The 403 and the word "403" in the message would otherwise
+    trigger the auth classifier, sending users a misleading re-auth hint.
+    """
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    auth = fwd._CODEX_ERROR_KIND_AUTH
+
+    # Realistic message shape from the AI gateway (budget name and id are
+    # synthetic; see prod samples for the real shape).
+    budget_msg = (
+        'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+        '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached its'
+        " limit of $100. To continue, contact an admin to increase the budget or use a"
+        ' different budget."}'
+    )
+    # Budget exhaustion is generic even when codexErrorInfo carries a 403 status.
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 403}}, budget_msg)
+        == generic
+    )
+    # Budget exhaustion is generic even when codexErrorInfo is absent.
+    assert fwd._classify_codex_error({}, budget_msg) == generic
+
+    # A disabled per-user rate limit (rate limit is set to 0) is also generic.
+    rate_zero_msg = (
+        'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+        '"rate limit is set to 0 for user test@example.com"}'
+    )
+    assert fwd._classify_codex_error({}, rate_zero_msg) == generic
+
+    # A genuine 401 auth failure must still classify as auth.
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": "unauthorized"}, "401 Unauthorized") == auth
+    )
+    # A genuine 403 permission error unrelated to budget must still classify as auth.
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 403}}, "access denied")
+        == auth
+    )
 
 
 def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
@@ -2136,6 +2183,52 @@ class _RaisingPostClient:
         raise self._exc
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["http", "connect", "ambiguous"])
+async def test_degraded_log_records_post_failure_classification(
+    failure: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A degraded period records its latest delivery outcome without copying the payload."""
+    fwd._reset_forward_health()
+    request = httpx.Request("POST", "https://example.test/events?secret=private")
+    client = (
+        _StatusClient(403)
+        if failure == "http"
+        else _RaisingPostClient(
+            httpx.ConnectError("private connection detail", request=request)
+            if failure == "connect"
+            else httpx.ReadTimeout("private timeout detail", request=request)
+        )
+    )
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD + 1):
+        await fwd._post_session_event(
+            client,
+            "conv_failed_post",
+            event_type="external_conversation_item",
+            data={"body": "private transcript"},
+            max_attempts=1,
+        )
+    records = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "codex_forward_sync_degraded"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.session_id == "conv_failed_post"
+    assert record.attributes == {
+        "http_status": 403 if failure == "http" else None,
+        "transport_error": None
+        if failure == "http"
+        else "ConnectError"
+        if failure == "connect"
+        else "ReadTimeout",
+        "delivered_ambiguous": failure == "ambiguous",
+    }
+    assert "private" not in record.getMessage()
+    assert record.exc_info is None
+
+
 class _SequencedPostClient:
     """Return or raise configured POST outcomes in order."""
 
@@ -2787,11 +2880,11 @@ async def test_post_session_event_dead_letters_records_http_status(
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
+async def test_replay_dead_letters_before_resume_reposts_proven_undelivered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    On startup, a proven-undelivered record is re-POSTed and removed (#1579).
+    Before resume, a proven-undelivered record is re-POSTed and removed (#1579).
 
     :param tmp_path: Pytest temp dir standing in for the bridge dir.
     :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
@@ -2824,7 +2917,7 @@ async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
         )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _ok_inner)
-    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+    await fwd._replay_dead_letters_before_resume(MagicMock(), tmp_path)
 
     assert len(posted) == 1
     assert posted[0]["session_id"] == "conv_codex1"
@@ -2839,11 +2932,11 @@ async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
 
 
 @pytest.mark.asyncio
-async def test_replay_dead_letters_on_startup_skips_ambiguous(
+async def test_replay_dead_letters_before_resume_skips_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    On startup, an ambiguous record is never re-POSTed and is retained (#1579).
+    Before resume, an ambiguous record is never re-POSTed and is retained (#1579).
 
     :param tmp_path: Pytest temp dir standing in for the bridge dir.
     :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
@@ -2867,7 +2960,7 @@ async def test_replay_dead_letters_on_startup_skips_ambiguous(
         )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _inner)
-    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+    await fwd._replay_dead_letters_before_resume(MagicMock(), tmp_path)
 
     assert called is False
     # Ambiguous record retained as a forensic record.
@@ -4407,3 +4500,202 @@ def test_thread_started_is_ephemeral_false_for_missing_thread() -> None:
     """Event with params but no thread is not ephemeral."""
     event = {"method": "thread/started", "params": {}}
     assert fwd._thread_started_is_ephemeral(event) is False
+
+
+# ---------------------------------------------------------------------------
+# _backfill_child_thread / _resume_child_thread_or_log
+# ---------------------------------------------------------------------------
+
+
+class _FakeChildResumeClient:
+    """
+    Test double for ``CodexAppServerClient`` exercising child backfill.
+
+    Returns/raises a canned result per JSON-RPC method so a test can drive
+    ``thread/resume`` and its ``thread/read`` fallback independently.
+
+    :param resume_response: Response returned by ``thread/resume``, if any.
+    :param resume_error: Exception raised by ``thread/resume``, if any.
+    :param read_response: Response returned by ``thread/read``, if any.
+    :param read_error: Exception raised by ``thread/read``, if any.
+    """
+
+    def __init__(
+        self,
+        *,
+        resume_response: dict | None = None,
+        resume_error: Exception | None = None,
+        read_response: dict | None = None,
+        read_error: Exception | None = None,
+    ) -> None:
+        self.resume_response = resume_response
+        self.resume_error = resume_error
+        self.read_response = read_response
+        self.read_error = read_error
+        self.calls: list[tuple[str, dict]] = []
+
+    async def request(self, method: str, params: dict) -> dict:
+        """
+        Record ``(method, params)`` and return/raise the canned outcome.
+
+        :param method: JSON-RPC method, e.g. ``"thread/resume"``.
+        :param params: JSON-RPC params.
+        :returns: Canned response for the method.
+        """
+        self.calls.append((method, params))
+        if method == "thread/resume":
+            if self.resume_error is not None:
+                raise self.resume_error
+            assert self.resume_response is not None
+            return self.resume_response
+        if method == "thread/read":
+            if self.read_error is not None:
+                raise self.read_error
+            assert self.read_response is not None
+            return self.read_response
+        raise AssertionError(f"unexpected method {method}")
+
+
+def _child_resume_response(child_thread_id: str, **thread_extra: object) -> dict:
+    """
+    Build a minimal ``thread/resume``/``thread/read`` success envelope.
+
+    :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
+    :param thread_extra: Extra ``Thread`` fields, e.g. ``agentNickname="scout"``.
+    :returns: A ``{"result": {"thread": ...}}`` envelope with empty turns.
+    """
+    thread: dict[str, object] = {"id": child_thread_id, "turns": []}
+    thread.update(thread_extra)
+    return {"result": {"thread": thread}}
+
+
+def _unloaded_subagent_error() -> CodexAppServerResponseError:
+    """Build the multi-agent v2 "unloaded sub-agent" resume refusal."""
+    return CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": (
+                "cannot resume an unloaded multi-agent v2 sub-agent through its "
+                "parent; resume the parent first, or use thread/read to inspect it"
+            ),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_child_thread_falls_back_to_thread_read_on_unloaded_subagent() -> None:
+    """
+    A v2 "unloaded sub-agent" refusal falls back to ``thread/read``.
+
+    Newer Codex refuses ``thread/resume`` for a sub-agent thread that has not
+    been loaded through its parent; Codex's own hint (``thread/read`` with
+    ``includeTurns``) must be used instead of surfacing the refusal as a
+    failure, and its response replayed/upserted exactly like a resume.
+    """
+    client = _RecordingClient()
+    codex_client = _FakeChildResumeClient(
+        resume_error=_unloaded_subagent_error(),
+        read_response=_child_resume_response("thread_child", agentNickname="scout"),
+    )
+    forwarder_state = fwd._CodexForwarderState()
+
+    await fwd._backfill_child_thread(
+        client,  # type: ignore[arg-type]
+        codex_client,  # type: ignore[arg-type]
+        parent_session_id="conv_parent",
+        child_session_id="conv_child",
+        child_thread_id="thread_child",
+        forwarder_state=forwarder_state,
+    )
+
+    assert codex_client.calls == [
+        ("thread/resume", {"threadId": "thread_child"}),
+        ("thread/read", {"threadId": "thread_child", "includeTurns": True}),
+    ]
+    # No failed status: the child's own turn/agent-status events own its liveness.
+    assert not any(post[1]["type"] == "external_session_status" for post in client.posts)
+    # The nickname from the thread/read fallback was still upserted.
+    assert any(
+        post[1]["type"] == "external_codex_subagent_start"
+        and post[1]["data"].get("agent_nickname") == "scout"
+        for post in client.posts
+    )
+    assert forwarder_state.needs_child_thread_backfill("thread_child") is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_child_thread_other_error_does_not_fail_or_retry() -> None:
+    """
+    A non-not-ready, non-refusal backfill error never fails the child.
+
+    Backfill only mirrors history; posting ``failed`` here would double-count
+    a healthy child alongside its own turn/agent-status events. The failure
+    must also be marked done so a later collab-agent item does not retry the
+    same doomed request.
+    """
+    client = _RecordingClient()
+    codex_client = _FakeChildResumeClient(
+        resume_error=CodexAppServerResponseError(
+            {"code": -32601, "message": "list_turns is not supported yet"}
+        ),
+    )
+    forwarder_state = fwd._CodexForwarderState()
+
+    await fwd._backfill_child_thread(
+        client,  # type: ignore[arg-type]
+        codex_client,  # type: ignore[arg-type]
+        parent_session_id="conv_parent",
+        child_session_id="conv_child",
+        child_thread_id="thread_child",
+        forwarder_state=forwarder_state,
+    )
+
+    assert codex_client.calls == [("thread/resume", {"threadId": "thread_child"})]
+    assert client.posts == []
+    assert forwarder_state.needs_child_thread_backfill("thread_child") is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_child_thread_read_fallback_error_does_not_fail_or_retry() -> None:
+    """A ``thread/read`` fallback that also errors is terminal, not a failure."""
+    client = _RecordingClient()
+    codex_client = _FakeChildResumeClient(
+        resume_error=_unloaded_subagent_error(),
+        read_error=RuntimeError("boom"),
+    )
+    forwarder_state = fwd._CodexForwarderState()
+
+    await fwd._backfill_child_thread(
+        client,  # type: ignore[arg-type]
+        codex_client,  # type: ignore[arg-type]
+        parent_session_id="conv_parent",
+        child_session_id="conv_child",
+        child_thread_id="thread_child",
+        forwarder_state=forwarder_state,
+    )
+
+    assert codex_client.calls == [
+        ("thread/resume", {"threadId": "thread_child"}),
+        ("thread/read", {"threadId": "thread_child", "includeTurns": True}),
+    ]
+    assert client.posts == []
+    assert forwarder_state.needs_child_thread_backfill("thread_child") is False
+
+
+@pytest.mark.asyncio
+async def test_resume_child_thread_or_log_not_ready_still_retries() -> None:
+    """A fresh child thread's not-ready gap keeps its retryable status."""
+    forwarder_state = fwd._CodexForwarderState()
+    codex_client = _FakeChildResumeClient(
+        resume_error=RuntimeError("no rollout found for thread id thread_child"),
+    )
+
+    response = await fwd._resume_child_thread_or_log(
+        codex_client,  # type: ignore[arg-type]
+        child_thread_id="thread_child",
+        forwarder_state=forwarder_state,
+    )
+
+    assert response is None
+    assert codex_client.calls == [("thread/resume", {"threadId": "thread_child"})]
+    assert forwarder_state.needs_child_thread_backfill("thread_child") is True

@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,89 @@ def test_manager_starts_and_pings(manager: ZygoteManager) -> None:
     """
     assert manager.is_running()
     assert isinstance(manager.pid, int)
+
+
+@pytest.fixture
+def managed_child() -> Iterator[tuple[ZygoteManager, subprocess.Popen[bytes]]]:
+    """A manager with a tiny direct child that exits when its stdin closes."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(); sys.exit(7)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    mgr = ZygoteManager()
+    mgr._proc = proc
+    try:
+        yield mgr, proc
+    finally:
+        assert proc.stdin is not None
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_unreaped_pid_is_none_before_start() -> None:
+    """An unstarted manager has no child exit status to protect."""
+    mgr = ZygoteManager()
+    assert mgr.unreaped_pid is None
+    assert mgr.pid is None
+
+
+def test_unreaped_pid_collects_exit_and_preserves_status(managed_child) -> None:
+    """Polling stops protecting an exited child without losing its exit code."""
+    mgr, proc = managed_child
+    assert mgr.unreaped_pid == proc.pid
+    assert proc.returncode is None
+    assert proc.stdin is not None
+    proc.stdin.close()
+
+    deadline = time.monotonic() + 5
+    while mgr.unreaped_pid is not None:
+        assert time.monotonic() < deadline, "child did not exit in time"
+        time.sleep(0.01)
+
+    assert proc.returncode == 7
+    assert mgr.pid == proc.pid
+    assert mgr.unreaped_pid is None
+    assert proc.wait(timeout=0) == 7
+    with pytest.raises(ChildProcessError):
+        os.waitpid(proc.pid, os.WNOHANG)
+
+
+def test_unreaped_pid_does_not_use_control_lock_or_socket(managed_child, monkeypatch) -> None:
+    """The host can collect zygote exits even while its control channel is busy."""
+    mgr, proc = managed_child
+
+    class ForbiddenLock:
+        def __enter__(self):
+            pytest.fail("unreaped_pid must not acquire the control lock")
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(mgr, "_lock", ForbiddenLock())
+    monkeypatch.setattr(
+        mgr, "_exchange", lambda _request: pytest.fail("unreaped_pid must not use the socket")
+    )
+    assert mgr.unreaped_pid == proc.pid
+
+
+def test_unreaped_pid_snapshots_process_during_stop(managed_child, monkeypatch) -> None:
+    """Concurrent shutdown cannot replace the Popen between its poll and pid read."""
+    mgr, proc = managed_child
+    original_poll = proc.poll
+
+    def poll_during_stop():
+        mgr._proc = None
+        return original_poll()
+
+    monkeypatch.setattr(proc, "poll", poll_during_stop)
+    assert mgr.unreaped_pid == proc.pid
+    assert mgr.pid is None
 
 
 def test_fork_runner_reports_pid_and_exit_code(manager: ZygoteManager, tmp_path) -> None:

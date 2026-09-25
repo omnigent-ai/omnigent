@@ -1,3 +1,4 @@
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Behaviour tests for the peek card's entry window: while the card is still
 // fading in it is (nearly) invisible yet already covers the header toggle
 // whose hover armed it, so it must stay click-through — otherwise a fast
@@ -109,9 +110,11 @@ function renderSidebar(props: { open: boolean; peek?: boolean }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>{sidebarAt(props)}</MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>{sidebarAt(props)}</MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
   return {
@@ -119,9 +122,11 @@ function renderSidebar(props: { open: boolean; peek?: boolean }) {
     rerenderSidebar: (next: { open: boolean; peek?: boolean }) =>
       view.rerender(
         <QueryClientProvider client={qc}>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/"]}>{sidebarAt(next)}</MemoryRouter>
-          </TooltipProvider>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/"]}>{sidebarAt(next)}</MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
         </QueryClientProvider>,
       ),
   };
