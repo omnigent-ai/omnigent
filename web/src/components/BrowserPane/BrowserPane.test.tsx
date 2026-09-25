@@ -87,6 +87,30 @@ describe("BrowserPane cold-start (no view yet)", () => {
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
   });
 
+  it("detaches the native view when its always-mounted rail becomes inactive", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({
+        exists: true,
+        url: "https://example.com",
+        canGoBack: false,
+        canGoForward: false,
+      }),
+    });
+    const { rerender } = render(<BrowserPane conversationId="conv_hidden" active />);
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_hidden"));
+
+    rerender(<BrowserPane conversationId="conv_hidden" active={false} />);
+
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null));
+    const resizeCount = bridge.browserResize.mock.calls.length;
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
+    expect(bridge.browserResize).toHaveBeenCalledTimes(resizeCount);
+  });
+
   it("reports native view-cap failures instead of silently leaving a blank tab", async () => {
     installBridge({
       browserOpenOrNavigate: vi

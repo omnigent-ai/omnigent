@@ -39,6 +39,7 @@ _PUBLIC_FALSY = ("0", "false", "no", "off")
 
 # mtime cache keyed by absolute path → (mtime, stripped text). Keyed by path so a
 # data-dir change (e.g. across tests) never reads through a stale entry.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by filesystem path
 _cache: dict[str, tuple[float, str]] = {}
 
 

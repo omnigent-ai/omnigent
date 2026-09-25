@@ -1,8 +1,9 @@
 <!--
 For AI-written descriptions:
 - Follow this template (Related issue, Summary, Test Plan, Demo, Type of change, Test coverage, Coverage notes).
-- Keep it concise; reviewers skim long descriptions.
-- For non-trivial changes, include an ELI5 and a diagram (ASCII or mermaid).
+- Keep it concise; explain the cause, fix, and proof once, in plain language.
+- For non-trivial changes, open the Summary with a 1–2 sentence ELI5; add a diagram when it
+  makes a relationship or sequence easier to follow.
 - Keep every section and checkbox row in place so reviewers can skim them.
 - For UI changes (the "UI / frontend change" box below), fill in the Demo
   section: attach a screenshot or screen recording of the new behaviour.
@@ -77,14 +78,15 @@ test coverage is not needed for this change.
 One line, in the user's voice, describing the user-facing change. The category
 is taken from the "Type of change" boxes above (e.g. UI / frontend change renders
 as "[UI] <your line>"), so don't repeat it here — just describe the change. The
-PR link is added for you.
+PR link and author credit are added for you.
 
 Lower the bar than docs: DO keep this for small features and UX changes
 (moved/renamed buttons, new flags, copy tweaks).
 
 DELETE THIS WHOLE SECTION if the change isn't noteworthy (CI, refactors,
-test-only changes, dependency bumps with no user impact) — it will simply be
-left out of the changelog. A Breaking change must always keep this section.
+test-only changes, dependency bumps with no user impact). The complete changelog
+will use the PR title and still credit the author. A Breaking change must always
+keep this section.
 
 Example:  `omnigent run --watch` reruns an agent when files change
 -->

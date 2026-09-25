@@ -21,6 +21,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import SqlConnection, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -159,6 +160,7 @@ class CredentialStore:
             return row
 
         def initial_write(session: Session) -> ProviderConnection:
+            require_active_account(session, user_id)
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()
             return self._build_entity(row, secret)
@@ -171,6 +173,7 @@ class CredentialStore:
             pass
 
         def conflict_write(session: Session) -> ProviderConnection:
+            require_active_account(session, user_id)
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()
             return self._build_entity(row, secret)
@@ -201,6 +204,7 @@ class CredentialStore:
         updated_at = now_epoch()
 
         def write(session: Session) -> bool:
+            require_active_account(session, user_id)
             row = session.get(SqlConnection, (workspace_id, user_id, provider, account_id))
             if row is None:
                 return False

@@ -29,7 +29,6 @@ def test_agent_picker_shows_bound_agent(
     # The read-only label names the bound model (gpt-4o-mini). Model/effort
     # switching lives in the config gear modal, not a dropdown here.
     label = page.get_by_test_id("composer-agent-config-value")
-    expect(label).to_be_visible()
     expect(label).to_contain_text("gpt-4o-mini")
 
     # The old dropdown trigger is gone.

@@ -165,6 +165,32 @@ def test_build_claude_native_base_args_resume_prefix(
     )
 
 
+def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resume() -> None:
+    """
+    A pinned ``--permission-mode`` reaches the cold-resume argv unchanged.
+
+    The server pins a picker-confirmed mode into ``terminal_launch_args``
+    precisely because this builder is the only thing a relaunch consults;
+    the pass-through must land after ``--resume`` and survive the
+    ``--model`` default so the resumed Claude opens in the chosen mode.
+    """
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override="claude-opus-5",
+        terminal_launch_args=["--permission-mode", "auto"],
+        resume_external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+    )
+
+    assert args == (
+        "--resume",
+        "02857840-6362-408f-b41f-309e396ed7c6",
+        "--permission-mode",
+        "auto",
+        "--model",
+        "claude-opus-5",
+    )
+
+
 def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
     """An apiKeyHelper launch strips the raw key + nested-session marker.
 
@@ -497,3 +523,107 @@ async def test_legacy_metadata_loader_reads_the_auto_harness_flag(
         metadata = await _load_legacy_claude_launch_metadata(client, "conv_abc")
 
     assert metadata.auto_harness is expected
+
+
+async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cancelling a blocked diagnostic drain must leave the launch error logged."""
+    import asyncio
+    import contextlib
+    import logging
+    import threading
+    from unittest.mock import AsyncMock, Mock
+
+    import httpx
+
+    from omnigent.harnesses.claude_native import diagnostics
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", lambda _: None
+    )
+    monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
+    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
+    monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
+    # Keep application traceback renderers out of this synchronization test.
+    logger = logging.getLogger(f"{__name__}.launch_failure")
+    caplog.set_level(logging.ERROR, logger=logger.name)
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    monkeypatch.setattr(orchestration, "_logger", logger)
+    session_id = "conv_launch_cancelled_during_drain"
+    original_error = httpx.ConnectError("original launch transport failure")
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = original_error
+    session_init = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=session_id,
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(bridge_dir)),
+    )
+    loop = asyncio.get_running_loop()
+    closing = asyncio.Event()
+    closed = asyncio.Event()
+    release_close = threading.Event()
+
+    def blocked_close(_session_id: str) -> None:
+        loop.call_soon_threadsafe(closing.set)
+        try:
+            if not release_close.wait(timeout=30):
+                raise TimeoutError("test did not release diagnostic close")
+        finally:
+            loop.call_soon_threadsafe(closed.set)
+
+    follower = Mock(close=Mock(side_effect=blocked_close))
+    monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: follower)
+    task = asyncio.create_task(
+        orchestration._auto_create_claude_terminal(
+            session_id,
+            registry,
+            Mock(),
+            server_client=AsyncMock(spec=httpx.AsyncClient),
+            session_init=session_init,
+            auth_token_factory=lambda: None,
+            resolve_launch_config=AsyncMock(return_value=None),
+        )
+    )
+    try:
+        await asyncio.wait_for(closing.wait(), timeout=10)
+        assert not closed.is_set()
+        errors_before_cancel = [
+            record
+            for record in caplog.records
+            if record.getMessage().startswith("Claude terminal tmux launch failed:")
+        ]
+        assert len(errors_before_cancel) == 1
+        record = errors_before_cancel[0]
+        assert record.levelno == logging.ERROR
+        assert record.exc_info is not None
+        assert record.exc_info[1] is original_error
+        assert getattr(record, "session_id", None) == session_id
+        assert f"session={session_id}" in record.getMessage()
+        task.cancel("cancelled during diagnostic cleanup")
+        with pytest.raises(asyncio.CancelledError, match="cancelled during diagnostic cleanup"):
+            await asyncio.wait_for(task, timeout=10)
+        assert task.cancelled()
+        assert not release_close.is_set()
+        assert not closed.is_set()
+        registry.launch_required_terminal.assert_awaited_once()
+        follower.close.assert_called_once_with(session_id)
+    finally:
+        release_close.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=10)
+        if closing.is_set():
+            await asyncio.wait_for(closed.wait(), timeout=10)

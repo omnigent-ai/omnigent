@@ -4,7 +4,8 @@
 const fs = require("fs");
 const path = require("path");
 
-const areas = JSON.parse(fs.readFileSync(path.resolve(".github/areas.json"), "utf8")).areas;
+const config = JSON.parse(fs.readFileSync(path.resolve(".github/areas.json"), "utf8"));
+const areas = config.areas;
 const priorityLabels = new Set(
   JSON.parse(fs.readFileSync(path.resolve(".github/issue-prioritization-labels.json"), "utf8"))
     .labels.map((label) => label.name),
@@ -25,6 +26,16 @@ let failures = 0;
 function assert(name, cond, detail) {
   console.log(`${cond ? "PASS" : "FAIL"}  ${name}${detail ? "  -- " + detail : ""}`);
   if (!cond) failures++;
+}
+
+// Pauses also cover maintainer authors who do not own any area.
+const paused = config.assignment_paused === undefined ? [] : config.assignment_paused;
+assert("assignment_paused is an array", Array.isArray(paused));
+if (Array.isArray(paused)) {
+  for (const login of paused) {
+    assert("paused login is a known maintainer",
+      typeof login === "string" && maint.has(login.toLowerCase()), JSON.stringify(login));
+  }
 }
 
 // Every owner is a known maintainer.

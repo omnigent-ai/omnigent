@@ -123,6 +123,7 @@ export type ConversationIconKind =
   | "qwen"
   | "kimi"
   | "hermes"
+  | "devin"
   | "nessie"
   | null;
 

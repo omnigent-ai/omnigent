@@ -21,6 +21,7 @@ subprocess spawn, no real CLI.
 from __future__ import annotations
 
 import logging
+import shlex
 import socket
 import sys
 import time
@@ -359,6 +360,57 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_MODEL"] == "gpt-default-model"
     # Codex defaults to the Responses wire API when the family omits wire_api.
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+@pytest.mark.parametrize("auth_source", ["spec", "global"])
+@pytest.mark.parametrize("endpoint_url", [None, "https://openrouter.ai/api/v1"])
+def test_codex_inline_api_key_routes_to_declared_endpoint(
+    config_home: Path,
+    auth_source: str,
+    endpoint_url: str | None,
+) -> None:
+    """Inline auth supplies both the key and endpoint, overriding a default when explicit."""
+    api_key = "test-key with ' quotes"
+    auth = ApiKeyAuth(api_key=api_key, base_url=endpoint_url)
+    if auth_source == "spec":
+        _write_config(config_home, _openai_default_config())
+    else:
+        _write_config(
+            config_home,
+            {"auth": {"type": "api_key", "api_key": api_key, "base_url": endpoint_url}},
+        )
+    spec = _make_spec(
+        harness="codex",
+        model="test-model",
+        auth=auth if auth_source == "spec" else None,
+    )
+
+    env = _build_codex_spawn_env(spec)
+
+    assert env["HARNESS_CODEX_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == (endpoint_url or "https://api.openai.com/v1")
+    assert shlex.split(env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]) == ["printf", "%s", api_key]
+    assert env["HARNESS_CODEX_MODEL"] == "test-model"
+    assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+@pytest.mark.parametrize("fragment", [None, "wrong-key"])
+def test_codex_resolved_api_key_preserves_literal_dollars(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch, fragment: str | None
+) -> None:
+    """Provider synthesis must not interpret an already-resolved secret as config."""
+    _write_config(config_home, {})
+    monkeypatch.delenv("OMNIGENT_KEY_FRAGMENT", raising=False)
+    if fragment is None:
+        monkeypatch.delenv("KEY_FRAGMENT", raising=False)
+    else:
+        monkeypatch.setenv("KEY_FRAGMENT", fragment)
+    api_key = "test-$KEY_FRAGMENT-'quoted'"
+    spec = _make_spec(harness="codex", model="test-model", auth=ApiKeyAuth(api_key=api_key))
+
+    env = _build_codex_spawn_env(spec)
+
+    assert shlex.split(env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]) == ["printf", "%s", api_key]
 
 
 def test_codex_rejects_chat_only_openrouter_before_harness_spawn(config_home: Path) -> None:

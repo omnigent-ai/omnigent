@@ -129,6 +129,30 @@ def test_bottom_survives_conversation_switch(
     assert distance is not None and distance <= 8
 
 
+def test_turn_rail_wheel_loads_and_navigates_older_history(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """An upward rail gesture still exposes older turns for navigation."""
+    _open_seeded_pair(page, seeded_session_pair)
+    rail = page.locator(".turn-rail-fade")
+    ticks = rail.locator("[data-turn-tick]")
+    initial_count = ticks.count()
+    assert 0 < initial_count < _TURNS
+
+    rail.hover()
+    page.mouse.wheel(0, -2_000)
+    expect(ticks).not_to_have_count(initial_count, timeout=30_000)
+    assert ticks.count() > initial_count
+
+    older_prompt = f"alpha prompt {_TURNS - initial_count - 1}"
+    rail.get_by_role("button", name=f"Jump to: {older_prompt}", exact=True).click()
+    # Scoped to the transcript: the rail's hover preview repeats the same text.
+    expect(page.get_by_role("log").get_by_text(older_prompt, exact=True)).to_be_visible(
+        timeout=30_000
+    )
+
+
 def test_mid_scroll_anchor_survives_conversation_switch(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
