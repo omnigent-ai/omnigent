@@ -1755,11 +1755,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             stmt = pg_insert(SqlUserDailyCost)
-        # NOTE: Per-harness spend tracking is not yet implemented. All spend
-        # is currently attributed to the cross-harness sentinel ("__all__").
-        # The harness column exists to support future per-harness budgets,
-        # but the spend tracking logic needs to be updated to capture the
-        # actual harness from the session context.
         stmt = stmt.values(
             user_id=user_id,
             day_utc=day_utc,
@@ -1767,7 +1762,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             updated_at=now,
         )
         stmt = stmt.on_conflict_do_update(
-            index_elements=["workspace_id", "user_id", "day_utc", "harness"],
+            index_elements=["workspace_id", "user_id", "day_utc"],
             set_={
                 "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
                 "updated_at": stmt.excluded.updated_at,
@@ -1900,7 +1895,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # On conflict touch only the approval (+ stamp) — never
                 # the accumulated cost.
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=["workspace_id", "user_id", "day_utc", "harness"],
+                    index_elements=["workspace_id", "user_id", "day_utc"],
                     set_={
                         "ask_approved_usd": stmt.excluded.ask_approved_usd,
                         "updated_at": stmt.excluded.updated_at,
