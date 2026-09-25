@@ -6554,6 +6554,20 @@ async def _cold_start_agy_conversation(
             session_id,
         )
         return None
+    # The reader's placeholder recovery may have adopted agy's TUI-minted
+    # cascade while this bootstrap settled; the headless StartCascade phantom
+    # must never overwrite that live binding.
+    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+    if state is not None and not is_placeholder_conversation_id(state.conversation_id):
+        _logger.info(
+            "Antigravity cold-start: bridge state already binds conversation %s for "
+            "session %s (the reader adopted it meanwhile); discarding cold-start "
+            "cascade %s.",
+            state.conversation_id,
+            session_id,
+            cascade_id,
+        )
+        return state.conversation_id
     # Persist the real id (replacing the ``agy_conv_*`` placeholder) so
     # ``read_bridge_state`` returns it and the reader/executor address the
     # cold-started conversation. Offloaded (file I/O).
