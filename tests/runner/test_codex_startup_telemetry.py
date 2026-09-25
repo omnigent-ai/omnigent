@@ -750,3 +750,113 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
     assert supervise.await_args.kwargs["thread_id"] == "thread-ready"
     assert supervise.await_args.kwargs["client"] is startup.event_client
     assert startup.close_order == ["client", "app_server", "subagent", "turn"]
+
+
+def _running_terminal_with_pane(tmp_path: Path, pane_text: str) -> TerminalInstance:
+    """Return a still-alive TerminalInstance with a visible pane snapshot."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path / "terminal",
+        keep_alive_after_exit=True,
+        running=True,
+    )
+    instance._remember_pane_snapshot(pane_text)
+    return instance
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (TimeoutError(), "timeout"),
+        (RuntimeError("event stream ended"), "event_stream_ended"),
+    ],
+)
+async def test_timeout_and_stream_end_include_pane_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    startup: _Startup,
+    error: Exception,
+    reason: str,
+) -> None:
+    """Timeout / event-stream-ended failure includes a sanitized pane snapshot.
+
+    The pane tail appears in both the codex_thread_start_failed debug event
+    and the bridge startup error so telemetry shows blocking prompts (trust
+    dialogs, auth errors) without needing OMNIGENT_HARNESS_STDERR_ENABLED.
+    """
+    pane_text = "\x1b[33mDo you want to proceed? (y/n)\x1b[0m\n> "
+    terminal = _running_terminal_with_pane(startup.bridge_dir, pane_text)
+    monkeypatch.setattr(forwarder, "wait_for_thread_started", AsyncMock(side_effect=error))
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        await _discover(
+            startup,
+            terminal_instance=terminal,
+            thread_start_timeout_seconds=120,
+        )
+
+    [record] = _failure_records(caplog)
+    assert record.attributes["reason"] == reason
+    tail = record.attributes.get("terminal_last_output")
+    assert tail is not None
+    assert "Do you want to proceed?" in tail
+    # ANSI escape codes stripped
+    assert "\x1b" not in tail
+    assert len(tail) < 4096
+
+    error_text = read_bridge_startup_error(startup.bridge_dir)
+    assert error_text is not None
+    assert "Codex startup terminal output:" in error_text
+    assert "Do you want to proceed?" in error_text
+
+
+async def test_timeout_without_terminal_instance_omits_pane_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    startup: _Startup,
+) -> None:
+    """Without a terminal_instance the failure attributes carry no pane output."""
+    monkeypatch.setattr(
+        forwarder, "wait_for_thread_started", AsyncMock(side_effect=TimeoutError())
+    )
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        await _discover(startup, thread_start_timeout_seconds=120)
+
+    [record] = _failure_records(caplog)
+    assert "terminal_last_output" not in record.attributes
+    error_text = read_bridge_startup_error(startup.bridge_dir)
+    assert error_text is not None
+    assert "startup timed out after 120s" in error_text
+    assert "terminal output" not in error_text
+
+
+async def test_pane_capture_failure_preserves_startup_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    startup: _Startup,
+) -> None:
+    """A pane-capture exception must not replace or swallow the startup error."""
+    terminal = _running_terminal_with_pane(startup.bridge_dir, "trust prompt")
+
+    def _raise_tmux_gone() -> None:
+        raise OSError("tmux gone")
+
+    # Simulate a pane-read failure after the terminal object is created.
+    monkeypatch.setattr(terminal, "last_pane_text", _raise_tmux_gone)
+    monkeypatch.setattr(
+        forwarder, "wait_for_thread_started", AsyncMock(side_effect=TimeoutError())
+    )
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        await _discover(startup, terminal_instance=terminal, thread_start_timeout_seconds=120)
+
+    [record] = _failure_records(caplog)
+    # Diagnostics collection error is recorded but must not hide the startup cause.
+    assert record.attributes.get("diagnostics_error_type") == "OSError"
+    assert "terminal_last_output" not in record.attributes
+    error_text = read_bridge_startup_error(startup.bridge_dir)
+    assert error_text is not None
+    assert "startup timed out after 120s" in error_text

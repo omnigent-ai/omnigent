@@ -5447,6 +5447,19 @@ def _codex_startup_terminal_output(instance: TerminalInstance) -> str | None:
     return trim_terminal_output(sanitize_diagnostic_text(instance.last_exit_text() or ""))
 
 
+def _codex_startup_pane_output(instance: TerminalInstance) -> str | None:
+    """Bounded, sanitized pane snapshot for startup-timeout diagnostics.
+
+    Uses the live pane cache so it captures output when the terminal has not
+    yet exited (e.g. a trust/auth prompt blocking startup). Ungated: matches
+    Claude required-terminal diagnostics which always include pane output.
+    """
+    from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+    from omnigent.runner.resource_registry import trim_terminal_output
+
+    return trim_terminal_output(sanitize_diagnostic_text(instance.last_pane_text() or ""))
+
+
 class _CodexTerminalExited(RuntimeError):
     """The exact TUI stopped before its thread could be discovered."""
 
@@ -5636,6 +5649,13 @@ async def _codex_discover_thread_and_forward(
                         diagnostics["terminal_last_output"] = _codex_startup_terminal_output(
                             exc.instance
                         )
+                elif terminal_instance is not None:
+                    # Pane snapshot for timeout / event-stream-ended: include
+                    # what was visible when the startup wait expired so telemetry
+                    # shows trust/auth prompts or crash output.
+                    diagnostics["terminal_last_output"] = _codex_startup_pane_output(
+                        terminal_instance
+                    )
             except Exception as diagnostics_error:  # noqa: BLE001
                 # Diagnostics must not replace the startup error or prevent cleanup.
                 diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
