@@ -9,6 +9,8 @@ entry plus a missing tmux socket surfaced as ``503 claude_native_*_failed``.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import threading
 import time
 from pathlib import Path
@@ -19,6 +21,7 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
+    _TMUX_FILE,
     bridge_dir_for_conversation_id,
     write_tmux_target,
 )
@@ -88,12 +91,14 @@ async def _open_claude_native_session(
     *,
     conv_id: str,
     auto_create_calls: list[str],
+    harness_client: _ScriptedHarnessClient | None = None,
 ) -> tuple[Any, TerminalRegistry]:
     """Build a runner with a real terminal registry and a claude-native session.
 
     ``_auto_create_claude_terminal`` is stubbed so session create does not
     spawn a real Claude TUI. Calls after session create are the session-change
-    heal path.
+    heal path. *harness_client* receives forwarded turns; ``None`` uses a
+    scripted client with no frames.
     """
 
     async def _stub_auto_create(
@@ -147,7 +152,9 @@ async def _open_claude_native_session(
 
     registry = TerminalRegistry()
     app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        process_manager=_FakeProcessManager(  # type: ignore[arg-type]
+            harness_client or _ScriptedHarnessClient([])
+        ),
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
         terminal_registry=registry,
@@ -410,7 +417,7 @@ def _plant_live_claude_pane(
     conv_id: str,
     tmp_path: Path,
     bridge_dir: Path,
-) -> None:
+) -> TerminalInstance:
     """Register a live Claude pane advertising a socket that exists."""
     sock = tmp_path / "omnigent-terminal-live" / "tmux.sock"
     sock.parent.mkdir(parents=True, exist_ok=True)
@@ -432,6 +439,7 @@ def _plant_live_claude_pane(
         registry._by_conversation[conv_id] = {("claude", "main"): live}
         registry._instance_locks[(conv_id, "claude", "main")] = threading.Lock()
     write_tmux_target(bridge_dir, socket_path=sock, tmux_target="claude:0.0")
+    return live
 
 
 @pytest.mark.asyncio
@@ -680,3 +688,80 @@ async def test_failed_recreate_does_not_wait(
         f"a recreate that made no pane must not be polled; got {pane_ready_calls!r}"
     )
     assert elapsed < 5.0, f"failed recreate stalled {elapsed:.1f}s instead of failing fast"
+
+
+def _read_advertisement(bridge_dir: Path) -> dict[str, object] | None:
+    """Return the bridge's ``tmux.json`` payload, or ``None`` when absent/invalid."""
+    try:
+        payload = json.loads((bridge_dir / _TMUX_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+class _AdvertisementProbeHarnessClient(_ScriptedHarnessClient):
+    """Snapshot the bridge's tmux advertisement at the moment a turn is forwarded."""
+
+    def __init__(self, bridge_dir: Path) -> None:
+        super().__init__([])
+        self._bridge_dir = bridge_dir
+        self.advertised_at_forward: list[dict[str, object] | None] = []
+        self.forwarded = asyncio.Event()
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        self.advertised_at_forward.append(_read_advertisement(self._bridge_dir))
+        self.forwarded.set()
+        return super().stream(method, url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_turn_readvertises_live_pane_before_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A turn to a live pane whose tmux.json is gone restores it before forwarding.
+
+    Message delivery into the pane waits on ``tmux.json``; with the pane alive
+    but unadvertised it timed out with "tmux target is not advertised yet".
+    The turn path must rewrite the advertisement from the live registry
+    instance before the harness receives the turn, without recreating the pane.
+    """
+    conv_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    harness_client = _AdvertisementProbeHarnessClient(bridge_dir)
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch,
+        conv_id=conv_id,
+        auto_create_calls=auto_create_calls,
+        harness_client=harness_client,
+    )
+    auto_create_calls.clear()
+    live = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    # The fault: the pane is alive but nothing advertises its tmux target.
+    (bridge_dir / _TMUX_FILE).unlink()
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness": "claude-native",
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        await asyncio.wait_for(harness_client.forwarded.wait(), timeout=10.0)
+
+    assert auto_create_calls == [], "a live pane must be re-advertised in place, not recreated"
+    advertised = [
+        {k: v for k, v in (entry or {}).items() if k in ("socket_path", "tmux_target")}
+        for entry in harness_client.advertised_at_forward
+    ]
+    expected = {"socket_path": str(live.socket_path), "tmux_target": live.tmux_target}
+    assert advertised == [expected], (
+        "the turn was forwarded without a usable advertisement: "
+        f"{harness_client.advertised_at_forward!r}"
+    )
