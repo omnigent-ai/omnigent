@@ -4163,6 +4163,9 @@ async def test_antigravity_elicitation_hook_accept_round_trip(
     assert resp.json() == {
         "action": "accept",
         "content": {"selectedOptionIds": ["1"]},
+        # Additive ``reason`` field (#7315): ``None`` when the resolver
+        # gave no refusal rationale — an accept carries none.
+        "reason": None,
     }
 
 
@@ -4202,7 +4205,7 @@ async def test_antigravity_elicitation_hook_decline_round_trip(
 
     resp = await hook_task
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"action": "decline", "content": None}
+    assert resp.json() == {"action": "decline", "content": None, "reason": None}
 
 
 async def test_antigravity_elicitation_hook_timeout_returns_empty_200(

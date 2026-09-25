@@ -27,6 +27,7 @@ from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestEvent,
     ElicitationRequestParams,
+    ElicitationResult,
     FailedEvent,
     FailedResponseObject,
     HeartbeatEvent,
@@ -206,6 +207,36 @@ def test_elicitation_request_roundtrip() -> None:
             "content_preview": "rm -rf /tmp/cache",
         },
     }
+
+
+def test_elicitation_result_reason_roundtrip() -> None:
+    """The resolver-rationale ``reason`` field validates, survives the
+    dump -> re-validate round-trip the resolve route performs, and is
+    omitted when unset (#7315).
+
+    ``reason`` is deliberately NOT ``content``: the MCP-mirrored field
+    stays accept-only, while this one carries a refusal rationale back
+    to the harness. Additive by design — an unset ``reason`` must not
+    appear in the wire shape at all (hook replies are compared
+    verbatim), which ``exclude_none`` guarantees.
+    """
+    verdict = ElicitationResult.model_validate(
+        {"action": "decline", "reason": "not like that — try read-only mode"}
+    )
+    assert verdict.reason == "not like that — try read-only mode"
+    # The resolve route dumps with exclude_none before re-validating.
+    dumped = verdict.model_dump(exclude_none=True)
+    assert dumped["reason"] == "not like that — try read-only mode"
+    assert ElicitationResult.model_validate(dumped).reason == (
+        "not like that — try read-only mode"
+    )
+    # Unset stays absent — existing clients see no wire change.
+    bare = ElicitationResult.model_validate({"action": "decline"})
+    assert bare.reason is None
+    assert "reason" not in bare.model_dump(exclude_none=True)
+    # ``content`` keeps its accept-only documentation contract: it is
+    # NOT widened to carry rationales on decline.
+    assert bare.content is None
 
 
 @pytest.fixture
