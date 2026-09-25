@@ -2481,6 +2481,44 @@ describe("Composer shared visible controls", () => {
     fireEvent.click(screen.getByTestId("composer-permission-option-read-only"));
     await waitFor(() => expect(setApproval).toHaveBeenCalledWith("read-only"));
   });
+
+  it("offers bypass approvals in the codex permission picker and dispatches it", async () => {
+    // The running-session picker must expose the same full-bypass stance the
+    // create-time picker offers, as its last row after Codex's own presets.
+    useChatStore.setState({
+      conversationId: "codex-bypass-switch",
+      codexApprovalMode: "ask-for-approval",
+    });
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockResolvedValue(undefined);
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
+    const menu = await screen.findByTestId("composer-permission-menu");
+    const options = within(menu)
+      .getAllByRole("menuitemradio")
+      .map((item) => item.textContent);
+    expect(options).toEqual([
+      "Ask for approval",
+      "Approve for me",
+      "Full Access",
+      "Read Only",
+      "Bypass approvals & sandbox",
+    ]);
+    fireEvent.click(screen.getByTestId("composer-permission-option-bypass"));
+    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("bypass"));
+  });
+
+  it("labels the pill from a bypass approval mode", () => {
+    useChatStore.setState({
+      conversationId: "codex-bypass-pill",
+      codexApprovalMode: "bypass",
+    });
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent(
+      "Bypass approvals & sandbox",
+    );
+  });
 });
 
 describe("Composer background tasks", () => {

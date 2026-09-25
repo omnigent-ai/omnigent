@@ -10372,6 +10372,127 @@ async def test_patch_approval_mode_rejects_unknown_mode(
     assert "approval_mode must be one of" in resp.text
 
 
+async def test_patch_approval_mode_bypass_arms_bypass_label(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    PATCH ``approval_mode: bypass`` switches the live thread and arms bypass.
+
+    Bypass has no ``/permissions`` row, so the runner delivers it through the
+    Full Access row (same runtime settings). The server then stamps the
+    read-back label as ``bypass`` AND arms
+    ``omnigent.codex_native.bypass_sandbox`` so a relaunch boots with
+    ``--dangerously-bypass-approvals-and-sandbox``.
+    """
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the injection like the codex-native runner handler."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body: dict[str, Any] | None = None
+        if request.content:
+            body = json.loads(request.content)
+        captured.append(_ForwardedEffort(url=str(request.url), body=body))
+        return httpx.Response(200, json={"approval_mode": "bypass"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+            },
+        )
+        captured.clear()
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"approval_mode": "bypass"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["labels"]["omnigent.codex_native.approval_mode"] == "bypass"
+    assert resp.json()["labels"]["omnigent.codex_native.bypass_sandbox"] == "1"
+    forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
+    assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
+    assert forwards[0].body == {
+        "type": "codex_approval_mode_change",
+        "approval_mode": "bypass",
+    }
+    mode_events = [
+        event for _, event in published if event["type"] == "session.codex_approval_mode"
+    ]
+    assert len(mode_events) == 1
+    assert mode_events[0]["approval_mode"] == "bypass"
+
+
+async def test_patch_approval_mode_preset_clears_bypass_label(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A confirmed switch to a normal preset disarms an armed bypass label.
+
+    Leaving ``omnigent.codex_native.bypass_sandbox`` set would relaunch the
+    session with ``--dangerously-bypass-approvals-and-sandbox`` even though
+    the user left the bypass stance.
+    """
+    from omnigent.runtime import set_runner_client
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the injection like the codex-native runner handler."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        return httpx.Response(200, json={"approval_mode": "read-only"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+                "omnigent.codex_native.bypass_sandbox": "1",
+            },
+        )
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"approval_mode": "read-only"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["labels"]["omnigent.codex_native.approval_mode"] == "read-only"
+    assert "omnigent.codex_native.bypass_sandbox" not in resp.json()["labels"]
+
+
 async def test_post_external_codex_approval_mode_change_sets_label_and_publishes(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -10420,6 +10541,84 @@ async def test_post_external_codex_approval_mode_change_requires_a_field(
     )
 
     assert resp.status_code == 400, resp.text
+
+
+async def test_external_full_access_keeps_armed_bypass_label(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Full-access settings on a bypass-armed session don't downgrade the label.
+
+    A bypass launch runs the thread at ``approval_policy="never"`` +
+    ``sandbox_mode="danger-full-access"`` — exactly what the forwarder reads
+    back as the ``full-access`` preset. Stamping that would flip the picker
+    from "Bypass approvals & sandbox" to "Full Access" right after launch.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.codex_native.bypass_sandbox": "1"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"approval_mode": "full-access"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == []
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert "omnigent.codex_native.approval_mode" not in snapshot["labels"]
+    assert snapshot["labels"]["omnigent.codex_native.bypass_sandbox"] == "1"
+
+
+async def test_external_preset_clears_bypass_label(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A TUI switch to a prompting preset disarms an armed bypass label.
+
+    When Codex's own ``/permissions`` popup leaves the bypass stance, the
+    next relaunch must not quietly re-arm
+    ``--dangerously-bypass-approvals-and-sandbox``.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.codex_native.bypass_sandbox": "1"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"approval_mode": "ask-for-approval"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == ["session.codex_approval_mode"]
+    assert published[0][1]["approval_mode"] == "ask-for-approval"
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.codex_native.approval_mode"] == "ask-for-approval"
+    assert "omnigent.codex_native.bypass_sandbox" not in snapshot["labels"]
 
 
 @pytest.mark.parametrize(

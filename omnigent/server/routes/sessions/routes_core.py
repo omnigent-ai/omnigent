@@ -28,6 +28,7 @@ from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from omnigent.codex_approval_modes import (
+    CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
     CODEX_NATIVE_PERMISSION_VALUES,
 )
 from omnigent.db.utils import generate_agent_id, generate_file_id
@@ -2318,9 +2319,12 @@ def register_core_routes(
                     "approval_mode must be a non-empty string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            if body.approval_mode not in CODEX_NATIVE_PERMISSION_VALUES:
+            switchable_approval_modes = CODEX_NATIVE_PERMISSION_VALUES | {
+                CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+            }
+            if body.approval_mode not in switchable_approval_modes:
                 raise OmnigentError(
-                    f"approval_mode must be one of {sorted(CODEX_NATIVE_PERMISSION_VALUES)}",
+                    f"approval_mode must be one of {sorted(switchable_approval_modes)}",
                     code=ErrorCode.INVALID_INPUT,
                 )
             conv_for_approval_mode = await asyncio.to_thread(
@@ -2786,6 +2790,18 @@ def register_core_routes(
                 _approval_result,
             )
             labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
+            if requested_codex_approval_mode == CODEX_NATIVE_BYPASS_APPROVAL_VALUE:
+                # Bypass must survive a relaunch: this label is what boots the
+                # TUI with --dangerously-bypass-approvals-and-sandbox.
+                labels_to_set[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+            else:
+                # A confirmed non-bypass stance disarms bypass, or the next
+                # relaunch would quietly re-arm it.
+                await asyncio.to_thread(
+                    conversation_store.delete_label,
+                    session_id,
+                    _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+                )
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before

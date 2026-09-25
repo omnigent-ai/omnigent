@@ -2287,7 +2287,10 @@ class UpdateSessionRequest(BaseModel):
         session to, one of ``"ask-for-approval"``, ``"approve-for-me"``,
         ``"full-access"``, ``"read-only"`` — Codex's own ``/permissions``
         presets (the set is codex-version-dependent, so an older build may not
-        offer every one). Only valid for sessions stamped with the codex-native
+        offer every one) — or ``"bypass"``, Omnigent's full-bypass stance
+        (delivered through the Full Access row and additionally armed/disarmed
+        via the ``omnigent.codex_native.bypass_sandbox`` label so relaunches
+        keep it). Only valid for sessions stamped with the codex-native
         wrapper label. The runner applies it by driving Codex's ``/permissions``
         popup and confirms the switch echoed before returning, so a failure to
         reach the mode surfaces as an error. The confirmed mode is stored on the

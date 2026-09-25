@@ -1051,12 +1051,12 @@ export async function updateSession(
      */
     claudePermissionMode?: string;
     /**
-     * Codex-native approval mode to switch a RUNNING session to, one of
-     * `"ask-for-approval"`, `"approve-for-me"`, `"full-access"`, `"read-only"`
-     * (Codex's `/permissions` presets; the set is codex-version-dependent).
-     * Rejected by the server unless the session is codex-native, and the PATCH
-     * fails unless the runner confirms Codex applied it via its `/permissions`
-     * popup — so a resolved promise means the mode really changed.
+     * Codex-native approval mode to switch a RUNNING session to: one of
+     * Codex's `/permissions` presets, or `"bypass"` (delivered via the Full
+     * Access row and armed on the bypass label so relaunches keep it).
+     * Rejected unless the session is codex-native; the PATCH fails unless the
+     * runner confirms Codex applied it, so a resolved promise means the mode
+     * really changed.
      */
     codexApprovalMode?: string;
     costControlModeOverride?: "on" | "off" | null;

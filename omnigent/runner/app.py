@@ -6002,9 +6002,11 @@ def create_runner_app(
         # thread/settings/update (that RPC drives model/effort but no-ops for
         # approval). So drive the popup by keystroke into the codex tmux pane —
         # the same channel /compact uses — selecting the preset by its menu digit.
-        from omnigent.codex_approval_modes import codex_permission_preset
+        # Bypass has no popup row; it rides the Full Access row (same runtime
+        # settings), and the server persists the bypass label for relaunches.
+        from omnigent.codex_approval_modes import codex_permission_switch_delivery
 
-        preset = codex_permission_preset(mode)
+        preset = codex_permission_switch_delivery(mode)
         if preset is None:
             return JSONResponse(
                 status_code=400,
@@ -6061,7 +6063,7 @@ def create_runner_app(
                     ),
                 },
             )
-        return JSONResponse(status_code=200, content={"approval_mode": preset.value})
+        return JSONResponse(status_code=200, content={"approval_mode": mode})
 
     async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
         from omnigent.harnesses.codex_native.app_server import (

@@ -284,6 +284,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -2715,6 +2716,18 @@ async def _persist_external_codex_approval_mode_change(
             "external_codex_approval_mode_change data.approval_mode must be one of "
             f"{sorted(CODEX_NATIVE_PERMISSION_VALUES)}; got {raw_mode!r}",
             code=ErrorCode.INVALID_INPUT,
+        )
+    if conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
+        if raw_mode == "full-access":
+            # Full-access settings are what an armed bypass looks like in
+            # thread settings; don't downgrade the read-back label.
+            return
+        # Codex left the bypass stance: disarm the label, or the next
+        # relaunch would quietly re-arm the full bypass flag.
+        await asyncio.to_thread(
+            conversation_store.delete_label,
+            session_id,
+            CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         )
     if conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY) == raw_mode:
         return

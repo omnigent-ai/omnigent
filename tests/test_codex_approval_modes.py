@@ -5,10 +5,13 @@ from __future__ import annotations
 import pytest
 
 from omnigent.codex_approval_modes import (
+    CODEX_NATIVE_BYPASS_APPROVAL_LABEL,
+    CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
     CODEX_NATIVE_PERMISSION_PRESETS,
     CODEX_NATIVE_PERMISSION_VALUES,
     codex_permission_preset,
     codex_permission_preset_from_thread_settings,
+    codex_permission_switch_delivery,
 )
 
 # Real ``threadSettings`` payloads captured from codex-cli 0.146.0's
@@ -62,6 +65,31 @@ def test_lookup_unknown_is_none() -> None:
     """An unknown value resolves to None (rejected upstream)."""
     assert codex_permission_preset("bypass") is None
     assert codex_permission_preset("turbo") is None
+
+
+def test_bypass_value_is_not_a_popup_preset() -> None:
+    """Bypass stays outside the preset vocabulary the forwarder reads back."""
+    assert CODEX_NATIVE_BYPASS_APPROVAL_VALUE not in CODEX_NATIVE_PERMISSION_VALUES
+    assert CODEX_NATIVE_BYPASS_APPROVAL_LABEL == "Bypass approvals & sandbox"
+
+
+def test_switch_delivery_routes_bypass_through_full_access() -> None:
+    """A live bypass switch keys the Full Access row (same runtime settings)."""
+    delivery = codex_permission_switch_delivery(CODEX_NATIVE_BYPASS_APPROVAL_VALUE)
+    assert delivery is not None
+    assert delivery.value == "full-access"
+    assert delivery.needs_confirm is True
+
+
+@pytest.mark.parametrize("value", sorted(CODEX_NATIVE_PERMISSION_VALUES))
+def test_switch_delivery_keeps_presets_as_themselves(value: str) -> None:
+    """Every popup preset delivers through its own row."""
+    assert codex_permission_switch_delivery(value) is codex_permission_preset(value)
+
+
+def test_switch_delivery_unknown_is_none() -> None:
+    """An unknown value has no delivery row (rejected upstream)."""
+    assert codex_permission_switch_delivery("turbo") is None
 
 
 @pytest.mark.parametrize(
