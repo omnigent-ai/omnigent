@@ -12,8 +12,8 @@ new-session`` client command; tmux's client->server protocol caps a single
 command at ~16KB, so the launch exits rc=1 "command too long". The user sees
 a session that never gets its terminal: the header's Chat/Terminal switcher
 never appears, the session drops to ``status: failed``
-(``native_terminal_start_failed``), and the chat band shows the
-"Agent disconnected" pill.
+(``native_terminal_start_failed``), and the chat band shows an error pill
+instead of the terminal.
 
 The stock wrapper session (small prompt) boots fine in this exact harness -
 the whole native render-parity suite proves it - so instructions size is the
@@ -32,7 +32,6 @@ instructions still reach the CLI after a fix.
 from __future__ import annotations
 
 import contextlib
-import os
 import shutil
 import subprocess
 import time
@@ -157,8 +156,8 @@ def big_prompt_claude_session(
 ) -> Any:
     """A runner-bound claude-native session on a ~20KB-instructions agent.
 
-    Mirrors ``native_claude_mock_session``: mock anthropic provider config
-    when ``LLM_API_KEY`` is absent, real gateway when it is set.
+    Mirrors ``native_claude_mock_session``: a standalone run installs the mock
+    anthropic provider config; a workflow-owned runner is already configured.
 
     :param live_server: Spawned server fixture; its runner is reused.
     :param mock_llm_server_url: Session-scoped mock LLM server base URL.
@@ -167,7 +166,7 @@ def big_prompt_claude_session(
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    use_mock = not os.environ.get("LLM_API_KEY")
+    use_mock = not _server_state.get("workflow_owned")
     ctx: Any = (
         _temp_omnigent_mock_config(mock_llm_server_url, "claude")
         if use_mock
@@ -200,7 +199,7 @@ def test_big_instructions_session_boots_terminal(
     behavior: the tmux launch command carrying the instructions exceeds
     tmux's ~16KB per-command cap, the terminal never starts, the session
     flips to ``failed`` (``native_terminal_start_failed``), and the page
-    shows the "Agent disconnected" pill instead of a terminal.
+    shows an error pill instead of a terminal.
 
     :param page: Playwright page from the pytest-playwright fixture.
     :param big_prompt_claude_session: ``(base_url, session_id)``.
@@ -222,11 +221,14 @@ def test_big_instructions_session_boots_terminal(
         page.wait_for_timeout(int(_POLL_S * 1000))
 
     if failed_error is not None:
-        # Let the failure land on screen (the disconnected pill) so a video
-        # of this run ends on the user-visible outcome, then fail with the
-        # structured cause.
+        # Let the failure land on screen (the error pill) so a video of this
+        # run ends on the user-visible outcome, then fail with the structured
+        # cause.
+        failure_pill = page.locator(
+            '[data-testid="error-pill"], [data-testid="disconnected-indicator"]'
+        ).first
         with contextlib.suppress(AssertionError):
-            expect(page.get_by_test_id("disconnected-indicator")).to_be_visible(timeout=30_000)
+            expect(failure_pill).to_be_visible(timeout=30_000)
         page.wait_for_timeout(2_000)
         pytest.fail(
             f"claude-native session with {_INSTRUCTIONS_SIZE} chars of agent "
