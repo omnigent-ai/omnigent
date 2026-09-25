@@ -4665,26 +4665,30 @@ async def test_post_external_session_status_publishes_session_status(
     assert "response_id" not in published[0][1]
 
 
+@pytest.mark.parametrize(
+    ("harness", "expected_code"),
+    [
+        ("codex-native", "codex_reauth_required"),
+        ("opencode-native", "native_turn_error"),
+    ],
+)
 async def test_post_external_session_status_failed_surfaces_output_and_reauth(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    expected_code: str,
 ) -> None:
-    """
-    A ``failed`` edge with ``output`` surfaces a typed error on the stream (#1108).
-
-    A native forwarder (e.g. codex-native on an expired login) posts the
-    terminal failure reason as ``data.output`` and flags ``reauth_required``.
-    The handler must surface it as the ``session.status`` edge's ``error`` so a
-    *top-level* session sees the reason — not only the sub-agent parent path.
-    ``reauth_required`` selects the ``codex_reauth_required`` code.
-    """
+    """The reauth flag selects a Codex error code only for Codex sessions."""
     published: list[tuple[str, dict[str, Any]]] = []
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda session_id, event: published.append((session_id, event)),
     )
-    agent = await create_test_agent(client)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
     session = await _create_session(client, agent["id"])
 
     resp = await client.post(
@@ -4703,7 +4707,7 @@ async def test_post_external_session_status_failed_surfaces_output_and_reauth(
     assert published[0][1]["status"] == "failed"
     error = published[0][1]["error"]
     assert error is not None
-    assert error["code"] == "codex_reauth_required"
+    assert error["code"] == expected_code
     assert "401 Unauthorized" in error["message"]
 
 
@@ -5250,37 +5254,62 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     assert "selected model" in error["message"]
 
 
-async def test_post_external_session_status_failed_keeps_wire_output_and_codex_code(
+@pytest.mark.parametrize(
+    ("spec_harness", "harness_override", "expected_code"),
+    [
+        ("codex-native", None, "codex_turn_error"),
+        ("opencode-native", None, "native_turn_error"),
+        ("claude-native", None, "native_turn_error"),
+        ("pi-native", None, "native_turn_error"),
+        ("codex-native", "opencode-native", "native_turn_error"),
+        ("opencode-native", "codex-native", "codex_turn_error"),
+    ],
+)
+async def test_post_external_session_status_failed_keeps_wire_output_and_harness_code(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    spec_harness: str,
+    harness_override: str | None,
+    expected_code: str,
 ) -> None:
-    """
-    A forwarder-sent ``output`` stays verbatim under codex's error code.
-
-    The store-side enrichment must never clobber a detail the forwarder
-    attached itself, and a wire-carried detail keeps the ``codex_turn_error``
-    code existing clients already see.
-    """
+    """Wire output retains its detail and uses the session's resolved harness."""
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda session_id, event: published.append((session_id, event)),
     )
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": spec_harness}},
+    )
+    session_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "harness_override": harness_override},
+    )
+    assert session_resp.status_code == 201, session_resp.text
+    session = session_resp.json()
+    assert session["harness"] == (harness_override or spec_harness)
+    detail = "Model provider rejected the request."
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": "failed", "output": "You've hit your usage limit."},
+            "data": {"status": "failed", "output": detail},
         },
     )
     assert resp.status_code == 202, resp.text
     error = published[0][1]["error"]
     assert error is not None
-    assert error["code"] == "codex_turn_error"
-    assert error["message"] == "You've hit your usage limit."
+    assert error["code"] == expected_code
+    assert error["message"] == detail
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    snapshot_error = snapshot_resp.json()["last_task_error"]
+    assert snapshot_error is not None
+    assert snapshot_error["code"] == expected_code
+    assert snapshot_error["message"] == detail
 
 
 @pytest.mark.parametrize("wire_output", [False, True])

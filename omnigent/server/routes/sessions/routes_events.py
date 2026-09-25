@@ -189,6 +189,7 @@ from omnigent.server.routes._sessions.helpers import (
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
     _require_filesystem_attachment_harness,
+    _resolve_harness,
     _response_agent_name_from_store,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
@@ -1595,14 +1596,20 @@ def register_events_routes(
             output = data.get("output")
             status_error: ErrorDetail | None = None
             if status == "failed" and isinstance(output, str) and output.strip():
-                if data.get("reauth_required") is True:
+                harness = await asyncio.to_thread(
+                    _resolve_harness,
+                    conv,
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+                # Native forwarders share the output and reauth fields.
+                # Codex-specific codes require a resolved Codex session.
+                if harness == "codex-native" and data.get("reauth_required") is True:
                     error_code = "codex_reauth_required"
+                elif harness == "codex-native" and body.data.get("output"):
+                    error_code = "codex_turn_error"
                 else:
-                    # Store-enriched failures are harness-neutral; wire output
-                    # retains the Codex fallback unless a rate limit is known.
-                    error_code = (
-                        "codex_turn_error" if body.data.get("output") else "native_turn_error"
-                    )
+                    error_code = "native_turn_error"
                 status_error = ErrorDetail(
                     code=classify_native_turn_error(error_code, output),
                     message=output.strip(),
