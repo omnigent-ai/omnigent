@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sqlite3
 import sys
 import uuid
@@ -321,6 +322,41 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     bridge_config = json.loads((bridge_dir / "bridge.json").read_text())
     assert isinstance(bridge_config["token"], str)
     assert len(bridge_config["token"]) > 0
+
+
+def _wrapper_hook_path(wrapper: Path) -> Path:
+    """The hook script the wrapper ``exec``s (the path after the interpreter)."""
+    for line in reversed(wrapper.read_text().splitlines()):
+        if line.startswith("exec "):
+            return Path(shlex.split(line)[-1])
+    raise AssertionError(f"no exec line in wrapper:\n{wrapper.read_text()}")
+
+
+def test_write_policy_hook_config_wrapper_execs_existing_hook(tmp_path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    hermes_home = b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "session-123")
+
+    hook = _wrapper_hook_path(hermes_home / "omnigent-policy-hook.sh")
+    assert hook.is_file(), f"wrapper execs a non-existent hook: {hook}"
+    from omnigent.inner import hermes_policy_hook
+
+    assert hook == Path(hermes_policy_hook.__file__).resolve()
+
+
+def test_inject_relay_into_policy_hook_wrapper_execs_existing_hook(tmp_path: Path) -> None:
+    hermes_home = b.write_policy_hook_config(tmp_path, "http://ap", "conv_h")
+    assert b.inject_relay_into_policy_hook(
+        tmp_path,
+        relay_url="http://127.0.0.1:9999",
+        relay_token="relay-tok",
+        server_url="http://ap",
+        session_id="conv_h",
+    )
+
+    hook = _wrapper_hook_path(hermes_home / "omnigent-policy-hook.sh")
+    assert hook.is_file(), f"relay-rewritten wrapper execs a non-existent hook: {hook}"
 
 
 def test_write_policy_hook_config_copies_user_files(tmp_path, monkeypatch) -> None:

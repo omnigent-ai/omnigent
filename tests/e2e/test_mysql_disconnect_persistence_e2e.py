@@ -1,397 +1,369 @@
-"""E2E regression: a mid-transaction DB disconnect fails session persistence.
+"""End-to-end regression: a transient mid-transaction MySQL disconnect silently
+drops a session-persistence write.
 
-A server pointed at a remote database (the reported deployment is MySQL via
-``pymysql``) loses writes when the connection drops **mid-statement**:
-``(2006, "MySQL server has gone away")`` raised while SQLAlchemy rolls a
-transaction back, or ``(2013, 'Lost connection to MySQL server during query')``
-on the ``UPDATE conversations SET next_position=... WHERE ...`` write the
-conversation-item ``append`` path flushes.
+The bug lives in :func:`omnigent.db.utils.run_write_transaction`, which replays
+only CockroachDB serialization failures (40001) and MySQL deadlock victims
+(1213). A connection-loss error raised mid-transaction -- pymysql 2013 ("Lost
+connection to MySQL server during query") or 2006 ("MySQL server has gone
+away") -- is not retryable, so it re-raises and the write is lost. The reported
+signatures both come from a session append: the 2013 case on the
+``UPDATE conversations SET next_position=...`` write, the 2006 case as a broken
+pipe while the aborted transaction rolls back. Both escape the store as a
+SQLAlchemy ``OperationalError`` (a ``StatementError``), which the server's
+``_handle_statement_error`` maps to an HTTP 500 with a ``Database error:`` log
+-- the KPI signature this guards against.
 
-The dialect-agnostic product path both signatures share:
+This test drives the REAL ``SqlAlchemyConversationStore.append()`` against a
+REAL MySQL 8.0 server (matching the reported ``mysql+pymysql://`` deployment),
+fronting it with a TCP relay that drops the connection mid-statement on the
+reported ``UPDATE conversations`` write. On the buggy build the append re-raises
+the pymysql disconnect and the item never persists; the fix replays the write
+transaction so the append recovers and the item persists exactly once.
 
-1. ``omnigent.db.utils.run_write_transaction`` runs the write. If a transient
-   disconnect ``OperationalError`` re-raises without a replay, a write the
-   very next connection would have persisted is lost outright.
-2. The resulting ``sqlalchemy.exc.OperationalError`` is a ``StatementError``,
-   so ``omnigent.server.app._handle_statement_error`` catches it, logs
-   ``"Database error: (...OperationalError) ..."`` and returns HTTP 500
-   (``code=internal_error``, ``error_category=SERVER``, ``impact=BLOCKING``) --
-   the observed surface.
-
-**Environment fidelity.** The CI sandbox blocks the PyPI registry, the internal
-package proxy, and git, so ``pymysql`` cannot be installed and the server
-cannot open a real ``mysql+pymysql://`` connection here. Instead we drive the
-**identical, dialect-agnostic product code** against a genuine out-of-process
-remote database server -- the ``cloudflare_d1`` SQLite-over-HTTP dialect (a test
-dependency, the same one ``test_server_banner_db_url_redaction_e2e.py`` boots the
-server against) -- and drop its connection **mid-statement**. The D1 dialect
-turns a dropped connection into a DBAPI ``OperationalError`` (``"HTTP request
-failed: Server disconnected without sending a response"``), the faithful analog
-of "MySQL server has gone away". Unlike the MySQL dialect, whose
-``is_disconnect`` natively recognizes 2006/2013, the D1 dialect does not
-classify its dropped-connection error -- so each test engine installs a
-``handle_error`` listener (:func:`_make_disconnect_aware_engine`) that marks it
-as a disconnect, keeping the stand-in faithful to the reported transport.
-
-The assertions encode the CORRECT post-fix behavior, so the test FAILS on the
-buggy build and PASSES once a transient mid-transaction disconnect is recovered
-(connection-lost errors replayed the way CockroachDB serialization failures
-already are):
-
-* :func:`test_transient_mid_transaction_disconnect_is_recovered` -- the fail->pass
-  regression guard. A write whose connection drops once, then recovers, must
-  ultimately persist rather than raising an uncaught ``OperationalError``.
-* :func:`test_mid_transaction_disconnect_surfaces_as_500` -- documents the exact
-  reported surface: the disconnect ``OperationalError`` routed through the real
-  ``_handle_statement_error`` yields HTTP 500 and the ``"Database error: (...
-  OperationalError) ..."`` log line.
-
-Run::
-
-    .venv/bin/python -m pytest tests/e2e/test_mysql_disconnect_persistence_e2e.py -v
+The reported disconnects (failover, restart, a ``wait_timeout`` kill) are
+server-side events: MySQL tears the dead session down and releases its row
+locks, so the replay runs cleanly. Severing only the TCP path would leave the
+orphaned transaction holding the ``conversations`` row lock until InnoDB's
+lock-wait timeout, so a background reaper kills that idle transaction once the
+disconnect has fired -- mimicking the server-side teardown the real causes
+perform.
 """
 
 from __future__ import annotations
 
-import json
-import logging
+import contextlib
 import os
+import shutil
 import socket
-import sqlite3
+import struct
+import subprocess
+import tempfile
 import threading
-from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-import sqlalchemy as sa
-import sqlalchemy.exc as saexc
 
-# The stand-in transport: skip cleanly if the dialect (a test dependency) is
-# absent so the file never hard-fails on an unexpected environment.
-pytest.importorskip(
-    "sqlalchemy_cloudflare_d1",
-    reason="cloudflare_d1 dialect is the stand-in remote DB transport for this repro",
+pymysql = pytest.importorskip("pymysql")
+
+from sqlalchemy.exc import OperationalError  # noqa: E402
+
+from omnigent.entities import MessageData, NewConversationItem  # noqa: E402
+from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
+    SqlAlchemyConversationStore,
 )
 
-# D1 auto-commits; the dialect still emits these transaction-control keywords,
-# which the emulator must accept without touching the backing store.
-_TXN_KEYWORDS = {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"}
+
+def _find_mysqld() -> str | None:
+    for candidate in ("mysqld", "mariadbd"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    for path in ("/usr/sbin/mysqld", "/usr/sbin/mariadbd"):
+        if os.path.exists(path):
+            return path
+    return None
 
 
-class _DisconnectingD1Emulator:
-    """A cloudflare_d1 ``/raw`` REST server backed by a local SQLite file.
+def _free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port: int = sock.getsockname()[1]
+    sock.close()
+    return port
 
-    Executes each posted statement on one autocommit SQLite connection
-    (matching D1 semantics), but when ``arm(sql_substring)`` is set it drops
-    the socket abruptly -- without sending a response -- the moment it receives
-    a statement containing that substring. The D1 dialect surfaces that as a
-    DBAPI ``OperationalError``, the analog of a MySQL "server has gone away"
-    mid-statement.
+
+class _MySQLServer:
+    """A throwaway mysqld with a plaintext-auth ``omni`` user + ``omnigent`` DB.
+
+    Runs with ``--skip-ssl`` so the drop relay can match the plaintext query
+    bytes crossing the wire; TLS is a transport detail orthogonal to the bug.
+    The ``omni`` user is granted ``PROCESS`` so the reaper can see and kill the
+    transaction orphaned by the severed connection.
     """
 
-    def __init__(self, backing_db: Path) -> None:
-        self._backing = sqlite3.connect(
-            str(backing_db), isolation_level=None, check_same_thread=False
-        )
-        self._lock = threading.Lock()
-        self._trigger: str | None = None
-        self._one_shot = False
-        self.drops = 0
-        emulator = self
-
-        class _Handler(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # noqa: N802 (http.server API)
-                length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(length) or b"{}")
-                sql = body.get("sql", "")
-                params = body.get("params") or []
-                if emulator._should_drop(sql):
-                    emulator.drops += 1
-                    try:
-                        self.connection.shutdown(socket.SHUT_RDWR)
-                        self.connection.close()
-                    except OSError:
-                        pass
-                    return
-                head = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
-                try:
-                    with emulator._lock:
-                        if head in _TXN_KEYWORDS:
-                            columns: list[str] = []
-                            rows: list[list[object]] = []
-                        else:
-                            cur = emulator._backing.execute(sql, params)
-                            if cur.description:
-                                columns = [d[0] for d in cur.description]
-                                rows = [list(r) for r in cur.fetchall()]
-                            else:
-                                columns, rows = [], []
-                    payload = {
-                        "success": True,
-                        "result": [
-                            {
-                                "results": {"columns": columns, "rows": rows},
-                                "meta": {},
-                                "success": True,
-                            }
-                        ],
-                    }
-                    code = 200
-                except Exception as exc:  # noqa: BLE001 - mirror the D1 error envelope
-                    payload = {"success": False, "errors": [{"message": str(exc)}]}
-                    code = 400
-                data = json.dumps(payload).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def log_message(self, *args: object) -> None:  # quiet the test output
-                pass
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-        self.base_url = f"http://127.0.0.1:{self._server.server_address[1]}"
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-
-    def _should_drop(self, sql: str) -> bool:
-        if self._trigger is None or self._trigger not in sql:
-            return False
-        if self._one_shot:
-            # Disarm so the retry (post-fix) reaches a live server.
-            self._trigger = None
-        return True
-
-    def arm(self, sql_substring: str, *, one_shot: bool) -> None:
-        """Drop the connection on the next statement containing *sql_substring*."""
-        self._trigger = sql_substring
-        self._one_shot = one_shot
+    def __init__(self, mysqld: str) -> None:
+        self._mysqld = mysqld
+        self.datadir = tempfile.mkdtemp(prefix="omni-mysql-disconnect-")
+        self.port = _free_port()
+        self._log = os.path.join(self.datadir, "mysqld.log")
+        self._proc: subprocess.Popen[bytes] | None = None
 
     def start(self) -> None:
-        self._thread.start()
+        subprocess.run(
+            [
+                self._mysqld,
+                "--no-defaults",
+                f"--datadir={self.datadir}",
+                "--initialize-insecure",
+                f"--log-error={self._log}",
+            ],
+            check=True,
+        )
+        init_sql = os.path.join(self.datadir, "init.sql")
+        Path(init_sql).write_text(
+            "CREATE DATABASE IF NOT EXISTS omnigent CHARACTER SET utf8mb4;\n"
+            "CREATE USER IF NOT EXISTS 'omni'@'%' IDENTIFIED WITH "
+            "mysql_native_password BY 'omni';\n"
+            "GRANT ALL PRIVILEGES ON omnigent.* TO 'omni'@'%';\n"
+            "GRANT PROCESS ON *.* TO 'omni'@'%';\n"
+            "FLUSH PRIVILEGES;\n"
+        )
+        self._proc = subprocess.Popen(
+            [
+                self._mysqld,
+                "--no-defaults",
+                f"--datadir={self.datadir}",
+                f"--socket={os.path.join(self.datadir, 'mysqld.sock')}",
+                f"--port={self.port}",
+                "--bind-address=127.0.0.1",
+                "--skip-ssl",
+                "--skip-log-bin",
+                "--performance-schema=OFF",
+                "--innodb-buffer-pool-size=64M",
+                "--secure-file-priv=",
+                f"--init-file={init_sql}",
+                f"--log-error={self._log}",
+            ],
+        )
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            try:
+                probe = socket.create_connection(("127.0.0.1", self.port), timeout=1)
+                probe.close()
+                time.sleep(1.0)  # let --init-file finish creating the user/DB
+                return
+            except OSError:
+                time.sleep(0.3)
+        log = Path(self._log).read_text() if os.path.exists(self._log) else "(no log)"
+        raise RuntimeError(f"mysqld did not start:\n{log}")
 
     def stop(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-        self._backing.close()
+        if self._proc is not None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        shutil.rmtree(self.datadir, ignore_errors=True)
 
 
-@pytest.fixture()
-def d1_disconnect(tmp_path: Path) -> Iterator[_DisconnectingD1Emulator]:
-    """A running D1 emulator with a probe table, wired via ``CF_D1_BASE_URL``.
+class _DropRelay:
+    """TCP relay to MySQL that severs the connection on a trigger substring.
 
-    Restores the ambient proxy/``CF_D1_BASE_URL`` env on teardown so the
-    loopback emulator is reachable without an intervening corporate proxy.
+    ``arm(trigger)`` makes the relay RST-close both sides of the first
+    connection whose client->server bytes contain ``trigger`` (one-shot), so a
+    subsequent replay reconnects cleanly through the relay.
     """
-    backing = tmp_path / "d1-backing.db"
-    conn = sqlite3.connect(str(backing))
-    conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
-    conn.execute("INSERT INTO probe (id, n) VALUES (1, 0)")
-    conn.commit()
-    conn.close()
 
-    emulator = _DisconnectingD1Emulator(backing)
-    emulator.start()
+    def __init__(self, upstream_port: int) -> None:
+        self._upstream_port = upstream_port
+        self.listen_port = _free_port()
+        self._trigger: bytes | None = None
+        self.drops = 0
+        self._srv: socket.socket | None = None
+        self._stop = False
 
-    saved = {k: os.environ.get(k) for k in ("CF_D1_BASE_URL", "no_proxy", "NO_PROXY")}
-    os.environ["CF_D1_BASE_URL"] = emulator.base_url
-    os.environ["no_proxy"] = "127.0.0.1,localhost"
-    os.environ["NO_PROXY"] = "127.0.0.1,localhost"
-    try:
-        yield emulator
-    finally:
-        emulator.stop()
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    def arm(self, trigger: bytes) -> None:
+        self._trigger = trigger
+
+    def start(self) -> None:
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", self.listen_port))
+        self._srv.listen(16)
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self) -> None:
+        assert self._srv is not None
+        self._srv.settimeout(0.5)
+        while not self._stop:
+            try:
+                client, _ = self._srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+
+    @staticmethod
+    def _rst_close(sock: socket.socket) -> None:
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        with contextlib.suppress(OSError):
+            sock.close()
+
+    def _handle(self, client: socket.socket) -> None:
+        try:
+            upstream = socket.create_connection(("127.0.0.1", self._upstream_port))
+        except OSError:
+            self._rst_close(client)
+            return
+
+        def pump(src: socket.socket, dst: socket.socket, inspect: bool) -> None:
+            while not self._stop:
+                try:
+                    data = src.recv(65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                if inspect and self._trigger and self._trigger in data:
+                    self._trigger = None
+                    self.drops += 1
+                    self._rst_close(upstream)
+                    self._rst_close(client)
+                    return
+                try:
+                    dst.sendall(data)
+                except OSError:
+                    break
+            self._rst_close(src)
+            self._rst_close(dst)
+
+        threading.Thread(target=pump, args=(client, upstream, True), daemon=True).start()
+        threading.Thread(target=pump, args=(upstream, client, False), daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._srv is not None:
+            with contextlib.suppress(OSError):
+                self._srv.close()
 
 
-def _make_disconnect_aware_engine() -> sa.Engine:
-    """Create a stand-in engine whose disconnects are classified as such.
-
-    The D1 dialect does not implement ``is_disconnect`` for its dropped-
-    connection ``OperationalError``, so mark it via SQLAlchemy's public
-    ``handle_error`` hook -- the same classification the MySQL dialect
-    performs natively for 2006/2013 in the reported environment.
-    """
-    from sqlalchemy_cloudflare_d1.connection import (
-        OperationalError as D1OperationalError,
-    )
-
-    engine = sa.create_engine("cloudflare_d1://omni:pw@omnigentdb")
-
-    @sa.event.listens_for(engine, "handle_error")
-    def _mark_disconnect(ctx: sa.engine.ExceptionContext) -> None:
-        exc = ctx.original_exception
-        if isinstance(exc, D1OperationalError) and "HTTP request failed" in str(exc):
-            ctx.is_disconnect = True
-
-    return engine
-
-
-def _capture_disconnect_operational_error(
-    emulator: _DisconnectingD1Emulator,
-) -> saexc.OperationalError:
-    """Run a statement against the remote server as it drops the connection.
-
-    :returns: the genuine ``sqlalchemy.exc.OperationalError`` the disconnect
-        raised -- the same class and shape the reported pymysql 2006/2013
-        errors carry.
-    """
-    engine = _make_disconnect_aware_engine()
-    emulator.arm("SELECT n FROM probe", one_shot=False)
-    try:
-        with engine.connect() as conn:
-            conn.execute(sa.text("SELECT n FROM probe WHERE id = 1")).scalar_one()
-    except saexc.OperationalError as exc:
-        return exc
-    finally:
-        engine.dispose()
-    raise AssertionError("expected a mid-statement disconnect to raise OperationalError")
-
-
-def test_transient_mid_transaction_disconnect_is_recovered(
-    d1_disconnect: _DisconnectingD1Emulator,
+def _reap_orphaned_transaction(
+    host: str, port: int, drops: Callable[[], int], stop: threading.Event
 ) -> None:
-    """A transient mid-transaction disconnect must not lose the write.
+    """Model the server-side teardown a real transient disconnect performs.
 
-    Drives the REAL ``run_write_transaction`` against a remote database server
-    whose connection drops once (then recovers) during the write -- the
-    dialect-agnostic core of both reported disconnect signatures.
-
-    Post-fix contract (asserted here): the write is replayed against the
-    recovered connection and ultimately persists, exactly as CockroachDB
-    serialization failures are already replayed.
-
-    Buggy build: ``run_write_transaction`` runs the callback once, the
-    disconnect raises ``sqlalchemy.exc.OperationalError`` (a
-    ``StatementError``), and the loop re-raises it without a replay -- so
-    this test fails with that uncaught OperationalError, reproducing the
-    lost write.
+    A failover, restart, or ``wait_timeout`` kill terminates the dead session
+    and releases its row locks. Severing only the TCP path leaves the orphaned
+    transaction holding the ``conversations`` row lock, so once the disconnect
+    has fired, kill the idle in-flight transaction (``RUNNING`` with no active
+    query) so the replay is not blocked on a lock the real causes would have
+    released. Connects straight to the server, bypassing the relay.
     """
-    from omnigent.db.utils import (
-        is_cockroachdb,
-        make_named_managed_session_maker,
-        run_write_transaction,
+    while not stop.is_set() and drops() == 0:
+        time.sleep(0.05)
+    killed = False
+    while not killed and not stop.wait(0.1):
+        try:
+            conn = pymysql.connect(
+                host=host,
+                port=port,
+                user="omni",
+                password="omni",
+                database="omnigent",
+                connect_timeout=5,
+            )
+        except Exception:
+            continue
+        try:
+            conn.autocommit(True)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT trx_mysql_thread_id FROM information_schema.innodb_trx "
+                    "WHERE trx_state = 'RUNNING' AND trx_query IS NULL"
+                )
+                for (thread_id,) in cur.fetchall():
+                    try:
+                        cur.execute(f"KILL {int(thread_id)}")
+                        killed = True
+                    except Exception:
+                        pass
+        finally:
+            conn.close()
+
+
+@pytest.fixture(scope="module")
+def mysql_server() -> Iterator[_MySQLServer]:
+    mysqld = _find_mysqld()
+    if mysqld is None:
+        pytest.skip("mysqld/mariadbd not available")
+    server = _MySQLServer(mysqld)
+    try:
+        server.start()
+    except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
+        server.stop()
+        pytest.skip(f"could not start a local mysqld: {exc}")
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+@pytest.fixture
+def store_and_relay(
+    mysql_server: _MySQLServer,
+) -> Iterator[tuple[SqlAlchemyConversationStore, _DropRelay]]:
+    relay = _DropRelay(mysql_server.port)
+    relay.start()
+    uri = f"mysql+pymysql://omni:omni@127.0.0.1:{relay.listen_port}/omnigent"
+    store = SqlAlchemyConversationStore(uri)
+    try:
+        yield store, relay
+    finally:
+        relay.stop()
+
+
+def _user_message(text: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="message",
+        response_id="resp_disconnect_repro",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
     )
 
-    engine = _make_disconnect_aware_engine()
-    # Guard the premise: this is NOT the one dialect whose serialization
-    # failures were already replayed, so any recovery must come from a real
-    # connection-loss fix.
-    assert not is_cockroachdb(engine.dialect.name)
-    maker = make_named_managed_session_maker(engine, query_name_prefix="disconnect_probe")
 
-    attempts = {"n": 0}
-
-    def _bump(session: sa.orm.Session) -> int:
-        attempts["n"] += 1
-        session.execute(sa.text("UPDATE probe SET n = n + 1 WHERE id = 1"))
-        return session.execute(sa.text("SELECT n FROM probe WHERE id = 1")).scalar_one()
-
-    # Drop the connection mid-query on the UPDATE itself (the reported 2013
-    # shape), then serve normally so a replay can succeed. The emulator
-    # autocommits each statement, so dropping before the UPDATE executes is
-    # the faithful equivalent of the aborted server-side transaction: the
-    # first attempt persists nothing, and a correct replay applies the write
-    # exactly once.
-    d1_disconnect.arm("UPDATE probe", one_shot=True)
-
-    try:
-        result = run_write_transaction(maker, "bump_probe", _bump)
-    except saexc.OperationalError as exc:
-        # Reproduced: the transient disconnect was never recovered. Surface the
-        # observed class/shape so the failure reads as the bug, not noise.
-        assert isinstance(exc, saexc.StatementError)
-        orig = type(exc.orig).__module__ + "." + type(exc.orig).__name__ if exc.orig else None
-        pytest.fail(
-            "run_write_transaction did NOT recover a transient mid-transaction "
-            "disconnect: a connection that dropped once, then recovered, lost "
-            f"the write. Raised {type(exc).__name__} "
-            f"(orig={orig}) after {attempts['n']} attempt(s), drops="
-            f"{d1_disconnect.drops}. First line: {str(exc).splitlines()[0]}"
-        )
-    finally:
-        engine.dispose()
-
-    assert result == 1, f"write should persist once after recovery, got {result!r}"
-    assert d1_disconnect.drops == 1, "the disconnect must have actually fired"
-
-
-def test_mid_transaction_disconnect_surfaces_as_500(
-    d1_disconnect: _DisconnectingD1Emulator,
-    tmp_path: Path,
+def test_transient_mysql_disconnect_persists_session_write(
+    store_and_relay: tuple[SqlAlchemyConversationStore, _DropRelay],
+    mysql_server: _MySQLServer,
 ) -> None:
-    """The disconnect ``OperationalError`` maps to the reported 500 + log line.
+    """A transient disconnect during the append write must not lose the item.
 
-    Documents the exact user-observable surface: a mid-statement disconnect
-    ``OperationalError`` routed through the REAL
-    ``omnigent.server.app._handle_statement_error`` (registered by
-    ``create_app``) returns HTTP 500 and logs ``"Database error: (...
-    OperationalError) ..."``.
+    Fails on the buggy build: ``run_write_transaction`` re-raises the pymysql
+    disconnect (2013/2006) without replay, so the second message never persists
+    and the error escapes as the HTTP 500 / ``Database error:`` KPI signature.
     """
-    from fastapi.testclient import TestClient
+    store, relay = store_and_relay
+    conv = store.create_conversation()
 
-    from omnigent.runtime.agent_cache import AgentCache
-    from omnigent.server.app import create_app
-    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-    from omnigent.stores.artifact_store.local import LocalArtifactStore
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        SqlAlchemyConversationStore,
+    store.append(conv.id, [_user_message("first message")])
+
+    # Sever the connection mid-statement on the reported next_position write,
+    # and reap the server-side transaction it orphans (as a real failover /
+    # wait_timeout kill would) so the replay is not blocked on a stale lock.
+    relay.arm(b"UPDATE conversations")
+    stop = threading.Event()
+    reaper = threading.Thread(
+        target=_reap_orphaned_transaction,
+        args=("127.0.0.1", mysql_server.port, lambda: relay.drops, stop),
+        daemon=True,
     )
-    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    reaper.start()
 
-    disconnect_error = _capture_disconnect_operational_error(d1_disconnect)
-    assert isinstance(disconnect_error, saexc.StatementError)
-
-    # Build the real app (SQLite-backed stores) so its production
-    # StatementError handler is the one under test.
-    del os.environ["CF_D1_BASE_URL"]  # app stores use sqlite, not the emulator
-    db_uri = f"sqlite:///{tmp_path}/app.db"
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    app = create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
-    )
-
-    async def _probe() -> None:
-        # Re-raise the genuine disconnect error captured above, as a real
-        # request path would when its DB write dies mid-statement.
-        raise disconnect_error
-
-    app.add_api_route("/__db_disconnect_probe", _probe, methods=["GET"])
-    # The SPA catch-all is registered last; move the probe ahead of it.
-    app.router.routes.insert(0, app.router.routes.pop())
-
-    # Capture directly on the app logger: it does not propagate to root, so
-    # caplog's root handler never sees the ``_handle_statement_error`` record.
-    captured_messages: list[str] = []
-
-    class _Capture(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            captured_messages.append(record.getMessage())
-
-    app_logger = logging.getLogger("omnigent.server.app")
-    handler = _Capture(level=logging.ERROR)
-    app_logger.addHandler(handler)
+    disconnect: OperationalError | None = None
     try:
-        client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/__db_disconnect_probe")
+        store.append(conv.id, [_user_message("second message")])
+    except OperationalError as exc:
+        disconnect = exc
     finally:
-        app_logger.removeHandler(handler)
+        stop.set()
+        reaper.join(timeout=5)
 
-    assert resp.status_code == 500, f"expected the reported 500, got {resp.status_code}"
-    assert resp.json() == {
-        "error": {"code": "internal_error", "message": "An internal error occurred."}
-    }
-    db_error_logs = [
-        message for message in captured_messages if message.startswith("Database error:")
+    assert relay.drops == 1, "relay did not sever the append's write"
+
+    texts = [
+        item.data.content[0].get("text")
+        for item in store.list_items(conv.id, limit=1000).data
+        if getattr(item.data, "content", None)
     ]
-    assert db_error_logs, "expected the _handle_statement_error 'Database error:' log line"
-    assert "OperationalError" in db_error_logs[0]
+    assert disconnect is None, (
+        "append() re-raised a transient MySQL disconnect instead of replaying "
+        f"the write transaction: {disconnect!r}. Session persistence lost the "
+        f"user message; only {texts!r} survived."
+    )
+    assert texts.count("second message") == 1, (
+        f"the user message did not persist exactly once after a transient "
+        f"disconnect; conversation items were {texts!r}."
+    )

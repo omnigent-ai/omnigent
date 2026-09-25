@@ -7,6 +7,7 @@ export interface SessionDraft extends ComposerDraft {
 
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();
+const retiredDraftIds = new Set<string>();
 
 function loadDraftsFromStorage(): Map<string, SessionDraft> {
   if (typeof window === "undefined") return new Map();
@@ -62,6 +63,7 @@ export function getSessionDraft(conversationId: string): SessionDraft | undefine
 }
 
 export function setSessionDraft(conversationId: string, draft: SessionDraft): void {
+  if (retiredDraftIds.has(conversationId)) return;
   if (draft.text === "" && draft.files.length === 0) {
     sessionDrafts.delete(conversationId);
   } else {
@@ -69,6 +71,48 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   }
   saveDraftsToStorage();
   notifyListeners();
+}
+
+/** Remove a draft and ignore any late cleanup write for the retired id. */
+export function retireSessionDraft(conversationId: string): SessionDraft | undefined {
+  const draft = sessionDrafts.get(conversationId);
+  retiredDraftIds.add(conversationId);
+  if (draft === undefined) return undefined;
+  sessionDrafts.delete(conversationId);
+  saveDraftsToStorage();
+  notifyListeners();
+  return draft;
+}
+
+/** Merge a failed temporary session's unsent input back into its source draft. */
+export function recoverFailedSessionDraft<T extends { message: string; files: File[] }>(
+  originalDraft: T,
+  temporaryConversationId?: string,
+): T {
+  if (temporaryConversationId === undefined) return originalDraft;
+  const temporaryDraft = retireSessionDraft(temporaryConversationId);
+  if (temporaryDraft === undefined) return originalDraft;
+  const message = [originalDraft.message, temporaryDraft.text]
+    .filter((part) => part.trim() !== "")
+    .join("\n\n");
+  return {
+    ...originalDraft,
+    message,
+    files: [...originalDraft.files, ...temporaryDraft.files],
+  };
+}
+
+/** Move an unsent draft when a temporary conversation receives its real id. */
+export function promoteSessionDraft(
+  temporaryConversationId: string,
+  conversationId: string,
+): SessionDraft | undefined {
+  const draft = retireSessionDraft(temporaryConversationId);
+  if (draft === undefined) return undefined;
+  sessionDrafts.set(conversationId, draft);
+  saveDraftsToStorage();
+  notifyListeners();
+  return draft;
 }
 
 export function hasSessionDraft(conversationId: string): boolean {
@@ -87,6 +131,7 @@ export function useHasSessionDraft(conversationId: string): boolean {
 /** Clear all drafts, primarily for logout/reset flows and isolated tests. */
 export function clearSessionDrafts(): void {
   sessionDrafts.clear();
+  retiredDraftIds.clear();
   saveDraftsToStorage();
   notifyListeners();
 }

@@ -63,7 +63,6 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     token_bound_runner_id,
 )
-from omnigent.server.oidc import mint_session_cookie
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -78,7 +77,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # server subprocess so (a) the accounts cookie we mint for the owner validates
 # server-side and (b) the JWT the mint endpoint signs validates the same way.
 _COOKIE_SECRET_HEX = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
-_OWNER = "alice@example.com"
+_OWNER = "alice"
+_OWNER_PASSWORD = "e2e-owner-password-1234"
 _BINDING_TOKEN = "e2e-managed-sandbox-binding-token"
 _SERVER_HEALTH_TIMEOUT_S = 40.0
 
@@ -135,6 +135,13 @@ def accounts_server(tmp_path: Path) -> Iterator[tuple[str, str]]:
     env["OMNIGENT_AUTH_PROVIDER"] = "accounts"
     env["OMNIGENT_ACCOUNTS_COOKIE_SECRET"] = _COOKIE_SECRET_HEX
     env["OMNIGENT_ACCOUNTS_BASE_URL"] = base_url
+    env["OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME"] = _OWNER
+    env["OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD"] = _OWNER_PASSWORD
+    env["OMNIGENT_ACCOUNTS_AUTO_OPEN"] = "0"
+    env["OMNIGENT_ADMIN_CREDENTIALS_PATH"] = str(tmp_path / "admin-credentials")
+    env["OMNIGENT_CONFIG_HOME"] = str(tmp_path / "config")
+    env["OMNIGENT_DATA_DIR"] = str(tmp_path / "data")
+    env["HOME"] = str(tmp_path)
     # Force the accounts branch of the auth-source switch (an ambient OIDC
     # issuer in the environment would otherwise select oidc mode).
     env.pop("OMNIGENT_OIDC_ISSUER", None)
@@ -173,22 +180,28 @@ def accounts_server(tmp_path: Path) -> Iterator[tuple[str, str]]:
         log_handle.close()
 
 
+def _login_owner(base_url: str) -> str:
+    response = httpx.post(
+        f"{base_url}/auth/login",
+        json={"username": _OWNER, "password": _OWNER_PASSWORD},
+        timeout=30,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["token"]
+
+
 def _seed_owned_session_with_managed_runner(base_url: str, db_uri: str) -> str:
     """Create Alice's session and bind the managed runner id to it.
 
-    Alice's identity comes from a directly-minted accounts cookie signed with
-    the server's shared secret — the same JWT the password login flow issues;
-    only the password dance is skipped. The session-create, agent registration,
-    and owner grant are all real. The runner-id bind is what the managed-launch
-    path does at spawn time via ``replace_runner_id``; WAL journaling + a 20s
-    busy_timeout make this cross-process write safe against the running server,
-    which then resolves runner_id -> owner from this row.
+    Alice logs in through the real accounts endpoint. Session creation and
+    owner grants use HTTP; the saved host and runner binding model a managed
+    launch without provisioning an external sandbox.
 
     :param base_url: Live server base URL.
     :param db_uri: SQLite URI of the server's database.
     :returns: The created session id.
     """
-    owner_cookie = mint_session_cookie(_OWNER, bytes.fromhex(_COOKIE_SECRET_HEX), 8, "accounts")
+    owner_cookie = _login_owner(base_url)
     bundle = build_agent_bundle(name="e2e-managed-runner-agent")
     with httpx.Client(base_url=base_url, timeout=30.0) as http:
         create = http.post(
@@ -204,7 +217,13 @@ def _seed_owned_session_with_managed_runner(base_url: str, db_uri: str) -> str:
     session_id = create.json()["session_id"]
 
     runner_id = token_bound_runner_id(_BINDING_TOKEN)
-    SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, runner_id)
+    from omnigent.stores.host_store import HostStore
+
+    host_id = "fc07bf2e7b2943ad9960f771169e83cc"
+    HostStore(db_uri).upsert_on_connect(host_id, "managed-test-host", _OWNER)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.set_host_id(session_id, host_id, workspace="/tmp/e2e-workspace")
+    conversations.replace_runner_id(session_id, runner_id)
     return session_id
 
 
@@ -416,9 +435,7 @@ def test_managed_runner_survives_mint_403_after_token_expiry(
         # the delegated-mint marker, and everything it sends goes through the
         # Apps edge. The machine also holds a stored `omnigent login` token —
         # the recovery credential the pre-fix code never consulted.
-        owner_cookie = mint_session_cookie(
-            _OWNER, bytes.fromhex(_COOKIE_SECRET_HEX), 8, "accounts"
-        )
+        owner_cookie = _login_owner(base_url)
         monkeypatch.setenv("RUNNER_SERVER_URL", proxy_url)
         monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, _BINDING_TOKEN)
         monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, owner_cookie)

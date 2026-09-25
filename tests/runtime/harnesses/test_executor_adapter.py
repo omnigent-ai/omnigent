@@ -409,6 +409,60 @@ async def test_executor_error_terminates_with_response_failed(
     assert "mock error" in error_detail["message"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preserve_session", [False, True])
+async def test_executor_error_preserves_only_explicitly_idle_sessions(
+    preserve_session: bool,
+) -> None:
+    """Ordinary errors still tear down; pre-prompt failures can retain an idle executor."""
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor, TextChunk
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    error = ExecutorError(message="model unavailable", retryable=True)
+    if preserve_session:
+        error.preserve_session = True
+        executor.enqueue_events([error])
+    else:
+        executor.enqueue_events([TextChunk(text="partial response"), error])
+    executor.interrupt_session = AsyncMock(return_value=True)
+    executor.close_session = AsyncMock()
+    executor.close = AsyncMock()
+    factory = Mock(return_value=executor)
+    adapter = ExecutorAdapter(executor_factory=factory)
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    ctx = TurnContext(
+        response_id="resp_failed", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        await adapter.run_turn(request, ctx)
+
+    if preserve_session:
+        assert adapter._executor is executor
+        assert adapter._abandoned_executor_cleanup is None
+        executor.interrupt_session.assert_not_awaited()
+        executor.close.assert_not_awaited()
+        executor.enqueue_response("retried")
+        retry_ctx = TurnContext(
+            response_id="resp_retry", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        await adapter.run_turn(request, retry_ctx)
+        factory.assert_called_once()
+    else:
+        assert adapter._executor is None
+        assert adapter._abandoned_executor_cleanup is not None
+        await adapter._abandoned_executor_cleanup
+        executor.interrupt_session.assert_awaited_once()
+        executor.close_session.assert_awaited_once()
+        executor.close.assert_awaited_once()
+
+
 async def test_executor_error_usage_reaches_response_failed(
     use_error_with_usage: None,
     manager: HarnessProcessManager,

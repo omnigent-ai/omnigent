@@ -6,11 +6,16 @@ but two Claude Code surfaces accept only the family *aliases*:
 * the ``Agent`` / ``Task`` tool's ``model`` parameter — a closed enum
   (``sonnet``, ``opus``, ``haiku``, ``fable``), so a catalog id fails
   schema validation and the spawn dies before it starts;
-* the ``/model`` slash command — an alias (or the custom slot's exact id)
-  resolves offline with no validation; ANY other value, catalog id or
-  canonical vendor id alike, is accepted only if a live one-token request
-  to the configured endpoint succeeds, so it depends on the gateway
-  answering mid-turn and fails as a network error otherwise.
+* the ``/model`` slash command — an alias, the custom slot's exact id, or
+  any id the session's own picker lists resolves offline with no
+  validation; ANY other value, catalog id or canonical vendor id alike, is
+  accepted only if a live one-token request to the configured endpoint
+  succeeds, so it depends on the gateway answering mid-turn and fails as a
+  network error otherwise.
+
+A gateway that manages the picker names its rows by the id it serves
+(``system.ai.glm-5-3``), family or not, and no alias spells those — so a
+session's picker values are part of its vocabulary alongside the pinning.
 
 Claude Code resolves each alias to a concrete id via the workspace's
 ``ANTHROPIC_DEFAULT_*_MODEL`` env (set by omnigent's launch config), so
@@ -167,6 +172,58 @@ def model_vocabulary_env(options: Iterable[Mapping[str, Any]]) -> dict[str, str]
     return env
 
 
+def picker_command_values(options: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Read the ``/model`` spellings a session's picker rows accept verbatim.
+
+    A picker row's id IS the value the CLI's own picker sets, so the rows
+    are this session's vocabulary read back out — including the ids a
+    gateway-managed picker lists for models of no Claude family, which no
+    alias and no pin spells.
+
+    :param options: Picker rows, e.g. ``[{"id": "system.ai.glm-5-3"}]``.
+    :returns: The row ids in picker order, deduplicated, without the
+        picker's own ``default`` choice (a launch with no model, not an
+        id).
+    """
+    values: list[str] = []
+    for option in options:
+        if not isinstance(option, Mapping):
+            continue
+        value = option.get("id")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        value = value.strip()
+        if value.lower() == "default" or value in values:
+            continue
+        values.append(value)
+    return values
+
+
+def picker_value_for_model(model: str, values: Iterable[str]) -> str | None:
+    """Which of a session's picker values spells *model*.
+
+    Prefix-folded first, so a ``[1m]`` row and its plain sibling stay
+    distinct models; only then marker-blind, so a routed id spelled
+    without the marker still finds the row that serves it.
+
+    :param model: Model id from a routing decision or a picker pick.
+    :param values: The session's picker values (:func:`picker_command_values`).
+    :returns: The picker's own spelling, or ``None`` when no row spells it.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return None
+    candidates = [value for value in values if isinstance(value, str) and value.strip()]
+    folded = prefix_folded_model_id(model)
+    for value in candidates:
+        if prefix_folded_model_id(value) == folded:
+            return value
+    normalized = normalized_model_id(model)
+    for value in candidates:
+        if normalized_model_id(value) == normalized:
+            return value
+    return None
+
+
 def claude_model_alias(
     model: str,
     env: Mapping[str, str] | None = None,
@@ -222,23 +279,32 @@ def claude_model_alias(
 def claude_model_command_arg(
     model: str,
     env: Mapping[str, str] | None = None,
+    *,
+    picker_values: Iterable[str] = (),
 ) -> str | None:
     """Translate a model id into a ``/model`` argument.
 
-    Same alias vocabulary as :func:`claude_model_alias`, except the extra
-    picker slot: ``/model`` takes that exact id, so a routed model pinned
-    there is applied precisely instead of stepping down to its family
-    alias.
+    The session's own picker values come first — they are the CLI's
+    enumeration of what ``/model`` takes, and the only vocabulary that
+    spells a managed model of no Claude family. Otherwise the alias
+    vocabulary of :func:`claude_model_alias`, plus the extra picker slot:
+    ``/model`` takes that exact id, so a routed model pinned there is
+    applied precisely instead of stepping down to its family alias.
 
     :param model: Model id from a routing decision, or an alias already.
     :param env: Environment mapping holding the session's pinning.
         ``None`` reads :data:`os.environ`.
+    :param picker_values: This session's picker values, when known, e.g.
+        ``("system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3")``.
     :returns: The ``/model`` argument, or ``None`` when the id maps to
         nothing the command accepts (the caller must skip the switch —
         an unaccepted value silently keeps the current model).
     """
     if not isinstance(model, str) or not model.strip():
         return None
+    picked = picker_value_for_model(model, picker_values)
+    if picked is not None:
+        return picked
     environ = os.environ if env is None else env
     custom = environ.get(CUSTOM_MODEL_OPTION_ENV_VAR, "").strip()
     if custom and normalized_model_id(custom) == normalized_model_id(model):

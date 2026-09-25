@@ -1053,10 +1053,11 @@ def run_write_transaction(
 ) -> _T:
     """Run a named managed transaction, replaying transient failures.
 
-    Two kinds of failure are replayed with bounded, jittered backoff:
-    CockroachDB serialization failures (SQLSTATE 40001) and statement-phase
-    connection losses on any dialect (the dialect invalidated the connection,
-    e.g. MySQL "server has gone away", so the replay runs on a fresh one).
+    Three kinds of failure are replayed with bounded, jittered backoff:
+    CockroachDB serialization failures (SQLSTATE 40001), MySQL deadlock
+    victims (error 1213), and statement-phase connection losses on any
+    dialect (the dialect invalidated the connection, e.g. MySQL "server has
+    gone away", so the replay runs on a fresh one).
 
     The callback must contain database work only. Callers must perform cache
     invalidation and external side effects after this function returns. The
@@ -1065,7 +1066,7 @@ def run_write_transaction(
     """
     if max_retries < 0:
         raise ValueError("max_retries must be >= 0")
-    retryable_serialization = is_cockroachdb(session_maker.engine.dialect.name)
+    dialect = session_maker.engine.dialect.name
     qualified_name = f"{session_maker.query_name_prefix}.{operation_name}"
 
     for attempt in range(max_retries + 1):
@@ -1075,8 +1076,10 @@ def run_write_transaction(
         except DBAPIError as exc:
             if _is_transient_disconnect(exc):
                 retry_reason = "connection loss"
-            elif retryable_serialization and _is_serialization_failure(exc):
+            elif is_cockroachdb(dialect) and _is_serialization_failure(exc):
                 retry_reason = "serialization failure"
+            elif dialect == "mysql" and getattr(exc.orig, "args", ())[:1] == (1213,):
+                retry_reason = "deadlock"
             else:
                 raise
             if attempt == max_retries:

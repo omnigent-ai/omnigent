@@ -10,6 +10,7 @@ import { CheckIcon, CopyIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 interface CopyPathButtonProps {
@@ -80,12 +81,13 @@ export function CopyPathButton({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon-sm"
           aria-label={`${label}: ${filename}`}
           className={cn(
-            "shrink-0 cursor-pointer rounded p-0.5 transition-opacity",
-            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+            "transition-opacity",
             copyError
               ? "text-destructive opacity-100"
               : copied
@@ -100,8 +102,8 @@ export function CopyPathButton({
           onClick={handleClick}
           data-testid="copy-path-button"
         >
-          {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
-        </button>
+          {copied ? <CheckIcon /> : <CopyIcon />}
+        </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">
         {copyError ? "Copy failed" : copied ? "Copied" : label}

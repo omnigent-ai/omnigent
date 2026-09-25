@@ -44,6 +44,54 @@ describe("isCommandPaletteHotkey", () => {
 });
 
 describe("useCommandPaletteHotkey", () => {
+  it("opens session search with Cmd+Alt+S using the physical key", () => {
+    const onToggle = vi.fn();
+    const onSearch = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle, true, true, onSearch));
+    expect(press({ key: "ß", code: "KeyS", metaKey: true, altKey: true }).defaultPrevented).toBe(
+      true,
+    );
+    expect(onSearch).toHaveBeenCalledOnce();
+    expect(onToggle).not.toHaveBeenCalled();
+    press({ code: "KeyS", metaKey: true, altKey: true, shiftKey: true });
+    press({ code: "KeyS", metaKey: true, altKey: true, repeat: true });
+    press({ code: "KeyS", ctrlKey: true, altKey: true });
+    expect(press({ key: "s", code: "KeyS", metaKey: true }).defaultPrevented).toBe(false);
+    expect(onSearch).toHaveBeenCalledOnce();
+  });
+
+  it("uses Ctrl+Alt+S on Windows/Linux but yields to terminal shortcuts", () => {
+    const onSearch = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(vi.fn(), true, false, onSearch));
+    press({ code: "KeyS", ctrlKey: true, altKey: true });
+    expect(onSearch).toHaveBeenCalledOnce();
+    document.body.innerHTML = '<div class="xterm"><textarea></textarea></div>';
+    document.querySelector("textarea")!.focus();
+    expect(press({ code: "KeyS", ctrlKey: true, altKey: true }).defaultPrevented).toBe(false);
+    expect(onSearch).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])("leaves Print and Open untouched (isMac=%s)", (isMac) => {
+    const onToggle = vi.fn();
+    const onSearch = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle, true, isMac, onSearch));
+    for (const key of ["p", "P", "o", "O"]) {
+      expect(press({ key, metaKey: isMac, ctrlKey: !isMac }).defaultPrevented).toBe(false);
+    }
+    expect(onToggle).not.toHaveBeenCalled();
+    expect(onSearch).not.toHaveBeenCalled();
+  });
+
+  it("does not interpret AltGr typing as session search", () => {
+    const onSearch = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(vi.fn(), true, false, onSearch));
+    const keydown = event({ code: "KeyS", ctrlKey: true, altKey: true });
+    vi.spyOn(keydown, "getModifierState").mockImplementation((modifier) => modifier === "AltGraph");
+    window.dispatchEvent(keydown);
+    expect(keydown.defaultPrevented).toBe(false);
+    expect(onSearch).not.toHaveBeenCalled();
+  });
+
   it("toggles on Cmd+K and prevents the browser default", () => {
     const onToggle = vi.fn();
     renderHook(() => useCommandPaletteHotkey(onToggle, true, true));

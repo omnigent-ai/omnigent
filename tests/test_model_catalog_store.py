@@ -93,13 +93,15 @@ async def test_ensure_catalog_fresh_hit_never_probes() -> None:
     assert probes == []
 
 
-async def test_ensure_catalog_stale_hit_serves_now_and_refreshes_in_background() -> None:
+@pytest.mark.parametrize("refreshed", [[{"id": "sonnet", "model": "claude-sonnet-6"}], []])
+async def test_ensure_catalog_stale_hit_serves_now_and_refreshes_in_background(
+    refreshed: list[dict[str, object]],
+) -> None:
     """
     A stale entry still answers instantly; the re-probe converges the store.
     """
     store.write_catalog("claude-native", "abc123", _ROWS)
     _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
-    refreshed = [{"id": "sonnet", "model": "claude-sonnet-6", "isDefault": True}]
     probes: list[int] = []
 
     async def _probe() -> list[dict[str, object]]:
@@ -134,13 +136,36 @@ async def test_ensure_catalog_stale_refresh_failure_keeps_serving() -> None:
     assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
 
 
-async def test_reprobe_catalog_joins_the_background_probe_and_persists() -> None:
+async def test_shutdown_clears_a_refresh_cancelled_before_it_starts() -> None:
+    """Even a probe cancelled before entering its finally block leaves no task."""
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
+    probes: list[int] = []
+
+    async def _probe() -> list[dict[str, object]]:
+        probes.append(1)
+        return [{"id": "new"}]
+
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
+    task = store._inflight[("claude-native", "abc123")]
+    await store.shutdown_catalog_probes()
+
+    assert task.cancelled()
+    assert probes == []
+    assert not store._inflight
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+    assert await store.reprobe_catalog("claude-native", "abc123", _probe) == [{"id": "new"}]
+
+
+@pytest.mark.parametrize("refreshed", [[{"id": "haiku", "model": "claude-haiku-4-5"}], []])
+async def test_reprobe_catalog_joins_the_background_probe_and_persists(
+    refreshed: list[dict[str, object]],
+) -> None:
     """
     An awaited refresh reuses the stale hit's in-flight probe and returns its rows.
     """
     store.write_catalog("claude-native", "abc123", _ROWS)
     _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
-    refreshed = [{"id": "haiku", "model": "claude-haiku-4-5", "isDefault": True}]
     probes: list[int] = []
 
     async def _probe() -> list[dict[str, object]]:
@@ -152,6 +177,19 @@ async def test_reprobe_catalog_joins_the_background_probe_and_persists() -> None
     assert probes == [1], "the awaited refresh must join the probe already in flight"
     assert store.read_catalog("claude-native", "abc123") == refreshed
     assert store.catalog_is_stale("claude-native", "abc123") is False
+
+
+async def test_ensure_catalog_caches_a_successful_empty_probe() -> None:
+    probes: list[int] = []
+
+    async def _probe() -> list[dict[str, object]]:
+        probes.append(1)
+        return []
+
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == []
+    assert store.read_catalog("claude-native", "abc123") == []
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == []
+    assert probes == [1]
 
 
 async def test_reprobe_catalog_failure_returns_none_and_keeps_serving() -> None:

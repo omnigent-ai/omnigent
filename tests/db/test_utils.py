@@ -126,8 +126,10 @@ def test_cockroachdb_engine_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["pool_timeout"] == 10.0
 
 
-def test_run_write_transaction_retries_only_serialization_failures(
+@pytest.mark.parametrize("dialect", ["cockroachdb", "mysql"])
+def test_run_write_transaction_retries_rolled_back_concurrency_failures(
     monkeypatch: pytest.MonkeyPatch,
+    dialect: str,
 ) -> None:
     from collections.abc import Iterator
     from contextlib import contextmanager
@@ -142,7 +144,7 @@ def test_run_write_transaction_retries_only_serialization_failures(
     class NamedMaker:
         def __init__(self) -> None:
             self.engine = MagicMock()
-            self.engine.dialect.name = "cockroachdb"
+            self.engine.dialect.name = dialect
             self.query_name_prefix = "omnigent.test"
             self.sessions: list[MagicMock] = []
 
@@ -172,7 +174,7 @@ def test_run_write_transaction_retries_only_serialization_failures(
         attempts += 1
         observed_names.append(current_query_name())
         if attempts < 3:
-            raise DBAPIError("statement", {}, SerializationFailure(), False)
+            raise DBAPIError("statement", {}, SerializationFailure(1213, "deadlock"), False)
         return "committed"
 
     sleeps: list[float] = []
