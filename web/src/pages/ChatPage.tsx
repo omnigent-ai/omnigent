@@ -255,13 +255,7 @@ import {
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
-import {
-  GoalDialog,
-  CommandGoalDialog,
-  GoalStatusPill,
-  useGoalState,
-  type Goal,
-} from "@/components/goal";
+import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
@@ -2243,15 +2237,14 @@ export function composerHarnessLabel(
  * Pulled up behind the card so a shelf peeks below; skips render when empty.
  * Session cost lives in the header agent-info popover, not here.
  */
-function ComposerStatusLine({ goal }: { goal: Goal | null }) {
+function ComposerStatusLine() {
   const conversationId = useChatStore((s) => s.conversationId);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
 
-  // The PR link and context ring now live in the workspace bar; this line
-  // carries only the plan-mode marker and the goal pill.
+  // The PR link, context ring, and goal indicator live in the workspace bar;
+  // this line carries only the plan-mode marker.
   const showPlanMode = !!conversationId && codexPlanMode;
-  const showGoal = !!conversationId && goal != null;
-  if (!showPlanMode && !showGoal) return null;
+  if (!showPlanMode) return null;
 
   return (
     <div
@@ -2272,7 +2265,6 @@ function ComposerStatusLine({ goal }: { goal: Goal | null }) {
             <span>Plan mode</span>
           </span>
         )}
-        {showGoal && goal && <GoalStatusPill goal={goal} />}
       </div>
     </div>
   );
@@ -3642,6 +3634,7 @@ function ComposerImpl(
             >
               <BackgroundTaskIndicator />
               <SubagentTaskIndicator conversationId={conversationId} />
+              {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
             </div>
             <ComposerContextRing
               contextWindow={composerContextWindow}
@@ -4027,7 +4020,7 @@ function ComposerImpl(
           />
         )
       )}
-      <ComposerStatusLine goal={goal} />
+      <ComposerStatusLine />
     </form>
   );
 }

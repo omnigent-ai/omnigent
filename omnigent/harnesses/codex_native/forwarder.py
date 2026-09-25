@@ -21,6 +21,7 @@ from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
+    CodexAppServerResponseError,
     CodexMessage,
     client_for_transport,
 )
@@ -77,6 +78,10 @@ _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # state as a missing rollout. Acute with the fresh-launch host auto-create,
 # whose listener races the TUI's just-created empty rollout.
 _EMPTY_ROLLOUT_FRAGMENT = "is empty"
+# Multi-agent v2 refuses ``thread/resume`` for a sub-agent thread that has not
+# been loaded through its parent. Codex's own hint is ``thread/read`` with
+# ``includeTurns: true``, which returns the same ``{"thread": Thread}`` shape.
+_UNLOADED_SUBAGENT_FRAGMENT = "cannot resume an unloaded multi-agent v2 sub-agent"
 _POST_MAX_ATTEMPTS = 3
 _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_MAX_DELAY_SECONDS = 30.0
@@ -387,8 +392,10 @@ class _CodexForwarderState:
         mapped to their spawning parent thread id when known, e.g.
         ``{"thread_child": "thread_parent"}``.
     :param subscribed_child_threads: Codex child thread ids whose backlog
-        has been replayed for this connection (guards against re-replay
-        if the same collab item is observed multiple times).
+        has been replayed for this connection, or whose backfill hit a
+        non-retryable error this connection (guards against re-replay
+        or a repeated doomed attempt if the same collab item is observed
+        multiple times).
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
@@ -5494,10 +5501,10 @@ async def _backfill_child_thread(
 
     Called at most once per connection per child (guarded by
     ``subscribed_child_threads``). Fetches the child's rollout via
-    ``thread/resume``, upserts the nickname/role labels, and replays
-    any already-completed items. Live items arriving after discovery
-    flow through the normal routing path; the dedup key prevents
-    overlap.
+    ``thread/resume`` (or its ``thread/read`` fallback), upserts the
+    nickname/role labels, and replays any already-completed items. Live
+    items arriving after discovery flow through the normal routing path;
+    the dedup key prevents overlap.
 
     :param client: HTTP client for Omnigent event posts.
     :param codex_client: Connected Codex app-server client.
@@ -5511,7 +5518,7 @@ async def _backfill_child_thread(
     :returns: None.
     """
     response = await _resume_child_thread_or_log(
-        client, codex_client, child_session_id=child_session_id, child_thread_id=child_thread_id
+        codex_client, child_thread_id=child_thread_id, forwarder_state=forwarder_state
     )
     if response is None:
         return
@@ -5525,35 +5532,76 @@ async def _backfill_child_thread(
     )
 
 
+def _is_unloaded_subagent_resume_error(exc: Exception) -> bool:
+    """
+    Return whether ``thread/resume`` was refused for an unloaded v2 sub-agent.
+
+    Multi-agent v2 requires the parent to load a sub-agent thread before it
+    can be resumed directly; Codex's own hint is to fall back to
+    ``thread/read``.
+
+    :param exc: Exception raised by ``thread/resume``.
+    :returns: ``True`` for this specific refusal.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == -32600
+        and _UNLOADED_SUBAGENT_FRAGMENT in (exc.message or "")
+    )
+
+
 async def _resume_child_thread_or_log(
-    client: httpx.AsyncClient,
     codex_client: CodexAppServerClient,
     *,
-    child_session_id: str,
     child_thread_id: str,
+    forwarder_state: _CodexForwarderState,
 ) -> CodexMessage | None:
     """
-    Request ``thread/resume`` for a child thread, logging errors.
+    Fetch a child thread's backlog, falling back and logging on error.
 
-    :param client: HTTP client for Omnigent status posts on failure.
+    Falls back to ``thread/read`` (with ``includeTurns``) when Codex
+    refuses ``thread/resume`` for an unloaded multi-agent v2 sub-agent —
+    the read returns the same ``{"thread": Thread}`` shape ``thread/resume``
+    does, so callers can treat it identically. Any other failure (besides
+    the retryable not-ready class) is logged and marked so backfill is not
+    retried on a later child item; the child's liveness still comes from its
+    own turn/agent-status events, not this history mirror.
+
     :param codex_client: Connected Codex app-server client.
-    :param child_session_id: Omnigent child session id, e.g. ``"conv_child"``.
     :param child_thread_id: Codex child thread id, e.g.
         ``"thread_child"``.
-    :returns: JSON-RPC response on success, or ``None`` on error.
+    :param forwarder_state: Mutable state; marks a non-retryable failure
+        as done so it is not retried.
+    :returns: JSON-RPC response envelope on success, or ``None`` on error.
     """
     try:
         return await codex_client.request("thread/resume", {"threadId": child_thread_id})
     except RuntimeError as exc:
         if _is_thread_not_ready_error(exc):
             _logger.info("Codex child thread %s not ready yet; skipping backfill", child_thread_id)
-        else:
-            _logger.warning(
-                "Codex forwarder failed to backfill child thread %s",
-                child_thread_id,
-                exc_info=True,
-            )
-            await _post_status(client, child_session_id, "failed")
+            return None
+        if _is_unloaded_subagent_resume_error(exc):
+            try:
+                return await codex_client.request(
+                    "thread/read", {"threadId": child_thread_id, "includeTurns": True}
+                )
+            except RuntimeError as read_exc:
+                _logger.warning(
+                    "Codex forwarder failed to backfill child thread %s via thread/read "
+                    "fallback: %s: %s",
+                    child_thread_id,
+                    type(read_exc).__name__,
+                    read_exc,
+                )
+                forwarder_state.note_child_thread_subscribed(child_thread_id)
+                return None
+        _logger.warning(
+            "Codex forwarder failed to backfill child thread %s: %s: %s",
+            child_thread_id,
+            type(exc).__name__,
+            exc,
+        )
+        forwarder_state.note_child_thread_subscribed(child_thread_id)
         return None
 
 

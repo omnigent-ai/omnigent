@@ -1153,6 +1153,28 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
   });
 
+  it("scopes the background-task pill state to the active conversation", async () => {
+    seedSession("conv_with_task", []);
+    seedSession("conv_empty", []);
+
+    await useChatStore.getState().switchTo("conv_with_task");
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_with_task",
+      status: "idle",
+      backgroundTaskCount: 1,
+      backgroundTasks: [{ description: "Wait for CI" }],
+    });
+    expect(useChatStore.getState().backgroundTaskCount).toBe(1);
+
+    await useChatStore.getState().switchTo("conv_empty");
+    expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+
+    await useChatStore.getState().switchTo("conv_with_task");
+    expect(useChatStore.getState().backgroundTaskCount).toBe(1);
+    expect(useChatStore.getState().backgroundTasks).toEqual([{ description: "Wait for CI" }]);
+  });
+
   it("revalidates a retained live conversation on revisit, recovering items its stream never delivered", async () => {
     // The stale-revisit bug: a session stream can be open yet deliver nothing
     // (on a sharded deployment an unkeyed open routes to the wrong replica and

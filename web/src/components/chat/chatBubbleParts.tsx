@@ -164,6 +164,7 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
+const MERMAID_FENCE_RE = /^ {0,3}(?:`{3,}|~{3,})mermaid(?:\s|$)/im;
 
 function isMarkdownTableRow(line: string): boolean {
   return line.trim().includes("|");
@@ -186,6 +187,10 @@ export function containsMarkdownTable(items: RenderItem[]): boolean {
 
 export function containsDisplayMath(items: RenderItem[]): boolean {
   return items.some((item) => item.kind === "text" && DISPLAY_MATH_RE.test(item.text));
+}
+
+export function containsMermaidDiagram(items: RenderItem[]): boolean {
+  return items.some((item) => item.kind === "text" && MERMAID_FENCE_RE.test(item.text));
 }
 
 /**
@@ -1000,7 +1005,10 @@ function AssistantBubble({
   // Elicitation cards want full chat-column width to match the composer.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide =
-    hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
+    hasElicitation ||
+    containsMarkdownTable(bubble.items) ||
+    containsDisplayMath(bubble.items) ||
+    containsMermaidDiagram(bubble.items);
   // An error banner's dashed rule spans the full chat column.
   const hasError = bubble.items.some((it) => it.kind === "error");
   // A bubble carrying an error but no prose stands alone as a thread-level
