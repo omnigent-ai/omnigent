@@ -2,22 +2,23 @@
 
 Symptom 1 — the typed prompt must never be silently lost. On the
 new-session page the user types a prompt and presses Enter; the create
-POST succeeds, but every GET of the fresh session fails (e.g. a
-rate-limit window answering 429). Today the SPA drops to "Conversation
-not found" with the prompt nowhere on screen, and "Start a new chat"
-lands on an EMPTY landing composer — the text is unrecoverable. The
-plain create-*failure* path already restores the draft to the composer,
-so this test requires the same recovery when the create succeeds but the
-session's first load fails: returning to the landing page must restore
-the typed prompt.
+POST succeeds, but every request scoped to the fresh session fails
+(e.g. a rate-limit window answering 429). Today the SPA drops to
+"Conversation not found" with the prompt nowhere on screen, and
+"Start a new chat" lands on an EMPTY landing composer — the text is
+unrecoverable. The plain create-*failure* path already restores the
+draft to the composer, so this test requires the same recovery when
+the create succeeds but the session's first load fails: returning to
+the landing page must restore the typed prompt.
 
-Symptom 2 — the workspace picker must give bounded feedback. With a host
-that is online but wedged (its tunnel never answers ``host.list_dir``),
-opening the landing workspace picker today shows a bare "Loading
-folder…" spinner with no error and no entries while the server times
-each request out at 5s and the client silently retries — first visible
-feedback only appears after ~26s. This test requires the picker to
-surface feedback (an error row or actual entries) within 15s of opening.
+Symptom 2 — the workspace picker must give bounded feedback. With a
+host that is online but wedged (its tunnel never answers
+``host.list_dir``), opening the landing workspace picker today shows a
+bare "Loading folder…" spinner with no error and no entries while the
+server times each request out at 5s and the client silently retries —
+first visible feedback only appears after ~26s. This test requires the
+picker to surface feedback (an error row or actual entries) within 15s
+of opening.
 """
 
 from __future__ import annotations
@@ -26,14 +27,12 @@ import asyncio
 import contextlib
 import json
 import re
-import threading
 import uuid
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
-import pytest
-from playwright.async_api import Page, Route, async_playwright, expect
+from playwright.async_api import Route, async_playwright, expect
 
 from omnigent.host.frames import (
     HostCreateDirFrame,
@@ -57,10 +56,18 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from tests.e2e_ui.start_session.helpers import open_landing_workspace_picker
+from tests.e2e_ui.start_session.helpers import (
+    open_landing_workspace_picker,
+    stub_empty_host_picker_data,
+)
+from tests.e2e_ui.start_session.test_start_session import (
+    _HOST_ID,
+    _SESSIONS_RE,
+    _agents_body,
+    _hosts_body,
+    _run_in_fresh_loop,
+)
 
-_HOST_ID = "host_e2e"
-_SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 _PROMPT = "prompt that must survive a failed first load"
 
 # The server times a single list_dir out at 5s; feedback must not need
@@ -68,79 +75,9 @@ _PROMPT = "prompt that must survive a failed first load"
 _PICKER_FEEDBACK_DEADLINE_S = 15.0
 
 
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run ``coro`` on a dedicated thread/event loop (pytest is sync here)."""
-    captured: dict[str, BaseException] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the pytest thread
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
-
-
 # ---------------------------------------------------------------------------
 # Symptom 1 — prompt survives create-OK + first-load-failure
 # ---------------------------------------------------------------------------
-
-
-def _hosts_body() -> str:
-    return json.dumps(
-        {
-            "hosts": [
-                {"host_id": _HOST_ID, "name": "arca-like-host", "owner": "e2e", "status": "online"}
-            ]
-        }
-    )
-
-
-def _agents_body() -> str:
-    return json.dumps(
-        {
-            "data": [
-                {
-                    "id": "ag_claude_e2e",
-                    "name": "claude-native-ui",
-                    "display_name": "Claude Code",
-                    "description": "Anthropic's coding agent",
-                    "harness": None,
-                    "skills": [],
-                }
-            ]
-        }
-    )
-
-
-async def _stub_landing(page: Page, on_create: Any) -> None:
-    """Give the landing composer a ready host/agent/workspace to send with."""
-
-    async def handle_hosts(route: Route) -> None:
-        await route.fulfill(status=200, content_type="application/json", body=_hosts_body())
-
-    async def handle_agents(route: Route) -> None:
-        await route.fulfill(status=200, content_type="application/json", body=_agents_body())
-
-    async def handle_scan(route: Route) -> None:
-        await route.fulfill(
-            status=200, content_type="application/json", body=json.dumps({"data": []})
-        )
-
-    await page.route("**/v1/hosts", handle_hosts)
-    await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_scan)
-    await page.route(_SESSIONS_RE, on_create)
-    await page.add_init_script(
-        f"""window.localStorage.setItem(
-            "omnigent:recent-workspaces",
-            JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
-        );"""
-    )
 
 
 def test_prompt_survives_failed_first_load(seeded_session: tuple[str, str]) -> None:
@@ -153,10 +90,26 @@ def test_prompt_survives_failed_first_load(seeded_session: tuple[str, str]) -> N
 async def _drive_prompt_loss(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
-        page = await browser.new_page()
+        context = await browser.new_context()
+        page = await context.new_page()
         try:
 
-            async def on_create(route: Route) -> None:
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            async def handle_create(route: Route) -> None:
                 if route.request.method == "POST":
                     await route.fulfill(
                         status=200,
@@ -166,16 +119,30 @@ async def _drive_prompt_loss(base_url: str, session_id: str) -> None:
                 else:
                     await route.continue_()
 
-            # A rate-limit window: every request for the created session 429s.
-            async def on_session_request(route: Route) -> None:
+            # A rate-limit window: everything scoped to the fresh session 429s.
+            async def handle_session_scoped(route: Route) -> None:
                 await route.fulfill(
                     status=429,
                     content_type="application/json",
                     body=json.dumps({"detail": "Too many requests"}),
                 )
 
-            await page.route(re.compile(rf"/v1/sessions/{session_id}"), on_session_request)
-            await _stub_landing(page, on_create)
+            await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
+            await page.route("**/v1/agents", handle_agents)
+            await page.route(_SESSIONS_RE, handle_create)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_scan
+            )
+            await page.route(
+                re.compile(rf"/v1/sessions/{re.escape(session_id)}"), handle_session_scoped
+            )
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
 
             await page.goto(f"{base_url}/")
             landing = page.get_by_test_id("new-chat-landing-input")
@@ -185,20 +152,19 @@ async def _drive_prompt_loss(base_url: str, session_id: str) -> None:
 
             # The create succeeded, the load fails: the SPA lands on the
             # conversation-load error screen.
-            await expect(
-                page.get_by_role("heading", name="Conversation not found")
-            ).to_be_visible(timeout=30_000)
+            await expect(page.get_by_role("heading", name="Conversation not found")).to_be_visible(
+                timeout=30_000
+            )
 
             # Going back to the landing page must restore the typed prompt
             # to the composer (parity with the create-failure recovery).
-            # Today the composer comes back EMPTY and the text is gone.
             await page.get_by_role("button", name="Start a new chat").click()
             await expect(landing).to_be_visible(timeout=15_000)
             await expect(landing).to_have_value(_PROMPT, timeout=10_000)
         finally:
             # Close the context before the browser so a recorded video (when
             # OMNIGENT_E2E_RECORD_DIR is set) is finalized even on failure.
-            await page.context.close()
+            await context.close()
             await browser.close()
 
 
@@ -262,7 +228,10 @@ async def _wedged_host(base_url: str) -> AsyncIterator[str]:
         await ws.send(
             encode_host_frame(
                 HostHelloFrame(
-                    version="0.0.0-e2e", frame_protocol_version=1, name=_WEDGED_HOST_NAME
+                    version="0.0.0-e2e",
+                    frame_protocol_version=1,
+                    name=_WEDGED_HOST_NAME,
+                    configured_harnesses={"claude-native": True},
                 )
             )
         )
@@ -305,7 +274,8 @@ def test_picker_feedback_when_host_unresponsive(live_server: str) -> None:
 async def _drive_picker_wedged(base_url: str) -> None:
     async with _wedged_host(base_url) as host_id, async_playwright() as pw:
         browser = await pw.chromium.launch()
-        page = await browser.new_page()
+        context = await browser.new_context()
+        page = await context.new_page()
         try:
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -329,15 +299,13 @@ async def _drive_picker_wedged(base_url: str) -> None:
                 if entries:
                     return  # listing populated — expected behavior
                 listing = page.get_by_test_id("workspace-picker-listing")
-                busy = (
-                    await listing.get_attribute("aria-busy") if await listing.count() else None
-                )
+                busy = await listing.get_attribute("aria-busy") if await listing.count() else None
                 loading_rows = await page.get_by_text("Loading folder…").count()
-                last_state = (
-                    f"aria-busy={busy} loading_row={loading_rows} entries=0 error=absent"
-                )
+                last_state = f"aria-busy={busy} loading_row={loading_rows} entries=0 error=absent"
                 await asyncio.sleep(0.5)
-            pytest.fail(
+            # AssertionError (not pytest.fail) so the imported
+            # _run_in_fresh_loop's Exception capture re-raises it.
+            raise AssertionError(
                 "workspace picker gave no feedback within "
                 f"{_PICKER_FEEDBACK_DEADLINE_S:.0f}s of opening against an unresponsive host "
                 f"(last observed: {last_state}) — bare 'Loading folder…' spinner with no "
@@ -346,5 +314,5 @@ async def _drive_picker_wedged(base_url: str) -> None:
         finally:
             # Close the context before the browser so a recorded video (when
             # OMNIGENT_E2E_RECORD_DIR is set) is finalized even on failure.
-            await page.context.close()
+            await context.close()
             await browser.close()
