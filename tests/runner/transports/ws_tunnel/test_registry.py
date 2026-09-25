@@ -252,6 +252,98 @@ async def test_stale_deregister_does_not_remove_newest_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deregister_watcher_style_with_session_marks_retired_by_server() -> None:
+    """An external caller (e.g. a managed rehoming watcher) passes the session
+    object as a generation guard but does NOT set ``session.route_teardown``.
+    That is the dominant production retirement path — and it must be flagged."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+
+    # Watcher-style: has the session object but does not set route_teardown.
+    reg.deregister("r1", session)
+
+    assert reg.retired_by_server_since("r1", 5.0) is True
+
+
+@pytest.mark.asyncio
+async def test_deregister_without_session_marks_retired_by_server() -> None:
+    """An external `deregister(runner_id)` with no session guard also flags
+    the runner as retired by this server."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+
+    reg.deregister("r1")
+
+    assert reg.retired_by_server_since("r1", 5.0) is True
+
+
+@pytest.mark.asyncio
+async def test_deregister_route_style_with_session_does_not_mark_retired() -> None:
+    """The tunnel route sets ``session.route_teardown = True`` before calling
+    ``deregister`` — that is a routine teardown, not a server retirement."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+
+    # Route-style: mark the flag the way runner_tunnel.py does it.
+    session.route_teardown = True
+    reg.deregister("r1", session)
+
+    assert reg.retired_by_server_since("r1", 5.0) is False
+
+
+@pytest.mark.asyncio
+async def test_deregister_route_fallback_no_session_does_not_mark_retired() -> None:
+    """The route's no-session fallback (registration failed before the route
+    saved the session object) passes ``route_teardown=True`` to the registry.
+    It must not be marked as a server-initiated retirement."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+
+    reg.deregister("r1", route_teardown=True)
+
+    assert reg.retired_by_server_since("r1", 5.0) is False
+
+
+def test_deregister_unknown_runner_does_not_mark_retired_by_server() -> None:
+    """A no-op deregister (runner already offline) must not flag anything."""
+    reg = TunnelRegistry()
+
+    assert reg.deregister("ghost") is None
+
+    assert reg.retired_by_server_since("ghost", 5.0) is False
+
+
+@pytest.mark.asyncio
+async def test_register_clears_retired_by_server_flag() -> None:
+    """Re-registering on this replica clears an earlier server retirement —
+    the runner has a fresh tunnel here now."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    # Watcher-style retirement: session passed, no route_teardown flag.
+    reg.deregister("r1", session)
+    assert reg.retired_by_server_since("r1", 5.0) is True
+
+    reg.register("r1", _NoopWS(), _hello())
+
+    assert reg.retired_by_server_since("r1", 5.0) is False
+
+
+@pytest.mark.asyncio
+async def test_retired_by_server_since_expires_after_window() -> None:
+    """The retirement flag ages out once more time than the window has
+    elapsed, so a caller that waited out its own window sees it as gone."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    # Watcher-style retirement.
+    reg.deregister("r1", session)
+    window_s = 0.05
+
+    assert reg.retired_by_server_since("r1", window_s) is True
+    await asyncio.sleep(window_s * 4)
+    assert reg.retired_by_server_since("r1", window_s) is False
+
+
+@pytest.mark.asyncio
 async def test_open_request_for_unknown_runner_raises_keyerror() -> None:
     reg = TunnelRegistry()
     with pytest.raises(KeyError):

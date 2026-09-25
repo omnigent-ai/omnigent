@@ -605,6 +605,7 @@ from omnigent.server.routes._sessions.helpers import (
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
+    RUNNER_REHOME_WINDOW_S as RUNNER_REHOME_WINDOW_S,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
     _context_labels_from_turn_usage as _context_labels_from_turn_usage,
@@ -651,6 +652,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _publish_subtree_cost_to_ancestors as _publish_subtree_cost_to_ancestors,
     _recover_subagent_status_forward_via_parent as _recover_subagent_status_forward_via_parent,
     _register_policy_elicitation as _register_policy_elicitation,
+    _relay_retired_by_server_window as _relay_retired_by_server_window,
     _relay_runner_stream as _relay_runner_stream,
     _resolve_elicitation as _resolve_elicitation,
     _run_managed_launch as _run_managed_launch,
@@ -664,6 +666,8 @@ from omnigent.server.routes._sessions.orchestration import (
     _wake_parent_for_blocked_child as _wake_parent_for_blocked_child,
     configure_subagent_block_notifier as configure_subagent_block_notifier,
     ensure_runner_connected as ensure_runner_connected,
+    get_server_tunnel_registry as get_server_tunnel_registry,
+    set_server_tunnel_registry as set_server_tunnel_registry,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _dispatch_session_event_to_runner_impl as _dispatch_session_event_to_runner,

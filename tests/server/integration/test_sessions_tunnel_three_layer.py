@@ -849,8 +849,15 @@ async def test_on_runner_connect_restarts_relay_via_router(
 
     # Zero the reconnect grace: this test needs the deregistered relay to
     # die promptly so the reconnect hook's restart path is what revives it.
+    # The deregister below has no session guard, which now also reads as a
+    # server-initiated retirement (rehome window) -- zero that too so the
+    # relay doesn't wait out the (real, 60s-default) rehome window instead.
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_REHOME_WINDOW_S",
         0.0,
     )
     ap_client = tunnel_three_layer_stack.ap_client
@@ -1645,6 +1652,279 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
         assert sessions_module._session_status_cache.get(session_id) != "failed", (
             "a runner live on another replica was failed by this replica's grace timer"
         )
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_runner_disconnect_grace_spares_runner_retired_by_server_once_restamped(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner THIS server retired gets the longer rehome window, not the grace.
+
+    A rehoming watcher (e.g. waking a stale resumable sandbox) can tear down
+    a live tunnel via ``TunnelRegistry.deregister(runner_id)`` with no
+    session guard. The disconnect handler must wait out
+    ``RUNNER_REHOME_WINDOW_S`` instead of the shorter
+    ``RUNNER_DISCONNECT_GRACE_S`` -- and once another replica re-stamps
+    liveness inside that longer window, the session must never be failed.
+    """
+    import time
+
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.1
+    rehome = 0.8
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_REHOME_WINDOW_S", rehome)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-retired-by-server-restamped"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    now = int(time.time())
+    # Pin this replica's own reference stamp well in the past, so the "other
+    # replica" write below is unambiguously newer regardless of exactly when
+    # this server's own retirement-time touch lands.
+    monkeypatch.setattr(session_live_state, "last_liveness_stamp", lambda _runner_id: now - 60)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        # Simulate the server's own rehoming watcher tearing down the
+        # still-live tunnel: an external deregister with no session guard.
+        ap_app.state.tunnel_registry.deregister(runner_id)
+        await communicator.wait(timeout=budget(2.0))
+
+        # Past the SHORT grace, still not failed: the rehome window governs.
+        await asyncio.sleep(grace * 3)
+        assert sessions_module._session_status_cache.get(session_id) != "failed", (
+            "a runner retired by this server was failed at the routine grace "
+            "instead of waiting out the longer rehome window"
+        )
+
+        # Another replica re-stamps liveness before the rehome window elapses.
+        await asyncio.sleep(0.05)
+        store.touch_runner_liveness([runner_id], now)
+
+        await asyncio.sleep(rehome)
+        assert sessions_module._session_status_cache.get(session_id) != "failed", (
+            "a runner retired by this server and re-stamped by another "
+            "replica inside the rehome window was still failed"
+        )
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_runner_disconnect_fails_after_rehome_window_when_retired_by_server_never_reconnects(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-retired runner that never reconnects still fails, eventually.
+
+    Past the longer rehome window a runner retired by this server that never
+    re-stamps liveness anywhere must still be reconciled -- this replica's
+    own retirement-time liveness touch must not be mistaken for proof that
+    another replica took over (it would otherwise spare every server-side
+    retirement unconditionally, runner or no runner).
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.1
+    rehome = 0.5
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_REHOME_WINDOW_S", rehome)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-retired-by-server-never-reconnects"
+    get_conversation_store().replace_runner_id(session_id, runner_id)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        ap_app.state.tunnel_registry.deregister(runner_id)
+        await communicator.wait(timeout=budget(2.0))
+
+        # Past the SHORT grace, still alive per the rehome window.
+        await asyncio.sleep(grace * 3)
+        assert sessions_module._session_status_cache.get(session_id) != "failed", (
+            "failed at the routine grace instead of the longer rehome window"
+        )
+
+        async def _marked_failed() -> None:
+            while sessions_module._session_status_cache.get(session_id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_marked_failed(), timeout=budget(rehome * 6))
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_runner_disconnect_retired_by_server_without_live_state_store_keeps_short_grace(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-retired runner keeps the short grace when no live-state store is wired.
+
+    Without a store ``touch_runner_liveness`` records no stamp, so the
+    disconnect handler sees ``None`` from ``last_liveness_stamp`` and must fall
+    back to ``RUNNER_DISCONNECT_GRACE_S``, not the longer rehome window.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.1
+    rehome = 30.0
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_REHOME_WINDOW_S", rehome)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    # Disable the live-state store before the runner connects so
+    # touch_runner_liveness() records no stamp on connect or on the
+    # retirement-time touch inside _on_runner_disconnect.
+    monkeypatch.setattr(session_live_state, "_store", None)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-retired-no-live-state-store"
+    get_conversation_store().replace_runner_id(session_id, runner_id)
+    # Remove any residual in-process stamp for this runner id.
+    session_live_state._last_liveness_stamp.pop(runner_id, None)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        ap_app.state.tunnel_registry.deregister(runner_id)
+        await communicator.wait(timeout=budget(2.0))
+
+        async def _marked_failed() -> None:
+            while sessions_module._session_status_cache.get(session_id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_marked_failed(), timeout=budget(grace * 20))
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_runner_disconnect_grace_ignores_rehome_window_for_ordinary_disconnect(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary route-side disconnect keeps the short grace.
+
+    A much longer rehome window configured on the server must not affect a
+    plain tunnel drop: only a server-initiated retirement
+    (``TunnelRegistry.deregister`` with no session guard) gets the longer
+    wait.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.1
+    rehome = 5.0  # comfortably longer than this test's own wait budget below
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_REHOME_WINDOW_S", rehome)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-ordinary-disconnect-keeps-grace"
+    get_conversation_store().replace_runner_id(session_id, runner_id)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        # A normal client-initiated close -- not a server-side deregister --
+        # must never be read as a server retirement.
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+        assert ap_app.state.tunnel_registry.retired_by_server_since(runner_id, rehome) is False
+
+        async def _marked_failed() -> None:
+            while sessions_module._session_status_cache.get(session_id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_marked_failed(), timeout=budget(grace * 10))
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
 

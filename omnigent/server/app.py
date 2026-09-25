@@ -114,6 +114,7 @@ from omnigent.server.routes.sessions import (
     create_sessions_router,
     set_server_host_registry,
     set_server_runner_router,
+    set_server_tunnel_registry,
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
@@ -1948,6 +1949,10 @@ def create_app(
     # refill their model catalog from the session's host, from background
     # tasks with no request in scope.
     set_server_host_registry(host_registry)
+    # Same pattern for the tunnel registry: the runner-stream relay's retry
+    # loop reads it to tell a server-initiated tunnel retirement apart from a
+    # routine drop, off a background task with no request in scope.
+    set_server_tunnel_registry(tunnel_registry)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
     # hold a session's runner tunnel serve the same sidebar fields. The
@@ -3245,7 +3250,7 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None
+        runner_id: str, reference_stamp: int | None, grace_s: float
     ) -> None:
         """Reconcile a dropped runner's sessions once the grace expires.
 
@@ -3270,15 +3275,20 @@ def create_app(
             *runner_id*, captured in :func:`_on_runner_disconnect` before
             the clear — the reference the cross-replica check compares
             against.
+        :param grace_s: How long to wait before reconciling — the routine
+            :data:`~omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S`,
+            or the longer
+            :data:`~omnigent.server.routes.sessions.RUNNER_REHOME_WINDOW_S`
+            when :func:`_on_runner_disconnect` determined this server itself
+            retired the runner's tunnel.
         """
         from omnigent.server.routes.sessions import (
-            RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
             _runner_live_on_another_replica,
         )
         from omnigent.server.schemas import ErrorDetail
 
-        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        await asyncio.sleep(grace_s)
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
@@ -3343,6 +3353,11 @@ def create_app(
         Runner invalidation and liveness clearing stay immediate so
         reconnect re-initialization still happens.
 
+        A runner whose live tunnel this server itself retired
+        (:meth:`TunnelRegistry.retired_by_server_since`) gets the longer
+        ``RUNNER_REHOME_WINDOW_S``: it is alive mid-rehome, and the short
+        grace routinely elapses before it re-stamps liveness elsewhere.
+
         :param runner_id: The disconnected runner's id.
         """
         # Newest-wins guard: a superseded tunnel's teardown fires this
@@ -3372,11 +3387,35 @@ def create_app(
         # timer can tell a fresher stamp another replica writes later from
         # one we wrote ourselves (the clear itself never erases this record).
         reference_stamp = session_live_state.last_liveness_stamp(runner_id)
+
+        from omnigent.server.routes.sessions import (
+            RUNNER_DISCONNECT_GRACE_S,
+            RUNNER_REHOME_WINDOW_S,
+        )
+
+        grace_s = RUNNER_DISCONNECT_GRACE_S
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
         # flip offline at once. Not on our own shutdown: the runner is alive and
         # re-tunnels to the replacement, which must not settle its turns to idle.
         if shutdown_state.server_shutting_down():
             session_live_state.touch_runner_liveness([runner_id])
+        elif tunnel_registry.retired_by_server_since(runner_id, RUNNER_REHOME_WINDOW_S):
+            # This server retired the tunnel itself (e.g. to rehome it): the
+            # runner is alive, so keep its liveness and wait longer.
+            session_live_state.touch_runner_liveness([runner_id])
+            touched_stamp = session_live_state.last_liveness_stamp(runner_id)
+            # Compare against our own fresh stamp, or the cross-replica check
+            # would read this touch as another replica taking over. Without a
+            # recorded stamp (no live-state store) keep the short grace.
+            if touched_stamp is not None:
+                reference_stamp = touched_stamp
+                grace_s = RUNNER_REHOME_WINDOW_S
+                _logger.info(
+                    "Runner %s was retired by this server; waiting %.0fs for it to "
+                    "rehome before reconciling",
+                    runner_id,
+                    grace_s,
+                )
         else:
             session_live_state.clear_runner_liveness(runner_id)
 
@@ -3384,7 +3423,7 @@ def create_app(
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id, reference_stamp),
+            _mark_disconnected_runner_failed(runner_id, reference_stamp, grace_s),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task

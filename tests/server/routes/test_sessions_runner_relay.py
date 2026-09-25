@@ -1684,6 +1684,103 @@ async def test_relay_still_fails_mid_turn_session_when_stamp_is_not_newer(
         session_stream.close(session_id)
 
 
+class _RetiredByServerRegistry:
+    """Fake tunnel registry that reports one runner as retired by this server."""
+
+    def __init__(self, runner_id: str) -> None:
+        self._runner_id = runner_id
+
+    def retired_by_server_since(self, runner_id: str, window_s: float) -> bool:
+        del window_s
+        return runner_id == self._runner_id
+
+
+@pytest.mark.asyncio
+async def test_relay_extends_retry_deadline_when_retired_by_this_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner THIS server retired gets the longer rehome window, not the grace.
+
+    A rehoming watcher (e.g. waking a stale resumable sandbox) can tear down
+    a live tunnel via ``TunnelRegistry.deregister(runner_id)`` with no
+    session guard. The relay must ride out ``RUNNER_REHOME_WINDOW_S`` instead
+    of the shorter ``RUNNER_DISCONNECT_GRACE_S`` before giving up on the
+    dropped stream -- and, since nothing ever re-stamps this runner
+    elsewhere, it still fails once that longer window elapses.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    grace = 0.05
+    rehome = 0.4
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        grace,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_REHOME_WINDOW_S",
+        rehome,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        0.01,
+    )
+    runner_id = "runner_retired_by_server"
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._server_tunnel_registry",
+        _RetiredByServerRegistry(runner_id),
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "9f0e1d2c3b4a5968776655443322110a"
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            runner_id,
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        started = asyncio.get_running_loop().time()
+        gate.set()
+
+        # Past the short grace, the relay must still be retrying: the rehome
+        # window, not the grace, governs a runner retired by this server.
+        await asyncio.sleep(grace * 3)
+        assert not handle.task.done(), (
+            "relay gave up at the routine grace instead of waiting out the "
+            "longer rehome window for a runner retired by this server"
+        )
+
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        elapsed = asyncio.get_running_loop().time() - started
+        # A little slack for retry-loop scheduling jitter (sub-10ms in
+        # practice) around the deadline boundary; the earlier not-done
+        # check already pins "past the grace", this pins "near the rehome
+        # window" rather than the exact instant.
+        assert elapsed >= rehome - 0.05, (
+            f"relay gave up after {elapsed:.2f}s, well before the {rehome}s rehome window"
+        )
+        assert sessions_module._session_status_cache.get(session_id) == "failed"
+        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+        assert persisted is not None
+        assert persisted["code"] == "runner_disconnected"
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
     """The grace must outlast the runner's worst-case jittered reconnect delay.
 

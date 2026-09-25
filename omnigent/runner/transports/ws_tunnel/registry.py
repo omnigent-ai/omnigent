@@ -97,6 +97,12 @@ class RunnerSession:
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
+    :param route_teardown: Set to ``True`` by the tunnel route's own
+        ``deregister`` call (the route marks the session before calling
+        ``TunnelRegistry.deregister``) so the registry can tell a
+        route-initiated close from an external server-side retirement
+        (e.g. a managed rehoming watcher) even when the latter passes
+        the session object as a generation guard.
     """
 
     runner_id: str
@@ -112,6 +118,7 @@ class RunnerSession:
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
+    route_teardown: bool = False
 
 
 @dataclass
@@ -196,6 +203,12 @@ class RunnerConnectWaitState:
     waiters: set[asyncio.Future[RunnerSession]] = field(default_factory=set)
 
 
+# Safety ceiling for the retired-by-server bookkeeping below — bounds its
+# memory independent of any particular caller's rehome window, so an entry
+# nobody ever re-checks or re-registers does not linger forever.
+_RETIRED_BY_SERVER_MAX_AGE_S: float = 300.0
+
+
 class TunnelRegistry:
     """In-memory map of runner_id → :class:`RunnerSession`.
 
@@ -240,6 +253,9 @@ class TunnelRegistry:
         self._max_connect_waiters_total = max_connect_waiters_total
         self._connect_waiter_total = 0
         self._lock = threading.RLock()
+        # runner_id -> monotonic time a caller other than the runner's own
+        # tunnel route retired its live session (see retired_by_server_since).
+        self._retired_by_server: dict[str, float] = {}
 
     # ── Session lifecycle ────────────────────────────────
 
@@ -290,6 +306,9 @@ class TunnelRegistry:
                     ),
                 )
             self._sessions[runner_id] = session
+            # This runner now has a fresh tunnel on this replica — any earlier
+            # server-initiated retirement no longer describes it.
+            self._retired_by_server.pop(runner_id, None)
             wait_state = self._connect_waits.pop(runner_id, None)
             if wait_state is not None:
                 self._connect_waiter_total -= len(wait_state.waiters)
@@ -304,6 +323,8 @@ class TunnelRegistry:
         self,
         runner_id: str,
         session: RunnerSession | None = None,
+        *,
+        route_teardown: bool = False,
     ) -> RunnerSession | None:
         """Remove a session and abort all its in-flight requests.
 
@@ -318,6 +339,12 @@ class TunnelRegistry:
             deregistration only removes the registry entry if the
             current entry is this exact session object. This prevents
             stale route handlers from deleting a newer tunnel.
+        :param route_teardown: ``True`` when the tunnel route's own handler
+            calls this for a session it never successfully registered
+            (i.e. ``session is None`` because registration failed before
+            the route saved the object). Treated as a routine teardown —
+            not a server-initiated retirement. External callers must not
+            set this.
         :returns: The removed session, or ``None`` when the runner is
             already offline or the guard did not match.
         """
@@ -326,6 +353,10 @@ class TunnelRegistry:
             if current is None or (session is not None and current is not session):
                 return None
             removed = self._sessions.pop(runner_id)
+            if not removed.route_teardown and not route_teardown:
+                # Not the route's own teardown: a server-side caller retired a
+                # live tunnel, so reconciliation waits out the rehome window.
+                self._mark_retired_by_server(runner_id)
             in_flight_count = len(removed.in_flight)
             if in_flight_count:
                 _logger.warning(
@@ -346,6 +377,60 @@ class TunnelRegistry:
             )
         _retire_session_writer(removed, code=4003, reason="tunnel closed")
         return removed
+
+    def _mark_retired_by_server(self, runner_id: str) -> None:
+        """Record that ``runner_id``'s live session was just retired by this server.
+
+        Must be called while already holding ``self._lock``.
+
+        :param runner_id: Runner id whose live session an external caller
+            (not its own route handler) just removed.
+        :returns: None.
+        """
+        now = time.monotonic()
+        self._retired_by_server[runner_id] = now
+        self._prune_retired_by_server(now)
+
+    def _prune_retired_by_server(self, now: float) -> None:
+        """Drop retired-by-server entries past the safety ceiling.
+
+        Must be called while already holding ``self._lock``.
+
+        :param now: Current :func:`time.monotonic` reading.
+        :returns: None.
+        """
+        stale = [
+            runner_id
+            for runner_id, retired_at in self._retired_by_server.items()
+            if now - retired_at > _RETIRED_BY_SERVER_MAX_AGE_S
+        ]
+        for runner_id in stale:
+            del self._retired_by_server[runner_id]
+
+    def retired_by_server_since(self, runner_id: str, window_s: float) -> bool:
+        """Report whether ``runner_id``'s tunnel was retired by this server recently.
+
+        True only when a caller other than the runner's own tunnel route
+        (e.g. a rehoming watcher or the managed-sandbox wake path) retired its
+        live session within the last *window_s* seconds, so disconnect
+        reconciliation can wait out a rehome window instead of the routine
+        reconnect grace.
+
+        :param runner_id: Runner id to check, e.g.
+            ``"runner_0123456789abcdef"``.
+        :param window_s: How recently the retirement must have happened,
+            e.g. ``60.0``.
+        :returns: ``True`` if retired by this server within *window_s*
+            seconds; ``False`` otherwise (never retired, too long ago, or
+            re-registered since).
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._prune_retired_by_server(now)
+            retired_at = self._retired_by_server.get(runner_id)
+        if retired_at is None:
+            return False
+        return now - retired_at <= window_s
 
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:

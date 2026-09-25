@@ -6630,6 +6630,10 @@ async def _dispatch_session_event_to_runner_impl(
 # worst-case reconnect is ~15s plus handshake. 20s covers that cluster
 # and resolves transient drops silently; a runner still gone afterwards fails.
 RUNNER_DISCONNECT_GRACE_S: float = 20.0
+# A runner whose tunnel this server retired (e.g. to rehome it) can take far
+# longer than a routine drop to come back mid-rollout: reconnects measured
+# p50 13s / p90 43s, with runners hopping replicas 2-7 times.
+RUNNER_REHOME_WINDOW_S: float = 60.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
@@ -6796,6 +6800,61 @@ async def _relay_runner_live_elsewhere(
     )
 
 
+# Set once at startup (set_server_tunnel_registry): the relay's retry loop runs
+# off a background task with no request scope to carry the registry.
+_server_tunnel_registry: TunnelRegistry | None = None
+
+
+def set_server_tunnel_registry(tunnel_registry: TunnelRegistry | None) -> None:
+    """Stash the live tunnel registry for the relay's retired-by-server check.
+
+    Called once from ``create_app`` so :func:`_relay_runner_stream` can tell
+    a server-initiated tunnel retirement apart from a routine drop without
+    carrying the registry through its call chain.
+
+    :param tunnel_registry: The server's live :class:`TunnelRegistry`, or
+        ``None`` in setups without one.
+    :returns: None.
+    """
+    global _server_tunnel_registry
+    _server_tunnel_registry = tunnel_registry
+
+
+def get_server_tunnel_registry() -> TunnelRegistry | None:
+    """Return the registry stashed by :func:`set_server_tunnel_registry`."""
+    return _server_tunnel_registry
+
+
+def _relay_retired_by_server_window(session_id: str) -> float | None:
+    """Return the rehome window if this relay's runner was retired by this server.
+
+    Cheap, in-memory check: resolves the runner id from this relay's own
+    ``_runner_relay_tasks`` registration and asks the tunnel registry's
+    retired-by-server bookkeeping — no store read, so it is safe to call
+    every time the retry deadline is (re)computed.
+
+    :param session_id: Session/conversation identifier.
+    :returns: :data:`RUNNER_REHOME_WINDOW_S` when the bound runner's tunnel
+        was retired by this server within that window; ``None`` when
+        unbound or not retired by this server.
+    """
+    handle = _runner_relay_tasks.get(session_id)
+    if handle is None:
+        return None
+    tunnel_registry = get_server_tunnel_registry()
+    if tunnel_registry is None:
+        return None
+    if not tunnel_registry.retired_by_server_since(handle.runner_id, RUNNER_REHOME_WINDOW_S):
+        return None
+    _logger.info(
+        "Runner %s was retired by this server; waiting %.0fs for it to rehome before reconciling",
+        handle.runner_id,
+        RUNNER_REHOME_WINDOW_S,
+        extra={"session_id": session_id},
+    )
+    return RUNNER_REHOME_WINDOW_S
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -6808,7 +6867,10 @@ async def _relay_runner_stream(
     Transport drops from ingress recycles and sleep-wake reconnects
     re-register the runner within :data:`RUNNER_DISCONNECT_GRACE_S`, so a
     lost stream retries inside that window instead of failing the
-    session. An intentional Stop exits quietly at once.
+    session. An intentional Stop exits quietly at once. A drop this
+    server itself caused by retiring the runner's tunnel
+    (:func:`_relay_retired_by_server_window`) gets the longer
+    :data:`RUNNER_REHOME_WINDOW_S` instead.
 
     Past the grace the runner is genuinely gone — unless this server is the
     one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
@@ -6845,7 +6907,9 @@ async def _relay_runner_stream(
             # An attempt that streamed longer than the grace was a live
             # tunnel dropping anew — give the new outage a fresh window.
             if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
-                deadline = now + RUNNER_DISCONNECT_GRACE_S
+                deadline = now + (
+                    _relay_retired_by_server_window(session_id) or RUNNER_DISCONNECT_GRACE_S
+                )
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
                 _logger.info(
                     "Relay: runner transport lost for session=%s; retrying for %.1fs",
