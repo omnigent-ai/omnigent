@@ -2343,22 +2343,31 @@ def reap_stalled_subagent_launches(
     return reaped
 
 
-def _classify_silent_child_from_summary(summary: _JsonObject | None) -> str:
-    """Map a child's server-side session summary to a silent-child verdict.
+def _classify_silent_child_from_snapshot(snapshot: _JsonObject | None) -> str:
+    """Map a child's own session snapshot to a silent-child verdict.
 
-    :param summary: The child's ``ChildSessionSummary`` dict from the parent
-        listing, or ``None`` when the child was absent / the read failed.
+    Read from a single, bounded ``GET /v1/sessions/{child_id}`` — the child's
+    tracked id — rather than scanning the parent's whole child list.
+
+    :param snapshot: The child's ``SessionResponse`` dict, or ``None`` when the
+        read failed.
     :returns: One of the ``_SILENT_CHILD_*`` verdicts.
     """
-    if summary is None:
+    if snapshot is None:
         return _SILENT_CHILD_UNKNOWN
-    pending = summary.get("pending_elicitations_count")
-    if isinstance(pending, int) and pending > 0:
+    pending = snapshot.get("pending_elicitations")
+    if isinstance(pending, list) and pending:
+        # Parked on a native permission prompt replayed on the snapshot.
         return _SILENT_CHILD_APPROVAL
-    status = summary.get("current_task_status")
-    if isinstance(status, str) and status in _SUBAGENT_TERMINAL_STATUSES:
+    status = snapshot.get("status")
+    if status in ("running", "waiting"):
+        # The server also sees an in-flight turn: genuinely wedged.
+        return _SILENT_CHILD_STUCK
+    if status in ("idle", "failed"):
+        # The dispatched turn already ended server-side; the runner merely
+        # missed the terminal edge. Let reconciliation deliver the real result.
         return _SILENT_CHILD_TERMINAL
-    return _SILENT_CHILD_STUCK
+    return _SILENT_CHILD_UNKNOWN
 
 
 async def reap_stalled_subagent_dispatches(
@@ -2366,7 +2375,7 @@ async def reap_stalled_subagent_dispatches(
     now: float | None = None,
     timeout_s: float | None = None,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
-    list_children: Callable[[str], Awaitable[list[_JsonObject] | None]] | None = None,
+    read_child: Callable[[str], Awaitable[_JsonObject | None]] | None = None,
     interrupt: Callable[[_SubagentWorkEntry], Awaitable[None]] | None = None,
 ) -> list[_SubagentWorkEntry]:
     """
@@ -2381,22 +2390,24 @@ async def reap_stalled_subagent_dispatches(
     refreshing ``last_activity_at`` and is never reaped.
 
     Silence alone is not proof of a hang, so a candidate silent past the
-    budget is adjudicated against the child's authoritative server-side
-    session summary (``list_children``, fetched once per parent per sweep)
-    before anything is delivered:
+    budget is adjudicated against the child's own authoritative session
+    snapshot (``read_child`` — a single, bounded ``GET`` of the tracked child
+    id, never a scan of the parent's whole child list) before anything is
+    delivered:
 
     * a pending elicitation (native permission prompt, invisible to the
       runner's local ``pending_approvals``) — left alone; the ASK has its own
       day-long budget.
-    * a terminal ``current_task_status`` — the server already holds the real
-      result the runner missed; the entry is demoted to ``waiting`` so the
-      reconcile pass delivers it, never a synthesized failure.
-    * unreadable / absent — no proof of a hang, so it is retried next sweep.
-    * otherwise genuinely wedged — the still-live child is interrupted (best
-      effort) and the parent gets a PROVISIONAL failure: the entry is marked
-      ``stalled`` so it stays trackable and cancellable, and any genuine
-      terminal edge that still arrives supersedes it (see
-      :func:`mark_subagent_work_terminal`).
+    * the server sees the session ``idle``/``failed`` — the dispatched turn
+      already ended and the runner merely missed the terminal edge; the entry
+      is demoted to ``waiting`` so the reconcile pass delivers the real result,
+      never a synthesized failure.
+    * unreadable / unexpected — no proof of a hang, so it is retried next sweep.
+    * the server also sees an in-flight turn (``running``/``waiting``) —
+      genuinely wedged. The still-live child is interrupted (best effort) and
+      the parent gets a PROVISIONAL failure: the entry is marked ``stalled`` so
+      it stays trackable and cancellable, and any genuine terminal edge that
+      still arrives supersedes it (see :func:`mark_subagent_work_terminal`).
 
     Because each verdict and interrupt is an ``await``, the child can finish,
     be cancelled, or be replaced by a new dispatch mid-decision. The entry's
@@ -2419,9 +2430,9 @@ async def reap_stalled_subagent_dispatches(
         app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
         also schedules the parent wake POST. Defaults to the inbox-only
         :func:`mark_subagent_work_terminal`.
-    :param list_children: Async callback returning a parent's child-session
-        summaries (or ``None`` on a failed read). ``None`` treats every silent
-        candidate as ``stuck`` (unit tests that only exercise the timing gate).
+    :param read_child: Async callback returning a child's own session snapshot
+        (or ``None`` on a failed read). ``None`` treats every silent candidate
+        as ``stuck`` (unit tests that only exercise the timing gate).
     :param interrupt: Async best-effort interrupt for a genuinely-stuck child,
         so a still-live turn is stopped rather than left duplicating work.
     :returns: The entries that were given a provisional stall failure.
@@ -2451,28 +2462,18 @@ async def reap_stalled_subagent_dispatches(
         and not pending_approvals.has_pending(entry.child_session_id)
         and current - entry.last_activity_at >= budget
     ]
-    listings: dict[str, list[_JsonObject] | None] = {}
     reaped: list[_SubagentWorkEntry] = []
     for entry in candidates:
-        parent_id = entry.parent_session_id
-        if list_children is not None and parent_id not in listings:
-            listings[parent_id] = await list_children(parent_id)
-        # Re-check after the (possible) listing await before acting on a
-        # verdict computed from now-possibly-stale state.
-        if not _still_silent_running(entry):
-            continue
-        if list_children is None:
+        if read_child is None:
             verdict = _SILENT_CHILD_STUCK
         else:
-            summary = next(
-                (
-                    child
-                    for child in (listings.get(parent_id) or [])
-                    if child.get("id") == entry.child_session_id
-                ),
-                None,
-            )
-            verdict = _classify_silent_child_from_summary(summary)
+            # One bounded read of the tracked child id, not a sibling scan.
+            snapshot = await read_child(entry.child_session_id)
+            # Re-check after the await before acting on a now-possibly-stale
+            # verdict.
+            if not _still_silent_running(entry):
+                continue
+            verdict = _classify_silent_child_from_snapshot(snapshot)
         if verdict in (_SILENT_CHILD_APPROVAL, _SILENT_CHILD_UNKNOWN):
             continue
         if verdict == _SILENT_CHILD_TERMINAL:
@@ -2516,7 +2517,7 @@ async def run_subagent_launch_reaper(
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
-    list_children: Callable[[str], Awaitable[list[_JsonObject] | None]] | None = None,
+    read_child: Callable[[str], Awaitable[_JsonObject | None]] | None = None,
     interrupt_silent: Callable[[_SubagentWorkEntry], Awaitable[None]] | None = None,
 ) -> None:
     """
@@ -2533,7 +2534,7 @@ async def run_subagent_launch_reaper(
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
     :param reconcile_pending: Refresh recovered work awaiting remote completion.
-    :param list_children: Per-parent child-summary reader, forwarded to
+    :param read_child: Single-child snapshot reader, forwarded to
         :func:`reap_stalled_subagent_dispatches` for authoritative adjudication.
     :param interrupt_silent: Best-effort interrupt for a genuinely-stuck child.
     :returns: None.
@@ -2544,7 +2545,7 @@ async def run_subagent_launch_reaper(
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
             await reap_stalled_subagent_dispatches(
                 mark_terminal=mark_terminal,
-                list_children=list_children,
+                read_child=read_child,
                 interrupt=interrupt_silent,
             )
             if reconcile_pending is not None:
@@ -5724,24 +5725,32 @@ def create_runner_app(
 
     app.state.reconcile_pending_subagent_results = _reconcile_pending_subagent_results
 
-    async def _list_child_session_summaries(parent_id: str) -> list[_JsonObject] | None:
-        """Read a parent's child-session summaries for stall adjudication.
+    async def _read_child_session_snapshot(child_id: str) -> _JsonObject | None:
+        """Read one child's own session snapshot for stall adjudication.
 
-        The summary is the authoritative source for both
-        ``current_task_status`` and ``pending_elicitations_count`` (native
-        permission prompts live only in the server-side elicitation index, not
-        the runner's local ``pending_approvals``). Returns ``None`` on any read
+        A single, bounded ``GET /v1/sessions/{child_id}`` of the already-tracked
+        child id — the authoritative source for the session ``status`` and any
+        replayed ``pending_elicitations`` (native permission prompts live only
+        server-side, not in the runner's local ``pending_approvals``). Never
+        scans the parent's whole child list. Returns ``None`` on any read
         failure so the sweep waits rather than failing a child on a guess.
 
-        :param parent_id: Parent session whose children to summarize.
-        :returns: The child summaries, or ``None`` when the read failed.
+        :param child_id: The dispatched child session to read.
+        :returns: The child's ``SessionResponse`` dict, or ``None`` on failure.
         """
         try:
-            return await _list_child_sessions(server_client, parent_id)
-        except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
+            resp = await server_client.get(f"/v1/sessions/{child_id}", timeout=30.0)
+        except httpx.HTTPError:
             return None
+        if resp.status_code != 200:
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
 
-    app.state.list_child_session_summaries = _list_child_session_summaries
+    app.state.read_child_session_snapshot = _read_child_session_snapshot
 
     async def _interrupt_silent_subagent_dispatch(entry: _SubagentWorkEntry) -> None:
         """Best-effort stop of a wedged-but-live child before failing it.

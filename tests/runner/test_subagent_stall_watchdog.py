@@ -9,10 +9,10 @@ with no error surfaced anywhere.
 The stall sweep is the backstop. It is keyed on the absence of runner-visible
 edges, never on wall-clock since dispatch, so a healthy long-running child that
 is still emitting activity is not killed. Silence past the budget is only a
-*candidate*: the child is then adjudicated against its authoritative
-server-side summary before anything is delivered, so a native-approval wait, a
-completion the runner merely missed, and an unreadable server are each handled
-without losing a result. A genuinely-stuck child is interrupted and given a
+*candidate*: the child is then adjudicated against its own bounded server-side
+snapshot before anything is delivered, so a native-approval wait, a completion
+the runner merely missed, and an unreadable server are each handled without
+losing a result. A genuinely-stuck child is interrupted and given a
 *provisional* failure that a real terminal edge can still supersede — and
 because every verdict and interrupt is awaited, the entry's identity and status
 are re-checked after each await so a result arriving mid-decision is never
@@ -36,7 +36,7 @@ CHILD_SESSION_ID = "conv_child_worker"
 STALL_TIMEOUT_S = 900.0
 
 _JsonObject = dict[str, Any]
-_ListChildren = Callable[[str], Awaitable[list[_JsonObject] | None]]
+_ReadChild = Callable[[str], Awaitable[_JsonObject | None]]
 
 
 @pytest.fixture
@@ -91,44 +91,28 @@ class _WakeRecordingServerClient(NullServerClient):
         return self._Response()
 
 
-def _summary(
-    *, child_id: str = CHILD_SESSION_ID, status: str = "in_progress", pending: int = 0
-) -> _JsonObject:
-    """Build one child-session summary row as the parent listing returns it."""
-    return {
-        "id": child_id,
-        "current_task_status": status,
-        "pending_elicitations_count": pending,
-    }
+def _snapshot(*, status: str = "running", pending: list[_JsonObject] | None = None) -> _JsonObject:
+    """Build one child ``SessionResponse``-shaped snapshot for adjudication."""
+    return {"status": status, "pending_elicitations": pending or []}
 
 
-def _listing(*summaries: _JsonObject) -> _ListChildren:
-    """Return a ``list_children`` stub that always answers *summaries*."""
+def _reader(snapshot: _JsonObject | None) -> _ReadChild:
+    """Return a ``read_child`` stub that always answers *snapshot*."""
 
-    async def _list(parent_id: str) -> list[_JsonObject]:
-        del parent_id
-        return list(summaries)
+    async def _read(child_id: str) -> _JsonObject | None:
+        del child_id
+        return snapshot
 
-    return _list
-
-
-def _listing_unreadable() -> _ListChildren:
-    """Return a ``list_children`` stub that models a failed server read."""
-
-    async def _list(parent_id: str) -> None:
-        """Model a failed server read by returning ``None`` implicitly."""
-        del parent_id
-
-    return _list
+    return _read
 
 
-def _forbidden_listing() -> _ListChildren:
-    """Return a ``list_children`` stub that must never be called."""
+def _forbidden_reader() -> _ReadChild:
+    """Return a ``read_child`` stub that must never be called."""
 
-    async def _list(parent_id: str) -> list[_JsonObject]:
+    async def _read(child_id: str) -> _JsonObject | None:
         raise AssertionError("a non-candidate child must not be adjudicated")
 
-    return _list
+    return _read
 
 
 def _recording_interrupt(sink: list[str]) -> Callable[..., Awaitable[None]]:
@@ -171,7 +155,7 @@ async def test_genuinely_stuck_child_is_interrupted_and_provisionally_failed(
         now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        list_children=_listing(_summary(status="in_progress")),
+        read_child=_reader(_snapshot(status="running")),
         interrupt=_recording_interrupt(interrupts),
     )
 
@@ -190,7 +174,7 @@ async def test_genuinely_stuck_child_is_interrupted_and_provisionally_failed(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
             mark_terminal=app.state.mark_subagent_terminal_and_wake,
-            list_children=_listing(_summary(status="in_progress")),
+            read_child=_reader(_snapshot(status="running")),
         )
         == []
     )
@@ -203,6 +187,51 @@ async def test_genuinely_stuck_child_is_interrupted_and_provisionally_failed(
     assert len(server.wake_posts) == 1, (
         f"Expected exactly one parent wake POST, got {server.wake_posts}"
     )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_keeps_child_alive_then_silence_is_reaped(
+    _clean_subagent_registry: None,
+) -> None:
+    """The end-to-end activity path: refreshed while healthy, reaped once silent.
+
+    A child that keeps reporting through the runner's child-event funnel
+    (``note_subagent_activity``) stays alive past the budget; once its
+    heartbeat stops and the budget elapses, the parent gets the failure.
+    """
+    server = _WakeRecordingServerClient()
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    entry = _dispatch_running_child()
+    entry.created_at = entry.created_at - STALL_TIMEOUT_S * 9  # dispatched long ago
+
+    # Heartbeats keep refreshing activity; each sweep is a budget-and-a-bit after
+    # the previous heartbeat but the fresh edge keeps the child alive.
+    for beat in range(3):
+        runner_app.note_subagent_activity(CHILD_SESSION_ID)
+        beat_at = entry.last_activity_at
+        assert (
+            await runner_app.reap_stalled_subagent_dispatches(
+                now=beat_at + STALL_TIMEOUT_S - 1,
+                timeout_s=STALL_TIMEOUT_S,
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                read_child=_forbidden_reader(),  # never even a candidate while fresh
+            )
+            == []
+        ), f"heartbeat {beat} must keep the child alive"
+        assert entry.status == "running"
+
+    # Heartbeat stops; silence past the budget now reaps it and wakes the parent.
+    last_beat = entry.last_activity_at
+    reaped = await runner_app.reap_stalled_subagent_dispatches(
+        now=last_beat + STALL_TIMEOUT_S + 1,
+        timeout_s=STALL_TIMEOUT_S,
+        mark_terminal=app.state.mark_subagent_terminal_and_wake,
+        read_child=_reader(_snapshot(status="running")),
+    )
+    assert [e.child_session_id for e in reaped] == [CHILD_SESSION_ID]
+    assert inbox.get_nowait()["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -225,7 +254,7 @@ async def test_child_still_emitting_activity_is_not_reaped(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S - 1,
             timeout_s=STALL_TIMEOUT_S,
-            list_children=_forbidden_listing(),
+            read_child=_forbidden_reader(),
         )
         == []
     )
@@ -244,7 +273,7 @@ async def test_stall_sweep_is_disabled_by_a_non_positive_budget(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + 10_000,
             timeout_s=0,
-            list_children=_forbidden_listing(),
+            read_child=_forbidden_reader(),
         )
         == []
     )
@@ -268,7 +297,7 @@ async def test_stall_sweep_leaves_launching_children_to_the_launch_sweep(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + 10_000,
             timeout_s=STALL_TIMEOUT_S,
-            list_children=_forbidden_listing(),
+            read_child=_forbidden_reader(),
         )
         == []
     )
@@ -292,7 +321,7 @@ async def test_recovered_waiting_child_is_left_to_reconciliation(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            list_children=_forbidden_listing(),
+            read_child=_forbidden_reader(),
         )
         == []
     )
@@ -316,7 +345,7 @@ async def test_child_with_runner_local_pending_approval_is_not_reaped(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            list_children=_forbidden_listing(),
+            read_child=_forbidden_reader(),
         )
         == []
     )
@@ -331,8 +360,9 @@ async def test_child_parked_on_native_approval_is_not_reaped(
 ) -> None:
     """The server reports a pending native permission prompt: leave the child alone.
 
-    Native prompts live only in the server-side elicitation index, so the
-    verdict comes from the authoritative summary, not runner-local state.
+    Native prompts live only in the server-side elicitation index and are
+    replayed on the child's snapshot, so the verdict comes from there, not
+    runner-local state.
     """
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
@@ -343,7 +373,7 @@ async def test_child_parked_on_native_approval_is_not_reaped(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            list_children=_listing(_summary(pending=1)),
+            read_child=_reader(_snapshot(status="running", pending=[{"elicitation_id": "e1"}])),
             interrupt=_recording_interrupt(interrupts),
         )
         == []
@@ -355,14 +385,14 @@ async def test_child_parked_on_native_approval_is_not_reaped(
 
 
 @pytest.mark.asyncio
-async def test_server_terminal_child_is_demoted_to_waiting_not_failed(
+async def test_server_idle_child_is_demoted_to_waiting_not_failed(
     _clean_subagent_registry: None,
 ) -> None:
-    """The server already holds the real result: hand it to reconciliation.
+    """The dispatched turn already ended server-side: hand it to reconciliation.
 
-    The runner merely missed the terminal edge, so the sweep must not
-    synthesize a failure over the server's authoritative completion; it demotes
-    the entry to ``waiting`` for the reconcile pass to deliver.
+    The runner merely missed the terminal edge (the server session is
+    ``idle``), so the sweep must not synthesize a failure over the real
+    result; it demotes the entry to ``waiting`` for the reconcile pass.
     """
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
@@ -372,7 +402,7 @@ async def test_server_terminal_child_is_demoted_to_waiting_not_failed(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            list_children=_listing(_summary(status="completed")),
+            read_child=_reader(_snapshot(status="idle")),
         )
         == []
     )
@@ -394,7 +424,7 @@ async def test_unreadable_server_leaves_child_for_the_next_sweep(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            list_children=_listing_unreadable(),
+            read_child=_reader(None),
         )
         == []
     )
@@ -409,8 +439,8 @@ async def test_completion_arriving_during_classification_is_not_overwritten(
 ) -> None:
     """A real completion landing during the verdict await wins the race.
 
-    The child finishes for real while the sweep is reading the server summary;
-    the re-check after that await must abort so the authoritative completion is
+    The child finishes for real while the sweep is reading its snapshot; the
+    re-check after that await must abort so the authoritative completion is
     never overwritten by a provisional failure.
     """
     server = _WakeRecordingServerClient()
@@ -419,18 +449,18 @@ async def test_completion_arriving_during_classification_is_not_overwritten(
     runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
     entry = _dispatch_running_child()
 
-    async def _list_then_complete(parent_id: str) -> list[dict[str, Any]]:
+    async def _read_then_complete(child_id: str) -> dict[str, Any]:
         # The child completes for real mid-classification.
         app.state.mark_subagent_terminal_and_wake(
             CHILD_SESSION_ID, status="completed", output="the real answer"
         )
-        return [_summary(status="in_progress")]  # stale view
+        return _snapshot(status="running")  # stale view
 
     reaped = await runner_app.reap_stalled_subagent_dispatches(
         now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        list_children=_list_then_complete,
+        read_child=_read_then_complete,
     )
 
     assert reaped == []
@@ -467,7 +497,7 @@ async def test_interrupt_that_reports_cancellation_is_not_overwritten(
         now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        list_children=_listing(_summary(status="in_progress")),
+        read_child=_reader(_snapshot(status="running")),
         interrupt=_interrupt_then_cancel,
     )
 
@@ -495,7 +525,7 @@ async def test_redispatch_during_await_is_not_failed(
     runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
     original = _dispatch_running_child()
 
-    async def _list_then_redispatch(parent_id: str) -> list[dict[str, Any]]:
+    async def _read_then_redispatch(child_id: str) -> dict[str, Any]:
         runner_app.unregister_subagent_work(CHILD_SESSION_ID, work_id=original.work_id)
         replacement = runner_app.register_subagent_work(
             parent_session_id=PARENT_SESSION_ID,
@@ -504,13 +534,13 @@ async def test_redispatch_during_await_is_not_failed(
             title="fresh dispatch",
         )
         replacement.status = "running"
-        return [_summary(status="in_progress")]
+        return _snapshot(status="running")
 
     reaped = await runner_app.reap_stalled_subagent_dispatches(
         now=original.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        list_children=_list_then_redispatch,
+        read_child=_read_then_redispatch,
     )
 
     assert reaped == []
@@ -545,7 +575,7 @@ async def test_genuine_result_supersedes_provisional_stall_through_drain(
         now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        list_children=_listing(_summary(status="in_progress")),
+        read_child=_reader(_snapshot(status="running")),
     )
     assert entry.stalled
     stall_payload = inbox.get_nowait()
@@ -594,7 +624,7 @@ async def test_provisionally_stalled_task_stays_cancellable(
         now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        list_children=_listing(_summary(status="in_progress")),
+        read_child=_reader(_snapshot(status="running")),
     )
     assert entry.status == "failed"
     assert entry.stalled
