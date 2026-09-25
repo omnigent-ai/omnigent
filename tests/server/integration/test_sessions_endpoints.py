@@ -10806,6 +10806,74 @@ async def test_patch_permission_mode_rejects_non_claude_session(
     assert "permission_mode is only supported" in resp.text
 
 
+async def test_patch_session_effort_forwards_only_when_value_changes(
+    client: httpx.AsyncClient,
+) -> None:
+    """Repeated effort PATCHes do not reinject the effort command."""
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            body = json.loads(request.content) if request.content else None
+            captured.append(_ForwardedEffort(url=str(request.url), body=body))
+            return httpx.Response(204)
+        if request.method == "POST":
+            # Session setup traffic expects the runner's queued-response shape.
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(204)
+
+    def _change_events(session_id: str) -> list[dict[str, Any] | None]:
+        return [
+            forwarded.body
+            for forwarded in captured
+            if forwarded.url.endswith(f"/v1/sessions/{session_id}/events")
+            and isinstance(forwarded.body, dict)
+            and forwarded.body.get("type") == "effort_change"
+        ]
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(None)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        session_id = session["id"]
+        set_runner_client(fake_runner)
+        captured.clear()
+
+        changed = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"reasoning_effort": "high"},
+        )
+        assert changed.status_code == 200, changed.text
+        assert _change_events(session_id) == [{"type": "effort_change", "effort": "high"}]
+
+        captured.clear()
+        unchanged = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"reasoning_effort": "high"},
+        )
+        assert unchanged.status_code == 200, unchanged.text
+        assert unchanged.json()["reasoning_effort"] == "high"
+        assert _change_events(session_id) == []
+
+        captured.clear()
+        cleared = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"reasoning_effort": "default"},
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()["reasoning_effort"] is None
+        assert _change_events(session_id) == [{"type": "effort_change", "effort": None}]
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+
 @pytest.mark.parametrize(
     "native_session,patch_effort,expected_persisted,expected_event_effort",
     [

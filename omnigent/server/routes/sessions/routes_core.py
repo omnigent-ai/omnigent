@@ -2635,6 +2635,7 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
+        effort_changed = conv is None or conv.reasoning_effort != updated.reasoning_effort
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
@@ -2664,7 +2665,7 @@ def register_core_routes(
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent
-        if live_forward and (effort is not None or clear_effort):
+        if live_forward and effort_changed and (effort is not None or clear_effort):
             await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
