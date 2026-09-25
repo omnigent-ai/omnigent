@@ -143,3 +143,16 @@ it("copies a workspace-relative path for an absolute viewer path inside it", () 
   fireEvent.click(screen.getByRole("menuitem", { name: "Copy Relative Path" }));
   expect(mocks.copy).toHaveBeenCalledWith("docs/report.md");
 });
+
+it("offers to open a folder rather than select it", async () => {
+  render(
+    <FileMenuProvider root="/Users/test/repo" hostId="local">
+      <FileContextMenu path="src" directory>
+        <button type="button">Folder</button>
+      </FileContextMenu>
+    </FileMenuProvider>,
+  );
+  fireEvent.contextMenu(screen.getByText("Folder"));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Open in Finder" }));
+  expect(mocks.reveal).toHaveBeenCalledWith("local", "/Users/test/repo/src");
+});

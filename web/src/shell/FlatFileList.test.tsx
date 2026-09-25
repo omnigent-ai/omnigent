@@ -223,3 +223,29 @@ describe("FlatFileList copy path", () => {
     expect(copyTextMock).toHaveBeenCalledWith("src/deep/app.ts");
   });
 });
+
+describe("FlatFileList context menu", () => {
+  it("offers the file's path on right-click without opening the file", () => {
+    const select = vi.fn();
+    renderList({
+      files: [
+        {
+          path: "src/deep/app.ts",
+          name: "app.ts",
+          status: "modified",
+          bytes: 2048,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
+      ],
+      onFileSelect: select,
+    });
+
+    fireEvent.contextMenu(screen.getByText("app.ts"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy Relative Path" }));
+
+    expect(copyTextMock).toHaveBeenCalledWith("src/deep/app.ts");
+    expect(select).not.toHaveBeenCalled();
+  });
+});

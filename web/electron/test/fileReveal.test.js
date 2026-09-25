@@ -13,7 +13,14 @@ function setup(t) {
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   let handler;
   const shown = [];
-  const shell = { showItemInFolder: (value) => shown.push(value) };
+  const opened = [];
+  const shell = {
+    showItemInFolder: (value) => shown.push(value),
+    openPath: async (value) => {
+      opened.push(value);
+      return "";
+    },
+  };
   registerFileReveal({
     ipcMain: {
       handle: (channel, callback) => {
@@ -25,28 +32,33 @@ function setup(t) {
     isPinnedOriginSender: (event) => event.trusted === true,
     localHostId: () => "local",
   });
-  return { directory, file, shown, shell, reveal: (...args) => handler(...args) };
+  return { directory, file, shown, opened, shell, reveal: (...args) => handler(...args) };
 }
 
-test("reveals existing files and directories without opening their contents", (t) => {
-  const { reveal, shown, file, directory } = setup(t);
-  assert.equal(reveal({ trusted: true }, "local", file), true);
-  assert.equal(reveal({ trusted: true }, "local", directory), true);
-  assert.deepEqual(shown, [file, directory]);
+test("selects a file in its folder and opens a directory, never opening the file", async (t) => {
+  const { reveal, shown, opened, file, directory } = setup(t);
+  assert.equal(await reveal({ trusted: true }, "local", file), true);
+  assert.equal(await reveal({ trusted: true }, "local", directory), true);
+  assert.deepEqual(shown, [file]);
+  assert.deepEqual(opened, [directory]);
 });
 
-test("rejects untrusted senders and remote or unknown hosts", (t) => {
-  const { reveal, shown, file } = setup(t);
-  assert.equal(reveal({}, "local", file), false);
-  for (const host of ["remote", "", null, undefined, {}]) {
-    assert.equal(reveal({ trusted: true }, host, file), false);
-  }
+test("rejects untrusted senders and remote or unknown hosts", async (t) => {
+  const { reveal, shown, opened, file } = setup(t);
+  assert.equal(await reveal({}, "local", file), false);
+  const hosts = ["remote", "", null, undefined, {}];
+  const results = await Promise.all(hosts.map((host) => reveal({ trusted: true }, host, file)));
+  assert.deepEqual(
+    results,
+    hosts.map(() => false),
+  );
   assert.deepEqual(shown, []);
+  assert.deepEqual(opened, []);
 });
 
-test("rejects relative, malformed, URL and missing paths", (t) => {
-  const { reveal, shown, file } = setup(t);
-  for (const value of [
+test("rejects relative, malformed, URL and missing paths", async (t) => {
+  const { reveal, shown, opened, file } = setup(t);
+  const values = [
     "relative.txt",
     "file:///tmp/file",
     "https://example.com",
@@ -54,16 +66,24 @@ test("rejects relative, malformed, URL and missing paths", (t) => {
     {},
     `${file}\0`,
     `${file}.missing`,
-  ]) {
-    assert.equal(reveal({ trusted: true }, "local", value), false);
-  }
+  ];
+  const results = await Promise.all(
+    values.map((value) => reveal({ trusted: true }, "local", value)),
+  );
+  assert.deepEqual(
+    results,
+    values.map(() => false),
+  );
   assert.deepEqual(shown, []);
+  assert.deepEqual(opened, []);
 });
 
-test("reports native reveal failures", (t) => {
-  const { reveal, shell, file } = setup(t);
+test("reports native reveal failures", async (t) => {
+  const { reveal, shell, file, directory } = setup(t);
   shell.showItemInFolder = () => {
     throw new Error("Unavailable");
   };
-  assert.equal(reveal({ trusted: true }, "local", file), false);
+  assert.equal(await reveal({ trusted: true }, "local", file), false);
+  shell.openPath = async () => "No application found";
+  assert.equal(await reveal({ trusted: true }, "local", directory), false);
 });

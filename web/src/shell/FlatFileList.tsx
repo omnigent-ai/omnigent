@@ -10,6 +10,7 @@ import {
   gitStatusLetter,
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
+import { FileContextMenu } from "./FileContextMenu";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
 
@@ -85,82 +86,84 @@ function FileListItem({
 
   return (
     <li>
-      <div
-        className={cn(
-          "group flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1",
-          isDeleted ? "opacity-50" : "hover:bg-muted",
-        )}
-      >
-        <button
-          type="button"
+      <FileContextMenu path={file.path} deleted={isDeleted}>
+        <div
           className={cn(
-            "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
-            isDeleted ? "cursor-default" : "cursor-pointer",
+            "group flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1",
+            isDeleted ? "opacity-50" : "hover:bg-muted",
           )}
-          onClick={() => !isDeleted && onFileSelect(file.path)}
-          disabled={isDeleted}
         >
-          <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
-          <span
-            className={cn("truncate font-mono text-ui md:text-sm", isDeleted && "line-through")}
-            {...handlers}
+          <button
+            type="button"
+            className={cn(
+              "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
+              isDeleted ? "cursor-default" : "cursor-pointer",
+            )}
+            onClick={() => !isDeleted && onFileSelect(file.path)}
+            disabled={isDeleted}
           >
-            {file.name}
-          </span>
-          {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
-        </button>
-        {/* Fixed-width and always rendered: a variable diffstat ("+7 −1" vs
+            <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
+            <span
+              className={cn("truncate font-mono text-ui md:text-sm", isDeleted && "line-through")}
+              {...handlers}
+            >
+              {file.name}
+            </span>
+            {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
+          </button>
+          {/* Fixed-width and always rendered: a variable diffstat ("+7 −1" vs
             "+1204 −318") would otherwise shift the copy button and status
             letter to a different x on every row. */}
-        <span className={cn("flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
-          {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
-            <span
-              className="font-mono text-[10px]"
-              aria-label={[
-                file.lines_added !== null && `${file.lines_added} lines added`,
-                file.lines_removed !== null && `${file.lines_removed} removed`,
-              ]
-                .filter(Boolean)
-                .join(", ")}
-            >
-              {file.lines_added !== null && (
-                <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-              )}
-              {file.lines_added !== null && file.lines_removed !== null && " "}
-              {file.lines_removed !== null && (
-                <span className="text-destructive">&minus;{file.lines_removed}</span>
-              )}
-            </span>
-          )}
-        </span>
-        {/* Status letter at rest, the copy/download pair on hover — the same
+          <span className={cn("flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
+            {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
+              <span
+                className="font-mono text-[10px]"
+                aria-label={[
+                  file.lines_added !== null && `${file.lines_added} lines added`,
+                  file.lines_removed !== null && `${file.lines_removed} removed`,
+                ]
+                  .filter(Boolean)
+                  .join(", ")}
+              >
+                {file.lines_added !== null && (
+                  <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+                )}
+                {file.lines_added !== null && file.lines_removed !== null && " "}
+                {file.lines_removed !== null && (
+                  <span className="text-destructive">&minus;{file.lines_removed}</span>
+                )}
+              </span>
+            )}
+          </span>
+          {/* Status letter at rest, the copy/download pair on hover — the same
             trailing column the tree rows use, so the two tabs match. */}
-        <span
-          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
-        >
           <span
-            className={cn(
-              "rounded px-1 py-0.5 font-mono text-[10px] group-hover:invisible",
-              isDeleted
-                ? "bg-destructive/10 text-destructive"
-                : file.status === "created"
-                  ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                  : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
-            )}
-            title={gitStatusLabel(file.status)}
+            className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
           >
-            {gitStatusLetter(file.status)}
+            <span
+              className={cn(
+                "rounded px-1 py-0.5 font-mono text-[10px] group-hover:invisible",
+                isDeleted
+                  ? "bg-destructive/10 text-destructive"
+                  : file.status === "created"
+                    ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                    : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+              )}
+              title={gitStatusLabel(file.status)}
+            >
+              {gitStatusLetter(file.status)}
+            </span>
+            <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+              {hasDownload && conversationId ? (
+                <FileDownloadButton conversationId={conversationId} path={file.path} />
+              ) : (
+                <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+              )}
+              <CopyPathButton path={file.path} revealOnHover />
+            </span>
           </span>
-          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
-            {hasDownload && conversationId ? (
-              <FileDownloadButton conversationId={conversationId} path={file.path} />
-            ) : (
-              <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
-            )}
-            <CopyPathButton path={file.path} revealOnHover />
-          </span>
-        </span>
-      </div>
+        </div>
+      </FileContextMenu>
       {tooltip}
     </li>
   );

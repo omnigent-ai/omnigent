@@ -939,7 +939,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
     // toggle, and a button nested inside a button is invalid HTML. The toggle
     // still spans everything up to the copy button, so the clickable area is
     // effectively unchanged.
-    <FileContextMenu path={node.path}>
+    <FileContextMenu path={node.path} directory>
       <div
         className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
         style={{ paddingLeft: `${indentFor(depth)}px` }}

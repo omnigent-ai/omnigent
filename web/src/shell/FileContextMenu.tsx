@@ -57,7 +57,7 @@ export function FileMenuProvider({
 }
 
 /** Shared by row/tab context menus and the viewer's toolbar menu. */
-export function useFileMenuActions(path: string, deleted = false) {
+export function useFileMenuActions(path: string, deleted = false, directory = false) {
   const { root, localHostId } = useContext(FileMenuContext);
   const absolutePath = resolveFileMenuPath(root, path);
   const relativePath = relativeFileMenuPath(root, path);
@@ -71,13 +71,15 @@ export function useFileMenuActions(path: string, deleted = false) {
   }
   const actions = [];
   if (localHostId && absolutePath && !deleted) {
+    const fileManager = isMacElectronShell()
+      ? "Finder"
+      : navigator.userAgent.includes("Windows")
+        ? "File Explorer"
+        : "File Manager";
     actions.push({
       key: "reveal-file",
-      label: isMacElectronShell()
-        ? "Show in Finder"
-        : navigator.userAgent.includes("Windows")
-          ? "Show in File Explorer"
-          : "Show in File Manager",
+      // A file is selected in its containing folder; a folder is opened.
+      label: `${directory ? "Open" : "Show"} in ${fileManager}`,
       icon: <FolderOpenIcon className="size-4" />,
       active: false,
       disabled: false,
@@ -116,13 +118,15 @@ export function useFileMenuActions(path: string, deleted = false) {
 export function FileContextMenu({
   path,
   deleted = false,
+  directory = false,
   children,
 }: {
   path: string;
   deleted?: boolean;
+  directory?: boolean;
   children: ReactElement;
 }) {
-  const actions = useFileMenuActions(path, deleted);
+  const actions = useFileMenuActions(path, deleted, directory);
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
