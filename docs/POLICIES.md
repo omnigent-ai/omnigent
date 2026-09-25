@@ -277,6 +277,32 @@ An agent that fails during its `initialize` handshake for no obvious reason is
 worth checking against this first; the ACP executor logs a hint pointing back at
 this field.
 
+##### Per-session values
+
+`env_passthrough` names variables whose values are resolved from the runner's
+own environment, which is per-daemon: every session on that runner sees the same
+value. A dispatching client that needs a value belonging to *one* run — run
+attribution in telemetry is the usual case — sends it at session creation
+instead:
+
+```bash
+curl -X POST "$OMNIGENT/v1/sessions" -d '{
+  "agent_id": "agt_123",
+  "env_passthrough_values": {"OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42"}
+}'
+```
+
+The name must already appear in the agent's `os_env.sandbox.env_passthrough`;
+the create request is rejected with a 400 otherwise, so the spec author decides
+what a client can reach and a value cannot be aimed at `PATH` or a credential
+variable. Values are persisted with the session and reapplied whenever the
+harness process respawns, so they stay accurate for the whole session rather
+than only its first spawn.
+
+These are per-session, not per-turn. The harness subprocess is keyed by session
+and its environment is fixed when the process starts, so a value that has to
+change between turns of one session needs a different mechanism.
+
 #### `deny_pii_in_llm_request`
 
 Scans user messages and LLM prompts for PII patterns (SSN, credit card, email, phone).

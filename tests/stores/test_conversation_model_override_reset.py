@@ -309,3 +309,43 @@ def test_clear_model_override_compiles_portable_exact_blob_comparison(
         assert "conversations.session_overrides = " in sql
         assert "CAST(" not in sql
         assert original in compiled.params.values()
+
+
+def test_env_passthrough_values_round_trip_through_the_overrides_blob(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Per-session env values persist as a nested object beside scalar overrides.
+
+    They must outlive the create request: the runner rebuilds the harness spawn
+    env on every respawn (crash, idle reap, model switch), long after the create
+    envelope is gone, so a value applied once would silently vanish.
+    """
+    conversation = store.create_conversation(title="Env values")
+
+    updated = store.update_conversation(
+        conversation.id,
+        model_override="claude-opus-4-7",
+        env_passthrough_values={"OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42"},
+    )
+
+    assert updated is not None
+    assert updated.env_passthrough_values == {"OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42"}
+    # Survives a fresh read, and does not disturb its scalar neighbours.
+    reloaded = store.get_conversation(conversation.id)
+    assert reloaded is not None
+    assert reloaded.env_passthrough_values == {"OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42"}
+    assert reloaded.model_override == "claude-opus-4-7"
+
+
+def test_a_legacy_overrides_blob_reads_back_without_env_values(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Rows written before the field existed decode as unset, not as an error."""
+    conversation = store.create_conversation(title="Legacy blob")
+    _write_overrides(store, conversation.id, json.dumps({"model_override": "older-model"}))
+
+    reloaded = store.get_conversation(conversation.id)
+
+    assert reloaded is not None
+    assert reloaded.env_passthrough_values is None
+    assert reloaded.model_override == "older-model"

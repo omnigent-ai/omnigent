@@ -859,6 +859,7 @@ class ConversationStore(ABC):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        env_passthrough_values: dict[str, str] | None = None,
         share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
@@ -906,6 +907,11 @@ class ConversationStore(ABC):
             variant — the override is set once at session create and
             immutable thereafter (the harness process is spawned on
             the first turn).
+        :param env_passthrough_values: Per-session values for env-var names
+            the agent spec declares in ``os_env.sandbox.env_passthrough``,
+            e.g. ``{"OTEL_RESOURCE_ATTRIBUTES": "run.id=42"}``. ``None`` or an
+            empty mapping leaves unchanged; set at session create and
+            immutable thereafter, for the same reason as ``harness_override``.
         :param share_workspace_files: Whether view-level collaborators may
             browse the workspace. ``True`` stores the share, ``False``
             clears it (edit-only again), ``None`` leaves it unchanged.

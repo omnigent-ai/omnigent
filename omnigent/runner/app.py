@@ -4191,6 +4191,11 @@ def create_runner_app(
                 cwd=await _session_runtime_cwd(session_id),
                 session_id=session_id,
                 model_override=_model_override,
+                env_passthrough_values=(
+                    init_context.envelope.snapshot.env_passthrough_values
+                    if init_context.envelope is not None
+                    else None
+                ),
             )
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
@@ -8653,6 +8658,12 @@ def create_runner_app(
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
+                # Forwarded on every event, not just the first: this env is
+                # what a respawn (crash, idle reap, model switch) is rebuilt
+                # from, so a turn that triggers one must still carry them.
+                env_passthrough_values=cast(
+                    "dict[str, str] | None", msg_body.get("env_passthrough_values")
+                ),
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
@@ -13474,6 +13485,35 @@ async def _ensure_session_subagent_router(
     )
 
 
+def _declared_env_passthrough_values(
+    spec: AgentSpec,
+    values: dict[str, str],
+) -> dict[str, str]:
+    """Keep only the *values* whose names the spec declares as passthrough.
+
+    The create route already rejects an undeclared name, so a drop here means
+    the spec stopped declaring it after the session was created. Dropping is
+    right in that case: the alternative is a harness whose environment reflects
+    a spec that no longer exists.
+
+    :param spec: The resolved agent spec for this session.
+    :param values: Per-session name → value mapping from the session record.
+    :returns: The subset of *values* the spec still declares; empty when the
+        spec declares no ``os_env.sandbox.env_passthrough``.
+    """
+    os_env = getattr(spec, "os_env", None)
+    sandbox = getattr(os_env, "sandbox", None) if os_env is not None else None
+    declared = set(getattr(sandbox, "env_passthrough", None) or ())
+    kept = {name: value for name, value in values.items() if name in declared}
+    dropped = sorted(set(values) - set(kept))
+    if dropped:
+        _logger.warning(
+            "dropping session env values no longer declared in os_env.sandbox.env_passthrough: %s",
+            ", ".join(dropped),
+        )
+    return kept
+
+
 def _build_spawn_env_from_spec(
     spec: AgentSpec,
     harness: str,
@@ -13482,6 +13522,7 @@ def _build_spawn_env_from_spec(
     workdir: Path | None = None,
     model_override: str | None = None,
     session_id: str | None = None,
+    env_passthrough_values: dict[str, str] | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -13499,6 +13540,12 @@ def _build_spawn_env_from_spec(
         via ``--model`` in :func:`_build_claude_native_base_args`; the
         SDK harnesses have no such arg, so the override must land in the
         env var here.)
+    :param env_passthrough_values: Per-session values for env-var names the
+        spec declares in ``os_env.sandbox.env_passthrough``, e.g.
+        ``{"OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42"}``. Re-checked
+        against the spec here rather than trusted from the session record, so
+        the declaration remains the only thing that widens the harness
+        environment even if a stale value outlives a spec edit.
     :returns: The spawn-env dict, or ``None`` for native / unknown harnesses.
     """
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
@@ -13653,6 +13700,13 @@ def _build_spawn_env_from_spec(
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
             env[model_key] = model_override
+
+    # Caller-supplied per-session values, last so they cannot be clobbered by
+    # a builder default, but confined to the names the spec declares: this runs
+    # on every respawn, and the spec is the only authority for what the harness
+    # process may see.
+    if env_passthrough_values and env is not None:
+        env.update(_declared_env_passthrough_values(spec, env_passthrough_values))
 
     # Routing visibility: log the resolved gateway target so operators can
     # confirm which provider a turn actually hits (api.anthropic.com /

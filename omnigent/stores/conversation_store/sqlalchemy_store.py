@@ -181,13 +181,16 @@ _SESSION_OVERRIDE_KEYS = (
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",
+    # A JSON object of declared env-var name -> per-session value, not a
+    # scalar like its neighbours; an empty object encodes as unset.
+    "env_passthrough_values",
     # Stored as the string ``"on"`` when the owner shares workspace files
     # with view-level collaborators; absent (SQL NULL blob key) otherwise.
     "share_workspace_files",
 )
 
 
-def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
+def _encode_session_overrides(overrides: dict[str, Any]) -> str | None:
     """Pack the set per-session overrides into a compact JSON blob.
 
     Omits keys whose value is ``None`` and returns ``None`` when nothing is
@@ -196,16 +199,20 @@ def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
     considered; any other keys in *overrides* are ignored.
 
     :param overrides: Mapping of override key to value (missing / ``None``
-        values mean "unset").
+        values mean "unset"). An empty collection also means "unset", so a
+        caller clearing ``env_passthrough_values`` drops the key rather than
+        storing an empty object.
     :returns: Compact JSON object string, or ``None`` when no override is set.
     """
     data = {
-        key: overrides[key] for key in _SESSION_OVERRIDE_KEYS if overrides.get(key) is not None
+        key: overrides[key]
+        for key in _SESSION_OVERRIDE_KEYS
+        if overrides.get(key) is not None and overrides[key] != {}
     }
     return json.dumps(data, separators=(",", ":")) if data else None
 
 
-def _decode_session_overrides(raw: str | None) -> dict[str, str | None]:
+def _decode_session_overrides(raw: str | None) -> dict[str, Any]:
     """Unpack the ``session_overrides`` blob to a full override dict.
 
     Every one of the :data:`_SESSION_OVERRIDE_KEYS` is present in the
@@ -280,6 +287,7 @@ def _to_conversation(
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
+        env_passthrough_values=overrides["env_passthrough_values"],
         # Stored as ``"on"`` / absent; surfaced as a plain bool on the entity.
         share_workspace_files=overrides["share_workspace_files"] == "on",
         sub_agent_name=meta.sub_agent_name if meta else None,
@@ -3214,6 +3222,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        env_passthrough_values: dict[str, str] | None = None,
         share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
@@ -3252,6 +3261,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param _unset_harness_override: When ``True``, clear
             ``harness_override`` to ``None`` (used to replace the
             ``"auto"`` sentinel after first-message routing resolves).
+        :param env_passthrough_values: Per-session values for spec-declared
+            env-var names, e.g. ``{"OTEL_RESOURCE_ATTRIBUTES": "run.id=42"}``.
+            ``None`` leaves unchanged; a non-empty mapping replaces the stored
+            value wholesale. Write-once in practice — the create route is the
+            only caller, because the harness bakes these into its process env.
         :param share_workspace_files: Whether view-level collaborators may
             browse the workspace. ``True`` stores the share flag, ``False``
             clears it (back to edit-only), ``None`` leaves it unchanged.
@@ -3325,6 +3339,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif harness_override is not None:
                 overrides["harness_override"] = harness_override
+                overrides_changed = True
+            if env_passthrough_values:
+                overrides["env_passthrough_values"] = dict(env_passthrough_values)
                 overrides_changed = True
             # Two-state flag: True stores ``"on"``, False clears it (edit-only
             # again), None leaves it untouched.

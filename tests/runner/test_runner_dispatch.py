@@ -1912,6 +1912,98 @@ def test_build_spawn_env_applies_model_override(
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
 
 
+def test_build_spawn_env_applies_declared_env_passthrough_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-session values reach the spawn env only for spec-declared names.
+
+    The valued half of ``os_env.sandbox.env_passthrough``: a dispatching client
+    can attribute one run's harness process (``OTEL_RESOURCE_ATTRIBUTES``)
+    without putting the value on the runner daemon, where every session would
+    share it. The declaration stays the trust boundary — this runs on every
+    respawn, so an undeclared name must not ride in from the session record.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(type="none", env_passthrough=["OTEL_RESOURCE_ATTRIBUTES"]),
+        ),
+    )
+
+    env = _build_spawn_env_from_spec(
+        spec,
+        "claude-sdk",
+        env_passthrough_values={
+            "OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42",
+            "PATH": "/tmp/evil",
+        },
+    )
+    assert env is not None
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == "myapp.run.id=42"
+    # An undeclared name is dropped even when it reaches the runner: the spec
+    # stopping its declaration must not leave the harness widened.
+    assert env.get("PATH") != "/tmp/evil"
+
+
+def test_build_spawn_env_ignores_env_values_without_a_declaration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec with no ``os_env`` block grants no per-session values at all.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    env = _build_spawn_env_from_spec(
+        spec,
+        "claude-sdk",
+        env_passthrough_values={"OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42"},
+    )
+    assert env is not None
+    assert "OTEL_RESOURCE_ATTRIBUTES" not in env
+
+
 def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The dispatch chain routes ``hermes`` to its builder.
 

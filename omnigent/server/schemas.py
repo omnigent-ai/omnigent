@@ -1534,6 +1534,10 @@ class _SessionCreateRequestBase(BaseModel):
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    # Values for env-var names the agent spec declares in
+    # ``os_env.sandbox.env_passthrough``; undeclared names are rejected so a
+    # client cannot reach PATH or a credential variable on the harness process.
+    env_passthrough_values: dict[str, str] | None = None
     smart_routing_message: str | None = None
 
     @model_validator(mode="after")
