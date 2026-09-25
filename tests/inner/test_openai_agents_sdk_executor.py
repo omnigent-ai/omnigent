@@ -2416,16 +2416,7 @@ def test_context_length_exceeded_re_raises() -> None:
 
 
 def test_connection_error_re_raises_for_classification() -> None:
-    """
-    ``openai.APIConnectionError`` from the SDK propagates as an exception
-    rather than being stringified into an ``ExecutorError``.
-
-    The ``ExecutorAdapter``'s classifier maps it to the semantic
-    ``connection_error`` code on the harness ``ErrorDetail``. Swallowing
-    it into ``ExecutorError`` erased the type, so the failure surfaced
-    as a generic ``RuntimeError``/``runner_error`` blob — an upstream
-    transport blip mis-attributed as an Omnigent runner defect.
-    """
+    """A classifiable SDK exception propagates typed so the adapter can stamp its code."""
     import openai
 
     conn_error = openai.APIConnectionError(
