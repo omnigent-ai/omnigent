@@ -295,6 +295,15 @@ def clipboard_browser(
         ),
         empty_list,
     )
+    browser_contract.json(
+        re.compile(rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/policies"),
+        empty_list,
+    )
+    browser_contract.json("/v1/policy-registry", empty_list)
+    browser_contract.json(
+        re.compile(rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/owner"),
+        {"owner": None},
+    )
     browser_contract.response(
         re.compile(
             rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/read-state(?:\?.*)?$"

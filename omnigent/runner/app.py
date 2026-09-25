@@ -2894,6 +2894,11 @@ def create_runner_app(
     mcp_execution_registry = McpExecutionRegistry()
     app.state.mcp_execution_registry = mcp_execution_registry
 
+    # Set as soon as SIGINT/SIGTERM is handled, so a required terminal that
+    # dies with the runner's process group is not reported as a crash.
+    _shutting_down = asyncio.Event()
+    app.state.shutting_down = _shutting_down
+
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
@@ -3539,6 +3544,19 @@ def create_runner_app(
             return
 
         if event.session_was_idle:
+            _release_required_terminal_session(event.session_id)
+            return
+
+        if _shutting_down.is_set():
+            # tmux died with this runner's process group on a stop signal, not
+            # a crash; the server settles the turn from the dropped tunnel.
+            _logger.info(
+                "required terminal %s exited for %s while the runner is shutting down; "
+                "not failing the turn",
+                event.terminal_name,
+                event.session_id,
+                extra={"session_id": event.session_id},
+            )
             _release_required_terminal_session(event.session_id)
             return
 
@@ -8796,6 +8814,7 @@ def create_runner_app(
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
+                        os_env_schema_only=True,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (

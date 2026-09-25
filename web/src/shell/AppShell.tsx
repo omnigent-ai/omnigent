@@ -798,13 +798,16 @@ export function AppShell() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(
-      rootSessionId,
-      inlinePanelMinWidth,
-      sidebarOpen ? sidebarWidth : 0,
-      rootSessionResolved,
-    );
+  const {
+    panelWidth: inlinePanelWidth,
+    handleProps: inlinePanelHandleProps,
+    isDragging: inlinePanelResizing,
+  } = useResizableInlinePanel(
+    rootSessionId,
+    inlinePanelMinWidth,
+    sidebarOpen ? sidebarWidth : 0,
+    rootSessionResolved,
+  );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -2135,6 +2138,7 @@ export function AppShell() {
             renders inline in main (via MainTerminalView) and the
             workspace card stays visible alongside. */}
               <div
+                data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
@@ -2253,12 +2257,14 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && workspacePanelVisible && (
+                {conversationId && hasRailContent && (
                   <WorkspacePanel
                     conversationId={conversationId}
                     pending={pendingConversation}
                     width={inlinePanelWidth}
-                    inert={inlinePanelWidth === 0}
+                    inert={!workspacePanelVisible || inlinePanelWidth === 0}
+                    open={workspacePanelVisible}
+                    resizing={inlinePanelResizing}
                     handleProps={inlinePanelHandleProps}
                     rightRailTab={rightRailTab}
                     onRightRailTabChange={handleRightRailTabChange}

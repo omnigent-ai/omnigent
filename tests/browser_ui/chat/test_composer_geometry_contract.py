@@ -279,6 +279,9 @@ def test_wrapped_attachment_rows_keep_the_grid(
     if not workspace.is_visible():
         page.get_by_role("button", name="Expand right panel").click()
         expect(workspace).to_be_visible()
+    workspace.evaluate(
+        "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
+    )
     names = [
         "quarterly-planning-notes.txt",
         "customer-feedback-export.csv",

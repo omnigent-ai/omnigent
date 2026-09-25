@@ -3893,6 +3893,86 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
 
 
 @pytest.mark.asyncio
+async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A required terminal exit while the runner is shutting down is not a crash.
+
+    The host stopping a runner mid-turn (SIGINT/SIGTERM) tears down tmux with
+    the process group, so the idle watcher reports the required terminal as
+    exited even though nothing crashed. With ``app.state.shutting_down`` set,
+    the runner must still remove the terminal resource and release the
+    harness, but must not log an ERROR or publish ``session.status: failed``
+    — the server already handles a runner going away via the dropped tunnel.
+    """
+    import logging
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = uuid.uuid4().hex
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    app.state.shutting_down.set()
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+            publish_exit(
+                TerminalExitEvent(
+                    session_id=conv_id,
+                    terminal_id="terminal_claude_main",
+                    terminal_name="claude",
+                    session_key="main",
+                    lifecycle=TerminalLifecycle.REQUIRED,
+                    exit_status=None,
+                    session_was_idle=False,
+                )
+            )
+            queued_events: list[dict[str, Any]] = []
+            for _ in range(1000):
+                queued_events.extend(
+                    _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                )
+                if pm.released:
+                    break
+                await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_claude_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    # No spurious failure card while the runner is shutting down.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+    assert any(
+        "shutting down" in record.getMessage() and record.levelno == logging.INFO
+        for record in caplog.records
+    )
+    # The harness subprocess is still released — the terminal is gone.
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
 async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
     """A non-claude terminal exiting with the resume-banner text is still a failure.
 

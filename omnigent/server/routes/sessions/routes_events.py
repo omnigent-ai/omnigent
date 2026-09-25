@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import secrets
 import time
 import weakref
@@ -216,6 +217,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
+    _persist_external_conversation_items,
     _persist_external_devin_subagent_start,
     _persist_external_session_usage,
     _persist_host_launch_failure_turn,
@@ -279,6 +281,30 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
         _EXTERNAL_SESSION_USAGE_TYPE,
     }
 )
+
+
+def _is_batchable_external_item(event: SessionEventInput) -> bool:
+    """
+    Whether a batch entry can skip :func:`_post_event_impl` and be appended
+    with its neighbors, which is the shape the claude-native forwarder posts.
+
+    For an external item that is not a user message (pending-input drain) or a
+    slash command (title seeding), the per-entry path only authorizes, persists
+    and broadcasts. Entries carrying ``created_by`` or ``tools`` also stay
+    per-entry so their validation is not duplicated here.
+    """
+    if (
+        event.type != _EXTERNAL_CONVERSATION_ITEM_TYPE
+        or event.created_by is not None
+        or event.tools
+    ):
+        return False
+    item_type = event.data.get("item_type")
+    item_data = event.data.get("item_data")
+    is_user_message = (
+        item_type == "message" and isinstance(item_data, dict) and item_data.get("role") == "user"
+    )
+    return item_type != "slash_command" and not is_user_message
 
 
 def _event_body_too_large() -> HTTPException:
@@ -517,6 +543,21 @@ def register_events_routes(
         runner_id = getattr(conv, "runner_id", None)
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
+    async def _authorized_conversation(
+        request: Request, session_id: str
+    ) -> tuple[str | None, Any]:
+        """Require EDIT on the session and return the caller and its conversation."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        return user_id, conv
+
     @event_router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -554,15 +595,31 @@ def register_events_routes(
                         "session event batch exceeds the 100-event limit",
                         code=ErrorCode.INVALID_INPUT,
                     )
-                return [
-                    await _post_event_impl(
-                        request,
-                        session_id,
-                        event,
-                        in_flight=in_flight if event.type == "message" else None,
+                # A sub-agent transcript arrives as one array of up to 100 items with a
+                # 10 s client timeout, and persisting it per entry on a store with
+                # per-append overhead outlasts that. Each run of batchable entries is
+                # authorized once and appended in one store call; every other entry
+                # keeps the per-entry path, in order.
+                acks: list[dict[str, bool | str]] = []
+                for batchable, run in itertools.groupby(body, key=_is_batchable_external_item):
+                    if not batchable:
+                        for event in run:
+                            acks.append(
+                                await _post_event_impl(
+                                    request,
+                                    session_id,
+                                    event,
+                                    in_flight=in_flight if event.type == "message" else None,
+                                )
+                            )
+                        continue
+                    await _authorized_conversation(request, session_id)
+                    add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
+                    item_ids = await _persist_external_conversation_items(
+                        session_id, list(run), conversation_store
                     )
-                    for event in body
-                ]
+                    acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
+                return acks
             return await _post_event_impl(
                 request,
                 session_id,
@@ -667,15 +724,7 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-        )
-        conv = access.conversation
-        if conv is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
+        user_id, conv = await _authorized_conversation(request, session_id)
         if in_flight is not None:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.

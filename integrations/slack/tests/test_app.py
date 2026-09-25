@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import Any
 
 import pytest
+from omnigent_slack import app as app_module
 from omnigent_slack.app import _register_error_handler
 from slack_bolt.async_app import AsyncApp
+
+
+class _StartupReached(Exception):
+    """Raised in place of connecting to Slack, to stop ``run()`` after wiring."""
 
 
 @pytest.mark.asyncio
@@ -54,3 +61,45 @@ async def test_error_handler_logs_exception_without_active_traceback(
     assert "created outside an except block" in record.message
     assert record.exc_info == (ValueError, error, None)
     assert "NoneType: None" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_passes_the_operator_setup_defaults_to_the_setup_flow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``run()`` hands the configured defaults to SetupFlow.
+
+    Without this the two env vars parse fine and do nothing. The socket handler
+    is replaced so startup stops just after wiring, before any Slack call.
+    """
+    for key in ("OMNIGENT_SLACK_DEFAULT_AGENT_ID", "OMNIGENT_SLACK_DEFAULT_HOST_TYPE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("OMNIGENT_SLACK_BOT_TOKEN", "xoxb-dummy")
+    monkeypatch.setenv("OMNIGENT_SLACK_APP_TOKEN", "xapp-dummy")
+    monkeypatch.setenv("OMNIGENT_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_SLACK_DATABASE_PATH", str(tmp_path / "bot.sqlite3"))
+    monkeypatch.setenv("OMNIGENT_SLACK_DEFAULT_AGENT_ID", "ag_standard")
+    monkeypatch.setenv("OMNIGENT_SLACK_DEFAULT_HOST_TYPE", "managed")
+
+    captured: dict[str, Any] = {}
+    real_setup_flow = app_module.SetupFlow
+
+    def _record(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_setup_flow(**kwargs)
+
+    class _StopHandler:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def start_async(self) -> None:
+            raise _StartupReached
+
+    monkeypatch.setattr(app_module, "SetupFlow", _record)
+    monkeypatch.setattr(app_module, "AsyncSocketModeHandler", _StopHandler)
+
+    with pytest.raises(_StartupReached):
+        await app_module.run()
+
+    assert captured["default_agent_id"] == "ag_standard"
+    assert captured["default_host_type"] == "managed"
