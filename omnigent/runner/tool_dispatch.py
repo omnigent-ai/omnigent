@@ -7940,6 +7940,14 @@ async def _cleanup_drained_subagent_work(
         return
     from omnigent.runner import app as _runner_app
 
+    entry = _runner_app.get_subagent_work(child_id)
+    if entry is not None and entry.work_id == work_id and entry.stalled:
+        # A provisional stall failure from the watchdog, not an authoritative
+        # terminal. Draining it unblocks the parent, but the entry must stay
+        # registered (not remembered as drained) so a genuine terminal edge
+        # that still arrives supersedes it and re-delivers the real result,
+        # and so the still-live child stays cancellable by task id.
+        return
     _runner_app.unregister_subagent_work(
         child_id,
         work_id=work_id,
@@ -8568,7 +8576,14 @@ async def _cancel_subagent_task(
         and entry.status == "failed"
         and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
     )
-    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
+    # A ``stalled`` entry carries a PROVISIONAL watchdog failure over a child
+    # that may still be live, so its cached ``failed`` status is not
+    # authoritative — route a real interrupt rather than returning it.
+    if (
+        entry.status not in ("launching", "running", "waiting")
+        and not can_stop_failed
+        and not entry.stalled
+    ):
         return _cached_subagent_cancel_result(str(task_id), entry.status)
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
