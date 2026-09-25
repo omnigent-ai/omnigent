@@ -56,6 +56,12 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
   const log = (action: string, detail?: unknown) =>
     console.info(`[onboarding mock] ${action}`, detail ?? "");
 
+  // The mock installer streams its output only once it starts — mirroring the
+  // real adapter, whose lines appear after install begins, not on subscribe.
+  // onInstallLog registers the sink; onInstallCli emits into it and resolves
+  // when the stream finishes.
+  let installLog: ((line: string) => void) | null = null;
+
   return {
     initialUrl: recentServers[0] ?? managedServers[0] ?? "http://localhost:6767",
     initialStep,
@@ -72,23 +78,32 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
       log("onStartLocal");
       return { ok: true };
     },
-    onInstallCli: async () => {
+    onInstallCli: () => {
       log("onInstallCli");
-      return { ok: true };
+      // Stream the install lines only once install starts, resolving when the
+      // stream finishes — so the warm-up beat shows an empty terminal first.
+      return new Promise<{ ok: boolean; error?: string }>((resolve) => {
+        const lines = [
+          "Installing uv (required by the Omnigent installer)…",
+          "Installing the Omnigent CLI…",
+          "uv tool install --force --python 3.12 omnigent",
+          "Installed omnigent",
+        ];
+        let i = 0;
+        const timer = setInterval(() => {
+          if (i < lines.length) installLog?.(lines[i++]);
+          else {
+            clearInterval(timer);
+            resolve({ ok: true });
+          }
+        }, 250);
+      });
     },
     onInstallLog: (cb) => {
-      const lines = [
-        "Installing uv (required by the Omnigent installer)…",
-        "Installing the Omnigent CLI…",
-        "uv tool install --force --python 3.12 omnigent",
-        "Installed omnigent",
-      ];
-      let i = 0;
-      const timer = setInterval(() => {
-        if (i < lines.length) cb(lines[i++]);
-        else clearInterval(timer);
-      }, 250);
-      return () => clearInterval(timer);
+      installLog = cb;
+      return () => {
+        if (installLog === cb) installLog = null;
+      };
     },
     onRemoveServer: (url) => log("onRemoveServer", url),
     onCopy: (text) => log("onCopy", text),

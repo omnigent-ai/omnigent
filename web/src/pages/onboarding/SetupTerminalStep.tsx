@@ -15,7 +15,7 @@ type Phase = "installing" | "running" | "ready" | "failed";
 
 // Empty-terminal beat before the first install commands stream in, so the
 // install step doesn't flash straight from empty into output.
-const WARMUP_MS = 600;
+export const WARMUP_MS = 600;
 
 export function SetupTerminalStep({
   onInstallCli,
