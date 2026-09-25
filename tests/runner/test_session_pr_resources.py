@@ -601,6 +601,41 @@ async def test_pr_update_reports_lock_contention_and_allows_retry(
     assert (url in {entry.url for entry in registry.list()}) == (action == "attach")
 
 
+async def test_shallow_diff_error_preserves_recovery_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner returns error.message so the server proxy preserves recovery advice."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    responses = {
+        ("rev-parse", "--verify", "--quiet", "origin/main^{commit}"): (0, "main-sha", ""),
+        ("merge-base", "origin/main", "HEAD"): (1, "", ""),
+        ("rev-parse", "--is-shallow-repository"): (0, "true\n", ""),
+    }
+
+    def git(args: list[str], *, cwd: str) -> tuple[int, str, str]:
+        assert cwd == str(tmp_path / "session")
+        return responses[tuple(args)]
+
+    monkeypatch.setattr(github, "_git", git)
+    app = create_runner_app(
+        runner_workspace=tmp_path,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/github/diff/fileA.py", params={"base": "main"}
+        )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "invalid_input"
+    assert "shallow" in error["message"]
+    assert "git fetch --deepen=" in error["message"]
+    assert "git fetch --unshallow" in error["message"]
+
+
 def test_manual_attach_and_exclusion(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         github, "_gh", lambda *_args, **_kwargs: (0, json.dumps({"number": 99}), "")
