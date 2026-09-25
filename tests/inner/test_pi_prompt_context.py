@@ -132,6 +132,10 @@ async def test_real_pi_adds_workspace_context_after_inline_prompt(
         (project / context_path).write_text(_WORKSPACE_MARKER, encoding="utf-8")
 
     base_url, requests = captured_llm_requests
+    # Pi resolves the home directory at startup; an isolated HOME keeps that
+    # working on hosts whose uid has no passwd entry, without leaking ~/.pi.
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
     agent_dir = tmp_path / "pi-config"
     agent_dir.mkdir()
     (agent_dir / "AGENTS.md").write_text(_GLOBAL_MARKER, encoding="utf-8")
@@ -154,7 +158,11 @@ async def test_real_pi_adds_workspace_context_after_inline_prompt(
     monkeypatch.setattr(
         pi_executor,
         "_clean_pi_env",
-        lambda *_: {"PATH": os.environ["PATH"], "PI_CODING_AGENT_DIR": str(agent_dir)},
+        lambda *_: {
+            "PATH": os.environ["PATH"],
+            "HOME": str(home_dir),
+            "PI_CODING_AGENT_DIR": str(agent_dir),
+        },
     )
     executor = pi_executor.PiExecutor(
         pi_path=pi_path,
