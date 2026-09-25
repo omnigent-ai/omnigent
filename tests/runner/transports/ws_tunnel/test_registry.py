@@ -39,6 +39,20 @@ class _NoopWS:
         return await asyncio.Future()
 
 
+class _ClosingWS(_NoopWS):
+    """WebSocket fake that records its ``close()`` call.
+
+    :ivar closed: ``None`` until ``close()`` runs, then the
+        ``(code, reason)`` it was called with.
+    """
+
+    def __init__(self) -> None:
+        self.closed: tuple[int, str] | None = None
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.closed = (code, reason)
+
+
 def _hello() -> HelloFrame:
     return HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
 
@@ -235,6 +249,42 @@ async def test_deregister_aborts_inflight() -> None:
     assert state.head_future.done()
     with pytest.raises(ConnectionError, match="tunnel closed"):
         state.head_future.result()
+
+
+@pytest.mark.asyncio
+async def test_deregister_closes_socket_with_recycle_code() -> None:
+    """Deregistering a live session closes with 1001, not 4003.
+
+    1001 ("going away") lands in the runner's existing tunnel-recycle path
+    (serve.py's ``_TUNNEL_RECYCLE_CLOSE_CODES``), so a server-initiated
+    retire (rollout, slice rehoming) gets a prompt, spread reconnect
+    instead of the runner's escalating backoff.
+    """
+    reg = TunnelRegistry()
+    ws = _ClosingWS()
+    reg.register("r1", ws, _hello())
+
+    reg.deregister("r1")
+    await _wait_until(lambda: ws.closed is not None)
+
+    assert ws.closed == (1001, "tunnel retired by server; reconnect")
+
+
+@pytest.mark.asyncio
+async def test_register_replacing_session_still_closes_old_socket_with_4000() -> None:
+    """Newest-wins keeps closing the replaced socket with 4000 'tunnel replaced'.
+
+    Confirms the deregister retire-code change (4003 -> 1001) left
+    register()'s own retire call untouched.
+    """
+    reg = TunnelRegistry()
+    old_ws = _ClosingWS()
+    reg.register("r1", old_ws, _hello())
+
+    reg.register("r1", _ClosingWS(), _hello())
+    await _wait_until(lambda: old_ws.closed is not None)
+
+    assert old_ws.closed == (4000, "tunnel replaced")
 
 
 @pytest.mark.asyncio

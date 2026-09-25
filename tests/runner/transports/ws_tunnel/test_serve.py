@@ -13,6 +13,7 @@ import pytest
 from typing_extensions import Unpack
 from websockets.exceptions import (
     ConnectionClosedError,
+    ConnectionClosedOK,
     InvalidStatus,
     InvalidURI,
     WebSocketException,
@@ -64,6 +65,55 @@ class _Closed(WebSocketException):
         self.rcvd = _Close(code)
 
 
+class _CleanCloseWS:
+    """WebSocket fake whose connection is already cleanly closed.
+
+    Supports both styles ``_serve_tunnel_once`` may read frames with: the
+    explicit ``recv()`` loop, and the ``async for`` sugar (which internally
+    calls ``recv()`` and turns a clean close into ``StopAsyncIteration``) —
+    so the same fake works whichever one a test is pinned to.
+
+    :param code: Received close code, e.g. ``1001``. ``None`` mimics a
+        close carrying no code info.
+    """
+
+    def __init__(self, code: int | None = None) -> None:
+        self._close_code = code
+
+    async def send(self, data: str) -> None:
+        """Discard the outgoing hello frame.
+
+        :param data: Encoded tunnel frame JSON.
+        :returns: None.
+        """
+        del data
+
+    async def recv(self) -> str:
+        """Raise the configured clean close.
+
+        :raises ConnectionClosedOK: Always.
+        """
+        rcvd = _Close(self._close_code) if self._close_code is not None else None
+        raise ConnectionClosedOK(rcvd, rcvd, None if rcvd is None else True)
+
+    def __aiter__(self) -> _CleanCloseWS:
+        """Return the async iterator.
+
+        :returns: This fake WebSocket.
+        """
+        return self
+
+    async def __anext__(self) -> str:
+        """Mirror ``websockets``: a clean close ends iteration quietly.
+
+        :raises StopAsyncIteration: Always.
+        """
+        try:
+            return await self.recv()
+        except ConnectionClosedOK:
+            raise StopAsyncIteration from None
+
+
 async def _noop_app(
     scope: dict[str, Any],
     receive: Any,
@@ -93,6 +143,29 @@ def test_websocket_close_code_returns_none_without_code() -> None:
     :returns: None.
     """
     assert _websocket_close_code(WebSocketException("boom")) is None
+
+
+def test_websocket_close_code_prefers_rcvd_over_legacy_code_shim() -> None:
+    """The code the peer actually sent wins over the deprecated ``.code`` shim.
+
+    :returns: None.
+    """
+
+    class _MisleadingClosed(WebSocketException):
+        """Exception whose deprecated ``.code`` disagrees with ``rcvd``."""
+
+        def __init__(self, rcvd_code: int, legacy_code: int) -> None:
+            super().__init__("closed")
+            self.rcvd = _Close(rcvd_code)
+            self._legacy_code = legacy_code
+
+        @property
+        def code(self) -> int:
+            """Return a deliberately-wrong code to prove it's not used."""
+            return self._legacy_code
+
+    exc = _MisleadingClosed(rcvd_code=1001, legacy_code=4003)
+    assert _websocket_close_code(exc) == 1001
 
 
 def test_websocket_http_status_reads_invalid_status_response() -> None:
@@ -655,8 +728,8 @@ async def test_serve_tunnel_once_sends_bearer_header(
 
     captured: dict[str, str | _ConnectKwargs] = {}
 
-    class _FakeWS:
-        """WebSocket stub that accepts hello then closes iteration."""
+    class _FakeWS(_CleanCloseWS):
+        """WebSocket stub that accepts hello then closes the connection."""
 
         async def send(self, data: str) -> None:
             """
@@ -666,22 +739,6 @@ async def test_serve_tunnel_once_sends_bearer_header(
             :returns: None.
             """
             captured["sent"] = data
-
-        def __aiter__(self) -> _FakeWS:
-            """
-            Return the async iterator.
-
-            :returns: This fake WebSocket iterator.
-            """
-            return self
-
-        async def __anext__(self) -> str:
-            """
-            End the fake WebSocket stream immediately.
-
-            :raises StopAsyncIteration: Always.
-            """
-            raise StopAsyncIteration
 
     class _ConnectContext:
         """Async context manager returned by fake ``websockets.connect``."""
@@ -798,15 +855,9 @@ async def test_serve_tunnel_once_sends_org_header(
 
     captured: dict[str, object] = {}
 
-    class _FakeWS:
+    class _FakeWS(_CleanCloseWS):
         async def send(self, data: str) -> None:
             del data
-
-        def __aiter__(self) -> _FakeWS:
-            return self
-
-        async def __anext__(self) -> str:
-            raise StopAsyncIteration
 
     class _Ctx:
         async def __aenter__(self) -> _FakeWS:
@@ -836,6 +887,74 @@ async def test_serve_tunnel_once_sends_org_header(
     headers = captured["headers"]
     assert isinstance(headers, dict)
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+class _CleanCloseCtx:
+    """Async-CM returned by a fake ``websockets.connect`` whose ``ws``
+    is already cleanly closed with the given received code."""
+
+    def __init__(self, code: int | None) -> None:
+        self._code = code
+
+    async def __aenter__(self) -> _CleanCloseWS:
+        return _CleanCloseWS(self._code)
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_reraises_received_recycle_close_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean, server-sent 1001 must reach ``serve_tunnel``, not vanish.
+
+    ``ws.recv()`` swallows an OK close code (``ConnectionClosedOK``) by
+    design; a server-initiated recycle needs that code to escape so the
+    reconnect loop can classify it and use the spread-jitter reconnect
+    instead of treating it as an ordinary quiet clean close.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", lambda *_a, **_kw: _CleanCloseCtx(1001))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+
+    with pytest.raises(ConnectionClosedOK):
+        await _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="ws://127.0.0.1:8000/v1/runners/runner_recycle/tunnel",
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_recycle",
+            runner_version="0.1.0",
+        )
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_swallows_non_recycle_clean_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain 1000 close still ends the read loop quietly, as before.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", lambda *_a, **_kw: _CleanCloseCtx(1000))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+
+    # No exception -> the function returned normally, same as today's
+    # ``async for`` swallow of an ordinary clean close.
+    await _serve_tunnel_once(
+        _noop_app,
+        tunnel_url="ws://127.0.0.1:8000/v1/runners/runner_clean/tunnel",
+        server_url="http://127.0.0.1:8000",
+        runner_id="runner_clean",
+        runner_version="0.1.0",
+    )
 
 
 @pytest.mark.asyncio
@@ -1790,17 +1909,11 @@ async def test_serve_tunnel_reconnect_uses_fresh_token_not_stale(
     )
 
 
-class _StubWS:
+class _StubWS(_CleanCloseWS):
     """Minimal websocket: accepts the hello frame, then closes immediately."""
 
     async def send(self, _text: str) -> None:
         return None
-
-    def __aiter__(self) -> _StubWS:
-        return self
-
-    async def __anext__(self) -> str:
-        raise StopAsyncIteration
 
 
 class _StubConnect:
