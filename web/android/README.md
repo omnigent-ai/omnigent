@@ -57,6 +57,18 @@ when the bridge methods are absent, so the Android shell omits them for now:
 
 ## Databricks workspaces
 
+Workspace connections authenticate natively before the WebView loads: Android
+opens public-client OAuth in the system browser, keeps the grant in Keystore-backed
+encrypted storage, exchanges it for a `DBAUTH` web session, and installs that
+session into a persistent AndroidX WebKit profile scoped to the workspace origin,
+optional `o`, and client ID. Databricks Apps keep their existing inline platform
+SSO, while other servers keep the generic ticket/poll OIDC flow.
+
+The system WebView must support AndroidX WebKit's multi-profile feature; the app
+fails closed rather than putting workspace cookies in the process-wide default
+profile. Build/App Link setup and the security model are documented in
+[`docs/databricks-oauth.md`](docs/databricks-oauth.md).
+
 A Databricks workspace serves its own landing page at the root and mounts the
 Omnigent SPA at `/omnigent`, so the shell rewrites a **bare** workspace root to
 that mount (`Origins.databricksWorkspaceUiUrl`):

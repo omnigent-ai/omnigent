@@ -27,6 +27,13 @@ class ConnectActivity : ComponentActivity() {
         setContentView(R.layout.activity_connect)
 
         val field = findViewById<EditText>(R.id.server_url)
+        intent.getStringExtra(EXTRA_SERVER_URL)?.let(field::setText)
+        intent.getStringExtra(EXTRA_ERROR)?.let { message ->
+            findViewById<TextView>(R.id.error_text).apply {
+                text = message
+                visibility = View.VISIBLE
+            }
+        }
         findViewById<Button>(R.id.connect).setOnClickListener { connect(field.text.toString()) }
         field.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_GO) {
@@ -53,6 +60,7 @@ class ConnectActivity : ComponentActivity() {
         startActivity(
             Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(MainActivity.EXTRA_USER_INITIATED_CONNECT, true)
             },
         )
         finish()
@@ -71,5 +79,10 @@ class ConnectActivity : ComponentActivity() {
             row.setOnClickListener { connect(url) }
             container.addView(row)
         }
+    }
+
+    companion object {
+        const val EXTRA_SERVER_URL = "ai.omnigent.android.SERVER_URL"
+        const val EXTRA_ERROR = "ai.omnigent.android.CONNECT_ERROR"
     }
 }

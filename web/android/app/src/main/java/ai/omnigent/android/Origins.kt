@@ -48,12 +48,9 @@ enum class ServerAuthentication {
     OIDC,
     ;
 
-    /**
-     * Current routing policy. Workspace native OAuth is activated separately;
-     * until then this preserves the existing inline Databricks authentication.
-     */
+    /** Only Databricks Apps retain embedded platform SSO. */
     val usesInWebViewAuth: Boolean
-        get() = this != OIDC
+        get() = this == DATABRICKS_APP
 }
 
 /** Path the Omnigent SPA is mounted at inside a Databricks workspace. */

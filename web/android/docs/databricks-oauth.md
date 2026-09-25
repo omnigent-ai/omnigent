@@ -1,9 +1,8 @@
 # Databricks OAuth on Android
 
 The Android app uses a public-client Databricks OAuth flow for workspace-hosted
-Omnigent. The protocol, browser callback, and credential layers are intentionally separate
-from WebView activation so they can be reviewed before a workspace stops using
-its existing inline login.
+Omnigent. It authenticates, creates the platform web session, and installs that
+session into an isolated persistent WebView profile before loading the page.
 
 Databricks Apps are a different server type and retain inline platform SSO.
 Generic Omnigent servers retain the existing ticket/poll OIDC flow.
@@ -140,5 +139,38 @@ As on iOS, an app process loss between remote refresh rotation and local durable
 write can still require a fresh sign-in because those operations cannot be
 atomic.
 
-This file will be expanded by the WebView-profile, recovery, and sign-out layers
-as they are activated.
+## Session bootstrap and WebView isolation
+
+A workspace connection does not load its URL first and infer authentication from
+redirects. The native coordinator obtains a current grant, then issues
+`GET /auth/session/create` with the bearer on the first request only. Redirects
+are followed manually for at most eight hops and must remain on supported HTTPS
+Databricks workspace domains without changing an explicit workspace ID.
+
+The operation maintains its own cookie jar. It validates cookie domain/path scope
+and requires the final page to have a nonempty `DBAUTH` cookie marked Secure and
+HttpOnly. Login-page landings, unsafe redirects, missing cookies, and unexpected
+HTTP responses fail before a WebView loads. A cached access token rejected with
+HTTP 401 is refreshed and retried once; other failures do not trigger that retry.
+The intended Omnigent path, query, fragment, and workspace hint survive the
+exchange.
+
+Each credential scope maps to a stable AndroidX WebKit profile name. The WebView
+is bound to that profile before its first use. Cookie installation is serialized
+per profile, clears stale profile cookies, writes the validated session cookies,
+flushes them, and reads `DBAUTH` back before navigation. Other server types keep
+the default profile. If the installed Android System WebView does not expose the
+multi-profile feature, workspace login fails with an update prompt rather than
+sharing the default cookie jar.
+
+Android's `CookieManager` cannot enumerate every stored cookie attribute after
+installation. Secure/HttpOnly/domain/path properties are therefore validated on
+the native `Set-Cookie` response before install; readback verifies the resulting
+name/value at the final page URL.
+
+On relaunch, a saved grant bootstraps silently. Missing credentials show an
+explicit Sign In action instead of opening the browser without user input. An
+explicit connection may start browser sign-in immediately. Cancellation returns
+to setup with the entered workspace preserved. Authentication navigation and
+main-frame 401/403 currently fail back to setup; bounded in-place recovery and
+local sign-out are layered on the same coordinator/profile primitives.
