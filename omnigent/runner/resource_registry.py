@@ -651,6 +651,19 @@ class SessionResourceRegistry:
         with self._lock:
             return self._terminal_roles.get((session_id, terminal_id))
 
+    def session_has_required_terminal(self, session_id: str) -> bool:
+        """Return True when *session_id* has a required terminal still registered.
+
+        Used by the stream error handler to decide whether to wait briefly for
+        an asynchronous terminal-exit event before attributing a transport drop.
+        """
+        with self._lock:
+            return any(
+                lifecycle == TerminalLifecycle.REQUIRED
+                for (sid, _), lifecycle in self._terminal_lifecycles.items()
+                if sid == session_id
+            )
+
     def list_resources(
         self,
         session_id: str,

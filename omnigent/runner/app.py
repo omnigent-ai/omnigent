@@ -560,6 +560,22 @@ _SESSION_STREAM_HEARTBEAT_S = 15.0
 # wait is bounded and the stream failure is then attributed to the exit.
 _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
 
+# How long the stream error handler waits for an asynchronous terminal-exit
+# event before falling back to the generic connection-error. The terminal
+# watcher runs on a background thread (poll interval 0.2 s for claude-native)
+# and may detect the pane death up to ~0.6 s after the harness stream drops
+# (3 consecutive failing probes). Waiting here bridges that gap so a stream
+# drop caused by the pane dying surfaces the exit diagnostics, not a bare
+# transport error.
+_TERMINAL_EXIT_ATTRIBUTION_GRACE_S = 1.0
+
+# How long a deferred terminal-exit failure waits, after the harness release,
+# for the severed stream's own error handler to consume the recorded exit
+# before this path publishes it itself. Bridges the case where the turn
+# stream ends cleanly (no exception) before the release runs, which would
+# otherwise leave the recorded exit unconsumed and the session never failed.
+_TERMINAL_EXIT_FALLBACK_PUBLISH_GRACE_S = 0.5
+
 # Banner printed by Claude Code on a voluntary /exit or /quit (exit 0).
 # The pane activity from printing it can flip the idle memo back to "running"
 # before the pane dies, making session_was_idle False on a user-initiated quit.
@@ -3460,7 +3476,21 @@ def create_runner_app(
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
         return message
 
-    def _release_required_terminal_session(session_id: str) -> None:
+    def _release_required_terminal_session(
+        session_id: str,
+        *,
+        fallback_error: dict[str, str] | None = None,
+    ) -> None:
+        """Release the session's harness subprocess after a required-terminal exit.
+
+        :param fallback_error: When the caller deferred publishing this exit's
+            failure to the severed stream's own error handler, the same error
+            object recorded in ``_required_terminal_exit_errors``. If that
+            handler never runs (the turn stream ended cleanly before this
+            release could sever it), this path publishes the failure itself
+            once it is sure no one else will — identity-checked so a newer
+            exit's error is never clobbered.
+        """
         if process_manager is None:
             return
 
@@ -3480,6 +3510,34 @@ def create_runner_app(
                     session_id,
                     extra={"session_id": session_id},
                 )
+            if fallback_error is None:
+                return
+            # Give a stream severed by the release above a bounded moment to
+            # consume the recorded exit through its own error handler.
+            fb_deadline = time.monotonic() + _TERMINAL_EXIT_FALLBACK_PUBLISH_GRACE_S
+            while (
+                _required_terminal_exit_errors.get(session_id) is fallback_error
+                and time.monotonic() < fb_deadline
+            ):
+                await asyncio.sleep(0.05)
+            if _required_terminal_exit_errors.get(session_id) is not fallback_error:
+                # Consumed by the stream handler (or superseded by a newer
+                # exit) — this path must not publish or double-report.
+                return
+            _required_terminal_exit_errors.pop(session_id, None)
+            _publish_event(
+                session_id,
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": fallback_error,
+                },
+            )
+            _mark_subagent_terminal_and_wake(
+                session_id,
+                status="failed",
+                output=fallback_error["message"],
+            )
 
         task = asyncio.create_task(
             _release(),
@@ -3549,6 +3607,13 @@ def create_runner_app(
             error.get("message"),
             extra={"session_id": event.session_id},
         )
+        if event.session_id in _live_response_id and process_manager is not None:
+            # An active turn stream is open: the stream error handler will find
+            # _required_terminal_exit_errors and publish exactly one failure.
+            # If that stream instead ends cleanly before the release below
+            # severs it, the release's own fallback publishes this exit.
+            _release_required_terminal_session(event.session_id, fallback_error=error)
+            return
         _publish_event(
             event.session_id,
             {
@@ -9734,6 +9799,17 @@ def create_runner_app(
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
+                if _exit_error is None and resource_registry.session_has_required_terminal(
+                    conv_id
+                ):
+                    # The terminal watcher runs on a background thread and may
+                    # detect the pane death slightly after the stream drops.
+                    # Wait briefly so a dying pane surfaces its own diagnostics
+                    # rather than a bare transport error.
+                    _attr_deadline = time.monotonic() + _TERMINAL_EXIT_ATTRIBUTION_GRACE_S
+                    while _exit_error is None and time.monotonic() < _attr_deadline:
+                        await asyncio.sleep(0.05)
+                        _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
                 if _exit_error is not None:
                     # The runner ended this stream itself: the session's required
                     # terminal exited and its handler released the harness
