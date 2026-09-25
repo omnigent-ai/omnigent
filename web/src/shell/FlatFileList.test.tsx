@@ -5,6 +5,7 @@ const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.r
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { ROW_STATUS_SLOT_CLASS } from "./fileStatusUtils";
 import { FlatFileList } from "./FlatFileList";
 
 afterEach(cleanup);
@@ -66,7 +67,7 @@ describe("FlatFileList runner-offline state", () => {
 });
 
 describe("FlatFileList status / download alignment", () => {
-  it("does not show a file-size label", () => {
+  it("shows file size using the same caption treatment as the Files tree", () => {
     renderList({
       files: [
         {
@@ -81,13 +82,10 @@ describe("FlatFileList status / download alignment", () => {
       ],
     });
 
-    expect(screen.queryByText(/\bKB\b/)).not.toBeInTheDocument();
+    expect(screen.getByText("2.0 KB")).toHaveClass("text-sm", "text-muted-foreground");
   });
 
-  it("overlays the download button on the status letter so both share one slot", () => {
-    // The status letter and the hover download button occupy the same relative
-    // container: the letter reserves the width and the button overlays it
-    // (absolute inset-0), so the button appears exactly where the letter was.
+  it("keeps status separate while actions replace the far-right file size", () => {
     renderList({
       files: [
         {
@@ -103,11 +101,12 @@ describe("FlatFileList status / download alignment", () => {
     });
 
     const letter = screen.getByText("M");
-    const slot = letter.parentElement;
-    expect(slot).toHaveClass("relative");
-    // The letter hides on hover but keeps its width to avoid a layout shift.
-    expect(letter).toHaveClass("group-hover:invisible");
+    expect(letter.parentElement).toHaveClass(ROW_STATUS_SLOT_CLASS);
 
+    const size = screen.getByText("2.0 KB");
+    const slot = size.parentElement;
+    expect(slot).toHaveClass("relative");
+    expect(size).toHaveClass("group-hover:invisible");
     const download = screen.getByRole("button", { name: /download app\.ts/i });
     const overlay = download.closest("span.absolute") as HTMLElement | null;
     expect(overlay).not.toBeNull();

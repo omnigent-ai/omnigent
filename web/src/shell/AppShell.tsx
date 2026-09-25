@@ -1,5 +1,14 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
@@ -103,7 +112,7 @@ import { GithubPanel } from "./GithubPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
-import { useSettingsRoute } from "./settingsNav";
+import { HEADERLESS_SECTIONS, useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -123,6 +132,11 @@ import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
+
+// Dev-only preview; lazy so the sample data never ships in production bundles.
+const ImportContextPreview = import.meta.env.DEV
+  ? lazy(() => import("@/components/onboarding/ImportContextPreview"))
+  : null;
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -269,7 +283,11 @@ export function AppShell() {
   // reintroduce the trap: by then the title-bar toggle is back and the Back row
   // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
   // stashes and restores the same state around the maximize flow.
-  const { inSettings } = useSettingsRoute();
+  const { inSettings, section } = useSettingsRoute();
+  // Only hide the header while the sidebar is open — it carries the
+  // sidebar-reopen control, so hiding it with the sidebar closed strands the
+  // user with no way back. Mirrors extensionOwnsHeader above.
+  const hideHeader = inSettings && HEADERLESS_SECTIONS.includes(section) && sidebarOpen;
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (inSettings) {
@@ -780,13 +798,16 @@ export function AppShell() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(
-      rootSessionId,
-      inlinePanelMinWidth,
-      sidebarOpen ? sidebarWidth : 0,
-      rootSessionResolved,
-    );
+  const {
+    panelWidth: inlinePanelWidth,
+    handleProps: inlinePanelHandleProps,
+    isDragging: inlinePanelResizing,
+  } = useResizableInlinePanel(
+    rootSessionId,
+    inlinePanelMinWidth,
+    sidebarOpen ? sidebarWidth : 0,
+    rootSessionResolved,
+  );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -1148,6 +1169,9 @@ export function AppShell() {
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
     setRightRailTab((tab) => {
+      // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
+      // gated nav tab — always valid, and never a fallback target.
+      if (tab === "sidechat") return tab;
       if (railTabsAvailable[tab]) return tab;
       return (
         (["files", "changes", "github", "subagents", "browser"] as const).find(
@@ -1593,20 +1617,15 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // A `/side` fork the user just opened: reveal it in the Agents rail on the
-  // SIDE CHAT itself, and leave the main chat's rail untouched. `ChatPage`
-  // navigates off `redirectToConversationId`; the rail tab is per-conversation,
-  // so we wait until the router has actually landed on the child
-  // (`conversationId === sideChatRailRequest`) before switching the tab —
-  // otherwise the tab would persist onto the main chat we're leaving.
-  const sideChatRailRequest = useChatStore((s) => s.sideChatRailRequest);
-  const clearSideChatRailRequest = useChatStore((s) => s.clearSideChatRailRequest);
+  // A side chat the user just opened must be visible: reveal the Workspace rail
+  // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
+  // clearing the one-shot `sideChatToOpen` signal (it holds the side-chat tab
+  // state, like the browser tabs); AppShell only ensures the rail is open.
+  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   useEffect(() => {
-    if (sideChatRailRequest === null) return;
-    if (conversationId !== sideChatRailRequest) return;
-    handleRightRailTabChange("subagents");
-    clearSideChatRailRequest();
-  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange, conversationId]);
+    if (sideChatToOpen === null) return;
+    setRightPanelOpen(true);
+  }, [sideChatToOpen]);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -2119,6 +2138,7 @@ export function AppShell() {
             renders inline in main (via MainTerminalView) and the
             workspace card stays visible alongside. */}
               <div
+                data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
@@ -2131,7 +2151,7 @@ export function AppShell() {
                   } as CSSProperties
                 }
               >
-                {!extensionOwnsHeader && (
+                {!extensionOwnsHeader && !hideHeader && (
                   <ChatHeader
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
@@ -2237,12 +2257,14 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && workspacePanelVisible && (
+                {conversationId && hasRailContent && (
                   <WorkspacePanel
                     conversationId={conversationId}
                     pending={pendingConversation}
                     width={inlinePanelWidth}
-                    inert={inlinePanelWidth === 0}
+                    inert={!workspacePanelVisible || inlinePanelWidth === 0}
+                    open={workspacePanelVisible}
+                    resizing={inlinePanelResizing}
                     handleProps={inlinePanelHandleProps}
                     rightRailTab={rightRailTab}
                     onRightRailTabChange={handleRightRailTabChange}
@@ -2364,6 +2386,7 @@ export function AppShell() {
               {serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
+                    viewport="mobile"
                     open
                     conversationId={serverConversationId}
                     path={selectedFilePath}
@@ -2434,6 +2457,12 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          {/* Dev-only `?import-preview` for the post-setup import modal. */}
+          {ImportContextPreview && (
+            <Suspense fallback={null}>
+              <ImportContextPreview />
+            </Suspense>
+          )}
           {/* Global command palette (⌘K). Ungated so it works on every route
               and in embedded mode — the sidebar's "Search" button opens it
               there even though the ⌘K hotkey is disabled (it belongs to the
@@ -2451,7 +2480,7 @@ export function AppShell() {
           {/* Match the previous toast system's effectively unbounded stack so
               security prompts cannot be hidden behind ordinary notifications. */}
           <Toaster
-            position="bottom-right"
+            position="top-center"
             visibleToasts={100}
             offset={{
               right: "1rem",

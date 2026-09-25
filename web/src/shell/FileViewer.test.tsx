@@ -120,6 +120,10 @@ vi.mock("./MonacoDiffViewer", () => ({
 
 // ── Mock hooks ────────────────────────────────────────────────────────────────
 
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: vi.fn(() => false),
+}));
+
 vi.mock("@/hooks/useComments", () => ({
   useComments: vi.fn(),
   useAddComment: vi.fn(() => ({ mutate: vi.fn() })),
@@ -176,6 +180,7 @@ vi.mock("@/store/chatStore", () => ({
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
@@ -285,6 +290,7 @@ beforeEach(() => {
   // localStorage. Clear it between tests so a preference written by one test
   // can't leak into another that asserts the hardcoded defaults.
   localStorage.clear();
+  vi.mocked(useIsMobileViewport).mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -583,6 +589,71 @@ describe("FileViewer prev/next navigation order", () => {
 });
 
 describe("FileViewer URL sync — diff param", () => {
+  it.each(
+    [false, true].flatMap((isMobile) =>
+      ["file1.py", "notes.md"].map((path) => ({ isMobile, path })),
+    ),
+  )(
+    "only the active viewer writes the $path URL through resizing (mobile=$isMobile)",
+    async ({ isMobile, path }) => {
+      await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+        () =>
+          ({
+            data: { available: true, data: [{ path, name: path, status: "modified", bytes: 10 }] },
+          }) as ReturnType<typeof useWorkspaceChangedFiles>,
+        async () => {
+          vi.mocked(useIsMobileViewport).mockReturnValue(isMobile);
+          useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+          const client = new QueryClient();
+          function Viewers() {
+            return (
+              <QueryClientProvider client={client}>
+                <MemoryRouter initialEntries={[`/?file=${path}`]}>
+                  <LocationDisplay />
+                  {(["desktop", "mobile"] as const).map((viewport) => (
+                    <div key={viewport} data-testid={viewport}>
+                      <FileViewer
+                        viewport={viewport}
+                        open
+                        path={path}
+                        conversationId="conv_1"
+                        onClose={vi.fn()}
+                      />
+                    </div>
+                  ))}
+                </MemoryRouter>
+              </QueryClientProvider>
+            );
+          }
+          const { rerender } = render(<Viewers />);
+          const first = within(screen.getByTestId(isMobile ? "mobile" : "desktop"));
+          const second = within(screen.getByTestId(isMobile ? "desktop" : "mobile"));
+          fireEvent.click(first.getByRole("button", { name: "Show diff" }));
+          expect(await first.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(second.queryByTestId("diff-viewer")).toBeNull();
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+
+          // Resizing transfers URL ownership without changing either viewer's mode.
+          vi.mocked(useIsMobileViewport).mockReturnValue(!isMobile);
+          rerender(<Viewers />);
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+          fireEvent.click(second.getByRole("button", { name: "Show diff" }));
+          expect(await second.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+          fireEvent.click(second.getByRole("button", { name: "Exit diff view" }));
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+          expect(first.getByTestId("diff-viewer")).toBeInTheDocument();
+
+          vi.mocked(useIsMobileViewport).mockReturnValue(isMobile);
+          rerender(<Viewers />);
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+          fireEvent.click(first.getByRole("button", { name: "Exit diff view" }));
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+        },
+      );
+    },
+  );
+
   it("restores the active diff param after another navigation replaces the search params", async () => {
     function FileNavigation() {
       const [, setParams] = useSearchParams();
@@ -1610,7 +1681,11 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
   // keybinding — the keybinding needs editor focus and doesn't fire inside the
   // managed same-root embed, so cmd+f silently did nothing there. These assert
   // that a Cmd/Ctrl+F flips the toggle FileViewer hands each surface.
+  let platform: string;
+
   beforeEach(() => {
+    platform = "MacIntel";
+    vi.spyOn(navigator, "platform", "get").mockImplementation(() => platform);
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
   });
 
@@ -1625,9 +1700,24 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
   });
 
   it("opens find on the code surface with Ctrl+F (Windows/Linux)", () => {
+    platform = "Linux x86_64";
     renderViewer({ open: true, path: "file1.py" });
     fireEvent.keyDown(window, { key: "f", ctrlKey: true });
     expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("does not intercept Ctrl+F on macOS", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(searchOpenOf("code-viewer")).toBe("false");
   });
 
   it("opens find in the diff view with Cmd+F", async () => {

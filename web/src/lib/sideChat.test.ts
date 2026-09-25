@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { isSideChatCommand, supportsSideChat } from "./sideChat";
+import { isSideChatCommand, supportsSideChat, usesNativeSideChatFork } from "./sideChat";
 
 describe("isSideChatCommand", () => {
   it("matches a /side command with a question", () => {
@@ -17,14 +17,24 @@ describe("isSideChatCommand", () => {
 });
 
 describe("supportsSideChat", () => {
-  it("enables side chat for codex-native", () => {
+  it("enables side chat for every harness (generic fork-and-continue)", () => {
     expect(supportsSideChat("codex-native")).toBe(true);
+    expect(supportsSideChat("claude-native")).toBe(true);
+    expect(supportsSideChat("codex-sdk")).toBe(true);
   });
 
-  it("is off for harnesses not yet onboarded, and for absent harness", () => {
-    expect(supportsSideChat("claude-native")).toBe(false);
-    expect(supportsSideChat("codex-sdk")).toBe(false);
+  it("is off only when there is no harness", () => {
     expect(supportsSideChat(null)).toBe(false);
     expect(supportsSideChat(undefined)).toBe(false);
+    expect(supportsSideChat("")).toBe(false);
+  });
+});
+
+describe("usesNativeSideChatFork", () => {
+  it("is on only for codex-native (its in-process ephemeral fork)", () => {
+    expect(usesNativeSideChatFork("codex-native")).toBe(true);
+    expect(usesNativeSideChatFork("claude-native")).toBe(false);
+    expect(usesNativeSideChatFork("codex-sdk")).toBe(false);
+    expect(usesNativeSideChatFork(null)).toBe(false);
   });
 });

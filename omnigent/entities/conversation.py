@@ -248,6 +248,7 @@ class Conversation:
     session_todos: list[dict[str, Any]] = field(default_factory=list)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    inference_snapshot: dict[str, Any] | None = None
     reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
@@ -661,6 +662,11 @@ class RoutingDecisionData(BaseModel):
         must still round-trip through stored rows and the wire instead
         of failing validation. ``None`` on rows written before the
         field existed.
+    :param task_description: Human label of the task/spawn this decision
+        governed, e.g. ``"Research auth flows"`` — what ties a fan-out's
+        decision to its sub-agent when every spawn shares one
+        :attr:`agent` type. ``None`` when the spawn carried none, and on
+        rows written before the field existed.
     """
 
     model: str
@@ -676,6 +682,7 @@ class RoutingDecisionData(BaseModel):
     raw_model: str | None = None
     attempted_override: str | None = None
     router_source: str | None = None
+    task_description: str | None = None
 
     @field_validator("model")
     @classmethod

@@ -33,6 +33,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
@@ -1024,6 +1025,7 @@ def test_remote_resume_omits_app_server_permission_config(
     overrides = (
         'approval_policy="never"',
         'sandbox_mode="danger-full-access"',
+        "sandbox_workspace_write.network_access=false",
         'model_provider="test-provider"',
     )
     assert codex_native_app_server.build_codex_remote_args(
@@ -1043,6 +1045,184 @@ def test_remote_resume_omits_app_server_permission_config(
         "ws://127.0.0.1:9876",
         "thread_test",
     ]
+
+
+@pytest.mark.parametrize("config_flag", ["-c", "--config", "-c=", "--config="])
+@pytest.mark.parametrize(
+    ("assignment", "expected_config"),
+    [
+        (
+            "sandbox_workspace_write.network_access=false",
+            {"sandbox_workspace_write.network_access": False},
+        ),
+        (
+            'sandbox_workspace_write.writable_roots=["/tmp/test-workspace"]',
+            {"sandbox_workspace_write.writable_roots": ["/tmp/test-workspace"]},
+        ),
+        (
+            "sandbox_workspace_write={network_access=false, exclude_tmpdir_env_var=true}",
+            {"sandbox_workspace_write": {"network_access": False, "exclude_tmpdir_env_var": True}},
+        ),
+        ("network.enabled=false", {"network.enabled": False}),
+        (
+            "permissions.restricted.network.enabled=false",
+            {"permissions.restricted.network.enabled": False},
+        ),
+        (
+            "network.proxy_url=http://127.0.0.1:8080",
+            {"network.proxy_url": "http://127.0.0.1:8080"},
+        ),
+        (
+            "permissions={restricted={network={enabled=false}}}",
+            {"permissions": {"restricted": {"network": {"enabled": False}}}},
+        ),
+        ("network.enabled=not-a-boolean", {"network.enabled": "not-a-boolean"}),
+        (
+            "network.proxy_url= 'http://127.0.0.1:8080 ",
+            {"network.proxy_url": "http://127.0.0.1:8080"},
+        ),
+        (
+            "sandbox_workspace_write.writable_roots=[",
+            {"sandbox_workspace_write.writable_roots": "["},
+        ),
+        (
+            "sandbox_workspace_write={network_access=false,network_access=true}",
+            {"sandbox_workspace_write": "{network_access=false,network_access=true}"},
+        ),
+        (
+            "network.proxy_url= \"'http://127.0.0.1:8080'\"' ",
+            {"network.proxy_url": "http://127.0.0.1:8080"},
+        ),
+    ],
+)
+def test_remote_resume_transfers_permission_config_to_preload(
+    monkeypatch: pytest.MonkeyPatch,
+    config_flag: str,
+    assignment: str,
+    expected_config: dict[str, object],
+) -> None:
+    fake_client = _FakeCodexAppServerClient()
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    config_args = (
+        (config_flag + assignment,) if config_flag.endswith("=") else (config_flag, assignment)
+    )
+    launch_args = ("--sandbox", "workspace-write", "--ask-for-approval", "never", *config_args)
+
+    asyncio.run(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:9876", "thread_test", terminal_launch_args=launch_args
+        )
+    )
+
+    assert fake_client.requests == [
+        (
+            "thread/resume",
+            {
+                "threadId": "thread_test",
+                "excludeTurns": True,
+                "sandbox": "workspace-write",
+                "approvalPolicy": "never",
+                "config": expected_config,
+            },
+        )
+    ]
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=(0, 155, 0),
+    ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=(0, 153, 1),
+    ) == [*launch_args, "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=(0, 155, 0),
+    ) == [*launch_args, "--remote", "ws://127.0.0.1:9876"]
+
+
+def test_remote_resume_merges_permission_config_without_dropping_profile() -> None:
+    launch_args = (
+        "--sandbox",
+        "workspace-write",
+        "-c",
+        "default_permissions=restricted",
+        "-c",
+        "permissions.restricted.network.enabled=false",
+        "-c",
+        "network.enabled=true",
+        "--config=network.enabled=false",
+        "-c",
+        'model="test-model"',
+    )
+
+    assert codex_native_app_server._codex_resume_permission_params(launch_args) == {
+        "permissions": "restricted",
+        "config": {"permissions.restricted.network.enabled": False, "network.enabled": False},
+    }
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+    ) == ["-c", 'model="test-model"', "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+
+
+@pytest.mark.parametrize(
+    ("assignments", "expected_config"),
+    [
+        (
+            ("network.enabled=false", "network={enabled=true}"),
+            {"network": {"enabled": True}},
+        ),
+        (
+            ("network={enabled=true,proxy_port=8080}", "network.enabled=false"),
+            {"network": {"enabled": False, "proxy_port": 8080}},
+        ),
+        (
+            (
+                "permissions={restricted={network={enabled=true}}}",
+                "permissions.restricted.network.enabled=false",
+            ),
+            {"permissions": {"restricted": {"network": {"enabled": False}}}},
+        ),
+        (
+            (
+                "permissions.restricted.network.enabled=true",
+                "permissions.restricted={network={enabled=false}}",
+                "permissions.restricted.network.proxy_port=8080",
+            ),
+            {"permissions.restricted": {"network": {"enabled": False, "proxy_port": 8080}}},
+        ),
+        (
+            ("permissions.restricted=false", "permissions.restricted.network.enabled=false"),
+            {"permissions.restricted": {"network": {"enabled": False}}},
+        ),
+    ],
+)
+def test_remote_resume_preserves_overlapping_permission_config_order(
+    assignments: tuple[str, ...], expected_config: dict[str, object]
+) -> None:
+    launch_args = (
+        "--sandbox",
+        "workspace-write",
+        *(f"-c={assignment}" for assignment in assignments),
+    )
+    assert codex_native_app_server._codex_resume_permission_params(launch_args) == {
+        "sandbox": "workspace-write",
+        "config": expected_config,
+    }
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=launch_args,
+        thread_id="thread_test",
+        remote_url="ws://127.0.0.1:9876",
+    ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
 
 
 @pytest.mark.parametrize("codex_cli_version", [(0, 136, 0), (0, 153, 0), (0, 153, 1)])
@@ -1075,8 +1255,13 @@ def test_remote_resume_preserves_legacy_bypass_args(
 @pytest.mark.parametrize(
     "args",
     [
-        ("--add-dir", "/extra-workspace"),
-        ("--config", "sandbox_workspace_write.network_access=false"),
+        ("--config", "sandbox_workspace_write.network_access=1979-05-27"),
+        ("--config", "network.proxy_port=nan"),
+        ("--config", "network.proxy_port=inf"),
+        ("--config", "permissions.restricted={network={enabled=1979-05-27}}"),
+        ("--config", "network.enabled"),
+        ("--config", "networking.enabled=false"),
+        ("--config", "permissions_extra.enabled=false"),
         ("--full-auto",),
         ("-c", "approvals_reviewer=false"),
         ("--config", 'sandbox_mode=""'),
@@ -2423,6 +2608,7 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
 
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
@@ -2433,6 +2619,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     thread, and send subsequent status/history events to the new AP
     session.
     """
+    caplog.set_level("INFO", logger="omnigent.harnesses.codex_native.forwarder")
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -2604,6 +2791,13 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         for _, payload in posted_events
         if payload["type"] == "external_conversation_item"
     ] == ["after clear"]
+
+    readiness = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"
+    ]
+    assert len(readiness) == 1
+    assert readiness[0].session_id == "conv_new"
+    assert readiness[0].attributes["runner_id"] == "runner_123"
 
 
 def test_forwarder_rotation_failure_preserves_old_target(
@@ -6388,7 +6582,10 @@ def _capture_handler(posted: list[dict[str, Any]]) -> Callable[[httpx.Request], 
 
 
 async def _replay_completed_item(
-    item: dict[str, Any], handler: Callable[..., httpx.Response]
+    item: dict[str, Any],
+    handler: Callable[..., httpx.Response],
+    *,
+    bridge_dir: Path = Path("/tmp"),
 ) -> None:
     """
     Drive one Codex ``item/completed`` notification through the forwarder.
@@ -6404,7 +6601,7 @@ async def _replay_completed_item(
         await codex_native_forwarder._handle_event(
             client,
             session_id="conv_123",
-            bridge_dir=Path("/tmp"),
+            bridge_dir=bridge_dir,
             usage_coalescer=_usage_coalescer(client),
             elicitation_tracker=_elicitation_tracker(),
             event={
@@ -6669,6 +6866,99 @@ def test_forwarder_posts_codex_file_change_tool_call() -> None:
     }
     # Output summarizes each change as "<kind> <path>" from real fields.
     assert posted[1]["data"]["item_data"]["output"] == "add /repo/greeting.py"
+
+
+def test_forwarder_sends_file_change_to_observer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed fileChange reaches the non-git workspace registry relay."""
+    (tmp_path / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}),
+        encoding="utf-8",
+    )
+    observed: list[dict[str, Any]] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def urlopen(request: Any, *, timeout: float) -> Response:
+        assert request.full_url == "http://relay.local/hook/observe-tool"
+        assert request.headers["Authorization"] == "Bearer relay-secret"
+        assert timeout == 2
+        observed.append(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(codex_native_forwarder.urllib.request, "urlopen", urlopen)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path != "/hook/observe-tool"
+        return httpx.Response(202, json={"queued": False})
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": "call_patch",
+                "changes": [
+                    {"path": "/repo/new.py", "kind": {"type": "add"}, "diff": "new"},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": "old"},
+                ],
+                "status": "completed",
+            },
+            handler,
+            bridge_dir=tmp_path,
+        )
+    )
+
+    assert observed == [
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "changes": [
+                    {"path": "/repo/new.py", "kind": {"type": "add"}},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}},
+                ]
+            },
+            "tool_response": {"type": "success"},
+        }
+    ]
+
+
+@pytest.mark.parametrize("status", ["failed", "declined"])
+def test_forwarder_does_not_observe_unsuccessful_file_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """Failed or declined patches must not create phantom change records."""
+    (tmp_path / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_native_forwarder.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail("unsuccessful patch reached file observer"),
+    )
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": f"call_patch_{status}",
+                "changes": [{"path": "/repo/not-applied.py", "kind": {"type": "add"}}],
+                "status": status,
+            },
+            lambda _request: httpx.Response(202, json={"queued": False}),
+            bridge_dir=tmp_path,
+        )
+    )
 
 
 def test_forwarder_posts_codex_web_search_tool_call() -> None:
@@ -8242,6 +8532,7 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
         )
 
     assert captured.get("developer_instructions") == "Be a concise, careful coding assistant."
+    assert captured["session_id"] == "conv_fresh_di"
 
 
 @pytest.mark.asyncio
@@ -11120,6 +11411,66 @@ async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
 
 
 @pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_restores_a_zip_outside_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """A cold rollout rebuild downloads ZIP files without changing the checkout."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    codex_home = tmp_path / "bridge" / "codex-home"
+    zip_bytes = b"PK\x03\x04 resumed zip"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/resources/files/file_zip/content"):
+            return httpx.Response(200, content=zip_bytes)
+        if path.endswith("/resources/files/file_zip"):
+            return httpx.Response(
+                200,
+                json={"id": "file_zip", "name": "bundle.zip", "content_type": "application/zip"},
+            )
+        item = {
+            "id": "msg_user_1",
+            "response_id": "codex_turn_1",
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_file", "file_id": "file_zip", "filename": "bundle.zip"},
+                {"type": "input_text", "text": "unpack this"},
+            ],
+        }
+        return httpx.Response(200, json={"data": [item], "has_more": False})
+
+    transport = httpx.MockTransport(handler)
+    expected = attachment_cache_dir(codex_home.parent) / "bundle.zip"
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for attempt in range(2):
+            rollout = await codex_native._ensure_local_codex_resume_rollout(
+                client,
+                session_id="conv_codex",
+                external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+                codex_home=codex_home,
+                workspace=workspace,
+                model_provider="omnigent_databricks",
+                codex_path=None,
+            )
+            assert expected.read_bytes() == zip_bytes
+            assert list(workspace.iterdir()) == []
+            if attempt == 0:
+                expected.unlink()
+
+    expected = attachment_cache_dir(codex_home.parent) / "bundle.zip"
+    assert expected.read_bytes() == zip_bytes
+    records = [json.loads(line) for line in rollout.read_text(encoding="utf-8").splitlines()]
+    user_item = next(r["payload"] for r in records if r["type"] == "response_item")
+    assert user_item["content"] == [
+        {"type": "input_text", "text": f"[Attached: {expected}]"},
+        {"type": "input_text", "text": "unpack this"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
     tmp_path: Path,
 ) -> None:
@@ -11933,6 +12284,254 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
         and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
     ]
     assert len(post_items) == 1
+
+
+def test_rollout_records_preserve_function_call_completed_after_compaction() -> None:
+    """A delayed tool output keeps its pre-compaction function call."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_abandoned",
+                "response_id": "codex_turn_abandoned",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"abandoned-command"}',
+                "call_id": "call_abandoned",
+            },
+            {
+                "id": "fc_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"slow-command"}',
+                "call_id": "call_slow",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after compaction",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    calls = [item for item in replacement_history if item.get("type") == "function_call"]
+    assert calls == [
+        {
+            "id": "fc_slow",
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": '{"cmd":"slow-command"}',
+            "call_id": "call_slow",
+        }
+    ]
+    outputs = [
+        record["payload"]
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"].get("type") == "function_call_output"
+    ]
+    assert outputs == [
+        {
+            "id": "fco_slow",
+            "type": "function_call_output",
+            "call_id": "call_slow",
+            "output": "finished after compaction",
+        }
+    ]
+
+
+def test_rollout_records_do_not_duplicate_function_call_in_compaction() -> None:
+    """A compaction snapshot that already has the open call remains unchanged."""
+    function_call = {
+        "id": "fc_slow",
+        "type": "function_call",
+        "name": "exec_command",
+        "arguments": '{"cmd":"slow-command"}',
+        "call_id": "call_slow",
+    }
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {**function_call, "response_id": "codex_turn_slow"},
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [function_call],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after compaction",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    assert [
+        item.get("call_id") for item in replacement_history if item.get("type") == "function_call"
+    ] == ["call_slow"]
+
+
+def test_rollout_records_preserve_function_call_across_repeated_compactions() -> None:
+    """An open call survives every compaction before its delayed output."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"slow-command"}',
+                "call_id": "call_slow",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "cmp_2",
+                "response_id": "compact_2",
+                "type": "compaction",
+                "summary": "slow command is still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after both compactions",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    compacted_records = [record for record in records if record["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    replacement_history = compacted_records[0]["payload"]["replacement_history"]
+    assert [
+        item.get("call_id") for item in replacement_history if item.get("type") == "function_call"
+    ] == ["call_slow"]
+    assert [
+        record["payload"].get("call_id")
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"].get("type") == "function_call_output"
+    ] == ["call_slow"]
+
+
+def test_rollout_records_do_not_carry_interrupted_call_across_compaction() -> None:
+    """An interrupted tool interaction is absent from resumed history."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"cancelled-command"}',
+                "call_id": "call_cancelled",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "cancelled command was still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "function_call_output",
+                "call_id": "call_cancelled",
+                "output": "finished after cancellation",
+            },
+            {
+                "id": "msg_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "message",
+                "role": "assistant",
+                "interrupted": True,
+                "content": [{"type": "output_text", "text": "cancelled"}],
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    assert not any(
+        item.get("call_id") == "call_cancelled"
+        for item in replacement_history
+        if isinstance(item, dict)
+    )
+    assert not any(
+        record["type"] == "response_item" and record["payload"].get("call_id") == "call_cancelled"
+        for record in records
+    )
 
 
 def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> None:

@@ -983,6 +983,7 @@ def _harness_cli_version_string(
     try:
         completed = subprocess.run(
             [binary, "--version"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1183,6 +1184,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             [argv_binary, *spec.status_args],
             check=False,
             timeout=timeout,
+            # Concurrent probes must not change or restore a shared terminal's input mode.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
         )

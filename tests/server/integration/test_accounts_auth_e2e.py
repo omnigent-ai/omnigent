@@ -494,7 +494,7 @@ async def test_magic_link_mint_and_redeem(
     # Redeem the magic link (follow_redirects=False to inspect the redirect).
     redeem_resp = await client.get(path_q, follow_redirects=False)
     assert redeem_resp.status_code == 302
-    assert redeem_resp.headers["location"] == "/"
+    assert redeem_resp.headers["location"] == "http://localhost:8000/"
     # A session cookie was set on the redirect response.
     assert any("session" in h.lower() for h in redeem_resp.headers.get_list("set-cookie"))
 
@@ -515,7 +515,7 @@ async def test_magic_link_is_single_use(
     # First redeem succeeds.
     first = await client.get(path_q, follow_redirects=False)
     assert first.status_code == 302
-    assert first.headers["location"] == "/"
+    assert first.headers["location"] == "http://localhost:8000/"
 
     # Second redeem fails (token already consumed).
     second = await client.get(path_q, follow_redirects=False)

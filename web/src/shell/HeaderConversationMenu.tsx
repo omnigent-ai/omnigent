@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
   DialogContent,
@@ -207,7 +208,7 @@ export function HeaderConversationMenu({
     // and per-call mutate callbacks don't fire once their observer unmounts.
     // The Undo toast is driven by module state + the app-level Toaster, so it
     // survives this menu unmounting.
-    showArchiveUndoToast(queryClient, [conversation]);
+    showArchiveUndoToast(queryClient, [conversation], navigate);
   };
 
   const mainItems = (
@@ -394,8 +395,9 @@ export function HeaderConversationMenu({
         >
           {isMobile && !projectPickerOpen && (
             <>
-              <DropdownMenuLabel className="truncate px-2.5 pb-1.5 text-foreground">
-                {label}
+              <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
+                <span className="min-w-0 flex-1 truncate">{label}</span>
+                <PresenceAvatars />
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
             </>

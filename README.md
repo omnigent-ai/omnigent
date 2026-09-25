@@ -372,6 +372,11 @@ Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
 
+To suppress the automatic browser tab, use `omni host --no-open` or set
+`OMNIGENT_HOST_NO_OPEN=1` in your shell. Both also apply to `omni host
+--background` and `omni start`. Sign-in may still open a browser; use
+`--non-interactive` in scripts to fail if sign-in is required.
+
 <details>
 <summary>Customize automatic session titles</summary>
 

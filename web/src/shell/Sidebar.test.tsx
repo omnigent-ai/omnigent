@@ -749,6 +749,69 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("session-filter-shared")).toHaveAttribute("aria-checked", "true");
   });
 
+  it("withholds the conversation list until identity is ready", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (identityReady: boolean) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider identityReady={identityReady}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(false));
+
+    expect(screen.queryByTestId("sidebar-conversation-list")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sessions");
+
+    rerender(tree(true));
+    expect(screen.getByTestId("sidebar-conversation-list")).toBeInTheDocument();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+  });
+
+  it("leaves Shared when runtime policy makes it unavailable", () => {
+    localStorage.setItem("omnigent:session-filter", "shared");
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+    ]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (config: SidebarConfig) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider config={config}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(sidebarConfig));
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+
+    rerender(tree({ ...sidebarConfig, sharedAvailable: false }));
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(localStorage.getItem("omnigent:session-filter")).toBe("mine");
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("session-filter-shared")).toBeNull();
+  });
+
   it("drops a persisted Shared filter on a single-user server", () => {
     // "Shared sessions" isn't in the menu on a loopback-only server, so honoring
     // a value stored against a multi-user one would scope the list to a slice
@@ -893,11 +956,13 @@ describe("Sidebar session list", () => {
     expect(search).toHaveAttribute("data-size", "icon-xs");
     expect(search).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(search).not.toHaveClass("rounded-sm");
-    expect(search.querySelector("svg")).toHaveClass("ui-icon");
+    expect(search.querySelector("svg")).toHaveClass("size-4");
+    expect(search.querySelector("svg")).not.toHaveClass("ui-icon");
     expect(settings).toHaveAttribute("aria-label", "Settings");
     expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6", "rounded-[var(--radius-md)]");
-    expect(settings.querySelector("svg")).toHaveClass("ui-icon");
+    expect(settings).toHaveClass("size-6", "rounded-[8px]");
+    expect(settings.querySelector("svg")).toHaveClass("size-4");
+    expect(settings.querySelector("svg")).not.toHaveClass("ui-icon");
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
@@ -1045,11 +1110,13 @@ describe("Sidebar session list", () => {
     const filterSessions = within(sessionsSection!).getByRole("button", {
       name: "Filter sessions",
     });
-    // The filter never fades; its wrapper re-enables hit-testing inside the
-    // pointer-events-gated outer box (see the overlay hit-test spec below).
-    expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
-    expect(filterSessions.parentElement).toHaveClass("pointer-events-auto", "flex");
-    expect(filterSessions.parentElement!.parentElement).toHaveClass("absolute", "right-1", "flex");
+    // The filter never fades; its persistent-action wrapper re-enables hit-testing
+    // inside the pointer-events-gated outer box (see the overlay hit-test spec below).
+    const filterTooltipTrigger = filterSessions.parentElement!;
+    const filterPersistentAction = filterTooltipTrigger.parentElement!;
+    expect(filterTooltipTrigger).not.toHaveClass("md:opacity-0");
+    expect(filterPersistentAction).toHaveClass("pointer-events-auto", "flex");
+    expect(filterPersistentAction.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();

@@ -346,11 +346,15 @@ class ExecutorError(ExecutorEvent):
         call started has already reported its prompt size, and
         discarding it freezes the context-occupancy meter at the
         previous turn's value exactly when the session is in trouble.
+    :param preserve_session: The executor is idle and safe to reuse after this
+        failure. Set only when no prompt or tool work remains in progress.
+        Defaults to ``False`` so failed turns receive normal teardown.
     """
 
     message: str
     retryable: bool = False
     usage: ExecutorUsage | None = None
+    preserve_session: bool = False
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:

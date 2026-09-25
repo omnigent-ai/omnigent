@@ -106,6 +106,41 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+### Pi context files
+
+With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
+and `CLAUDE.md` from the workspace, its ancestors, and Pi's global agent
+directory. To disable this discovery for an agent, set `context_files: false`:
+
+```yaml
+name: focused-agent
+executor:
+  harness: pi
+  context_files: false
+prompt: |
+  Follow these explicit agent instructions.
+```
+
+For a directory bundle using `config.yaml`, place the option in `executor.config`:
+
+```yaml
+spec_version: 1
+name: focused-agent
+executor:
+  type: omnigent
+  config:
+    harness: pi
+    context_files: false
+instructions: AGENTS.md
+```
+
+The default is `true`; the value must be a YAML boolean. Explicit `prompt:` or
+`instructions:` content (including an explicitly referenced `AGENTS.md`) and
+Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
+`--no-context-files` flag. It does not disable skills, extensions, or Pi's
+separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
+or other harnesses.
+
 ### GitHub Copilot
 
 `harness: copilot` runs the agent through the
@@ -198,6 +233,41 @@ acp:
 Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
 app. See the [OpenClaw integration guide](openclaw.md) for registry import,
 Gateway setup, and compatibility details.
+
+To offer a curated model picker for a custom ACP agent, explicitly reference a
+named provider in its agent spec:
+
+```yaml
+executor:
+  harness: acp:helper
+  auth:
+    type: provider
+    name: team-gateway
+```
+
+Configure at least two distinct model IDs in that provider's family `models:`
+map in `config.yaml`, for example `models: {default: model-a, fast: model-b}`.
+Tier aliases resolve to concrete IDs. The provider default leads the picker;
+session selections cannot add models to the configured list. A default-only
+map leaves model switching unrestricted, and an unrelated global default
+provider does not change custom ACP agents. An explicitly selected provider
+must resolve successfully; configuration errors do not remove model restrictions.
+
+With curation enabled, a model pinned in the spec or ACP-agent configuration
+must also appear in the list. An unlisted default prevents launch even when a
+valid override is selected; clearing a selection restores the approved default.
+
+The ACP command still owns its gateway URL and authentication; this provider
+reference supplies model choices, not credentials. Configure matching provider
+definitions on the server and execution host. Select a model from the session
+composer and send a turn to apply it through ACP without losing the live
+session, provided the command supports ACP model switching. If the switch fails,
+the turn reports an error without sending the prompt on the previous model.
+Retrying attempts the switch again in the same session.
+
+Set `OMNIGENT_ACP_ENV_UNSET` on the execution host to a comma-separated list of
+environment variable names to remove from the ACP command's environment. The
+setting propagates through the runner and affects newly spawned commands.
 
 ## Local OS access
 

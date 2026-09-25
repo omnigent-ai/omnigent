@@ -220,7 +220,9 @@ def _find_child_session_id(
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        resp = http_client.get("/v1/sessions", params={"kind": "sub_agent", "limit": 1000})
+        resp = http_client.get(
+            "/v1/sessions", params={"visibility": "all", "kind": "sub_agent", "limit": 1000}
+        )
         resp.raise_for_status()
         for item in resp.json().get("data", []):
             if item.get("title") != child_title:

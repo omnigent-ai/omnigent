@@ -15,10 +15,13 @@ def test_project_orders_migration_round_trip(tmp_path: Path) -> None:
     store = SqlAlchemyProjectStore(uri)
     project = store.create("a" * 32, "Existing", None)
     store.save_order([project.id], user_id=None)
+    config = _build_alembic_config(uri)
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.downgrade(config, "gh1b2c3d4e5f")
     assert "project_orders" not in sa.inspect(engine).get_table_names()
     columns = {column["name"]: column for column in sa.inspect(engine).get_columns("users")}
     assert columns["project_order"]["nullable"] is True
-    config = _build_alembic_config(uri)
     with engine.begin() as connection:
         config.attributes["connection"] = connection
         command.downgrade(config, "gg1b2c3d4e5f")
@@ -48,14 +51,15 @@ def test_project_orders_migration_round_trip(tmp_path: Path) -> None:
                 "FROM users WHERE id = 'local'"
             )
         ).one() == (1, "existing-hash", 123, 456, None)
+        command.upgrade(config, "head")
     assert store.get_order(user_id=None) is None
     assert store.get(project.id, user_id=None) == project
     store.save_order([project.id], user_id=None)
     assert store.get_order(user_id=None) == [project.id]
 
 
-def test_mysql_project_order_column_has_large_capacity() -> None:
-    """Both model bootstrap and Alembic must create a column larger than BLOB."""
+def test_mysql_project_order_migration_retains_original_capacity() -> None:
+    """The historical column stays MEDIUMBLOB; current preferences use BLOB."""
     from importlib import import_module
     from io import StringIO
 
@@ -63,10 +67,10 @@ def test_mysql_project_order_column_has_large_capacity() -> None:
     from alembic.operations import Operations
     from sqlalchemy.dialects import mysql
 
-    from omnigent.db.db_models import SqlUser
+    from omnigent.db.db_models import SqlPreference
 
     dialect = mysql.dialect()
-    assert SqlUser.__table__.c.project_order.type.compile(dialect=dialect) == "MEDIUMBLOB"
+    assert SqlPreference.__table__.c.value.type.compile(dialect=dialect) == "BLOB"
     output = StringIO()
     context = MigrationContext.configure(
         dialect=dialect, opts={"as_sql": True, "output_buffer": output}
