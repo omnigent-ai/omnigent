@@ -4686,6 +4686,41 @@ async def test_post_external_session_status_failed_surfaces_output_and_reauth(
     assert "401 Unauthorized" in error["message"]
 
 
+async def test_post_external_session_status_failure_detail_keeps_native_code(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A harness ``failure_detail`` names the failure without the Codex wire label.
+
+    Claude-native reports its ``StopFailure`` reason this way; the edge must not
+    fall back to the turn's last assistant prose or report no detail at all.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "failure_detail": "API Error: 500 Overloaded"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert published[0][1]["status"] == "failed"
+    error = published[0][1]["error"]
+    assert error is not None
+    assert error["code"] == "native_turn_error"
+    assert error["message"] == "API Error: 500 Overloaded"
+
+
 async def test_post_external_session_status_carries_response_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -5275,7 +5310,10 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
 
     snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
     assert snapshot_resp.status_code == 200, snapshot_resp.text
-    assert snapshot_resp.json()["last_task_error"] == expected
+    assert snapshot_resp.json()["last_task_error"] == {
+        **expected,
+        "agent_name": "claude-native-ui",
+    }
 
 
 async def test_post_external_session_status_propagates_runner_delivery_failure(
@@ -9738,6 +9776,66 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
         after = await client.get(f"/v1/sessions/{session['id']}")
         assert after.json()["items"] == before_items
 
+    finally:
+        await runner_client.aclose()
+
+
+async def test_retry_session_retries_native_terminal_ensure_after_runner_reconnects(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry-session recovery waits for a dropped runner and repeats the terminal ensure."""
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session = await _create_session(client, agent["id"], initial_message="Keep this once")
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.replace_runner_id(session["id"], "native-runner")
+    ensure_requests: list[httpx.Request] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/terminals"):
+            ensure_requests.append(request)
+            if len(ensure_requests) == 1:
+                # What WSTunnelTransport raises when the tunnel dies under the request.
+                raise ConnectionError("tunnel closed before request completed")
+            return httpx.Response(200, json={})
+        return httpx.Response(
+            201, json={"session_init_protocol_version": 2, "terminal_ready": True}
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    )
+    await app.state.runner_session_initializer.initialize(conv, runner_client, timeout=10)
+    wait_for_runner = AsyncMock(return_value=True)
+    monkeypatch.setattr(RunnerRouter, "wait_for_runner", wait_for_runner)
+    monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner_client))
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "retry_session", "data": {}},
+        )
+
+        assert response.status_code == 202, response.text
+        assert response.json()["recovery"] == "native_terminal_ready"
+        # The retry path hands the real router to the probe, which waits for the
+        # session's runner and then repeats the ensure over the new tunnel.
+        wait_for_runner.assert_awaited_once_with(
+            "native-runner",
+            timeout_s=orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S,
+        )
+        assert len(ensure_requests) == 2
     finally:
         await runner_client.aclose()
 

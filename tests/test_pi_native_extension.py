@@ -3047,6 +3047,48 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
+def test_bound_models_use_literal_ids_and_only_managed_providers() -> None:
+    """A raw gateway selection cannot switch to an ambient vendor provider."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  process.env.OMNIGENT_PI_INFERENCE_BOUND = "1";
+  catalog.unshift({ provider: "anthropic", id: "databricks-claude-opus-4-1", hasKey: true });
+  catalog.push({ provider: "omnigent", id: "foo", hasKey: true });
+  catalog.push({ provider: "omnigent-completions", id: "omnigent/foo", hasKey: true });
+  await handlers.session_start({}, ctx);
+  await deliverModelChange("databricks-claude-opus-4-1");
+  await deliverModelChange("omnigent/foo");
+  assert.deepEqual(setModelCalls.map((model) => [model.provider, model.id]), [
+    ["omnigent", "databricks-claude-opus-4-1"],
+    ["omnigent-completions", "omnigent/foo"],
+  ]);
+  const options = posted.find((event) => event.type === "external_model_options").data.models;
+  assert.deepEqual(options.map((model) => model.id), [
+    "databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1", "foo", "omnigent/foo",
+  ]);
+  await handlers.model_select({ source: "set", model: setModelCalls[1] }, ctx);
+  const changes = posted.filter((event) => event.type === "external_model_change");
+  assert.equal(changes[0].data.model, "databricks-claude-sonnet-4-6");
+  assert.equal(changes[1].data.model, "omnigent/foo");
+  await deliverModelChange("anthropic/databricks-claude-opus-4-1");
+  assert.equal(setModelCalls.length, 2);
+  assert.equal(errorItems().length, 1);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
     """A user ``/model`` pick inside Pi posts ``external_model_change`` (two-way sync).
 

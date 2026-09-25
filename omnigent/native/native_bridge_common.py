@@ -119,6 +119,7 @@ def prune_orphaned_dirs(
     """
     if not bridge_root.exists():
         return 0
+    from omnigent.inner.native_attachments import attachment_cache_dir
     from omnigent.inner.terminal import _process_alive
 
     pruned = 0
@@ -149,7 +150,10 @@ def prune_orphaned_dirs(
                 continue
             if confirmed_pid != pid or _process_alive(confirmed_pid):
                 continue
+            cache_dir = attachment_cache_dir(entry)
             shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
             pruned += 1
     return pruned
 
@@ -181,9 +185,20 @@ def reap_orphaned_native_bridge_dirs() -> int:
         module_name = f"omnigent.harnesses.{agent.key}_native.bridge"
         try:
             module = importlib.import_module(module_name)
+        except ImportError:
+            # The harness is simply not importable here — a stdlib module its
+            # bridge needs was not built into this interpreter, an extra is not
+            # installed. Skipping it is the documented behaviour, so it does not
+            # rank as a session error.
+            _logger.warning(
+                "Skipping native bridge module %s in the orphan sweep: not importable",
+                module_name,
+                exc_info=True,
+            )
+            continue
         except Exception:
-            # A broken transitive import must not crash maintenance startup;
-            # skip this harness (matches the per-prune guard below).
+            # The module imported and then raised — a defect in the bridge, not
+            # an absent harness. Still skipped, but worth an error.
             _logger.exception(
                 "Error importing native bridge module %s for orphan sweep",
                 module_name,

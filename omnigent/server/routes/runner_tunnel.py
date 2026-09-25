@@ -162,6 +162,7 @@ def create_runner_tunnel_router(
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -200,6 +201,8 @@ def create_runner_tunnel_router(
         runner-side analog of the host tunnel's ``resolve_launch_token``.
         ``None`` disables the lookup (an unauthenticated non-loopback
         peer is then rejected, the prior behavior).
+    :param mint_managed_runner_token: Accounts-mode issuer that validates the
+        saved runner authority and mints under the account lock.
     :returns: A FastAPI router with the tunnel endpoint.
     """
     router = APIRouter()
@@ -322,15 +325,19 @@ def create_runner_tunnel_router(
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token or token_bound_runner_id(token) != runner_id:
             raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-        owner: str | None = None
-        if resolve_managed_runner_owner is not None:
-            owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
-        if owner is None:
-            # No managed-launch record bound to this runner id: a peer
-            # with a syntactically valid but unrecognized token. Refuse,
-            # the same fail-closed posture as the tunnel handshake.
-            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-        bearer = auth_provider.mint_runner_token(owner, _MANAGED_RUNNER_TOKEN_TTL_S)
+        if mint_managed_runner_token is not None:
+            bearer = await asyncio.to_thread(
+                mint_managed_runner_token, runner_id, _MANAGED_RUNNER_TOKEN_TTL_S
+            )
+            if bearer is None:
+                raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        else:
+            owner: str | None = None
+            if resolve_managed_runner_owner is not None:
+                owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
+            if owner is None:
+                raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+            bearer = auth_provider.mint_runner_token(owner, _MANAGED_RUNNER_TOKEN_TTL_S)
         if bearer is None:
             # oidc/accounts mint; header/proxy mode can't (identity is
             # asserted upstream). Signal clearly rather than 401.

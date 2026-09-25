@@ -93,6 +93,7 @@ runs:
     - name: Install bubblewrap and tmux
       shell: bash
       run: |
+        sudo apt-get update
         sudo apt-get install -y bubblewrap tmux
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 

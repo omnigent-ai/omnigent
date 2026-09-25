@@ -138,6 +138,17 @@ uv run --no-sync pyrefly check               # Python type checking (core and cl
 uv run --no-sync pre-commit run --all-files
 ```
 
+The `session-list-visibility` custom rule checks Python, JavaScript/TypeScript,
+and shell clients for explicit visibility on session-list requests. It follows
+local query builders and same-file helpers; direct server tests and mock
+fixtures are excluded so they can exercise the API's compatibility default.
+Install web dependencies (`pnpm install --frozen-lockfile --filter web`) before
+running the full custom lint, then use
+`uv run --no-sync python -m dev.lint.custom_lint`. A request built outside the
+checker's supported patterns needs a `custom-lint: disable=session-list-visibility
+-- <reason>` comment on its request line (or `disable-next` on the preceding
+line), after verifying that its query builder sends visibility.
+
 When touching `web/`:
 
 ```bash
@@ -374,6 +385,23 @@ request enforces this, so unsigned commits will block merging.
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
+
+### Database migration reviews
+
+Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when
+changing schemas, queries, transactions, or storage code. Polly uses this
+reference in its reviews and treats violations of mandatory requirements as
+blocking findings.
+
+Changes under `omnigent/db/migrations/`, to `omnigent/db/alembic.ini`, or to
+[`.github/CODEOWNERS`](.github/CODEOWNERS) require a GitHub approval from at
+least one of Edwin He (`@Edwinhe03`), Aravind Segu (`@aravind-segu`), Corey
+Zumar (`@dbczumar`), or Bryan Qiu (`@bbqiu`). The reviewer must be someone
+other than the PR author, including for maintainer-authored PRs.
+
+GitHub requests these reviews automatically. The `main-no-force-push` ruleset
+requires code-owner approval and dismisses stale approvals after changes are
+pushed. This requirement is enforced by GitHub alongside the CI checks.
 
 ### Every PR needs an issue
 

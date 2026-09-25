@@ -49,7 +49,11 @@ if TYPE_CHECKING:
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
-from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_aliases import (
+    canonicalize_harness,
+    is_native_harness,
+    native_terminal_name,
+)
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -1806,7 +1810,13 @@ async def _inherited_parent_model(
       worker's author chose that model deliberately;
     - a child harness without model-override plumbing runs its default;
     - a parent model outside the child harness's family (e.g. a Claude
-      selection dispatched to a codex worker) is not forced across vendors.
+      selection dispatched to a codex worker) is not forced across vendors;
+    - a child on a *different harness vendor* than the parent runs its own
+      default unless an inference binding validates the id (see
+      :func:`_child_is_foreign_harness` and
+      :func:`_harness_has_inference_binding`). The parent's model belongs to the
+      parent harness's provider vocabulary, so a foreign harness resolves it
+      against its own provider where it may not be servable.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The parent session id.
@@ -1840,13 +1850,29 @@ async def _inherited_parent_model(
         parent_model = validate_model_override(raw_model)
     except ValueError:
         return None
-    if child_harness is not None and model_family_mismatch(child_harness, parent_model):
-        _logger.debug(
+    if child_harness is not None and _dispatch_model_mismatch(child_harness, parent_model):
+        _logger.info(
             "sys_session_send: not inheriting parent model %r for sub-agent %r "
             "(family mismatch with harness %s); child runs its default",
             parent_model,
             sub_agent_name,
             child_harness,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return None
+    if (
+        child_harness is not None
+        and not _harness_has_inference_binding(child_harness)
+        and _child_is_foreign_harness(child_harness, snap.get("harness"))
+    ):
+        _logger.info(
+            "sys_session_send: not inheriting parent model %r for sub-agent %r "
+            "(child harness %s differs from the parent harness %r); child runs "
+            "its default",
+            parent_model,
+            sub_agent_name,
+            child_harness,
+            snap.get("harness"),
             extra={"session_id": runner_primary_session_id()},
         )
         return None
@@ -2277,6 +2303,96 @@ def _subagent_allowed_harnesses(
     )
 
 
+def _dispatch_model_mismatch(harness: str, model: str) -> str | None:
+    """Treat configured model IDs as opaque; legacy sessions retain family checks."""
+    from omnigent.errors import OmnigentError
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+    )
+
+    config = load_runtime_inference_config()
+    if binding_for_harness(config, harness) is not None:
+        try:
+            resolve_bound_model(config, harness, model)
+        except OmnigentError as exc:
+            return str(exc)
+        return None
+    return model_family_mismatch(harness, model)
+
+
+def _harness_has_inference_binding(harness: str) -> bool:
+    """Whether an inference binding owns *harness*'s model namespace.
+
+    A bound harness resolves ids through ``resolve_bound_model`` at launch
+    (see the opencode/claude launch paths in :mod:`omnigent.runner.app`), so a
+    binding-validated bare id needs no ``provider/`` prefix or Databricks
+    profile; ``_dispatch_model_mismatch`` has already vetted the id against
+    the binding's allowlist by the time inheritance consults this.
+
+    :param harness: The child's resolved harness, e.g. ``"opencode-native"``.
+    :returns: ``True`` when a binding is configured for the harness.
+    """
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    return binding_for_harness(load_runtime_inference_config(), harness) is not None
+
+
+def _harness_vendor_key(canon: str) -> str:
+    """Return a vendor key that unifies a harness's native/SDK spellings.
+
+    Single-vendor harnesses key on their ``ModelFamily`` (claude / gpt / gemini),
+    so ``claude-native``, ``claude-sdk`` and ``claude_sdk`` all collapse to
+    ``"claude"`` and ``codex`` / ``codex-native`` to ``"gpt"``. Multi-model
+    harnesses have no single family, so they key on the base name with
+    ``-native`` dropped (``pi`` ↔ ``pi-native``, ``opencode`` ↔
+    ``opencode-native``). The ``_``→``-`` fold lets the executor-type spelling
+    ``claude_sdk`` resolve to the ``claude-sdk`` capability row.
+
+    :param canon: A canonical harness id, e.g. ``"claude-sdk"``.
+    :returns: The vendor key, e.g. ``"claude"``.
+    """
+    from omnigent.harness_capabilities import ModelFamily
+    from omnigent.harness_plugins import harness_capabilities
+
+    caps = harness_capabilities()
+    cap = caps.get(canon) or caps.get(canon.replace("_", "-"))
+    if cap is not None and cap.model_family is not ModelFamily.MULTI:
+        return cap.model_family.value
+    return native_terminal_name(canon) or canon
+
+
+def _child_is_foreign_harness(child_harness: str, parent_harness: object) -> bool:
+    """
+    Report whether *child_harness* is a different harness vendor than the parent.
+
+    The parent's model belongs to the parent harness's provider vocabulary, so a
+    child on a different harness resolves it against its own provider where it
+    may not be servable — inheritance should skip and let the child use its own
+    default. Vendor identity is :func:`_harness_vendor_key`, which folds a
+    vendor's native/SDK spellings together (``claude-native`` ↔ ``claude-sdk``,
+    ``pi`` ↔ ``pi-native``) so same-vendor children inherit while genuinely
+    different vendors (claude vs gpt vs pi vs opencode) skip. A child whose
+    inference binding validated the id is exempted upstream by
+    :func:`_harness_has_inference_binding`.
+
+    :param child_harness: The child's resolved harness, alias or canonical.
+    :param parent_harness: The parent session's ``harness`` field from its
+        snapshot; a non-string (missing) is treated as "differs".
+    :returns: ``True`` when inheritance should be skipped for this child.
+    """
+    child_canon = canonicalize_harness(child_harness)
+    if child_canon is None:
+        return False
+    parent_canon = (
+        canonicalize_harness(parent_harness) if isinstance(parent_harness, str) else None
+    )
+    if parent_canon is None:
+        return True
+    return _harness_vendor_key(parent_canon) != _harness_vendor_key(child_canon)
+
+
 def _normalize_subagent_model(
     model: str,
     *,
@@ -2302,8 +2418,15 @@ def _normalize_subagent_model(
     :param harness: The child's declared harness, e.g. ``"claude-native"``.
     :returns: The id to persist as ``model_override``.
     """
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
     from omnigent.models.model_catalog import resolve_model_provider
 
+    # ACP commands own their model namespace, even when provider credentials are shared.
+    if canonicalize_harness(harness) == "acp" or (
+        harness is not None
+        and binding_for_harness(load_runtime_inference_config(), harness) is not None
+    ):
+        return model
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None or harness is None:
         return model
@@ -2751,7 +2874,7 @@ async def _execute_subagent_tool(
                     f"{child_harness or 'unknown'!r} has no model-override "
                     "plumbing. Omit 'model' to use the harness default."
                 )
-            mismatch = model_family_mismatch(child_harness, model) if child_harness else None
+            mismatch = _dispatch_model_mismatch(child_harness, model) if child_harness else None
             if mismatch is not None:
                 return (
                     f"Error: sys_session_send 'model' rejected for sub-agent "
@@ -4467,6 +4590,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "permission_mode",
     "workspace",
     "host_id",
+    "execution_target",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4481,6 +4605,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "max_cost_usd",
     "workspace",
     "host_id",
+    "execution_target",
     "state",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -5319,6 +5444,8 @@ async def _agent_list_fetch(
     """
     try:
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+        if path == "/v1/sessions":
+            params["visibility"] = "all"
         if after is not None:
             params["after"] = after
         resp = await server_client.get(path, params=params, timeout=30.0)
@@ -5898,7 +6025,7 @@ async def _collect_global_sessions(
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:

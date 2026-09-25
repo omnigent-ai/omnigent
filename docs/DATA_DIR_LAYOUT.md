@@ -54,6 +54,7 @@ directly instead of going through `data_dir()`.
 |-----------|---------|------------|
 | `logs/` | Process logs split by role: `cli/`, `host/`, `runner/`, `server/`. | `logs_root()` / `process_log_dir()` in `omnigent/process_logging.py` |
 | `artifacts/` | Stored artifacts, one directory per artifact ID; paired with `chat.db`. | `omnigent/chat.py`, `omnigent/host/local_server.py` |
+| `attachments/` | Native harness attachment copies, grouped by an opaque session cache key. The original uploads remain in the server's configured artifact store. | `attachment_cache_dir()` in `omnigent/inner/native_attachments.py` |
 | `runners/` | Runner identity: `runner_id` (stable per-machine id), created by `identity.py`. Also holds per-runner workspace subdirs — `runner_<id>/` and, for token-bound remote `run --server` runners, `runner_token_<hash>/` — each with a `pending-tokens/` dir; those are created by the host/runner launch path, not `identity.py`. | `omnigent/runner/identity.py` (`runner_id`) |
 | `daemons/` | Daemon lifecycle registry, one JSON record per target. | `daemon_registry_dir()` in `omnigent/host/daemon_lifecycle.py` |
 | `crashes/` | Crash reports, `crash-<timestamp>.md`. | `omnigent/crash_handler.py` |
@@ -89,6 +90,41 @@ clean it up:
 3. Remove only the reviewed `bundle-*` and `backup-*` entries in `.staging`,
    repair disk-space or permission problems, and restart the server. Future
    cache misses re-extract bundles from the ArtifactStore.
+
+### Attached files
+
+Claude Code and Codex accept ZIP archives, Office documents (`.docx`, `.xlsx`,
+`.pptx`), and SQLite files (`.db`, `.sqlite`, `.sqlite3`). The composer shows
+ordinary file cards with an icon, filename, type, and size; images keep their
+thumbnail and preview. There is no attachment storage selector or workspace
+badge.
+
+The server keeps the original upload in its configured artifact store and a
+session-owned file record referenced by `file_id`. The runner materializes
+files needed by native harnesses under
+`~/.omnigent/attachments/<session-key>/<filename>`, or
+`$OMNIGENT_DATA_DIR/attachments/<session-key>/<filename>` when overridden. This
+path is on the execution host, which may differ from the server or browser's
+machine. The harness receives an absolute path. Attaching a file adds no file,
+directory, or symlink to the working checkout, and archives are not extracted.
+
+The cache key derives from the session's native bridge path. Claude Code and
+Codex can recreate copies from the artifact store when rebuilding session
+history. Native session cleanup removes the corresponding cache; the cache
+is not the durable copy of an upload. Other native harnesses use the same
+cache for their existing supported attachment types.
+
+Custom sandbox and provider configurations must allow the runner to write
+this cache and the harness's file-reading tools to read the emitted absolute
+path. Permission to read the working directory, or an older bridge-local
+`uploads/` directory, does not grant access to `attachments/`. If the harness
+uses a separate filesystem namespace, expose the session cache at the same
+absolute path. Scope any added access to the required cache, rather than the
+whole data directory, which also contains credentials. Runtime capability
+checks require an updated host/runner; they do not change sandbox access.
+
+See [attachment admission controls](POLICIES.md#attachment-admission-controls)
+for filename-based limits and their scope.
 
 ### Native harness state
 

@@ -134,6 +134,77 @@ without emitting a verdict handoff so the workflow retries. App, network,
 authentication, tooling, sandbox, workspace, timeout, and agent-crash failures
 are never `needs_more_info`. Don't narrate a clean preflight.
 
+## Coordinated reproduction records (optional)
+
+<!-- reproduction-contract:v1 -->
+
+Apply this procedure only when the launcher supplies a read-only report snapshot,
+run identity, plan template, and plan-ready signal format. Otherwise continue the
+normal workflow without a planning pause. The coordinator is automated; do not
+ask a person to register the plan, resume the session, or collect the account.
+
+Use the captured report and dated discussion to reconstruct the journey. Keep
+reported requirements separate from inferences and unknowns. Missing attachments,
+partial discussion, and later clarifications must remain visible; do not rewrite
+the captured report to fit available tools. Additional context you fetch is not
+part of that snapshot: identify its source and limitations rather than presenting
+it as a captured fact.
+
+Before driving the journey or emitting any verdict handoff:
+
+1. Write `.omnigent/reproduction-plan.json` using the supplied template. Separate
+   environment, setup, trigger, and observation. Cite captured source IDs, name
+   substitutions and their limitations, and specify the outcome and observation
+   interval or completion event that would distinguish the bug from expected
+   behavior. Retain unknown or unexercisable requirements rather than dropping
+   them, including when the eventual verdict may be `needs_more_info`.
+2. Emit the supplied plan-ready signal in your final assistant message and end
+   the turn. The coordinator checks and records the plan, then automatically
+   sends either a correction request or a continuation with the accepted plan
+   hash. Do not start executing the journey until that continuation arrives.
+3. If the plan needs to change, preserve its requirement IDs, cite the previous
+   accepted plan hash, explain the revision, and submit it through the same
+   automatic registration step before continuing. Never edit the coordinator's
+   records. On a new run, prior plans and accounts are history; submit a plan for
+   the new run's snapshot even when earlier tests or recordings can be reused.
+
+After the accepted-plan continuation, follow [environment preparation](recipes.md)
+for its environment/setup requirements. Inspect the prepared runtime and bootstrap
+record, install missing tools through the existing setup instructions, configure
+the required host/session, and recheck before driving the reported trigger. Retain
+before/after observations under the same requirement IDs. Keep reported failure
+conditions intact: if missing tools, offline state, or setup itself is the bug,
+exercise that as the journey. Disclose remaining differences in the existing plan
+revision/account; a setup check never verifies journey fidelity or proves the bug.
+
+<!-- reproduction-preparation:v1 -->
+When the coordinator supplies a preparation-only continuation, prepare the
+environment without driving the reported trigger. It supplies this checkout's
+recipe and collects observations before and after preparation. Put requested
+fact comparisons in the plan's `preparation.checks` using existing requirement
+IDs; unknown requirements remain unchecked. Finish with the supplied
+`REPRO_PREPARATION_DONE` signal and the actual selected host ID (or `-` if unknown
+or inapplicable), then wait for the execution continuation. This signals the end
+of preparation, including blocked attempts; it does not assert readiness. Keep
+remaining differences and failed setup attempts explicit. A planned host change
+or changed comparison needs a plan revision. Do not repair reported bad state
+merely to make an environment comparison match.
+
+After execution, write `.omnigent/reproduction-account.json` using the account
+template supplied with the continuation, alongside the normal handoff. Reference
+the current run, snapshot, and accepted plan. Cover every requirement exactly
+once as `exercised`, `substituted`, or `unverified`; describe what actually
+happened, cite evidence, and state limitations. A substitute does not count as
+performing the original action. Identify tested product sessions separately from
+your own repro-agent conversation. Preserve this account before your final
+handoff so the coordinator can collect it automatically.
+
+Registration checks record structure, not whether your interpretation is correct
+or the bug is proven. Your account remains a claim for independent review.
+Preserve uncertainty: missing evidence is unverified, and unsuccessful attempts
+do not by themselves disprove an intermittent report. Continue to follow the
+normal environment, evidence, recording, and verdict requirements below.
+
 ## Step 1 — Reconstruct the user journey
 
 Rebuild what the **user actually did** from the bug report at `bug_url` — not
@@ -151,18 +222,66 @@ investigation attempt. It means the **report itself** omits product information
 required to define or execute the reproduction—never that your turn, tools,
 credentials, environment, or infrastructure failed.
 
-**The journey is user-observable only — an ordered list of actions a user
-takes.** Write it as concrete numbered steps, each one an action the user
-performs or a state they change (setup/config, launch, UI interaction,
-environment toggles like VPN or network, sending a message), ending in the
-failure they observe. A good report's "Steps to reproduce" is exactly this
-shape — e.g.:
+**Write a manual reproduction recipe a reader can follow without opening the
+test, recording, or earlier messages.** Keep it user-observable and use concrete
+numbered steps, with one action or closely related action group per step:
 
+- Start with the prerequisites: the build/version actually tested, surface,
+  harness, required authentication/configuration, and starting state (for
+  example, a fresh session versus an existing one). Include only relevant
+  details in one or two short sentences; explicitly mark unknown requirements
+  instead of inventing them. Put fixture setup and CI configuration in evidence.
+- Name the screen, control, agent, or command to use, and provide the exact
+  input/message or a concrete safe example. Explain how to create any required
+  data. Avoid vague instructions such as "use the feature" or "trigger the bug."
+- For a UI bug, write the clicks and typing a person performs in the app, using
+  visible control names. For example: "Choose `hello_world`, select Grok Build
+  in the harness picker, and create a new session." Do not substitute a POST
+  request, JSON payload, runner binding, session ID placeholder, or test selector
+  for those actions. Commands belong here only when the user's actual surface
+  is a terminal/CLI or the setup requires the user to run them.
+- Keep each step short and use ordinary language: "read the model label next
+  to the composer settings button," not "wait for data-testid to hydrate from
+  the snapshot." Keep protocol events, internal field names, mock executables,
+  fixture environment variables, and persistence explanations in `evidence`.
+  Retain one plain-language caveat when a stand-in limits the result.
+- Spell out order and timing that matter: before sending the first message,
+  wait until the reply finishes, reload, reopen, or switch sessions. Include a
+  duration or observable completion condition for waits.
+- At the step where the symptom appears, say exactly where to look and include
+  **Expected:** and **Observed:** results. Describe the visible value, error, or
+  behavior, not just "it fails."
+- Keep the original failure and any follow-up/regression checks distinct. For
+  multiple symptoms, label each recipe and its result. State what you actually
+  observed on the running build; label steps or outcomes inferred from the
+  report as unverified. If already fixed, distinguish the reported old failure
+  from the passing result you observed. Do not imply you tested an older build.
+- If automation created state through an API or used a mock, verify the manual
+  UI path before calling that recipe reproduced. Otherwise label it **Manual
+  steps not verified**, describe what was actually exercised in `evidence`,
+  and preserve the applicable verdict/environment-fidelity rules. Do not turn
+  automated setup into claimed clicks or a mock response into a real reply.
+
+For example (use the actual tested build and results in your response):
+
+```markdown
+### Steps to reproduce — wrong model label in a new session
+
+Prerequisites: Grok Build is installed and authenticated on your host.
+
+1. Open Omnigent on the tested build (include its version or commit).
+2. Choose an agent whose spec pins a model, such as `hello_world`.
+3. Select **Grok Build** in the harness picker and create a new session.
+4. Open the session **before sending any message**.
+5. Read the model/harness label next to the composer settings button.
+   - **Expected:** the label shows **Grok Build**.
+   - **Observed:** the label shows the agent's pinned model instead.
 ```
-1. create session A and run one command
-2. create session B and run one command in terminal (different than A)
-3. select session A → terminal still displays session B's output
-```
+
+Retain this level of detail in the final response and the `journey` handoff
+field (see Output); an arrow-separated summary alone is insufficient.
+Before handing off, read the recipe as a person opening the app: they should
+know what to click, type, and look for without understanding the test harness.
 
 Every step is something a user *does* or *toggles*. The journey does **not**
 contain the internal mechanism (which function is called, which state isn't
@@ -466,8 +585,13 @@ choice:
   recording results, atomically rewrite it, and emit that same object in the
   final fence. The checkpoint and final block must not disagree.
 
-- You may write comprehensive prose above the block (a human-readable summary,
-  the journey, the per-facet notes) — that's fine and encouraged. Then, as the
+- Before the test source and JSON block, include a **Steps to reproduce**
+  section using the manual recipe from Step 1: prerequisites, numbered actions,
+  and expected/observed results at the relevant step. This section is required,
+  even when a recording is available. For `needs_more_info` or
+  `needs_manual_review`, include the known steps and clearly identify missing
+  information or unverified steps; do not invent a successful reproduction.
+  You may also include a brief verdict and per-facet notes. Then, as the
   last thing before the JSON block, paste the **complete, verbatim source of the
   e2e test(s) you authored** as a fenced, path-labelled code block — the whole
   file, never truncated or elided with `# ...` placeholders — so the reproduction
@@ -475,9 +599,8 @@ choice:
   **context, not the contract**: everything the parser needs lives *inside* the
   JSON block, and the ```json block is the **last chunk** of the message, with
   nothing after its closing fence.
-- Do **not** split the artifacts across separate sections or headers (no lone
-  "Reproduction Verdict" / "Journey" / "Facets" blocks standing in for the
-  handoff, and no second data block). Whatever you also say in prose, the single
+- The human-readable sections do not replace the handoff, and there must be no
+  second data block. Whatever you also say in prose, the single
   ```json block below carries the complete, self-contained handoff.
 - Emit that block as **JSON**, never YAML. One ` ```json ` fence, one JSON
   object.
@@ -514,7 +637,7 @@ choice:
   "environment_fidelity": "real",
   "missing_information": [],
   "session_id": "dc59e331-...",
-  "journey": "open model picker → select catalog → picker shows raw IDs",
+  "journey": "Prerequisites: running web build, a new session, and an available catalog.\n1. Open the model picker in the session composer.\n2. Select the available catalog.\n3. Read the model names in the picker.\n   Expected: readable model names.\n   Observed: raw model IDs instead of names.",
   "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
 }
 ```
@@ -560,14 +683,14 @@ Field meanings:
 - `session_id` — **this session** (in the app), from `sys_session_get_info`, so
   the fix step can replay how you reproduced it and you can browse it at
   `<server>/c/<session_id>`.
-- `journey` — the reconstructed **user-observable** journey: the ordered user
-  actions from Step 1, compacted to one line by joining the numbered steps with
-  ` → `, ending in the observed failure, e.g. `create session A + run a command →
-  create session B + run a different command → select session A → terminal still
-  shows B's output`. Each segment is an action the user takes or a state they
-  toggle. Keep the internal mechanism (function calls, uncleared state, leaked
-  subscriptions, timeouts) **out** of this field — that is root cause and goes in
-  `facets`/`evidence`, not here.
+- `journey` — a string containing the same complete manual reproduction recipe
+  as the **Steps to reproduce** section: prerequisites, numbered user actions,
+  exact inputs, relevant timing, and expected/observed results. Preserve line
+  breaks as `\n` escapes in valid JSON; do not compact the steps into an
+  arrow-separated summary or change this field to an array. Include labeled
+  recipes for separate facets and distinguish verified results from reported
+  or unverified outcomes. Keep the internal mechanism (function calls, uncleared
+  state, leaked subscriptions, timeouts) in `facets`/`evidence`.
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
@@ -595,8 +718,8 @@ Field meanings:
     Text-only CLI output is not a reason to skip recording.
   - Do not substitute a video of test output or a made-up demonstration.
 
-Keep the prose before the block terse — the one exception is the full test
-source, which you paste in full. You produce the live-confirmed reproduction +
+Keep other prose terse, but include the full manual reproduction recipe and
+the full test source. You produce the live-confirmed reproduction +
 the test; the fix step takes it from here. You take no further
 action — no fix, no merge, no push.
 

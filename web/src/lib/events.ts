@@ -68,6 +68,8 @@ export interface ResponseCompleted {
 export interface ResponseFailed {
   type: "response_failed";
   response: Response;
+  /** Where the failure originated, when supplied by the server. */
+  source?: string;
 }
 
 /** `response.incomplete` — stopped early. */

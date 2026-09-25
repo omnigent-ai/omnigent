@@ -18,7 +18,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/compact": "Compact conversation context to free up space",
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
-  "/model": "Switch the model for this session: /model <name> | default",
+  "/model": "Switch the model for this session: /model <name>",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
     "Start a side chat: an ephemeral fork opened as its own sub-agent chat, kept out of this conversation",

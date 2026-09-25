@@ -228,10 +228,12 @@ async def test_registration_failure_terminates_allocated_sandbox(
         )
     )
 
-    with pytest.raises(RuntimeError) as caught:
+    with pytest.raises(HTTPException) as caught:
         await launch_managed_host(config=deployment, owner="pool-user", host_store=host_store)
 
-    assert caught.value is failure
+    assert caught.value.status_code == 502
+    assert caught.value.__cause__ is failure
+    assert "database registration failed" in caught.value.detail
     assert len(launcher.provisioned_names) == 1
     assert launcher.terminated == ["sb-fake-1"]
     assert launcher.host_starts == []

@@ -30,6 +30,8 @@ from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
+from omnigent.db.account_authority import AccountAuthority, require_active_account
+from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
@@ -42,6 +44,7 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
+    SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
     uuid_to_bytes,
@@ -82,7 +85,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
-from omnigent.errors import StaleCursorError
+from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
@@ -103,6 +106,12 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     SessionConnectivity,
     pinned_label_key,
+)
+from omnigent.stores.conversation_store.overrides import (
+    decode_session_overrides as _decode_session_overrides,
+)
+from omnigent.stores.conversation_store.overrides import (
+    encode_session_overrides as _encode_session_overrides,
 )
 
 _logger = logging.getLogger(__name__)
@@ -169,53 +178,6 @@ class _RowCountResult(Protocol):
     rowcount: int
 
 
-# Per-session config overrides packed into the ``conversations.session_overrides``
-# JSON blob. Order is fixed so the encoded object is stable across writes.
-_SESSION_OVERRIDE_KEYS = (
-    "reasoning_effort",
-    "model_override",
-    "reported_model",
-    "cost_control_mode_override",
-    "subagent_routing_override",
-    "harness_override",
-    # Stored as the string ``"on"`` when the owner shares workspace files
-    # with view-level collaborators; absent (SQL NULL blob key) otherwise.
-    "share_workspace_files",
-)
-
-
-def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
-    """Pack the set per-session overrides into a compact JSON blob.
-
-    Omits keys whose value is ``None`` and returns ``None`` when nothing is
-    set, so a session on all agent/spec defaults stores SQL ``NULL`` rather
-    than an empty object. Only the :data:`_SESSION_OVERRIDE_KEYS` are
-    considered; any other keys in *overrides* are ignored.
-
-    :param overrides: Mapping of override key to value (missing / ``None``
-        values mean "unset").
-    :returns: Compact JSON object string, or ``None`` when no override is set.
-    """
-    data = {
-        key: overrides[key] for key in _SESSION_OVERRIDE_KEYS if overrides.get(key) is not None
-    }
-    return json.dumps(data, separators=(",", ":")) if data else None
-
-
-def _decode_session_overrides(raw: str | None) -> dict[str, str | None]:
-    """Unpack the ``session_overrides`` blob to a full override dict.
-
-    Every one of the :data:`_SESSION_OVERRIDE_KEYS` is present in the
-    result (unset keys read back as ``None``) so read-modify-write callers can
-    treat the dict uniformly regardless of which overrides were stored.
-
-    :param raw: The stored JSON blob, or ``None``.
-    :returns: Dict keyed by every override name, value ``None`` when unset.
-    """
-    data: dict[str, Any] = json.loads(raw) if raw else {}
-    return {key: data.get(key) for key in _SESSION_OVERRIDE_KEYS}
-
-
 def _to_conversation(
     row: SqlConversation,
     meta: SqlConversationMetadata | None = None,
@@ -268,6 +230,11 @@ def _to_conversation(
         session_todos=session_todos,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
+        inference_snapshot=(
+            json.loads(meta.inference_snapshot)
+            if meta and meta.inference_snapshot is not None
+            else None
+        ),
         reported_model=overrides["reported_model"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
@@ -351,6 +318,17 @@ def _new_session_conversation_row(
     )
 
 
+def _validate_inference_snapshot(value: str | None) -> None:
+    """Reject snapshots that cannot fit a MySQL BLOB before writing either database."""
+    stored = compress_text(value)
+    if stored is not None and len(stored) > 65_535:
+        raise OmnigentError(
+            "Inference snapshot exceeds the 65,535-byte compressed storage limit. "
+            "Reduce the configured model catalog or allowlist.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def _new_session_metadata_row(
     conversation_id: str,
     parent_conversation_id: str | None = None,
@@ -359,6 +337,7 @@ def _new_session_metadata_row(
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
     host_id: str | None = None,
+    inference_snapshot: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -376,6 +355,7 @@ def _new_session_metadata_row(
         must supply ``workspace`` alongside it (the
         ``workspace_required_for_host`` check constraint enforces the
         pairing). ``None`` leaves the column NULL.
+    :param inference_snapshot: Pre-encoded JSON configuration saved for this session.
     :returns: Unsaved :class:`SqlConversationMetadata` row.
     """
     return SqlConversationMetadata(
@@ -384,6 +364,7 @@ def _new_session_metadata_row(
         runner_id=runner_id,
         project_id=project_id,
         host_id=host_id,
+        inference_snapshot=inference_snapshot,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -398,6 +379,7 @@ def _new_session_agent_row(
     agent_bundle_location: str,
     agent_description: str | None,
     now: int,
+    created_by: str | None = None,
 ) -> SqlAgent:
     """
     Build the session-scoped agent row for atomic creation.
@@ -407,6 +389,9 @@ def _new_session_agent_row(
     :param agent_bundle_location: Artifact-store key for the bundle.
     :param agent_description: Optional description from the spec.
     :param now: Unix epoch seconds used for the created field.
+    :param created_by: Identity of the creating user, recorded so
+        agent-code mutation can be restricted to the owner. ``None`` in
+        single-user mode.
     :returns: Unsaved :class:`SqlAgent` row.
     """
     return SqlAgent(
@@ -417,6 +402,7 @@ def _new_session_agent_row(
         version=1,
         kind=encode_agent_kind("session"),
         description=agent_description,
+        created_by=created_by,
     )
 
 
@@ -985,6 +971,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1055,6 +1042,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         encoded_terminal_launch_args = (
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         )
+        encoded_inference_snapshot = (
+            json.dumps(inference_snapshot) if inference_snapshot is not None else None
+        )
         try:
             # Get parent's root from AP, then write AP row and Omnigent meta separately.
             root_id = new_id
@@ -1069,6 +1059,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                             f"parent conversation {parent_conversation_id!r} does not exist"
                         )
                     root_id = parent_row.root_conversation_id
+                if inference_snapshot is None:
+                    parent_meta = self._get_meta(parent_conversation_id)
+                    encoded_inference_snapshot = (
+                        parent_meta.inference_snapshot if parent_meta else None
+                    )
+            _validate_inference_snapshot(encoded_inference_snapshot)
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
 
@@ -1128,6 +1124,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     workspace=workspace,
                     git_branch=git_branch,
                     terminal_launch_args=encoded_terminal_launch_args,
+                    inference_snapshot=encoded_inference_snapshot,
                     project_id=project_id,
                 )
                 meta_sess.add(meta)
@@ -1644,6 +1641,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "sqlite" or is_postgresql_family(dialect):
                 self._upsert_daily_cost_dialect(session, dialect, user_id, day_utc, delta_usd, now)
@@ -1809,6 +1807,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "sqlite" or is_postgresql_family(dialect):
                 # Typed as Any to sidestep the mypy variance between the
@@ -1874,20 +1873,38 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param owner_only: Require an explicit owner-level grant.
         :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
         """
+        owner = self.get_session_owner_authority(conversation_id, owner_only=owner_only)
+        return owner.user_id if owner is not None else None
+
+    def get_session_owner_authority(
+        self, conversation_id: str, *, owner_only: bool = False
+    ) -> AccountAuthority | None:
+        """Read the owner grant and registration together, including external identities."""
         from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
 
         query = (
-            select(SqlSessionPermission.user_id)
+            select(SqlSessionPermission.user_id, SqlUser.account_generation)
+            .outerjoin(
+                SqlUser,
+                and_(
+                    SqlUser.workspace_id == SqlSessionPermission.workspace_id,
+                    SqlUser.id == SqlSessionPermission.user_id,
+                ),
+            )
             .where(SqlSessionPermission.workspace_id == current_workspace_id())
             .where(SqlSessionPermission.conversation_id == conversation_id)
             .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
+            .where(SqlUser.deleted_at.is_(None))
             .order_by(SqlSessionPermission.level.desc())
             .limit(1)
         )
         if owner_only:
             query = query.where(SqlSessionPermission.level >= LEVEL_OWNER)
         with self._session("select_session_owner") as session:
-            return session.execute(query).scalar_one_or_none()
+            row = session.execute(query).one_or_none()
+            if row is None:
+                return None
+            return AccountAuthority(row.user_id, row.account_generation, current_workspace_id())
 
     def search(
         self,
@@ -3965,12 +3982,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
+        created_by: str | None = None,
     ) -> CreatedSession:
         """
         Insert a conversation row and session-scoped agent.
@@ -4020,6 +4040,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             bundled create with a caller-supplied host can launch a
             runner on it, mirroring the JSON create path. Requires a
             non-``None`` ``workspace``.
+        :param created_by: Identity of the creating user, recorded on the
+            session-scoped agent so its code can only be mutated by the
+            owner. ``None`` in single-user mode.
         :returns: A :class:`CreatedSession` with both entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -4034,12 +4057,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             title=title,
             labels=labels,
             reasoning_effort=reasoning_effort,
+            model_override=model_override,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
             project_id=project_id,
             host_id=host_id,
+            inference_snapshot=inference_snapshot,
+            created_by=created_by,
         )
 
     def _create_session_with_agent_with_id(
@@ -4053,12 +4079,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
+        created_by: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -4066,7 +4095,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         from omnigent.stores.conversation_store import ConversationNotFoundError
 
         now = now_epoch()
-        encoded_overrides = _encode_session_overrides({"reasoning_effort": reasoning_effort})
+        encoded_overrides = _encode_session_overrides(
+            {
+                "reasoning_effort": reasoning_effort,
+                "model_override": model_override,
+            }
+        )
+        encoded_inference_snapshot = (
+            json.dumps(inference_snapshot) if inference_snapshot is not None else None
+        )
         prepared_labels = dict(labels) if labels else {}
 
         # Conversation + labels go to AP; agent + metadata go to Omnigent.
@@ -4082,6 +4119,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                         f"parent conversation {parent_conversation_id!r} does not exist"
                     )
                 root_conversation_id = parent_row.root_conversation_id
+            if inference_snapshot is None:
+                parent_meta = self._get_meta(parent_conversation_id)
+                encoded_inference_snapshot = (
+                    parent_meta.inference_snapshot if parent_meta else None
+                )
+
+        _validate_inference_snapshot(encoded_inference_snapshot)
 
         def insert_ap(ap_sess: Session) -> SqlConversation:
             conversation_row = _new_session_conversation_row(
@@ -4108,6 +4152,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             session: Session,
         ) -> tuple[SqlConversationMetadata, SqlAgent]:
             agent_row = _new_session_agent_row(
+                created_by=created_by,
                 agent_id=agent_id,
                 agent_name=agent_name,
                 agent_bundle_location=agent_bundle_location,
@@ -4122,6 +4167,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 workspace=workspace,
                 terminal_launch_args=terminal_launch_args,
                 host_id=host_id,
+                inference_snapshot=encoded_inference_snapshot,
             )
             session.add(agent_row)
             session.add(meta_row)
@@ -4165,6 +4211,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
+        created_by: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -4288,6 +4335,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             session-scoped file resources the caller copies into the fork.
             Copied items referencing a mapped id are rewritten to the
             fork's copy; ``None`` or empty copies every payload verbatim.
+        :param created_by: Identity of the forking user, recorded on the
+            cloned session-scoped agent (when a clone is created) so its
+            code can only be mutated by the owner. ``None`` in single-user
+            mode, or when the fork binds an existing agent (no clone).
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -4318,6 +4369,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             up_to_response_id=up_to_response_id,
             project_id=project_id,
             file_id_map=file_id_map,
+            created_by=created_by,
         )
 
     def _fork_conversation_with_id(
@@ -4346,6 +4398,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
+        created_by: str | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -4363,6 +4416,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             source_meta_ref: SqlConversationMetadata | None = meta_sess.get(
                 SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
             )
+
+        _validate_inference_snapshot(
+            source_meta_ref.inference_snapshot if source_meta_ref else None
+        )
 
         with self._conv_session("prepare_fork_conversation") as session:
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
@@ -4723,6 +4780,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 id=new_conv_id,
                 kind=encoded_default_kind,
                 terminal_launch_args=source_terminal_args,
+                inference_snapshot=(
+                    source_meta_ref.inference_snapshot if source_meta_ref else None
+                ),
                 project_id=project_id,
             )
             meta_sess.add(fork_meta)
@@ -4737,6 +4797,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         version=1,
                         kind=encoded_session_agent_kind,
                         description=cloned_agent_description,
+                        created_by=created_by,
                     )
                 )
             return fork_meta
@@ -4859,6 +4920,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     session.flush()
 
             session.add(
+                # created_by is left unset. A switch only binds a vetted
+                # built-in, and an unowned session-scoped agent is admin-only to
+                # mutate (see require_agent_owner), so a shared editor who
+                # switches cannot then edit the replacement. Assigning the
+                # session owner here is left to a full switch implementation.
                 SqlAgent(
                     id=new_agent_id,
                     created_at=now,
