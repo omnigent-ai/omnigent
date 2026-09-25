@@ -39,6 +39,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.runner.session_status import SessionStatusBook, StatusSource
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -283,6 +284,15 @@ def _monotonic() -> float:
 _UNSAFE_SESSION_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 
+def _is_native_role(role: str | None) -> bool:
+    """Whether a terminal role marks a runner-owned native agent pane."""
+    if role is None:
+        return False
+    from omnigent.harness_aliases import is_native_harness
+
+    return is_native_harness(role)
+
+
 def _sanitize_session_id(session_id: str) -> str:
     """Sanitize a session id for safe use as a filesystem path component.
 
@@ -372,6 +382,7 @@ class SessionResourceRegistry:
         runner_workspace: Path | None = None,
         *,
         per_session_workspace: bool = False,
+        status_clock: Callable[[], float] | None = None,
     ) -> None:
         self._terminal_registry = terminal_registry
         self._runner_workspace = runner_workspace
@@ -397,24 +408,20 @@ class SessionResourceRegistry:
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
         self._session_status_publisher: Callable[[str, str, str | None], None] | None = None
-        # Latest PTY-derived status (running/idle) per session. Lets
-        # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
-        # mid-turn crash. Written from the watcher thread and the turn-start
-        # hook; all access goes through the ``_*_session_status_memo`` helpers
-        # under ``self._lock``.
-        self._last_session_status: dict[str, str] = {}
-        self._session_activity_epoch: dict[str, int] = {}
-        self._active_session_turns: set[str] = set()
-        # Last status *edge published to the server* per session, shared by the
-        # watcher and the native forwarders' hook-derived edges so the two
-        # dedup against one baseline. Kept separate from the exit memo above,
-        # which the turn-start hook also writes — deduping against that one
-        # would swallow the turn's real ``running``.
-        self._published_session_status: dict[str, tuple[str, str | None]] = {}
+        # The runner's one record of each session's status. Every edge is
+        # recorded here at observation time (see ``SessionStatusBook``); the
+        # exit-classification memo is a projection of it.
+        self.status_book = SessionStatusBook(clock=status_clock or time.monotonic)
+        # What the server has heard: the last status edge delivered per session,
+        # shared by the watcher and the forwarders' relayed edges so the two
+        # dedup against one baseline. Wire-delivery bookkeeping only, never a
+        # status source — read ``status_book`` for the session's status.
+        self._server_delivery_baseline: dict[str, tuple[str, str | None]] = {}
         # Live claude-native status-file pollers, per session. Held so a
         # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
         # poller keeps its own edge/mtime baselines on the watcher thread, and
         # clearing the registry's baseline alone would leave those intact.
+        # custom-lint: disable-next=session-status-single-source -- poller objects, not statuses
         self._status_pollers: dict[str, SessionStatusPoller] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
@@ -426,6 +433,16 @@ class SessionResourceRegistry:
         # instead of polling. Entries self-remove on completion.
         self._terminal_exit_tasks: set[asyncio.Task[None]] = set()
         self._terminal_exit_scheduled: asyncio.Event = asyncio.Event()
+        # A native pane's sidecars (forwarder, relay, vendor server) stay keyed
+        # by the session that launched it. After a ``/clear``-style rotation
+        # transfers the pane, this maps its new owner to that launching session.
+        self._sidecar_homes: dict[str, str] = {}
+        # A session whose moved TUI was lost while the launching session's
+        # vendor server still ran its turn, mapped to that launching session.
+        # Releasing the launching session's sidecars resets it (see
+        # :meth:`reset_statuses_kept_for`), as it does the launching session's own.
+        # A pane of its own or a new runner turn takes its status over instead.
+        self._vendor_turn_homes: dict[str, str] = {}
 
     def set_terminal_activity_publisher(
         self,
@@ -500,24 +517,113 @@ class SessionResourceRegistry:
     def _set_session_status_memo(
         self, session_id: str, status: str, *, record_activity: bool = True
     ) -> None:
-        """Record the session's latest PTY status for exit classification."""
-        with self._lock:
-            if record_activity and status in {"running", "waiting"}:
-                self._active_session_turns.add(session_id)
-                self._session_activity_epoch[session_id] = (
-                    self._session_activity_epoch.get(session_id, 0) + 1
-                )
-            if status in {"idle", "failed"}:
-                self._active_session_turns.discard(session_id)
-            self._last_session_status[session_id] = status
+        """Record the session's latest status for exit classification."""
+        self.status_book.note_exit_status(session_id, status, record_activity=record_activity)
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
-        """Pop and return the session's recorded PTY status (or ``None``)."""
+        """Pop and return the session's exit-classification status (or ``None``)."""
         with self._lock:
-            self._active_session_turns.discard(session_id)
-            self._published_session_status.pop(session_id, None)
+            self._server_delivery_baseline.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
-            return self._last_session_status.pop(session_id, None)
+        return self.status_book.take_exit_status(session_id)
+
+    def reset_session_status(self, session_id: str, reason: str) -> None:
+        """Drop a session's per-pane status state after its native pane is gone.
+
+        Clears the status record, the poller and the exit memo so a re-created
+        pane cannot inherit a stale ``running``. Keeps what the server heard
+        (the wire baseline): closing a pane does not change it, and forgetting
+        it would re-send a re-created pane's first edge as a duplicate. The
+        activity epoch survives too: it counts turns across pane lifetimes.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
+        :param reason: Why, for the log, e.g. ``"native_terminal_closed"``.
+        """
+        with self._lock:
+            self._status_pollers.pop(session_id, None)
+        self.status_book.reset(session_id, reason)
+
+    def sidecar_home(self, session_id: str) -> str:
+        """The session whose sidecars serve *session_id*'s native pane.
+
+        Itself, unless the pane arrived by transfer from another session.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_new"``.
+        :returns: e.g. ``"conv_old"`` after a ``/clear`` rotation.
+        """
+        with self._lock:
+            return self._sidecar_homes.get(session_id, session_id)
+
+    def _forget_sidecar_home(self, session_id: str) -> None:
+        with self._lock:
+            self._sidecar_homes.pop(session_id, None)
+
+    def _keep_status_for_vendor_turn(
+        self, session_id: str, role: str | None, lifecycle: TerminalLifecycle | None
+    ) -> bool:
+        """Whether a lost TUI leaves the session's turn running in a vendor server.
+
+        Codex and opencode run each turn in their vendor server (codex
+        app-server, ``opencode serve``) and observe the TUI as auxiliary.
+        Losing that TUI does not end the turn, so the session's status stays
+        until the server is released, which resets it. The server is the one
+        serving the TUI: after a ``/clear`` rotation moved the TUI here, the
+        launching session's, never one this session has of its own. Such a
+        session is remembered under the launching session, whose sidecar
+        release resets it too. Call before :meth:`_forget_sidecar_home`.
+        """
+        if lifecycle is not TerminalLifecycle.AUXILIARY or role is None:
+            return False
+        from omnigent.runner.native.orchestration import native_vendor_server_registered
+
+        home = self.sidecar_home(session_id)
+        if not native_vendor_server_registered(home, role):
+            return False
+        if home != session_id:
+            with self._lock:
+                self._vendor_turn_homes[session_id] = home
+        return True
+
+    def reset_statuses_kept_for(self, home: str, reason: str) -> tuple[str, ...]:
+        """Reset the sessions whose status was kept for *home*'s vendor server.
+
+        Call it whenever *home*'s sidecars are released: the turn a moved TUI
+        left running in that server ends with it, as *home*'s own turn does.
+
+        :param home: The launching session, e.g. ``"conv_old"``.
+        :param reason: Why, for the log, e.g. ``"idle_sidecar_sweep"``.
+        :returns: The sessions reset, e.g. ``("conv_new",)``.
+        """
+        with self._lock:
+            kept = tuple(
+                session_id
+                for session_id, kept_for in self._vendor_turn_homes.items()
+                if kept_for == home
+            )
+            for session_id in kept:
+                del self._vendor_turn_homes[session_id]
+        for session_id in kept:
+            self.reset_session_status(session_id, reason)
+        return kept
+
+    def vendor_turn_home(self, session_id: str) -> str | None:
+        """The launching session *session_id*'s status is kept for, if any.
+
+        Set when a TUI a ``/clear`` rotation moved to *session_id* was lost
+        while the launching session's vendor server still ran its turn (see
+        :meth:`reset_statuses_kept_for`).
+
+        :param session_id: Session/conversation id, e.g. ``"conv_new"``.
+        :returns: e.g. ``"conv_old"``, or ``None``.
+        """
+        with self._lock:
+            return self._vendor_turn_homes.get(session_id)
+
+    def status_poller_path(self, session_id: str) -> Path | None:
+        """Claude's resolved ``sessions/<pid>.json`` for *session_id*, if any."""
+        with self._lock:
+            poller = self._status_pollers.get(session_id)
+        return getattr(poller, "path", None)
 
     def _claim_status_edge(self, session_id: str, status: str, blocked_on: str | None) -> bool:
         """Record an edge as published, reporting whether it was a change.
@@ -532,15 +638,17 @@ class SessionResourceRegistry:
             (so the caller should publish), ``False`` when it is a duplicate.
         """
         with self._lock:
-            if self._published_session_status.get(session_id) == (status, blocked_on):
+            if self._server_delivery_baseline.get(session_id) == (status, blocked_on):
                 return False
-            self._published_session_status[session_id] = (status, blocked_on)
+            # custom-lint: disable-next=session-status-single-source -- what the server heard
+            self._server_delivery_baseline[session_id] = (status, blocked_on)
             return True
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
         """Adopt an externally-published *status* as the dedup baseline."""
         with self._lock:
-            self._published_session_status[session_id] = (status, None)
+            # custom-lint: disable-next=session-status-single-source -- what the server heard
+            self._server_delivery_baseline[session_id] = (status, None)
 
     def resync_session_statuses(self) -> None:
         """Re-arm every status source so it republishes what it already sent.
@@ -559,13 +667,12 @@ class SessionResourceRegistry:
         they hold their own edge/mtime baselines on the watcher thread, so
         clearing only this side would leave them silent.
 
-        Deliberately does NOT clear ``_last_session_status`` — that memo
-        classifies terminal exits (clean vs mid-turn crash) and is unrelated to
-        what the server has heard.
+        Deliberately does NOT touch ``status_book`` — it records what the panes
+        and channels reported, which is unrelated to what the server has heard.
         """
         with self._lock:
-            sessions = sorted(self._published_session_status)
-            self._published_session_status.clear()
+            sessions = sorted(self._server_delivery_baseline)
+            self._server_delivery_baseline.clear()
             pollers = list(self._status_pollers.values())
         for poller in pollers:
             poller.resync()
@@ -581,13 +688,11 @@ class SessionResourceRegistry:
 
     def session_activity_epoch(self, session_id: str) -> int:
         """Count explicit turn activity, retaining it after idle or terminal exit."""
-        with self._lock:
-            return self._session_activity_epoch.get(session_id, 0)
+        return self.status_book.activity_epoch(session_id)
 
     def session_turn_is_active(self, session_id: str) -> bool:
         """Whether an explicitly observed turn is unfinished, excluding pane repaints."""
-        with self._lock:
-            return session_id in self._active_session_turns
+        return self.status_book.turn_is_active(session_id)
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
@@ -597,11 +702,24 @@ class SessionResourceRegistry:
         turn's stale ``idle`` and be misclassified as a clean shutdown. The
         watcher flips the memo back to ``idle`` once the turn completes.
 
+        The new turn owns the session's status from here on, as a pane of its
+        own would: a status kept for a launching session's vendor server (see
+        :meth:`reset_statuses_kept_for`) no longer ends with that server.
+
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         """
-        self._set_session_status_memo(session_id, "running")
+        with self._lock:
+            self._vendor_turn_homes.pop(session_id, None)
+        self.status_book.note_turn_started(session_id)
 
-    def note_external_session_status(self, session_id: str, status: str) -> None:
+    def note_external_session_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        response_id: str | None = None,
+        blocked_on: str | None = None,
+    ) -> None:
         """Record a terminal-observed external status for exit classification.
 
         Structured native forwarders can know turn completion more reliably than
@@ -616,9 +734,22 @@ class SessionResourceRegistry:
         next turn's ``running`` as a duplicate — leaving the session stuck on
         the hook's ``idle`` with no working indicator for the whole turn.
 
+        The edge is recorded in ``status_book`` first, as a relayed edge: a
+        relayed ``idle`` ends the local ``running`` episode even when the pane's
+        own ``idle`` is later swallowed by the wire dedup.
+
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
+        :param response_id: Response id the forwarder attached (diagnostics).
+        :param blocked_on: Dialog reason the forwarder attached, if any.
         """
+        self.status_book.record(
+            session_id,
+            status,
+            source=StatusSource.RELAY,
+            blocked_on=blocked_on,
+            response_id=response_id,
+        )
         if status in {"idle", "failed"}:
             self._set_session_status_memo(session_id, status)
         elif status in {"running", "waiting"}:
@@ -1165,6 +1296,10 @@ class SessionResourceRegistry:
             self._terminal_lifecycles[(session_id, resource_id)] = lifecycle
             if resource_role is not None:
                 self._terminal_roles[(session_id, resource_id)] = resource_role
+            if _is_native_role(resource_role):
+                # Its own pane now owns the session's status: a release of the
+                # server a lost, moved TUI ran in must not reset this pane's turn.
+                self._vendor_turn_homes.pop(session_id, None)
         self._start_terminal_activity_watcher(
             session_id,
             terminal_name,
@@ -1248,19 +1383,40 @@ class SessionResourceRegistry:
         def _publish_status(
             status: str, blocked_on: str | None = None, *, record_activity: bool = False
         ) -> None:
-            # Publish one running/idle edge: dedup against the last value,
-            # memo for exit classification, and hop to the loop (publishers
-            # are loop-only). Shared by the PTY edges and the claude-native
-            # status-file poller so both go through the same dedup/memo. The
-            # dedup baseline lives on the registry, not this closure, so a
-            # forwarder's hook-derived edge resyncs it (see
-            # :meth:`note_external_session_status`).
+            # Record one running/idle edge in the status book, then dedup it
+            # against what the server heard, memo it for exit classification,
+            # and hop to the loop (publishers are loop-only). Shared by the PTY
+            # edges and the claude-native status-file poller. Recording comes
+            # first: a relayed edge may have already moved the wire baseline
+            # (see :meth:`note_external_session_status`), and the dedup must
+            # never hide this edge from the runner itself.
             if status_publisher is None:
                 return
+            source = StatusSource.STATUS_FILE if record_activity else StatusSource.PTY
+            try:
+                self.status_book.record(session_id, status, source=source, blocked_on=blocked_on)
+            except Exception:
+                # Never raise into the watcher thread.
+                _logger.exception("Recording %s status edge failed: %s", source, session_id)
             explicit_activity = record_activity and status in {"running", "waiting"}
             if explicit_activity:
                 self._set_session_status_memo(session_id, status)
-            if not self._claim_status_edge(session_id, status, blocked_on):
+            delivered = self._claim_status_edge(session_id, status, blocked_on)
+            _logger.debug(
+                "session status wire edge: session=%s source=%s status=%s delivered=%s",
+                session_id,
+                source.value,
+                status,
+                delivered,
+                extra=debug_event(
+                    "session_status_wire_edge",
+                    session_id=session_id,
+                    source=source.value,
+                    status=status,
+                    delivered=delivered,
+                ),
+            )
+            if not delivered:
                 return
             # Pane repaints can be startup output, not a new agent turn.
             if not explicit_activity:
@@ -1560,6 +1716,11 @@ class SessionResourceRegistry:
         """Preserve exit evidence even when a pane dies before observation starts."""
         terminal_id = terminal_resource_id(terminal_name, session_key)
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+        # The registry frees the key before the old instance's close yields, so
+        # a new turn can record its first edge meanwhile; the reset spares it.
+        # This protects an auxiliary TUI's session (codex, opencode). After a
+        # REQUIRED pane's exit, the exit publisher decides the session's status.
+        status_mark = self.status_book.edge_mark(session_id)
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1586,6 +1747,14 @@ class SessionResourceRegistry:
             else None
         )
         session_was_idle = session_status_before_exit == "idle"
+        # The agent's pane is gone, so its status went with it. A side shell
+        # exiting, a launch that died before it was observed, or a launch a
+        # successor already replaced leaves the session's status alone. So
+        # does a codex or opencode TUI whose vendor server still runs the turn.
+        if superseded_by is None and not before_observation and _is_native_role(resource_role):
+            if not self._keep_status_for_vendor_turn(session_id, resource_role, lifecycle):
+                self.status_book.reset(session_id, "native_terminal_exited", mark=status_mark)
+            self._forget_sidecar_home(session_id)
 
         # Codex keeps its existing final-screen event. New pre-observation
         # diagnostics may include recent history only under explicit opt-in.
@@ -1661,11 +1830,19 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         terminal_id: str,
+        *,
+        keep_vendor_turn: bool = False,
     ) -> bool:
         """Close a terminal resource by id.
 
+        Closing a native agent pane resets its session's status.
+
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id.
+        :param keep_vendor_turn: Keep the status when the pane is a codex or
+            opencode TUI whose vendor server still runs the session's turn;
+            whoever releases that server resets it. A teardown that releases
+            the server itself leaves this ``False``.
         :returns: ``True`` if a terminal was closed.
         """
         if self._terminal_registry is None:
@@ -1687,16 +1864,24 @@ class SessionResourceRegistry:
                         terminal_name=entry.terminal_name,
                     ),
                 )
-                closed = await self._terminal_registry.close(
+                # The registry frees the key before its close first yields, so
+                # the role and status go now too: a pane re-created while the
+                # old one closes (and the turn that re-created it) keeps its own.
+                with self._lock:
+                    role = self._terminal_roles.pop((session_id, terminal_id), None)
+                    lifecycle = self._terminal_lifecycles.pop((session_id, terminal_id), None)
+                if _is_native_role(role):
+                    if not (
+                        keep_vendor_turn
+                        and self._keep_status_for_vendor_turn(session_id, role, lifecycle)
+                    ):
+                        self.reset_session_status(session_id, "native_terminal_closed")
+                    self._forget_sidecar_home(session_id)
+                return await self._terminal_registry.close(
                     session_id,
                     entry.terminal_name,
                     entry.session_key,
                 )
-                if closed:
-                    with self._lock:
-                        self._terminal_roles.pop((session_id, terminal_id), None)
-                        self._terminal_lifecycles.pop((session_id, terminal_id), None)
-                return closed
         return False
 
     async def transfer_terminal(
@@ -1750,19 +1935,21 @@ class SessionResourceRegistry:
                 lifecycle = self._terminal_lifecycles.pop((source_session_id, terminal_id), None)
                 if lifecycle is not None:
                     self._terminal_lifecycles[(target_session_id, terminal_id)] = lifecycle
-            # Move the PTY-status memo with the pane so a post-transfer exit is
+                if _is_native_role(role):
+                    home = self._sidecar_homes.pop(source_session_id, source_session_id)
+                    if home == target_session_id:
+                        self._sidecar_homes.pop(target_session_id, None)
+                    else:
+                        self._sidecar_homes[target_session_id] = home
+                    # The pane takes the source's status along and owns the
+                    # target's: neither is kept for a lost TUI's server now.
+                    self._vendor_turn_homes.pop(source_session_id, None)
+                    self._vendor_turn_homes.pop(target_session_id, None)
+            # Move the session status with the pane so a post-transfer exit is
             # classified against the right session. Don't clobber a status the
             # target already has from its own terminal.
+            self.status_book.transfer(source_session_id, target_session_id)
             with self._lock:
-                moved_status = self._last_session_status.pop(source_session_id, None)
-                if moved_status is not None and target_session_id not in self._last_session_status:
-                    self._last_session_status[target_session_id] = moved_status
-                    if source_session_id in self._active_session_turns:
-                        self._active_session_turns.add(target_session_id)
-                        self._session_activity_epoch[target_session_id] = (
-                            self._session_activity_epoch.get(target_session_id, 0) + 1
-                        )
-                self._active_session_turns.discard(source_session_id)
                 # The watcher restart below rebuilds the poller under the
                 # target, so drop the source's entry rather than leaving a
                 # retired poller to be re-armed on every later reconnect.
@@ -1807,8 +1994,11 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier.
         """
         self._take_session_status_memo(session_id)
+        self.status_book.forget(session_id)
+        self.reset_statuses_kept_for(session_id, "launching_session_cleaned_up")
         with self._lock:
-            self._session_activity_epoch.pop(session_id, None)
+            self._vendor_turn_homes.pop(session_id, None)
+            self._sidecar_homes.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:

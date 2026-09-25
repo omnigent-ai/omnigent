@@ -80,3 +80,50 @@ def test_devin_is_wired_into_interrupt_and_stop() -> None:
     assert _UNIFORM_INTERRUPT["devin"].module == "omnigent.harnesses.devin_native.bridge"
     assert _UNIFORM_INTERRUPT["devin"].inject_fn == "inject_interrupt"
     assert _UNIFORM_STOP["devin"].module == "omnigent.harnesses.devin_native.bridge"
+
+
+def _app():  # type: ignore[no-untyped-def]
+    from omnigent.runner.app import create_runner_app
+    from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
+    from tests.runner.helpers import NullServerClient
+
+    return create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+
+def test_the_app_holds_one_lock_map_covering_every_builtin() -> None:
+    app = _app()
+    locks = app.state.native_terminal_ensure_locks
+    assert set(locks) == set(_BUILTIN_NATIVE_KEYS)
+    # The same per-harness dicts the launch paths use, not copies.
+    assert locks["antigravity"] is app.state.antigravity_terminal_ensure_locks
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("DELETE", "/v1/sessions/{sid}"),
+        ("DELETE", "/v1/sessions/{sid}/resources"),
+        ("POST", "/v1/sessions/{sid}/reset-state"),
+    ],
+)
+async def test_session_teardown_routes_drop_every_ensure_lock(method: str, path: str) -> None:
+    import asyncio
+
+    import httpx
+
+    app = _app()
+    sid = "conv_lock_pop"
+    locks = app.state.native_terminal_ensure_locks
+    for per_key in locks.values():
+        per_key[sid] = asyncio.Lock()
+        per_key["conv_other"] = asyncio.Lock()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.request(method, path.format(sid=sid))
+    assert resp.status_code < 500, resp.text
+    # Every harness's lock is dropped, opencode and devin included.
+    assert {key for key, per_key in locks.items() if sid in per_key} == set()
+    assert all("conv_other" in per_key for per_key in locks.values())

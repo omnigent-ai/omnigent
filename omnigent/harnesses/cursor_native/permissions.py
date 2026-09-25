@@ -54,6 +54,7 @@ from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cu
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
 # (one chat per workspace) and reads the live ``-wal`` state correctly.
 from omnigent.harnesses.cursor_native.forwarder import _discover_store, _read_blob_rows
+from omnigent.native import prompt_parks
 
 _logger = logging.getLogger(__name__)
 
@@ -864,7 +865,10 @@ async def supervise_cursor_transcript_elicitations(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        prompt_parks.released(session_id, "cursor:"),
+    ):
         while True:
             try:
                 if store_path is None or not store_path.exists():
@@ -882,6 +886,7 @@ async def supervise_cursor_transcript_elicitations(
                 # TUI (or executed after approval): release the web card.
                 for tool_call_id in [tcid for tcid in active if tcid not in seen_ids]:
                     entry = active.pop(tool_call_id)
+                    prompt_parks.close_park(session_id, f"cursor:{tool_call_id}")
                     task = entry["task"]
                     if isinstance(task, asyncio.Task) and not task.done():
                         await _post_external_elicitation_resolved(
@@ -965,6 +970,7 @@ async def supervise_cursor_transcript_elicitations(
                         "elicitation_id": elicitation_id,
                         "task": task,
                     }
+                    prompt_parks.open_park(session_id, f"cursor:{call.tool_call_id}")
                     first_seen.pop(call.tool_call_id, None)
             except asyncio.CancelledError:
                 raise

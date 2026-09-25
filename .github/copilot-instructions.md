@@ -66,3 +66,33 @@ component or module it touches. If a behaviour change ships without one, flag it
   no flow change, type-only changes, dependency bumps, or refactors with no
   observable behaviour change.
 - A trivial, empty, or unrelated test does not count as coverage.
+
+## Session Status and Liveness
+
+Apply this checklist when a pull request under `omnigent/runner/`,
+`omnigent/terminals/`, `omnigent/native/` or `omnigent/harnesses/` reads,
+stores or decides from session status (`running` / `waiting` / `idle` /
+`failed`), turn liveness, or whether a pane or process is busy. The contract is
+in `AGENTS.md` under "Session status and liveness".
+
+- Flag a new dict, set or attribute that holds session status outside
+  `SessionStatusBook` (`omnigent/runner/session_status.py`), and a status edge
+  that is sent to the server but not recorded in the book.
+- Flag a decision that keeps a pane, process or turn alive only because a
+  recorded `running` says so. It also needs first-hand evidence (a live runner
+  turn, pane output, a harness probe, a pending prompt) and must still reach a
+  verdict when the status never changes again. The runner idle watchdog's
+  native-turn hold is the one sanctioned exception, bounded as `AGENTS.md`
+  describes; flag a change that lets a re-asserted status renew it or removes
+  its bound.
+- For a new cached value, ask which channels write it: runner events, server
+  relays, watchers or pollers, interrupts, reconnects, teardown. A channel that
+  never writes it leaves the value stale.
+- Flag a new `# custom-lint: disable=session-status-single-source` whose reason
+  does not say what the container holds.
+- A new native harness must declare `pane_reap` and `status_owner` and pass
+  `tests/runner/test_native_pane_reap_conformance.py` without new
+  `_KNOWN_GAPS` entries.
+- Expect the fix's test to send the edge through the production route (the
+  runner's HTTP route, the real watcher or poller, the relay endpoint), not to
+  write the cache directly.

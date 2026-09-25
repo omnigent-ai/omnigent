@@ -41,6 +41,7 @@ from typing import TypedDict
 import httpx
 
 from omnigent.harnesses.hermes_native.bridge import capture_hermes_pane, send_hermes_pane_keys
+from omnigent.native import prompt_parks
 
 
 class _PendingApproval(TypedDict):
@@ -181,7 +182,10 @@ async def supervise_hermes_approval_mirror(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        prompt_parks.released(session_id, "hermes:"),
+    ):
         while True:
             try:
                 pane = await asyncio.to_thread(capture_hermes_pane, bridge_dir)
@@ -203,6 +207,9 @@ async def supervise_hermes_approval_mirror(
                             name=f"hermes-approval-{episode}",
                         )
                         active = {"elicitation_id": elicitation_id, "task": task}
+                        # The prompt is on screen: park until it goes away, even
+                        # if the card POST fails.
+                        prompt_parks.open_park(session_id, f"hermes:{episode}")
                 elif active is not None:
                     # Falling edge: prompt vanished. Release the card if still
                     # parked (answered in the TUI); no-op if answered via the web.
@@ -212,6 +219,7 @@ async def supervise_hermes_approval_mirror(
                             client, session_id, str(active["elicitation_id"])
                         )
                     active = None
+                    prompt_parks.close_parks(session_id, "hermes:")
             except asyncio.CancelledError:
                 raise
             except Exception:

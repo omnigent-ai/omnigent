@@ -55,6 +55,22 @@ Find *why* the test fails. Read the code the journey and `evidence` point at. Us
 repro-agent's root-cause leads as hypotheses, but confirm them against the code.
 State the root cause concretely before you change anything.
 
+**Cached state.** Before you trust a cache, memo, dedup baseline or status map,
+or add one, list every writer (grep for each assignment and mutating call) and
+every channel that should update it: the runner's own events, relays from the
+server, watchers and pollers, interrupts, reconnects, teardown. A channel with
+no writer means the value can go stale, and a stale value must never block a
+decision on its own. Session status already has one store, `SessionStatusBook`;
+see "Session status and liveness" in the root `AGENTS.md`. A fix that writes
+one more channel into a cache is incomplete if another channel can still be
+lost. When an existing test asserts the stale value, it documents the bug:
+change the test and say why in the PR, rather than keeping it green.
+
+Prove the fail→pass (2B.4, 2B.5) with at least one test that sends the edge
+through the production route that carries it in real use (the runner's HTTP
+route, the real watcher or poller, the relay endpoint), not by writing the
+cache directly.
+
 ### 2B.3 — Implement the fix
 
 Fix the root cause, not the symptom. Change the code the bug lives in, matching

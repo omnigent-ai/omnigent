@@ -6452,25 +6452,29 @@ def _tool_relay_handler_factory(
             url = f"/v1/sessions/{_up.quote(session_id, safe='')}/policies/evaluate"
             verdict: object = None
             last_error: str | None = None
-            for attempt in range(3):
-                if attempt:
-                    time.sleep(0.4)
-                future = asyncio.run_coroutine_threadsafe(
-                    policy_client.post(url, json=request_body), loop
-                )
-                try:
-                    resp = future.result(timeout=86400.0)
-                except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
-                    last_error = str(exc).strip() or type(exc).__name__
-                    continue
-                if resp.status_code != HTTPStatus.OK:
-                    last_error = f"server returned HTTP {resp.status_code}"
-                    continue
-                try:
-                    verdict = json.loads(resp.content)
-                except (ValueError, TypeError):
-                    last_error = "malformed EvaluationResponse body"
-                break
+            from omnigent.native import prompt_parks
+
+            # The agent waits on this verdict, possibly on a human ASK card.
+            with prompt_parks.hold(session_id, f"relay-policy:{secrets.token_hex(8)}"):
+                for attempt in range(3):
+                    if attempt:
+                        time.sleep(0.4)
+                    future = asyncio.run_coroutine_threadsafe(
+                        policy_client.post(url, json=request_body), loop
+                    )
+                    try:
+                        resp = future.result(timeout=86400.0)
+                    except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
+                        last_error = str(exc).strip() or type(exc).__name__
+                        continue
+                    if resp.status_code != HTTPStatus.OK:
+                        last_error = f"server returned HTTP {resp.status_code}"
+                        continue
+                    try:
+                        verdict = json.loads(resp.content)
+                    except (ValueError, TypeError):
+                        last_error = "malformed EvaluationResponse body"
+                    break
             if not isinstance(verdict, dict) or not verdict.get("result"):
                 _logger.warning(
                     "policy_eval_relay_failure: session=%s hook_event=%s "
@@ -6510,9 +6514,16 @@ def _tool_relay_handler_factory(
 
             session_component = _up.quote(session_id, safe="")
             url = f"/v1/sessions/{session_component}/policies/evaluate"
-            future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
+            from omnigent.native import prompt_parks
+
+            # The agent waits on this verdict, possibly on a human ASK card. Open
+            # the park before the request is scheduled so it covers the whole wait.
             try:
-                resp = future.result(timeout=86400.0)
+                with prompt_parks.hold(session_id, f"relay-policy:{secrets.token_hex(8)}"):
+                    future = asyncio.run_coroutine_threadsafe(
+                        policy_client.post(url, json=payload), loop
+                    )
+                    resp = future.result(timeout=86400.0)
             except Exception as exc:  # noqa: BLE001
                 self._send_policy_proxy_error(exc)
                 return

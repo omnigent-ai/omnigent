@@ -97,6 +97,7 @@ from omnigent.harnesses.antigravity_native.steps import (
     pending_interaction,
 )
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.native import prompt_parks
 from omnigent.native._native_post_delivery import post_session_event_with_retry
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
@@ -3294,18 +3295,23 @@ async def run_reader_with_bridge(
             async def _get_steps() -> list[dict[str, object]]:
                 return await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
 
-            await bridge_interaction(
-                cascade_id,
-                pending,
-                port=port,
-                get_steps=_get_steps,
-                request_elicitation=_request_elicitation,
-                # Bind the injector to THIS reader's bridge dir. The default
-                # resolves it from the harness spawn env, which the runner process
-                # hosting this reader does not carry — that failed every web
-                # approval and left agy's own prompt open in the pane.
-                inject_tui=tui_injector_for(bridge_dir),
+            park_key = (
+                f"antigravity:{cascade_id}:{pending['trajectory_id']}:{pending['step_index']}"
             )
+            # agy is gated on this interaction until the bridge resolves it.
+            with prompt_parks.hold(current["session_id"], park_key):
+                await bridge_interaction(
+                    cascade_id,
+                    pending,
+                    port=port,
+                    get_steps=_get_steps,
+                    request_elicitation=_request_elicitation,
+                    # Bind the injector to THIS reader's bridge dir. The default
+                    # resolves it from the harness spawn env, which the runner
+                    # process hosting this reader does not carry — that failed
+                    # every web approval and left agy's own prompt open in the pane.
+                    inject_tui=tui_injector_for(bridge_dir),
+                )
 
         # Cascades a prior rotation attempt failed to bind — the detector skips them
         # so a persistent rotation failure does not hot-loop detect→fail→detect.

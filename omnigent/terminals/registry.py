@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -361,27 +362,32 @@ class TerminalRegistry:
             for (name, key), instance in slot.items()
         ]
 
-    def native_panes(self) -> list[tuple[str, str, Path]]:
+    def native_panes(self, names: Collection[str] | None = None) -> list[tuple[str, str, Path]]:
         """Return live native-harness CLI panes as ``(conversation_id, name, socket_path)``.
 
-        A "native pane" is a terminal whose name is a native harness short name
-        (``claude`` / ``codex`` / ``cursor`` / ...) with session key ``"main"``.
-        This is a cheap NAME pre-filter for the native idle reaper
-        (:mod:`omnigent.terminals.pane_reaper`); the reaper's wiring additionally
-        confirms the resource ROLE is a native harness before reaping, so a user
-        terminal that merely shares the name is never reclaimed. Snapshot
-        semantics; sync (map read only, no tmux I/O).
+        A "native pane" is a terminal whose name is one of *names* with session
+        key ``"main"``. This is a cheap NAME pre-filter for the native idle
+        reaper (:mod:`omnigent.terminals.pane_reaper`); the reaper's wiring
+        additionally confirms the resource ROLE is that harness before reaping,
+        so a user terminal that merely shares the name is never reclaimed.
+        Snapshot semantics; sync (map read only, no tmux I/O).
 
+        :param names: Terminal names to match, e.g. ``{"claude", "codex"}``.
+            ``None`` means every harness the registry declares reapable
+            (:func:`~omnigent.terminals.pane_reaper.native_pane_reap_rows`).
         :returns: ``(conversation_id, terminal_name, tmux_socket_path)`` per live
             name-matching native pane.
         """
-        from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
+        if names is None:
+            from omnigent.terminals.pane_reaper import native_pane_reap_rows
 
+            names = native_pane_reap_rows().keys()
+        wanted = frozenset(names)
         out: list[tuple[str, str, Path]] = []
         with self._lock:
             for conv_id, slot in self._by_conversation.items():
                 for (name, key), instance in slot.items():
-                    if key == "main" and name in NATIVE_PANE_TERMINAL_NAMES:
+                    if key == "main" and name in wanted:
                         out.append((conv_id, name, instance.socket_path))
         return out
 

@@ -45,6 +45,7 @@ from omnigent.harnesses.opencode_native.permissions import (
     parse_permission_request,
     reply_body,
 )
+from omnigent.native import prompt_parks
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -990,6 +991,12 @@ class OpenCodeNativeForwarder:
             return
         if not self.state.mark(self._key("perm", request.request_id)):
             return
+        # opencode waits on this permission until the verdict is replied.
+        with prompt_parks.hold(self._session_id, f"opencode:perm:{request.request_id}"):
+            await self._reply_permission(request)
+
+    async def _reply_permission(self, request: OpenCodePermissionRequest) -> None:
+        """Resolve one permission request and reply its verdict to opencode."""
         decision = await self._resolve_permission(request_dict=request)
         reply = decision_to_reply(decision)
         if reply is None:
@@ -1061,10 +1068,16 @@ class OpenCodeNativeForwarder:
             self._handle_question(request_id, questions, event.properties.get("tool"))
         )
         self._question_tasks[request_id] = task
+        # opencode's question blocks its turn until answered or withdrawn.
+        prompt_parks.open_park(self._session_id, f"opencode:question:{request_id}")
         # Self-evict from the registry once done so it can't grow unbounded; a
         # later withdrawal (``question.replied``) that already popped it is a
         # no-op (``pop(..., None)``).
-        task.add_done_callback(lambda _t, rid=request_id: self._question_tasks.pop(rid, None))
+        task.add_done_callback(lambda _t, rid=request_id: self._on_question_task_done(rid))
+
+    def _on_question_task_done(self, request_id: str) -> None:
+        self._question_tasks.pop(request_id, None)
+        prompt_parks.close_park(self._session_id, f"opencode:question:{request_id}")
 
     async def _handle_question(self, request_id: str, questions: list[Any], tool: Any) -> None:
         """Park one opencode ``question`` as a web card and apply the verdict.
@@ -1242,6 +1255,7 @@ class OpenCodeNativeForwarder:
         """
         if not isinstance(request_id, str) or not request_id:
             return
+        prompt_parks.close_park(self._session_id, f"opencode:question:{request_id}")
         task = self._question_tasks.pop(request_id, None)
         if task is not None and not task.done():
             task.cancel()
