@@ -127,6 +127,12 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
   assertions, debug logs, or test source.
+- Caption an after clip only with visible states the driver asserted on the
+  rendered page and the final frames actually show. A passing internal check
+  (a readiness map entry, an API response) is not evidence of what the screen
+  showed. If the footage shows the claimed state missing — the harness swapped
+  away, a different notice up — the behavior is not proven fixed; recheck the
+  fix and the outcome before declaring either.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.

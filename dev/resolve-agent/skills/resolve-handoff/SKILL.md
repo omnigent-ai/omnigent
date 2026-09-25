@@ -135,8 +135,9 @@ Field meanings:
   Follow the recording rules in Step 2B.5 on both author and review runs; in
   review mode, record the reviewed PR head. Keep recovered before-clips and
   captions unchanged. Each after-clip's caption lists the actions shown, ending
-  with the corrected behavior. A missing before-clip is not a reason to skip
-  the after-clip. Use `[]` only for internal/API-only results with no visible
+  with the corrected behavior as the final frames actually show it — never a
+  selected item or absent notice the clip does not display. A missing
+  before-clip is not a reason to skip the after-clip. Use `[]` only for internal/API-only results with no visible
   user interaction, or when recording is blocked as described above.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
