@@ -48,6 +48,19 @@ _PERMISSION_PANE_REJECT_FOCUSED = _PERMISSION_PANE.replace(
 _PERMISSION_PANE_DATE = _PERMISSION_PANE.replace("↓ Shell pwd", "↓ Shell date")
 
 
+@pytest.fixture
+def secure_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A bridge dir under a production-shaped kiro root (passes secure validation).
+
+    ``write_mcp_bridge_config`` hardens the bridge tree via ``_ensure_secure_dir``,
+    which requires the dir to live below a known bridge root. Mirror the real
+    layout (``<uid-scoped temp>/kiro-native/<digest>``) so the owner-only
+    ancestor walk anchors at ``tmp_path``.
+    """
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "omnigent-test" / "kiro-native")
+    return bridge.bridge_dir_for_session_id("conv_kiro")
+
+
 def _install_fake_tmux(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -488,9 +501,9 @@ def test_kill_session_kills_target(
     assert calls == [("kill-session", "-t", "t")]
 
 
-def test_write_mcp_bridge_config_writes_token_idempotently(tmp_path: Path) -> None:
+def test_write_mcp_bridge_config_writes_token_idempotently(secure_bridge_dir: Path) -> None:
     """serve-mcp's bridge.json gets a token; a second call keeps the same one."""
-    bridge_dir = tmp_path / "bridge"
+    bridge_dir = secure_bridge_dir
     bridge.write_mcp_bridge_config(bridge_dir)
     config_path = bridge_dir / "bridge.json"
     first = json.loads(config_path.read_text())
@@ -521,7 +534,9 @@ def test_build_kiro_mcp_config_targets_serve_mcp(tmp_path: Path) -> None:
     assert default_cmd == sys.executable
 
 
-def test_write_kiro_workspace_mcp_config_merges_preserving_user_servers(tmp_path: Path) -> None:
+def test_write_kiro_workspace_mcp_config_merges_preserving_user_servers(
+    tmp_path: Path, secure_bridge_dir: Path
+) -> None:
     """The Omnigent server is merged into <workspace>/.kiro/settings/mcp.json
     without clobbering a user's pre-existing workspace servers."""
     workspace = tmp_path / "repo"
@@ -531,7 +546,7 @@ def test_write_kiro_workspace_mcp_config_merges_preserving_user_servers(tmp_path
         json.dumps({"mcpServers": {"user_server": {"command": "x", "args": []}}}),
         encoding="utf-8",
     )
-    bridge_dir = tmp_path / "bridge"
+    bridge_dir = secure_bridge_dir
 
     path = bridge.write_kiro_workspace_mcp_config(workspace, bridge_dir)
 
@@ -637,3 +652,48 @@ def test_inject_user_message_surfaces_kiro_cli_argv_error(
 
     with pytest.raises(RuntimeError, match="Conflicting options"):
         inject_user_message(bridge_dir, content="hello", timeout_s=0.1)
+
+
+def test_write_mcp_bridge_config_rejects_symlinked_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A symlinked bridge-tree ancestor is refused — the token is never written.
+
+    bridge.json holds a bearer token for the relay's control endpoint, so the
+    dir must pass owner-only ancestor validation. A pre-created symlinked
+    ancestor must fail loudly instead of redirecting the token into storage the
+    attacker controls.
+    """
+    real_root = tmp_path / "omnigent-test"
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", real_root / "kiro-native")
+    bridge_dir = bridge.bridge_dir_for_session_id("conv_kiro")
+
+    # Redirect an ancestor (the uid-scoped dir) through a symlink.
+    elsewhere = tmp_path / "attacker"
+    elsewhere.mkdir()
+    real_root.symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        bridge.write_mcp_bridge_config(bridge_dir)
+
+    assert not (bridge_dir / "bridge.json").exists()
+    # No token leaked into the redirected location.
+    assert not (elsewhere / "kiro-native").exists()
+
+
+def test_prepare_bridge_dir_rejects_symlinked_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``prepare_bridge_dir`` feeds the same token tree, so it validates too."""
+    real_root = tmp_path / "omnigent-test"
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", real_root / "kiro-native")
+    elsewhere = tmp_path / "attacker"
+    elsewhere.mkdir()
+    real_root.symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        bridge.prepare_bridge_dir("conv_kiro")
+
+    assert not (elsewhere / "kiro-native").exists()
