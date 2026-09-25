@@ -1,156 +1,127 @@
-"""E2E regression: the embedded main terminal must survive its tmux backing dying.
+"""The embedded REPL terminal of a runner-hosted SDK session outlives its tmux server.
 
-A runner-hosted SDK-harness session (any non-native harness, here
-``openai-agents``) auto-creates an Omnigent REPL terminal ``tui:main`` — the
-embedded terminal the web SPA shows behind the Chat/Terminal toggle
-(``omnigent/runner/native/orchestration.py:_auto_create_repl_terminal``). That
-terminal runs ``omnigent attach`` inside a private tmux server and is observed
-as an *auxiliary* terminal.
-
-A threaded idle watcher polls the pane with ``tmux capture-pane``
-(``omnigent/inner/terminal.py:_idle_watch_loop_threaded``). When the pane's
-tmux server goes away — the REPL process crashes/exits, the tmux server dies —
-the watcher confirms with ``has-session``, flips ``running=False`` and fires
-the exit callback. The runner must then rebuild the embedded terminal instead
-of silently dropping it: before this behavior existed, ``tui:main`` vanished
-from the resource inventory and a user watching the Terminal view saw the live
-pane replaced by the misleading "The harness is not running." fallback even
-though the session's SDK harness was perfectly alive.
-
-The test drives the real user path:
-
-1. create a runner-hosted ``openai-agents`` session (auto-creates ``tui:main``),
-2. drive one chat turn so the runner initialises the session + REPL terminal,
-3. open the Terminal view and confirm the embedded terminal is ``connected``,
-4. kill the tmux server backing ``tui:main`` (``tmux kill-server`` on its
-   private socket — the faithful stand-in for the REPL process/tmux dying),
-5. assert the runner recreates ``tui:main`` (a fresh resource with a new tmux
-   socket) and the Terminal view reconnects instead of ending on the
-   "harness is not running" fallback.
+A runner-hosted SDK-harness session auto-creates the Omnigent REPL terminal
+``tui:main`` that the web SPA shows behind the Chat/Terminal toggle. Its tmux
+server can die underneath a live session (the REPL crashes or quits, the server
+is killed). The runner must rebuild that terminal instead of dropping it: the
+resource stays in the session inventory, the Terminal view reconnects, and the
+session never claims the harness stopped while its SDK harness is still alive.
 """
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import time
+from typing import Any
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
 
-_COMPOSER = "Send a message…"
-_REPL_TERMINAL_NAME = "tui:main"
+pytestmark = [
+    pytest.mark.skipif(shutil.which("tmux") is None, reason="requires tmux on PATH"),
+    pytest.mark.timeout(600),
+]
+
+_REPL_TERMINAL = "tui:main"
+_FALLBACK = "The harness is not running."
+_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
+_REPLY = "Hello from the mock model."
+# The idle watcher needs three 1s probes to declare tmux gone; the rebuild and
+# the browser's re-attach follow. Give the runner ample room past that.
+_RUNNER_VERDICT_TIMEOUT_S = 60.0
 
 
-def _list_terminals(base_url: str, session_id: str) -> list[dict]:
-    """Return the session's live terminal resources from the runner inventory."""
-    resp = httpx.get(
-        f"{base_url}/v1/sessions/{session_id}/resources/terminals",
-        timeout=10.0,
+def _repl_terminal(base_url: str, session_id: str) -> dict[str, Any] | None:
+    response = httpx.get(f"{base_url}/v1/sessions/{session_id}/resources/terminals", timeout=10.0)
+    response.raise_for_status()
+    return next((item for item in response.json()["data"] if item["name"] == _REPL_TERMINAL), None)
+
+
+def _session_status(base_url: str, session_id: str) -> str:
+    response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    response.raise_for_status()
+    return str(response.json()["status"])
+
+
+def _tmux(socket_path: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["tmux", "-S", socket_path, *args], capture_output=True, text=True, timeout=10
     )
-    resp.raise_for_status()
-    return resp.json().get("data", [])
 
 
-def _find_repl_terminal(base_url: str, session_id: str) -> dict | None:
-    for term in _list_terminals(base_url, session_id):
-        if term.get("name") == _REPL_TERMINAL_NAME:
-            return term
-    return None
+def _wait_for_pane_output(socket_path: str, timeout_s: float = 30.0) -> str:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        captured = _tmux(socket_path, "capture-pane", "-p")
+        if captured.returncode == 0 and captured.stdout.strip():
+            return captured.stdout
+        assert time.monotonic() < deadline, "REPL never rendered into its tmux pane"
+        time.sleep(0.5)
 
 
-def test_main_terminal_recreated_after_tmux_server_dies(
-    page: Page,
-    seeded_session: tuple[str, str],
-    mock_llm_server_url: str,
+def _terminal_states(terminal: Any) -> list[str | None]:
+    return terminal.evaluate_all("(elements) => elements.map((el) => el.dataset.state)")
+
+
+def test_repl_terminal_survives_tmux_server_death(
+    page: Page, seeded_session: tuple[str, str], mock_llm_server_url: str
 ) -> None:
-    """``tui:main`` is rebuilt and reconnects when its tmux server dies.
-
-    :param page: Playwright page fixture.
-    :param seeded_session: ``(base_url, session_id)`` — a runner-bound
-        ``openai-agents`` (non-native SDK harness) session.
-    :param mock_llm_server_url: Mock LLM the seeded agent's turn is routed to.
-    :returns: None.
-    """
     base_url, session_id = seeded_session
     configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": "hello from the agent"}],
-        key="repl-terminal-recovery-turn",
-        match="Say hello",
+        mock_llm_server_url, [{"text": _REPLY}], key="repl-tmux-death", match="Say hello"
     )
 
     page.goto(f"{base_url}/c/{session_id}")
-    composer = page.get_by_placeholder(_COMPOSER)
+    composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=60_000)
-
-    # One real chat turn drives the runner's session-init handshake, which
-    # auto-creates the tui:main REPL terminal and stamps the omnigent.ui:terminal
-    # label that gates the web Chat/Terminal toggle.
     composer.fill("Say hello")
     page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_ASSISTANT).filter(has_text=_REPLY)).to_have_count(1, timeout=60_000)
 
-    # The REPL terminal auto-creates on the runner. Poll the inventory until it
-    # appears and grab its private tmux socket (published in the resource
-    # metadata) so we can make that tmux server disappear like production.
-    repl_terminal: dict | None = None
-    for _ in range(90):
-        repl_terminal = _find_repl_terminal(base_url, session_id)
-        if repl_terminal is not None:
+    terminal_button = page.get_by_test_id("view-mode-terminal")
+    expect(terminal_button).to_be_enabled(timeout=60_000)
+    terminal_button.click()
+    main_terminal = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+    terminal = main_terminal.get_by_test_id("terminal-view")
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=120_000)
+
+    before = _repl_terminal(base_url, session_id)
+    assert before is not None, "runner did not register the REPL terminal"
+    socket_path = str(before["metadata"]["tmux_socket"])
+    _wait_for_pane_output(socket_path)
+    assert _session_status(base_url, session_id) == "idle"
+
+    killed = _tmux(socket_path, "kill-server")
+    assert killed.returncode == 0, killed.stderr
+    assert _tmux(socket_path, "has-session").returncode != 0
+
+    # Wait for the runner's verdict: either the misleading resume fallback
+    # appears, or the Terminal view is connected to a live tmux pane again.
+    # The inventory may lack tui:main for a moment while it is rebuilt, so a
+    # transient miss is not a verdict.
+    fallback = main_terminal.get_by_text(_FALLBACK, exact=True)
+    deadline = time.monotonic() + _RUNNER_VERDICT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if fallback.count() > 0:
             break
-        page.wait_for_timeout(1000)
-    assert repl_terminal is not None, (
-        "tui:main REPL terminal was never auto-created for the runner-hosted SDK session"
-    )
-    tmux_socket = repl_terminal["metadata"]["tmux_socket"]
-    assert tmux_socket, "REPL terminal resource did not publish its tmux socket"
-
-    # Open the Terminal view and confirm the embedded REPL pane connects — this
-    # is the live terminal the user is watching when its backing dies.
-    terminal_toggle = page.get_by_test_id("view-mode-terminal")
-    expect(terminal_toggle).to_be_visible(timeout=30_000)
-    terminal_toggle.click()
-    terminal_surface = page.get_by_test_id("terminal-view").first
-    expect(terminal_surface).to_have_attribute("data-state", "connected", timeout=60_000)
-
-    # Faithful fault injection: the tmux server backing tui:main goes away
-    # (the REPL process crashing / tmux dying is what production hits). The
-    # runner is a sibling process on this machine, so its private tmux socket
-    # is reachable here.
-    killed = subprocess.run(
-        ["tmux", "-S", tmux_socket, "kill-server"],
-        capture_output=True,
-        text=True,
-    )
-    assert killed.returncode == 0, (
-        f"failed to kill the REPL tmux server: rc={killed.returncode} stderr={killed.stderr!r}"
-    )
-
-    # The idle watcher (1s poll, 3-failure threshold) detects tmux is gone and
-    # fires the auxiliary exit. The runner must rebuild the embedded terminal:
-    # poll until tui:main is listed again with a fresh tmux socket. Without the
-    # rebuild, the resource stays gone and this times out — the main terminal
-    # has silently disappeared while the SDK session is still alive.
-    recreated: dict | None = None
-    for _ in range(60):
-        candidate = _find_repl_terminal(base_url, session_id)
-        candidate_socket = (
-            (candidate.get("metadata") or {}).get("tmux_socket") if candidate is not None else None
-        )
-        if candidate_socket and candidate_socket != tmux_socket:
-            recreated = candidate
+        current = _repl_terminal(base_url, session_id)
+        if (
+            current is not None
+            and "connected" in _terminal_states(terminal)
+            and _tmux(str(current["metadata"]["tmux_socket"]), "has-session").returncode == 0
+        ):
             break
-        page.wait_for_timeout(1000)
-    assert recreated is not None, (
-        "tui:main was not recreated after its tmux server died — the embedded "
-        "main terminal silently disappeared while the SDK session was still "
-        "alive"
-    )
+        time.sleep(0.5)
 
-    # The user-visible recovery: the Terminal view reconnects to the rebuilt
-    # pane instead of ending on the misleading "harness is not running"
-    # fallback while the session is still alive.
-    terminal_surface = page.get_by_test_id("terminal-view").first
-    expect(terminal_surface).to_have_attribute("data-state", "connected", timeout=60_000)
-    expect(page.get_by_text("The harness is not running.")).to_have_count(0)
-    expect(page.get_by_text("Resume the session to reconnect the terminal.")).to_have_count(0)
+    after = _repl_terminal(base_url, session_id)
+    assert after is not None, "runner dropped tui:main from the session's terminal inventory"
+    expect(fallback).to_have_count(0)
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=60_000)
+    assert _tmux(str(after["metadata"]["tmux_socket"]), "has-session").returncode == 0, (
+        "tui:main is listed but its tmux server is not running"
+    )
+    assert _session_status(base_url, session_id) == "idle"

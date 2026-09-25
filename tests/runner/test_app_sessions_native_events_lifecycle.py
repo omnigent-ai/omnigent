@@ -3761,8 +3761,8 @@ async def test_auxiliary_repl_exit_recreates_embedded_terminal(
     resource and returning (the generic auxiliary-exit path) silently loses
     it: the inventory drops ``tui:main`` and the web view claims the harness
     is not running while the session is still alive. The runner must instead
-    signal the rebuild via ``session.terminal_pending`` and recreate the
-    terminal.
+    announce the rebuild via ``session.terminal_pending`` before the deletion
+    lands and recreate the terminal.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
@@ -3799,18 +3799,19 @@ async def test_auxiliary_repl_exit_recreates_embedded_terminal(
         _session_event_queues_ref.pop(conv_id, None)
 
     assert recreated == [conv_id]
-    # The stale resource is still deleted (the new one republishes on create).
-    assert {
-        "type": "session.resource.deleted",
-        "resource_id": "terminal_tui_main",
-        "resource_type": "terminal",
-        "session_id": conv_id,
-    } in events
-    # The web view is held on "terminal coming up" while the rebuild runs,
-    # then released, instead of falling back to "the harness is not running".
-    assert [
-        event["pending"] for event in events if event.get("type") == "session.terminal_pending"
-    ] == [True, False]
+    # The rebuild is announced before the stale resource is deleted, so the web
+    # view moves straight to "terminal coming up" instead of the misleading
+    # "harness is not running" fallback, and is released once the rebuild ends.
+    lifecycle_events = [
+        (event["type"], event.get("pending"), event.get("resource_id"))
+        for event in events
+        if event.get("type") in {"session.resource.deleted", "session.terminal_pending"}
+    ]
+    assert lifecycle_events == [
+        ("session.terminal_pending", True, None),
+        ("session.resource.deleted", None, "terminal_tui_main"),
+        ("session.terminal_pending", False, None),
+    ]
     # A live SDK session losing its embedded pane is not a session failure.
     assert not [event for event in events if event.get("type") == "session.status"]
 
@@ -3860,12 +3861,16 @@ async def test_auxiliary_repl_exit_recreate_is_rate_limited(
     finally:
         _session_event_queues_ref.pop(conv_id, None)
 
-    # Only the capped number of rebuilds ran; the over-cap exit was dropped
-    # without another pending toggle.
+    # Only the capped number of rebuilds ran; the over-cap exit still deletes
+    # its resource but is dropped without another pending toggle.
     assert recreated == [conv_id] * _REPL_RECREATE_LIMIT
     assert [
         event["pending"] for event in events if event.get("type") == "session.terminal_pending"
     ] == [True, False] * _REPL_RECREATE_LIMIT
+    assert (
+        len([event for event in events if event.get("type") == "session.resource.deleted"])
+        == _REPL_RECREATE_LIMIT + 1
+    )
 
 
 @pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])

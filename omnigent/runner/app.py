@@ -3514,17 +3514,20 @@ def create_runner_app(
         _repl_terminal_auto_recreates[session_id] = stamps
         return allowed
 
-    def _recover_repl_terminal_after_exit(event: TerminalExitEvent) -> None:
-        """Recreate the embedded REPL terminal after an unexpected exit.
+    def _begin_repl_terminal_recovery(event: TerminalExitEvent) -> bool:
+        """Claim an exit-driven REPL rebuild and announce it on the session stream.
 
         ``tui:main`` is a live SDK session's main terminal. When its tmux
         backing dies, the resource would silently vanish and the web view
         would claim the harness is not running while the session is still
-        alive — so rebuild the terminal instead. Deliberate closes never
-        reach the exit publisher, so an exit seen here is an unexpected
-        death.
+        alive — so rebuild the terminal instead. Deliberate closes stop the
+        watcher before killing tmux and never reach the exit publisher, so
+        an exit seen here is an unexpected death.
 
         :param event: The auxiliary REPL terminal's exit event.
+        :returns: ``True`` when a rebuild was claimed; the caller then runs
+            :func:`_recover_repl_terminal_after_exit` once the deletion is
+            published.
         """
         if not _claim_repl_terminal_auto_recreate(event.session_id):
             _logger.warning(
@@ -3536,10 +3539,17 @@ def create_runner_app(
                 _REPL_TERMINAL_AUTO_RECREATE_LIMIT,
                 _REPL_TERMINAL_AUTO_RECREATE_WINDOW_S,
             )
-            return
-        # "Terminal coming up" keeps the web view on its starting state
-        # instead of the misleading resume fallback while we rebuild.
+            return False
+        # Announce the rebuild before the deletion lands so the web view goes
+        # straight to "Starting up…" instead of flashing the resume fallback.
         _publish_terminal_pending(_publish_event, event.session_id, True)
+        return True
+
+    def _recover_repl_terminal_after_exit(event: TerminalExitEvent) -> None:
+        """Rebuild the REPL terminal claimed by :func:`_begin_repl_terminal_recovery`.
+
+        :param event: The auxiliary REPL terminal's exit event.
+        """
 
         async def _recover() -> None:
             try:
@@ -3561,6 +3571,14 @@ def create_runner_app(
         _background_tasks.add(task)
 
     def _publish_terminal_exit(event: TerminalExitEvent) -> None:
+        # The embedded REPL terminal is the one auxiliary pane a live SDK
+        # session cannot lose, so its unexpected death triggers a rebuild.
+        rebuild_repl = (
+            event.lifecycle != TerminalLifecycle.REQUIRED
+            and event.terminal_name == _REPL_TERMINAL_NAME
+            and event.session_key == _REPL_TERMINAL_SESSION_KEY
+            and _begin_repl_terminal_recovery(event)
+        )
         _publish_event(
             event.session_id,
             {
@@ -3573,13 +3591,8 @@ def create_runner_app(
         # Auxiliary terminals do not own the session control plane. In
         # particular, losing Codex's streamable TUI must not cancel an active
         # app-server turn; the native-terminal ensure path can recreate it.
-        # The embedded REPL terminal is the one auxiliary pane a live SDK
-        # session cannot lose, so its unexpected death triggers a rebuild.
         if event.lifecycle != TerminalLifecycle.REQUIRED:
-            if (
-                event.terminal_name == _REPL_TERMINAL_NAME
-                and event.session_key == _REPL_TERMINAL_SESSION_KEY
-            ):
+            if rebuild_repl:
                 _recover_repl_terminal_after_exit(event)
             return
 
