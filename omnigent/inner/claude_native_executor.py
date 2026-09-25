@@ -256,7 +256,7 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            cleanup_error = await self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -267,7 +267,7 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            cleanup_error = await self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -296,11 +296,32 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            await self._reap_failed_turn()
             raise
 
-    def _reap_failed_turn(self) -> str | None:
-        """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+    async def _reap_failed_turn(self) -> str | None:
+        """Kill the failed turn's pane off-loop and drain cleanup before releasing its lock.
+
+        Repeated cancellation is delayed until the worker finishes, then re-raised.
+        The worker inherits context outside the cancelled injection scope.
+        Return a cleanup error, or None if the pane was killed or already gone."""
+        worker = asyncio.create_task(asyncio.to_thread(self._kill_failed_session))
+        cancelled = False
+        while not worker.done():
+            try:
+                # Worker exceptions surface via worker.result() below.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            with contextlib.suppress(Exception):
+                worker.result()
+            raise asyncio.CancelledError
+        return worker.result()
+
+    def _kill_failed_session(self) -> str | None:
+        """Blocking half of :meth:`_reap_failed_turn`; runs in a worker thread."""
         try:
             kill_session(self._bridge_dir, timeout_s=1.0)
         except TmuxSessionNotAdvertised:
