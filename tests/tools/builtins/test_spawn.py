@@ -58,6 +58,13 @@ def test_file_ids_present_and_optional() -> None:
     assert branch["additionalProperties"] is False
 
 
+def test_workspace_present_and_optional() -> None:
+    branch = _object_branch()
+    assert branch["properties"]["workspace"]["type"] == "string"
+    assert branch["properties"]["workspace"]["minLength"] == 1
+    assert "workspace" not in branch["required"]
+
+
 def test_description_mentions_file_ids() -> None:
     schema = _schema_with_subagent()
     assert "file_ids" in schema["function"]["description"]
@@ -97,6 +104,10 @@ def test_object_args_without_file_ids_validate() -> None:
     _validate({"input": "go"})
 
 
+def test_object_args_with_workspace_validate() -> None:
+    _validate({"input": "go", "workspace": "/tmp/worktree"})
+
+
 def test_plain_string_args_validate() -> None:
     _validate("just a message")
 
@@ -112,6 +123,12 @@ def test_file_ids_string_rejected() -> None:
 def test_empty_file_ids_rejected() -> None:
     with pytest.raises(jsonschema.ValidationError):
         _validate({"input": "go", "file_ids": []})
+
+
+@pytest.mark.parametrize("workspace", ["", 123, True, []])
+def test_invalid_workspace_rejected(workspace: object) -> None:
+    with pytest.raises(jsonschema.ValidationError):
+        _validate({"input": "go", "workspace": workspace})
 
 
 def test_duplicate_file_ids_allowed() -> None:
