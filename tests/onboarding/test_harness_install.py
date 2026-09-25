@@ -1403,8 +1403,13 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
+# 0.130.0 sits below the 0.131.0 bypass-hook-trust flag gate, 0.133.0 above
+# it: both halves of the window the capability floor admits must read
+# installed (the flag gate degrades launch args, never installability).
+@pytest.mark.parametrize("version", ["0.130.0", "0.133.0"])
 def test_the_codex_floor_is_the_policy_hook_capability_floor(
     monkeypatch: pytest.MonkeyPatch,
+    version: str,
 ) -> None:
     """A codex at or above the policy-hook floor must read as installed.
 
@@ -1420,7 +1425,7 @@ def test_the_codex_floor_is_the_policy_hook_capability_floor(
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
             return subprocess.CompletedProcess(
-                args=argv, returncode=0, stdout="codex-cli 0.133.0\n", stderr=""
+                args=argv, returncode=0, stdout=f"codex-cli {version}\n", stderr=""
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 

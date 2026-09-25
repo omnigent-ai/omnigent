@@ -111,8 +111,8 @@ KIRO_KEY = "kiro"
 #   as "outdated" in the picker and refuses every codex launch on that host.
 #   The subagent-router ``PreToolUse`` hook needs 0.145.0, but that is enforced
 #   where the hook is registered
-#   (``codex_native_app_server._CODEX_ROUTING_HOOK_MIN_VERSION``) so an older
-#   CLI loses only smart-routing spawn gating, not the ability to launch.
+#   (``omnigent/inner/codex_executor._CODEX_ROUTING_HOOK_MIN_VERSION``) so an
+#   older CLI loses only smart-routing spawn gating, not the ability to launch.
 # - cursor: Cursor's CLI uses ``YYYY.MM.DD[-build]`` date versions. Default
 #   to the day after 2026-06-01 so we don't support stale pre-June builds.
 # - kimi: the harness drives Moonshot's ``kimi-code`` CLI (the ``kimi`` binary
