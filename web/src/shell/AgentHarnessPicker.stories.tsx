@@ -80,7 +80,7 @@ const extraHarnesses = [
 ];
 const otherHarnesses = [claude, codex, cursor, openCode, pi];
 const allHarnesses = [...otherHarnesses, ...extraHarnesses];
-const manyCustomAgents = Array.from({ length: 10 }, (_, index) =>
+const manyCustomAgents = Array.from({ length: 24 }, (_, index) =>
   agent({
     id: `agent-custom-${index}`,
     name: `custom-agent-${index}`,
@@ -256,7 +256,7 @@ function ExternallySelectedOtherHarness(args: React.ComponentProps<typeof AgentH
       effectiveAgentId={selectedId}
       agentLabel="OpenCode"
       onOpenChange={(open) => {
-        if (open) setSelectedId(openCode.id);
+        if (open) window.setTimeout(() => setSelectedId(openCode.id), 0);
       }}
     />
   );
@@ -273,7 +273,12 @@ export const OtherHarnessSelected: Story = {
     ],
   },
   render: (args) => <ExternallySelectedOtherHarness {...args} />,
-  play: async ({ canvasElement }) => openPicker(canvasElement),
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    await expect(
+      await within(canvasElement.ownerDocument.body).findByTestId("new-chat-landing-harness-more"),
+    ).toHaveTextContent("Other... (OpenCode Experimental Extended Harness)");
+  },
 };
 
 export const MobileMorePage: Story = {
