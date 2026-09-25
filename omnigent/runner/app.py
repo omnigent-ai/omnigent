@@ -3107,6 +3107,11 @@ def create_runner_app(
     _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
+    # Wake-notice turns tracked from start to end: False until the turn
+    # surfaces output (a text delta or tool call), True after. A wake turn
+    # that ends still-False with an undrained inbox gets one bounded
+    # recovery wake (see _rewake_parent_if_inbox_stranded).
+    _wake_turn_saw_output: dict[str, bool] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox
     # still held a sub-agent result (typically: the server was down when the
     # child finished). The catch-up scan re-attempts these on tunnel reconnect.
@@ -5042,6 +5047,7 @@ def create_runner_app(
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
+        _wake_turn_saw_output.pop(session_id, None)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
@@ -8124,6 +8130,7 @@ def create_runner_app(
         _background_tasks.add(_wake_task)
 
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
+        wake_turn_output = _wake_turn_saw_output.pop(parent_session_id, None)
         inbox = _session_inboxes.get(parent_session_id)
         drained = inbox is None or inbox.empty()
         if drained:
@@ -8132,15 +8139,27 @@ def create_runner_app(
             # later episode's matching notice is wrongly deduped.
             _last_rewake_notice.pop(parent_session_id, None)
             _stranded_wake_parents.discard(parent_session_id)
-        # A parent whose wake POST exhausted its retries has no pending flag,
-        # but its inbox still holds an undelivered result — rescue it too.
-        stranded_retry = parent_session_id in _stranded_wake_parents
-        if parent_session_id not in _subagent_wake_pending and not stranded_retry:
+            # Keep the wake-pending flag consistent with a drained inbox.
+            _subagent_wake_pending.discard(parent_session_id)
             return
+        # Recover the undrained inbox only when its delivery is known broken:
+        # the wake never started a turn (pending flag still set), the wake
+        # POST exhausted its retries (stranded), or the delivered wake turn
+        # ended without surfacing any output — _run_turn_bg discards the
+        # pending flag at turn start, so the empty-completion case leaves no
+        # flag behind. A wake turn that produced output already answered the
+        # notice; re-waking it would spend model turns on an inbox the parent
+        # chose not to drain.
+        if (
+            wake_turn_output is not False
+            and parent_session_id not in _subagent_wake_pending
+            and parent_session_id not in _stranded_wake_parents
+        ):
+            return
+        # Clear both markers so _schedule_subagent_wake's double-wake guard
+        # lets the recovery wake through.
         _subagent_wake_pending.discard(parent_session_id)
         _stranded_wake_parents.discard(parent_session_id)
-        if drained:
-            return
         entries = list_subagent_work(parent_session_id)
         if not entries:
             return
@@ -8468,7 +8487,13 @@ def create_runner_app(
         msg_body: _JsonObject,
         conv: str,
     ) -> None:
-        _subagent_wake_pending.discard(conv)
+        if conv in _subagent_wake_pending:
+            _subagent_wake_pending.discard(conv)
+            # This turn delivers a sub-agent wake notice; track whether it
+            # surfaces any output so an empty completion can be recovered.
+            _wake_turn_saw_output[conv] = False
+        else:
+            _wake_turn_saw_output.pop(conv, None)
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
@@ -9410,6 +9435,8 @@ def create_runner_app(
                                     delta = event.get("delta")
                                     if delta is not None:
                                         _text_acc.append(delta)
+                                    if delta and conv_id in _wake_turn_saw_output:
+                                        _wake_turn_saw_output[conv_id] = True
                                 elif _evt_type == "response.completed":
                                     _stream_failed_error = None
                                     if _text_acc:
@@ -9439,6 +9466,10 @@ def create_runner_app(
                                     _item = event.get("item")
                                     if isinstance(_item, dict):
                                         _it = _item.get("type")
+                                        if _it in ("function_call", "function_call_output") and (
+                                            conv_id in _wake_turn_saw_output
+                                        ):
+                                            _wake_turn_saw_output[conv_id] = True
                                         if _it == "function_call":
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
