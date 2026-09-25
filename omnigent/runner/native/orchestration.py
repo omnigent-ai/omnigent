@@ -974,11 +974,15 @@ async def _launch_config_retry_sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
 
-# Metadata reads do not need transcript, liveness, or subtree-usage aggregation.
+# Metadata reads need stored-row fields only: skip the transcript page, liveness,
+# usage, and the live-status probe of the very runner making the read.
+# Older servers ignore unknown query params, so a newer runner against an older
+# server keeps working.
 _SESSION_METADATA_PARAMS: dict[str, str] = {
     "include_items": "false",
     "include_liveness": "false",
     "include_usage": "false",
+    "include_live_status": "false",
 }
 
 

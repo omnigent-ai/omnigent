@@ -11290,6 +11290,17 @@
             }
           },
           {
+            "description": "When `False`, skip the live-status probe of the session's bound runner on a status-cache miss and report `status` from the cached or persisted value. Runner-owned reads pass `False` because the probe targets the very runner waiting on this response.",
+            "in": "query",
+            "name": "include_live_status",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Live Status",
+              "type": "boolean"
+            }
+          },
+          {
             "description": "When `True`, refresh runner-derived snapshot overlays from the live session instead of serving stale AP-process caches. Browser reload/bind requests use this to recover from fixed bugs without restarting the AP server.",
             "in": "query",
             "name": "refresh_state",

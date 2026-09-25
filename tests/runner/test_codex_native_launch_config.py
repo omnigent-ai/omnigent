@@ -174,7 +174,12 @@ async def test_launch_config_reads_the_metadata_only_snapshot(
 
     assert client.urls == ["/v1/sessions/conv_1"]
     assert client.params == [
-        {"include_items": "false", "include_liveness": "false", "include_usage": "false"}
+        {
+            "include_items": "false",
+            "include_liveness": "false",
+            "include_usage": "false",
+            "include_live_status": "false",
+        }
     ]
 
 
@@ -220,6 +225,7 @@ async def test_native_metadata_reads_skip_usage_aggregation(
         "include_items": "false",
         "include_liveness": "false",
         "include_usage": "false",
+        "include_live_status": "false",
     }
     assert requests[0].extensions["timeout"]["read"] == 10.0
 
@@ -299,7 +305,15 @@ async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) ->
     assert client.calls == 2, "Should retry once after the transient read timeout."
     assert (
         client.params
-        == [{"include_items": "false", "include_liveness": "false", "include_usage": "false"}] * 2
+        == [
+            {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+                "include_live_status": "false",
+            }
+        ]
+        * 2
     )
     assert retry_sleeps == [pytest.approx(0.5)], "One backoff sleep before the retry."
 

@@ -699,7 +699,7 @@ When liveness is wired, each list item includes two orthogonal signals
 ### Get Session (Snapshot)
 
 ```
-GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&include_usage=true&refresh_state=false]
+GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&include_usage=true&include_live_status=true&refresh_state=false]
 
 200 OK — body matches the `SessionResponse` shape above.
 404 Not Found — no session with that id
@@ -731,6 +731,12 @@ Contract" below.
     spend. Runner metadata reads use this option. The web chat also opts
     out and loads display usage separately, so a slow usage store does not
     block opening the session. Budget enforcement is unchanged.
+
+  include_live_status (query param, boolean, default `true`)
+    When `false`, skip the live-status probe of the session's bound runner
+    on a status-cache miss and report `status` from the cached or persisted
+    value. Runner metadata reads use this option: the probe would target the
+    very runner waiting on the response.
 
   refresh_state (query param, boolean, default `false`)
     When `true`, runner-derived snapshot overlays (for example skills

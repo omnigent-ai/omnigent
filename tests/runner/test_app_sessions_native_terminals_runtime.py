@@ -916,6 +916,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
                 "include_items": "false",
                 "include_liveness": "false",
                 "include_usage": "false",
+                "include_live_status": "false",
             }
             return httpx.Response(
                 200,
@@ -1197,6 +1198,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
                     "include_items": "false",
                     "include_liveness": "false",
                     "include_usage": "false",
+                    "include_live_status": "false",
                 }
                 labels = {
                     FORK_SOURCE_LABEL_KEY: source_id,

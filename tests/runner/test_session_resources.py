@@ -1953,6 +1953,7 @@ async def test_concurrent_resource_reads_share_one_session_snapshot(
                 "include_items": "false",
                 "include_liveness": "false",
                 "include_usage": "false",
+                "include_live_status": "false",
             }
             snapshot_count += 1
             snapshot_started.set()
