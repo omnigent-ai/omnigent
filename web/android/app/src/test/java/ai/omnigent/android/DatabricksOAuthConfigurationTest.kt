@@ -59,6 +59,23 @@ class DatabricksOAuthConfigurationTest {
     }
 
     @Test
+    fun `private callback transport accepts only the exact scheme and host`() {
+        assertTrue(
+            configuration.matchesCallback(
+                URI("ai.omnigent.android://mobile-redirect?state=opaque&code=code&extra=value"),
+            ),
+        )
+        listOf(
+            "ai.omnigent.android://other?state=opaque&code=code",
+            "ai.omnigent.android://mobile-redirect/extra?state=opaque&code=code",
+            "ai.omnigent.android://user@mobile-redirect?state=opaque&code=code",
+            "ai.omnigent.android://mobile-redirect?state=opaque&code=code#fragment",
+        ).forEach { callback ->
+            assertFalse(configuration.matchesCallback(URI(callback)))
+        }
+    }
+
+    @Test
     fun `credential scope normalizes origin and preserves one ASCII workspace id`() {
         val scope =
             DatabricksCredentialScope.from(
