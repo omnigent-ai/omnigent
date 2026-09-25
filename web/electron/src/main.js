@@ -52,7 +52,6 @@ const {
   isDatabricksManagedServerUrl,
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
-  LOCAL_HOSTS,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
@@ -69,6 +68,7 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
@@ -144,6 +144,31 @@ function serverSelectorV2DevUrl() {
 }
 
 /**
+ * Dev-only onboarding mock, driven by env vars so the wizard's four desktop
+ * variants can be exercised in the real Electron shell without MDM / a real
+ * server. Translates OMNIGENT_ONBOARDING_MOCK* into the `?mock=1&…` query the
+ * renderer's mockSetup.ts reads. Empty (no query) unless the mock is on, and
+ * never active in a packaged build. See web/src/pages/onboarding/mockSetup.ts.
+ *
+ *   OMNIGENT_ONBOARDING_MOCK=1                 enable
+ *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   MDM-preset servers
+ *   OMNIGENT_ONBOARDING_MOCK_RECENTS=url,url   recent servers
+ *   OMNIGENT_ONBOARDING_MOCK_INSTALLED=1       returning user
+ *
+ * @returns {string} A query string without the leading "?", or "".
+ */
+function onboardingMockSearch() {
+  if (app.isPackaged || process.env.OMNIGENT_ONBOARDING_MOCK !== "1") return "";
+  const p = new URLSearchParams({ mock: "1" });
+  if (process.env.OMNIGENT_ONBOARDING_MOCK_MANAGED)
+    p.set("managed", process.env.OMNIGENT_ONBOARDING_MOCK_MANAGED);
+  if (process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS)
+    p.set("recents", process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS);
+  if (process.env.OMNIGENT_ONBOARDING_MOCK_INSTALLED === "1") p.set("installed", "1");
+  return p.toString();
+}
+
+/**
  * Load the setup page (or server selector) into `win`, appending `search`
  * (a query string without the leading "?", or empty).
  *
@@ -161,11 +186,22 @@ function serverSelectorV2DevUrl() {
  */
 function loadSetupPage(win, search = "") {
   abortConnectionAttempt(win);
-  const loadFile = () => win.loadFile(setupPagePath(), search ? { search } : undefined);
+  // Fold in the dev-only onboarding mock (env-driven); caller params win on
+  // conflict. No-op in packaged builds / when the mock is off.
+  const mock = onboardingMockSearch();
+  let effectiveSearch = search;
+  if (mock) {
+    const merged = new URLSearchParams(mock);
+    for (const [k, v] of new URLSearchParams(search)) merged.set(k, v);
+    effectiveSearch = merged.toString();
+  }
+  const loadFile = () =>
+    win.loadFile(setupPagePath(), effectiveSearch ? { search: effectiveSearch } : undefined);
   const devUrl = serverSelectorV2DevUrl();
   const run = () => {
     if (win.isDestroyed()) return Promise.resolve();
-    if (devUrl) return win.loadURL(search ? `${devUrl}?${search}` : devUrl).catch(loadFile);
+    if (devUrl)
+      return win.loadURL(effectiveSearch ? `${devUrl}?${effectiveSearch}` : devUrl).catch(loadFile);
     return loadFile();
   };
   return new Promise((resolve) => {
@@ -2852,28 +2888,6 @@ function registerIpc() {
       const target = await expandDatabricksWorkspaceUrl(normalized, { signal });
       signal.throwIfAborted();
 
-      // Guard against navigating to (and pinning as trusted) a non-Omnigent site
-      // the user typed by mistake. Managed choices are pre-validated; local hosts
-      // are the user's own machine — both skip the check. For a remote URL we
-      // probe the well-known manifest; if it doesn't look like an Omnigent server
-      // and the user hasn't confirmed, ask the page to warn before proceeding.
-      // Soft (not a hard block): older Omnigent servers predate the manifest, so
-      // a second click must still let them through. force skips the re-probe.
-      //
-      // ONLY when the server selector is active: the classic static setup page
-      // calls setServerUrl(url) with no opts and can't handle a {needsConfirm}
-      // reply (it just expects navigation), so guarding it there would silently
-      // swallow the connect. The server selector is the only caller that
-      // understands the confirm handshake.
-      const isLocal = LOCAL_HOSTS.has(new URL(target).hostname);
-      if (serverSelectorV2Enabled() && !managedTarget && !isLocal && !opts?.force) {
-        const manifest = await fetchServerManifest(target, { signal });
-        signal.throwIfAborted();
-        if (manifest.manifestVersion < 1) {
-          return { needsConfirm: true, url: target };
-        }
-      }
-
       // Multi-server windows connect without touching the saved server —
       // the connection lives and dies with the window.
       const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
@@ -3223,6 +3237,9 @@ function registerIpc() {
     return {
       ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
       customizationDisabled: databricksInternalFeaturesEnabled(),
+      // In-app install is macOS-only; the renderer must not route connect/local
+      // through an install step on platforms where it can't run.
+      installSupported: process.platform === "darwin",
     };
   });
 
@@ -3279,6 +3296,34 @@ function registerIpc() {
       }
     };
     return serverManager.startLocalServer(cliPath, onLine);
+  });
+
+  // Setup page → install the omnigent CLI (macOS). Runs the bundled
+  // install_oss.sh (ensuring uv first) and streams its output to the page, then
+  // re-probes status so the caller learns whether the binary is now resolvable.
+  // Single-flight guard: a duplicate cli-install (e.g. a renderer effect that
+  // re-fired) joins the in-flight install instead of spawning a second one.
+  let cliInstallInFlight = null;
+  ipcMain.handle("omnigent:cli-install", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("cli-install is only available to the setup page");
+    }
+    if (cliInstallInFlight) return cliInstallInFlight;
+    const onOutput = (text) => {
+      try {
+        event.sender.send("omnigent:cli-install-log", { line: text });
+      } catch {
+        /* window torn down mid-install */
+      }
+    };
+    cliInstallInFlight = (async () => {
+      const result = await cliInstall.installCli({ onOutput });
+      const status = await omnigentCli.getCliStatus(loadSettings().omnigent_path);
+      return { ...result, installed: status.installed === true };
+    })().finally(() => {
+      cliInstallInFlight = null;
+    });
+    return cliInstallInFlight;
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both

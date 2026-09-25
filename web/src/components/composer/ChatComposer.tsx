@@ -18,6 +18,27 @@ import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
 
 /**
+ * The composer layout contract: one 12px inset, two roles.
+ *
+ * Inside the card, every content row - the input text, chip rows
+ * (attachment/mention chips), feedback rows (attachment/command errors), and
+ * the action row's controls - aligns to a shared left/right inset line 12px
+ * from the card's edges. Outside the card, the docked trays (workspace bar,
+ * queued-messages strip, sub-agent tray) nest 12px in from the card's outer
+ * edges: a tray is a shelf peeking above the card, not a content row, so it
+ * keeps its own inset rather than sharing the card's border box.
+ *
+ * Padding vs margin follows what each row's border box must coincide with:
+ * chip and action rows are measured through their children (chips, buttons),
+ * so they pad; a feedback row's own box sits on the inset line, so it uses
+ * margins. Vertical rhythm: the input area is `pt-3 pb-1`, each content row
+ * carries `pb-2`, and the action row is `pt-1 pb-2`.
+ */
+export const COMPOSER_CONTENT_INSET_CLASS = "px-3";
+export const COMPOSER_BLOCK_INSET_CLASS = "mx-3";
+export const COMPOSER_TRAY_INSET_CLASS = "mx-3";
+
+/**
  * Minimum free space (px) the action row keeps between its leading and
  * trailing groups. Once the row is narrower than both groups plus this gap,
  * the controls' text labels collapse to icons instead of wrapping.
@@ -239,7 +260,49 @@ export function ComposerInputArea({ className, ...props }: ComponentPropsWithout
   return (
     <div
       className={cn(
-        "composer-input-text relative overflow-hidden px-3 pt-3 pb-1 text-ui",
+        "composer-input-text relative overflow-hidden pt-3 pb-1 text-ui",
+        COMPOSER_CONTENT_INSET_CLASS,
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/**
+ * One wrapping row of chips (attachment tiles, mention chips) on the shared
+ * inset line. Chips are measured through their own boxes, so the row pads
+ * rather than margins; the chip type picks its gap via ``className``.
+ */
+export function ComposerChipRow({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+  return (
+    <div
+      className={cn(
+        "flex flex-wrap items-start gap-2 pb-2",
+        COMPOSER_CONTENT_INSET_CLASS,
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/**
+ * One feedback line under the input (rejected attachments, slash-command
+ * errors and /help output). The row's own border box sits on the shared
+ * inset line, so it margins rather than pads.
+ */
+export function ComposerFeedbackRow({
+  tone = "muted",
+  className,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { tone?: "muted" | "error" }) {
+  return (
+    <div
+      className={cn(
+        "pb-2 text-sm whitespace-pre-wrap",
+        COMPOSER_BLOCK_INSET_CLASS,
+        tone === "error" ? "text-destructive" : "text-muted-foreground",
         className,
       )}
       {...props}
@@ -284,7 +347,8 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
       <div
         ref={ref}
         className={cn(
-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 px-2 pt-1 pb-2",
+          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 pt-1 pb-2",
+          COMPOSER_CONTENT_INSET_CLASS,
           className,
         )}
         {...props}

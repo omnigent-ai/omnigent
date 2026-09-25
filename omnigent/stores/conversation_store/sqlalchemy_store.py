@@ -31,6 +31,7 @@ from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.account_authority import AccountAuthority, require_active_account
+from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
@@ -84,7 +85,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
-from omnigent.errors import StaleCursorError
+from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
@@ -105,6 +106,12 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     SessionConnectivity,
     pinned_label_key,
+)
+from omnigent.stores.conversation_store.overrides import (
+    decode_session_overrides as _decode_session_overrides,
+)
+from omnigent.stores.conversation_store.overrides import (
+    encode_session_overrides as _encode_session_overrides,
 )
 
 _logger = logging.getLogger(__name__)
@@ -169,53 +176,6 @@ _WORKSPACE_SHARER_SCAN_LIMIT = 32
 
 class _RowCountResult(Protocol):
     rowcount: int
-
-
-# Per-session config overrides packed into the ``conversations.session_overrides``
-# JSON blob. Order is fixed so the encoded object is stable across writes.
-_SESSION_OVERRIDE_KEYS = (
-    "reasoning_effort",
-    "model_override",
-    "reported_model",
-    "cost_control_mode_override",
-    "subagent_routing_override",
-    "harness_override",
-    # Stored as the string ``"on"`` when the owner shares workspace files
-    # with view-level collaborators; absent (SQL NULL blob key) otherwise.
-    "share_workspace_files",
-)
-
-
-def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
-    """Pack the set per-session overrides into a compact JSON blob.
-
-    Omits keys whose value is ``None`` and returns ``None`` when nothing is
-    set, so a session on all agent/spec defaults stores SQL ``NULL`` rather
-    than an empty object. Only the :data:`_SESSION_OVERRIDE_KEYS` are
-    considered; any other keys in *overrides* are ignored.
-
-    :param overrides: Mapping of override key to value (missing / ``None``
-        values mean "unset").
-    :returns: Compact JSON object string, or ``None`` when no override is set.
-    """
-    data = {
-        key: overrides[key] for key in _SESSION_OVERRIDE_KEYS if overrides.get(key) is not None
-    }
-    return json.dumps(data, separators=(",", ":")) if data else None
-
-
-def _decode_session_overrides(raw: str | None) -> dict[str, str | None]:
-    """Unpack the ``session_overrides`` blob to a full override dict.
-
-    Every one of the :data:`_SESSION_OVERRIDE_KEYS` is present in the
-    result (unset keys read back as ``None``) so read-modify-write callers can
-    treat the dict uniformly regardless of which overrides were stored.
-
-    :param raw: The stored JSON blob, or ``None``.
-    :returns: Dict keyed by every override name, value ``None`` when unset.
-    """
-    data: dict[str, Any] = json.loads(raw) if raw else {}
-    return {key: data.get(key) for key in _SESSION_OVERRIDE_KEYS}
 
 
 def _to_conversation(
@@ -356,6 +316,17 @@ def _new_session_conversation_row(
         agent_id=agent_id,
         session_overrides=session_overrides,
     )
+
+
+def _validate_inference_snapshot(value: str | None) -> None:
+    """Reject snapshots that cannot fit a MySQL BLOB before writing either database."""
+    stored = compress_text(value)
+    if stored is not None and len(stored) > 65_535:
+        raise OmnigentError(
+            "Inference snapshot exceeds the 65,535-byte compressed storage limit. "
+            "Reduce the configured model catalog or allowlist.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _new_session_metadata_row(
@@ -1093,6 +1064,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     encoded_inference_snapshot = (
                         parent_meta.inference_snapshot if parent_meta else None
                     )
+            _validate_inference_snapshot(encoded_inference_snapshot)
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
 
@@ -4108,6 +4080,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     parent_meta.inference_snapshot if parent_meta else None
                 )
 
+        _validate_inference_snapshot(encoded_inference_snapshot)
+
         def insert_ap(ap_sess: Session) -> SqlConversation:
             conversation_row = _new_session_conversation_row(
                 conversation_id,
@@ -4397,6 +4371,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             source_meta_ref: SqlConversationMetadata | None = meta_sess.get(
                 SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
             )
+
+        _validate_inference_snapshot(
+            source_meta_ref.inference_snapshot if source_meta_ref else None
+        )
 
         with self._conv_session("prepare_fork_conversation") as session:
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))

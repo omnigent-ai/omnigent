@@ -208,7 +208,7 @@ async def _drive(base_url: str, created_session_id: str) -> None:
                 return page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
 
             # The seeded (built-in) debby lists inline. Agent A is a custom
-            # agent, so it lives in the "Custom agents" submenu — drill in.
+            # agent, so it lives in the custom-agent "Other..." submenu — drill in.
             await expect(option(_DEBBY_ID)).to_be_visible()
             await page.get_by_test_id("new-chat-landing-custom-agents").click()
             # Agent A is offered as the NEWER upload id — the stale template id

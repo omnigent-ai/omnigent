@@ -15,8 +15,8 @@ from sqlalchemy.engine import Engine
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache
 
 # Revision ids bounding the migration under test.
-_PRIOR = "jj1a2b3c4d5e"
-_THIS = "jk1b2c3d4e5f"
+_PRIOR = "ll1a2b3c4d5e"
+_THIS = "mm1a2b3c4d5e"
 
 
 def _engine_at(uri: str, revision: str) -> Engine:

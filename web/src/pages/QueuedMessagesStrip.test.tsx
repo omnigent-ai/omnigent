@@ -18,6 +18,49 @@ const msg = (queueId: string, text: string): QueuedMessage => ({
 afterEach(cleanup);
 
 describe("QueuedMessagesStrip", () => {
+  it.each([
+    ["attachment only, named", "", "Screenshot 2026-09-18 at 11.49.24 AM.png"],
+    ["attachment only, unnamed", "", ""],
+    ["short text, named", "Hey", "Screenshot 2026-09-18 at 11.49.24 AM.png"],
+    ["short text, unnamed", "Hey", ""],
+    [
+      "long text, named",
+      "Compare these screenshots. ".repeat(30).trim(),
+      "Screenshot 2026-09-18 at 11.49.24 AM.png",
+    ],
+    ["long text, unnamed", "Compare these screenshots. ".repeat(30).trim(), ""],
+  ])("owns the queued attachment row contract: %s", (_case, text, filename) => {
+    const filenames = [filename, "after.png", "notes.txt"];
+    const expectedNames = [filename || "image.png", "after.png", "notes.txt"];
+    render(
+      <QueuedMessagesStrip
+        messages={[
+          {
+            ...msg("q_1", text),
+            files: filenames.map(
+              (name, index) => new File([], name, { type: index < 2 ? "image/png" : "text/plain" }),
+            ),
+          },
+        ]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+
+    const chip = screen.getByTestId("queued-message-attachments");
+    expect(chip).toHaveAttribute("title", expectedNames.join("\n"));
+    expect(screen.getByText(expectedNames[0]!)).toHaveClass("truncate");
+    expect(screen.getByText("+2")).toBeInTheDocument();
+    if (text) {
+      const preview = screen.getByText(text);
+      expect(preview).toHaveClass("truncate");
+      expect(preview).toHaveAttribute("title", text);
+      expect(preview.parentElement).toBe(chip.parentElement);
+    } else {
+      expect(chip.parentElement?.children).toHaveLength(1);
+    }
+  });
+
   it("renders nothing when the queue is empty", () => {
     const { container } = render(
       <QueuedMessagesStrip messages={[]} onDelete={vi.fn()} onEdit={vi.fn()} />,

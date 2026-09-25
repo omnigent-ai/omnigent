@@ -68,6 +68,17 @@ describe("KeyboardShortcutsList composer rows", () => {
   });
 });
 
+describe("KeyboardShortcutsList settings layout", () => {
+  it("groups shortcut rows into settings cards", () => {
+    render(<KeyboardShortcutsList variant="settings" />);
+
+    const heading = screen.getByRole("heading", { name: "General" });
+    const list = heading.closest("section")?.querySelector("ul");
+    expect(heading).toHaveClass("text-ui", "text-foreground");
+    expect(list).toHaveClass("rounded-xl", "border-border", "bg-card");
+  });
+});
+
 describe("KeyboardShortcutsDialog", () => {
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);

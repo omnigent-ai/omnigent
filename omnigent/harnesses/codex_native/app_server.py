@@ -55,6 +55,7 @@ from omnigent.harnesses.codex_native.process_registry import (
 from omnigent.harnesses.codex_native.stderr_diagnostics import (
     MAX_STDERR_RECORD_BYTES,
     CodexStderrDiagnostics,
+    codex_app_server_diagnostic_env,
     report_capture_start_failure,
 )
 from omnigent.inner import _proc
@@ -1994,7 +1995,9 @@ class CodexNativeAppServer:
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
         )
-        proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
+        proc_env = codex_app_server_diagnostic_env(
+            {**self.env, "CODEX_HOME": str(self.codex_home)}
+        )
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
             self.proc = await asyncio.create_subprocess_exec(
@@ -2997,12 +3000,15 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
-    except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
+    except Exception as exc:  # noqa: BLE001 — cached ucode state is the launch fallback
+        # Recoverable fallback; frames are debug-only so a TTY-mirrored
+        # host console stays concise.
         _logger.warning(
             "native-codex: live Databricks model discovery failed for profile %r; "
-            "falling back to ucode state",
+            "falling back to ucode state (%s)",
             profile,
-            exc_info=True,
+            exc,
+            exc_info=_logger.isEnabledFor(logging.DEBUG),
         )
         try:
             from omnigent.onboarding.ucode_state import read_ucode_state

@@ -26,6 +26,7 @@ from omnigent.host.connect import (
     HostProcess,
     HostRetryableConnectionError,
     _build_runner_env,
+    _runner_exit_error,
     _RunnerHandle,
     run_host_process,
 )
@@ -37,6 +38,7 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFsRequestFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportLocalByIdFrame,
@@ -67,6 +69,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
+    RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
@@ -1473,6 +1476,30 @@ async def test_watch_runner_reports_unexpected_exit(
     assert maintenance_reasons == ["runner_exited"]
 
 
+def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
+    """Redact credentials before exit reports reach the server or SPA."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "boot: starting\n"
+        "OPENAI_API_KEY=sk-live-abc123\n"
+        "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n"
+        "using ghp_0123456789abcdef0123456789abcdef\n"
+        "tunnel rejected: bad frame\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(3, log)
+
+    assert "sk-live-abc123" not in error
+    assert "eyJhbGciOiJIUzI1NiJ9" not in error
+    # Standalone provider-shaped tokens are masked even without a key label.
+    assert "ghp_0123456789abcdef0123456789abcdef" not in error
+    assert "OPENAI_API_KEY=[REDACTED]" in error
+    # Keep the diagnostic cause.
+    assert "tunnel rejected: bad frame" in error
+    assert "code 3" in error
+
+
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1589,13 +1616,271 @@ async def test_watch_runner_silent_on_clean_exit(
         result = await host._handle_launch(frame)
     assert result.status == "launched", result.error
 
+    # The runner connected before exiting — the graceful idle-reaper shape.
+    marker = host._runners[token_bound_runner_id("tok_clean")].connect_marker
+    assert marker is not None
+    marker.touch()
+
     # Let the watcher observe the clean exit and finish.
     await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
-    # A clean (code 0) exit is graceful, not a crash: no report, nothing parked.
+    # A clean (code 0) exit after connecting is graceful, not a crash:
+    # no report, nothing parked.
     assert tunnel.sent == []
     assert host._unreported_exits == {}
     assert maintenance_reasons == ["runner_exited"]
+
+
+async def test_watch_runner_reports_clean_exit_before_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report a clean pre-connect exit as a failed launch."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Exit cleanly before touching the connect marker."""
+        return original_popen(
+            ["sh", "-c", "echo 'boot aborted: nothing to do' >&2; sleep 0.2; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_clean_preconn",
+        binding_token="tok_clean_preconn",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    assert len(tunnel.sent) == 1
+    report = decode_host_frame(tunnel.sent[0])
+    assert isinstance(report, HostRunnerExitedFrame)
+    assert report.runner_id == token_bound_runner_id("tok_clean_preconn")
+    assert "code 0" in report.error
+    assert "boot aborted: nothing to do" in report.error
+
+
+async def _wait_for_error_record(
+    caplog: pytest.LogCaptureFixture, *, timeout_s: float
+) -> list[logging.LogRecord]:
+    """Poll captured logs for ERROR records until timeout."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        if errors:
+            return errors
+        await asyncio.sleep(0.02)
+    return [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+async def test_connect_watchdog_errors_when_runner_never_connects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log a runner- and session-correlated ERROR for a hung launch."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.05)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned_env: dict[str, str] = {}
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Keep a stand-in runner alive without connecting."""
+        spawned_env.update(kwargs.get("env", {}))  # type: ignore[arg-type]
+        return original_popen(
+            ["sleep", "60"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_conn_watch",
+        binding_token="tok_conn_watch",
+        workspace=str(workspace),
+        session_id="conv_conn_watch",
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        errors = await _wait_for_error_record(caplog, timeout_s=5.0)
+
+    runner_id = token_bound_runner_id("tok_conn_watch")
+    # Check the host-to-runner marker handoff.
+    handle = host._runners[runner_id]
+    assert handle.connect_marker is not None
+    assert spawned_env.get(RUNNER_CONNECT_MARKER_ENV_VAR) == str(handle.connect_marker)
+
+    assert errors, "connect watchdog never emitted its ERROR"
+    message = errors[0].getMessage()
+    assert runner_id in message, message
+    assert "conv_conn_watch" in message, message
+    assert "never connected" in message, message
+    _cleanup_host(host)
+
+
+async def test_connect_watchdog_errors_on_silent_pre_connect_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log a clean pre-connect exit without waiting for the deadline."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    # A long deadline distinguishes exit-triggered logging from timeout.
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 60.0)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Exit cleanly before touching the connect marker."""
+        return original_popen(
+            ["sh", "-c", "sleep 0.2; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_conn_exit0",
+        binding_token="tok_conn_exit0",
+        workspace=str(workspace),
+        session_id="conv_conn_exit0",
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        errors = await _wait_for_error_record(caplog, timeout_s=5.0)
+
+    assert errors, (
+        "a clean pre-connect exit must produce the never-connected ERROR "
+        "without waiting out the 60s deadline"
+    )
+    message = errors[0].getMessage()
+    assert token_bound_runner_id("tok_conn_exit0") in message, message
+    assert "conv_conn_exit0" in message, message
+    assert "never connected" in message, message
+    _cleanup_host(host)
+
+
+async def test_connect_watchdog_silent_when_runner_connects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Suppress the watchdog ERROR after a timely tunnel connect."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.15)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Keep a stand-in runner alive."""
+        return original_popen(
+            ["sleep", "60"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_conn_ok",
+        binding_token="tok_conn_ok",
+        workspace=str(workspace),
+        session_id="conv_conn_ok",
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+
+        # Mirror the real tunnel's marker touch.
+        handle = host._runners[token_bound_runner_id("tok_conn_ok")]
+        assert handle.connect_marker is not None
+        handle.connect_marker.touch()
+
+        # Let the deadline pass; the watchdog must stay silent.
+        await asyncio.sleep(0.4)
+
+    assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+    _cleanup_host(host)
+
+
+async def test_connect_watchdog_silent_on_intentional_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Suppress the watchdog ERROR after an intentional stop."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.2)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Keep a stand-in runner alive."""
+        return original_popen(
+            ["sleep", "60"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_conn_stop",
+        binding_token="tok_conn_stop",
+        workspace=str(workspace),
+        session_id="conv_conn_stop",
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+
+        stop_result = await host._handle_stop(
+            HostStopRunnerFrame(
+                request_id="req_conn_stop_2",
+                runner_id=token_bound_runner_id("tok_conn_stop"),
+            )
+        )
+        assert stop_result.status == "stopped"
+
+        # Let the deadline pass; the watchdog must read the pop as intent.
+        await asyncio.sleep(0.5)
+
+    assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+    _cleanup_host(host)
 
 
 async def test_unreported_exit_flushes_after_reconnect(
@@ -7338,3 +7623,123 @@ async def test_github_pr_update_reports_lock_contention_on_host(
     assert registry.path.read_bytes() == before
     assert host._handle_fs_write(frame).status == "ok"
     assert (target in {entry.url for entry in registry.list()}) == (action == "attach")
+
+
+def test_fs_search_reuses_the_changed_files_snapshot_across_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each fs request arrives as its own frame, so the reader — and the
+    registry snapshot search reuses for untracked files — must survive from a
+    Changed-tab request to a later search. A fresh reader per request never has
+    the snapshot, and an untracked file past the walk budget goes unfound."""
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+        cwd=ws,
+        check=True,
+    )
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    host = _make_host_process()
+    try:
+        changes = host._handle_fs_request(
+            HostFsRequestFrame(request_id="r1", op="changes", workspace=str(ws), session_id="conv")
+        )
+        assert changes.status == "ok", changes
+        search = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="r2",
+                op="search",
+                workspace=str(ws),
+                session_id="conv",
+                params={"q": "scratch"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert search.status == "ok", search
+    assert [e["path"] for e in search.payload["data"]] == ["zzz/scratch.txt"], search.payload
+
+
+def test_fs_reader_picks_up_a_repo_created_after_first_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that gains a git repository after its first fs request (a
+    clone landing in a fresh directory) must get git-index search coverage on
+    later requests, not stay pinned to the reader built before the repo
+    existed."""
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "target.jsonnet").write_text("y")
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    host = _make_host_process()
+    try:
+        first = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="r1",
+                op="search",
+                workspace=str(ws),
+                session_id="conv",
+                params={"q": "target"},
+            )
+        )
+        assert first.status == "ok", first
+        assert first.payload["data"] == [], first.payload
+        assert first.payload["truncated"] is True
+
+        subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+            cwd=ws,
+            check=True,
+        )
+
+        second = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="r2",
+                op="search",
+                workspace=str(ws),
+                session_id="conv",
+                params={"q": "target"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert second.status == "ok", second
+    assert [e["path"] for e in second.payload["data"]] == ["zzz/target.jsonnet"], second.payload

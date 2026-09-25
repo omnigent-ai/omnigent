@@ -749,6 +749,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launched.args == [
         "codex",
         "--",
+        "-c",
+        "check_for_update_on_startup=false",
         "--dangerously-bypass-hook-trust",
         *permission_args,
         "resume",
@@ -773,7 +775,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launch_events[0].session_id == session_id
     assert launch_events[0].attributes["command"] == "codex-wrapper"
     assert launch_events[0].attributes["resume"] is True
-    assert launch_events[0].attributes["args"] == shlex.join(launched.args)
+    from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
+
+    assert launch_events[0].attributes["args"] == shlex.join(
+        redact_codex_launch_args(launched.args)
+    )
     from omnigent.harnesses.codex_native.app_server import _format_codex_version
 
     assert launch_events[0].attributes["codex_cli_version"] == _format_codex_version(version)
@@ -1689,7 +1695,11 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     # session behind Codex's terminal-only hook review screen. Omnigent's
     # supported Codex floor is newer than the release that added this flag.
     assert app_server.codex_cli_version is None
-    assert launch_captured["spec"].args[0] == "--dangerously-bypass-hook-trust"
+    assert launch_captured["spec"].args[:3] == [
+        "-c",
+        "check_for_update_on_startup=false",
+        "--dangerously-bypass-hook-trust",
+    ]
 
 
 @pytest.mark.asyncio
