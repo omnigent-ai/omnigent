@@ -49,6 +49,13 @@ _logger = logging.getLogger(__name__)
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
 
+# Bounded retry for transient HTTP failures from the MCP proxy endpoint
+# (server restart, LB blip, momentary overload). ``call_tool`` documents why
+# re-posting under the same operation id is safe for every proxied tool.
+_TRANSIENT_PROXY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_TRANSIENT_PROXY_MAX_RETRIES = 2
+_TRANSIENT_PROXY_BACKOFF_S = 0.5
+
 
 def _json_object(value: object) -> _JsonObject | None:
     """Return a string-keyed object mapping when the value has that shape."""
@@ -312,6 +319,16 @@ class ProxyMcpManager:
         runner-side approval Future until the user accepts or declines, then
         retries once with the user's decision in ``inputResponses``.
 
+        **Transient proxy failures**: an HTTP status in
+        :data:`_TRANSIENT_PROXY_STATUSES` is re-posted a bounded number of
+        times with the same operation id and a fresh JSON-RPC id. On the
+        server a re-post repeats only TOOL_CALL/TOOL_RESULT policy evaluation
+        and its idempotent label writes -- the work the approval retry and the
+        reconnect reattach already repeat -- while the runner's execution
+        registry attaches the retried ``/mcp/execute`` to the step already
+        started instead of running the tool again. The one tool the server
+        executes itself, ``sys_advise_models``, is a read-only advisory.
+
         :param spec: Ignored — accepted for interface parity with
             :class:`RunnerMcpManager`.  ``None`` is acceptable for callers
             that have no spec context (e.g. the claude-native relay executor).
@@ -381,6 +398,7 @@ class ProxyMcpManager:
 
         payload = _initial_payload()
         approval_retries = 0
+        transient_retries = 0
 
         while True:
             request_generation = pending_approvals.current_server_generation()
@@ -409,6 +427,31 @@ class ProxyMcpManager:
                 request_id += 1
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if (
+                    status in _TRANSIENT_PROXY_STATUSES
+                    and transient_retries < _TRANSIENT_PROXY_MAX_RETRIES
+                ):
+                    # Back off and re-post under the same operation id (see call_tool).
+                    transient_retries += 1
+                    _logger.warning(
+                        "MCP proxy returned HTTP %s for tool %r in session %r; retrying (%d/%d)",
+                        status,
+                        tool_name,
+                        self._session_id,
+                        transient_retries,
+                        _TRANSIENT_PROXY_MAX_RETRIES,
+                        extra={"session_id": self._session_id},
+                    )
+                    await asyncio.sleep(_TRANSIENT_PROXY_BACKOFF_S * 2 ** (transient_retries - 1))
+                    request_id += 1
+                    payload = cast("_JsonObject", {**payload, "id": request_id})
+                    continue
+                raise RuntimeError(
+                    f"MCP proxy call failed for tool {tool_name!r} in session "
+                    f"{self._session_id!r}: {exc}"
+                ) from exc
             except Exception as exc:
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
