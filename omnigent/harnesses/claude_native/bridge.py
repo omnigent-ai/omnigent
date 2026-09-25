@@ -6407,6 +6407,59 @@ def _tool_relay_handler_factory(
             if raw:
                 self.wfile.write(raw)
 
+        def _surface_prompt_block(
+            self, hook_event: str, hook_output: dict[str, object] | None
+        ) -> None:
+            """Surface a blocked ``UserPromptSubmit`` to the web chat view.
+
+            A blocked prompt starts no turn and persists nothing to the
+            transcript, so the ``Stop`` / ``StopFailure`` forwarder never
+            sees it: the block reason shows only as Claude Code's terminal
+            ``blocked by hook`` line, and the web UI is left with a prompt
+            that vanished (and a status pill stuck at ``running``). Posting a
+            ``failed`` status edge carrying the reason mirrors the
+            ``StopFailure`` path: the server copies ``failure_detail`` into
+            ``last_task_error``, so ap-web renders the reason inline and
+            clears the pill. Covers both a real request-phase DENY and the
+            fail-closed block on an unevaluable verdict; best-effort, and
+            never delays or fails the block already returned to Claude Code.
+
+            :param hook_event: Hook event name this verdict answered.
+            :param hook_output: The hook output just returned to Claude Code.
+            """
+            if hook_event != "UserPromptSubmit":
+                return
+            if not isinstance(hook_output, dict) or hook_output.get("decision") != "block":
+                return
+            if policy_client is None or session_id is None:
+                return
+            reason = hook_output.get("reason")
+            detail = (
+                reason.strip()
+                if isinstance(reason, str) and reason.strip()
+                else "Prompt blocked by policy"
+            )
+            from omnigent.native._native_post_delivery import post_external_session_status
+
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    post_external_session_status(
+                        policy_client,
+                        session_id=session_id,
+                        status="failed",
+                        failure_detail=detail,
+                    ),
+                    loop,
+                )
+                future.result(timeout=10.0)
+            except Exception:  # noqa: BLE001 — best-effort surfacing only
+                _logger.warning(
+                    "failed to surface blocked prompt to web UI; session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+
         def _handle_hook_evaluate(self, payload: _JsonObject) -> None:
             """Serve one Claude policy hook event end to end.
 
@@ -6480,7 +6533,11 @@ def _tool_relay_handler_factory(
                     last_error,
                     extra={"session_id": session_id},
                 )
-                self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
+                fail_output = fail_ask_hook_output(hook_event, last_error)
+                # Surface before responding so the reason reaches the web UI
+                # even though a blocked prompt starts no turn to carry it.
+                self._surface_prompt_block(hook_event, fail_output)
+                self._respond_hook_output(fail_output)
                 return
             hook_output = evaluation_response_to_hook_output(hook_event, verdict)
             hook_specific = (hook_output or {}).get("hookSpecificOutput")
@@ -6500,6 +6557,9 @@ def _tool_relay_handler_factory(
                     verdict.get("reason"),
                     extra={"session_id": session_id},
                 )
+            # Surface before responding so the reason reaches the web UI
+            # even though a blocked prompt starts no turn to carry it.
+            self._surface_prompt_block(hook_event, hook_output)
             self._respond_hook_output(hook_output)
 
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
