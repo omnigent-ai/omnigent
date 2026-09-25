@@ -1,35 +1,20 @@
-"""E2E repro: a silent HTTPS server is reported as an Omnigent ERROR.
+"""A host pointed at an HTTPS endpoint that accepts tunnels but never answers.
 
-A user runs ``omnigent host --server https://<server>`` against an HTTPS
-deployment whose edge accepts every WebSocket tunnel upgrade (a valid
-``101``) but whose backend never sends a single frame — the shape a
-Databricks Apps ingress produces while the app behind it is hung or
-restarting. The host reconnect-loops (each attempt even prints
-``✓ Connected`` before the tunnel dies unanswered), and after
-``_SILENT_CONNECT_ESCALATE_ATTEMPTS`` consecutive accepted-but-silent
-connections it emits, at **ERROR** level::
+``omnigent host --server https://<server>`` against a deployment whose edge
+accepts every WebSocket tunnel upgrade (a valid ``101``) while the backend never
+sends a frame reconnect-loops (each attempt prints ``✓ Connected`` before the
+tunnel dies unanswered). After ``_SILENT_CONNECT_ESCALATE_ATTEMPTS`` consecutive
+accepted-but-silent connections the host escalates: an operator ``⚠`` notice on
+stderr and slow-backoff retries until the server speaks. That silence is the
+server's condition, so the escalation must be recorded as a WARN with server
+attribution, never as an ERROR-level ``omnigent.host.connect`` record, which the
+error-KPI pipeline would count as an Omnigent defect.
 
-    The server at https://... accepted N consecutive connections but never
-    responded on any of them. Treating the endpoint as unhealthy;
-    reconnecting on slow backoff until it responds.
-
-The detection itself is wanted (operator ⚠ notice on stderr, slow-backoff
-retry, automatic recovery once the server speaks). The defect this test
-pins is the *attribution*: the condition is the upstream endpoint failing
-to answer, yet it lands in the omnigent debug log as an unstructured
-ERROR-level record from ``omnigent.host.connect`` — the exact record the
-error-KPI pipeline counts as an Omnigent defect. The identical message for
-an ``http://`` (local) server is already triaged as expected; the
-``https://`` variant is the same host-side code path reporting a
-server-side outage as its own error.
-
-This test drives the real user journey: it stands up a TLS endpoint that
-accepts upgrades and stays silent, points a real ``omnigent host`` process
-at it under a non-loopback https hostname (a DNS shim maps the hostname to
-loopback, so the reconnect loop classifies the endpoint as a remote deploy
-exactly like the field), lets the silent-connect streak cross the
-escalation threshold, and then asserts the host survived AND that the
-upstream condition was not recorded as an ERROR-level omnigent log record.
+The test stands up a TLS endpoint that accepts upgrades and stays silent, points
+a real ``omnigent host`` process at it under a non-loopback https hostname (a
+DNS shim maps the hostname to loopback, so the reconnect loop classifies the
+endpoint as a remote deploy exactly like the field), waits for the escalation,
+and checks the host log and console.
 
 Run with::
 
@@ -56,21 +41,15 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.host.connect import _SILENT_CONNECT_ESCALATE_ATTEMPTS
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# A deliberately non-loopback hostname: the reconnect loop's disconnect
-# classification distinguishes loopback from remote (Apps-ingress-fronted)
-# servers, and the reported failure is against a remote https deployment.
-# A getaddrinfo shim maps it to 127.0.0.1; it never touches real DNS.
+# Non-loopback like the reported Apps URL: the reconnect loop classifies
+# loopback and remote servers differently. A getaddrinfo shim pins it to
+# 127.0.0.1; ``.test`` never reaches real DNS.
 _FAKE_HOST = "app-omni-silent-e2e.test"
-
-# Mirrors _SILENT_CONNECT_ESCALATE_ATTEMPTS in omnigent/host/connect.py:
-# consecutive accepted-but-silent connections before the host declares the
-# endpoint unhealthy. The journey gate below waits for a couple more than
-# this so the escalation moment has definitely passed, whatever form the
-# build under test reports it in.
-_SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
-_JOURNEY_ATTEMPTS = _SILENT_CONNECT_ESCALATE_ATTEMPTS + 2
 
 # The stable phrase of the silent-endpoint escalation message.
 _ESCALATION_PHRASE = "consecutive connections but never responded"
@@ -78,8 +57,11 @@ _ESCALATION_PHRASE = "consecutive connections but never responded"
 # Process-log lines start with the level name (see DEFAULT_LOG_PREFIX_FORMAT
 # in omnigent/process_logging.py).
 _ERROR_RECORD_RE = re.compile(r"^ERROR\b.*" + re.escape(_ESCALATION_PHRASE))
+_WARNING_RECORD_RE = re.compile(r"^WARN(?:ING)?\b.*" + re.escape(_ESCALATION_PHRASE))
 
-_COLLECT_DEADLINE_S = 150.0
+# Ten prompt (0.5s) reconnects plus per-attempt header/credential work; the
+# first hello also waits on startup capability discovery.
+_ESCALATION_DEADLINE_S = 150.0
 
 _WS_MAGIC_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -234,23 +216,14 @@ def _read(path: Path) -> str:
 
 @pytest.mark.timeout(240)
 def test_host_silent_https_endpoint_not_logged_as_omnigent_error(tmp_path: Path) -> None:
-    """A silent https endpoint must not be recorded as an Omnigent ERROR.
+    """The silent-endpoint escalation is a WARN record, never an Omnigent ERROR.
 
-    Drives the reported journey to its failure state — the host has made
-    well past the escalation threshold of consecutive accepted-but-silent
-    connections against a remote-classified https endpoint — then asserts:
-
-    1. the daemon is still retrying (exiting would strand every runner);
-    2. the upstream endpoint's silence is not recorded in the omnigent
-       debug log as an unstructured ERROR-level ``never responded`` record
-       (the error-KPI pipeline ingests ERROR records as Omnigent defects;
-       an upstream/server condition must carry a non-ERROR level or a
-       structured upstream attribution instead). The operator-facing ⚠
-       stderr notice and the slow-backoff retry cadence are wanted and are
-       untouched by this assertion.
+    Drives the reported journey until the host escalates, then checks that the
+    daemon is still retrying (exiting would strand every runner), that the
+    escalation reached the operator (the ``⚠`` console notice) and the host log
+    as a WARN-level record, and that no ERROR-level ``never responded`` record
+    was written.
     """
-    from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
-
     cert_path = tmp_path / "cert.pem"
     key_path = tmp_path / "key.pem"
     _write_self_signed_cert(cert_path, key_path)
@@ -317,25 +290,20 @@ def test_host_silent_https_endpoint_not_logged_as_omnigent_error(tmp_path: Path)
             stderr=subprocess.STDOUT,
         )
     try:
-        # Journey gate: the failure state is reached once the endpoint has
-        # accepted (and left unanswered) comfortably more consecutive
-        # connections than the escalation threshold.
-        deadline = time.monotonic() + _COLLECT_DEADLINE_S
-        while time.monotonic() < deadline:
-            if proc.poll() is not None or endpoint.accepted_upgrades >= _JOURNEY_ATTEMPTS:
+        # Journey gate: the escalation has fired once its operator notice is on
+        # the console (or the host gave up).
+        deadline = time.monotonic() + _ESCALATION_DEADLINE_S
+        while time.monotonic() < deadline and proc.poll() is None:
+            if _ESCALATION_PHRASE in _read(console_log):
                 break
             time.sleep(0.5)
 
+        console = _read(console_log)
+        log = _read(host_log)
         diagnostics = (
             f"accepted upgrades: {endpoint.accepted_upgrades}\n"
-            f"--- console ---\n{_read(console_log)[-4000:]}\n"
-            f"--- daemon log tail ---\n{_read(host_log)[-4000:]}"
-        )
-        assert endpoint.accepted_upgrades >= _JOURNEY_ATTEMPTS, (
-            f"journey did not reach the reported failure state: the endpoint "
-            f"accepted only {endpoint.accepted_upgrades} tunnel connections within "
-            f"{_COLLECT_DEADLINE_S:.0f}s (needed {_JOURNEY_ATTEMPTS} consecutive "
-            f"accepted-but-silent connections)\n{diagnostics}"
+            f"--- console ---\n{console[-4000:]}\n"
+            f"--- daemon log tail ---\n{log[-4000:]}"
         )
 
         # The daemon must still be retrying: the endpoint may heal at any
@@ -344,21 +312,24 @@ def test_host_silent_https_endpoint_not_logged_as_omnigent_error(tmp_path: Path)
             f"host daemon exited (code {proc.returncode}) instead of retrying "
             f"on backoff\n{diagnostics}"
         )
+        assert _ESCALATION_PHRASE in console, (
+            f"the host never escalated after {endpoint.accepted_upgrades} accepted-but-silent "
+            f"connections within {_ESCALATION_DEADLINE_S:.0f}s\n{diagnostics}"
+        )
+        assert endpoint.accepted_upgrades >= _SILENT_CONNECT_ESCALATE_ATTEMPTS, diagnostics
 
-        # The bug: the upstream endpoint's silence lands in the omnigent
-        # debug log as an unstructured ERROR record from
-        # omnigent.host.connect ("... accepted N consecutive connections but
-        # never responded on any of them."), which the error KPI attributes
-        # to Omnigent. Detection/operator messaging may (and should) remain;
-        # this record must not be a bare ERROR.
-        error_records = [
-            line for line in _read(host_log).splitlines() if _ERROR_RECORD_RE.search(line)
-        ]
+        # The server's silence is a server-side condition: recorded as a WARN
+        # with attribution, not as an ERROR the error KPI counts against Omnigent.
+        records = [line for line in log.splitlines() if _ESCALATION_PHRASE in line]
+        error_records = [line for line in records if _ERROR_RECORD_RE.search(line)]
         assert not error_records, (
-            "the silent https endpoint (an upstream/server condition) was "
-            "recorded as an ERROR-level omnigent log record:\n  "
+            "the silent https endpoint (a server condition) was recorded as an "
+            "ERROR-level omnigent log record:\n  "
             + "\n  ".join(error_records)
             + f"\n{diagnostics}"
+        )
+        assert any(_WARNING_RECORD_RE.search(line) for line in records), (
+            f"no WARN-level escalation record in the host log\n{diagnostics}"
         )
     finally:
         if proc.poll() is None:
