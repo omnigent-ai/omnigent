@@ -127,6 +127,19 @@ describe("RunnerStartingIndicator", () => {
   });
 
   it.each(["hero", "row"] as const)(
+    "%s: names prepared workspace activation during sandbox startup",
+    (variant) => {
+      useChatStore.setState({ sandboxStatus: { stage: "preparing_workspace", error: null } });
+      renderWithContext(variant, makeCtx({ terminalStartingUp: true }));
+      const indicator = screen.getByTestId("runner-starting-indicator");
+      expect(indicator).toHaveTextContent("Preparing workspace…");
+      expect(indicator).not.toHaveTextContent(/cloning repository/i);
+      expect(indicator).toHaveAttribute("role", "status");
+      expect(indicator).toHaveAttribute("aria-live", "polite");
+    },
+  );
+
+  it.each(["hero", "row"] as const)(
     "%s: renders nothing for a FAILED sandbox launch",
     (variant) => {
       // Failure belongs to the destructive SandboxFailedIndicator band —

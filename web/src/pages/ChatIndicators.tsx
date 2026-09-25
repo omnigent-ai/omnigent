@@ -11,7 +11,7 @@ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 /**
  * Band copy for each in-flight managed-sandbox launch stage, in
- * pipeline order: provisioning → cloning (repo workspaces only) →
+ * pipeline order: provisioning → cloning/preparing_workspace →
  * starting → connecting. `starting` is the in-sandbox host booting
  * and dialing back to the server (so it reads "Connecting host");
  * `connecting` is the agent runner being launched on that host
@@ -22,6 +22,7 @@ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
   provisioning: "Provisioning sandbox",
   cloning: "Cloning repository",
+  preparing_workspace: "Preparing workspace",
   starting: "Connecting host",
   connecting: "Starting agent",
 };

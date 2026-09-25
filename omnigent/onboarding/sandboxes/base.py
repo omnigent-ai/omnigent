@@ -910,6 +910,10 @@ class SandboxHostLauncher(SandboxLifecycle):
     transport.
     """
 
+    def prepare_launch_request(self, request: _sandbox_types.SandboxLaunchRequest) -> None:
+        """Provide request context while preserving existing provider overrides."""
+        self.prepare_for_launch(agent_name=request.agent_name)
+
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.
 

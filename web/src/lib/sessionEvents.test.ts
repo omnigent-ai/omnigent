@@ -1329,20 +1329,23 @@ describe("session.terminal_pending (FLAT envelope)", () => {
 });
 
 describe("session.sandbox_status (FLAT envelope)", () => {
-  it("lifts conversation_id, stage, and error", () => {
-    const out = parse("session.sandbox_status", {
-      type: "session.sandbox_status",
-      conversation_id: "conv_abc",
-      stage: "cloning",
-      error: null,
-    });
-    expect(out).toHaveLength(1);
-    const ev = out[0] as SessionSandboxStatusEvent;
-    expect(ev.type).toBe("session_sandbox_status");
-    expect(ev.conversationId).toBe("conv_abc");
-    expect(ev.stage).toBe("cloning");
-    expect(ev.error).toBeNull();
-  });
+  it.each(["cloning", "preparing_workspace"])(
+    "lifts %s stage, conversation_id, and error",
+    (stage) => {
+      const out = parse("session.sandbox_status", {
+        type: "session.sandbox_status",
+        conversation_id: "conv_abc",
+        stage,
+        error: null,
+      });
+      expect(out).toHaveLength(1);
+      const ev = out[0] as SessionSandboxStatusEvent;
+      expect(ev.type).toBe("session_sandbox_status");
+      expect(ev.conversationId).toBe("conv_abc");
+      expect(ev.stage).toBe(stage);
+      expect(ev.error).toBeNull();
+    },
+  );
 
   it("carries the failure reason on stage=failed", () => {
     const out = parse("session.sandbox_status", {

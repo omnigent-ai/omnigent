@@ -157,6 +157,15 @@ class RepoWorkspace:
     repo_name: str
 
 
+@dataclass(frozen=True)
+class SandboxLaunchRequest:
+    """Trusted request context for choosing infrastructure before allocation."""
+
+    owner: str
+    repos: tuple[RepoWorkspace, ...] = ()
+    agent_name: str | None = None
+
+
 def _owner_segment(url: str) -> str:
     """
     The owner/org segment of a repo URL (second-to-last path segment), used to
