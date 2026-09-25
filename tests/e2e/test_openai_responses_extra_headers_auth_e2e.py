@@ -1,37 +1,13 @@
 """E2E: OpenAI Responses requests must carry connection-supplied auth headers.
 
-A caller that threads endpoint authentication through
-``connection_params["extra_headers"]`` — the supported route added for the
-MAS Barnacle forward proxy, whose auth is a ``host`` header + s2s headers
-rather than a bearer ``api_key`` — gets authenticated Chat Completions
-requests but **unauthenticated** Responses requests. The provider rejects
-the request::
+A caller that authenticates an OpenAI-compatible endpoint solely through
+``connection_params["extra_headers"]`` (the MAS Barnacle proxy route: a ``host``
+header plus s2s headers instead of a bearer ``api_key``) needs those headers on
+``/v1/responses`` as well as ``/v1/chat/completions``; otherwise the endpoint
+rejects the Responses request with 401 and the caller's turn fails.
 
-    OpenAI Responses API 401: {"error": {"message": "Missing bearer ... in
-    header", "type": "invalid_request_error", ...}}
-
-(logger ``omnigent.llms.adapters.openai``, function ``_stream_responses``),
-and the caller's turn dies.
-
-The journey, driven end to end through the real ``omnigent.llms`` client
-and real HTTP:
-
-1. The caller's connection carries working auth in ``extra_headers``
-   (the loopback provider below accepts exactly that header, standing in
-   for an auth-requiring OpenAI-compatible endpoint).
-2. A Chat Completions call with that connection succeeds — proving the
-   connection itself is good.
-3. The same connection is used for an ``openai/*`` model, which the client
-   routes to the OpenAI Responses API (``/v1/responses``).
-
-Expected: the Responses request reaches the endpoint with the same
-``Authorization`` header and the call completes. Before the fix the header
-is silently dropped (``responses_create`` builds headers from ``api_key``
-alone), the endpoint answers 401, and the call raises ``HTTPStatusError``.
-
-Self-contained: mocks only the provider HTTP endpoint; the client, routing,
-adapter, and SSE parsing are all real. Requires no server, no credentials,
-and no network.
+Drives the real ``omnigent.llms`` client, routing, adapter, and SSE parsing over
+real HTTP against a loopback provider; needs no server, credentials, or network.
 """
 
 from __future__ import annotations
@@ -51,13 +27,10 @@ AUTH_HEADER = "Bearer mas-s2s-token"
 
 
 class _FakeProvider(http.server.ThreadingHTTPServer):
-    """Loopback stand-in for an auth-requiring OpenAI-compatible endpoint.
+    """Loopback OpenAI-compatible endpoint that accepts only ``AUTH_HEADER``.
 
-    Accepts only ``Authorization: Bearer mas-s2s-token`` (what the caller
-    threads through ``connection_params["extra_headers"]``); anything else
-    gets the provider's real-world rejection shape:
-    ``401 {"error": {"message": "Missing bearer ... in header", ...}}``.
-    Records the Authorization header seen per path.
+    Any other request gets the provider's 401 body; the Authorization header
+    seen per path is recorded in ``auth_seen``.
     """
 
     def __init__(self) -> None:

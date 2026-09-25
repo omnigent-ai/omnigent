@@ -125,10 +125,7 @@ def test_headers_with_api_key() -> None:
 
 
 def test_headers_merge_extra_headers() -> None:
-    """
-    Caller-supplied ``extra_headers`` (e.g. proxy ``host`` + s2s auth) are
-    merged into the built headers; non-string entries are dropped.
-    """
+    """String ``extra_headers`` entries are merged in; non-string keys/values are dropped."""
     adapter = OpenAICompatibleAdapter(base_url="https://localhost")
     headers = adapter._build_headers(
         extra_headers={
@@ -154,13 +151,16 @@ def test_headers_extra_headers_override_api_key() -> None:
     assert headers["Authorization"] == "Bearer s2s-token"
 
 
+@pytest.mark.parametrize("extra_headers", [None, {}, "Authorization: Bearer x", ["host"]])
+def test_headers_ignore_absent_or_non_dict_extra_headers(extra_headers: object) -> None:
+    """Absent, empty, or non-dict ``extra_headers`` leave the built headers unchanged."""
+    adapter = OpenAICompatibleAdapter(base_url="https://localhost")
+    headers = adapter._build_headers(api_key_override="sk-test-123", extra_headers=extra_headers)
+    assert headers == {"Content-Type": "application/json", "Authorization": "Bearer sk-test-123"}
+
+
 async def test_responses_create_sends_extra_headers_non_streaming() -> None:
-    """
-    ``responses_create`` must forward ``connection_params["extra_headers"]``
-    — a caller whose endpoint auth rides extra headers (no ``api_key``)
-    otherwise sends unauthenticated ``/v1/responses`` requests that the
-    provider rejects with 401.
-    """
+    """``responses_create`` forwards ``connection_params["extra_headers"]`` to the request."""
     adapter = OpenAIAdapter(base_url="https://fake-host/v1")
     send = AsyncMock(return_value={"model": "gpt-5", "output": []})
     with patch.object(adapter, "_send_request", send):
