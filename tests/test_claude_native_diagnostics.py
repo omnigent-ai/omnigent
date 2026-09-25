@@ -158,6 +158,24 @@ def test_poll_exports_new_records_once_with_session_and_launch_identity(
     assert events[-1]["offset"] == capture_file.stat().st_size
 
 
+def test_poll_marks_highest_native_severity_without_promoting_wrapper_log(
+    capture_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    capture_file.write_text(
+        "2026-09-25T12:00:00.000Z [DEBUG] request started\n"
+        "2026-09-25T12:00:00.100Z [ERROR] request failed\n"
+    )
+    follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
+
+    follower.poll("conv_test")
+    follower.close("conv_test")
+
+    assert len(_events(caplog)) == 1
+    row = record_to_row(caplog.records[0], "runner")
+    assert row["attributes"]["native_severity"] == "ERROR"
+    assert row["level"] == "INFO"
+
+
 @pytest.mark.parametrize(
     ("diagnostic", "secret", "expected"),
     [

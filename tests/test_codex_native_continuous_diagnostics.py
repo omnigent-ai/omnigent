@@ -100,7 +100,9 @@ async def test_exports_startup_runtime_and_eof_with_active_session_attribution(
     monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent-session")
     stderr = _reader(server)
     try:
-        stderr.feed_data(b"startup request password=synthetic-secret\n")
+        stderr.feed_data(
+            b"2026-09-25T12:00:00.000Z ERROR codex_core::startup: password=synthetic-secret\n"
+        )
         startup = record_to_row(await output.next(), "runner")
         assert startup["session_id"] == "child-session"
         assert startup["event_name"] == "harness_diagnostic_output"
@@ -108,6 +110,8 @@ async def test_exports_startup_runtime_and_eof_with_active_session_attribution(
         assert startup["attributes"]["source_kind"] == "codex_app_server_stderr"
         assert startup["attributes"]["harness"] == "codex-native"
         assert startup["attributes"]["app_server_pid"] == "123"
+        assert startup["attributes"]["native_severity"] == "ERROR"
+        assert startup["level"] == "INFO"
         assert server.stderr_task is not None and not server.stderr_task.done()
 
         write_bridge_state(

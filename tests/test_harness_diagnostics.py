@@ -153,3 +153,43 @@ def test_cookie_redaction_precedes_diagnostic_tail_clipping() -> None:
     snapshot = bounded_diagnostic_tail([raw])
     assert snapshot["tail"] == 'headers={"set-cookie": "[REDACTED]"}'
     assert snapshot["truncated"] is False
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ("TRACE codex_core::events: trace detail", "TRACE"),
+        ("DEBUG model_client.request: request complete", "DEBUG"),
+        ("2026-09-25T12:00:00.000Z INFO codex_core::client: connected", "INFO"),
+        ("2026-09-25T12:00:00.000Z WARN codex_core::client: retrying", "WARN"),
+        ("2026-09-25T12:00:00.000Z WARNING native runtime retrying", "WARN"),
+        ("2026-09-25T12:00:00.000Z [ERROR] request failed", "ERROR"),
+        ("\x1b[31mERROR\x1b[0m codex_core::client: failed", "ERROR"),
+    ],
+)
+def test_diagnostic_tail_marks_native_severity(record: str, expected: str) -> None:
+    assert bounded_diagnostic_tail([record])["native_severity"] == expected
+
+
+def test_diagnostic_tail_marks_highest_severity_in_retained_batch() -> None:
+    snapshot = bounded_diagnostic_tail(
+        [
+            "2026-09-25T12:00:00.000Z [DEBUG] starting request",
+            "2026-09-25T12:00:00.100Z [ERROR] request failed",
+            "2026-09-25T12:00:00.200Z [INFO] cleanup complete",
+        ]
+    )
+
+    assert snapshot["native_severity"] == "ERROR"
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "request body contains ERROR as user text",
+        "ERRORISH is not a severity marker",
+        "an INFO message without a leading marker",
+    ],
+)
+def test_diagnostic_tail_does_not_infer_severity_from_message_text(record: str) -> None:
+    assert bounded_diagnostic_tail([record])["native_severity"] is None

@@ -287,6 +287,7 @@ class ClaudeDebugLogFollower:
                 launch_id=self._capture.launch_id,
                 offset=self._offset,
                 text=text,
+                native_severity=snapshot["native_severity"],
                 truncated=bool(snapshot["truncated"] or omitted_lines or omitted_bytes),
                 lines_omitted=total_lines_omitted,
                 bytes_omitted=total_bytes_omitted,

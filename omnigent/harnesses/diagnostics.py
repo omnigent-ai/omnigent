@@ -23,6 +23,19 @@ _HTTP_COOKIE = re.compile(
     r"|'[^'\r\n]*(?:(?<=\\)'[^'\r\n]*)*(?<!\\)'"
     r"|[^\r\n]*)"
 )
+_NATIVE_SEVERITY = re.compile(
+    r"^(?:(?:\d{4}-\d{2}-\d{2}[T ][0-9:.+-]+Z?)\s+)?"
+    r"(?:\[(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR)\]"
+    r"|(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR))(?=[\s:])"
+)
+_NATIVE_SEVERITY_RANK = {
+    "TRACE": 0,
+    "DEBUG": 1,
+    "INFO": 2,
+    "WARN": 3,
+    "WARNING": 3,
+    "ERROR": 4,
+}
 
 
 def _redact_http_cookie(match: re.Match[str]) -> str:
@@ -42,6 +55,25 @@ def sanitize_diagnostic_text(text: str) -> str:
     cleaned = _URL_USERINFO.sub(r"\1[REDACTED]@", cleaned)
     cleaned = _HTTP_COOKIE.sub(_redact_http_cookie, cleaned)
     return redact_log_text(cleaned, include_whitespace_credentials=True)
+
+
+def native_diagnostic_severity(entries: list[str]) -> str | None:
+    """Return the highest leading native log severity in retained records."""
+    highest: str | None = None
+    highest_rank = -1
+    for entry in entries:
+        first_line = entry.lstrip().split("\n", 1)[0]
+        match = _NATIVE_SEVERITY.match(first_line)
+        if match is None:
+            continue
+        marker = match[1] or match[2]
+        if marker is None:
+            continue
+        rank = _NATIVE_SEVERITY_RANK[marker]
+        if rank > highest_rank:
+            highest = "WARN" if marker == "WARNING" else marker
+            highest_rank = rank
+    return highest
 
 
 def bounded_diagnostic_tail(entries: list[str]) -> dict[str, object]:
@@ -64,6 +96,7 @@ def bounded_diagnostic_tail(entries: list[str]) -> dict[str, object]:
     omitted_bytes = len("\n".join(lines).encode("utf-8")) - len(tail.encode("utf-8"))
     return {
         "tail": tail,
+        "native_severity": native_diagnostic_severity(list(reversed(retained))),
         "truncated": omitted_bytes > 0,
         "lines_omitted": len(lines) - len(retained),
         "bytes_omitted": omitted_bytes,

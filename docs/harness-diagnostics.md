@@ -94,7 +94,9 @@ process lifetime. With capture enabled, completed records are handed to a
 background thread that sanitizes and emits them at INFO about every 250 ms,
 independently of thread discovery, prompt delivery, or transcript forwarding.
 Events use `event_name=harness_diagnostic_output`, `harness=codex-native`, and
-`source_kind=codex_app_server_stderr`.
+`source_kind=codex_app_server_stderr`. The wrapper remains INFO so native runtime
+messages do not change Omnigent alerting semantics. `native_severity` makes the
+highest recognized severity in the retained text independently queryable.
 
 Each event uses the current session ID from the bridge state, falling back to
 the owning launch session before bridge state exists. Child startup diagnostics
@@ -108,6 +110,7 @@ Use `launch_id`, PID, and byte offset to follow the same process across a switch
 | `launch_id`, `app_server_pid` | Unique capture identifier and app-server PID |
 | `offset` | Raw stderr bytes consumed through the submitted records, including omitted bytes |
 | `text` | Recent redacted records, at most 65,536 UTF-8 bytes per event |
+| `native_severity` | Highest leading severity in retained records: `TRACE`, `DEBUG`, `INFO`, `WARN`, or `ERROR`; omitted when no marker is recognized |
 | `truncated` | Whether records or bytes were omitted |
 | `lines_omitted`, `bytes_omitted` | Whole source records dropped by input/queue limits, plus omissions from the redacted export buffer |
 | `tail_byte_limit` | Maximum exported text size, 65,536 bytes; metadata and the formatted message add to event size |
@@ -270,12 +273,15 @@ records emit INFO events with
 including after a session switch. The diagnostic text can include prompt-hook
 prompts, scripts, request/response context, and response fragments. The source
 file contains Claude's original output; redaction applies to exported records.
+The wrapper remains INFO, while `native_severity` reports the highest recognized
+severity in the retained text.
 
 | Attribute | Meaning |
 | --- | --- |
 | `launch_id` | Unique identifier for the owned diagnostic file |
 | `offset` | Byte offset consumed from the current file |
 | `text` | Recent redacted records, at most 65,536 UTF-8 bytes per event |
+| `native_severity` | Highest leading severity in retained records: `TRACE`, `DEBUG`, `INFO`, `WARN`, or `ERROR`; omitted when no marker is recognized |
 | `truncated` | Whether records or bytes were omitted |
 | `lines_omitted`, `bytes_omitted` | Known omitted records and bytes for this event; unread backlog has a byte count without a complete line count |
 | `tail_byte_limit` | Maximum exported text size, 65,536 bytes; metadata and the formatted log message add to the overall event size |

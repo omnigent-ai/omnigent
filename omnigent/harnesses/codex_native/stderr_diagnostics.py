@@ -172,6 +172,7 @@ class CodexStderrDiagnostics:
                 app_server_pid=self._pid,
                 offset=offset,
                 text=text,
+                native_severity=snapshot["native_severity"],
                 truncated=bool(snapshot["truncated"] or omitted_lines or omitted_bytes),
                 lines_omitted=omitted_lines,
                 bytes_omitted=omitted_bytes,
