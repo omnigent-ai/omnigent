@@ -612,7 +612,12 @@ export function FilesPanel({
             // flight React Query returns the PRIOR term's results (isPlaceholderData),
             // which would otherwise render as if they matched the new term. Drop
             // them so the tree shows "Searching…" until the real results land.
-            searchResults={treeSearchQuery.isPlaceholderData ? undefined : treeSearchQuery.data}
+            searchResults={
+              treeSearchQuery.isPlaceholderData ? undefined : treeSearchQuery.data?.files
+            }
+            searchTruncated={
+              !treeSearchQuery.isPlaceholderData && (treeSearchQuery.data?.truncated ?? false)
+            }
             isSearching={treeSearchQuery.isFetching}
             isSearchError={treeSearchQuery.isError}
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}

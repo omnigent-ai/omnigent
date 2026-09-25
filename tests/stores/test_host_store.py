@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 
 import pytest
 from sqlalchemy import event, update
@@ -10,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
     Host,
@@ -43,6 +46,52 @@ def _set_updated_at(db_uri: str, host_id: str, value: int) -> None:
     with Session(engine) as session:
         session.execute(update(SqlHost).where(SqlHost.host_id == host_id).values(updated_at=value))
         session.commit()
+
+
+@pytest.mark.parametrize("provider", [None, "kubernetes", "agent_sandbox", "modal", "lakebox"])
+@pytest.mark.parametrize("saved_profile", [False, True])
+@pytest.mark.parametrize("binding", ["unbound", "same-host", "transfer"])
+def test_launch_admission_keeps_saved_profiles_on_managed_hosts(
+    host_store: HostStore, db_uri: str, provider: str | None, saved_profile: bool, binding: str
+) -> None:
+    host_id, source_id = uuid.uuid4().hex, uuid.uuid4().hex
+    if provider is None:
+        host_store.upsert_on_connect(host_id, "laptop", "alice")
+    else:
+        host_store.register_managed_host(
+            host_id=host_id,
+            name="sandbox",
+            user_id="alice",
+            token="test-launch-token",
+            provider=provider,
+            sandbox_id="test-sandbox",
+            token_expires_at=now_epoch() + 100,
+        )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation(
+        inference_snapshot={"runtime_config": {}} if saved_profile else None
+    )
+    if binding != "unbound":
+        conversations.set_host_id(
+            conv.id, host_id if binding == "same-host" else source_id, workspace="/tmp"
+        )
+
+    def admit() -> None:
+        host_store.admit_launch(
+            host_id,
+            conv.id,
+            "alice",
+            None,
+            allow_unbound=binding == "unbound",
+            transfer_from_host_id=source_id if binding == "transfer" else None,
+        )
+
+    if saved_profile and provider is None:
+        with pytest.raises(OmnigentError, match="saved sandbox inference profile") as error:
+            admit()
+        assert error.value.code == ErrorCode.INVALID_INPUT
+    else:
+        admit()
 
 
 def test_upsert_creates_host_on_first_connect(
@@ -857,14 +906,17 @@ def test_delete_host_hides_row_and_retains_cleanup_tombstone(db_uri: str) -> Non
     assert retry.deleted_at is not None
     assert retry.sandbox_id == "sb-m5"
 
-    cleanup = store.list_stale_managed_sandbox_hosts(now_epoch())
+    cleanup = [
+        host for _, host in store.list_current_managed_sandbox_hosts_page(after=None, limit=10)
+    ]
     assert [host.host_id for host in cleanup] == ["dcf4eb5fc0b04985ec45f79cfda95566"]
     assert cleanup[0].deleted_at == retry.deleted_at
     assert store.mark_sandbox_terminated(
         "dcf4eb5fc0b04985ec45f79cfda95566",
         sandbox_id="sb-m5",
     )
-    assert store.list_stale_managed_sandbox_hosts(now_epoch()) == []
+    assert store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
 
     engine = get_or_create_engine(db_uri)
     with Session(engine) as session:
@@ -945,7 +997,9 @@ def test_replace_managed_host_sandbox_cannot_revive_deleted_tombstone(db_uri: st
         )
         is None
     )
-    tombstones = store.list_stale_managed_sandbox_hosts(now_epoch())
+    tombstones = [
+        host for _, host in store.list_current_managed_sandbox_hosts_page(after=None, limit=10)
+    ]
     assert [(host.host_id, host.sandbox_id) for host in tombstones] == [
         (host_id, "original-sandbox")
     ]
@@ -1054,10 +1108,10 @@ def test_delete_host_serializes_with_sandbox_replacement(db_uri: str) -> None:
     assert store.get_host(host_id) is None
 
 
-def test_managed_sandbox_reaper_queries_and_compare_clear_span_workspaces(
+def test_managed_sandbox_reaper_pages_and_compare_clear_span_workspaces(
     db_uri: str,
 ) -> None:
-    """The reaper discovers workspaces, scopes stale reads, and clears one generation."""
+    """The reaper keyset spans workspaces and clears one exact generation."""
     store = HostStore(db_uri)
     host_11 = "d6cb45e67d3d4bdbbff1b45d5c408e11"
     host_22 = "60a41477758b4b4c9f3072dd47009522"
@@ -1082,12 +1136,25 @@ def test_managed_sandbox_reaper_queries_and_compare_clear_span_workspaces(
             token_expires_at=now_epoch() + 3600,
         )
 
-    assert store.list_managed_sandbox_workspace_ids() == [11, 22]
+    first_page = store.list_current_managed_sandbox_hosts_page(after=None, limit=1)
+    assert [(workspace_id, host.host_id) for workspace_id, host in first_page] == [(11, host_11)]
+    first_host = first_page[0][1]
+    assert first_host.sandbox_id == "sb-11"
+    second_page = store.list_current_managed_sandbox_hosts_page(
+        after=("sb-11", 11, host_11),
+        limit=1,
+    )
+    assert [(workspace_id, host.host_id) for workspace_id, host in second_page] == [(22, host_22)]
+    assert (
+        store.list_current_managed_sandbox_hosts_page(
+            after=("sb-22", 22, host_22),
+            limit=1,
+        )
+        == []
+    )
+
     with workspace_scope(11):
-        assert store.list_stale_managed_sandbox_hosts(0) == []
-        listed = store.list_stale_managed_sandbox_hosts(now_epoch() + 1)
-        assert [host.host_id for host in listed] == [host_11]
-        last_seen_at = listed[0].updated_at
+        last_seen_at = first_host.updated_at
         assert (
             store.detach_stale_managed_sandbox(
                 host_11,
@@ -1112,7 +1179,6 @@ def test_managed_sandbox_reaper_queries_and_compare_clear_span_workspaces(
         assert detached.sandbox_id is None
         assert detached.terminating_sandbox_id == "sb-11"
         assert store.resolve_launch_token(host_11, "token-11") is None
-        assert store.list_managed_sandbox_workspace_ids() == [11, 22]
         assert (
             store.mark_sandbox_terminated(
                 host_11,
@@ -1132,10 +1198,9 @@ def test_managed_sandbox_reaper_queries_and_compare_clear_span_workspaces(
         assert reaped.sandbox_id is None
         assert reaped.terminating_sandbox_id is None
 
-    assert store.list_managed_sandbox_workspace_ids() == [22]
-    with workspace_scope(22):
-        listed = store.list_stale_managed_sandbox_hosts(now_epoch() + 1)
-        assert [host.host_id for host in listed] == [host_22]
+    assert store.list_terminating_managed_sandbox_hosts_page(after=None, limit=1) == []
+    remaining = store.list_current_managed_sandbox_hosts_page(after=None, limit=1)
+    assert [(workspace_id, host.host_id) for workspace_id, host in remaining] == [(22, host_22)]
 
 
 def test_detach_and_resume_rearm_are_atomic_competitors(db_uri: str) -> None:
