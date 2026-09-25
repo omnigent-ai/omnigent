@@ -12808,7 +12808,7 @@ def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    async def _timeout(_client: object) -> str:
+    async def _timeout(_client: object, **_kwargs: object) -> str:
         raise TimeoutError("no thread event")
 
     monkeypatch.setattr(_fwd, "wait_for_thread_started", _timeout)
