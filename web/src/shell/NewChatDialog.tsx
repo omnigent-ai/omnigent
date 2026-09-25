@@ -1909,7 +1909,7 @@ export function AgentHarnessPicker({
             className="items-center font-medium"
           >
             <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
-            <span className="truncate">Other</span>
+            <span className="truncate">Other...</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {customAgentsBody}
@@ -2013,7 +2013,7 @@ export function AgentHarnessPicker({
                 }}
                 className="items-center"
               >
-                <HarnessMenuNavigationLabel>Other</HarnessMenuNavigationLabel>
+                <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
               </DropdownMenuItem>
             ) : (
@@ -2023,7 +2023,7 @@ export function AgentHarnessPicker({
                   data-testid="new-chat-landing-custom-agents"
                   className="cursor-pointer items-center"
                 >
-                  <HarnessMenuNavigationLabel>Other</HarnessMenuNavigationLabel>
+                  <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 </DropdownMenuSubTrigger>
                 <HarnessPickerSubContent
                   sideOffset={-4}
