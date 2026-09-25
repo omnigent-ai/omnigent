@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.entities import Conversation
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -647,6 +648,7 @@ class _RecordingLabelStore:
     def __init__(self, *, live_status: str = "idle") -> None:
         self.labels: dict[str, dict[str, str]] = {}
         self.live_status = live_status
+        self.get_conversation_calls = 0
 
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
@@ -656,8 +658,10 @@ class _RecordingLabelStore:
 
         ``.labels`` is read by the recovery guard and ``.live_status`` by
         the mid-turn check when the in-memory status cache is cold, so a
-        lightweight namespace over both is enough.
+        lightweight namespace over both is enough. Counts calls so a
+        cold-cache test can assert the row was consulted exactly once.
         """
+        self.get_conversation_calls += 1
         return SimpleNamespace(
             labels=dict(self.labels.get(conversation_id, {})),
             live_status=self.live_status,
@@ -852,6 +856,207 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_runner_recovery_cold_cache_clears_disconnect_failure() -> None:
+    """
+    A cold cache falls back to the row so a post-deploy reconnect still clears.
+
+    A rolling deploy can land a runner's passive reconnect on a replica
+    whose in-memory status cache never saw the earlier failure — a
+    different (now-retired) replica relayed it. The persisted row is the
+    only record left, so recovery must consult it instead of silently
+    leaving the stale disconnect in place.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "cold_cache_clears_disconnect"
+    store = _RecordingLabelStore(live_status="failed")
+    store.labels[session_id] = {
+        sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_disconnected",
+        sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "Runner disconnected unexpectedly.",
+    }
+    sessions_module._session_status_cache.pop(session_id, None)
+
+    collector = await start_session_stream_collector(session_id)
+    try:
+        await sessions_module._publish_runner_recovered_status(
+            session_id,
+            store,  # type: ignore[arg-type]
+            require_disconnect_code=True,
+        )
+
+        # Exactly one read: the disconnect-code gate below must reuse the
+        # row already fetched for the cold-cache fallback, not re-fetch it.
+        assert store.get_conversation_calls == 1
+        assert sessions_module._session_status_cache.get(session_id) == "idle"
+        event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "idle"
+        cleared = store.labels.get(session_id)
+        assert cleared is not None
+        assert sessions_module._last_task_error_from_labels(cleared) is None
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_runner_recovery_cold_cache_keeps_non_disconnect_failure() -> None:
+    """A cold-cache reconnect leaves a genuine (non-disconnect) task failure alone."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "cold_cache_keeps_task_error"
+    store = _RecordingLabelStore(live_status="failed")
+    store.labels[session_id] = {
+        sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_error",
+        sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "Harness crashed.",
+    }
+    sessions_module._session_status_cache.pop(session_id, None)
+
+    await sessions_module._publish_runner_recovered_status(
+        session_id,
+        store,  # type: ignore[arg-type]
+        require_disconnect_code=True,
+    )
+
+    assert store.get_conversation_calls == 1
+    assert sessions_module._session_status_cache.get(session_id) is None
+    persisted = store.labels[session_id]
+    assert persisted[sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY] == "runner_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_status", ["idle", "running"])
+async def test_runner_recovery_cold_cache_noop_for_healthy_row(live_status: str) -> None:
+    """A cold cache backed by a non-failed row is left alone."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = f"cold_cache_noop_{live_status}"
+    store = _RecordingLabelStore(live_status=live_status)
+    sessions_module._session_status_cache.pop(session_id, None)
+
+    await sessions_module._publish_runner_recovered_status(
+        session_id,
+        store,  # type: ignore[arg-type]
+    )
+
+    assert store.get_conversation_calls == 1
+    assert sessions_module._session_status_cache.get(session_id) is None
+    assert store.labels.get(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_runner_recovery_warm_cache_running_skips_row_read() -> None:
+    """A warm cache that already disagrees with 'failed' is authoritative — no row read."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    class _ExplodingConversationStore:
+        def get_conversation(self, conversation_id: str) -> Any:
+            raise AssertionError("a warm, non-failed cache must not read the row")
+
+    session_id = "warm_cache_running_no_read"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        await sessions_module._publish_runner_recovered_status(
+            session_id,
+            _ExplodingConversationStore(),  # type: ignore[arg-type]
+            require_disconnect_code=True,
+        )
+        assert sessions_module._session_status_cache.get(session_id) == "running"
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_runner_recovery_cold_cache_row_read_error_is_noop() -> None:
+    """A cold-cache row-read failure is a no-op, not a crash, on the reconnect path."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    class _RaisingConversationStore:
+        def __init__(self) -> None:
+            self.get_calls = 0
+            self.set_labels_calls = 0
+
+        def get_conversation(self, conversation_id: str) -> Any:
+            self.get_calls += 1
+            raise RuntimeError("db unavailable")
+
+        def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
+            self.set_labels_calls += 1
+
+    session_id = "cold_cache_read_error_noop"
+    store = _RaisingConversationStore()
+    sessions_module._session_status_cache.pop(session_id, None)
+
+    await sessions_module._publish_runner_recovered_status(
+        session_id,
+        store,  # type: ignore[arg-type]
+        require_disconnect_code=True,
+    )
+
+    assert store.get_calls == 1
+    assert store.set_labels_calls == 0
+    assert sessions_module._session_status_cache.get(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_runner_recovery_supplied_conversation_skips_all_reads() -> None:
+    """Supplying the pre-loaded row costs zero additional get_conversation calls.
+
+    The reconnect storm on a rolling deploy calls this once per session in a
+    loop that already fetched the row via ``list_conversations_by_runner_id``.
+    Passing ``conversation=conv`` must bypass both the cold-cache fallback read
+    and the ``require_disconnect_code`` label re-read — confirmed by asserting
+    the store's get_conversation counter stays at zero throughout.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "supplied_conv_zero_reads"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=2,
+        root_conversation_id=session_id,
+        live_status="failed",
+        labels={
+            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_disconnected",
+            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: (
+                "Runner disconnected unexpectedly."
+            ),
+        },
+    )
+    store = _RecordingLabelStore(live_status="failed")
+    sessions_module._session_status_cache.pop(session_id, None)
+
+    collector = await start_session_stream_collector(session_id)
+    try:
+        await sessions_module._publish_runner_recovered_status(
+            session_id,
+            store,  # type: ignore[arg-type]
+            require_disconnect_code=True,
+            conversation=conv,
+        )
+
+        assert store.get_conversation_calls == 0, (
+            "supplied conversation must not trigger a re-read"
+        )
+        assert sessions_module._session_status_cache.get(session_id) == "idle"
+        event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "idle"
+        cleared = store.labels.get(session_id)
+        assert cleared is not None
+        assert sessions_module._last_task_error_from_labels(cleared) is None
+    finally:
+        await collector.stop()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 

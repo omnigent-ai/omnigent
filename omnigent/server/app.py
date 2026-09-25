@@ -3544,7 +3544,10 @@ def create_app(
                     conv.parent_conversation_id in bound_ids and conv.host_id is None
                 ):
                     await _publish_runner_recovered_status(
-                        conv.id, conversation_store, require_disconnect_code=True
+                        conv.id,
+                        conversation_store,
+                        require_disconnect_code=True,
+                        conversation=conv,
                     )
                 # A managed launch that outlived its connect timeout cached
                 # sandbox_status "failed"; this runner connecting proves the

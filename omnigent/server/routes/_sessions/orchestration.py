@@ -2989,6 +2989,7 @@ async def _publish_runner_recovered_status_impl(
     conversation_store: ConversationStore,
     *,
     require_disconnect_code: bool = False,
+    conversation: Conversation | None = None,
 ) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -3017,6 +3018,10 @@ async def _publish_runner_recovered_status_impl(
     reconnect, keeping the red "Failed" pill instead of silently flipping
     it back to idle and hiding the error.
 
+    A cold cache (a replica that never saw the failure, e.g. after a
+    rolling deploy) falls back to the persisted ``live_status``; a warm
+    cache is trusted as-is.
+
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conversation_store: Store used to read the persisted error
@@ -3026,9 +3031,29 @@ async def _publish_runner_recovered_status_impl(
         ``runner_disconnected``; when ``False`` (default, explicit
         rebind/handshake), clear any stale ``failed`` state. Labels are
         cleared in both cases.
+    :param conversation: The session's row when the caller already loaded
+        it, used instead of a re-read on a cold cache. A warm ``failed``
+        cache still re-reads, since the row may predate that failure.
     :returns: None.
     """
-    if _session_status_cache.get(session_id) != "failed":
+    cached = _session_status_cache.get(session_id)
+    conv: Conversation | None = None
+    if cached is None:
+        conv = conversation
+        if conv is None:
+            try:
+                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            except Exception:  # noqa: BLE001 - a cold-cache read failure is a no-op, not a crash
+                _logger.debug(
+                    "Runner-recovery cold-cache read failed for %s; leaving status as-is",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                return
+        if conv is None or conv.live_status != "failed":
+            return
+    elif cached != "failed":
         return
     # A passive reconnect must distinguish a benign runner disconnect
     # from a real task failure: both land the cache on "failed", but only
@@ -3037,7 +3062,8 @@ async def _publish_runner_recovered_status_impl(
     # disconnect failure but says nothing about a genuine task error —
     # leave that one alone. Explicit rebinds skip this guard.
     if require_disconnect_code:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
