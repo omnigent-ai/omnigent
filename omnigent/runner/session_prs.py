@@ -8,7 +8,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -84,6 +84,9 @@ class SessionPullRequest(PullRequestRef):
     source: str
     first_seen_at: float
     last_seen_at: float
+    title: str | None = None
+    title_checked_at: float = 0
+    title_lookup_timed_out: bool = False
 
 
 class _Registry(BaseModel):
@@ -158,11 +161,41 @@ class SessionPrRegistry:
                     source=previous.source if previous else source,
                     first_seen_at=min(previous.first_seen_at, now) if previous else now,
                     last_seen_at=max(previous.last_seen_at, now) if previous else now,
+                    title=previous.title if previous else None,
+                    title_checked_at=previous.title_checked_at if previous else 0,
+                    title_lookup_timed_out=previous.title_lookup_timed_out if previous else False,
                 )
             state.prs = list(entries.values())
             if observation_id:
                 state.observations = [*state.observations[-511:], observation_id]
             self._write(state)
+
+    def update_titles(
+        self,
+        titles: Mapping[str, str | None],
+        *,
+        timestamp: float | None = None,
+        timed_out_urls: Collection[str] = (),
+    ) -> None:
+        """Cache title lookups without reordering or recreating removed associations."""
+        if not titles:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with FileLock(str(self.path) + ".lock", timeout=1):
+            state = self._read()
+            now = time.time() if timestamp is None else timestamp
+            changed = False
+            for entry in state.prs:
+                if entry.url not in titles or entry.title_checked_at > now:
+                    continue
+                title = titles[entry.url]
+                if title is not None:
+                    entry.title = title
+                entry.title_checked_at = now
+                entry.title_lookup_timed_out = title is None and entry.url in timed_out_urls
+                changed = True
+            if changed:
+                self._write(state)
 
     def remove(self, url: str) -> None:
         """Remember removal so subsequent hook replay cannot attach the PR again."""

@@ -122,10 +122,9 @@ def test_jump_to_top_reveals_on_scroll_up_then_auto_hides(
     assert scroll_top > 50, (
         f"conversation did not overflow enough to scroll (scrollTop={scroll_top})"
     )
-    assert page.evaluate(_PILL_INTERACTIVE) is False
-
     # Keep the pointer outside the short transcript's entire hover band.
     page.mouse.move(0, 0)
+    page.wait_for_function(f"!({_PILL_INTERACTIVE})", timeout=10_000)
 
     # Scroll up to roughly the middle. Setting scrollTop dispatches a real
     # 'scroll' event — the same signal a wheel/drag emits, and exactly how

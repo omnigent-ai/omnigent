@@ -24,6 +24,8 @@ _Json: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 # A ready ALLOW decision (the common case — most tool calls pass).
 _ALLOW: _Json = {"result": "ALLOW"}
 
+_SPAWN_BOUNDS_STATE_KEY = "_policy_spawn_bounds_dispatches"
+
 
 def _decision(result: str, reason: str) -> _Json:
     """
@@ -430,12 +432,12 @@ def spawn_bounds(
 
     Counts the *dispatch_tools* tool calls within a single orchestrator turn
     and DENIES once *max_dispatches_per_turn* is exceeded, forcing fan-out in
-    bounded waves rather than an unbounded fleet. The orchestrator dispatches
-    every worker through a sub-agent send (``sys_session_send``), so that is the
-    default counted tool. The counter resets each turn via the ``reset_turn``
-    hook the runner calls (``omnigent/runner/policy.py``). This is the v1
-    concurrency bound; true cross-turn live-concurrency accounting is a v1.x
-    refinement.
+    bounded waves rather than an unbounded fleet. The count is persisted in
+    ``session_state`` because the deployed server rebuilds its policy engine
+    for every tool call. Every request-phase event resets the persisted count
+    — that is each inbound user-role message, including a sub-agent wake
+    notice — so a wave collected by a wake gets a fresh budget. The closure
+    remains the runner-local fallback, reset through ``reset_turn``.
 
     :param max_dispatches_per_turn: Maximum worker dispatches allowed in one
         turn, e.g. ``5``.
@@ -455,20 +457,46 @@ def spawn_bounds(
             ``data["name"]`` is one of *dispatch_tools*.
         :returns: ALLOW, or DENY once the per-turn cap is exceeded.
         """
+        if event.get("type") == "request":
+            state["count"] = 0
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _SPAWN_BOUNDS_STATE_KEY, "action": "set", "value": 0},
+                ],
+            }
         if _tool_call(event, counted) is None:
             return _ALLOW
-        state["count"] += 1
-        if state["count"] > max_dispatches_per_turn:
-            return _decision(
+        session_state = event.get("session_state") or {}
+        persisted = session_state.get(_SPAWN_BOUNDS_STATE_KEY, 0)
+        persisted_count = persisted if isinstance(persisted, int) else 0
+        # A fresh server engine starts the closure at 0 and reads the
+        # persisted count; the runner gate has no session_state and keeps
+        # counting in the closure. max() serves both without double counting.
+        state["count"] = max(state["count"], persisted_count) + 1
+        result: _Json = (
+            _decision(
                 "DENY",
                 f"Exceeded {max_dispatches_per_turn} worker dispatches this turn; "
                 "fan out in waves (collect the running batch before dispatching more).",
             )
-        return _ALLOW
+            if state["count"] > max_dispatches_per_turn
+            else {"result": "ALLOW"}
+        )
+        # Increment rather than set: an ASK from another policy defers this
+        # write until approval, and replaying an absolute count would wind
+        # back the dispatches counted in between.
+        result["state_updates"] = [
+            {"key": _SPAWN_BOUNDS_STATE_KEY, "action": "increment", "value": 1},
+        ]
+        return result
 
     def reset_turn() -> None:
         """
-        Reset the per-turn dispatch counter at each turn boundary.
+        Reset the closure's per-turn dispatch counter at each turn boundary.
+
+        Clears only the runner-local closure; the persisted count in
+        ``session_state`` is reset by the request-phase event instead.
 
         :returns: ``None``.
         """

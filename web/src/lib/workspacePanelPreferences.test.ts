@@ -15,32 +15,32 @@ afterEach(() => {
 });
 
 describe("workspacePanelPreferences — read/write", () => {
-  it("returns open when nothing is stored", () => {
+  it("returns collapsed when nothing is stored", () => {
     expect(readWorkspacePanelDefault()).toBe(WORKSPACE_PANEL_DEFAULT);
-    expect(readDefaultWorkspacePanelOpen()).toBe(true);
+    expect(readDefaultWorkspacePanelOpen()).toBe(false);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 
   it("records the rail's visibility from the collapse/expand toggle", () => {
     writeDefaultWorkspacePanelOpen(false);
     expect(readDefaultWorkspacePanelOpen()).toBe(false);
-    expect(localStorage.getItem(STORAGE_KEY)).toBe("collapsed");
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
 
     writeDefaultWorkspacePanelOpen(true);
     expect(readDefaultWorkspacePanelOpen()).toBe(true);
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(STORAGE_KEY)).toBe("open");
   });
 
-  it("stores collapsed and clears the key for open", () => {
+  it("clears the key for collapsed and stores open", () => {
     writeWorkspacePanelDefault("collapsed");
     expect(readWorkspacePanelDefault()).toBe("collapsed");
     expect(readDefaultWorkspacePanelOpen()).toBe(false);
-    expect(localStorage.getItem(STORAGE_KEY)).toBe("collapsed");
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
 
     writeWorkspacePanelDefault("open");
     expect(readWorkspacePanelDefault()).toBe("open");
     expect(readDefaultWorkspacePanelOpen()).toBe(true);
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(STORAGE_KEY)).toBe("open");
   });
 });
 
@@ -50,10 +50,10 @@ describe("normalizeWorkspacePanelDefault", () => {
     expect(normalizeWorkspacePanelDefault("collapsed")).toBe("collapsed");
   });
 
-  it("maps unknown, null, and garbage to open", () => {
-    expect(normalizeWorkspacePanelDefault("closed")).toBe("open");
-    expect(normalizeWorkspacePanelDefault("bogus")).toBe("open");
-    expect(normalizeWorkspacePanelDefault(null)).toBe("open");
-    expect(normalizeWorkspacePanelDefault(undefined)).toBe("open");
+  it("maps unknown, null, and garbage to collapsed", () => {
+    expect(normalizeWorkspacePanelDefault("closed")).toBe("collapsed");
+    expect(normalizeWorkspacePanelDefault("bogus")).toBe("collapsed");
+    expect(normalizeWorkspacePanelDefault(null)).toBe("collapsed");
+    expect(normalizeWorkspacePanelDefault(undefined)).toBe("collapsed");
   });
 });

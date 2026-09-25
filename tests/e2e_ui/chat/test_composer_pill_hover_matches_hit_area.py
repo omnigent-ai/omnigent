@@ -14,6 +14,9 @@ def test_composer_pill_highlighted_label_is_clickable(
     """The model label shares the trigger's hover paint and click target."""
     base_url, session_id = seeded_session
     _patch_session_as_claude_native(page, session_id)
+    # Wide enough for the model label to show beside the sidebar and workspace
+    # rail; narrower columns collapse it to the harness icon.
+    page.set_viewport_size({"width": 1800, "height": 900})
     try:
         page.goto(f"{base_url}/c/{session_id}")
         trigger = page.get_by_test_id("composer-config-gear")
@@ -29,9 +32,10 @@ def test_composer_pill_highlighted_label_is_clickable(
         )
         label.click()
         expect(page.get_by_test_id("composer-agent-menu")).to_be_visible()
-        page.get_by_test_id("composer-advanced-settings").click()
-        expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+        expect(page.get_by_test_id("composer-advanced-settings")).to_have_count(0)
+        page.get_by_test_id("composer-agent-edit").click()
+        expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
         page.keyboard.press("Escape")
-        expect(page.get_by_test_id("composer-config-modal")).not_to_be_visible()
+        expect(page.get_by_test_id("composer-agent-config-menu")).not_to_be_visible()
     finally:
         page.unroute_all(behavior="ignoreErrors")

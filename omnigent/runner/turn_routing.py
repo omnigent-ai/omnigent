@@ -1431,6 +1431,7 @@ async def _apply_routed_model(
         inject_slash_command,
         read_claude_status_model,
         read_model_env,
+        read_model_picker_values,
     )
     from omnigent.models.claude_model_vocabulary import (
         claude_model_command_arg,
@@ -1446,14 +1447,16 @@ async def _apply_routed_model(
         )
         return True
     env = read_model_env(bridge_dir) or None
-    arg = claude_model_command_arg(model, env)
+    picker_values = read_model_picker_values(bridge_dir)
+    arg = claude_model_command_arg(model, env, picker_values=picker_values)
     if arg is None:
         _logger.warning(
-            "route-turn: routed model %r has no spelling session=%s accepts (pins=%s); "
-            "replaying on the launch model",
+            "route-turn: routed model %r has no spelling session=%s accepts "
+            "(pins=%s, picker=%s); replaying on the launch model",
             model,
             session_id,
             sorted(env or ()),
+            picker_values,
         )
         return False
     try:

@@ -128,9 +128,11 @@ def _normalize_responses_items_for_chat(
     :returns: New list with normalised ``input_file`` blocks in message
         content.  Items without ``input_file`` blocks are returned as-is.
     """
+    from omnigent.inner.native_attachments import expand_framework_notices
+
     result: list[_JsonObject] = []
-    for item in items:
-        if item.get("type") == "message":
+    for item in expand_framework_notices(items):
+        if item.get("type") == "message" or "role" in item:
             raw_content = item.get("content")
             if item.get("role") == "assistant" and isinstance(raw_content, str):
                 # The chat converter iterates assistant content expecting
@@ -1321,8 +1323,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 # endpoint may not support ``file`` content blocks at all.
                 # Converting to ``input_text`` is the universally compatible
                 # path: the model sees the file content as plain text.
-                normalized = _normalize_content_blocks_for_chat(content)
-                return [{"type": "message", "role": "user", "content": normalized}]
+                return _normalize_responses_items_for_chat(
+                    [{"type": "message", "role": "user", "content": content}]
+                )
             return json.dumps(content)
         return _normalize_responses_items_for_chat(_convert_messages_to_responses(delta_messages))
 

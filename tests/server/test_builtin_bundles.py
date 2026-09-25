@@ -249,6 +249,10 @@ _EXPECTED_BUILTIN_AGENT_IDS = {
     "qwen-native-ui": "2cffe181a2fc6cf417a49e1cf8b28d77",
     "kimi-native-ui": "9e7d109e7da66e8b5ed4ec3ecb54cef1",
     "hermes-native-ui": "32113910cf31fcc63dc96bbde428b97c",
+    # Added with the devin-native harness. This is an ADDITION, not a drift:
+    # every id above is byte-identical to before, so no persisted
+    # conversation.agent_id row is orphaned and no migration is owed.
+    "devin-native-ui": "010b5eea4b105dc0af6fb62f46065894",
 }
 
 

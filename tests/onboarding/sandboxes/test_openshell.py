@@ -12,7 +12,7 @@ from typing import Any
 import click
 import pytest
 
-from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
+from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE, SandboxGoneError
 from omnigent.onboarding.sandboxes.openshell import (
     HOST_IMAGE_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
@@ -407,6 +407,8 @@ class _SDKState:
     connect_error: bool = False
     delete_not_found: bool = False
     delete_not_found_via_sandbox_error: bool = False
+    resume_not_found: bool = False
+    resume_sandbox_error: str | None = None
     created_spec: Any = None
     waited: tuple[str, int | None] | None = None
     got: list[str] = field(default_factory=list)
@@ -475,6 +477,10 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
             return _SandboxRef(id=f"id-for-{name}", name=name)
 
         def start(self, name: str, *, workspace: str) -> None:
+            if state.resume_not_found:
+                raise _NotFound(_StatusCode.NOT_FOUND)
+            if state.resume_sandbox_error is not None:
+                raise _SandboxError(state.resume_sandbox_error)
             state.resumed.append((name, workspace))
 
         def exec(
@@ -632,6 +638,24 @@ def test_client_resume_waits_ready_and_recaches_id(sdk: _SDKState) -> None:
     client.execute("box", ["ls"])
     assert sdk.execs[-1][0] == "id-resumed"
     assert sdk.got == ["box"]  # no re-get: the resume refreshed the cache
+
+
+def test_client_resume_missing_sandbox_raises_gone(sdk: _SDKState) -> None:
+    """A definitive gateway not-found lets the server recreate the sandbox."""
+    sdk.resume_not_found = True
+
+    with pytest.raises(SandboxGoneError, match="no longer exists"):
+        _OpenShellClient().resume_sandbox("box")
+
+
+def test_client_resume_transient_failure_stays_click_error(sdk: _SDKState) -> None:
+    """A provider outage must not trigger a workspace-destroying recreate."""
+    sdk.resume_sandbox_error = "gateway unavailable"
+
+    with pytest.raises(click.ClickException, match="gateway unavailable") as exc:
+        _OpenShellClient().resume_sandbox("box")
+
+    assert not isinstance(exc.value, SandboxGoneError)
 
 
 def test_client_resume_requires_sdk_support(

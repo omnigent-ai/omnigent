@@ -201,13 +201,8 @@ def test_custom_codex_native_session_shows_model_and_effort_controls(
         model_row = page.locator(f'[role="menuitemcheckbox"][data-model-id="{_MODEL_ID}"]')
         expect(model_row).to_be_visible()
         expect(model_row).to_contain_text(_MODEL_DISPLAY_NAME)
-        # Re-select the current model to close the listbox without sending
-        # Escape to the surrounding dialog.
-
-        expect(model_row).to_be_visible()
-
-        # The effort control is enabled and derives its ladder from the
-        # selected Codex model's supportedReasoningEfforts.
+        # The effort control derives its ladder from the selected Codex model.
+        page.get_by_test_id("composer-agent-effort-select").click()
         effort_trigger = page.get_by_test_id("composer-agent-efforts")
         expect(effort_trigger).to_be_visible()
 
