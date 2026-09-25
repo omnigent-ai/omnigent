@@ -2624,3 +2624,26 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
         "https://github.com/example/sdk/pull/42"
     ]
+
+
+def test_build_error_detail_surfaces_structured_inner_code() -> None:
+    """A coded inner-executor failure keeps its structured code; a plain one does not."""
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        _InnerExecutorError,
+    )
+
+    def _no_executor() -> Executor:
+        raise AssertionError("executor is never constructed in this test")
+
+    adapter = ExecutorAdapter(executor_factory=_no_executor)
+
+    coded = adapter._build_error_detail(
+        _InnerExecutorError("inner executor error: too big", code="codex_input_too_large")
+    )
+    assert coded.code == "codex_input_too_large"
+    assert coded.message == "inner executor error: too big"
+
+    # A plain re-raised failure keeps the coarse class-name code (unchanged).
+    plain = adapter._build_error_detail(RuntimeError("inner executor error: boom"))
+    assert plain.code == "RuntimeError"

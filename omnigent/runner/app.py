@@ -2613,6 +2613,12 @@ def _session_status_to_task_status(status: object) -> str | None:
     return None
 
 
+# Structured turn-failure codes a harness may set on ``ErrorDetail.code`` that
+# the UI knows how to describe. A turn error carries no ``type``, so these are
+# honored as the surfaced ``code`` instead of collapsing to ``runner_error``.
+_STRUCTURED_TURN_ERROR_CODES: frozenset[str] = frozenset({"codex_input_too_large"})
+
+
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     """
     Coerce a turn-failure ``error`` dict into a ``{code, message}`` shape.
@@ -2640,8 +2646,19 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
         message = f"turn failed (status {error['status']})"
     else:
         message = "turn failed"
-    raw_code = error.get("type")
-    code = raw_code if isinstance(raw_code, str) and raw_code else "runner_error"
+    raw_type = error.get("type")
+    if isinstance(raw_type, str) and raw_type:
+        code = raw_type
+    else:
+        # No ``type`` on a turn error, so honor a known structured
+        # ``ErrorDetail.code`` (e.g. an oversized-input rejection) as the
+        # surfaced code; otherwise fall back to the generic host error.
+        raw_code = error.get("code")
+        code = (
+            raw_code
+            if isinstance(raw_code, str) and raw_code in _STRUCTURED_TURN_ERROR_CODES
+            else "runner_error"
+        )
     return {"code": code, "message": message}
 
 
