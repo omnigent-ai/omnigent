@@ -48,7 +48,10 @@ from tests.e2e_ui.messages.test_native_codex_render_parity import (
 
 _log = logging.getLogger(__name__)
 
-_EFFORT_GEAR = '[data-testid="composer-agent-effort-select"]'
+_CONFIG_ROW = '[data-testid="composer-agent-edit"]'
+_CONFIG_SUBMENU = '[data-testid="composer-agent-config-menu"]'
+_EFFORT_SECTION = '[data-testid="composer-agent-efforts"]'
+_CHECKED_EFFORT = '[role="menuitemcheckbox"][data-effort-level][aria-checked="true"]'
 _CONFIG_GEAR = '[data-testid="composer-config-gear"]'
 _CONFIG_MENU = '[data-testid="composer-agent-menu"]'
 
@@ -141,7 +144,7 @@ def test_codex_terminal_effort_change_reaches_composer(
     """A ``/model`` effort change in the terminal must update the composer gear.
 
     Reproduces the stale-composer bug on the live SPA: after changing the reasoning effort in
-    the embedded Codex terminal, the chat composer's effort control must show
+    the embedded Codex terminal, the chat composer's effort section must show
     the terminal's new effort.
 
     :param page: Playwright page fixture.
@@ -157,19 +160,23 @@ def test_codex_terminal_effort_change_reaches_composer(
     _wait_terminal_connected(page)
     _log.info("Codex TUI attached (terminal-view connected)")
 
-    # --- Baseline: the composer's effort control on the launch effort. -------
+    # --- Baseline: the composer's effort section on the launch effort. -------
     _ensure_chat_view(page)
     gear = page.locator(_CONFIG_GEAR)
     expect(gear).to_be_visible(timeout=_TERMINAL_READY_TIMEOUT_MS)
     gear.click()
     expect(page.locator(_CONFIG_MENU)).to_be_visible(timeout=15_000)
-    effort_control = page.locator(_EFFORT_GEAR)
-    # The effort row is catalog-gated: a launch model the codex catalog does
-    # not list (this fixture pins a mock-provider model) renders no effort
-    # control until the in-TUI ``/model`` lands the session on a catalog model.
-    # The baseline is whatever the composer shows now -- possibly nothing.
+    page.locator(_CONFIG_ROW).click()
+    expect(page.locator(_CONFIG_SUBMENU)).to_be_visible(timeout=15_000)
+    # The effort section is catalog-gated: a launch model the codex catalog
+    # does not list (this fixture pins a mock-provider model) renders no effort
+    # section until the in-TUI ``/model`` lands the session on a catalog model.
+    # The baseline is whatever the composer checks now -- possibly nothing.
+    checked_effort = page.locator(_CHECKED_EFFORT)
     baseline_composer_effort = (
-        (effort_control.inner_text() or "").strip() if effort_control.is_visible() else ""
+        (checked_effort.first.get_attribute("data-effort-level") or "")
+        if page.locator(_EFFORT_SECTION).is_visible() and checked_effort.count()
+        else ""
     )
     baseline_config_effort = _read_config_effort(session_id)
     _log.info(
@@ -177,8 +184,10 @@ def test_codex_terminal_effort_change_reaches_composer(
         baseline_composer_effort,
         baseline_config_effort,
     )
-    # Close the config menu before driving the terminal.
+    # Close the submenu and the config menu before driving the terminal.
     page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    expect(page.locator(_CONFIG_MENU)).to_be_hidden(timeout=15_000)
 
     # --- Change the reasoning effort inside the embedded Codex terminal. -----
     _open_terminal_view(page)
@@ -207,16 +216,10 @@ def test_codex_terminal_effort_change_reaches_composer(
     )
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
 
-    # --- The composer's effort control must now match the terminal. ----------
-    gear = page.locator(_CONFIG_GEAR)
-    expect(gear).to_be_visible(timeout=30_000)
-    gear.click()
-    expect(page.locator(_CONFIG_MENU)).to_be_visible(timeout=15_000)
-    effort_control = page.locator(_EFFORT_GEAR)
-    expect(effort_control).to_be_visible(timeout=15_000)
+    # --- The composer's effort section must now match the terminal. ----------
+    _open_config_menu(page)
 
     # Check the exact selected option, not a substring of its label.
-    effort_control.click()
     expect(page.get_by_test_id(f"composer-agent-effort-{new_config_effort}")).to_have_attribute(
         "aria-checked", "true", timeout=30_000
     )
@@ -280,7 +283,7 @@ def _wait_for_config_effort(session_id: str, expected: str, *, timeout_s: float 
 
 
 def _open_config_menu(page: Page) -> None:
-    """Open the composer configuration menu.
+    """Open the composer configuration menu and its model/effort submenu.
 
     :param page: The Playwright page, on the Chat view.
     """
@@ -288,6 +291,8 @@ def _open_config_menu(page: Page) -> None:
     expect(gear).to_be_visible(timeout=30_000)
     gear.click()
     expect(page.locator(_CONFIG_MENU)).to_be_visible(timeout=15_000)
+    page.locator(_CONFIG_ROW).click()
+    expect(page.locator(_EFFORT_SECTION)).to_be_visible(timeout=15_000)
 
 
 @pytest.mark.nightly
@@ -318,7 +323,7 @@ def test_composer_effort_pick_survives_terminal_turns(
 
     1. Change the effort in the embedded terminal first (same driving as the
        mirror journey) and run a turn — this lands the session on a known
-       terminal effort and makes the composer's effort row render.
+       terminal effort and makes the composer's effort section render.
     2. Pick a DIFFERENT effort in the composer gear (applied immediately); the gear must
        show the pick (the "works" half of the requirement).
     3. Run a turn so the executor applies the pick; the terminal's
@@ -342,9 +347,6 @@ def test_composer_effort_pick_survives_terminal_turns(
 
     # The composer mirrors the terminal effort (the already-guarded direction).
     _open_config_menu(page)
-    effort_control = page.locator(_EFFORT_GEAR)
-    expect(effort_control).to_be_visible(timeout=15_000)
-    effort_control.click()
     expect(page.get_by_test_id(f"composer-agent-effort-{terminal_effort}")).to_have_attribute(
         "aria-checked", "true", timeout=30_000
     )
@@ -373,7 +375,6 @@ def test_composer_effort_pick_survives_terminal_turns(
 
     # The pick works: reopening the gear shows the composer-picked effort.
     _open_config_menu(page)
-    page.locator(_EFFORT_GEAR).click()
     expect(page.get_by_test_id(f"composer-agent-effort-{picked}")).to_have_attribute(
         "aria-checked", "true", timeout=30_000
     )
@@ -389,9 +390,6 @@ def test_composer_effort_pick_survives_terminal_turns(
     # --- 4. Another terminal turn must not revert the composer's pick. -------
     _run_mock_turn(page, mock_llm_server_url, 3)
     _open_config_menu(page)
-    effort_control = page.locator(_EFFORT_GEAR)
-    expect(effort_control).to_be_visible(timeout=15_000)
-    effort_control.click()
     expect(page.get_by_test_id(f"composer-agent-effort-{picked}")).to_have_attribute(
         "aria-checked", "true", timeout=30_000
     )
