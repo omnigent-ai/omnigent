@@ -81,6 +81,23 @@ def _rpc_shell_success(request_body: bytes) -> httpx.Response:
     )
 
 
+def _unsandboxed_spec(cwd: Path) -> AgentSpec:
+    """Pin the os_env to an unsandboxed helper so the spawn is identical on any host.
+
+    The default os_env is the platform sandbox (``linux_bwrap`` on Linux), which
+    refuses to start without the ``bwrap`` binary before ``Popen`` is reached.
+    """
+    return AgentSpec(
+        spec_version=1,
+        name="shell-dispatch-fault-recovery",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(cwd),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+
 async def test_shell_proxy_transient_500_recovers(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -229,21 +246,12 @@ async def test_shell_helper_transient_fork_failure_recovers(
         return real_popen(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fork_blocked_once)
-    spec = AgentSpec(
-        spec_version=1,
-        name="shell-dispatch-fault-recovery",
-        os_env=OSEnvSpec(
-            type="caller_process",
-            cwd=str(tmp_path),
-            sandbox=OSEnvSandboxSpec(type="none"),
-        ),
-    )
 
     with caplog.at_level(logging.ERROR, logger="omnigent.runner.tool_dispatch"):
         output = await execute_tool(
             tool_name=_TOOL,
             arguments=_SHELL_ARGS,
-            agent_spec=spec,
+            agent_spec=_unsandboxed_spec(tmp_path),
             conversation_id="conv_fork_transient",
             mcp_manager=None,
         )
@@ -258,6 +266,7 @@ async def test_shell_helper_transient_fork_failure_recovers(
 
 
 async def test_shell_helper_persistent_fork_failure_surfaces_as_tool_error(
+    tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -290,7 +299,7 @@ async def test_shell_helper_persistent_fork_failure_surfaces_as_tool_error(
         output = await execute_tool(
             tool_name=_TOOL,
             arguments=_SHELL_ARGS,
-            agent_spec=None,
+            agent_spec=_unsandboxed_spec(tmp_path),
             conversation_id="conv_fork_persistent",
             mcp_manager=None,
         )
