@@ -2337,7 +2337,10 @@ class UpdateSessionRequest(BaseModel):
         sandbox reach — a relative path is traversal-rejected and
         confined under that root, and the target must be an existing
         directory — then the server persists the resolved absolute
-        path. Omitting the field leaves the workspace unchanged.
+        path. New shells open there at once; subprocess harnesses pick
+        it up when their next turn spawns, while an already-running
+        native terminal harness keeps its directory until restarted.
+        Omitting the field leaves the workspace unchanged.
     :param silent: When ``True``, persist metadata changes but skip
         the runner-side side effects — specifically the
         native ``/effort`` / ``/model`` / Codex collaboration-mode

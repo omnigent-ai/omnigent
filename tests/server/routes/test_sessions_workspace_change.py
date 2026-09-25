@@ -157,6 +157,123 @@ async def test_offline_absolute_change_validates_against_the_host_boundary(
     assert conv.workspace == "/home/user/project/subdir-canonical"
 
 
+async def test_offline_change_resyncs_a_runner_that_reconnected_during_validation(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner that comes back mid-change is handed the persisted target.
+
+    The offline branch validates on the host and then persists. A runner
+    that reconnects in between initializes from the previously persisted
+    workspace, so without a follow-up forward its live cwd would silently
+    disagree with the snapshot. The resolved path must be forwarded once
+    the persist lands.
+    """
+    import uuid
+
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    app, session_id, store = _seed_session(
+        db_uri,
+        tmp_path,
+        grants={_OWNER: LEVEL_OWNER},
+        workspace="/home/user/project",
+        host_id=uuid.uuid4().hex,
+    )
+
+    forwarded: list[str] = []
+
+    async def _forward(
+        _session_id: str, _router: object, event: dict[str, object], **kwargs: object
+    ) -> _RunnerForwardResult | None:
+        del kwargs
+        forwarded.append(str(event["workspace"]))
+        # Unreachable while the change is being validated, back afterwards.
+        if len(forwarded) == 1:
+            return None
+        return _RunnerForwardResult(
+            status_code=200,
+            body=f'{{"object": "session.workspace_changed", "workspace": "{event["workspace"]}"}}',
+        )
+
+    async def _validate(**kwargs: object) -> str:
+        del kwargs
+        return "/home/user/project/subdir-canonical"
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", _forward)
+    monkeypatch.setattr(sessions_helpers, "_validate_session_workspace", _validate)
+    async with _client(app, _OWNER) as c:
+        resp = await c.patch(
+            f"/v1/sessions/{session_id}",
+            json={"workspace": "/home/user/project/subdir"},
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert forwarded == ["/home/user/project/subdir", "/home/user/project/subdir-canonical"]
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == "/home/user/project/subdir-canonical"
+
+
+async def test_offline_change_reverts_when_the_reconnected_runner_refuses(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconnected runner's refusal wins over the host-validated persist.
+
+    The runner enforces the session's sandbox reach, which the host-side
+    validator cannot see. If it refuses the target that was persisted while
+    it was away, the stored workspace must return to the value the runner
+    is actually using and the caller must see the refusal.
+    """
+    import uuid
+
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    app, session_id, store = _seed_session(
+        db_uri,
+        tmp_path,
+        grants={_OWNER: LEVEL_OWNER},
+        workspace="/home/user/project",
+        host_id=uuid.uuid4().hex,
+    )
+
+    calls = 0
+
+    async def _forward(
+        _session_id: str, _router: object, event: dict[str, object], **kwargs: object
+    ) -> _RunnerForwardResult | None:
+        del kwargs, event
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return _RunnerForwardResult(
+            status_code=403,
+            body='{"error": "forbidden", "detail": "Path is not reachable"}',
+        )
+
+    async def _validate(**kwargs: object) -> str:
+        del kwargs
+        return "/home/user/project/subdir-canonical"
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", _forward)
+    monkeypatch.setattr(sessions_helpers, "_validate_session_workspace", _validate)
+    async with _client(app, _OWNER) as c:
+        resp = await c.patch(
+            f"/v1/sessions/{session_id}",
+            json={"workspace": "/home/user/project/subdir"},
+        )
+        assert resp.status_code == 403, resp.text
+
+    assert calls == 2
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == "/home/user/project"
+
+
 async def test_offline_absolute_change_rejected_by_the_validator_persists_nothing(
     db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -326,8 +326,9 @@ export function FilesPanel({
   // After a reload the panel would otherwise open at the environment root even
   // when a persisted re-root means turns and new shells run in a subfolder.
   // Seed the browsed location from the saved workspace once per conversation,
-  // only while the user hasn't navigated, and only for a location inside the
-  // root (absolute outside-root browsing is owner-gated server-side).
+  // only while the user hasn't navigated. A location outside the root is
+  // seeded only where the location bar could have roamed there.
+  const envReach = envQuery.data?.reachable ?? null;
   const workspaceSeedRef = useRef<string | null>(null);
   useEffect(() => {
     if (!conversationId || workspaceSeedRef.current === conversationId) return;
@@ -344,14 +345,20 @@ export function FilesPanel({
     // Windows hosts persist canonical backslash paths; containment must use
     // the root's own separator or every child fails the check.
     const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
-    // An out-of-root workspace browses absolutely, which the server
-    // owner-gates — seeding it for a collaborator would 403 their tree.
-    if (!saved.startsWith(root + sep) && !isOwnerLevel(session?.permissionLevel ?? null)) {
-      return;
+    // An out-of-root workspace lists host-absolutely, which only an owner of
+    // a host-bound, unconfined session can do (the same gate that lets the
+    // location bar roam). Seeding it for anyone else would fire a listing
+    // the viewer cannot use, so those sessions open at the root instead.
+    if (!saved.startsWith(root + sep)) {
+      const canRoam =
+        isOwnerLevel(session?.permissionLevel ?? null) &&
+        (envReach?.unconfined ?? false) &&
+        !!session?.hostId;
+      if (!canRoam) return;
     }
     browseLocationCache.set(conversationId, saved);
     setBrowseLocation(saved);
-  }, [conversationId, workspaceRoot, session, sessionLoading]);
+  }, [conversationId, workspaceRoot, session, sessionLoading, envReach]);
   const workingDir = browseLocation ?? workspaceRoot;
   // The wire form: "" means the workspace root (the historical relative
   // contract). A location INSIDE the workspace is sent relative to it, and

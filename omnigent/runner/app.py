@@ -10340,7 +10340,7 @@ def create_runner_app(
             from omnigent.runner.environment_filesystem import (
                 InvalidPath,
                 PathUnreachable,
-                is_absolute_request,
+                is_platform_absolute_path,
                 resolve_workdir_target,
             )
 
@@ -10368,12 +10368,13 @@ def create_runner_app(
             root_path = Path(env_root)
             policy = resolve_sandbox(spec_os_env, root_path)
             # A pinned absolute spec cwd is the session-create-time boundary;
-            # relative/placeholder cwds leave the workspace unconstrained.
+            # relative/placeholder cwds leave the workspace unconstrained. The
+            # spec cwd is a native path, so a Windows drive/UNC form counts too.
             spec_cwd = getattr(spec_os_env, "cwd", None)
             boundary: Path | None = None
             if isinstance(spec_cwd, str):
                 expanded_cwd = os.path.expanduser(spec_cwd)
-                if is_absolute_request(expanded_cwd):
+                if is_platform_absolute_path(expanded_cwd):
                     boundary = Path(expanded_cwd)
             try:
                 resolved = resolve_workdir_target(

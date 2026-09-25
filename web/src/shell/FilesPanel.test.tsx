@@ -306,6 +306,76 @@ describe("FilesPanel working folder directory", () => {
   });
 });
 
+describe("FilesPanel saved-workspace seed", () => {
+  const useSessionMock = vi.mocked(useSession);
+
+  afterEach(() => {
+    useSessionMock.mockReturnValue({ session: { hostId: "host_test" } } as never);
+  });
+
+  it("re-roots onto a saved in-root workspace after a reload", async () => {
+    useSessionMock.mockReturnValue({
+      session: {
+        hostId: "host_test",
+        workspace: "/home/user/workspace/sub",
+        permissionLevel: null,
+      },
+      isLoading: false,
+    } as never);
+    renderPanel({
+      conversationId: "conv_seed_in_root",
+      files: [],
+      workingDir: "/home/user/workspace",
+    });
+
+    await waitFor(() => {
+      expect(useAllFilesMock).toHaveBeenLastCalledWith(
+        "conv_seed_in_root",
+        { enabled: true },
+        "sub",
+      );
+    });
+  });
+
+  it("stays at the root when the saved workspace lies outside a session that cannot roam", async () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_test", workspace: "/browser-workspace", permissionLevel: null },
+      isLoading: false,
+    } as never);
+    renderPanel({ conversationId: "conv_seed_confined", files: [], workingDir: "/workspace" });
+
+    // Let the seed effect run before checking that it left the root alone.
+    await act(async () => {});
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_seed_confined", { enabled: true }, "");
+    expect(useAllFilesMock).not.toHaveBeenCalledWith(
+      "conv_seed_confined",
+      { enabled: true },
+      "/browser-workspace",
+    );
+  });
+
+  it("re-roots onto a saved out-of-root workspace when the owner can roam there", async () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_test", workspace: "/browser-workspace", permissionLevel: null },
+      isLoading: false,
+    } as never);
+    renderPanel({
+      conversationId: "conv_seed_roam",
+      files: [],
+      workingDir: "/workspace",
+      reachable: { unconfined: true, roots: [] },
+    });
+
+    await waitFor(() => {
+      expect(useAllFilesMock).toHaveBeenLastCalledWith(
+        "conv_seed_roam",
+        { enabled: true },
+        "/browser-workspace",
+      );
+    });
+  });
+});
+
 describe("FilesPanel header role", () => {
   it("omits the redundant Working folder heading in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });

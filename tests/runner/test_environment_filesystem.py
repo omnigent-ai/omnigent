@@ -23,6 +23,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import (
     CallerProcessFilesystem,
     _path_query,
+    is_platform_absolute_path,
     search_indexed_paths,
 )
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -2492,6 +2493,36 @@ async def test_scoped_search_reaches_snapshot_files_past_the_budget(
 
     assert [e["path"] for e in body["data"]] == ["zzz/new.txt"], body
     assert body["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/srv/project", True),
+        ("C:\\allowed", True),
+        ("C:/allowed", True),
+        ("\\\\server\\share", True),
+        ("\\allowed", True),
+        ("relative/dir", False),
+        (".", False),
+        ("", False),
+    ],
+    ids=[
+        "posix",
+        "drive_backslash",
+        "drive_slash",
+        "unc",
+        "rooted_backslash",
+        "relative",
+        "dot",
+        "empty",
+    ],
+)
+def test_is_platform_absolute_path_covers_posix_and_windows_forms(
+    path: str, expected: bool
+) -> None:
+    """Configured paths are classified by either platform's rule, unlike the wire form."""
+    assert is_platform_absolute_path(path) is expected
 
 
 def test_path_query_recognizes_windows_separators() -> None:

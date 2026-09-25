@@ -12,7 +12,9 @@ filesystem service.
 from __future__ import annotations
 
 import base64
+import ntpath
 import os
+import posixpath
 import re
 import stat
 from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -508,6 +510,22 @@ def is_absolute_request(path: str) -> bool:
     :returns: ``True`` for absolute paths.
     """
     return path.startswith("/")
+
+
+def is_platform_absolute_path(path: str) -> bool:
+    """Whether a configured filesystem path is absolute under POSIX or Windows rules.
+
+    For paths that come from configuration rather than the wire, such as an
+    agent's pinned ``os_env.cwd``. :func:`is_absolute_request` deliberately
+    classifies only the leading-``/`` wire form, so a Windows agent pinned to
+    ``C:\\allowed`` would otherwise place no working-directory boundary at
+    all. A POSIX runner given such a path treats it as a boundary nothing can
+    satisfy, which fails closed instead of open.
+
+    :param path: Configured path, e.g. ``"/srv/project"`` or ``"C:\\allowed"``.
+    :returns: ``True`` when the path is absolute on either platform.
+    """
+    return posixpath.isabs(path) or ntpath.isabs(path) or path.startswith("\\")
 
 
 def resolve_browse_target(

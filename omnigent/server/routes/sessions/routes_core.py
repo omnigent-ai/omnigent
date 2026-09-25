@@ -2964,6 +2964,22 @@ def register_core_routes(
                     runner_router,
                     {"type": "workspace_change", "workspace": body.workspace or ""},
                 )
+
+                def _runner_refusal(forward: Any) -> OmnigentError:
+                    # Preserve the runner's verdict: out-of-reach (403) is a
+                    # permission refusal, a runner 5xx is infrastructure (so
+                    # the client can retry), anything else is bad input.
+                    if forward.status_code == 403:
+                        _forward_code = ErrorCode.FORBIDDEN
+                    elif forward.status_code >= 500:
+                        _forward_code = ErrorCode.RUNNER_UNAVAILABLE
+                    else:
+                        _forward_code = ErrorCode.INVALID_INPUT
+                    return OmnigentError(
+                        f"runner rejected the working-directory change: {forward.body}",
+                        code=_forward_code,
+                    )
+
                 _resolved_workspace: str | None = None
                 if _workspace_forward is not None and _workspace_forward.status_code == 200:
                     try:
@@ -2974,20 +2990,7 @@ def register_core_routes(
                         _resolved_workspace = _wf_body["workspace"]
                 if _resolved_workspace is None:
                     if _workspace_forward is not None and _workspace_forward.status_code >= 400:
-                        # Preserve the runner's verdict: out-of-reach (403) is a
-                        # permission refusal, a runner 5xx is infrastructure (so
-                        # the client can retry), anything else is bad input.
-                        if _workspace_forward.status_code == 403:
-                            _forward_code = ErrorCode.FORBIDDEN
-                        elif _workspace_forward.status_code >= 500:
-                            _forward_code = ErrorCode.RUNNER_UNAVAILABLE
-                        else:
-                            _forward_code = ErrorCode.INVALID_INPUT
-                        raise OmnigentError(
-                            "runner rejected the working-directory change: "
-                            f"{_workspace_forward.body}",
-                            code=_forward_code,
-                        )
+                        raise _runner_refusal(_workspace_forward)
                     if body.workspace and _is_absolute_workspace(body.workspace):
                         # No runner to resolve against. The same agent boundary
                         # the create/relaunch paths enforce applies here: the
@@ -3050,6 +3053,25 @@ def register_core_routes(
                     if isinstance(exc, ConversationNotFoundError):
                         raise _session_not_found() from exc
                     raise
+                if _workspace_forward is None:
+                    # The runner was unreachable when validation began. If it
+                    # reconnected meanwhile, it initialized from the previously
+                    # persisted value, so hand it the resolved target now: a
+                    # confirmation keeps live and stored workdirs aligned, a
+                    # refusal reverts the persist, and a still-absent runner
+                    # picks the stored value up at its next launch.
+                    _resync = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        {"type": "workspace_change", "workspace": _resolved_workspace},
+                    )
+                    if _resync is not None and _resync.status_code >= 400:
+                        if _prior_workspace:
+                            with contextlib.suppress(Exception):
+                                await asyncio.to_thread(
+                                    conversation_store.set_workspace, session_id, _prior_workspace
+                                )
+                        raise _runner_refusal(_resync)
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the

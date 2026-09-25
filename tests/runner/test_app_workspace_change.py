@@ -30,13 +30,18 @@ from tests.runner.helpers import NullServerClient
 
 def _app_rooted_at(root: Path) -> FastAPI:
     """A runner app whose sessions run unconfined with *root* as env root."""
+    return _app_pinned_to(str(root))
+
+
+def _app_pinned_to(cwd: str) -> FastAPI:
+    """A runner app whose unconfined agent declares *cwd* as its ``os_env.cwd``."""
     spec = AgentSpec(
         spec_version=1,
         name="workdir-probe",
         executor=ExecutorSpec(type="omnigent", config={}),
         os_env=OSEnvSpec(
             type="caller_process",
-            cwd=str(root),
+            cwd=cwd,
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
@@ -214,6 +219,23 @@ async def test_absolute_target_outside_the_agent_boundary_is_rejected(tmp_path: 
         )
         assert reset.status_code == 200, reset.text
         assert reset.json()["workspace"] == str(root.resolve())
+
+
+async def test_windows_pinned_cwd_still_bounds_absolute_targets(tmp_path: Path) -> None:
+    """A drive-letter ``os_env.cwd`` is a boundary too, not the absence of one.
+
+    The wire-form check that classifies browse requests knows only the
+    leading-``/`` form, so it must not decide whether an agent's configured
+    cwd bounds the workspace: a Windows agent pinned to ``C:\\allowed`` would
+    otherwise let its owner move the session anywhere the unconfined reach
+    extends. Here that boundary can never contain a POSIX target, so the
+    change fails closed.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    resp = await _post_workspace_change(_app_pinned_to("C:\\allowed"), str(outside))
+    assert resp.status_code == 400, resp.text
+    assert "boundary" in resp.json()["detail"]
 
 
 async def test_absolute_target_inside_the_agent_boundary_is_accepted(tmp_path: Path) -> None:
