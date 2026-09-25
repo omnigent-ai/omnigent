@@ -1,0 +1,8 @@
+{
+  "name": "omnigent-harness-claude",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.266"
+  }
+}

@@ -105,23 +105,9 @@ def test_codex_native_approval_mode_switch_persists(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    gear = page.get_by_test_id("composer-config-gear")
-    expect(gear).to_be_visible(timeout=15_000)
-    gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-
-    # The Approvals picker is visible for codex-native sessions even before
-    # any switch; with no read-back label yet it shows its placeholder.
-    picker = page.get_by_test_id("composer-config-approval-mode")
-    expect(picker).to_be_visible()
-    expect(picker).to_contain_text("Set in Codex")
+    picker = page.get_by_test_id("composer-permission-chip")
+    expect(picker).to_be_visible(timeout=15_000)
     picker.click()
-
-    # Located by data attribute, not accessible name: each option renders its
-    # label and description together, so the name is never the bare label.
-    page.locator('[role="option"][data-approval-mode="approve-for-me"]').click()
-
-    # Save commits the draft and fires the PATCH.
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -129,21 +115,13 @@ def test_codex_native_approval_mode_switch_persists(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.get_by_test_id("composer-permission-option-approve-for-me").click()
 
     assert patch_bodies[-1] == {"approval_mode": "approve-for-me"}
 
-    # Save closes the modal only after its awaited setter chain settles; a
-    # click during that close races the dialog, so wait for it to finish.
-    expect(page.get_by_test_id("composer-config-save")).not_to_be_visible()
-
-    # The store reads the mode back from the PATCH response's stamped label,
-    # so reopening the modal shows the confirmed preset, not a draft.
-    gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    picker = page.get_by_test_id("composer-config-approval-mode")
-    expect(picker).to_be_visible()
     expect(picker).to_contain_text("Approve for me")
+    page.reload()
+    expect(page.get_by_test_id("composer-permission-chip")).to_contain_text("Approve for me")
 
 
 def test_codex_native_approval_mode_starts_from_label(
@@ -168,11 +146,6 @@ def test_codex_native_approval_mode_starts_from_label(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    gear = page.get_by_test_id("composer-config-gear")
-    expect(gear).to_be_visible(timeout=15_000)
-    gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-
-    picker = page.get_by_test_id("composer-config-approval-mode")
-    expect(picker).to_be_visible()
+    picker = page.get_by_test_id("composer-permission-chip")
+    expect(picker).to_be_visible(timeout=15_000)
     expect(picker).to_contain_text("Full Access")

@@ -33,6 +33,7 @@ async function run({
   author = "someexternaldev", fork = true, linkedIssues = [],
   rank = null, // LLM area-fit ranking (array of logins) or null for none
   action = "opened", // PR event action; `edited` is promote-only
+  paused = [],
 }) {
   // Point the script at a per-run rank file so real /tmp state can't leak in.
   // `rank: null` writes no file -> the script's fallback (pure load) is tested,
@@ -42,6 +43,11 @@ async function run({
   );
   if (rank) fs.writeFileSync(rankFile, JSON.stringify(rank));
   process.env.REVIEWER_RANK_FILE = rankFile;
+  const config = JSON.parse(fs.readFileSync(".github/workflows/auto-assign-reviewer.fixture.json", "utf8"));
+  config.assignment_paused = paused;
+  const areasFile = path.join(path.dirname(rankFile), "areas.json");
+  fs.writeFileSync(areasFile, JSON.stringify(config));
+  process.env.REVIEWER_AREAS_FILE = areasFile;
   const listFiles = () => {}; listFiles._tag = "files";
   const list = () => {}; list._tag = "open";
   const PR_NUMBER = 1;
@@ -110,6 +116,33 @@ function assert(name, cond, detail) {
 }
 
 (async () => {
+  const pausedResult = await run({
+    files: ["web/src/App.tsx"],
+    paused: ["SERENA-RUAN"],
+    rank: ["serena-ruan", "daniellok-db"],
+    linkedIssues: [{ number: 40, assignees: ["serena-ruan"] }, { number: 41, assignees: [] }],
+    current: ["serena-ruan"],
+    currentAssignees: ["serena-ruan"],
+  });
+  assert("paused linked owner cannot be adopted or ranked into a new review",
+    JSON.stringify(pausedResult.added) === JSON.stringify(["daniellok-db"]), JSON.stringify(pausedResult));
+  assert("PR and linked issue receive only the active reviewer",
+    JSON.stringify(pausedResult.assigned) === JSON.stringify(["daniellok-db"]) &&
+    JSON.stringify(pausedResult.issueAssigned) === JSON.stringify({ 41: ["daniellok-db"] }),
+    JSON.stringify(pausedResult));
+  assert("pause does not remove existing reviewers or assignees",
+    !pausedResult.removed.length && !pausedResult.unassigned.length, JSON.stringify(pausedResult));
+
+  const allOwners = JSON.parse(fs.readFileSync(".github/workflows/auto-assign-reviewer.fixture.json", "utf8"))
+    .areas.flatMap((area) => area.owners || []);
+  const emptyResult = await run({
+    files: ["unknown/file"], paused: allOwners,
+    linkedIssues: [{ number: 41, assignees: [] }],
+  });
+  assert("fully paused fallback pool produces no assignments or requests",
+    !emptyResult.added.length && !emptyResult.assigned.length && !Object.keys(emptyResult.issueAssigned).length,
+    JSON.stringify(emptyResult));
+
   // 1. inner PR: owners SabhyaC26,TomeHirata,dhruv0811,dbczumar. Loads make the
   //    single lowest deterministic: dhruv0811(0) wins.
   let r = await run({

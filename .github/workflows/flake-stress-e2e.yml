@@ -202,7 +202,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -241,24 +241,28 @@ jobs:
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
 
-      - name: Install binary dependencies
-        # Mirrors e2e.yml. ripgrep: Grep fallback for inner tests. tmux +
-        # bubblewrap: the e2e runner runs real agents under the linux_bwrap
-        # sandbox, which fails loud if `bwrap` is missing. The apparmor
-        # sysctl mirrors ci.yml (Ubuntu 24.04 blocks unprivileged user
-        # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs). pnpm
-        # install with --ignore-scripts blocks postinstall; the claude-code
-        # stub needs its audited install.cjs run explicitly (platform detect +
-        # same-tree hardlink, no network/exec) for claude-sdk harness rows.
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      - name: Install system dependencies
+        # Mirrors e2e.yml. ripgrep supports Grep fallbacks; tmux and bubblewrap
+        # support native harnesses and the linux_bwrap sandbox.
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep tmux bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
-          node .github/ci-deps/node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Install Claude Code CLI
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        with:
+          harness: claude
+
+      - name: Install Codex CLI
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        with:
+          harness: codex
+
+      - name: Install Pi CLI
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        with:
+          harness: pi
 
       - name: Run pytest target
         # Inputs validated by prep. Word-splitting on $TEST_TARGET /

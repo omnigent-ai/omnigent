@@ -16,7 +16,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxReaperConfig,
 )
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
-from omnigent.stores.host_store import Host
+from omnigent.stores.host_store import Host, ManagedSandboxScanCursor, ManagedSandboxScanRow
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,33 +68,48 @@ class _FakeHostStore:
         self.detached: list[tuple[int, str, str]] = []
         self.cleared: list[tuple[int, str, str]] = []
         self.refresh_on_detach: set[str] = set()
-        self.stale_queries: list[tuple[int, int]] = []
+        self.current_page_queries: list[tuple[ManagedSandboxScanCursor | None, int]] = []
+        self.terminating_page_queries: list[tuple[ManagedSandboxScanCursor | None, int]] = []
 
-    def list_managed_sandbox_workspace_ids(self) -> list[int]:
-        return sorted(
-            workspace_id
-            for workspace_id, hosts in self.hosts.items()
-            if any(
-                host.sandbox_provider is not None
-                and (host.sandbox_id is not None or host.terminating_sandbox_id is not None)
+    def list_current_managed_sandbox_hosts_page(
+        self,
+        *,
+        after: ManagedSandboxScanCursor | None,
+        limit: int,
+    ) -> list[ManagedSandboxScanRow]:
+        self.current_page_queries.append((after, limit))
+        rows = sorted(
+            (
+                (host.sandbox_id, workspace_id, host.host_id, host)
+                for workspace_id, hosts in self.hosts.items()
                 for host in hosts.values()
-            )
+                if host.sandbox_id is not None
+            ),
+            key=lambda row: row[:3],
         )
+        if after is not None:
+            rows = [row for row in rows if row[:3] > after]
+        return [(workspace_id, host) for _, workspace_id, _, host in rows[:limit]]
 
-    def list_stale_managed_sandbox_hosts(self, older_than_epoch: int) -> list[Host]:
-        workspace_id = current_workspace_id()
-        self.stale_queries.append((workspace_id, older_than_epoch))
-        hosts = [
-            host
-            for host in self.hosts[workspace_id].values()
-            if host.sandbox_provider is not None
-            and (
-                host.deleted_at is not None
-                or host.terminating_sandbox_id is not None
-                or (host.sandbox_id is not None and host.updated_at <= older_than_epoch)
-            )
-        ]
-        return sorted(hosts, key=lambda host: (host.updated_at, host.host_id))
+    def list_terminating_managed_sandbox_hosts_page(
+        self,
+        *,
+        after: ManagedSandboxScanCursor | None,
+        limit: int,
+    ) -> list[ManagedSandboxScanRow]:
+        self.terminating_page_queries.append((after, limit))
+        rows = sorted(
+            (
+                (host.terminating_sandbox_id, workspace_id, host.host_id, host)
+                for workspace_id, hosts in self.hosts.items()
+                for host in hosts.values()
+                if host.terminating_sandbox_id is not None
+            ),
+            key=lambda row: row[:3],
+        )
+        if after is not None:
+            rows = [row for row in rows if row[:3] > after]
+        return [(workspace_id, host) for _, workspace_id, _, host in rows[:limit]]
 
     def detach_stale_managed_sandbox(
         self,
@@ -277,7 +292,81 @@ async def test_sweep_reaps_stale_host_rows_without_scanning_sessions() -> None:
     assert hosts.hosts[7]["host_modal"].sandbox_id is None
     assert hosts.hosts[7]["host_modal"].terminating_sandbox_id is None
     assert hosts.hosts[7]["host_recent"].sandbox_id == "sb-recent"
-    assert hosts.stale_queries == [(7, now - _DAY_S), (9, now - _DAY_S)]
+    assert hosts.terminating_page_queries == [(None, 500)]
+    assert hosts.current_page_queries == [(None, 500)]
+
+
+async def test_sweep_completely_traverses_bounded_slot_pages() -> None:
+    now = 4_000_000
+    modal = _RecordingLauncher("modal")
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_current_a",
+                    provider="modal",
+                    sandbox_id="sb-current-a",
+                    updated_at=now - 2 * _DAY_S,
+                ),
+                _host(
+                    "host_current_b",
+                    provider="modal",
+                    sandbox_id="sb-current-b",
+                    updated_at=now - 3 * _DAY_S,
+                ),
+                _host(
+                    "host_current_c",
+                    provider="modal",
+                    sandbox_id="sb-current-c",
+                    updated_at=now - 4 * _DAY_S,
+                ),
+                _host(
+                    "host_pending_a",
+                    provider="modal",
+                    sandbox_id=None,
+                    terminating_sandbox_id="sb-pending-a",
+                    updated_at=now,
+                ),
+                _host(
+                    "host_pending_b",
+                    provider="modal",
+                    sandbox_id=None,
+                    terminating_sandbox_id="sb-pending-b",
+                    updated_at=now,
+                ),
+                _host(
+                    "host_pending_c",
+                    provider="modal",
+                    sandbox_id=None,
+                    terminating_sandbox_id="sb-pending-c",
+                    updated_at=now,
+                ),
+            ]
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal]),
+        scan_batch_size=2,
+    )
+
+    assert await reaper.sweep_once(now=now) == 6
+    assert set(modal.terminated) == {
+        "sb-current-a",
+        "sb-current-b",
+        "sb-current-c",
+        "sb-pending-a",
+        "sb-pending-b",
+        "sb-pending-c",
+    }
+    assert hosts.terminating_page_queries == [
+        (None, 2),
+        (("sb-pending-b", 7, "host_pending_b"), 2),
+    ]
+    assert hosts.current_page_queries == [
+        (None, 2),
+        (("sb-current-b", 7, "host_current_b"), 2),
+    ]
 
 
 async def test_provider_failure_does_not_stop_other_sandboxes() -> None:
