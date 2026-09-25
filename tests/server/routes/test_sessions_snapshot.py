@@ -2778,12 +2778,7 @@ def test_runner_reject_detail_tolerates_status_only_response_fake() -> None:
 
 @pytest.mark.asyncio
 async def test_relayed_output_limit_failure_projects_as_output_limit_exceeded() -> None:
-    """A native turn that hit the model's output cap is not a generic turn error.
-
-    The claude-native forwarder relays the failure under the generic native
-    code; persisting and projecting it back yields ``output_limit_exceeded``
-    so the failure card headlines the model's limit.
-    """
+    """A relayed output-token-limit failure projects as ``output_limit_exceeded``."""
     from omnigent.server.routes.sessions import _last_task_error_from_labels
     from omnigent.server.schemas import ErrorDetail
 

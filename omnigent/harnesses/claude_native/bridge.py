@@ -8602,13 +8602,9 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
     "space, or /clear to start a new conversation."
 )
 
-# Claude Code's constant for a response that ended with stop_reason
-# "max_tokens": "API Error: Claude's response exceeded the <N> output token
-# maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS
-# environment variable." The env var belongs to the CLI process, so in the web
-# chat the record is a dead end like the context-overflow constant above.
-# Matched loosely (any count, either apostrophe, optional prefix) so a CLI
-# limit or wording bump keeps matching; applied only to flagged CLI records.
+# Claude Code's record for a response that ended with stop_reason "max_tokens";
+# its remedy (CLAUDE_CODE_MAX_OUTPUT_TOKENS on the CLI process) is a dead end in
+# the web chat. Loose on count, apostrophe and prefix so a CLI wording bump matches.
 _OUTPUT_TOKEN_LIMIT_RE = re.compile(
     r"^(?:API Error: )?Claude['’]s response exceeded the [\d,]+ output token maximum\.",
     re.IGNORECASE,

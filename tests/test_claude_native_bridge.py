@@ -1462,13 +1462,7 @@ _RAW_OUTPUT_LIMIT_ERROR_VARIANT = (
 
 @pytest.mark.parametrize("raw_text", [_RAW_OUTPUT_LIMIT_ERROR, _RAW_OUTPUT_LIMIT_ERROR_VARIANT])
 def test_read_transcript_rewrites_output_token_limit(tmp_path: Path, raw_text: str) -> None:
-    """
-    The CLI's flagged output-token-limit error becomes guidance the web user can act on.
-
-    The constant's only remedy — an environment variable of the running CLI
-    process — cannot be applied from the web chat, so relaying it raw strands
-    the user exactly like the context-overflow constant.
-    """
+    """The CLI's flagged output-token-limit error becomes guidance the web user can act on."""
     text = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
 
     assert text.startswith("Output limit reached")

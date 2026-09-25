@@ -812,10 +812,9 @@ class QueuedResponse:
     # this text before the ``text`` block — scripts a turn where the model
     # visibly thinks before answering.
     thinking: str | None = None
-    # When set, overrides the terminal ``stop_reason`` on ``/v1/messages``
-    # text responses (e.g. ``"max_tokens"``: the response hit the model's
-    # output-token limit; Claude Code fails the turn with its "response
-    # exceeded the ... output token maximum" API error).
+    # When set, overrides the terminal ``stop_reason`` on ``/v1/messages`` text
+    # responses; ``"max_tokens"`` scripts a reply that hit the model's output-token
+    # limit, which Claude Code turns into its "output token maximum" API error.
     stop_reason: str | None = None
     # Seconds to sleep between SSE events on ``/v1/messages``. ``0`` keeps the
     # historical single-chunk body; a small value paces the stream so live
