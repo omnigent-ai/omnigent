@@ -274,7 +274,7 @@ def _list_session(client: httpx.Client, session_id: str) -> dict[str, object] | 
     """
     resp = client.get(
         "/v1/sessions",
-        params={"include_archived": "true", "limit": 1000},
+        params={"visibility": "all", "include_archived": "true", "limit": 1000},
     )
     resp.raise_for_status()
     for item in resp.json().get("data", []):

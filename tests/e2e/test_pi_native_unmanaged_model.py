@@ -24,6 +24,14 @@ Facet 2 (dropped pick, surface ``cli``):
     (``omnigent/runner/native/orchestration.py``), so the pinned model is
     silently dropped and Pi opens its own default.
 
+Facet 2 observes the launched argv through a test-owned Pi *user extension*
+seeded into the daemon HOME's ``~/.pi/agent/extensions/`` (Pi's supported
+auto-discovery): on load it atomically writes the real ``process.argv`` into
+the session's bridge dir. This replaces polling ``/proc`` for the bridge
+marker: Pi rewrites ``process.title`` early in startup, erasing its launch
+argv from ``/proc/<pid>/cmdline``, so a /proc poll races the rewrite and can
+miss the process entirely.
+
 Both assertions are written against the FIXED behavior, so this module is
 RED on the buggy build (facet 1: empty ``models``; facet 2: no ``--model``)
 and turns GREEN once the fallback path is fixed. It runs against the mock
@@ -51,6 +59,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
+import psutil
 import pytest
 import yaml
 
@@ -69,6 +78,36 @@ _WORKTREE = Path(__file__).resolve().parents[2]
 # id keeps the argv assertion in facet 2 unambiguous.
 _PI_MODEL_ID = "claude-sonnet-4-5"
 _PINNED_SPEC_MODEL = f"anthropic/{_PI_MODEL_ID}"
+
+# Test-owned argv observer: a seeded Pi user extension records the real
+# process identity (pid, argv, cwd -- never environment) when the launched
+# CLI loads it. Mechanism details: the module docstring.
+_OBSERVER_EXTENSION_NAME = "omnigent-e2e-argv-observer.js"
+_OBSERVER_OUTPUT_FILE = "e2e-argv-observation.json"
+_OBSERVER_EXTENSION_SOURCE = """\
+// Seeded by tests/e2e/test_pi_native_unmanaged_model.py and loaded through
+// Pi's user-extension auto-discovery (~/.pi/agent/extensions/).
+const fs = require("fs");
+const path = require("path");
+
+module.exports = function () {
+    try {
+        const argv = process.argv.slice();
+        const flag = argv.indexOf("--extension");
+        if (flag < 0 || flag + 1 >= argv.length) return;
+        const bridgeDir = path.resolve(path.dirname(argv[flag + 1]));
+        const out = path.join(bridgeDir, "__OBSERVER_OUTPUT_FILE__");
+        const tmp = out + ".tmp";
+        fs.writeFileSync(
+            tmp,
+            JSON.stringify({ pid: process.pid, argv: argv, cwd: process.cwd() })
+        );
+        fs.renameSync(tmp, out);
+    } catch (err) {
+        // Observation must never break the session under test.
+    }
+};
+""".replace("__OBSERVER_OUTPUT_FILE__", _OBSERVER_OUTPUT_FILE)
 
 # Skip the whole module unless the real Pi terminal toolchain is present:
 # the launch path shells out to node -> pi inside a runner-owned tmux pane.
@@ -91,79 +130,124 @@ pytestmark = [
 ]
 
 
-def _bridge_marker(session_id: str) -> str:
-    """Return the hashed bridge-dir path segment for *session_id*.
+def _bridge_digest(session_id: str) -> str:
+    """Return the hashed bridge-dir segment for *session_id*.
 
     The harness writes a session's Pi bridge under
-    ``~/.omnigent/pi-native/<sha256(session_id)[:32]>``; the launched
-    ``pi`` process references that dir via ``--extension`` / ``--session-dir``,
-    so the segment is a reliable needle for finding the process in ``/proc``.
+    ``~/.omnigent/pi-native/<sha256(session_id)[:32]>``.
 
     :param session_id: The session/conversation id.
-    :returns: ``"pi-native/<32-hex>"``.
+    :returns: The 32-hex digest segment.
     """
-    digest = hashlib.sha256(session_id.encode()).hexdigest()[:32]
-    return f"pi-native/{digest}"
+    return hashlib.sha256(session_id.encode()).hexdigest()[:32]
 
 
-def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
-    """Scan ``/proc`` for the launched ``pi`` CLI naming *marker*.
+def _bridge_dir(home: Path, session_id: str) -> Path:
+    """Return the session's bridge dir under the daemon HOME *home*.
 
-    The pi CLI runs as ``node .../pi --extension <bridge>/... --approve
-    --session-dir <bridge>/...`` (after the fix, additionally ``--provider ...
-    --model <resolved>``). Two *other* processes also name the bridge marker
-    and must be skipped:
-
-    - the ``tmux new-session ... '<pi command string>'`` launcher, which
-      embeds the entire pi command as ONE argv element (so ``--extension``
-      is not a standalone token there); and
-    - the ``python -m omnigent.runner...`` runner that spawned it.
-
-    Match only the process where ``--extension`` is its own argv token and
-    ``argv[0]`` is not tmux -- that is the real pi CLI.
-
-    :param marker: The ``pi-native/<hash>`` bridge segment from
-        :func:`_bridge_marker`.
-    :returns: ``(pid, argv)`` of the pi process, or ``None`` if not found yet.
+    :param home: The spawned daemon's HOME.
+    :param session_id: The session/conversation id.
+    :returns: ``<home>/.omnigent/pi-native/<digest>``.
     """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle not in raw:
-            continue
-        argv = [chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk]
-        if not argv:
-            continue
-        # ``--extension`` as a STANDALONE token uniquely identifies the real pi
-        # CLI: tmux embeds the pi command as one string, the runner never
-        # carries ``--extension`` at all.
-        if "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux"):
-            return int(pid_dir.name), argv
-    return None
+    return home / ".omnigent" / "pi-native" / _bridge_digest(session_id)
 
 
-def _kill_pi_processes(marker: str) -> None:
-    """Best-effort SIGKILL of any process still naming *marker*.
+def _bridge_marker(session_id: str) -> str:
+    """Return the session's hashed bridge-dir path segment."""
+    return f"pi-native/{_bridge_digest(session_id)}"
 
-    :param marker: The bridge segment; kills the pi CLI and any child that
-        inherited it so the test leaves no orphaned tmux/pi tree.
+
+def _read_argv_observation(bridge_dir: Path) -> dict | None:
+    """Return the observer extension's record for the session, if written yet.
+
+    The extension publishes via write-temp-then-rename, so a visible record
+    is always complete.
+
+    :param bridge_dir: The session's bridge dir from :func:`_bridge_dir`.
+    :returns: The parsed ``{pid, argv, cwd}`` record, or ``None``.
     """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle in raw:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(int(pid_dir.name), signal.SIGKILL)
+    try:
+        record = json.loads((bridge_dir / _OBSERVER_OUTPUT_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _live_observed_pid(observation: dict, *, marker: str, workspace: Path) -> int | None:
+    """Return the recorded pid when the live process is still that session's Pi.
+
+    A recorded pid could have exited and been recycled by an unrelated
+    process. The pid is trusted only when its cwd is the session workspace
+    and its cmdline is either the
+    pre-rewrite launch argv (bridge marker present) or the post-rewrite bare
+    ``pi`` title.
+
+    :param observation: The observer record from :func:`_read_argv_observation`.
+    :param marker: The session's bridge marker from :func:`_bridge_marker`.
+    :param workspace: The session workspace the pane launched in.
+    :returns: The verified pid, or ``None`` when unverifiable.
+    """
+    pid = observation.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        process = psutil.Process(pid)
+        cmdline = [token for token in process.cmdline() if token]
+        cwd = os.path.realpath(process.cwd())
+    except (psutil.Error, OSError):
+        return None
+    if cwd != os.path.realpath(workspace):
+        return None
+    if not any(marker in token for token in cmdline) and cmdline != ["pi"]:
+        return None
+    return pid
+
+
+def _capture_pane_diagnostics(marker: str, out_path: Path) -> None:
+    """Best-effort capture of the session's tmux pane content after a failure.
+
+    The daemon log already lives under the test basetemp and shows the runner
+    side; this preserves what the Pi pane itself displayed. No-ops when tmux,
+    the pane, or the ``pane_start_command`` format is unavailable.
+
+    :param marker: The session's bridge marker (present in the pane's start
+        command string).
+    :param out_path: Destination under the test basetemp.
+    """
+    try:
+        listing = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index}.#{pane_index} #{pane_start_command}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if listing.returncode != 0:
+            return
+        chunks = []
+        for line in listing.stdout.splitlines():
+            target, _, start_command = line.partition(" ")
+            if marker not in start_command:
+                continue
+            capture = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", target],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if capture.returncode == 0:
+                chunks.append(f"--- {target} ---\n{capture.stdout}")
+        if chunks:
+            out_path.write_text("\n".join(chunks))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 class _UnmanagedPiHost:
@@ -195,7 +279,10 @@ def _seed_unmanaged_pi_home(home: Path) -> str:
     ``.pi/agent/models-store.json`` (one usable model) so Pi itself has
     models, while ``.omnigent/config.yaml`` carries only a host block and
     NO provider setup -- exactly the state where
-    ``resolve_pi_native_provider()`` returns ``None``.
+    ``resolve_pi_native_provider()`` returns ``None``. Also seeds
+    ``.pi/agent/extensions/`` with the test-owned argv observer (see the
+    module constants), which every real Pi launch under this HOME
+    auto-loads.
 
     :param home: The daemon HOME to populate.
     :returns: The host id written into ``config.yaml``.
@@ -213,6 +300,9 @@ def _seed_unmanaged_pi_home(home: Path) -> str:
     )
     pi_agent = home / ".pi" / "agent"
     pi_agent.mkdir(parents=True, exist_ok=True)
+    extensions_dir = pi_agent / "extensions"
+    extensions_dir.mkdir(parents=True, exist_ok=True)
+    (extensions_dir / _OBSERVER_EXTENSION_NAME).write_text(_OBSERVER_EXTENSION_SOURCE)
     (pi_agent / "auth.json").write_text(
         json.dumps({"anthropic": {"type": "api_key", "key": "sk-e2e-unmanaged-fake"}})
     )
@@ -289,6 +379,7 @@ def unmanaged_pi_host(
         **os.environ,
         "HOME": str(home),
         "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
+        "OMNIGENT_DATA_DIR": str(home / ".omnigent"),
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
     # Prepend ABSOLUTE worktree roots to PYTHONPATH. The runner the daemon
@@ -361,7 +452,9 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
     """Facet 2: a spec-pinned ``executor.model`` must reach the ``pi`` argv.
 
     Create a pi-native terminal session whose spec pins ``executor.model``,
-    let the runner auto-launch the real ``pi`` CLI, then inspect its argv.
+    let the runner auto-launch the real ``pi`` CLI, then read the argv the
+    test-owned user extension recorded inside that process (the module
+    header explains why /proc polling raced Pi's ``process.title`` rewrite).
     The buggy build launches ``pi`` with NO ``--model`` (the pick is dropped
     because ``_auto_create_pi_terminal`` only appends launch args when a
     provider is configured); the fix passes ``--model`` through.
@@ -416,15 +509,20 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
     assert create.status_code in (200, 201), f"session create failed: {create.text}"
     session_id = str(create.json()["session_id"])
     marker = _bridge_marker(session_id)
+    bridge_dir = _bridge_dir(host.home, session_id)
 
-    pi_argv: list[str] | None = None
+    observation: dict | None = None
+    pi_started = False
     deadline = time.monotonic() + 150.0
     try:
         while time.monotonic() < deadline:
-            found = _find_pi_process(marker)
-            if found is not None:
-                pi_argv = found[1]
-                break
+            observation = _read_argv_observation(bridge_dir)
+            if observation is not None:
+                session = http_client.get(f"/v1/sessions/{session_id}", timeout=10.0)
+                session.raise_for_status()
+                if session.json().get("external_session_id"):
+                    pi_started = True
+                    break
             if host.proc.poll() is not None:
                 raise AssertionError(
                     f"host daemon exited (rc={host.proc.returncode}) before pi launched; "
@@ -432,10 +530,28 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
                 )
             time.sleep(1.0)
 
-        assert pi_argv is not None, (
-            "the launched 'pi' process never appeared for session "
-            f"{session_id!r}; daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
+        assert observation is not None, (
+            "the test-owned Pi user extension never recorded a launch for session "
+            f"{session_id!r}: the real pi CLI either never started or never "
+            "auto-loaded ~/.pi/agent/extensions/ from the seeded HOME; daemon log "
+            f"tail:\n{host.daemon_log.read_text()[-2000:]}"
         )
+        pi_argv = [str(token) for token in observation.get("argv") or []]
+        # npm exposes the package bin as .bin/pi (a shim or symlink); resolve
+        # through it so both entry styles verify the real package identity.
+        resolved_entry = os.path.realpath(pi_argv[1]) if len(pi_argv) > 1 else ""
+        assert resolved_entry.endswith(os.path.join("pi-coding-agent", "dist", "cli.js")), (
+            "the observed process is not the real Pi CLI -- expected its node "
+            "entry point to resolve to .../pi-coding-agent/dist/cli.js, got "
+            f"argv: {pi_argv} (resolved: {resolved_entry})"
+        )
+        assert pi_started, (
+            f"Pi never reported its native session ID for {session_id!r}; "
+            f"argv: {pi_argv}; daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
+        )
+        assert "--extension" in pi_argv, pi_argv
+        extension_idx = pi_argv.index("--extension")
+        assert marker in pi_argv[extension_idx + 1], pi_argv
         assert "--model" in pi_argv, (
             "the spec-pinned model was silently DROPPED: the launched pi argv "
             f"carries no --model flag. _auto_create_pi_terminal appends --model "
@@ -444,5 +560,80 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
         )
         model_idx = pi_argv.index("--model")
         assert model_idx + 1 < len(pi_argv), f"--model had no value in argv: {pi_argv}"
+        assert pi_argv[model_idx + 1] == _PINNED_SPEC_MODEL, (
+            f"the launched pi CLI resolved --model {pi_argv[model_idx + 1]!r} instead "
+            f"of the spec-pinned {_PINNED_SPEC_MODEL!r}. argv: {pi_argv}"
+        )
+        assert observation.get("cwd") == os.path.realpath(workspace), (
+            f"the observed Pi ran in {observation.get('cwd')!r} instead of the "
+            f"session workspace {os.path.realpath(workspace)!r}"
+        )
+        assert _live_observed_pid(observation, marker=marker, workspace=workspace) is not None, (
+            "the recorded Pi process is not verifiably alive for session "
+            f"{session_id!r}: a persisted observation alone does not prove a "
+            "running Pi (it has exited or no longer matches this "
+            "session's workspace/cmdline)"
+        )
+    except Exception:
+        _capture_pane_diagnostics(marker, host.home / "pi-pane-diagnostics.txt")
+        raise
     finally:
-        _kill_pi_processes(marker)
+        with contextlib.suppress(httpx.HTTPError):
+            http_client.delete(f"/v1/sessions/{session_id}", timeout=10.0).raise_for_status()
+
+
+@pytest.mark.parametrize("rewrite_title", [False, True])
+def test_live_observed_pid_accepts_launch_argv_or_pi_title(
+    tmp_path: Path, rewrite_title: bool
+) -> None:
+    """Verify a live process before and after Node rewrites its argv."""
+    marker = _bridge_marker("conv_title_change_control")
+    script = (
+        "process.title = 'pi';" if rewrite_title else ""
+    ) + "console.log('ready'); setTimeout(() => {}, 30000);"
+    process = subprocess.Popen(
+        ["node", "-e", script, marker],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ready"
+        observation = {"pid": process.pid}
+        assert _live_observed_pid(observation, marker=marker, workspace=tmp_path) == process.pid
+        assert _live_observed_pid(observation, marker=marker, workspace=tmp_path.parent) is None
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def test_live_observed_pid_rejects_stale_or_recycled_pids(tmp_path: Path) -> None:
+    """Negative control: stale or recycled recorded pids must never verify.
+
+    These controls pin that a persisted record alone -- a dead pid, or a live but
+    unrelated process that recycled it -- cannot satisfy the verification.
+
+    :param tmp_path: Stand-in session workspace.
+    """
+    marker = _bridge_marker("conv_negative_control")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    assert (
+        _live_observed_pid(
+            {"pid": dead.pid, "argv": [], "cwd": os.path.realpath(workspace)},
+            marker=marker,
+            workspace=workspace,
+        )
+        is None
+    )
+    assert (
+        _live_observed_pid(
+            {"pid": os.getpid(), "argv": [], "cwd": os.path.realpath(Path.cwd())},
+            marker=marker,
+            workspace=Path.cwd(),
+        )
+        is None
+    )

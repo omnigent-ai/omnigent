@@ -35,6 +35,29 @@ export function claudeNativeSubagentLabel(
   return agentType.slice(agentType.lastIndexOf(":") + 1) || agentType;
 }
 
+/** Wrapper stamped on a child row that tracks a Codex sub-agent (incl. `/side` forks). */
+export const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
+/** Friendly nickname forwarded onto a Codex sub-agent child, e.g. `"Side chat"`. */
+export const CODEX_NATIVE_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname";
+
+/**
+ * Human-readable label for a Codex sub-agent session (including `/side` forks).
+ *
+ * A Codex child's title is `"codex-native-ui-subagent:{threadId}"`, whose suffix
+ * is an opaque thread UUID — useless to show. The friendly name rides the
+ * `agent_nickname` label instead (e.g. `"Side chat"`).
+ *
+ * @param labels - Session-scoped labels from the child row.
+ * @returns The nickname, or `null` when the row is not a Codex sub-agent or
+ *   carries no nickname, leaving the caller's own fallbacks in charge.
+ */
+export function codexNativeSubagentLabel(
+  labels: Record<string, string> | undefined,
+): string | null {
+  if (labels?.[WRAPPER_LABEL_KEY] !== CODEX_NATIVE_SUBAGENT_WRAPPER) return null;
+  return labels[CODEX_NATIVE_NICKNAME_LABEL_KEY]?.trim() || null;
+}
+
 export type NativeCodingAgentIconKind =
   | "claude"
   | "codex"
@@ -46,9 +69,16 @@ export type NativeCodingAgentIconKind =
   | "qwen"
   | "antigravity"
   | "kimi"
-  | "hermes";
+  | "hermes"
+  | "devin";
 export type NativeCodingAgentCapability =
-  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
+  | "permissionMode"
+  | "approvalMode"
+  | "cursorMode"
+  | "skipPermissions"
+  | "modelPicker"
+  | "devinMode"
+  | "devinPermission";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -118,6 +148,37 @@ export const NATIVE_CODING_AGENTS = [
     // `approvalMode`, whose `--sandbox`/`--ask-for-approval` presets aren't
     // understood by `opencode attach` and crashed the TUI on any non-default
     // pick.)
+  },
+  {
+    // Devin's native TUI (Cognition). Replaced the built-in ACP row, removed in
+    // 0.14 — both `devin` and the retired `devin-acp` id resolve here, while a
+    // user-configured `acp:devin` still runs the generic ACP executor. Devin's
+    // `run_subagent` delegates surface as child sessions: the forwarder
+    // reconstructs each one's transcript from Devin's session store.
+    //
+    // `devinMode` owns Devin's own Model + Effort rows. It is deliberately the
+    // ONLY capability here:
+    //   * `permissionMode` would render Claude's vocabulary AND the server
+    //     hard-gates the `permission_mode` FIELD to claude-native agents
+    //     (_PERMISSION_MODE_HARNESS in routes/_session_create_validation.py).
+    //     `devinPermission` instead carries Devin's own four rungs
+    //     (auto/accept-edits/smart/dangerous) as `terminal_launch_args`, the
+    //     same channel cursor/agy/codex modes use, so no gated field is sent.
+    //   * `modelPicker` would render pi's model list.
+    key: "devin",
+    agentName: "devin-native-ui",
+    harness: "devin-native",
+    wrapperLabel: "devin-native-ui",
+    subagentWrapperLabel: "devin-native-ui-subagent",
+    displayName: "Devin",
+    iconKind: "devin",
+    sortRank: 28,
+    capabilities: ["devinMode", "devinPermission"],
+    // Deliberately NOT fullySupported: that flag pins the picker's primary list
+    // to Claude Code + Codex and is guarded by a test asserting exactly those
+    // two, so promoting a brand-new harness there is a product call for a
+    // maintainer, not a side effect of adding it. Devin folds into "More" with
+    // the other natives; flipping this is a one-line change.
   },
   {
     key: "cursor",

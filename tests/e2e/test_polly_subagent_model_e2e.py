@@ -194,7 +194,7 @@ def _polly_parent_id(base_url: str) -> str:
     :param base_url: Local server base URL.
     :returns: The parent conversation id.
     """
-    sessions = _api(base_url, "/v1/sessions").get("data", [])
+    sessions = _api(base_url, "/v1/sessions?visibility=all").get("data", [])
     parents = [s["id"] for s in sessions if s.get("agent_name") == "polly"]
     assert parents, f"no polly session found among {len(sessions)} sessions"
     return parents[0]

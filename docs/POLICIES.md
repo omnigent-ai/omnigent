@@ -67,6 +67,36 @@ omnigent server --config server_config.yaml
 
 After starting, you can also add or remove policies at runtime through the REST API (see [Admin policy REST API](#admin-policy-rest-api)).
 
+### Attachment admission controls
+
+The upload, copy, and fork routes apply additional server settings to `.zip`, `.docx`,
+`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These formats require
+Claude Code or Codex and an updated execution host/runner that supports their
+delivery and restoration. They are stored without extraction; the harness
+reads a local copy outside the working checkout. See
+[attached files and sandbox access](DATA_DIR_LAYOUT.md#attached-files).
+
+| Server config key | Default | Scope |
+|-------------------|---------|-------|
+| `filesystem_attachment_max_bytes` | `52428800` (50 MiB) | Bytes per file |
+| `filesystem_attachment_max_files` | `20` | Stored files of these types per session |
+| `filesystem_attachment_max_total_bytes` | `209715200` (200 MiB) | Combined bytes of these types per session |
+| `filesystem_attachment_denied_extensions` | `[]` | Further restrict the allowlist, e.g. `[".zip", ".db"]` |
+
+These are filename-based admission and storage limits, not content inspection.
+Classification uses the stored filename's extension, even when the browser
+reports a different MIME type. It does not identify file formats from their
+bytes, inspect archive entries, or detect renamed binary content. The denylist
+does not restrict files the agent creates or downloads through other tools.
+Images, PDFs, and text/code uploads retain their separate existing limits;
+the web composer also has a fixed 50 MiB ceiling for the formats listed above.
+
+Request-phase policies receive the filename and content type for these files,
+with an empty `text` value. Their document, archive, and database contents are
+not scanned as text. Ordinary text/code attachments continue to provide decoded
+text to request-phase policies. No attachment delivery-mode field is added to
+the policy payload.
+
 ---
 
 ## For agent developers

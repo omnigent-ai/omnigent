@@ -572,12 +572,21 @@ def _worker_db_uri() -> Generator[str, None, None]:
     root_engine2.dispose()
 
 
+@pytest.fixture(scope="session")
+def _sqlite_db_template() -> Path | None:
+    """Suites may supply a migrated SQLite snapshot; the default runs migrations."""
+    return None
+
+
 @pytest.fixture()
-def db_uri(tmp_path: Path, _worker_db_uri: str) -> Generator[str, None, None]:
+def db_uri(
+    tmp_path: Path, _worker_db_uri: str, _sqlite_db_template: Path | None
+) -> Generator[str, None, None]:
     """
     Per-test database URI.
 
-    * **SQLite** (default): fresh file per test, fully isolated.
+    * **SQLite** (default): fresh file per test, optionally copied from
+      a suite's migrated template. Engines and data remain fully isolated.
     * **Postgres / MySQL / CockroachDB** (``OMNIGENT_TEST_DB_URI`` set):
       reuses the session-scoped worker database and clears all non-alembic
       tables between tests so each test starts clean without re-migrating.
@@ -587,6 +596,8 @@ def db_uri(tmp_path: Path, _worker_db_uri: str) -> Generator[str, None, None]:
     if not _worker_db_uri:
         # SQLite: per-test file.
         db_path = tmp_path / "test.db"
+        if _sqlite_db_template is not None:
+            shutil.copyfile(_sqlite_db_template, db_path)
         uri = f"sqlite:///{db_path}"
         engine = get_or_create_engine(uri)
         yield uri
