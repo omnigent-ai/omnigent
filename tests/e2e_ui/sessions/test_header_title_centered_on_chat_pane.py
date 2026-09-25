@@ -1,21 +1,10 @@
-"""Browser e2e for the chat-header title's horizontal placement.
+"""Browser e2e: the chat header's session title must center on the chat pane.
 
-The session title in the chat header should read as belonging to the chat
-pane: centered on the pane's width, so widening the left sidebar (an
-increasingly common layout when the right rail previews code/PDFs/websites)
-doesn't shove the title deep into the window where it visually collides
-with the sidebar's edge.
-
-Journey (from the bug report):
-
-1. Open the web UI and open a session (the title renders in the header).
-2. Drag the sidebar's right-edge resize handle to widen the sidebar.
-3. The title must stay centered on the chat pane — today it is anchored to
-   the pane's left edge, so it tracks the sidebar's edge instead.
-
-The assertion measures geometry rather than CSS classes so any future
-centering implementation (flex order, absolute overlay, grid) passes as
-long as the rendered result is centered.
+Journey from the report: open a session, then drag the Conversations
+sidebar's right-edge handle to widen it. The title should stay centered over
+the chat pane and clear of the sidebar; a left-anchored header slot instead
+drags it along with the sidebar's edge, so it reads as attached to /
+overlapped by the sidebar.
 """
 
 from __future__ import annotations
@@ -23,23 +12,17 @@ from __future__ import annotations
 import httpx
 from playwright.sync_api import Page, expect
 
-# How far (px) the title's horizontal midpoint may sit from the chat pane's
-# midpoint and still count as "centered". Generous enough for sub-pixel
-# rounding and the rename-affordance padding; far smaller than the
-# left-anchored breadcrumb's offset, which is hundreds of px on a wide pane.
-CENTER_TOLERANCE_PX = 40
+_CONVERSATIONS = 'aside[aria-label="Conversations"]'
+_TITLE = "Header centering check"
+_VIEWPORT = {"width": 1440, "height": 900}
+_SIDEBAR_TARGET_PX = 640
+# Well under the left-anchored breadcrumb's offset (hundreds of px on a wide
+# pane) while leaving room for sub-pixel rounding and rename-control padding.
+_CENTER_TOLERANCE_PX = 40
+_LAYOUT_SETTLE_MS = 300
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
-    """Give the seeded session a stable title via ``PATCH /v1/sessions/{id}``.
-
-    The seeded session starts untitled; the header only mounts the breadcrumb
-    once a title (or a parent link) resolves, so the test pins one explicitly.
-
-    :param base_url: Spawned server base URL.
-    :param session_id: The session/conversation id to rename.
-    :param title: The new title to set.
-    """
     resp = httpx.patch(
         f"{base_url}/v1/sessions/{session_id}",
         json={"title": title},
@@ -48,72 +31,74 @@ def _set_title(base_url: str, session_id: str, title: str) -> None:
     resp.raise_for_status()
 
 
-def _horizontal_center(box: dict[str, float]) -> float:
-    """Return the horizontal midpoint of a Playwright bounding box."""
+def _center_x(box: dict[str, float]) -> float:
     return box["x"] + box["width"] / 2
 
 
-def test_header_title_centered_after_widening_sidebar(
+def _drag_sidebar_edge_to(page: Page, target_x: int) -> None:
+    handle = page.get_by_role("separator", name="Resize sidebar")
+    expect(handle).to_be_visible()
+    box = handle.bounding_box()
+    assert box is not None
+    y = box["y"] + box["height"] / 2
+    page.mouse.move(box["x"] + box["width"] / 2, y)
+    page.mouse.down()
+    page.mouse.move(target_x, y, steps=16)
+    page.mouse.up()
+    page.wait_for_function(
+        """([selector, target]) => {
+            const el = document.querySelector(selector);
+            return el && Math.abs(el.getBoundingClientRect().width - target) < 4;
+        }""",
+        arg=[_CONVERSATIONS, target_x],
+        timeout=5_000,
+    )
+    page.wait_for_timeout(_LAYOUT_SETTLE_MS)
+
+
+def test_header_title_stays_centered_on_chat_pane_when_sidebar_widens(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Widening the sidebar must not pull the header title off the pane's center.
-
-    Drives the real resize affordance (the sidebar's right-edge drag handle)
-    rather than seeding a persisted width, so the journey matches what a user
-    does: grab the handle, drag right, look at the title.
-    """
     base_url, session_id = seeded_session
-    _set_title(base_url, session_id, "Centering check session")
+    _set_title(base_url, session_id, _TITLE)
 
+    page.set_viewport_size(_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
     title = page.get_by_test_id("header-title")
     expect(title).to_be_visible(timeout=30_000)
-    expect(title).to_have_text("Centering check session")
+    expect(title).to_have_text(_TITLE)
+    sidebar = page.locator(_CONVERSATIONS)
+    expect(sidebar).not_to_have_attribute("data-collapsed", "true")
+    pane = page.get_by_role("main")
+    expect(pane).to_be_visible()
+    page.wait_for_timeout(_LAYOUT_SETTLE_MS)
 
-    # Widen the sidebar by dragging its right-edge resize handle toward the
-    # viewport's midpoint (the hook clamps at 50% of the viewport width).
-    handle = page.get_by_role("separator", name="Resize sidebar")
-    expect(handle).to_be_visible()
-    handle_box = handle.bounding_box()
-    assert handle_box is not None
-    viewport = page.viewport_size
-    assert viewport is not None
-    target_x = int(viewport["width"] * 0.45)
+    before = title.bounding_box()
+    pane_before = pane.bounding_box()
+    assert before is not None and pane_before is not None
+    offset_before = _center_x(before) - _center_x(pane_before)
 
-    page.mouse.move(
-        handle_box["x"] + handle_box["width"] / 2,
-        handle_box["y"] + handle_box["height"] / 2,
-    )
-    page.mouse.down()
-    page.mouse.move(target_x, handle_box["y"] + handle_box["height"] / 2, steps=12)
-    page.mouse.up()
+    _drag_sidebar_edge_to(page, _SIDEBAR_TARGET_PX)
 
-    # The sidebar must actually have widened, or the journey didn't happen.
-    sidebar = page.get_by_role("complementary", name="Conversations")
     sidebar_box = sidebar.bounding_box()
-    assert sidebar_box is not None
-    assert sidebar_box["width"] >= target_x - 20, (
-        f"sidebar drag did not take: width {sidebar_box['width']:.0f}px, expected ~{target_x}px"
+    pane_box = pane.bounding_box()
+    title_box = title.bounding_box()
+    assert sidebar_box is not None and pane_box is not None and title_box is not None
+    sidebar_right = sidebar_box["x"] + sidebar_box["width"]
+    assert abs(pane_box["x"] - sidebar_right) <= 2, (pane_box, sidebar_box)
+
+    assert title_box["x"] >= sidebar_right - 1, (
+        f"sidebar overlaps the title: title starts at {title_box['x']:.0f}px, "
+        f"sidebar's right edge is {sidebar_right:.0f}px"
     )
 
-    # The chat header spans exactly the chat pane (it is absolutely inset
-    # within the pane container), so its box gives the pane's extent. This
-    # assertion depends on that positioning contract: if the header is ever
-    # re-parented above the pane, measure the pane container instead.
-    header = page.locator("header.chat-header")
-    header_box = header.bounding_box()
-    title_box = title.bounding_box()
-    assert header_box is not None and title_box is not None
-
-    pane_center = _horizontal_center(header_box)
-    title_center = _horizontal_center(title_box)
-    offset = title_center - pane_center
-
-    assert abs(offset) <= CENTER_TOLERANCE_PX, (
-        f"header title is not centered on the chat pane: title midpoint "
-        f"{title_center:.0f}px vs pane midpoint {pane_center:.0f}px "
-        f"(offset {offset:+.0f}px, tolerance {CENTER_TOLERANCE_PX}px; "
-        f"pane spans x={header_box['x']:.0f}..{header_box['x'] + header_box['width']:.0f})"
+    offset = _center_x(title_box) - _center_x(pane_box)
+    assert abs(offset) <= _CENTER_TOLERANCE_PX, (
+        f"header title is not centered on the chat pane after widening the sidebar to "
+        f"{sidebar_box['width']:.0f}px: title midpoint {_center_x(title_box):.0f}px vs pane "
+        f"midpoint {_center_x(pane_box):.0f}px (offset {offset:+.0f}px, tolerance "
+        f"{_CENTER_TOLERANCE_PX}px; title left edge sits {title_box['x'] - sidebar_right:.0f}px "
+        f"from the sidebar edge; offset before widening was {offset_before:+.0f}px)"
     )
