@@ -2858,12 +2858,15 @@ def _ucode_config_for_profile(
             live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
             live_models = live_catalog.families
             routable_models = live_catalog.model_ids
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # Recoverable fallback; frames are debug-only so a TTY-mirrored
+            # host console stays concise.
             _logger.warning(
                 "native-claude: live Databricks model discovery failed for profile %r; "
-                "using cached ucode models",
+                "using cached ucode models (%s)",
                 profile,
-                exc_info=True,
+                exc,
+                exc_info=_logger.isEnabledFor(logging.DEBUG),
             )
         if live_models is not None:
             if not workspace_state.fable_enabled:

@@ -1681,7 +1681,11 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
   // keybinding — the keybinding needs editor focus and doesn't fire inside the
   // managed same-root embed, so cmd+f silently did nothing there. These assert
   // that a Cmd/Ctrl+F flips the toggle FileViewer hands each surface.
+  let platform: string;
+
   beforeEach(() => {
+    platform = "MacIntel";
+    vi.spyOn(navigator, "platform", "get").mockImplementation(() => platform);
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
   });
 
@@ -1696,9 +1700,24 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
   });
 
   it("opens find on the code surface with Ctrl+F (Windows/Linux)", () => {
+    platform = "Linux x86_64";
     renderViewer({ open: true, path: "file1.py" });
     fireEvent.keyDown(window, { key: "f", ctrlKey: true });
     expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("does not intercept Ctrl+F on macOS", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(searchOpenOf("code-viewer")).toBe("false");
   });
 
   it("opens find in the diff view with Cmd+F", async () => {

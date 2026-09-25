@@ -13,12 +13,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -26,6 +29,7 @@ from omnigent.runner.native.orchestration import (
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
 )
+from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
 _ERROR_ID_RE = re.compile(r" Error ID: (err_[0-9a-f]{32})\.$")
 
@@ -76,6 +80,119 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
     assert payload["code"] == "native_terminal_start_failed"
     assert "agent is no longer available" not in payload["message"]
+
+
+def test_generic_cause_names_errno_without_free_form_text() -> None:
+    """The generic startup-defect message now names a structured errno cause.
+
+    Production telemetry for these failures only carries this message, so an
+    environmental cause (e.g. disk-full) must be legible without the runner
+    log — but only via structured facts, never the raw exception text.
+    """
+    payload = _native_terminal_start_error_payload(
+        OSError(28, "No space left on device"),
+        "Codex",
+        session_id="conv_1",
+    )
+
+    assert (
+        "Native Codex terminal failed to start (OSError errno 28 ENOSPC); "
+        "see the runner log for details:"
+    ) in payload["message"]
+    assert "No space left on device" not in payload["message"]
+
+
+def test_cause_includes_errno_name_for_os_errors() -> None:
+    """An ``OSError`` cause names its errno, never its free-form strerror text."""
+    exc = OSError(28, "No space left on device")
+
+    assert orchestration._native_terminal_start_failure_cause(exc) == "OSError errno 28 ENOSPC"
+
+
+def test_cause_names_direct_cause_type_for_chained_exception() -> None:
+    """A wrapping exception names its direct cause's type, not any message text."""
+    exc = RuntimeError("private launch configuration detail")
+    exc.__cause__ = httpx.ReadTimeout("private upstream URL")
+
+    cause = orchestration._native_terminal_start_failure_cause(exc)
+
+    assert cause == "RuntimeError (cause ReadTimeout)"
+
+
+def test_cause_never_includes_exception_message_text() -> None:
+    """No part of the exception's message — secrets or multi-line text — ever appears."""
+    exc = RuntimeError("token=super-secret-value andmultiline\nsecond line with more detail")
+
+    cause = orchestration._native_terminal_start_failure_cause(exc)
+
+    assert cause == "RuntimeError"
+    assert "secret" not in cause
+    assert "token" not in cause
+    assert "\n" not in cause
+
+
+def test_cause_is_class_name_only_when_no_structured_facts_available() -> None:
+    """An exception with a message but no errno/code/cause is class-name only."""
+    assert orchestration._native_terminal_start_failure_cause(RuntimeError()) == "RuntimeError"
+
+
+def test_cause_names_omnigent_error_code() -> None:
+    """An ``OmnigentError`` cause names its structured error code, not its message."""
+    exc = OmnigentError("some internal detail", code=ErrorCode.INTERNAL_ERROR)
+
+    assert (
+        orchestration._native_terminal_start_failure_cause(exc)
+        == f"OmnigentError code {ErrorCode.INTERNAL_ERROR}"
+    )
+    assert "internal detail" not in orchestration._native_terminal_start_failure_cause(exc)
+
+
+def test_codex_early_exit_with_unknown_status_does_not_invent_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+    )
+    read_output = Mock(side_effect=AssertionError("capture is disabled"))
+    monkeypatch.setattr(instance, "last_exit_text", read_output)
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Codex", session_id="conv_1"
+    )
+
+    assert "Codex terminal exited before becoming available." in payload["message"]
+    assert "with status" not in payload["message"]
+    assert "Codex startup terminal output:" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+    read_output.assert_not_called()
+
+
+def test_codex_early_exit_diagnostic_failure_preserves_exit_cause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_status("1 2")
+    read_output = Mock(side_effect=ValueError("private diagnostic failure detail"))
+    monkeypatch.setattr(instance, "last_exit_text", read_output)
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Codex", session_id="conv_1"
+    )
+
+    assert "Codex terminal exited with status 2 before becoming available." in payload["message"]
+    assert "Codex startup terminal output:" not in payload["message"]
+    assert "private diagnostic failure detail" not in payload["message"]
+    read_output.assert_called_once_with()
 
 
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
@@ -130,6 +247,9 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
     else:
         assert attributes["exception_cause_type"] == "ReadTimeout"
         assert "ReadTimeout" in str(row["stack_trace"])
+        # The generic startup-defect branch names the direct cause's type as
+        # a structured, non-sensitive fact — never the free-form message.
+        assert "(cause ReadTimeout)" in payload["message"]
 
 
 def test_ensure_response_and_diagnostic_share_error_and_session_ids(
@@ -152,3 +272,6 @@ def test_ensure_response_and_diagnostic_share_error_and_session_ids(
     assert attributes["exception_type"] == "OSError"
     assert "private launch path" not in str(attributes)
     assert "private launch path" not in payload["message"]
+    # This ``OSError`` has no numeric errno (single-arg constructor), so the
+    # structured cause is the class name only.
+    assert "(OSError)" in payload["message"]

@@ -101,6 +101,8 @@ export interface BrowserPaneProps {
   /** Native view key: the session ID or a session-scoped browser tab ID. */
   conversationId: string;
   agentBrowser?: boolean;
+  /** Whether this pane may attach and position its native view. */
+  active?: boolean;
   /** Extra classes for the measuring placeholder wrapper. */
   className?: string;
 }
@@ -109,7 +111,12 @@ export interface BrowserPaneProps {
  * Keeps the agent relay alive for a conversation and, once a native browser
  * view is attached, keeps that view positioned over a measuring placeholder.
  */
-export function BrowserPane({ conversationId, className, agentBrowser = true }: BrowserPaneProps) {
+export function BrowserPane({
+  conversationId,
+  className,
+  agentBrowser = true,
+  active = true,
+}: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
@@ -265,11 +272,11 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
   useEffect(() => {
-    if (!viewActive && designMode) {
+    if ((!viewActive || !active) && designMode) {
       designModeRef.current = false;
       setDesignMode(false);
     }
-  }, [viewActive, designMode]);
+  }, [viewActive, active, designMode]);
 
   // Measure the placeholder and push bounds to the main process. These are
   // renderer CSS pixels; the main process converts to WebContentsView DIPs
@@ -309,7 +316,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   // present; DETACH (not destroy) on unmount so a background agent's page keeps
   // running when the user switches away. A later mount re-attaches.
   useEffect(() => {
-    if (!browserSupported || !viewActive) return;
+    if (!browserSupported || !viewActive || !active) return;
     const bridge = getBridge();
     if (!bridge?.browserSetActive) return;
     void bridge.browserSetActive(conversationId);
@@ -338,7 +345,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
         /* swallow — window may be tearing down */
       }
     };
-  }, [conversationId, browserSupported, viewActive, syncBounds]);
+  }, [conversationId, browserSupported, viewActive, active, syncBounds]);
 
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
@@ -346,7 +353,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   // teardown still schedules the next frame — else the rAF chain dies and the
   // overlay strands.
   useEffect(() => {
-    if (!browserSupported || !viewActive) return;
+    if (!browserSupported || !viewActive || !active) return;
     let rafId = 0;
     const tick = () => {
       try {
@@ -358,13 +365,13 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [browserSupported, viewActive, syncBounds]);
+  }, [browserSupported, viewActive, active, syncBounds]);
 
   // Defense-in-depth against a hung rAF chain: ResizeObserver (size), window
   // resize, and visibilitychange (tab-back, where rAFs were throttled) each
   // recover bounds on the next interaction.
   useEffect(() => {
-    if (!browserSupported || !viewActive || !containerRef.current) return;
+    if (!browserSupported || !viewActive || !active || !containerRef.current) return;
     const el = containerRef.current;
     const ro = new ResizeObserver(() => syncBounds());
     ro.observe(el);
@@ -379,7 +386,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
       window.removeEventListener("resize", onResize);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [browserSupported, viewActive, syncBounds]);
+  }, [browserSupported, viewActive, active, syncBounds]);
 
   // No browser-capable shell (plain web build, or a desktop build too old for
   // the embedded browser): render nothing so there's no empty split pane. The

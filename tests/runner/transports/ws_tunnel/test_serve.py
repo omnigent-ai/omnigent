@@ -2394,4 +2394,240 @@ async def test_serve_tunnel_403_keeps_genuine_no_auth_decline_latched(
             auth_token_factory=_RefusedFactory(),
         )
 
-    assert resets == []
+
+# ── reconnect backoff stability reset ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An abnormal drop after a stable connection resets the reconnect backoff.
+
+    The backoff must track *consecutive* failures, not cumulative ones.  Two
+    early failures escalate it (0.5 → 1.0); a third attempt that connects and
+    stays live past the stability window resets it so the very next reconnect
+    sleeps the initial 0.5 s instead of the accumulated 2.0 s.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    outcomes = iter(["error", "error", "stable_drop", "stop"])
+    sleeps: list[float] = []
+    # Provide controlled start/end times for the connected attempt and fall
+    # back to the real clock for all other callers (e.g. the asyncio loop).
+    _real_monotonic = serve_module.time.monotonic
+    controlled = [0.0, 6.0]
+    controlled_idx = [0]
+
+    def _fake_monotonic() -> float:
+        if controlled_idx[0] < len(controlled):
+            val = controlled[controlled_idx[0]]
+            controlled_idx[0] += 1
+            return val
+        return _real_monotonic()
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        on_connected: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Fail twice, then connect-and-drop past the stability window.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param server_url: Server base URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Optional bearer token.
+        :param tunnel_token: Optional tunnel binding token.
+        :param on_connected: Upgrade-success callback from the loop.
+        :raises ConnectionError: For the first two attempts.
+        :raises ConnectionError: For the third attempt after marking connected.
+        :raises asyncio.CancelledError: On the final attempt to end the test.
+        """
+        del app, tunnel_url, server_url, runner_id, runner_version, auth_token, tunnel_token
+        outcome = next(outcomes)
+        if outcome == "error":
+            raise ConnectionError("outage")
+        if outcome == "stable_drop":
+            if on_connected is not None:
+                on_connected()
+            raise ConnectionError("1006 abrupt close")
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        """Record delays without waiting.
+
+        :param delay: Delay from the reconnect loop.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(serve_module.time, "monotonic", _fake_monotonic)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_stable_drop_reset",
+            runner_version="0.1.0",
+        )
+
+    # Attempt 1 (error): sleep 0.5 (initial), then double → 1.0
+    # Attempt 2 (error): sleep 1.0, then double → 2.0
+    # Attempt 3 (stable_drop): connected for 6 s ≥ 5 s → reset delay to 0.5
+    # Attempt 4 (stop): CancelledError before sleep
+    assert sleeps == [0.5, 1.0, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_escalates_backoff_without_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive failures with no successful upgrade escalate to the cap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    attempt = 0
+    sleeps: list[float] = []
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        """Fail every attempt without connecting.
+
+        :param app: Runner ASGI app.
+        :raises ConnectionError: Always, to drive backoff escalation.
+        :raises asyncio.CancelledError: After enough attempts to reach the cap.
+        """
+        del app
+        nonlocal attempt
+        attempt += 1
+        if attempt > 6:
+            raise asyncio.CancelledError
+        raise ConnectionError("unreachable")
+
+    async def _sleep(delay: float) -> None:
+        """Record delays without waiting.
+
+        :param delay: Delay from the reconnect loop.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_a, **_k: 0.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_pure_escalation",
+            runner_version="0.1.0",
+        )
+
+    # 0.5 → 1.0 → 2.0 → 4.0 → 8.0 → 10.0 (capped), then CancelledError
+    assert sleeps == [0.5, 1.0, 2.0, 4.0, 8.0, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_keeps_escalating_after_brief_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection that drops before the stability window does not reset backoff.
+
+    Flaps (connections that die within a couple of seconds) must not reset the
+    counter; otherwise a server that repeatedly accepts then immediately drops
+    would hold the delay at the initial value forever.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    outcomes = iter(["error", "error", "brief_drop", "stop"])
+    sleeps: list[float] = []
+    # Provide controlled start/end times for the brief-drop attempt and fall
+    # back to the real clock for all other callers (e.g. the asyncio loop).
+    _real_monotonic = serve_module.time.monotonic
+    controlled = [0.0, 2.0]
+    controlled_idx = [0]
+
+    def _fake_monotonic() -> float:
+        if controlled_idx[0] < len(controlled):
+            val = controlled[controlled_idx[0]]
+            controlled_idx[0] += 1
+            return val
+        return _real_monotonic()
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        on_connected: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Fail twice, then connect and drop within the stability window.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param server_url: Server base URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Optional bearer token.
+        :param tunnel_token: Optional tunnel binding token.
+        :param on_connected: Upgrade-success callback from the loop.
+        :raises ConnectionError: For the first two attempts.
+        :raises ConnectionError: For the third attempt (brief: 2 s < 5 s window).
+        :raises asyncio.CancelledError: On the final attempt to end the test.
+        """
+        del app, tunnel_url, server_url, runner_id, runner_version, auth_token, tunnel_token
+        outcome = next(outcomes)
+        if outcome == "error":
+            raise ConnectionError("outage")
+        if outcome == "brief_drop":
+            if on_connected is not None:
+                on_connected()
+            raise ConnectionError("dropped quickly")
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        """Record delays without waiting.
+
+        :param delay: Delay from the reconnect loop.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(serve_module.time, "monotonic", _fake_monotonic)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_brief_drop_no_reset",
+            runner_version="0.1.0",
+        )
+
+    # Attempt 1 (error): sleep 0.5, double → 1.0
+    # Attempt 2 (error): sleep 1.0, double → 2.0
+    # Attempt 3 (brief_drop): connected for 2 s < 5 s; no reset → sleep 2.0
+    # Attempt 4 (stop): CancelledError before sleep
+    assert sleeps == [0.5, 1.0, 2.0]

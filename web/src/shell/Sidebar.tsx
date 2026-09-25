@@ -48,6 +48,7 @@ import {
   MailIcon,
   MailOpenIcon,
   MessageCircleDashedIcon,
+  MessageCirclePlusIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
@@ -61,7 +62,6 @@ import {
   SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
-  SquarePenIcon,
   Trash2Icon,
   UsersIcon,
   WalletIcon,
@@ -1039,7 +1039,7 @@ function SidebarImpl({
               />
             </div>
 
-            <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+            <div className="flex flex-col gap-px px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
               {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -1071,7 +1071,7 @@ function SidebarImpl({
                     onNavClick(e);
                   }}
                 >
-                  <SquarePenIcon
+                  <MessageCirclePlusIcon
                     className={cn(
                       "ui-icon",
                       isNewChatPage
@@ -2232,7 +2232,7 @@ function ConversationList({
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
-            className="flex flex-col gap-4"
+            className="flex flex-col gap-6"
             data-testid="sidebar-conversation-list"
             // Freeze the sort order while the pointer is over the list so rows
             // never move under the cursor. The frozen-keys map is cleared by the
@@ -2759,7 +2759,7 @@ function SectionHeader({
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
             )
-          : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+          : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
     >
       {icon ? (
@@ -2860,6 +2860,7 @@ function SessionFilterMenu({
                 size="icon-xs"
                 aria-label="Filter sessions"
                 data-testid="session-filter"
+                className="text-muted-foreground"
                 onClick={(event) => event.stopPropagation()}
               >
                 <ListFilterIcon className="size-3.5" />
@@ -3044,7 +3045,7 @@ function SectionGroup({
         )}
       </div>
       {afterHeader}
-      {!collapsed && <div className="flex flex-col gap-0">{children}</div>}
+      {!collapsed && <div className="flex flex-col gap-px pt-1">{children}</div>}
     </section>
   );
 }
@@ -3197,7 +3198,7 @@ function ConversationSection({
       )}
       {afterHeader}
       {!isCollapsed && (
-        <>
+        <div className="pt-1">
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
@@ -3215,7 +3216,7 @@ function ConversationSection({
             )
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
+            <ul className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -3233,7 +3234,7 @@ function ConversationSection({
             </ul>
           )}
           {footer}
-        </>
+        </div>
       )}
     </section>
   );
@@ -4813,7 +4814,7 @@ function ProjectFolderActions({
                 onNavigate(e);
               }}
             >
-              <SquarePenIcon className="size-3.5" data-icon-size="14" />
+              <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
             </Link>
           </Button>
         </TooltipTrigger>
@@ -4854,7 +4855,7 @@ function ProjectFolderMenuItems({
             onNavigate(e);
           }}
         >
-          <SquarePenIcon className="size-3.5" />
+          <MessageCirclePlusIcon className="size-3.5" />
           New session
         </Link>
       </C.Item>
