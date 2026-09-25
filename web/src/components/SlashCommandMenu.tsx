@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { CommandIcon, LoaderCircleIcon, WandSparklesIcon } from "lucide-react";
 import type { SkillsStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { COMPOSER_POPOVER_MAX_H, COMPOSER_POPOVER_Z } from "@/pages/chatLayout";
 
 /**
  * Built-in slash commands the web UI recognises directly. Each entry
@@ -221,8 +222,14 @@ export function SlashCommandMenu({
   // with section headers and icon + name + inline description rows. No separate
   // detail card — each row is self-describing.
   return (
-    <div className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu">
-      <div ref={listRef} className="max-h-80 overflow-y-auto">
+    <div
+      className={cn(
+        "absolute bottom-full left-0 mb-2 flex w-[28rem] max-w-[calc(100vw-24px)] flex-col overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu",
+        COMPOSER_POPOVER_Z,
+        COMPOSER_POPOVER_MAX_H,
+      )}
+    >
+      <div ref={listRef} className="min-h-0 overflow-y-auto">
         {builtinRows.length > 0 && sectionHeader("Commands")}
         {builtinRows.map((row) => (
           <MenuRowButton
