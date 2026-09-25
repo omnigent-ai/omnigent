@@ -1131,6 +1131,11 @@ def _build_profile(
                 f"(deny network-outbound (remote unix-socket (path-literal {_quote(canonical)})))"
             )
 
+    for source_path in policy.credential_source_paths or []:
+        quoted = _quote(str(source_path.resolve()))
+        lines.append(f"(deny file-read* file-write* (literal {quoted}))")
+        lines.append(f"(deny network-outbound (remote unix-socket (path-literal {quoted})))")
+
     return "\n".join(lines) + "\n"
 
 

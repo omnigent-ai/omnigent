@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 /**
  * TanStack Query hooks for session permissions CRUD.
  * Wraps the fetch functions in `permissionsApi.ts`.
@@ -14,7 +15,6 @@ import {
   revokePermission,
 } from "@/lib/permissionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
-import { useConversations } from "./useConversations";
 import { useSession } from "./useSession";
 
 function permissionsKey(sessionId: string) {
@@ -81,7 +81,7 @@ export function useRevokePermission(sessionId: string) {
  * `null` permission level (single-user mode) is treated as unrestricted.
  */
 export function useCanEdit(conversationId: string): boolean {
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);

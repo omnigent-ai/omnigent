@@ -328,7 +328,7 @@ def _newest_session_id(base_url: str, agent_name: str) -> str:
     """
     resp = httpx.get(
         f"{base_url}/v1/sessions",
-        params={"agent_name": agent_name, "limit": 1},
+        params={"visibility": "all", "agent_name": agent_name, "limit": 1},
         timeout=5.0,
     )
     resp.raise_for_status()

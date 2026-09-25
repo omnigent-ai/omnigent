@@ -60,6 +60,39 @@ def test_load_skill_returns_content(
     assert result == "Summarize the input concisely."
 
 
+@pytest.mark.posix_only
+@pytest.mark.parametrize("explicit_root", [False, True])
+def test_load_skill_survives_deleted_working_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    skill_no_resources: SkillSpec,
+    tool_ctx: ToolContext,
+    explicit_root: bool,
+) -> None:
+    """A removed runner cwd does not prevent constructing or loading skills."""
+    root = tmp_path / "project"
+    host_skill = root / ".agents" / "skills" / "host-skill"
+    host_skill.mkdir(parents=True)
+    (host_skill / "SKILL.md").write_text(
+        "---\nname: host-skill\ndescription: Host skill\n---\nHost instructions.\n",
+        encoding="utf-8",
+    )
+    removed = tmp_path / "removed"
+    removed.mkdir()
+    with monkeypatch.context() as context:
+        context.chdir(removed)
+        removed.rmdir()
+        tool = LoadSkillTool(
+            [skill_no_resources],
+            agent_root=root if explicit_root else None,
+            skills_filter=["host-skill"],
+        )
+        result = tool.invoke(json.dumps({"name": "summarize"}), tool_ctx)
+
+    assert result == "Summarize the input concisely."
+    assert ("host-skill" in {skill.name for skill in tool.skills}) is explicit_root
+
+
 def test_load_skill_not_found(
     skill_no_resources: SkillSpec,
     tool_ctx: ToolContext,

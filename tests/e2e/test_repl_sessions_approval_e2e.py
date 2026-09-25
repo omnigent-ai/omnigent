@@ -140,8 +140,13 @@ def _spawn_repl_with_args(
 
 
 def _wait_for_prompt_ready(child: Any, timeout: float = 60.0) -> None:
-    """Wait for the REPL prompt (``❯``) to appear."""
-    child.expect("❯", timeout=timeout)
+    """Wait for prompt_toolkit's live input loop to reach idle state.
+
+    The welcome banner can contain a prompt-shaped ``❯`` before the input
+    loop starts reading.  The ready toolbar is emitted by the live loop, so
+    waiting for it prevents the first keystroke from being dropped.
+    """
+    child.expect(r"·\s*ready", timeout=timeout)
 
 
 def _read_pending(child: Any, seconds: float = 0.3) -> str:

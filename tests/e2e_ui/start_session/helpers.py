@@ -5,6 +5,18 @@ from __future__ import annotations
 from playwright.async_api import Page, expect
 
 
+async def stub_empty_host_picker_data(page: Page, host_id: str) -> None:
+    """Answer auxiliary requests for a fake host with no catalog or worktrees."""
+    await page.route(
+        f"**/v1/hosts/{host_id}/harnesses/*/model-options",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+    await page.route(
+        f"**/v1/hosts/{host_id}/worktrees?*",
+        lambda route: route.fulfill(json={"data": []}),
+    )
+
+
 async def open_landing_workspace_picker(page: Page) -> None:
     """Open the second-stage filesystem picker from the workspace recents menu."""
     await page.get_by_test_id("new-chat-landing-workspace-chip").click()
@@ -34,3 +46,6 @@ async def select_landing_agent(page: Page, agent_id: str) -> None:
     if await trigger.get_attribute("aria-expanded") == "true":
         await page.keyboard.press("Escape")
     await expect(trigger).to_have_attribute("aria-expanded", "false")
+    # The closed menu's dismissal layer outlives aria-expanded and swallows the
+    # next pointerdown; wait for it to unmount so a follow-up click lands.
+    await expect(page.locator("[data-radix-popper-content-wrapper]")).to_have_count(0)

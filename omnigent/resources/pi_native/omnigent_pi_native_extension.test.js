@@ -473,8 +473,83 @@ async function testRunningIdleShareResponseId() {
   );
 }
 
+async function testSessionStartupDoesNotCompleteATurn() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "saved-native-session" };
+
+  await h.handlers.session_start({}, ctx);
+
+  assert(
+    "starting an idle or resumed session does not report a completed turn",
+    statusEdges(h.postedEvents).length === 0,
+    JSON.stringify(statusEdges(h.postedEvents)),
+  );
+}
+
+async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "queued-native-session" };
+  const captureFetch = global.fetch;
+  let releaseStartupPatch;
+  const startupPatchPending = new Promise((resolve) => {
+    releaseStartupPatch = resolve;
+  });
+  global.fetch = async (url, opts) => {
+    if (opts.method === "PATCH") await startupPatchPending;
+    return captureFetch(url, opts);
+  };
+  let agentStartPromise;
+  h.pi.sendUserMessage = () => {
+    ctx.isIdle = () => false;
+    agentStartPromise = h.handlers.agent_start({}, ctx);
+  };
+  const payloadPath = path.join(h.inboxDir, "first-prompt.json");
+  fs.writeFileSync(
+    payloadPath,
+    JSON.stringify({ id: "first-prompt", type: "user_message", content: "Run the task" }),
+  );
+  const startup = h.handlers.session_start({}, ctx);
+  try {
+    const deadline = Date.now() + 3000;
+    while (fs.existsSync(payloadPath)) {
+      if (Date.now() > deadline) throw new Error("startup prompt was not consumed by poller");
+      await sleep(20);
+    }
+    if (!agentStartPromise) throw new Error("the queued prompt did not start an agent loop");
+    await agentStartPromise;
+    releaseStartupPatch();
+    await startup;
+
+    const beforeEnd = statusEdges(h.postedEvents);
+    assert(
+      "finishing startup preserves the queued prompt's running turn",
+      beforeEnd.length === 1 && beforeEnd[0].status === "running",
+      JSON.stringify(beforeEnd),
+    );
+
+    await h.handlers.agent_end({ messages: [] }, ctx);
+    const afterEnd = statusEdges(h.postedEvents);
+    assert(
+      "only agent_end completes the queued prompt with the same response_id",
+      afterEnd.length === 2 &&
+        afterEnd[0].status === "running" &&
+        afterEnd[1].status === "idle" &&
+        afterEnd[0].responseId === afterEnd[1].responseId,
+      JSON.stringify(afterEnd),
+    );
+  } finally {
+    releaseStartupPatch();
+    await startup;
+    global.fetch = captureFetch;
+  }
+}
+
 (async () => {
   try {
+    await testSessionStartupDoesNotCompleteATurn();
+    await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();

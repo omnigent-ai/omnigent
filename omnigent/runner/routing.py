@@ -68,6 +68,32 @@ class RoutedRunner:
     client: httpx.AsyncClient
 
 
+def routing_host_id(conv: Conversation, conversation_store: ConversationStore) -> str | None:
+    """
+    Return the host whose replica serves *conv*'s runner tunnel.
+
+    A host-bound session is served by its own ``host_id``. A sub-agent child
+    copies its parent's ``runner_id`` at creation but carries no host binding
+    of its own, so the nearest host-bound ancestor (parent, then root) names
+    the replica holding the shared tunnel. Without this, a child's routing
+    miss reads as a dead runner instead of a re-addressable wrong replica.
+
+    :param conv: Conversation whose runner is being routed.
+    :param conversation_store: Store used to read the ancestor rows.
+    :returns: The routing host id, or ``None`` when no host is bound anywhere
+        in the chain (a hostless local runner).
+    """
+    if conv.host_id is not None or conv.kind != "sub_agent":
+        return conv.host_id
+    for ancestor_id in dict.fromkeys((conv.parent_conversation_id, conv.root_conversation_id)):
+        if ancestor_id is None or ancestor_id == conv.id:
+            continue
+        ancestor = conversation_store.get_conversation(ancestor_id)
+        if ancestor is not None and ancestor.host_id is not None:
+            return ancestor.host_id
+    return None
+
+
 class RunnerRouter:
     """
     Select runners from the live tunnel registry.
@@ -127,9 +153,7 @@ class RunnerRouter:
         if conv is None:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
         if conv.runner_id:
-            return self._routed_pinned_runner(
-                conv.runner_id, harness=harness, host_id=conv.host_id
-            )
+            return self._routed_pinned_runner(conv, conv.runner_id, harness=harness)
         raise OmnigentError(
             f"conversation {conversation_id!r} is not bound to a runner; "
             "resume the session to bind a registered runner",
@@ -172,7 +196,7 @@ class RunnerRouter:
             if session is None:
                 raise OmnigentError(
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                    code=self._runner_absent_code(conv.host_id),
+                    code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
                 )
             return RoutedRunner(
                 runner_id=conv.runner_id,
@@ -208,7 +232,7 @@ class RunnerRouter:
         if session is None:
             raise OmnigentError(
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                code=self._runner_absent_code(conv.host_id),
+                code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
             )
         return RoutedRunner(
             runner_id=conv.runner_id,
@@ -224,6 +248,17 @@ class RunnerRouter:
         :returns: ``True`` when the registry has a live session.
         """
         return self._registry.get(runner_id) is not None
+
+    async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
+        """
+        Wait until *runner_id* has a live tunnel or *timeout_s* elapses.
+
+        :param runner_id: Runner UUID, e.g.
+            ``"runner_0123456789abcdef"``.
+        :param timeout_s: Maximum seconds to wait, e.g. ``30.0``.
+        :returns: ``True`` when the runner is connected when the wait ends.
+        """
+        return await self._registry.wait_for_runner(runner_id, timeout_s=timeout_s) is not None
 
     def runner_owner(self, runner_id: str) -> str | None:
         """
@@ -252,16 +287,17 @@ class RunnerRouter:
             await client.aclose()
 
     def _routed_pinned_runner(
-        self, runner_id: str, *, harness: str, host_id: str | None = None
+        self, conv: Conversation, runner_id: str, *, harness: str
     ) -> RoutedRunner:
         """
         Return a routed runner after validating hard affinity.
 
-        :param runner_id: Pinned runner UUID.
-        :param harness: Harness kind requested by the agent spec.
-        :param host_id: The session's bound host, used to classify an
-            offline runner as wrong-replica vs genuinely gone. See
+        :param conv: Conversation pinned to *runner_id*. Its routing host (see
+            :func:`routing_host_id`) classifies an offline runner as
+            wrong-replica vs genuinely gone on a miss; see
             :meth:`_runner_absent_code`.
+        :param runner_id: Pinned runner UUID (``conv.runner_id``).
+        :param harness: Harness kind requested by the agent spec.
         :returns: Selected runner id and client.
         :raises OmnigentError: If the runner is offline or
             lacks the requested harness capability.
@@ -270,7 +306,7 @@ class RunnerRouter:
         if session is None:
             raise OmnigentError(
                 f"runner {runner_id!r} is offline; resume the session to bind a registered runner",
-                code=self._runner_absent_code(host_id),
+                code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
             )
         if not _runner_supports_harness(session, harness):
             raise OmnigentError(
@@ -303,8 +339,10 @@ class RunnerRouter:
         (send / stream / create). With no store wired, fall back to the
         registry-only check — single-replica setups never misroute.
 
-        :param host_id: The session's bound host id, or ``None`` (hostless
-            local runner — always genuinely offline when its tunnel drops).
+        :param host_id: The session's routing host id (its own ``host_id``, or
+            a sub-agent's host-bound ancestor — see :func:`routing_host_id`),
+            or ``None`` for a hostless local runner, which is always genuinely
+            offline when its tunnel drops.
         :returns: The error code string to raise.
         """
         if (

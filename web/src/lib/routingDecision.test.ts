@@ -19,6 +19,7 @@ describe("routingExtrasFromWire", () => {
         raw_model: "gpt-5-6-sol",
         attempted_override: "databricks-claude-opus-4-8",
         router_source: "databricks-aigw",
+        task_description: "Research auth flows",
       }),
     ).toEqual({
       harness: "codex-native",
@@ -27,6 +28,7 @@ describe("routingExtrasFromWire", () => {
       rawModel: "gpt-5-6-sol",
       attemptedOverride: "databricks-claude-opus-4-8",
       routerSource: "databricks-aigw",
+      taskDescription: "Research auth flows",
     });
   });
 
@@ -47,6 +49,19 @@ describe("routingExtrasFromWire", () => {
     expect(extras).toEqual({});
     expect("routerSource" in extras).toBe(false);
   });
+
+  it.each([
+    ["a blank string", ""],
+    ["null", null],
+    ["a non-string", 7],
+  ] as const)(
+    "drops %s task_description rather than keying it undefined",
+    (_case, taskDescription) => {
+      const extras = routingExtrasFromWire({ task_description: taskDescription });
+      expect(extras).toEqual({});
+      expect("taskDescription" in extras).toBe(false);
+    },
+  );
 
   it("returns nothing for a legacy payload", () => {
     // Rows written before routing grew these fields must not gain keys —
@@ -71,6 +86,14 @@ describe("routingExtras", () => {
 
   it("copies the router source through the camelCase hops", () => {
     expect(routingExtras({ routerSource: "oss-llm" })).toEqual({ routerSource: "oss-llm" });
+  });
+
+  it("copies the task description through the camelCase hops", () => {
+    expect(routingExtras({ taskDescription: "Review session storage" })).toEqual({
+      taskDescription: "Review session storage",
+    });
+    // Unset stays unset, so a legacy row never gains the key.
+    expect("taskDescription" in routingExtras({ harness: "codex" })).toBe(false);
   });
 
   it.each([

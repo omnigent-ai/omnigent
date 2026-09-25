@@ -19,6 +19,7 @@ import contextlib
 import logging
 import os
 import random
+import time
 from collections.abc import Awaitable, Callable
 from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -27,11 +28,12 @@ from starlette.types import ASGIApp, Message, Scope
 from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+    touch_connect_marker,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
@@ -50,17 +52,17 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_body,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.limits import (
-    RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-)
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
 )
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.tunnel_limits import (
+    RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -81,6 +83,9 @@ _ASGIApp: TypeAlias = ASGIApp
 _INITIAL_RECONNECT_DELAY_S = 0.5
 _MAX_RECONNECT_DELAY_S = 10.0
 _RECONNECT_JITTER_FRACTION = 0.5
+# Minimum live duration before a dropped connection resets the backoff counter.
+# Connections that die within 1-2 s are flaps; 5 s is comfortably above that.
+_STABLE_CONNECTION_DURATION_S = 5.0
 _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}
 # Both 401 and 403 are treated as refreshable: the server may return 403
 # (not 401) when a previously-valid token expires while the machine is
@@ -365,17 +370,22 @@ async def serve_tunnel(
     # Consecutive HTTP 401/403 rejections; reset by a successful upgrade.
     http_auth_rejection_streak = 0
     connected_this_attempt = False
+    connect_monotonic: float | None = None
 
     def _mark_connected() -> None:
         nonlocal connected_this_attempt
         nonlocal ever_connected
         nonlocal login_redirect_streak
         nonlocal http_auth_rejection_streak
+        nonlocal connect_monotonic
         record_websocket_connected("runner", reconnect=ever_connected)
+        # Tell the launching host's connect watchdog this runner made it.
+        touch_connect_marker()
         connected_this_attempt = True
         ever_connected = True
         login_redirect_streak = 0
         http_auth_rejection_streak = 0
+        connect_monotonic = time.monotonic()
 
     # Set by the per-connection suspend watcher (in _serve_tunnel_once) when it
     # aborts the live tunnel after a wake from system suspend. Read at the
@@ -394,7 +404,12 @@ async def serve_tunnel(
         except Exception:
             _logger.exception(
                 "on_reconnect callback failed",
-                extra={"session_id": runner_primary_session_id()},
+                extra=debug_event(
+                    "runner_reconnect_callback_failed",
+                    session_id=runner_primary_session_id(),
+                    runner_id=runner_id,
+                    stage="runner_connect",
+                ),
             )
 
     while True:
@@ -440,13 +455,7 @@ async def serve_tunnel(
             redirect_url = _websocket_auth_redirect_url(exc)
             if redirect_url is not None:
                 login_redirect_streak += 1
-                _reset_server_error_decline(auth_token_factory)
-                if _invalidate_auth_token_factory(auth_token_factory):
-                    auth_token = await _handle_refreshable_auth_failure(
-                        auth_token_factory, 302, exc
-                    )
-                    delay_s = _INITIAL_RECONNECT_DELAY_S
-                    continue
+                await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
                 # The websockets library auto-followed a redirect away
                 # from our ws:// endpoint to an http(s):// URL —
                 # typically the Databricks App login page. On a runner
@@ -511,8 +520,7 @@ async def serve_tunnel(
                     # so we don't call the factory directly here. Also clear a
                     # 5xx-latched mint decline: the rejection proves the server
                     # requires auth, so the next refresh must re-mint.
-                    _reset_server_error_decline(auth_token_factory)
-                    _invalidate_auth_token_factory(auth_token_factory)
+                    await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
                     if ever_connected:
                         # Escalate the backoff rather than resetting it: a rejection
@@ -585,6 +593,15 @@ async def serve_tunnel(
             delay_s = _INITIAL_RECONNECT_DELAY_S
             recycle = True
             retry_reason = "resumed from system suspend; reconnecting promptly"
+        if (
+            connected_this_attempt
+            and connect_monotonic is not None
+            and time.monotonic() - connect_monotonic >= _STABLE_CONNECTION_DURATION_S
+        ):
+            # The tunnel was live long enough to consider it a healthy connection.
+            # Reset the backoff so accumulated failures from previous sessions do
+            # not delay a reconnect after an abrupt drop (e.g. close 1006).
+            delay_s = _INITIAL_RECONNECT_DELAY_S
         jittered = delay_s * (
             1.0 + random.uniform(-_RECONNECT_JITTER_FRACTION, _RECONNECT_JITTER_FRACTION)
         )
@@ -601,6 +618,19 @@ async def serve_tunnel(
         # promptly at the base delay instead of doubling toward the cap.
         if not recycle:
             delay_s = min(delay_s * 2, _MAX_RECONNECT_DELAY_S)
+
+
+def _prepare_auth_retry(factory: Callable[[], str | None] | None) -> None:
+    """Reset rejected credentials without making transient failures fatal."""
+    try:
+        _reset_server_error_decline(factory)
+        _invalidate_auth_token_factory(factory)
+    except (ValueError, OSError, ImportError):
+        _logger.warning(
+            "auth token invalidation failed; retrying credential lookup",
+            exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
+        )
 
 
 def _invalidate_auth_token_factory(factory: Callable[[], str | None] | None) -> bool:
@@ -664,48 +694,6 @@ async def _refresh_auth_token(
             extra={"session_id": runner_primary_session_id()},
         )
     return current_token
-
-
-async def _handle_refreshable_auth_failure(
-    factory: Callable[[], str | None] | None,
-    http_status: int,
-    exc: WebSocketException,
-) -> str | None:
-    """
-    Attempt a token refresh after an HTTP 302 login-page redirect.
-
-    If the factory produces a new token, returns it so the caller
-    can retry immediately. If no factory is available or the refresh
-    fails, raises a fatal ``RuntimeError``.
-
-    :param factory: Sync callable returning a fresh token.
-    :param http_status: The HTTP status that triggered this call,
-        e.g. ``302`` for a login-page redirect.
-    :param exc: The original ``WebSocketException``.
-    :returns: A refreshed token string.
-    :raises RuntimeError: When no factory is available or refresh
-        fails.
-    """
-    if factory is not None:
-        try:
-            fresh = await asyncio.to_thread(factory)
-            if fresh is not None:
-                _logger.info(
-                    "auth token refreshed after HTTP %d; retrying",
-                    http_status,
-                    extra={"session_id": runner_primary_session_id()},
-                )
-                return fresh
-        except (ValueError, OSError, ImportError):
-            _logger.warning(
-                "auth token refresh failed after HTTP %d",
-                http_status,
-                exc_info=True,
-                extra={"session_id": runner_primary_session_id()},
-            )
-    raise RuntimeError(
-        f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP {http_status}); check remote server authentication"
-    ) from exc
 
 
 def _websocket_http_status(exc: BaseException) -> int | None:
@@ -872,7 +860,12 @@ async def _serve_tunnel_once(
             "runner %s connected to %s",
             runner_id,
             tunnel_url,
-            extra={"session_id": runner_primary_session_id()},
+            extra=debug_event(
+                "runner_connected",
+                session_id=runner_primary_session_id(),
+                runner_id=runner_id,
+                stage="runner_connect",
+            ),
         )
 
         def _on_resume_from_suspend(gap_s: float) -> None:
@@ -1072,11 +1065,14 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+
     await send_text(
         encode_frame(
             HelloFrame(
                 runner_version=runner_version,
                 frame_protocol_version=1,
+                capabilities=[CAP_FILESYSTEM_ATTACHMENTS],
                 telemetry_opt_out=_tel_opt_out,
                 direct_attach_port=direct_attach_port,
                 direct_attach_token=direct_attach_token,
