@@ -10,16 +10,19 @@ The stall sweep is the backstop. It is keyed on the absence of runner-visible
 edges, never on wall-clock since dispatch, so a healthy long-running child that
 is still emitting activity is not killed. Silence past the budget is only a
 *candidate*: the child is then adjudicated against its authoritative
-server-side status before anything is delivered, so a native-approval wait, a
+server-side summary before anything is delivered, so a native-approval wait, a
 completion the runner merely missed, and an unreadable server are each handled
-without losing a result — and a genuinely-stuck child is interrupted and given
-a *provisional* failure that a real terminal edge can still supersede.
+without losing a result. A genuinely-stuck child is interrupted and given a
+*provisional* failure that a real terminal edge can still supersede — and
+because every verdict and interrupt is awaited, the entry's identity and status
+are re-checked after each await so a result arriving mid-decision is never
+overwritten.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
 
 import pytest
@@ -31,6 +34,9 @@ from tests.runner.helpers import NullServerClient
 PARENT_SESSION_ID = "conv_parent_orchestrator"
 CHILD_SESSION_ID = "conv_child_worker"
 STALL_TIMEOUT_S = 900.0
+
+_JsonObject = dict[str, Any]
+_ListChildren = Callable[[str], Awaitable[list[_JsonObject] | None]]
 
 
 @pytest.fixture
@@ -85,17 +91,47 @@ class _WakeRecordingServerClient(NullServerClient):
         return self._Response()
 
 
-def _verdict(value: str) -> Any:
-    """Return an async ``classify`` stub that always answers *value*."""
+def _summary(
+    *, child_id: str = CHILD_SESSION_ID, status: str = "in_progress", pending: int = 0
+) -> _JsonObject:
+    """Build one child-session summary row as the parent listing returns it."""
+    return {
+        "id": child_id,
+        "current_task_status": status,
+        "pending_elicitations_count": pending,
+    }
 
-    async def _classify(entry: runner_app._SubagentWorkEntry) -> str:
-        del entry
-        return value
 
-    return _classify
+def _listing(*summaries: _JsonObject) -> _ListChildren:
+    """Return a ``list_children`` stub that always answers *summaries*."""
+
+    async def _list(parent_id: str) -> list[_JsonObject]:
+        del parent_id
+        return list(summaries)
+
+    return _list
 
 
-def _recording_interrupt(sink: list[str]) -> Any:
+def _listing_unreadable() -> _ListChildren:
+    """Return a ``list_children`` stub that models a failed server read."""
+
+    async def _list(parent_id: str) -> None:
+        """Model a failed server read by returning ``None`` implicitly."""
+        del parent_id
+
+    return _list
+
+
+def _forbidden_listing() -> _ListChildren:
+    """Return a ``list_children`` stub that must never be called."""
+
+    async def _list(parent_id: str) -> list[_JsonObject]:
+        raise AssertionError("a non-candidate child must not be adjudicated")
+
+    return _list
+
+
+def _recording_interrupt(sink: list[str]) -> Callable[..., Awaitable[None]]:
     """Return an async ``interrupt`` stub that records the child ids it stops."""
 
     async def _interrupt(entry: runner_app._SubagentWorkEntry) -> None:
@@ -135,7 +171,7 @@ async def test_genuinely_stuck_child_is_interrupted_and_provisionally_failed(
         now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        classify=_verdict(runner_app._SILENT_CHILD_STUCK),
+        list_children=_listing(_summary(status="in_progress")),
         interrupt=_recording_interrupt(interrupts),
     )
 
@@ -154,7 +190,7 @@ async def test_genuinely_stuck_child_is_interrupted_and_provisionally_failed(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
             mark_terminal=app.state.mark_subagent_terminal_and_wake,
-            classify=_verdict(runner_app._SILENT_CHILD_STUCK),
+            list_children=_listing(_summary(status="in_progress")),
         )
         == []
     )
@@ -185,14 +221,11 @@ async def test_child_still_emitting_activity_is_not_reaped(
     entry.created_at = entry.created_at - STALL_TIMEOUT_S * 5
     runner_app.note_subagent_activity(CHILD_SESSION_ID)
 
-    async def _classify_must_not_run(entry: runner_app._SubagentWorkEntry) -> str:
-        raise AssertionError("a child still emitting activity must not be adjudicated")
-
     assert (
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S - 1,
             timeout_s=STALL_TIMEOUT_S,
-            classify=_classify_must_not_run,
+            list_children=_forbidden_listing(),
         )
         == []
     )
@@ -209,7 +242,9 @@ async def test_stall_sweep_is_disabled_by_a_non_positive_budget(
 
     assert (
         await runner_app.reap_stalled_subagent_dispatches(
-            now=entry.last_activity_at + 10_000, timeout_s=0
+            now=entry.last_activity_at + 10_000,
+            timeout_s=0,
+            list_children=_forbidden_listing(),
         )
         == []
     )
@@ -233,7 +268,7 @@ async def test_stall_sweep_leaves_launching_children_to_the_launch_sweep(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + 10_000,
             timeout_s=STALL_TIMEOUT_S,
-            classify=_verdict(runner_app._SILENT_CHILD_STUCK),
+            list_children=_forbidden_listing(),
         )
         == []
     )
@@ -244,11 +279,7 @@ async def test_stall_sweep_leaves_launching_children_to_the_launch_sweep(
 async def test_recovered_waiting_child_is_left_to_reconciliation(
     _clean_subagent_registry: None,
 ) -> None:
-    """A restart-recovered ``waiting`` dispatch is the reconcile loop's business.
-
-    Such an entry awaits *remote* completion and has no local edges by
-    construction, so the local-silence sweep must not adjudicate or fail it.
-    """
+    """A restart-recovered ``waiting`` dispatch is the reconcile loop's business."""
     entry = runner_app.register_subagent_work(
         parent_session_id=PARENT_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
@@ -261,7 +292,7 @@ async def test_recovered_waiting_child_is_left_to_reconciliation(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            classify=_verdict(runner_app._SILENT_CHILD_STUCK),
+            list_children=_forbidden_listing(),
         )
         == []
     )
@@ -281,14 +312,11 @@ async def test_child_with_runner_local_pending_approval_is_not_reaped(
         pending_approvals, "has_pending", lambda conv_id: conv_id == CHILD_SESSION_ID
     )
 
-    async def _classify_must_not_run(entry: runner_app._SubagentWorkEntry) -> str:
-        raise AssertionError("a locally-approval-parked child must not be adjudicated")
-
     assert (
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            classify=_classify_must_not_run,
+            list_children=_forbidden_listing(),
         )
         == []
     )
@@ -304,7 +332,7 @@ async def test_child_parked_on_native_approval_is_not_reaped(
     """The server reports a pending native permission prompt: leave the child alone.
 
     Native prompts live only in the server-side elicitation index, so the
-    verdict comes from the authoritative snapshot, not runner-local state.
+    verdict comes from the authoritative summary, not runner-local state.
     """
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
@@ -315,7 +343,7 @@ async def test_child_parked_on_native_approval_is_not_reaped(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            classify=_verdict(runner_app._SILENT_CHILD_APPROVAL),
+            list_children=_listing(_summary(pending=1)),
             interrupt=_recording_interrupt(interrupts),
         )
         == []
@@ -344,7 +372,7 @@ async def test_server_terminal_child_is_demoted_to_waiting_not_failed(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            classify=_verdict(runner_app._SILENT_CHILD_TERMINAL),
+            list_children=_listing(_summary(status="completed")),
         )
         == []
     )
@@ -366,12 +394,130 @@ async def test_unreadable_server_leaves_child_for_the_next_sweep(
         await runner_app.reap_stalled_subagent_dispatches(
             now=entry.last_activity_at + STALL_TIMEOUT_S * 10,
             timeout_s=STALL_TIMEOUT_S,
-            classify=_verdict(runner_app._SILENT_CHILD_UNKNOWN),
+            list_children=_listing_unreadable(),
         )
         == []
     )
     assert entry.status == "running"
     assert not entry.stalled
+    assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_completion_arriving_during_classification_is_not_overwritten(
+    _clean_subagent_registry: None,
+) -> None:
+    """A real completion landing during the verdict await wins the race.
+
+    The child finishes for real while the sweep is reading the server summary;
+    the re-check after that await must abort so the authoritative completion is
+    never overwritten by a provisional failure.
+    """
+    server = _WakeRecordingServerClient()
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    entry = _dispatch_running_child()
+
+    async def _list_then_complete(parent_id: str) -> list[dict[str, Any]]:
+        # The child completes for real mid-classification.
+        app.state.mark_subagent_terminal_and_wake(
+            CHILD_SESSION_ID, status="completed", output="the real answer"
+        )
+        return [_summary(status="in_progress")]  # stale view
+
+    reaped = await runner_app.reap_stalled_subagent_dispatches(
+        now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
+        timeout_s=STALL_TIMEOUT_S,
+        mark_terminal=app.state.mark_subagent_terminal_and_wake,
+        list_children=_list_then_complete,
+    )
+
+    assert reaped == []
+    assert entry.status == "completed"
+    assert not entry.stalled
+    payload = inbox.get_nowait()
+    assert payload["status"] == "completed"
+    assert payload["output"] == "the real answer"
+    assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_that_reports_cancellation_is_not_overwritten(
+    _clean_subagent_registry: None,
+) -> None:
+    """An interrupt that synchronously cancels the child wins the race.
+
+    The interrupt handler delivers an authoritative ``cancelled`` result; the
+    re-check after the interrupt await must abort so the provisional failure
+    never overwrites it.
+    """
+    server = _WakeRecordingServerClient()
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    entry = _dispatch_running_child()
+
+    async def _interrupt_then_cancel(work: runner_app._SubagentWorkEntry) -> None:
+        app.state.mark_subagent_terminal_and_wake(
+            work.child_session_id, status="cancelled", output="stopped by user"
+        )
+
+    reaped = await runner_app.reap_stalled_subagent_dispatches(
+        now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
+        timeout_s=STALL_TIMEOUT_S,
+        mark_terminal=app.state.mark_subagent_terminal_and_wake,
+        list_children=_listing(_summary(status="in_progress")),
+        interrupt=_interrupt_then_cancel,
+    )
+
+    assert reaped == []
+    assert entry.status == "cancelled"
+    assert not entry.stalled
+    payload = inbox.get_nowait()
+    assert payload["status"] == "cancelled"
+    assert payload["output"] == "stopped by user"
+    assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_redispatch_during_await_is_not_failed(
+    _clean_subagent_registry: None,
+) -> None:
+    """A new dispatch replacing the child during the await is left untouched.
+
+    If the original entry is unregistered and a fresh dispatch takes the same
+    child id mid-decision, the sweep must not fail the newcomer by child id.
+    """
+    server = _WakeRecordingServerClient()
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    original = _dispatch_running_child()
+
+    async def _list_then_redispatch(parent_id: str) -> list[dict[str, Any]]:
+        runner_app.unregister_subagent_work(CHILD_SESSION_ID, work_id=original.work_id)
+        replacement = runner_app.register_subagent_work(
+            parent_session_id=PARENT_SESSION_ID,
+            child_session_id=CHILD_SESSION_ID,
+            agent="worker",
+            title="fresh dispatch",
+        )
+        replacement.status = "running"
+        return [_summary(status="in_progress")]
+
+    reaped = await runner_app.reap_stalled_subagent_dispatches(
+        now=original.last_activity_at + STALL_TIMEOUT_S + 1,
+        timeout_s=STALL_TIMEOUT_S,
+        mark_terminal=app.state.mark_subagent_terminal_and_wake,
+        list_children=_list_then_redispatch,
+    )
+
+    assert reaped == []
+    replacement = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    assert replacement is not None and replacement is not original
+    assert replacement.status == "running"
+    assert not replacement.stalled
     assert inbox.empty()
 
 
@@ -399,7 +545,7 @@ async def test_genuine_result_supersedes_provisional_stall_through_drain(
         now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        classify=_verdict(runner_app._SILENT_CHILD_STUCK),
+        list_children=_listing(_summary(status="in_progress")),
     )
     assert entry.stalled
     stall_payload = inbox.get_nowait()
@@ -448,7 +594,7 @@ async def test_provisionally_stalled_task_stays_cancellable(
         now=entry.last_activity_at + STALL_TIMEOUT_S + 1,
         timeout_s=STALL_TIMEOUT_S,
         mark_terminal=app.state.mark_subagent_terminal_and_wake,
-        classify=_verdict(runner_app._SILENT_CHILD_STUCK),
+        list_children=_listing(_summary(status="in_progress")),
     )
     assert entry.status == "failed"
     assert entry.stalled

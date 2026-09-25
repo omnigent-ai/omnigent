@@ -2343,12 +2343,30 @@ def reap_stalled_subagent_launches(
     return reaped
 
 
+def _classify_silent_child_from_summary(summary: _JsonObject | None) -> str:
+    """Map a child's server-side session summary to a silent-child verdict.
+
+    :param summary: The child's ``ChildSessionSummary`` dict from the parent
+        listing, or ``None`` when the child was absent / the read failed.
+    :returns: One of the ``_SILENT_CHILD_*`` verdicts.
+    """
+    if summary is None:
+        return _SILENT_CHILD_UNKNOWN
+    pending = summary.get("pending_elicitations_count")
+    if isinstance(pending, int) and pending > 0:
+        return _SILENT_CHILD_APPROVAL
+    status = summary.get("current_task_status")
+    if isinstance(status, str) and status in _SUBAGENT_TERMINAL_STATUSES:
+        return _SILENT_CHILD_TERMINAL
+    return _SILENT_CHILD_STUCK
+
+
 async def reap_stalled_subagent_dispatches(
     *,
     now: float | None = None,
     timeout_s: float | None = None,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
-    classify: Callable[[_SubagentWorkEntry], Awaitable[str]] | None = None,
+    list_children: Callable[[str], Awaitable[list[_JsonObject] | None]] | None = None,
     interrupt: Callable[[_SubagentWorkEntry], Awaitable[None]] | None = None,
 ) -> list[_SubagentWorkEntry]:
     """
@@ -2362,28 +2380,37 @@ async def reap_stalled_subagent_dispatches(
     wall-clock since dispatch: a child still emitting activity keeps
     refreshing ``last_activity_at`` and is never reaped.
 
-    Silence alone is not proof of a hang, so a candidate that has been silent
-    past the budget is adjudicated against the child's authoritative
-    server-side status (``classify``) before anything is delivered:
+    Silence alone is not proof of a hang, so a candidate silent past the
+    budget is adjudicated against the child's authoritative server-side
+    session summary (``list_children``, fetched once per parent per sweep)
+    before anything is delivered:
 
-    * ``approval`` — parked on a human approval (a native permission prompt
-      lives in the server-side elicitation index, invisible to the runner's
-      local ``pending_approvals``). The ASK has its own day-long budget, so
-      the child is left alone.
-    * ``terminal`` — the server already holds a real terminal result the
-      runner missed. The entry is demoted to ``waiting`` so the reconcile
-      pass delivers that authoritative result, never a synthesized failure.
-    * ``unknown`` — the server was unreadable. Failing on a guess is worse
-      than waiting, so it is retried on the next sweep.
-    * ``stuck`` — genuinely wedged. The still-live child is interrupted
-      (best effort) and the parent gets a PROVISIONAL failure: the entry is
-      marked ``stalled`` so it stays trackable and cancellable, and any
-      genuine terminal edge that still arrives supersedes it and is
-      re-delivered (see :func:`mark_subagent_work_terminal`).
+    * a pending elicitation (native permission prompt, invisible to the
+      runner's local ``pending_approvals``) — left alone; the ASK has its own
+      day-long budget.
+    * a terminal ``current_task_status`` — the server already holds the real
+      result the runner missed; the entry is demoted to ``waiting`` so the
+      reconcile pass delivers it, never a synthesized failure.
+    * unreadable / absent — no proof of a hang, so it is retried next sweep.
+    * otherwise genuinely wedged — the still-live child is interrupted (best
+      effort) and the parent gets a PROVISIONAL failure: the entry is marked
+      ``stalled`` so it stays trackable and cancellable, and any genuine
+      terminal edge that still arrives supersedes it (see
+      :func:`mark_subagent_work_terminal`).
+
+    Because each verdict and interrupt is an ``await``, the child can finish,
+    be cancelled, or be replaced by a new dispatch mid-decision. The entry's
+    identity and ``running`` status are therefore re-checked after every
+    await, and the provisional failure is only ever recorded while the entry
+    is still the same live ``running`` dispatch — so a real terminal result
+    (or a newer dispatch) is never overwritten.
 
     A ``launching`` entry belongs to the launch sweep; a ``waiting`` entry is
     a restart-recovered dispatch the reconcile loop owns; terminal entries
-    are done. None of them are candidates here.
+    are done. A quiet-but-healthy child with no execution heartbeat can still
+    be classified ``stuck`` once past the (default 900s) budget; the interrupt
+    is best effort and the failure provisional, so a genuine late result still
+    supersedes it.
 
     :param now: Clock override for tests, e.g. ``time.time()``.
     :param timeout_s: Budget override for tests; defaults to
@@ -2392,10 +2419,9 @@ async def reap_stalled_subagent_dispatches(
         app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
         also schedules the parent wake POST. Defaults to the inbox-only
         :func:`mark_subagent_work_terminal`.
-    :param classify: Async callback returning the authoritative verdict for a
-        silent child (one of the ``_SILENT_CHILD_*`` values). ``None`` treats
-        every silent candidate as ``stuck`` (used by unit tests that only
-        exercise the timing gate).
+    :param list_children: Async callback returning a parent's child-session
+        summaries (or ``None`` on a failed read). ``None`` treats every silent
+        candidate as ``stuck`` (unit tests that only exercise the timing gate).
     :param interrupt: Async best-effort interrupt for a genuinely-stuck child,
         so a still-live turn is stopped rather than left duplicating work.
     :returns: The entries that were given a provisional stall failure.
@@ -2405,21 +2431,53 @@ async def reap_stalled_subagent_dispatches(
         return []
     deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
     current = time.time() if now is None else now
+
+    def _still_silent_running(entry: _SubagentWorkEntry) -> bool:
+        # Re-read the registry: only act while this exact entry is still the
+        # registered dispatch, still running, still un-warned, and still
+        # silent. Anything else means a real edge or a new dispatch landed
+        # during an await and now owns the child id.
+        return (
+            _subagent_work_by_child.get(entry.child_session_id) is entry
+            and entry.status == "running"
+            and not entry.stalled
+            and current - entry.last_activity_at >= budget
+        )
+
+    candidates = [
+        entry
+        for entry in list(_subagent_work_by_child.values())
+        if entry.status == "running"
+        and not pending_approvals.has_pending(entry.child_session_id)
+        and current - entry.last_activity_at >= budget
+    ]
+    listings: dict[str, list[_JsonObject] | None] = {}
     reaped: list[_SubagentWorkEntry] = []
-    for entry in list(_subagent_work_by_child.values()):
-        if entry.status != "running":
+    for entry in candidates:
+        parent_id = entry.parent_session_id
+        if list_children is not None and parent_id not in listings:
+            listings[parent_id] = await list_children(parent_id)
+        # Re-check after the (possible) listing await before acting on a
+        # verdict computed from now-possibly-stale state.
+        if not _still_silent_running(entry):
             continue
-        if pending_approvals.has_pending(entry.child_session_id):
-            # Runner-local ASK verdict parked here; silence is expected.
-            continue
-        if current - entry.last_activity_at < budget:
-            continue
-        verdict = _SILENT_CHILD_STUCK if classify is None else await classify(entry)
+        if list_children is None:
+            verdict = _SILENT_CHILD_STUCK
+        else:
+            summary = next(
+                (
+                    child
+                    for child in (listings.get(parent_id) or [])
+                    if child.get("id") == entry.child_session_id
+                ),
+                None,
+            )
+            verdict = _classify_silent_child_from_summary(summary)
         if verdict in (_SILENT_CHILD_APPROVAL, _SILENT_CHILD_UNKNOWN):
             continue
         if verdict == _SILENT_CHILD_TERMINAL:
-            # The server has the real result; hand it to the reconcile pass,
-            # which reads the authoritative status and delivers it.
+            # The server has the real result; hand it to the reconcile pass.
+            # No await between the re-check and here, so the transition is safe.
             entry.status = "waiting"
             continue
         _logger.warning(
@@ -2430,8 +2488,14 @@ async def reap_stalled_subagent_dispatches(
         )
         if interrupt is not None:
             await interrupt(entry)
-        # Provisional, not authoritative: keep it trackable so a genuine
-        # terminal edge still supersedes and re-delivers the real result.
+            # The interrupt may have synchronously terminalized the child (a
+            # real ``cancelled`` edge). Re-check before recording anything, so
+            # the provisional failure never overwrites that authoritative result.
+            if not _still_silent_running(entry):
+                continue
+        # Atomic with the re-check above (no await until delivery returns):
+        # keep the entry trackable so a genuine terminal edge still supersedes
+        # and re-delivers the real result.
         entry.stalled = True
         deliver(
             entry.child_session_id,
@@ -2452,7 +2516,7 @@ async def run_subagent_launch_reaper(
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
-    classify_silent: Callable[[_SubagentWorkEntry], Awaitable[str]] | None = None,
+    list_children: Callable[[str], Awaitable[list[_JsonObject] | None]] | None = None,
     interrupt_silent: Callable[[_SubagentWorkEntry], Awaitable[None]] | None = None,
 ) -> None:
     """
@@ -2469,8 +2533,8 @@ async def run_subagent_launch_reaper(
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
     :param reconcile_pending: Refresh recovered work awaiting remote completion.
-    :param classify_silent: Authoritative-verdict callback for a silent child,
-        forwarded to :func:`reap_stalled_subagent_dispatches`.
+    :param list_children: Per-parent child-summary reader, forwarded to
+        :func:`reap_stalled_subagent_dispatches` for authoritative adjudication.
     :param interrupt_silent: Best-effort interrupt for a genuinely-stuck child.
     :returns: None.
     """
@@ -2480,7 +2544,7 @@ async def run_subagent_launch_reaper(
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
             await reap_stalled_subagent_dispatches(
                 mark_terminal=mark_terminal,
-                classify=classify_silent,
+                list_children=list_children,
                 interrupt=interrupt_silent,
             )
             if reconcile_pending is not None:
@@ -5660,34 +5724,24 @@ def create_runner_app(
 
     app.state.reconcile_pending_subagent_results = _reconcile_pending_subagent_results
 
-    async def _classify_silent_subagent_dispatch(entry: _SubagentWorkEntry) -> str:
-        """Adjudicate a silent dispatched child against its server-side status.
+    async def _list_child_session_summaries(parent_id: str) -> list[_JsonObject] | None:
+        """Read a parent's child-session summaries for stall adjudication.
 
-        Reads the parent's child-session summary — the authoritative source
-        for both ``current_task_status`` and ``pending_elicitations_count``
-        (native permission prompts live only in the server-side elicitation
-        index, not the runner's local ``pending_approvals``). Any read failure
-        returns ``unknown`` so the sweep waits rather than failing on a guess.
+        The summary is the authoritative source for both
+        ``current_task_status`` and ``pending_elicitations_count`` (native
+        permission prompts live only in the server-side elicitation index, not
+        the runner's local ``pending_approvals``). Returns ``None`` on any read
+        failure so the sweep waits rather than failing a child on a guess.
 
-        :param entry: The silent dispatched child's work entry.
-        :returns: One of the ``_SILENT_CHILD_*`` verdicts.
+        :param parent_id: Parent session whose children to summarize.
+        :returns: The child summaries, or ``None`` when the read failed.
         """
         try:
-            children = await _list_child_sessions(server_client, entry.parent_session_id)
+            return await _list_child_sessions(server_client, parent_id)
         except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
-            return _SILENT_CHILD_UNKNOWN
-        summary = next((c for c in children if c.get("id") == entry.child_session_id), None)
-        if summary is None:
-            return _SILENT_CHILD_UNKNOWN
-        pending = summary.get("pending_elicitations_count")
-        if isinstance(pending, int) and pending > 0:
-            return _SILENT_CHILD_APPROVAL
-        status = summary.get("current_task_status")
-        if isinstance(status, str) and status in _SUBAGENT_TERMINAL_STATUSES:
-            return _SILENT_CHILD_TERMINAL
-        return _SILENT_CHILD_STUCK
+            return None
 
-    app.state.classify_silent_subagent_dispatch = _classify_silent_subagent_dispatch
+    app.state.list_child_session_summaries = _list_child_session_summaries
 
     async def _interrupt_silent_subagent_dispatch(entry: _SubagentWorkEntry) -> None:
         """Best-effort stop of a wedged-but-live child before failing it.

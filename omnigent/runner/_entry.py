@@ -1596,7 +1596,7 @@ def create_app(
             run_subagent_launch_reaper(
                 mark_terminal=app.state.mark_subagent_terminal_and_wake,
                 reconcile_pending=app.state.reconcile_pending_subagent_results,
-                classify_silent=app.state.classify_silent_subagent_dispatch,
+                list_children=app.state.list_child_session_summaries,
                 interrupt_silent=app.state.interrupt_silent_subagent_dispatch,
             ),
             name="runner-subagent-launch-reaper",
