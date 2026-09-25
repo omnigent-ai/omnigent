@@ -40,6 +40,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -213,23 +214,45 @@ def _create_big_prompt_claude_session(base_url: str) -> str:
     return str(create.json()["session_id"])
 
 
-def _runner_log_tail(runner_home: Path, fallback: Path) -> str:
-    """The spawned runner's own log tail, for failure messages.
+def _launch_failure_details(
+    base_url: str, session_id: str, runner_home: Path, fallback: Path
+) -> str:
+    """The session's structured launch error plus the runner log tail behind it.
 
-    The runner configures process logging under ``$HOME/.omnigent/logs/runner``
-    (its hermetic HOME here), so its stdout capture stays empty; read the real
-    log so an assertion failure carries the actual launch error (e.g. ``tmux
-    launch failed (rc=1): command too long``).
+    The runner's stdout capture stays empty because it logs to a file. A failed
+    launch names that file in the session's ``last_task_error`` message, so read
+    it from there first; fall back to the hermetic ``$HOME`` log dir, then to the
+    stdout capture.
 
+    :param base_url: Spawned server base URL.
+    :param session_id: The session whose terminal launch failed.
     :param runner_home: The runner subprocess's hermetic ``$HOME``.
     :param fallback: The stdout-capture log to fall back to.
-    :returns: Tail of the newest runner log file, or of *fallback*.
+    :returns: Session status, ``last_task_error`` and the newest log tail found.
     """
+    error: dict[str, object] = {}
+    status: object = None
+    try:
+        snapshot = _http.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+    except httpx.HTTPError as exc:
+        status = f"unavailable ({type(exc).__name__})"
+    else:
+        status = snapshot.get("status")
+        error = snapshot.get("last_task_error") or {}
+    candidates: list[Path] = []
+    match = re.search(r"see the runner log for details: (\S+)", str(error.get("message", "")))
+    if match is not None:
+        candidates.append(Path(match.group(1)).expanduser())
     log_dir = runner_home / ".omnigent" / "logs" / "runner"
-    logs = sorted(log_dir.glob("*.log")) if log_dir.exists() else []
-    if logs:
-        return logs[-1].read_text(errors="ignore")[-3000:]
-    return fallback.read_text(errors="ignore")[-3000:] if fallback.exists() else ""
+    if log_dir.exists():
+        candidates.extend(sorted(log_dir.glob("*.log"))[-1:])
+    candidates.append(fallback)
+    tail = ""
+    for path in candidates:
+        if path.is_file():
+            tail = f"{path}\n{path.read_text(errors='ignore')[-3000:]}"
+            break
+    return f"status={status} last_task_error={json.dumps(error)}\nrunner log tail:\n{tail}"
 
 
 def _marker_delivered(argv: list[str]) -> bool:
@@ -404,12 +427,15 @@ def test_big_instructions_claude_terminal_launches(tmp_path: Path) -> None:
 
         # The bug: the terminal never launches at all - tmux rejects the
         # oversized new-session command before the CLI runs.
-        assert argv is not None, (
-            "claude terminal never launched for an agent with "
-            f"{_INSTRUCTIONS_SIZE} chars of instructions - the tmux launch "
-            "command exceeded tmux's per-command cap; runner log tail:\n"
-            f"{_runner_log_tail(runner_home, tmp_path / 'runner.log')}"
-        )
+        if argv is None:
+            details = _launch_failure_details(
+                base_url, session_id, runner_home, tmp_path / "runner.log"
+            )
+            pytest.fail(
+                "claude terminal never launched for an agent with "
+                f"{_INSTRUCTIONS_SIZE} chars of instructions - the tmux launch "
+                f"command exceeded tmux's per-command cap; {details}"
+            )
 
         # Guard the fix's other half: launching by silently dropping the
         # author's instructions would be a different data-loss bug.
