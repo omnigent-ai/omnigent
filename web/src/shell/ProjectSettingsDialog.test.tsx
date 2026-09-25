@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
@@ -33,7 +34,7 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
     name: "hello",
     display_name: "Hello",
     description: null,
-    harness: null,
+    harness: "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -63,7 +64,14 @@ function renderDialog(projectId: string | null = "p_1") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <ProjectSettingsDialog open onOpenChange={vi.fn()} projectId={projectId} projectName="Work" />
+      <TooltipProvider>
+        <ProjectSettingsDialog
+          open
+          onOpenChange={vi.fn()}
+          projectId={projectId}
+          projectName="Work"
+        />
+      </TooltipProvider>
     </QueryClientProvider>,
   );
 }
@@ -309,7 +317,7 @@ describe("ProjectSettingsDialog", () => {
     );
 
     // Open the agent picker dropdown (Radix opens on pointerdown), then the
-    // "Custom agents" submenu where composed agents are listed.
+    // custom-agent "Other..." submenu where composed agents are listed.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     expect(screen.getByTestId("new-chat-landing-agent-ag_1")).toBeInTheDocument();
@@ -344,7 +352,7 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
     await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
 
-    // Switch the default to a plain bundle agent (under "Custom agents") → the
+    // Switch the default to a plain bundle agent (under "Other...") → the
     // model field goes away.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));

@@ -1,5 +1,11 @@
-import { cleanup, renderHook, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  useConversations as useTestConversations,
+  useConversations,
+} from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+import { cleanup, renderHook, act } from "@testing-library/react";
 
 const navigateMock = vi.fn();
 // The hook consumes `useNavigate` from the routing IoC seam (@/lib/routing),
@@ -37,7 +43,6 @@ vi.mock("@/lib/lastAssistantText", () => ({
   fetchLastAssistantText: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { useConversations } from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   getNotificationPermission,
@@ -729,4 +734,17 @@ describe("useIdleNotifications lazy permission request", () => {
     });
     expect(requestPermMock).not.toHaveBeenCalled();
   });
+});
+
+it("cancels a deferred notification when its scope leaves the loaded rows", async () => {
+  setConversations([conv("shared", "running")]);
+  const { rerender } = renderHook(() => useIdleNotifications());
+  setConversations([conv("shared", "idle")]);
+  rerender();
+  setConversations([]);
+  rerender();
+  await settle();
+  expect(showMock).not.toHaveBeenCalled();
+  expect(fetchPreviewMock).not.toHaveBeenCalled();
+  expect(setBadgeMock).toHaveBeenLastCalledWith(0);
 });

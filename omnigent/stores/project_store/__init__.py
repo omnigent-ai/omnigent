@@ -12,10 +12,17 @@ Projects have no ACL of their own (PRD §9): every method is scoped by
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Literal, TypedDict, TypeVar
 
 from omnigent.entities import Project
+
+
+class ProjectOrderPreference(TypedDict):
+    sort_mode: Literal["alphabetical", "manual"]
+    ordered_project_ids: list[str] | None
 
 
 class ProjectStore(ABC):
@@ -120,3 +127,42 @@ class ProjectStore(ABC):
         :returns: ``True`` if removed; ``False`` if not found / not owned.
         """
         ...
+
+    @abstractmethod
+    def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
+        """Read saved IDs; None means alphabetical order."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_order_preference(self, *, user_id: str | None) -> ProjectOrderPreference:
+        """Read the sorting mode and remembered manual order."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def save_order(
+        self, ids: builtins.list[str] | None, *, user_id: str | None
+    ) -> ProjectOrderPreference:
+        """Save owned IDs; unranked projects append. Null retains IDs in alphabetical mode."""
+        raise NotImplementedError
+
+
+_T = TypeVar("_T")
+
+
+def apply_project_order(
+    projects: list[_T],
+    order: list[str] | None,
+    *,
+    project_id: Callable[[_T], str | None],
+    project_name: Callable[[_T], str],
+) -> list[_T]:
+    """Order projects, retaining input order for unranked entries in custom mode."""
+    if order is None:
+        return sorted(projects, key=project_name)
+    by_id = {
+        project_id(project): project for project in projects if project_id(project) is not None
+    }
+    ranked = dict.fromkeys(order)
+    return [by_id[id] for id in ranked if id in by_id] + [
+        project for project in projects if project_id(project) not in ranked
+    ]

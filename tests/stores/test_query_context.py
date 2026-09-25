@@ -141,6 +141,7 @@ def test_file_store_names_each_application_query(db_uri: str) -> None:
         assert query_names == [
             "omnigent.file_store.list_session_files_for_delete",
             "omnigent.file_store.delete_session_files",
+            "omnigent.file_store.count_blob_key_refs",
         ]
 
 
@@ -164,6 +165,7 @@ def test_conversation_store_names_create_and_get_queries(
         )
         assert query_names == [
             "omnigent.conversation_store.select_parent_conversation",
+            "omnigent.conversation_store.select_conversation_metadata_by_id",
             "omnigent.conversation_store.select_duplicate_child_title",
             "omnigent.conversation_store.insert_conversation",
             "omnigent.conversation_store.insert_conversation_metadata",

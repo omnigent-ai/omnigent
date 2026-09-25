@@ -72,6 +72,7 @@ describe("session page request", () => {
     expect(query).toContain("sort_by=updated_at");
     expect(query).toContain("order=desc");
     expect(query).toContain("kind=default");
+    expect(query).toContain("visibility=all");
     expect(query).toContain("include_archived=false");
     expect(query).toContain("after=conv+a");
     expect(query).not.toMatch(/search_query|project|pinned|agent_id/);
@@ -248,7 +249,7 @@ describe("listSessionPage", () => {
 
     expect(result.sessions[0].id).toBe("conv_1");
     expect(authenticatedFetch).toHaveBeenCalledWith(
-      expect.stringContaining("include_archived=false"),
+      "/v1/sessions?limit=25&sort_by=updated_at&order=desc&kind=default&visibility=all&include_archived=false",
       { signal: controller.signal },
     );
   });
@@ -272,6 +273,32 @@ describe("listSessionPage", () => {
 
     await expect(listSessionPage({}, new AbortController().signal)).rejects.toMatchObject({
       code,
+    });
+  });
+
+  it("maps the server's stale_cursor 400 to a distinguishable code", async () => {
+    // `sessions.listAll` restarts its walk on this code, so a plain
+    // `HostError` here would fail the whole call instead.
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "stale_cursor", message: "cursor gone" } }), {
+        status: 400,
+      }),
+    );
+
+    await expect(listSessionPage({}, new AbortController().signal)).rejects.toMatchObject({
+      code: "StaleCursor",
+    });
+  });
+
+  it("leaves an unrelated 400 a plain host error", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "invalid_input", message: "bad" } }), {
+        status: 400,
+      }),
+    );
+
+    await expect(listSessionPage({}, new AbortController().signal)).rejects.toMatchObject({
+      code: "HostError",
     });
   });
 

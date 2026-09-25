@@ -1,10 +1,17 @@
 # Sandbox providers
 
 Omnigent supports running agent hosts in remote sandboxes. Built-in providers
-(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Islo, OpenShell, Boxlite,
-Kubernetes, microsandbox)
+(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
+Boxlite, Kubernetes, microsandbox)
 ship with the core package. Third-party packages can add new providers through
 the `omnigent.sandbox_providers` entrypoint group.
+
+## Harness providers and model lists
+
+Managed Kubernetes and Agent Sandbox deployments can bind individual harnesses
+to different inference gateways and curate the models shown in both composers.
+See [Model and provider selection](../../designs/MANAGED_SANDBOX_MODEL_SELECTION.md)
+for configuration, credential setup, session lifetime, and verification steps.
 
 ## How it works
 
@@ -13,9 +20,9 @@ Each sandbox provider implements the
 Providers that exec into a running sandbox (Modal, Daytona, …) inherit
 `ExecModelHostLauncher`, which provides a default `start_host` that probes
 `$HOME`, creates a workspace, clones a repo, and backgrounds `omnigent host`.
-Providers whose sandbox boots running the host directly (Kubernetes) inherit
-`SandboxHostLauncher` and override `start_host` to build the infrastructure
-manifest instead.
+Providers whose sandbox boots running the host directly (Kubernetes), or whose
+control plane owns host startup (Gensee), inherit `SandboxHostLauncher` and
+override `start_host` without exposing a general-purpose exec transport.
 
 ## Creating a community sandbox provider
 
@@ -141,6 +148,19 @@ The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
 
+Sandbox automations use this same launch path and create a fresh sandbox for
+each run. Existing managed sandbox hosts cannot be pinned as automation targets.
+Their lifecycle follows the server's sandbox configuration, just like ordinary
+chats: automations do not override timeouts or terminate a sandbox when a run
+finishes. Server owners must choose provider lifetime, idle, and cleanup settings
+appropriate for their automation frequency and resource budget.
+
+For `agent_sandbox`, `sandbox.keep_warm_s` controls the runner idle timeout;
+the existing keepalive renews the sandbox deadline while the runner is alive.
+Once renewal stops, expiry suspends compute while retaining storage. Other
+providers have different lifetime behavior, so enabling managed sandboxes alone
+does not guarantee a short shutdown time.
+
 `sandbox.reaper` is deployment-wide: configure it next to `provider` or
 `providers`, never inside one provider entry. One configurable loop covers every
 configured provider and dispatches termination through the provider recorded on
@@ -176,9 +196,11 @@ Providers declare their feature set via a `capabilities` property returning
 ## Network policy for harness bridge servers
 
 Native harnesses (e.g. `claude-native`) run small HTTP servers on the sandbox
-host — a tool relay and an MCP control ingress — that the harness's hook and
-helper subprocesses call back into. **By default these bind loopback only
-(`127.0.0.1`)**, so an ordinary host keeps them off every other interface.
+host that the harness's hook and helper subprocesses call back into: a tool
+relay, which **by default binds loopback only (`127.0.0.1`)** so an ordinary
+host keeps it off every other interface, and an MCP control ingress, which by
+default listens on a Unix domain socket under the harness socket root
+(`/tmp/omnigent-<uid>/mcp-<pid>.sock`) and so needs no network policy at all.
 
 A sandbox whose SSRF hardening denies loopback destinations unconditionally
 (e.g. OpenShell) cannot reach a loopback-advertised relay, which fail-closes
@@ -189,9 +211,10 @@ the in-sandbox hooks can reach them. Their ports come from a small stable pool
 a network policy can allowlist by exact host+port:
 
 - **`OMNIGENT_BRIDGE_BIND_HOST`** selects the posture. Unset (default) is
-  loopback-only. `0.0.0.0` binds all interfaces and advertises the detected
-  routable address (falling back to loopback when the host has none). Any
-  other value pins that exact host for both bind and advertisement.
+  loopback-only for the relay and a Unix socket for the MCP ingress. `0.0.0.0`
+  binds both servers on all interfaces and advertises the detected routable
+  address (falling back to loopback when the host has none). Any other value
+  pins that exact host for both bind and advertisement.
 - **Default port pool:** `28700`–`28715`
   (`omnigent.harnesses.claude_native.bridge.DEFAULT_BRIDGE_PORT_POOL`).
   Several servers coexist per host (the MCP ingress plus one tool relay per
