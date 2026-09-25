@@ -3436,8 +3436,8 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
         async def close(self) -> None:
             closed["app_server"] = True
 
-    async def _raise_no_thread(_client: object) -> str:
-        raise TimeoutError("no thread/started observed")
+    async def _raise_no_thread(_client: object, **_kwargs: object) -> str:
+        raise RuntimeError("event stream ended before thread startup")
 
     # The helper lazily imports wait_for_thread_started from the forwarder
     # module on each call, so patching the module attribute takes effect.
@@ -3534,6 +3534,140 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     # A RuntimeError must never be described as a timeout.
     if not isinstance(exc, TimeoutError):
         assert "timed out" not in recorded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["late_thread", "terminal_exit", "cancelled"])
+async def test_codex_discover_thread_and_forward_recovers_late_thread_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    """A thread-start timeout must not end discovery while the app-server lives.
+
+    The deadline records a turn-facing startup error (in-flight turns fail with
+    an actionable message), but discovery keeps listening: a late
+    ``thread/started`` from a slow cold start clears the error and forwards
+    chat, while a dying TUI or session teardown still releases the listener,
+    the app-server, and the routers.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    thread_id = "019e96aa-2222-7343-8d3b-6f914d60936b"
+    supervised: list[object] = []
+    closed: list[str] = []
+
+    async def _fake_supervise(**kwargs: object) -> None:
+        supervised.append(kwargs["thread_id"])
+
+    class _Client(CodexAppServerClient):
+        async def close(self) -> None:
+            closed.append("client")
+            await super().close()
+
+    class _AppServer:
+        async def close(self) -> None:
+            closed.append("server")
+
+    class _Terminal:
+        diagnostic_id = "codex-tui-under-test"
+        alive = True
+
+        async def is_alive(self) -> bool:
+            return self.alive
+
+        def last_exit_status(self) -> int | None:
+            return None
+
+        def last_exit_text(self) -> str | None:
+            return None
+
+    real_async_client = httpx.AsyncClient
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+
+    session_id = "f59f1c9c0f024f80a621d9a3ba3fbc10"
+    client = _Client(ws_url="ws://127.0.0.1:1")
+    terminal = _Terminal()
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    task = asyncio.create_task(
+        _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            # A real client: the waits run against its live event queue.
+            event_client=client,
+            routing_summary="provider 'test' (model=gpt-test)",
+            terminal_instance=cast(Any, terminal),
+            thread_start_timeout_seconds=0.05,
+        )
+    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 5
+        while codex_native_bridge.read_bridge_startup_error(tmp_path) is None:
+            assert asyncio.get_running_loop().time() < deadline, (
+                "the deadline never recorded a startup error"
+            )
+            await asyncio.sleep(0.01)
+        recorded = codex_native_bridge.read_bridge_startup_error(tmp_path)
+        assert recorded is not None
+        assert "startup timed out" in recorded
+        await asyncio.sleep(0.05)
+        assert not task.done(), (
+            "discovery gave up at the deadline instead of listening for a late thread"
+        )
+        assert closed == []
+
+        if outcome == "late_thread":
+            client._events.put_nowait(
+                {"method": "thread/started", "params": {"thread": {"id": thread_id}}}
+            )
+            await asyncio.wait_for(task, timeout=5)
+        elif outcome == "terminal_exit":
+            terminal.alive = False
+            await asyncio.wait_for(task, timeout=5)
+        else:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert closed == ["client", "server"]
+    state = codex_native_bridge.read_bridge_state(tmp_path)
+    error = codex_native_bridge.read_bridge_startup_error(tmp_path)
+    if outcome == "late_thread":
+        # The late thread supersedes the recorded failure: chat forwards again.
+        assert state is not None
+        assert state.thread_id == thread_id
+        assert supervised == [thread_id]
+        assert error is None
+    else:
+        assert state is None
+        assert supervised == []
+        assert error is not None
+        if outcome == "terminal_exit":
+            # A dead pane ends discovery with the real cause, so the per-turn
+            # self-heal can relaunch a fresh terminal.
+            assert "Codex terminal exited" in error
 
 
 @pytest.mark.asyncio
