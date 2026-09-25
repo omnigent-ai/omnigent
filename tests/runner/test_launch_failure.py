@@ -76,25 +76,26 @@ def test_classifies_missing_binary_by_output() -> None:
 
 # Pane output proving the CLI was present and running: it self-updated and
 # printed a resume hint, then a stray flag hit the shell as command-not-found
-# (exit 127). This is a mid-session crash of a present CLI, not a missing
-# install.
+# (exit 127). A mid-session crash of a present CLI, not a missing install.
 _PRESENT_CLI_CRASH_OUTPUT = "\n".join(
     (
         "● Unknown command: /restart",
         "  Press Ctrl-C again to exit    ✔ Update installed · Restart to update",
         "Resume this session with:",
         "claude --resume be28caff-2e85-47de-8f17-9346d116106b",
-        "zsh:2: command not found: --model",
+        "^Czsh:2: command not found: --model",
     )
 )
 
 
-def test_present_cli_crash_with_stray_flag_is_not_missing_binary() -> None:
-    # The not-found line blames `--model`, not the claude command itself, and
-    # the rest of the pane proves the CLI ran. Must not say "install the
-    # harness" — unclassified is the honest answer.
+# claude-native launches through ``env -u … claude …``, so the runner reports
+# ``env`` as the launched command; a direct launch reports the CLI itself.
+@pytest.mark.parametrize("command", ["env", "claude", "/usr/local/bin/claude"])
+def test_present_cli_crash_with_stray_flag_is_not_missing_binary(command: str) -> None:
+    # The not-found line blames `--model`, not the launched command, and the
+    # rest of the pane proves the CLI ran: unclassified is the honest answer.
     diagnosis = classify_terminal_failure(
-        command="claude",
+        command=command,
         exit_status=127,
         output=_PRESENT_CLI_CRASH_OUTPUT,
     )
@@ -112,46 +113,64 @@ def test_exit_127_with_output_not_blaming_command_is_not_missing_binary() -> Non
     assert diagnosis is None
 
 
-def test_missing_binary_named_without_command_word_still_matches() -> None:
-    # dash prints ``claude: not found`` with no "command"; the line names the
-    # launched command, so it is still a missing install.
+def test_incidental_not_found_text_from_present_cli_is_not_missing_binary() -> None:
+    # "not found" inside the CLI's own message is not the shell blaming the
+    # launched command, whatever the exit code.
     diagnosis = classify_terminal_failure(
         command="claude",
-        exit_status=127,
-        output="sh: 1: claude: not found",
+        exit_status=1,
+        output="Loading settings…\nclaude: config file not found",
     )
-    assert diagnosis is not None
-    assert diagnosis.title == "Agent command not found"
+    assert diagnosis is None
 
 
-def test_missing_binary_matches_full_path_not_found_line() -> None:
+@pytest.mark.parametrize("command", ["zsh", "bash", "sh"])
+def test_shell_launcher_reporting_a_stray_token_is_not_missing_binary(command: str) -> None:
+    # A shell used as the launcher prefixes its own name (``zsh:2:``); only
+    # the blamed token decides, and ``--model`` is not the launched command.
     diagnosis = classify_terminal_failure(
-        command="/usr/local/bin/claude",
-        exit_status=127,
-        output="bash: /usr/local/bin/claude: No such file or directory",
-    )
-    assert diagnosis is not None
-    assert diagnosis.title == "Agent command not found"
-
-
-def test_command_name_matches_on_word_boundary_only() -> None:
-    # ``sh`` must not match inside ``zsh:``; the not-found line is about a
-    # stray flag, not the launched shell.
-    diagnosis = classify_terminal_failure(
-        command="sh",
+        command=command,
         exit_status=127,
         output="zsh:2: command not found: --model",
     )
     assert diagnosis is None
 
 
-def test_unknown_command_keeps_strict_marker_match() -> None:
-    # With no command to cross-check, a shell not-found marker still counts.
-    diagnosis = classify_terminal_failure(
-        command=None,
-        exit_status=None,
-        output="bash: qwen: command not found",
-    )
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        ("claude", "zsh: command not found: claude"),
+        ("claude", "bash: claude: command not found"),
+        ("claude", "bash: line 1: claude: command not found"),
+        ("claude", "sh: 1: claude: not found"),
+        ("/usr/local/bin/claude", "bash: /usr/local/bin/claude: No such file or directory"),
+        ("claude", "zsh: no such file or directory: /opt/claude/bin/claude"),
+        ("claude", "'claude' is not recognized as an internal or external command,"),
+        ("claude", 'exec: "claude": executable file not found in $PATH'),
+        # env blames the CLI it could not exec (GNU quotes the name, BSD does not).
+        ("env", "env: ‘claude’: No such file or directory"),
+        ("env", "env: claude: No such file or directory"),
+    ],
+)
+def test_not_found_line_blaming_launched_command_is_missing_binary(
+    command: str, output: str
+) -> None:
+    diagnosis = classify_terminal_failure(command=command, exit_status=127, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent command not found"
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        (None, "bash: qwen: command not found"),
+        (127, _PRESENT_CLI_CRASH_OUTPUT),
+    ],
+)
+def test_unknown_command_keeps_legacy_broad_match(exit_status: int | None, output: str) -> None:
+    # With no command to cross-check, the historical exit-code / marker rule
+    # still applies rather than guessing which token the shell meant.
+    diagnosis = classify_terminal_failure(command=None, exit_status=exit_status, output=output)
     assert diagnosis is not None
     assert diagnosis.title == "Agent command not found"
 

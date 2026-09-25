@@ -103,43 +103,55 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
-# Looser not-found phrasings (dash prints ``claude: not found`` without the
-# word "command"); safe only when the same line names the launched command.
-_MISSING_COMMAND_HINTS = (
-    "not found",
-    "no such file or directory",
-    "not recognized as an internal or external command",
+# A shell's not-found line names the token it could not resolve, either after
+# the phrase (zsh: ``zsh:2: command not found: --model``) or before it (bash,
+# dash, env, exec: ``bash: line 1: claude: command not found``,
+# ``sh: 1: claude: not found``, ``env: 'claude': No such file or directory``).
+_BLAMED_AFTER_PHRASE = re.compile(r"(?:command not found|no such file or directory):\s*(\S+)")
+_BLAMED_BEFORE_PHRASE = re.compile(
+    r"(\S+):\s*(?:command not found|no such file or directory|not found\b"
+    r"|executable file not found)"
 )
+_BLAMED_NOT_RECOGNIZED = re.compile(r"(\S+) is not recognized as an internal or external command")
+_REPORTER = re.compile(r"^-?([a-z0-9_.+-]+?)(?::\d+)?:")
+_BLAME_QUOTES = "'\"`‘’,;"
+# Launchers whose own not-found line blames the program they failed to exec.
+# claude-native runs ``env -u … claude …``, so an ``env:`` error means the CLI.
+_EXEC_WRAPPERS = frozenset({"env"})
 
 
-def _output_names_missing_command(s: _Signal) -> bool:
-    """True when a not-found line in the output is about the launched command.
-
-    A pane can read ``command not found`` about something else entirely (e.g.
-    a stray ``--model`` line hitting the shell after a present CLI crashed);
-    that proves the CLI ran and must not be read as a missing install.
-    """
-    command = re.compile(rf"\b{re.escape(s.command)}\b") if s.command else None
-    for line in s.output.splitlines():
-        if command is None:
-            # Unknown command: fall back to the strict shell error markers.
-            if any(marker in line for marker in _MISSING_MARKERS):
-                return True
-        elif command.search(line) and any(hint in line for hint in _MISSING_COMMAND_HINTS):
-            return True
-    return False
+def _not_found_blame(line: str) -> tuple[str, str] | None:
+    """Return ``(reporter, blamed token)`` for a shell not-found *line*, else ``None``."""
+    match = (
+        _BLAMED_AFTER_PHRASE.search(line)
+        or _BLAMED_BEFORE_PHRASE.search(line)
+        or _BLAMED_NOT_RECOGNIZED.search(line)
+    )
+    if match is None:
+        return None
+    reporter = _REPORTER.match(line.lstrip())
+    return (reporter.group(1) if reporter else "", match.group(1).strip(_BLAME_QUOTES))
 
 
 def _missing_binary(s: _Signal) -> bool:
-    """Missing install: the not-found error names the command, or a bare 127.
+    """Missing install: a not-found line blames the launched command, or a silent 127.
 
-    Exit 127 alone is ambiguous — the shell also uses it for any unresolved
-    line a *present* CLI leaves behind when it crashes — so when output was
-    captured, claim a missing binary only when that output blames the
-    launched command itself.
+    Exit 127 alone is ambiguous: a present CLI that crashes and leaves a stray
+    token for the shell exits 127 too. With a known command, only a not-found
+    line about that command (or from its exec wrapper) proves a missing install.
     """
-    if _output_names_missing_command(s):
-        return True
+    if not s.command:
+        # Nothing to cross-check against; keep the historical broad rule.
+        return s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS)
+    for line in s.output.splitlines():
+        blame = _not_found_blame(line)
+        if blame is None:
+            continue
+        reporter, token = blame
+        if token == s.command or token.rsplit("/", 1)[-1] == s.command:
+            return True
+        if reporter == s.command and reporter in _EXEC_WRAPPERS:
+            return True
     return s.exit_code == 127 and not s.output.strip()
 
 
