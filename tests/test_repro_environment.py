@@ -262,6 +262,8 @@ def test_stop_during_startup_is_successful_cancellation(tmp_path, monkeypatch):
 
     from dev.repro_env import runtime
 
+    monkeypatch.setattr("dev.repro_env.doctor.launch_observations", lambda root: {})
+
     state = tmp_path / "environment.json"
     state.write_text(
         json.dumps(
@@ -365,6 +367,8 @@ def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monke
 
     from dev.repro_env import runtime
 
+    monkeypatch.setattr("dev.repro_env.doctor.launch_observations", lambda root: {})
+
     state = tmp_path / "environment.json"
     state.write_text(
         json.dumps(
@@ -397,6 +401,8 @@ def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monke
     relays[-1].__exit__.side_effect = TimeoutError("stuck relay")
     monkeypatch.setattr(runtime, "Relay", Mock(side_effect=relays))
     runtime.supervise(tmp_path)
+    model_command = runtime.subprocess.Popen.call_args_list[0].args[0]
+    assert model_command[1:3] == ["-m", "tests.server.integration.mock_llm_server"]
     final = json.loads(state.read_text())
     assert final["status"] == "failed"
     assert "stuck relay" in final["error"]

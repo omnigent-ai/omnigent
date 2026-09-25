@@ -23,6 +23,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
@@ -446,10 +447,8 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-# Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
-# that has produced NO edge at all (no running/waiting/terminal status, no
-# in-flight response) within this window never started — fail it loudly
-# instead of letting the dispatched work wedge forever with no error surfaced.
+# Bound how long a sub-agent dispatch can wait for a start acknowledgment.
+# A timeout reports uncertain launch status, not proof that the process is dead.
 _SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
 _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
 # Interval for the background sweep in the runner entrypoint.
@@ -560,6 +559,11 @@ _SESSION_STREAM_HEARTBEAT_S = 15.0
 # that died on its own leaves the harness parked on a readiness wait, so the
 # wait is bounded and the stream failure is then attributed to the exit.
 _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
+
+# Banner printed by Claude Code on a voluntary /exit or /quit (exit 0).
+# The pane activity from printing it can flip the idle memo back to "running"
+# before the pane dies, making session_was_idle False on a user-initiated quit.
+_CLAUDE_VOLUNTARY_EXIT_MARKER = "Resume this session with:"
 
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
@@ -2232,9 +2236,9 @@ def reap_stalled_subagent_launches(
     """
     Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
 
-    A child that has produced no edge at all (no running/waiting/terminal
-    status) within the budget never started; without this sweep the dispatched
-    work wedges forever and the parent is never told. Each reaped entry is
+    A dispatch with no running/waiting/terminal status acknowledgment can
+    otherwise remain pending forever. Missing acknowledgment does not prove
+    that the child process never started. Each reaped entry is
     marked ``failed`` and its failure is delivered to the parent inbox through
     ``mark_terminal``.
 
@@ -2269,9 +2273,9 @@ def reap_stalled_subagent_launches(
             entry.child_session_id,
             status="failed",
             output=(
-                f"Error: sub-agent {entry.agent!r} title {entry.title!r} produced no "
-                f"activity within {budget:.0f}s of dispatch; the child session never "
-                "started. The dispatched message was not processed."
+                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
+                f"title {entry.title!r} within {budget:.0f}s of dispatch. "
+                "The child may still be running; inspect its session before retrying."
             ),
         )
         reaped.append(entry)
@@ -3521,6 +3525,19 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        # A claude /exit or /quit prints this banner and exits 0. Printing it
+        # can flip the idle memo back to "running" before pane death, so treat
+        # a banner exit as a clean stop rather than a failure.
+        if (
+            event.exit_status == 0
+            and event.terminal_name == "claude"
+            and event.last_output is not None
+            and _CLAUDE_VOLUNTARY_EXIT_MARKER in event.last_output
+        ):
+            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _release_required_terminal_session(event.session_id)
+            return
+
         if event.session_was_idle:
             _release_required_terminal_session(event.session_id)
             return
@@ -3552,6 +3569,7 @@ def create_runner_app(
     from omnigent.runtime.filesystem_registry import (
         FilesystemRegistry,
         create_filesystem_registry,
+        detect_git_root,
     )
 
     if runner_workspace is not None:
@@ -3562,6 +3580,37 @@ def create_runner_app(
     app.state.filesystem_registry = filesystem_registry
 
     _session_fs_registries: dict[str, FilesystemRegistry] = {}
+    # Roots whose search registry stays warm; bounded so distinct generated
+    # workspaces cannot accumulate for the runner's lifetime.
+    _search_fs_registries: OrderedDict[str, FilesystemRegistry] = OrderedDict()
+    _search_registry_cache_size = 8
+
+    def _search_registry_for_root(root: Path) -> FilesystemRegistry:
+        """Registry rooted at *root*, the tree a search actually walks.
+
+        The session registry watches the session's stored workspace (or the
+        runner's), which is not necessarily the environment root the search
+        walks — runner-managed sessions get a generated per-session workspace
+        no other registry covers. The repository root is re-detected on every
+        call, so a repository created or removed mid-session — including one
+        nested at the workspace root inside an outer repository — is read on
+        the next search. The registry is never started: startup
+        runs ``git update-index`` inside the repository, and a repository at a
+        generated workspace root may be the agent's own. Search needs only
+        the anchored index read.
+
+        :param root: Absolute directory the search walks.
+        :returns: A registry whose workspace root is *root*.
+        """
+        key = str(root)
+        registry = _search_fs_registries.get(key)
+        if registry is None or registry.git_root != detect_git_root(root):
+            registry = create_filesystem_registry(watch_path=root)
+            _search_fs_registries[key] = registry
+            while len(_search_fs_registries) > _search_registry_cache_size:
+                _search_fs_registries.popitem(last=False)
+        _search_fs_registries.move_to_end(key)
+        return registry
 
     async def _session_snapshot(session_id: str) -> _SessionSnapshot:
         cached = _session_snapshot_cache.get(session_id)
@@ -4088,12 +4137,12 @@ def create_runner_app(
             # The session's override outranks the spec: resolving from the spec
             # alone made init spawn a harness the turns never ask for, evicting
             # the override's live subprocess (entries are keyed by conversation).
-            harness_name = (
+            raw_harness = (
                 _session_harness_overrides.get(session_id)
                 or spec.executor.config.get("harness")
                 or spec.executor.type
             )
-            harness_name = canonicalize_harness(harness_name) or harness_name
+            harness_name = canonicalize_harness(raw_harness) or raw_harness
 
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
             if _start_verdict is not None:
@@ -4135,14 +4184,21 @@ def create_runner_app(
                 if init_context.envelope is not None
                 else await _fetch_session_model_override(session_id)
             )
-            spawn_env = _build_spawn_env_from_spec(
-                spec,
-                harness_name,
-                workdir=_resolved_spec_workdir(spec_entry),
-                cwd=await _session_runtime_cwd(session_id),
-                session_id=session_id,
-                model_override=_model_override,
-            )
+            try:
+                spawn_env = _build_spawn_env_from_spec(
+                    spec,
+                    raw_harness,
+                    workdir=_resolved_spec_workdir(spec_entry),
+                    cwd=await _session_runtime_cwd(session_id),
+                    session_id=session_id,
+                    model_override=_model_override,
+                )
+            except OmnigentError as exc:
+                # The relay also needs the failure when init precedes the first turn.
+                _publish_turn_status(
+                    session_id, "failed", error={"code": exc.code, "message": str(exc)}
+                )
+                raise
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
                     harness_name,
@@ -4816,6 +4872,9 @@ def create_runner_app(
             )
         has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
         status = "running" if has_turn else "idle"
+        # A failed setup has no active turn; retain its failure in server status probes.
+        if not has_turn and _native_pane_status.get(session_id) == "failed":
+            status = "failed"
         agent_id = _session_agent_ids.get(session_id)
         if agent_id is None:
             # An agent-cache reset retires the binding while the session
@@ -5618,9 +5677,7 @@ def create_runner_app(
         """
         if not harness_override or harness_override == "auto":
             return
-        _session_harness_overrides[conv_id] = (
-            canonicalize_harness(harness_override) or harness_override
-        )
+        _session_harness_overrides[conv_id] = harness_override
 
     def _session_harness_name(conv_id: str) -> str | None:
         # The override wins: a routed session runs the harness the server
@@ -5630,7 +5687,7 @@ def create_runner_app(
         # the parent inbox (the native path that owes it never ran).
         override = _session_harness_overrides.get(conv_id)
         if override is not None:
-            return override
+            return canonicalize_harness(override) or override
         spec = _session_spec_cache.get(conv_id)
         if spec is None:
             return None
@@ -8309,6 +8366,51 @@ def create_runner_app(
             except _json.JSONDecodeError:
                 return {"result": result_str}
 
+        async def _observe_native_file_changes(payload: _JsonObject) -> None:
+            """Record native file-mutating tool calls in the session's registry.
+
+            Non-git workspaces track changes only through
+            ``FilesystemRegistry.record_change``, which the runner's
+            ``sys_os_write``/``sys_os_edit`` dispatch calls; a native harness
+            writing through its own tools (Claude Code's ``Write``/``Edit``)
+            never reaches it, so ``GET .../changes`` stayed empty. The relay's
+            ``/hook/observe-tool`` delivers every PostToolUse event here so
+            those writes are recorded too. Best-effort: failures are logged
+            and never surface to the hook.
+
+            :param payload: Hook JSON object from ``/hook/observe-tool``.
+            """
+            from omnigent.runner.native_file_observer import native_file_changes
+            from omnigent.runner.tool_dispatch import _maybe_signal_changed_files
+
+            try:
+                changes = native_file_changes(payload)
+                if not changes:
+                    return
+                registry = await _resolve_session_fs_registry(_captured_session_id)
+                if registry is None:
+                    return
+                for change in changes:
+                    if change.baseline is not None:
+                        registry.seed_snapshot(
+                            change.path,
+                            change.baseline,
+                            session_id=_captured_session_id,
+                        )
+                    registry.record_change(change.path, change.operation, _captured_session_id)
+                _maybe_signal_changed_files(
+                    _captured_session_id,
+                    _publish_event,
+                    now=asyncio.get_running_loop().time(),
+                )
+            except Exception:  # noqa: BLE001 — best-effort observer; never fail the hook
+                _logger.warning(
+                    "native file-change recording failed for session=%s",
+                    _captured_session_id,
+                    exc_info=True,
+                    extra={"session_id": _captured_session_id},
+                )
+
         try:
             relay: ClaudeNativeToolRelay = start_tool_relay(
                 bridge_dir=bridge_dir,
@@ -8317,6 +8419,7 @@ def create_runner_app(
                 loop=asyncio.get_running_loop(),
                 policy_client=server_client,
                 session_id=session_id,
+                file_change_observer=_observe_native_file_changes,
             )
         except (OSError, RuntimeError):
             _logger.warning(
@@ -8528,6 +8631,7 @@ def create_runner_app(
             _session_spec_cache[conv] = cached_spec_entry
 
         harness_name: str | None = None
+        raw_harness: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
         _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
@@ -8537,13 +8641,13 @@ def create_runner_app(
             # per-event harness_override, so resolving from the body alone
             # dropped a later turn back onto the spec's harness and evicted
             # the override harness mid-session.
-            h = (
+            raw_harness = (
                 _session_harness_overrides.get(conv)
                 or cast(str | None, msg_body.get("harness_override"))
                 or cached_spec.executor.config.get("harness")
                 or cached_spec.executor.type
             )
-            harness_name = canonicalize_harness(h) or h
+            harness_name = canonicalize_harness(raw_harness) or raw_harness
 
         if conv not in _session_histories:
             _session_histories[conv] = (
@@ -8553,7 +8657,7 @@ def create_runner_app(
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
-                cast(str, harness_name),
+                cast(str, raw_harness),
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
@@ -8692,6 +8796,7 @@ def create_runner_app(
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
+                        os_env_schema_only=True,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -11214,8 +11319,13 @@ def create_runner_app(
         exclude: str | None,
         limit: int,
     ) -> JSONResponse:
+        import asyncio as _asyncio
+
         from omnigent.runner.environment_filesystem import (
             CallerProcessFilesystem,
+            _validate_path,
+            index_search,
+            merge_entries,
             split_glob_list,
         )
 
@@ -11226,13 +11336,54 @@ def create_runner_app(
         await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env)
-        entries, truncated = await fs.search_files(
-            q,
-            path=path,
-            include=include_patterns,
-            exclude=exclude_patterns,
-            limit=limit,
+
+        # The budgeted walk is the only source for ignored files (and, until a
+        # ``git status`` has run, untracked ones), so it always runs. Alongside
+        # it, git's index adds every tracked file in one read however large the
+        # repo, and the Changed tab's latest ``git status`` adds untracked files
+        # past the budget. Absolute (browse-anywhere) paths have no registry.
+        walk = _asyncio.ensure_future(
+            fs.search_files(
+                q,
+                path=path,
+                include=include_patterns,
+                exclude=exclude_patterns,
+                limit=limit,
+            )
         )
+        indexed: list[FilesystemEntry] | None = None
+        try:
+            registry = None
+            if not fs._absolute(path):
+                env_root = fs._resolve("")
+                registry = await _resolve_session_fs_registry(session_id)
+                if (
+                    registry is None
+                    or registry.cwd != env_root
+                    or registry.git_root != detect_git_root(env_root)
+                ):
+                    # The session registry watches a different tree than this
+                    # walk covers, or a repository boundary moved since it was
+                    # built; either way its index would answer for the wrong
+                    # files. Consult one rooted where the search actually runs.
+                    registry = _search_registry_for_root(env_root)
+            if registry is not None:
+                indexed = await _asyncio.to_thread(
+                    index_search,
+                    registry,
+                    fs._resolve(path),
+                    _validate_path(path) if path else "",
+                    q,
+                    include=include_patterns,
+                    exclude=exclude_patterns,
+                    limit=limit,
+                )
+        except BaseException:
+            walk.cancel()
+            raise
+        entries, truncated = await walk
+        if indexed is not None:
+            entries = merge_entries(indexed, entries, limit)
         data = [_fs_entry_to_dict(e) for e in entries]
         return JSONResponse(
             status_code=200,
@@ -12267,15 +12418,9 @@ def create_runner_app(
         return JSONResponse(status_code=200, content=payload)
 
     def _fs_entry_to_dict(entry: FilesystemEntry) -> dict[str, object]:
-        return {
-            "id": entry.id,
-            "object": "session.environment.filesystem.entry",
-            "name": entry.name,
-            "path": entry.path,
-            "type": entry.type,
-            "bytes": entry.bytes,
-            "modified_at": entry.modified_at,
-        }
+        from omnigent.runner.environment_filesystem import entry_payload
+
+        return entry_payload(entry)
 
     @app.post("/v1/sessions/{session_id}/resources/environments/{environment_id}/shell")
     async def run_environment_shell(
@@ -13222,11 +13367,13 @@ async def _resolve_harness_config(
                 else:
                     spec = _unwrap_resolved_spec(sub_entry)
                     workdir = _resolved_spec_workdir(sub_entry)
-            harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
-            harness = canonicalize_harness(harness) or harness
+            raw_harness = (
+                harness_override or spec.executor.config.get("harness") or spec.executor.type
+            )
+            harness = canonicalize_harness(raw_harness) or raw_harness
             spawn_env = _build_spawn_env_from_spec(
                 spec,
-                harness,
+                raw_harness,
                 cwd=cwd,
                 workdir=workdir,
                 model_override=model_override,
@@ -13351,7 +13498,7 @@ def _build_spawn_env_from_spec(
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
     :param spec: The resolved agent spec.
-    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
+    :param harness: Requested harness, including any ``acp:<slug>`` selection.
     :param cwd: Runtime working directory for harnesses that need it.
     :param workdir: Bundle workdir, threaded to the builders.
     :param session_id: Session/conversation id, used to hand the harness
@@ -13368,9 +13515,16 @@ def _build_spawn_env_from_spec(
     """
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
-    # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    # the concrete agent's slug must also reach the command and model resolvers.
     requested_harness = harness
     harness = canonicalize_harness(harness) or harness
+    if requested_harness.startswith("acp:"):
+        spec = dataclasses.replace(
+            spec,
+            executor=dataclasses.replace(
+                spec.executor, config={**spec.executor.config, "harness": requested_harness}
+            ),
+        )
     effective_spec = spec
     from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
 

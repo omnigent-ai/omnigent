@@ -90,7 +90,7 @@ function WorkspaceStatusItem({
 }) {
   return (
     <span
-      className="relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] items-center gap-1 px-0.5 text-xs leading-4 font-normal text-muted-foreground md:px-1"
+      className="relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] items-center gap-1 px-1 text-xs leading-4 font-normal text-muted-foreground"
       title={title}
       aria-label={ariaLabel}
       data-testid={testId}

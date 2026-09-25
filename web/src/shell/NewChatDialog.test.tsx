@@ -811,7 +811,7 @@ describe("sandbox repository helpers", () => {
       autoSeededBranch: "",
       expected: {
         repositoryLabel: "alpha",
-        branchLabel: "New",
+        branchLabel: "Choose",
         branchDescription: "Create or select a worktree from main repository branch: main",
       },
     },
@@ -2756,7 +2756,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(readNewChatWorkspaceCache(key)).toMatchObject({
       workspace: "/work/second",
       repositoryLabel: "second",
-      branchLabel: "New",
+      branchLabel: "Choose",
     });
   });
 });
@@ -3237,7 +3237,7 @@ describe("NewChatLandingScreen", () => {
     const landingContent = screen.getByTestId("new-chat-landing").firstElementChild;
 
     expect(screen.getByTestId("new-chat-landing")).toHaveClass("pb-24");
-    expect(landingContent).toHaveClass("max-w-[800px]", "md:px-10");
+    expect(landingContent).toHaveClass("max-w-[800px]", "px-4");
     expect(composerSurface.firstElementChild).toBe(workspaceControls);
     expect(workspaceControls).toContainElement(workspace);
     expect(workspaceControls.nextElementSibling).toBe(composer.closest("form"));
@@ -3254,22 +3254,14 @@ describe("NewChatLandingScreen", () => {
       "border",
       "border-b-0",
       "composer-workspace-surface",
-      "px-2",
+      "px-3",
       "py-1.5",
     );
-    expect(workspace).toHaveClass(
-      "h-6",
-      "gap-1",
-      "rounded-md",
-      "px-0.5",
-      "md:px-1",
-      "text-xs",
-      "leading-4",
-    );
+    expect(workspace).toHaveClass("h-6", "gap-1", "rounded-md", "px-1", "text-xs", "leading-4");
     expect(composer).not.toHaveClass("min-h-[105px]");
     expect(composer).toHaveClass("md:min-h-[105px]");
     expect(composer).toContainElement(actions);
-    expect(actions).toHaveClass("justify-between", "gap-2", "px-2", "pt-1", "pb-2");
+    expect(actions).toHaveClass("justify-between", "gap-2", "px-3", "pt-1", "pb-2");
     expect(actions).not.toHaveClass("mt-2");
     const attach = screen.getByTestId("new-chat-landing-attach");
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
@@ -3311,8 +3303,7 @@ describe("NewChatLandingScreen", () => {
       "gap-1",
       "rounded-md",
       "bg-transparent",
-      "px-0.5",
-      "md:px-1",
+      "px-1",
       "text-xs",
       "leading-4",
     );
@@ -3323,7 +3314,7 @@ describe("NewChatLandingScreen", () => {
       "title",
       "Create or select a worktree from main repository branch: main",
     );
-    expect(worktree).toHaveTextContent("New");
+    expect(worktree).toHaveTextContent("Choose");
     expect(worktree.querySelectorAll("svg")[0]).toHaveClass("size-3.5");
     expect(worktree.querySelectorAll("svg")[1]).toHaveClass("size-3");
     expect(harness).toHaveClass(
@@ -3535,7 +3526,7 @@ describe("NewChatLandingScreen", () => {
       renderLanding();
       const worktree = screen.getByTestId("new-chat-landing-branch-chip");
       await waitFor(() =>
-        expect(worktree).toHaveTextContent(autoSeeded ? /^worktree-[0-9a-f]{8}$/ : /^New$/),
+        expect(worktree).toHaveTextContent(autoSeeded ? /^worktree-[0-9a-f]{8}$/ : /^Choose$/),
       );
       fireEvent.click(worktree);
       if (!autoSeeded) {
@@ -5802,8 +5793,7 @@ describe("NewChatLandingScreen", () => {
       "h-6",
       "max-w-[calc(50%-0.25rem)]",
       "gap-1",
-      "px-0.5",
-      "md:px-1",
+      "px-1",
       "text-xs",
       "leading-4",
     );
@@ -5867,6 +5857,90 @@ describe("NewChatLandingScreen", () => {
       "Codex needs Codex authentication on machine-1 — run codex login on that machine.",
     );
   });
+
+  it.each([
+    {
+      id: "a_codex",
+      name: "codex-native-ui",
+      displayName: "Codex",
+      harness: "codex-native",
+      readiness: "needs-auth",
+      badgeName: "needs auth",
+      warning: "Codex needs Codex authentication on machine-1 — run codex login",
+    },
+    {
+      id: "a_cursor",
+      name: "cursor-native-ui",
+      displayName: "Cursor",
+      harness: "cursor-native",
+      readiness: "binary-missing",
+      badgeName: "binary missing",
+      warning: "Cursor isn't configured on machine-1 — run omni setup",
+    },
+    {
+      id: "a_pi",
+      name: "pi-native-ui",
+      displayName: "Pi",
+      harness: "pi-native",
+      readiness: "version-too-low",
+      badgeName: "outdated",
+      warning: "Pi has an outdated CLI on machine-1 — run omni setup",
+    },
+    {
+      id: "a_polly",
+      name: "polly",
+      displayName: "Polly",
+      harness: "codex",
+      readiness: "needs-auth",
+      badgeName: "needs auth",
+      warning: "Polly needs Codex authentication on machine-1 — run codex login",
+    },
+  ])(
+    "renders the $readiness availability warning for $displayName",
+    async ({ id, name, displayName, harness, readiness, badgeName, warning }) => {
+      mockAgents([
+        DEFAULT_LANDING_AGENTS[0],
+        {
+          id,
+          name,
+          display_name: displayName,
+          description: null,
+          harness,
+          skills: [],
+        },
+      ]);
+      renderLanding();
+      selectUnconfiguredAgent(id);
+      mockHosts([
+        {
+          ...host("online"),
+          configured_harnesses: {
+            "claude-native": true,
+            "codex-native": true,
+            [harness]: readiness,
+          },
+        } as Host,
+      ]);
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Harness readiness changed" },
+      });
+
+      const notice = screen.getByTestId("new-chat-landing-harness-warning");
+      expect(notice).toHaveTextContent(warning);
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      if (screen.queryByTestId(`new-chat-landing-agent-${id}`) == null) {
+        fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+      }
+      const row = screen.getByTestId(`new-chat-landing-agent-${id}`);
+      expect(row).toHaveAttribute("aria-disabled", "true");
+      const badge = within(row).getByTestId(`new-chat-landing-agent-warning-${id}`);
+      expect(badge).toBeVisible();
+      expect(badge).toHaveAccessibleName(badgeName);
+      fireEvent.focus(badge);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(warning);
+    },
+  );
 
   it("disables broken harness rows and explains the actionable failure", async () => {
     mockHosts([
@@ -7314,6 +7388,48 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByText("Loading skills…")).not.toBeInTheDocument();
   });
 
+  it("keeps Create disabled with the loading reason when the composer blurs mid-discovery", async () => {
+    // A lone partial token typed while skills are still loading keeps
+    // Create blocked even after the textarea loses focus — the pending
+    // completion is a property of the draft, not of the open menu.
+    mockSkills({ skillsStatus: "loading" });
+    renderLanding();
+    typeMessage("/review");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+
+    fireEvent.blur(screen.getByTestId("new-chat-landing-input"));
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByTestId("new-chat-landing-submit-error-tooltip");
+    expect(tooltip).toHaveTextContent("Loading skills…");
+  });
+
+  it("keeps Start disabled for a restored slash draft that never takes focus", async () => {
+    // The stashed draft rides back onto a remounted landing; with discovery
+    // still in flight its partial command token must keep Start blocked even
+    // though this mount never focused the textarea (no autofocus on touch).
+    const restoreViewport = forceMobileViewport();
+    try {
+      mockSkills({ skillsStatus: "loading" });
+      const first = renderLanding();
+      typeMessage("/rev");
+      first.unmount();
+
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("/rev");
+      expect(screen.getByTestId("new-chat-landing-input")).not.toHaveFocus();
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      expect(submit).toBeDisabled();
+      fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+      const tooltip = await screen.findByTestId("new-chat-landing-submit-error-tooltip");
+      expect(tooltip).toHaveTextContent("Loading skills…");
+    } finally {
+      restoreViewport();
+    }
+  });
+
   it("hides the cached host catalog when the host disconnects", () => {
     mockAgents([skilledAgent()]);
     mockSkills({ skills: [{ name: "host-only", description: "Host-only skill" }] });
@@ -7460,6 +7576,25 @@ describe("NewChatLandingScreen skills menu", () => {
     renderLanding();
     typeMessage("/");
     expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
+  });
+
+  it("uses the dollar prefix for Codex native skills", () => {
+    mockAgents([
+      {
+        id: "codex-native",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [{ name: "allowed", description: "Run an allowed workflow" }],
+      },
+    ]);
+    renderLanding();
+    typeMessage("/allow");
+
+    expect(screen.getByTestId("slash-menu-item-allowed")).toHaveTextContent("$allowed");
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Tab" });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("$allowed ");
   });
 });
 
@@ -7723,6 +7858,102 @@ describe("NewChatLandingScreen attachments", () => {
     });
 
     expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
+
+  it("hands the attachments back when a create the user walked away from is rejected", async () => {
+    // A submitted draft is dropped on unmount — it belongs to the session
+    // being created. But a rejected create makes no session, so the files
+    // are the user's again and must ride the stashed draft back onto the
+    // remounted landing instead of vanishing with the failed attempt.
+    let rejectCreate: (() => void) | null = null;
+    authenticatedFetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          rejectCreate = () =>
+            resolve({
+              ok: false,
+              status: 400,
+              json: async () => ({ detail: "workspace already in use" }),
+              text: async () => "workspace already in use",
+            } as unknown as Response);
+        }),
+    );
+    const first = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rebuild the parser" },
+    });
+    const file = new File(["hello"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(rejectCreate).not.toBeNull());
+
+    // The user gives up waiting and opens another session, then the create
+    // comes back rejected.
+    first.unmount();
+    await act(async () => {
+      rejectCreate!();
+    });
+
+    renderLanding();
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "rebuild the parser",
+    );
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+  });
+
+  it("keeps the rejection notice verbatim when a create is rejected on screen", async () => {
+    // A mixed batch leaves a valid chip plus a rejection notice. A wholesale
+    // re-validating restore of the returned draft would clear the notice
+    // (every restored file is valid); the verbatim restore keeps both
+    // exactly as the user left them.
+    let rejectCreate: (() => void) | null = null;
+    authenticatedFetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          rejectCreate = () =>
+            resolve({
+              ok: false,
+              status: 400,
+              json: async () => ({ detail: "workspace already in use" }),
+              text: async () => "workspace already in use",
+            } as unknown as Response);
+        }),
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rebuild the parser" },
+    });
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [ok] },
+    });
+    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [clip] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(rejectCreate).not.toBeNull());
+
+    // The user is still on the landing when the create comes back rejected.
+    await act(async () => {
+      rejectCreate!();
+    });
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-error")).toBeTruthy());
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
   });
 });
 
@@ -8298,7 +8529,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 // Mobile drill-in navigation
 //
 // Touch devices can't hover, so the desktop submenu flyouts ("More" for
-// needs-setup harnesses, "Custom agents") are unreachable there. Below the
+// needs-setup harnesses, custom-agent "Other...") are unreachable there. Below the
 // `md` breakpoint the picker swaps its contents in place: tapping the row
 // drills into that group's page with a Back row. jsdom's matchMedia mock
 // reports non-mobile, so these tests force the `max-width` query to match.
@@ -8409,8 +8640,8 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
   });
 
-  it("drills into the Custom agents page in place and returns via Back", () => {
-    // A custom (non-builtin) agent lands in the Custom agents group.
+  it("drills into the custom-agent Other page in place and returns via Back", () => {
+    // A custom (non-builtin) agent lands in the custom-agent group.
     mockAgents([
       {
         id: "a1",
@@ -8431,7 +8662,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     ]);
     renderLanding();
     openPicker();
-    // The custom agent isn't inline — it's behind the "Custom agents" row.
+    // The custom agent isn't inline — it's behind the "Other..." row.
     expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
     // Tapping drills into the page in place (Claude Code inline row is gone).
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));

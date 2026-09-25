@@ -64,13 +64,31 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
     managedServers,
     installed,
     mockInstall: true,
-    onConnect: async (url, force) => {
-      log("onConnect", { url, force });
+    onConnect: async (url) => {
+      log("onConnect", url);
       return {};
     },
     onStartLocal: async () => {
       log("onStartLocal");
       return { ok: true };
+    },
+    onInstallCli: async () => {
+      log("onInstallCli");
+      return { ok: true };
+    },
+    onInstallLog: (cb) => {
+      const lines = [
+        "Installing uv (required by the Omnigent installer)…",
+        "Installing the Omnigent CLI…",
+        "uv tool install --force --python 3.12 omnigent",
+        "Installed omnigent",
+      ];
+      let i = 0;
+      const timer = setInterval(() => {
+        if (i < lines.length) cb(lines[i++]);
+        else clearInterval(timer);
+      }, 250);
+      return () => clearInterval(timer);
     },
     onRemoveServer: (url) => log("onRemoveServer", url),
     onCopy: (text) => log("onCopy", text),

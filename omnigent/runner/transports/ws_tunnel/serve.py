@@ -19,6 +19,7 @@ import contextlib
 import logging
 import os
 import random
+import time
 from collections.abc import Awaitable, Callable
 from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -32,6 +33,7 @@ from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+    touch_connect_marker,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
@@ -81,6 +83,9 @@ _ASGIApp: TypeAlias = ASGIApp
 _INITIAL_RECONNECT_DELAY_S = 0.5
 _MAX_RECONNECT_DELAY_S = 10.0
 _RECONNECT_JITTER_FRACTION = 0.5
+# Minimum live duration before a dropped connection resets the backoff counter.
+# Connections that die within 1-2 s are flaps; 5 s is comfortably above that.
+_STABLE_CONNECTION_DURATION_S = 5.0
 _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}
 # Both 401 and 403 are treated as refreshable: the server may return 403
 # (not 401) when a previously-valid token expires while the machine is
@@ -365,17 +370,22 @@ async def serve_tunnel(
     # Consecutive HTTP 401/403 rejections; reset by a successful upgrade.
     http_auth_rejection_streak = 0
     connected_this_attempt = False
+    connect_monotonic: float | None = None
 
     def _mark_connected() -> None:
         nonlocal connected_this_attempt
         nonlocal ever_connected
         nonlocal login_redirect_streak
         nonlocal http_auth_rejection_streak
+        nonlocal connect_monotonic
         record_websocket_connected("runner", reconnect=ever_connected)
+        # Tell the launching host's connect watchdog this runner made it.
+        touch_connect_marker()
         connected_this_attempt = True
         ever_connected = True
         login_redirect_streak = 0
         http_auth_rejection_streak = 0
+        connect_monotonic = time.monotonic()
 
     # Set by the per-connection suspend watcher (in _serve_tunnel_once) when it
     # aborts the live tunnel after a wake from system suspend. Read at the
@@ -583,6 +593,15 @@ async def serve_tunnel(
             delay_s = _INITIAL_RECONNECT_DELAY_S
             recycle = True
             retry_reason = "resumed from system suspend; reconnecting promptly"
+        if (
+            connected_this_attempt
+            and connect_monotonic is not None
+            and time.monotonic() - connect_monotonic >= _STABLE_CONNECTION_DURATION_S
+        ):
+            # The tunnel was live long enough to consider it a healthy connection.
+            # Reset the backoff so accumulated failures from previous sessions do
+            # not delay a reconnect after an abrupt drop (e.g. close 1006).
+            delay_s = _INITIAL_RECONNECT_DELAY_S
         jittered = delay_s * (
             1.0 + random.uniform(-_RECONNECT_JITTER_FRACTION, _RECONNECT_JITTER_FRACTION)
         )
