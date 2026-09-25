@@ -4302,6 +4302,14 @@ export function readOnlyReasonForSessionLabels(
   if (wrapper === "claude-code-native-ui-subagent") {
     return "Claude Code sub-agents are read-only";
   }
+  // Every native-UI sub-agent mirror (codex, opencode, antigravity, devin, pi)
+  // runs inside its parent session's runtime, not its own runner. A message
+  // typed here has no runner of its own to reach — the parent drives it — so
+  // the send dead-ends (RUNNER_UNAVAILABLE). Make the whole mirror class
+  // read-only, matching the Claude mirror above.
+  if (typeof wrapper === "string" && wrapper.endsWith("-native-ui-subagent")) {
+    return "This sub-agent is driven by its parent session and is read-only";
+  }
   return null;
 }
 

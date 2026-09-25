@@ -142,6 +142,30 @@ describe("Composer structural read-only reasons", () => {
     ).toBe("This sub-agent session is closed");
   });
 
+  it("marks a live codex native sub-agent mirror read-only", () => {
+    // A non-closed codex mirror runs inside its parent's runtime; sending here
+    // has no runner to reach, so the composer must be read-only.
+    expect(
+      readOnlyReasonForSessionLabels(
+        { labels: { "omnigent.wrapper": "codex-native-ui-subagent" } },
+        null,
+      ),
+    ).toBe("This sub-agent is driven by its parent session and is read-only");
+  });
+
+  it("marks the other native-UI sub-agent mirrors read-only too", () => {
+    for (const wrapper of [
+      "opencode-native-ui-subagent",
+      "antigravity-native-ui-subagent",
+      "devin-native-ui-subagent",
+      "pi-native-ui-subagent",
+    ]) {
+      expect(
+        readOnlyReasonForSessionLabels({ labels: { "omnigent.wrapper": wrapper } }, null),
+      ).toBe("This sub-agent is driven by its parent session and is read-only");
+    }
+  });
+
   it("returns null for editable sessions without structural labels", () => {
     expect(readOnlyReasonForSessionLabels({ labels: {} }, { labels: {} })).toBeNull();
   });
