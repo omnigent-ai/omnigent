@@ -247,21 +247,30 @@ def test_big_instructions_session_boots_terminal(
     expect(segment).to_be_enabled(timeout=int(_TERMINAL_READY_TIMEOUT_S * 1000))
     segment.click()
 
+    # Poll the attach and the session status together so a failing build
+    # reports its structured cause instead of timing out on a missing pane.
     connected = page.locator('[data-testid="terminal-view"][data-state="connected"]')
-    while time.monotonic() < deadline and connected.count() == 0:
+    attached = False
+    while time.monotonic() < deadline:
+        if connected.count() > 0:
+            attached = True
+            break
         snapshot = _session_snapshot(base_url, session_id)
         if snapshot.get("status") == "failed":
             pytest.fail(_launch_failure_report(snapshot, _show_chat_failure(page)))
         page.wait_for_timeout(int(_POLL_S * 1000))
 
-    if connected.count() == 0:
+    if not attached:
         pytest.fail(
             _launch_failure_report(
                 _session_snapshot(base_url, session_id),
                 f"Terminal view did not attach within {_TERMINAL_READY_TIMEOUT_S:.0f}s",
             )
         )
+    # The pane's connection state can change right after the first attach;
+    # settle on a connected pane so a recording ends on the live terminal.
+    terminal = page.locator('[data-testid="terminal-view"]').last
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
     snapshot = _session_snapshot(base_url, session_id)
     assert snapshot["status"] != "failed", snapshot.get("last_task_error")
-    # Linger so a recording of the fixed run ends on the attached terminal.
     page.wait_for_timeout(2_000)
