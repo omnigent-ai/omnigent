@@ -353,12 +353,14 @@ class ExecutorSpec:
         base_url). Carried through so the omnigent spec translator
         can forward it into the child :class:`ExecutorSpec` without
         re-reading raw YAML.
+    :param context_files: Pi context-file discovery override. None uses Pi's default.
     """
 
     model: str | None = None
     harness: str | None = None
     profile: str | None = None
     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
+    context_files: bool | None = None
 
 
 # ---------------------------------------------------------------------------

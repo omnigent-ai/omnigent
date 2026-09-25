@@ -256,6 +256,17 @@ def test_resolve_description_does_not_endorse_unaudited_tests() -> None:
     assert "a test that PASSES there means main has since fixed the bug" not in description
 
 
+def test_resolve_publish_requests_inline_eli5_without_placeholder_sections() -> None:
+    skills = {skill.name: skill.content for skill in load(_RESOLVE_AGENT).skills}
+    summary = (
+        skills["resolve-publish"].split("- In **Summary**", 1)[1].split("- In **Test Plan**", 1)[0]
+    )
+
+    assert "start non-trivial changes with a 1–2 sentence ELI5" in summary
+    assert "inline rather than in a separate section" in summary
+    assert "placeholder diagrams or empty sections" in summary
+
+
 def test_written_evidence_is_limited_to_results_without_visible_interaction() -> None:
     normalized = _normalized_resolve_instructions()
 

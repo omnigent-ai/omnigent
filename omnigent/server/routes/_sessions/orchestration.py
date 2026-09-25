@@ -9226,10 +9226,6 @@ async def _create_session_from_existing_agent(
     inference_snapshot = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
-        from omnigent.models.model_catalog import (
-            _acp_launch_model,
-            validate_acp_model,
-        )
         from omnigent.runtime.workflow import _find_spec_by_name
 
         try:
@@ -9287,10 +9283,9 @@ async def _create_session_from_existing_agent(
             and not configured_snapshot(inference_snapshot)
             and canonicalize_harness(harness_override or _spec_harness(selection_spec)) == "acp"
         ):
-            default_model = await asyncio.to_thread(_acp_launch_model, selection_spec)
-            await asyncio.to_thread(validate_acp_model, selection_spec, default_model)
-            if model_override is not None:
-                await asyncio.to_thread(validate_acp_model, selection_spec, model_override)
+            await asyncio.to_thread(
+                _validate_acp_spec_models, selection_spec, model_override, harness_override
+            )
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
@@ -9459,7 +9454,19 @@ async def _create_session_from_existing_agent(
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
     )
+    from omnigent.stores.conversation_store.overrides import encode_session_overrides
+
     try:
+        # Include spec-seeded defaults before create; overflow must not leave a session.
+        encode_session_overrides(
+            {
+                "reasoning_effort": reasoning_effort,
+                "model_override": model_override,
+                "cost_control_mode_override": cost_control_mode_override,
+                "subagent_routing_override": subagent_routing_override,
+                "harness_override": harness_override,
+            }
+        )
         conv = conversation_store.create_conversation(
             agent_id=agent.id,
             title=body.title,
@@ -9855,9 +9862,7 @@ def _create_session_from_bundle(
     from omnigent.server.routes.sandbox_inference import configured_snapshot
 
     if _spec_harness(spec) == "acp" and not configured_snapshot(inference_snapshot):
-        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
-
-        validate_acp_model(spec, _acp_launch_model(spec))
+        _validate_acp_spec_models(spec)
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
         _, seeded_effort = validate_session_model_metadata(
@@ -10561,6 +10566,35 @@ def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | N
     return canonicalize_harness(_resolve_harness(conv, agent_store=agent_store)) == "acp"
 
 
+def _validate_acp_spec_models(
+    spec: AgentSpec, model_override: str | None = None, harness_override: str | None = None
+) -> None:
+    """Validate portable model choices; the runner validates its local ACP default.
+
+    :param spec: Resolved agent or sub-agent spec.
+    :param model_override: Explicit session model, if supplied.
+    :param harness_override: Session harness selection, if supplied.
+    """
+    from dataclasses import replace
+
+    from omnigent.models.model_catalog import validate_acp_model
+
+    if harness_override:
+        spec = replace(
+            spec,
+            executor=replace(
+                spec.executor, config={**spec.executor.config, "harness": harness_override}
+            ),
+        )
+    default_model = spec.executor.model
+    if not default_model:
+        embedded = spec.executor.config.get("acp_agent")
+        if isinstance(embedded, dict):
+            default_model = embedded.get("model")
+    validate_acp_model(spec, default_model)
+    validate_acp_model(spec, model_override)
+
+
 def _validate_session_model_selection(
     conv: Conversation, model: str | None, agent_store: AgentStore
 ) -> None:
@@ -10572,7 +10606,6 @@ def _validate_session_model_selection(
     :raises OmnigentError: If the harness cannot be resolved or its model policy rejects the pick.
     """
     from omnigent.harness_aliases import canonicalize_harness
-    from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
     from omnigent.runtime.workflow import _find_spec_by_name
 
     harness = canonicalize_harness(conv.harness_override)
@@ -10610,8 +10643,7 @@ def _validate_session_model_selection(
             code=ErrorCode.INVALID_INPUT,
         )
     if harness == "acp":
-        validate_acp_model(selection_spec, _acp_launch_model(selection_spec))
-        validate_acp_model(selection_spec, model)
+        _validate_acp_spec_models(selection_spec, model, conv.harness_override)
 
 
 async def _load_acp_model_options(

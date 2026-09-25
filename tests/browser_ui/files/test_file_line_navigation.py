@@ -130,6 +130,9 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
         },
     )
     browser_contract.json(f"{api}/child_sessions", empty)
+    browser_contract.json(f"{api}/policies", empty)
+    browser_contract.json("/v1/policy-registry", empty)
+    browser_contract.json(f"{api}/owner", {"owner": None})
     browser_contract.response(f"{api}/read-state", method="PUT")
     browser_contract.json(
         f"{api}/resources/environments/default", {"metadata": {"root": "/workspace"}}
@@ -385,7 +388,11 @@ def test_source_citation_centers_last_loaded_line(
       )[0].textContent.replace(/\u00a0/g, ' ');
     }""")
     page.get_by_role("button", name="Collapse right panel").click()
-    expect(viewer).to_have_count(0)
+    # The rail stays mounted at width 0 so its 300ms exit can finish without
+    # remounting the editor. Pin the closed rail state instead of expecting
+    # the viewer subtree to disappear.
+    rail = page.locator('aside[aria-label="Workspace"]')
+    expect(rail).to_have_attribute("data-state", "closed")
     page.get_by_role("button", name="Expand right panel").click()
     page.wait_for_function(
         _CENTERED_LINE, arg={"text": centered_text, "diff": False}, timeout=30_000

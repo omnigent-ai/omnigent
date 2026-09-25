@@ -1928,7 +1928,7 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     :param value: The raw override from the request body, e.g. ``"pi"``
         or the ``"openai-agents-sdk"`` alias. ``None`` means no override.
     :param agent: The bound agent row (already fetched by the caller).
-    :returns: The canonical harness id, or ``None`` when *value* is.
+    :returns: The canonical id, preserving a namespaced ACP selection.
     :raises OmnigentError: ``invalid_input`` for an unknown harness, a
         non-omnigent executor type, or an unloadable agent bundle.
     """
@@ -1946,6 +1946,13 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
         raise OmnigentError(
             f"invalid harness_override: must be one of "
             f"{sorted(OMNIGENT_HARNESSES)}, got {value!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # The runner owns ACP configuration; the server only validates its syntax.
+    namespaced_acp = value.startswith("acp:")
+    if namespaced_acp and not re.fullmatch(r"acp:[a-z0-9]+(?:-[a-z0-9]+)*", value):
+        raise OmnigentError(
+            f"invalid harness_override: invalid ACP agent identifier {value!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     try:
@@ -1966,7 +1973,7 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
             f"declares executor.type {executor_type!r}",
             code=ErrorCode.INVALID_INPUT,
         )
-    return canonical
+    return value if namespaced_acp else canonical
 
 
 def _validated_harness_override_executor_type(agent: Agent) -> None:

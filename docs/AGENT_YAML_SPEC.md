@@ -106,6 +106,41 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+### Pi context files
+
+With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
+and `CLAUDE.md` from the workspace, its ancestors, and Pi's global agent
+directory. To disable this discovery for an agent, set `context_files: false`:
+
+```yaml
+name: focused-agent
+executor:
+  harness: pi
+  context_files: false
+prompt: |
+  Follow these explicit agent instructions.
+```
+
+For a directory bundle using `config.yaml`, place the option in `executor.config`:
+
+```yaml
+spec_version: 1
+name: focused-agent
+executor:
+  type: omnigent
+  config:
+    harness: pi
+    context_files: false
+instructions: AGENTS.md
+```
+
+The default is `true`; the value must be a YAML boolean. Explicit `prompt:` or
+`instructions:` content (including an explicitly referenced `AGENTS.md`) and
+Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
+`--no-context-files` flag. It does not disable skills, extensions, or Pi's
+separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
+or other harnesses.
+
 ### GitHub Copilot
 
 `harness: copilot` runs the agent through the
