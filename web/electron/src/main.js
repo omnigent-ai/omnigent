@@ -1656,6 +1656,15 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
+  // Native fullscreen removes macOS traffic lights; the renderer adjusts its
+  // clearance. Platform-neutral events also allow Linux desktop E2E coverage.
+  const sendFullScreenState = () => {
+    if (!win.isDestroyed()) {
+      win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
+    }
+  };
+  win.on("enter-full-screen", sendFullScreenState);
+  win.on("leave-full-screen", sendFullScreenState);
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
@@ -2846,6 +2855,11 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
 
 function registerIpc() {
   registerWorkspacePickerIpc();
+  // Initial state complements transition events for renderers loaded fullscreen.
+  ipcMain.handle("omnigent:window-is-full-screen", (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return win ? win.isFullScreen() : false;
+  });
   ipcMain.handle("omnigent:cancel-server-connection", (event, requestId) => {
     if (!isSetupPageSender(event))
       throw new Error("Connection cancellation is only available to the setup page");

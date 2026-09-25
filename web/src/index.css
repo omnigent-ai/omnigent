@@ -853,6 +853,19 @@ aside[aria-label="Workspace"][data-maximized] {
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
+/* Fullscreen hides the traffic lights. Move the header to the sidebar's 0.75rem
+ * inset and shrink the slot clearances by 4.75rem, retaining the Settings gap. */
+[data-electron-mac][data-electron-fullscreen] .electron-sidebar-header-actions {
+  left: 0.75rem;
+}
+[data-electron-mac][data-electron-fullscreen] .traffic-light-clearance {
+  padding-left: 5.75rem;
+}
+[data-electron-mac][data-electron-fullscreen]:not([data-sidebar-open])
+  aside[aria-label="Workspace"][data-maximized]
+  .workspace-tab-strip {
+  padding-left: 5.75rem;
+}
 /* Drag regions are geometric, not z-ordered: anything that overlaps the
  * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
  * without an explicit counter-region on interactive elements. */

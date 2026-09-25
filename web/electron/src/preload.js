@@ -141,6 +141,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:host-status-changed", listener);
   },
   /**
+   * Current native fullscreen state; transition events have no initial value.
+   * @returns {Promise<boolean>}
+   */
+  isFullScreen: () => ipcRenderer.invoke("omnigent:window-is-full-screen"),
+  /**
+   * Subscribe to native fullscreen transitions.
+   * @param {(fullScreen: boolean) => void} callback
+   * @returns {() => void} Unsubscribe function
+   */
+  onFullScreenChanged: (callback) => {
+    const listener = (_event, fullScreen) => callback(fullScreen === true);
+    ipcRenderer.on("omnigent:full-screen-changed", listener);
+    return () => ipcRenderer.removeListener("omnigent:full-screen-changed", listener);
+  },
+  /**
    * The local `omni` CLI status — `{ installed, path, version, source,
    * installCommand }`. Read-only; lets the in-app Local CLI settings show which
    * binary is in use.

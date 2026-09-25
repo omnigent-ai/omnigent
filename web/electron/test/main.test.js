@@ -105,16 +105,25 @@ function loadNavigationHarness({
     getURL: () => currentUrl,
     setWindowOpenHandler: () => {},
   };
+  const winListeners = new Map();
+  let fullScreen = false;
   const win = {
     webContents,
     contentView: { addChildView: () => {}, removeChildView: () => {} },
     isDestroyed: () => false,
     isMaximized: () => false,
+    isFullScreen: () => fullScreen,
     getNormalBounds: () => ({ x: 0, y: 0, width: 1280, height: 860 }),
     getPosition: () => [0, 0],
     setPosition: () => {},
     maximize: () => {},
-    on: () => {},
+    on(eventName, listener) {
+      if (!winListeners.has(eventName)) winListeners.set(eventName, []);
+      winListeners.get(eventName).push(listener);
+    },
+    emit(eventName, ...args) {
+      for (const listener of winListeners.get(eventName) ?? []) listener(...args);
+    },
     loadFile: (...args) => {
       calls.loadFile.push(args);
       return Promise.resolve();
@@ -344,6 +353,9 @@ function loadNavigationHarness({
     hasListener: (eventName) => listeners.has(eventName),
     setUrl: (url) => {
       currentUrl = url;
+    },
+    setFullScreen: (value) => {
+      fullScreen = value;
     },
     win,
     cleanup: () => {
@@ -1509,5 +1521,41 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         "close a registry with nothing open. Keep the guard.",
       ].join(" "),
     );
+  });
+});
+
+describe("fullscreen state plumbing", () => {
+  it("forwards native fullscreen transitions to the renderer", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow();
+
+    h.setFullScreen(true);
+    h.win.emit("enter-full-screen");
+    h.setFullScreen(false);
+    h.win.emit("leave-full-screen");
+
+    const sent = h.calls.progress.filter((c) => c.channel === "omnigent:full-screen-changed");
+    assert.deepEqual(
+      sent.map((c) => c.data),
+      [true, false],
+      "createWindow must forward enter/leave-full-screen to the renderer " +
+        "as omnigent:full-screen-changed booleans",
+    );
+  });
+
+  it("answers the renderer's initial fullscreen query for its own window", async (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.registerIpc();
+
+    const handler = h.ipc.get("omnigent:window-is-full-screen");
+    assert.ok(handler, "registerIpc must expose omnigent:window-is-full-screen");
+    h.setFullScreen(true);
+    assert.equal(await handler({ sender: h.webContents }), true);
+    h.setFullScreen(false);
+    assert.equal(await handler({ sender: h.webContents }), false);
+    // A sender with no window (e.g. a detached view) reads false, not a throw.
+    assert.equal(await handler({ sender: {} }), false);
   });
 });
