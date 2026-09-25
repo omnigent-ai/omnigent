@@ -2,12 +2,10 @@
 
 The user asks an orchestrator to delegate a report to its writer sub-agent;
 the writer returns a report longer than the inbox delivery cap. Delivery
-into the parent's wake stays bounded — the "Read inbox" tool card shows the
-report cut at the runtime's ``...[truncated N chars — read the full text
-with sys_session_get_history ...]`` marker — but the marker now names the
-retrieval path, and following it works: the parent reads the child session
-with ``sys_session_get_history`` and the report's tail (its end marker)
-becomes visible in the parent transcript's "Get session history" card.
+into the parent's automatic wake stays bounded and names the retrieval path
+in the parent model request. Following that path works: the parent reads the
+child session with ``sys_session_get_history`` and the report's tail (its end
+marker) becomes visible in the parent transcript's "Get session history" card.
 
 This driver asserts the fixed rendering and records the after-fix footage;
 the durable regression guard is
@@ -35,7 +33,7 @@ from typing import Any
 
 import httpx
 import pytest
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Locator, Page, expect, sync_playwright
 
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
@@ -208,12 +206,21 @@ def _child_session_id(base_url: str, parent_id: str) -> str:
     return str(children[0]["id"])
 
 
+def _captured_requests_blob(mock_url: str, model: str) -> str:
+    """Return JSON text for requests captured for *model*."""
+    response = httpx.get(
+        f"{mock_url}/mock/requests", params={"key": model}, timeout=10.0, trust_env=False
+    )
+    response.raise_for_status()
+    return json.dumps(response.json().get("requests", []))
+
+
 def _click_closed_triggers(
-    page: Page, scope: str, *, has_text: re.Pattern[str] | None = None
+    root: Page | Locator, scope: str, *, has_text: re.Pattern[str] | None = None
 ) -> int:
     """Click every closed collapsible trigger matching *scope*; return clicks made."""
     triggers = (
-        page.locator(scope, has_text=has_text) if has_text is not None else page.locator(scope)
+        root.locator(scope, has_text=has_text) if has_text is not None else root.locator(scope)
     )
     clicks = 0
     for index in range(triggers.count()):
@@ -225,19 +232,19 @@ def _click_closed_triggers(
 
 
 def _open_tool_card_output(page: Page, card_label: str, *, timeout_s: float = 30) -> None:
-    """Open settled "Worked for" folds and *card_label*'s Output panel."""
+    """Open the latest settled turn's *card_label* Output panel."""
+    worked = page.get_by_test_id("turn-worked-fold").last
+    expect(worked).to_be_visible(timeout=int(timeout_s * 1000))
+
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        _click_closed_triggers(worked, '[data-slot="collapsible-trigger"]')
         _click_closed_triggers(
-            page,
-            '[data-testid="turn-worked-fold"] [data-slot="collapsible-trigger"]',
-        )
-        _click_closed_triggers(
-            page,
+            worked,
             '[data-slot="collapsible-trigger"]',
             has_text=re.compile(card_label),
         )
-        expand_button = page.get_by_role("button", name="Expand")
+        expand_button = worked.get_by_role("button", name="Expand")
         if expand_button.count() > 0:
             for index in range(expand_button.count()):
                 button = expand_button.nth(index)
@@ -289,15 +296,13 @@ def _run_browser_journey(
                 state="visible", timeout=240_000
             )
 
-            # The delivered handoff is still cut at the delivery cap, but its
-            # marker now points the reader at the retrieval path.
-            _open_tool_card_output(page, "Read inbox")
-            hint = page.get_by_text(_TRUNCATION_HINT)
-            hint.first.wait_for(state="visible", timeout=15_000)
-            hint.first.scroll_into_view_if_needed()
-            result["delivery_hint"] = hint.first.inner_text()
+            # Automatic inbox drains are framework-owned and no longer render a
+            # visible tool card. Verify the bounded result reached the parent model
+            # with the retrieval hint before the test follows that path in the UI.
+            delivery_requests = _captured_requests_blob(mock_llm_server_url, parent_model)
+            result["delivery_hint_reached_parent"] = _TRUNCATION_HINT in delivery_requests
+            result["end_marker_reached_parent_before_retrieval"] = end_marker in delivery_requests
             result["end_marker_hits_after_delivery"] = page.get_by_text(end_marker).count()
-            time.sleep(1)
 
             # Follow the marker: the next turn reads the child session with
             # sys_session_get_history at the report's full length.
@@ -333,10 +338,9 @@ def test_long_subagent_handoff_tail_reachable_in_parent_chat(
 
     Journey (all in the browser): ask the orchestrator to delegate the
     report → dispatch ack → the writer finishes with a 20000-char report →
-    the parent auto-wakes and drains its inbox → the drained result is cut
-    at the delivery cap but names the retrieval path → the next turn reads
-    the child session with ``sys_session_get_history`` → the report's end
-    marker is visible in the parent transcript.
+    the parent auto-wakes with a bounded result that names the retrieval path →
+    the next turn reads the child session with ``sys_session_get_history`` →
+    the report's end marker is visible in the parent transcript.
     """
     uid = uuid.uuid4().hex[:6]
     parent_model = f"mock-hoff-parent-{uid}"
@@ -371,11 +375,12 @@ def test_long_subagent_handoff_tail_reachable_in_parent_chat(
                 respawned_runner.kill()
                 respawned_runner.wait(timeout=5)
 
-    # Delivery stays bounded: the tail is not in the drained inbox text,
-    # and the marker names the retrieval path instead of dead-ending.
-    assert _TRUNCATION_HINT in result["delivery_hint"], result
+    # Delivery stays bounded: the parent model receives the retrieval hint,
+    # while neither its pre-retrieval request nor the transcript contains the tail.
+    assert result["delivery_hint_reached_parent"], result
+    assert not result["end_marker_reached_parent_before_retrieval"], result
     assert result["end_marker_hits_after_delivery"] == 0, (
-        f"the >12k report unexpectedly arrived whole in the inbox drain: {result!r}"
+        f"the >12k report unexpectedly arrived whole before retrieval: {result!r}"
     )
     # The user-visible fix: following the marker surfaces the complete
     # report — its end marker is on the parent session page.

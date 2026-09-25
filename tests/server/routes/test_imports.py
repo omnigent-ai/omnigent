@@ -655,16 +655,188 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
     events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
     session_events = [e for e in events if e["event"] == "session"]
     assert [e["title"] for e in session_events] == ["Streamed 1", "Streamed 2"]
-    # The terminal line carries the tally.
+    # The terminal line carries the tally plus the (here empty) failures list.
     assert events[-1] == {
         "event": "done",
         "imported": 2,
         "already_imported": 0,
         "failed": 0,
+        "failures": [],
     }
     # Each streamed session was actually persisted.
     for e in session_events:
         assert conversation_store.get_conversation(e["session_id"]) is not None
+
+
+async def test_local_import_stream_reports_failure_reasons(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed sessions surface a per-session reason, not just a count.
+
+    Covers both failure origins: a session the server can't normalize (malformed
+    frame) and one the host couldn't read (reported on the done frame). Each gets
+    a ``failed`` line, the tally counts them, and ``done.failures`` lists reasons.
+    """
+    from omnigent.server.routes import imports as imports_module
+
+    _seed_claude_agent(db_uri)
+
+    async def _fake_stream(**kwargs: object):
+        stats = kwargs.get("stats")
+        yield {
+            "external_session_id": "ok-1",
+            "workspace": None,
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "claude:1",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                }
+            ],
+            "title": "Good one",
+            "source": "claude",
+        }
+        # Malformed: items is not a list → server-side failure with a reason.
+        yield {
+            "external_session_id": "bad-1",
+            "workspace": None,
+            "items": "not-a-list",
+            "title": None,
+            "source": "claude",
+        }
+        # A session the host enumerated but couldn't read (no frame, only a
+        # reason on the terminal done frame).
+        if isinstance(stats, dict):
+            stats["host_failed"] = 1
+            stats["host_failures"] = [
+                {
+                    "external_session_id": "unreadable-1",
+                    "source": "codex",
+                    "reason": "No visible messages to import.",
+                }
+            ]
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            SqlAlchemyConversationStore(db_uri),
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/imports/local/stream",
+            json={
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "source": "all",
+                "limit": 5,
+            },
+        )
+
+    assert resp.status_code == 200
+    events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+    assert [e["title"] for e in events if e["event"] == "session"] == ["Good one"]
+    failed = [e for e in events if e["event"] == "failed"]
+    assert {f["reason"] for f in failed} == {
+        "This session's transcript was malformed or too large to import.",
+        "No visible messages to import.",
+    }
+    # The host-read failure keeps its source-session identity through the wire.
+    assert {(f["external_session_id"], f["source"]) for f in failed} == {
+        ("bad-1", "claude"),
+        ("unreadable-1", "codex"),
+    }
+    done = events[-1]
+    assert done["event"] == "done"
+    assert (done["imported"], done["failed"]) == (1, 2)
+    assert len(done["failures"]) == 2
+
+
+async def test_local_import_id_collision_counts_as_already_imported(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A create that collides on the deterministic id is already-imported, not failed.
+
+    A concurrent batch can persist the session (and its external id) after this
+    batch's pre-check missed but before its create, so the create then hits the
+    deterministic conversation id. That is the same source session, so it must
+    count as already-imported and never as a failure or a duplicate.
+    """
+    from omnigent.server.routes import imports as imports_module
+    from omnigent.server.routes.imports import _import_conversation_id
+
+    agent_id = _seed_claude_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    # Occupy the deterministic id but leave the external id unindexed, so the
+    # pre-check misses and only the create surfaces the collision (the race).
+    store.create_conversation(
+        agent_id=agent_id,
+        title="pre-existing",
+        conversation_id=_import_conversation_id("claude", "race-1"),
+    )
+
+    async def _fake_stream(**_kwargs: object):
+        yield {
+            "external_session_id": "race-1",
+            "workspace": None,
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "claude:1",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                }
+            ],
+            "title": "Racing",
+            "source": "claude",
+        }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/imports/local",
+            json={
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "source": "claude",
+                "limit": 5,
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["imported"], body["already_imported"], body["failed"]) == (0, 1, 0)
+    assert body["failures"] == []
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
@@ -715,8 +887,11 @@ async def test_local_import_endpoints_redact_host_error(
 
     if stream:
         events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
-        error_payload = events[0]
-        assert error_payload["event"] == "error"
+        # A degenerate session yielded before the raise surfaces as a benign
+        # ``failed`` line; the host read error is a separate ``error`` line.
+        error_events = [e for e in events if e["event"] == "error"]
+        assert len(error_events) == 1
+        error_payload = error_events[0]
     else:
         assert response.status_code == 409
         error_payload = response.json()["error"]

@@ -7,8 +7,8 @@ Reconstructed user journey (from the report):
 1. Start a Claude Code session.
 2. Claude invokes a tool that needs approval → the web UI parks an
    ``ApprovalCard`` (a ``PermissionRequest`` hook, surfaced here with the same
-   synthetic-hook fast pattern as ``test_native_permission_card_names_the_harness``
-   / ``test_persistent_approval`` — no native CLI required, seconds to run).
+   synthetic-hook fast pattern as ``test_persistent_approval`` — no native CLI
+   required, seconds to run).
 3. The user answers the prompt from *another surface* — the native Claude Code
    terminal popup, another tab, or the inbox. Modelled here by resolving the
    parked elicitation server-side with an ``accept`` verdict via

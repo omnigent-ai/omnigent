@@ -239,7 +239,7 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
         )
         payload = inbox.get_nowait()
         assert payload["status"] == "failed", payload
-        assert "never started" in str(payload["output"]), (
+        assert "no start acknowledgment" in str(payload["output"]), (
             f"the parent must receive an explanatory failure, got {payload['output']!r}"
         )
     finally:

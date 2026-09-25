@@ -4,6 +4,8 @@ import {
   type ExtensionSessionPage,
   validateSessionPageLimit,
   type ExtensionSessionSummary,
+  SESSIONS_LIST_ALL_MAX_RESTARTS,
+  STALE_CURSOR_ERROR_CODE,
 } from "../../../sdks/web-extension/src/sessions";
 
 function session(id: string): ExtensionSessionSummary {
@@ -85,6 +87,39 @@ describe("drainSessionPages", () => {
     expect(validateSessionPageLimit(1, failure)).toBe(1);
     expect(validateSessionPageLimit(1_000, failure)).toBe(1_000);
     expect(() => validateSessionPageLimit(1_001, failure)).toThrow("session page limit");
+  });
+
+  it("restarts the walk from page 1 when a cursor goes stale", async () => {
+    // A session deleted mid-walk kills the cursor; the retried walk must
+    // return the full post-deletion list, not a truncated or doubled one.
+    let attempt = 0;
+    const fetchPage = vi.fn(async (after: string | null) => {
+      if (attempt === 0 && after === "cursor-1") {
+        attempt = 1;
+        throw failure(STALE_CURSOR_ERROR_CODE, "cursor gone");
+      }
+      return after === null
+        ? { sessions: [session("one")], nextCursor: "cursor-1", hasMore: true }
+        : { sessions: [session("two")], nextCursor: null, hasMore: false };
+    });
+
+    const result = await drainSessionPages(fetchPage, failure);
+
+    expect(result.map((item) => item.id)).toEqual(["one", "two"]);
+    expect(fetchPage).toHaveBeenNthCalledWith(3, null);
+  });
+
+  it("gives up after a bounded number of stale-cursor restarts", async () => {
+    const stale = vi.fn(async (after: string | null) => {
+      if (after !== null) throw failure(STALE_CURSOR_ERROR_CODE, "cursor gone");
+      return { sessions: [session("one")], nextCursor: "cursor-1", hasMore: true };
+    });
+
+    await expect(drainSessionPages(stale, failure)).rejects.toMatchObject({
+      code: STALE_CURSOR_ERROR_CODE,
+    });
+    // One initial walk plus the bounded restarts, two calls each.
+    expect(stale).toHaveBeenCalledTimes((SESSIONS_LIST_ALL_MAX_RESTARTS + 1) * 2);
   });
 
   it("propagates page failures unchanged", async () => {

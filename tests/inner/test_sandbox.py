@@ -237,6 +237,20 @@ def test_sandbox_policy_round_trips_spawn_env_allowlist() -> None:
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).spawn_env_allowlist is None
 
 
+def test_credential_source_paths_survive_serialization_and_cloning(tmp_path: pathlib.Path) -> None:
+    from omnigent.inner.sandbox import with_additional_read_roots, with_additional_write_roots
+
+    policy = _noop_policy()
+    protected = (tmp_path / "token.sock").resolve()
+    policy.credential_source_paths = [protected]
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+    cloned = with_additional_read_roots(decoded, [tmp_path / "tools"])
+    cloned = with_additional_write_roots(cloned, [tmp_path / "scratch"])
+    assert cloned.credential_source_paths == [protected]
+    assert cloned.credential_source_paths is not decoded.credential_source_paths
+    assert SandboxPolicy.from_jsonable({}).credential_source_paths is None
+
+
 def test_sandbox_policy_round_trips_deny_unix_socket_paths() -> None:
     """``deny_unix_socket_paths`` survives the launcher wire encoding.
 

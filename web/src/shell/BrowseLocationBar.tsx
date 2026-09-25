@@ -1,5 +1,7 @@
+import { ArrowLeftIcon, FolderDotIcon } from "lucide-react";
 import { useState } from "react";
 
+import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { WorkspaceReach } from "@/hooks/useWorkspaceChangedFiles";
@@ -36,11 +38,9 @@ interface BrowseLocationBarProps {
  * show-hidden along with it. Navigation applies live as the user browses (no
  * separate confirm), matching the new-session chip.
  *
- * Falls back to a plain label when there is nowhere else to go OR this
- * viewer may not go there — a confined agent, a session with no host, or a
- * non-owner collaborator. Offering a control that is guaranteed to 403 is
- * worse than not offering it: the picker browses the owner-scoped host
- * filesystem, so for a collaborator it opens onto an error.
+ * Falls back to a plain path label when the full browser is unavailable. The
+ * parent button remains enabled only while moving upward stays inside the
+ * workspace, avoiding an owner-scoped host browse that would be refused.
  *
  * @param current Absolute path currently shown.
  * @param workspace Absolute workspace root, for the picker's return button.
@@ -61,52 +61,124 @@ export function BrowseLocationBar({
 }: BrowseLocationBarProps) {
   const [open, setOpen] = useState(false);
   const canRoam = canBrowseOutside && (reach?.unconfined ?? false) && hostId !== null;
+  const parent = parentPath(current);
+  const navigableParent =
+    parent !== null && (canRoam || pathIsWithin(parent, workspace)) ? parent : null;
 
   if (!canRoam) {
     return (
       <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="inline-block max-w-full truncate font-mono text-[11px] text-muted-foreground">
-              {basename(current)}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">{current}</TooltipContent>
-        </Tooltip>
+        <span className="flex min-w-0 flex-1 items-center gap-[2px]">
+          <ParentFolderButton parent={navigableParent} onNavigate={onNavigate} />
+          <WorkspaceRootButton current={current} workspace={workspace} onNavigate={onNavigate} />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-block min-w-0 flex-1 truncate font-medium text-ui">
+                {basename(current)}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{current}</TooltipContent>
+          </Tooltip>
+        </span>
       </TooltipProvider>
     );
   }
 
   return (
     <span className="flex min-w-0 flex-1 flex-col">
-      <Popover open={open} onOpenChange={setOpen}>
-        <PopoverTrigger asChild>
-          <button
-            type="button"
-            title={current}
-            aria-label={`Working folder: ${current}. Click to browse.`}
-            className="min-w-0 rounded px-1 py-0.5 text-left hover:bg-accent hover:text-accent-foreground"
-            data-testid="browse-location-path"
-          >
-            <PathText path={current} />
-          </button>
-        </PopoverTrigger>
-        {/* Cap to the viewport so the browser can't overflow a narrow panel. */}
-        <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
-          <WorkspacePicker
-            hostId={hostId}
-            initialPath={isNavigablePath(current) ? current : undefined}
-            workspacePath={workspace}
-            onNavigate={onNavigate}
-          />
-        </PopoverContent>
-      </Popover>
+      <span className="flex min-w-0 items-center gap-[2px]">
+        <ParentFolderButton parent={navigableParent} onNavigate={onNavigate} />
+        <WorkspaceRootButton current={current} workspace={workspace} onNavigate={onNavigate} />
+        <Popover open={open} onOpenChange={setOpen}>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              title={current}
+              aria-label={`Working folder: ${current}. Click to browse.`}
+              className="min-w-0 flex-1 cursor-pointer rounded px-1 py-0.5 text-left hover:bg-muted hover:text-foreground"
+              data-testid="browse-location-path"
+            >
+              <PathText path={current} />
+            </button>
+          </PopoverTrigger>
+          {/* Cap to the viewport so the browser can't overflow a narrow panel. */}
+          <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
+            <WorkspacePicker
+              hostId={hostId}
+              initialPath={isNavigablePath(current) ? current : undefined}
+              workspacePath={workspace}
+              onNavigate={onNavigate}
+            />
+          </PopoverContent>
+        </Popover>
+      </span>
       {error && (
         <span className="truncate text-[10px] text-destructive" data-testid="browse-location-error">
           {error}
         </span>
       )}
     </span>
+  );
+}
+
+function WorkspaceRootButton({
+  current,
+  workspace,
+  onNavigate,
+}: {
+  current: string;
+  workspace: string;
+  onNavigate: (absolutePath: string) => void;
+}) {
+  if (current === workspace) return null;
+
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Back to working folder"
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+            onClick={() => onNavigate(workspace)}
+          >
+            <FolderDotIcon />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Back to working folder</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+function ParentFolderButton({
+  parent,
+  onNavigate,
+}: {
+  parent: string | null;
+  onNavigate: (absolutePath: string) => void;
+}) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Go to parent folder"
+            disabled={parent === null}
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+            onClick={() => parent && onNavigate(parent)}
+          >
+            <ArrowLeftIcon />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Back one folder</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -122,10 +194,7 @@ export function BrowseLocationBar({
  */
 function PathText({ path }: { path: string }) {
   return (
-    <span
-      dir="rtl"
-      className="block truncate text-left font-mono text-[11px] text-muted-foreground"
-    >
+    <span dir="rtl" className="block truncate text-left font-medium text-ui">
       <bdi dir="ltr">{path}</bdi>
     </span>
   );
@@ -140,4 +209,23 @@ function PathText({ path }: { path: string }) {
 function basename(absolutePath: string): string {
   if (absolutePath === "/" || absolutePath === "") return "/";
   return absolutePath.split(/[/\\]/).filter(Boolean).pop() ?? absolutePath;
+}
+
+function parentPath(absolutePath: string): string | null {
+  const usesBackslashes = absolutePath.includes("\\");
+  const normalized = absolutePath.replaceAll("\\", "/").replace(/\/+$/, "");
+  if (normalized === "" || normalized === "/" || /^[A-Za-z]:$/.test(normalized)) return null;
+
+  const separator = normalized.lastIndexOf("/");
+  if (separator < 0) return null;
+  let parent = separator === 0 ? "/" : normalized.slice(0, separator);
+  if (/^[A-Za-z]:$/.test(parent)) parent += "/";
+  return usesBackslashes ? parent.replaceAll("/", "\\") : parent;
+}
+
+function pathIsWithin(path: string, root: string): boolean {
+  const normalize = (value: string) => value.replaceAll("\\", "/").replace(/\/+$/, "");
+  const normalizedPath = normalize(path);
+  const normalizedRoot = normalize(root);
+  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
 }

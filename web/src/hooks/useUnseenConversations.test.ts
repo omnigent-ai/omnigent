@@ -187,6 +187,49 @@ describe("markConversationUnread", () => {
   });
 });
 
+describe("markConversationRead", () => {
+  it("clears the explicit-unread override and the dot, PUTting the read state", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    mod.markConversationUnread("conv-1", 5_000);
+    authFetch.mockClear();
+    // Client wall clock (4000) lags the row's updated_at (5000) — the
+    // baseline must still clear the dot by anchoring at updated_at.
+    vi.useFakeTimers({ now: 4_000_000 });
+
+    mod.markConversationRead("conv-1", 5_000);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(lastPutBody()).toEqual({ last_seen: 5_000, unread: false });
+  });
+
+  it("anchors to the wall clock when it leads updated_at (captures unpolled updates)", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    mod.markConversationUnread("conv-1", 5_000);
+    vi.useFakeTimers({ now: 6_000_000 });
+
+    mod.markConversationRead("conv-1", 5_000);
+
+    // An update from before the read (5_500 < the 6_000 read time) that the
+    // poll hadn't delivered yet stays read.
+    expect(mod.isConversationUnseen("conv-1", 5_500, "idle")).toBe(false);
+  });
+
+  it("applies before the first seed — explicit intent is exempt from the hydration gate", async () => {
+    const mod = await loadFresh();
+    // No seedReadState: the user acts before the conversation list loads.
+    mod.markConversationUnread("conv-1", 5_000);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+
+    mod.markConversationRead("conv-1", 5_000);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+  });
+});
+
 describe("clearUnreadOverride", () => {
   it("removes the override, PUTs the cleared state, and re-enables mark-seen", async () => {
     const mod = await loadFresh();
