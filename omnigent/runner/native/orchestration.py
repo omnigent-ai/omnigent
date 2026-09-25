@@ -2977,6 +2977,9 @@ async def _auto_create_cursor_terminal(
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
+            # Keep the dead pane when cursor-agent exits so the watcher reports
+            # a pane-dead exit with its status instead of "tmux unavailable".
+            keep_alive_after_exit=True,
         ),
     )
     # Advertise the tmux socket+target so the cursor-native harness executor can

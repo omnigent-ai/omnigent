@@ -2048,6 +2048,23 @@ async def test_auto_create_cursor_terminal_wires_yolo_auto_accept(
     assert captured["elicitation_kwargs"]["auto_accept_approvals"] is expected
 
 
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_keeps_tmux_alive_after_cursor_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cursor:main launch spec must set keep_alive_after_exit (like claude/pi/codex)
+    so a cursor-agent exit is reported as a pane-dead exit, not the generic "tmux
+    unavailable" cascade."""
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=None,
+        terminal_launch_args=None,
+    )
+    assert captured["spec"].keep_alive_after_exit is True
+
+
 @pytest.mark.parametrize(
     ("snapshot_external_id", "expected_start_at_end"),
     [
