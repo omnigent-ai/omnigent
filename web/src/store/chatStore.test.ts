@@ -75,9 +75,10 @@ import {
   initChatStore,
   pumpStreamEvents,
   SSE_STALE_RECYCLE_MS,
+  clearFailedSendDraft,
+  peekFailedSendDraft,
   setPendingInitialPrompt,
   startStreamPump,
-  takeFailedSendDraft,
   useChatStore,
   type ConversationState,
   type FrameScheduler,
@@ -15212,9 +15213,10 @@ describe("chatStore — interaction_phase analytics", () => {
 
 // A failed send hands its text back as the conversation's failedSendDraft,
 // but when the session itself failed to LOAD no composer ever renders to
-// drain it. takeFailedSendDraft is the load-error screen's recovery read.
-describe("takeFailedSendDraft", () => {
-  it("drains the stranded draft for the failed conversation (read-once)", () => {
+// drain it. The load-error screen peeks this draft to hand it to the landing
+// composer, and clears it only once that restore is confirmed.
+describe("peekFailedSendDraft / clearFailedSendDraft", () => {
+  function strandDraft(): { entry: ReturnType<typeof conversationRegistry.acquire>; file: File } {
     const entry = conversationRegistry.acquire("conv_load_failed");
     const file = new File(["x"], "notes.txt", { type: "text/plain" });
     entry.setState({
@@ -15226,21 +15228,35 @@ describe("takeFailedSendDraft", () => {
       },
       pendingRetryStableId: "stable_1",
     });
+    return { entry, file };
+  }
 
-    expect(takeFailedSendDraft("conv_load_failed")).toEqual({
+  it("peeks the stranded draft without consuming it", () => {
+    const { entry, file } = strandDraft();
+    expect(peekFailedSendDraft("conv_load_failed")).toEqual({
       text: "prompt stranded by a failed first load",
       files: [file],
     });
-    // Read-once: the entry no longer holds the draft (or its retry id).
-    expect(entry.getState().failedSendDraft).toBeNull();
-    expect(entry.getState().pendingRetryStableId).toBeNull();
-    expect(takeFailedSendDraft("conv_load_failed")).toBeNull();
+    // A refused restore must find the draft again: peek never clears.
+    expect(peekFailedSendDraft("conv_load_failed")).not.toBeNull();
+    expect(entry.getState().failedSendDraft).not.toBeNull();
+    expect(entry.getState().pendingRetryStableId).toBe("stable_1");
   });
 
-  it("returns null when nothing is stranded or the conversation is unknown", () => {
+  it("clears the draft and its retry id after a confirmed restore", () => {
+    const { entry } = strandDraft();
+    clearFailedSendDraft("conv_load_failed");
+    expect(entry.getState().failedSendDraft).toBeNull();
+    expect(entry.getState().pendingRetryStableId).toBeNull();
+    expect(peekFailedSendDraft("conv_load_failed")).toBeNull();
+  });
+
+  it("returns null / no-ops when nothing is stranded or the conversation is unknown", () => {
     conversationRegistry.acquire("conv_clean");
-    expect(takeFailedSendDraft("conv_clean")).toBeNull();
-    expect(takeFailedSendDraft("conv_never_seen")).toBeNull();
+    expect(peekFailedSendDraft("conv_clean")).toBeNull();
+    clearFailedSendDraft("conv_clean");
+    expect(peekFailedSendDraft("conv_never_seen")).toBeNull();
+    clearFailedSendDraft("conv_never_seen");
   });
 });
 

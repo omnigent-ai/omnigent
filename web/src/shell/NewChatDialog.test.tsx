@@ -10351,25 +10351,39 @@ describe("restoreLandingDraftMessage", () => {
   }
 
   it("restores a stranded first message into the landing composer", () => {
-    restoreLandingDraftMessage("prompt stranded by a failed first load", []);
+    expect(restoreLandingDraftMessage("prompt stranded by a failed first load", [])).toBe(true);
     renderLanding();
     expect(landingValue()).toBe("prompt stranded by a failed first load");
   });
 
-  it("never overwrites a draft the user composed since", () => {
+  it("refuses to overwrite a draft the user composed since", () => {
     renderLanding();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "newer text the user typed" },
     });
     // Unmount stashes the in-progress text as the module-scoped draft.
     cleanup();
-    restoreLandingDraftMessage("stranded", []);
+    // The refusal is reported so the caller keeps the stranded copy.
+    expect(restoreLandingDraftMessage("stranded", [])).toBe(false);
     renderLanding();
     expect(landingValue()).toBe("newer text the user typed");
   });
 
+  it("keeps picker-only selections while restoring the stranded text", () => {
+    renderLanding();
+    selectAgent("a2");
+    // No text typed: unmount stashes a picker-only draft (agent = Codex).
+    cleanup();
+    expect(restoreLandingDraftMessage("stranded", [])).toBe(true);
+    renderLanding();
+    expect(landingValue()).toBe("stranded");
+    // The chip labels the selection by its model: GPT-5.5 is the mocked Codex
+    // default, so the picked agent survived (a clobber would show Claude's).
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("GPT-5.5");
+  });
+
   it("ignores an empty stranded message", () => {
-    restoreLandingDraftMessage("   ", []);
+    expect(restoreLandingDraftMessage("   ", [])).toBe(false);
     renderLanding();
     expect(landingValue()).toBe("");
   });

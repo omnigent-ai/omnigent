@@ -2098,17 +2098,19 @@ export function resetLandingDraft(): void {
  * Restore a first message stranded by a failed session load to the next
  * landing visit: the create succeeded (so the draft was already cleared)
  * but the session never became viewable, leaving the typed text with no
- * composer to surface it. Only the text and attachments come back — every
- * picker slot keeps the same fresh-visit default it would have anyway. A
- * non-empty draft the user composed since is never overwritten.
+ * composer to surface it. Only the text and attachments come back: an
+ * existing draft keeps its picker selections (host, workspace, agent, …),
+ * and a draft the user has already typed into is never overwritten.
+ *
+ * @returns Whether the message was written, so the caller keeps the
+ *   stranded source intact when the restore is refused.
  */
-export function restoreLandingDraftMessage(message: string, files: File[]): void {
-  if (message.trim() === "" && files.length === 0) return;
-  if (
-    landingDraft !== null &&
-    (landingDraft.message.trim() !== "" || landingDraft.files.length > 0)
-  ) {
-    return;
+export function restoreLandingDraftMessage(message: string, files: File[]): boolean {
+  if (message.trim() === "" && files.length === 0) return false;
+  if (landingDraft !== null) {
+    if (landingDraft.message.trim() !== "" || landingDraft.files.length > 0) return false;
+    writeLandingDraft({ ...landingDraft, message, files });
+    return true;
   }
   writeLandingDraft({
     project: "",
@@ -2135,6 +2137,7 @@ export function restoreLandingDraftMessage(message: string, files: File[]): void
     agentFromConfig: false,
     workspaceFromConfig: false,
   });
+  return true;
 }
 
 export function NewChatLandingScreen() {

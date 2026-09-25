@@ -89,13 +89,14 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  clearFailedSendDraft,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
   isTempConvId,
+  peekFailedSendDraft,
   type PendingInitialPrompt,
   type QueuedMessage,
-  takeFailedSendDraft,
   useChatStore,
 } from "@/store/chatStore";
 import {
@@ -1997,11 +1998,15 @@ function ConversationLoadError({
   // auto-send gates never opened.
   const startNewChat = () => {
     const stranded =
-      takeFailedSendDraft(conversationId) ??
+      peekFailedSendDraft(conversationId) ??
       (strandedPrompt !== null
         ? { text: strandedPrompt.text, files: strandedPrompt.files ?? [] }
         : null);
-    if (stranded !== null) restoreLandingDraftMessage(stranded.text, stranded.files);
+    // Clear the store copy only once the landing draft accepted the text — a
+    // newer draft refuses the restore and must not destroy the stranded copy.
+    if (stranded !== null && restoreLandingDraftMessage(stranded.text, stranded.files)) {
+      clearFailedSendDraft(conversationId);
+    }
     navigate("/");
   };
   return (

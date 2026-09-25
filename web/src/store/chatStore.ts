@@ -491,26 +491,32 @@ export function removeLocalConversation(tempConvId: string): boolean {
 }
 
 /**
- * Drain the first message a failed-to-load conversation stranded.
+ * Peek the first message a failed-to-load conversation stranded.
  *
  * A failed send hands its text back as that conversation's
  * `failedSendDraft`, expecting the in-session composer to drain it — but
  * when the session's own load fails, the error screen replaces the whole
  * page and that composer never renders, so the text would be silently
- * lost. The load-error screen calls this to recover it for the landing
- * composer instead. Read-once: cleared on read so it can't restore twice.
+ * lost. The load-error screen reads it here to recover it for the landing
+ * composer, then calls `clearFailedSendDraft` only once the restore is
+ * confirmed — a refused restore must leave the stranded copy in place.
  *
  * @param conversationId The failed conversation's id, e.g. `"conv_abc"`.
  * @returns The stranded text + attachments, or `null` when none.
  */
-export function takeFailedSendDraft(
+export function peekFailedSendDraft(
   conversationId: string,
 ): { text: string; files: File[] } | null {
   const state = setterForState(conversationId);
   const draft = state?.failedSendDraft ?? null;
   if (draft === null || draft.conversationId !== conversationId) return null;
-  setterFor(conversationId)({ failedSendDraft: null, pendingRetryStableId: null });
   return { text: draft.text, files: draft.files };
+}
+
+/** Drop a stranded draft (and its retry id) after a confirmed restore. */
+export function clearFailedSendDraft(conversationId: string): void {
+  if (peekFailedSendDraft(conversationId) === null) return;
+  setterFor(conversationId)({ failedSendDraft: null, pendingRetryStableId: null });
 }
 
 /**

@@ -127,12 +127,14 @@ async function describeListError(res: Response, path: string): Promise<string> {
  *
  * 4xx responses are deterministic (missing path, bad path, not the owner), so
  * retrying them just delays the error behind the stale placeholder listing the
- * picker keeps on screen while a query is pending. 502/504 are the server's
- * own host-connectivity verdicts — the host connection dropped, or the host
- * had the server's whole ``list_dir`` window (5s) and never answered — so a
- * silent retry just repeats that multi-second wait behind a bare loading row;
- * surface those immediately too. Only genuinely transient failures (other
- * 5xx, network errors) retry, up to the default cap of 3.
+ * picker keeps on screen while a query is pending. 502/504 are verdicts the
+ * server already settled — a dropped host connection, a host-reported
+ * filesystem failure, or the host taking the server's whole ``list_dir``
+ * window (5s) without answering — so a silent retry mostly repeats a
+ * multi-second wait behind a bare loading row; surface those immediately. A
+ * gateway blip can also read as 502/504: skipping its retry trades that rare
+ * auto-recovery for bounded feedback, and re-opening the folder retries.
+ * Other 5xx and network errors retry, up to the default cap of 3.
  *
  * @param failureCount Number of failures so far (0 on the first failure).
  * @param error The thrown error; a ``FetchError`` carries the HTTP ``status``.
