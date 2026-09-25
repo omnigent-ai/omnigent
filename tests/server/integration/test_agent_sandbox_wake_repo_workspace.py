@@ -55,6 +55,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.managed_hosts import (
+    ONLINE_TIMEOUT_ENV_VAR,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     RepoWorkspace,
@@ -308,7 +309,7 @@ async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
     """
     # A healthy fake host registers well under a second; shrink the online-poll
     # budget so a wake/registration regression fails in seconds.
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     # Keep the runner-connect wait short (it is stubbed to succeed below, so this
     # only bounds any residual waiting).
     monkeypatch.setattr(

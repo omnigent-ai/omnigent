@@ -288,3 +288,4 @@ Modal guide.
 | `OMNIGENT_E2B_TEMPLATE` | CLI machine / server | E2B template name to provision from (`sandbox.e2b.template` takes precedence; default `omnigent-host`) |
 | `OMNIGENT_E2B_SANDBOX_ENV` | CLI machine / server | Comma-separated launcher-side env var names to inject (`sandbox.e2b.env` takes precedence for managed) |
 | `OMNIGENT_E2B_MAX_LIFETIME_S` | CLI machine / server | Requested sandbox lifetime in seconds (default 24 h); creation auto-clamps to the account cap if exceeded |
+| `OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S` | Server | Seconds to wait for the sandboxed host to register (default 120); provider-agnostic |
