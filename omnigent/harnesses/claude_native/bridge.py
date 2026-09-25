@@ -60,6 +60,7 @@ from urllib import request
 
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
+from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
@@ -293,6 +294,21 @@ _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
+# Claude Code added chat:sendNow in 2.1.275; older CLIs must never receive the chord.
+_SEND_NOW_MIN_VERSION = Version("2.1.275")
+_SEND_NOW_HINT_RE = re.compile(
+    r"^ctrl\+x\s+ctrl\+s\s+to\s+send\s+now$", re.MULTILINE | re.IGNORECASE
+)
+_SEND_NOW_HINT_TIMEOUT_S = 20.0
+_SEND_NOW_POLL_INTERVAL_S = 0.05
+_QUEUED_MESSAGE_PLACEHOLDERS = frozenset(
+    {
+        "Press up to edit queued messages",
+        "Press up to edit queued messages, Enter to send them immediately",
+        "Press up to select a queued message, then Enter to edit it",
+        "Press up to select a queued message to edit, or Enter to send them now",
+    }
+)
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -3947,6 +3963,10 @@ def inject_user_message(
     the box — re-sending Enter while it hasn't — and raises if the
     message never submits.
 
+    When a supported Claude Code queues the accepted message during a running
+    turn, its advertised send-now shortcut promotes the message immediately.
+    Older or unknown versions retain ordinary Enter delivery.
+
     A message leading with an *unknown* slash command passes through
     unescaped on the guess that it names a skill. When Claude Code
     rejects that guess ("Unknown command: /<name>") it drops the whole
@@ -4067,6 +4087,12 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
+    # Only an already-running turn needs time for its queued prompt's submit hooks.
+    # Snapshot before Enter so an idle prompt's own hook cannot add a needless wait.
+    last_hook = None
+    with contextlib.suppress(OSError, UnicodeDecodeError):
+        last_hook = _read_json_file(bridge_dir / _STATE_FILE).get("last_hook_event_name")
+    wait_for_send_now = last_hook not in (None, "SessionStart", "Stop", "StopFailure")
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -4142,12 +4168,123 @@ def _paste_and_submit(
         needle=needle,
         what="submitted message",
         bridge_dir=bridge_dir,
+        on_queued=lambda pane: _send_now_if_queued(
+            bridge_dir,
+            socket_path,
+            tmux_target,
+            needle=needle,
+            wait_for_hint=wait_for_send_now,
+            pane=pane,
+        ),
     ):
         return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
+
+
+def _send_now_if_queued(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str,
+    wait_for_hint: bool = True,
+    pane: str | None = None,
+) -> None:
+    """Promote accepted web input without replaying it if the shortcut fails."""
+    try:
+        # The running TUI reports its version; probing PATH could see an upgraded binary.
+        version = _read_json_file(bridge_dir / CONTEXT_RAW_FILE).get("version")
+        if not isinstance(version, str) or Version(version) < _SEND_NOW_MIN_VERSION:
+            return
+    except (OSError, UnicodeDecodeError, InvalidVersion):
+        return
+    try:
+        start = time.monotonic()
+        deadline = start + (_SEND_NOW_HINT_TIMEOUT_S if wait_for_hint else 0.0)
+        while True:
+            if pane is None:
+                pane = _capture_pane(socket_path, tmux_target)
+            if _send_now_queue_region(pane, needle) is None:
+                return
+            _raise_if_user_prompt_pending(bridge_dir, pane)
+            if _send_now_hint_visible(pane, needle):
+                # Separate from the paste/Enter burst so Claude parses two keys.
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-x", "C-s")
+                _logger.info(
+                    "claude-native: sent queued message with Ctrl+X Ctrl+S (hint wait %.3fs)",
+                    time.monotonic() - start,
+                )
+                return
+            if time.monotonic() >= deadline:
+                if wait_for_hint:
+                    _logger.info(
+                        "claude-native: send-now hint not advertised within %.1fs; "
+                        "keeping ordinary Enter delivery",
+                        _SEND_NOW_HINT_TIMEOUT_S,
+                    )
+                return
+            # Claude hides the hint until asynchronous UserPromptSubmit hooks settle.
+            time.sleep(min(_CLAUDE_READY_POLL_INTERVAL_S, _SEND_NOW_POLL_INTERVAL_S))
+            pane = None
+    except ClaudeInjectionCancelled:
+        raise
+    except ClaudeUserPromptPending:
+        return
+    except (RuntimeError, OSError):
+        _logger.warning(
+            "claude-native: send-now shortcut failed; the accepted message remains queued",
+            exc_info=True,
+        )
+
+
+def _send_now_hint_visible(pane: str, needle: str) -> bool:
+    """Match the shortcut after this queued message, outside the live composer."""
+    region = _send_now_queue_region(pane, needle)
+    hint = _SEND_NOW_HINT_RE.search(region) if region is not None else None
+    if region is None or hint is None:
+        return False
+    return _send_now_message_matches(region[: hint.start()], needle)
+
+
+def _send_now_message_matches(text: str, needle: str) -> bool:
+    """Recognize wrapped/collapsed input and Markdown-rendered queue text."""
+    if _PASTED_PLACEHOLDER_PREFIX in text or "".join(needle.split()) in "".join(text.split()):
+        return True
+    marker = "".join(char for char in needle if char.isalnum())
+    return bool(marker) and marker in "".join(char for char in text if char.isalnum())
+
+
+def _send_now_queue_region(pane: str, needle: str) -> str | None:
+    """Find the accepted message above a free composer, even while hooks run."""
+    if not needle or not _claude_prompt_rendered(pane):
+        return None
+    lines = [line.strip() for line in pane.splitlines() if line.strip()]
+    rules = [index for index, line in enumerate(lines) if _is_box_rule(line)]
+    if len(rules) < 2:
+        return None
+    opening, closing = rules[-2:]
+    composer = " ".join(lines[opening + 1 : closing])
+    # A concurrent terminal draft must not be submitted along with the queued message.
+    placeholder = composer.removeprefix(_CLAUDE_PROMPT_GLYPH).strip()
+    if placeholder and placeholder not in _QUEUED_MESSAGE_PLACEHOLDERS:
+        return None
+    last_prompt = next(
+        (
+            index
+            for index in range(opening - 1, -1, -1)
+            if lines[index].startswith(_CLAUDE_PROMPT_GLYPH)
+        ),
+        None,
+    )
+    if last_prompt is None:
+        return None
+    region = "\n".join(lines[last_prompt:opening])
+    if _send_now_message_matches(region, needle):
+        return region
+    return None
 
 
 def _verify_submit_accepted(
@@ -4157,6 +4294,7 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    on_queued: Callable[[str], None] | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4176,6 +4314,8 @@ def _verify_submit_accepted(
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param on_queued: Promote a matching queued message using the accepted pane
+        snapshot, without another capture or retrying Enter into a free composer.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4184,8 +4324,11 @@ def _verify_submit_accepted(
     retry_interval = _SUBMIT_RETRY_INTERVAL_S
     warned = False
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
+        # A framed, empty composer proves acceptance even when a footer echoes the draft.
+        if on_queued is not None and _send_now_queue_region(pane, needle) is not None:
+            on_queued(pane)
+            return True
         if not _draft_in_input_box(pane, needle):
             if warned:
                 _logger.info(
@@ -4209,6 +4352,11 @@ def _verify_submit_accepted(
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
+        time.sleep(
+            min(_CLAUDE_READY_POLL_INTERVAL_S, _SEND_NOW_POLL_INTERVAL_S)
+            if on_queued is not None
+            else _CLAUDE_READY_POLL_INTERVAL_S
+        )
     return False
 
 
