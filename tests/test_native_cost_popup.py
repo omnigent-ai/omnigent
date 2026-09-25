@@ -465,22 +465,42 @@ def test_tmux_window_activity_at_none_on_unparseable_output(
     assert native_cost_popup._tmux_window_activity_at("/tmp/x.sock", "main") is None
 
 
-def _wait_for_tmux_clients(socket_path: str, count: int, pty_fd: int | None = None) -> None:
-    """Poll until *count* clients are attached, draining *pty_fd* so tmux never blocks."""
+def _drain_pty(pty_fd: int) -> None:
+    """Discard pending output on *pty_fd* so the tmux client behind it never blocks."""
     import os
     import select
+
+    try:
+        while select.select([pty_fd], [], [], 0)[0]:
+            if not os.read(pty_fd, 65536):
+                return
+    except OSError:  # the child exited; Linux reports EIO on the master side
+        return
+
+
+def _wait_for_tmux_clients(socket_path: str, count: int, pty_fd: int | None = None) -> None:
+    """Poll until *count* clients are attached to the ``main`` session."""
     import time
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         if pty_fd is not None:
-            while select.select([pty_fd], [], [], 0)[0]:
-                if not os.read(pty_fd, 65536):
-                    break
+            _drain_pty(pty_fd)
         if len(native_cost_popup._list_tmux_clients(socket_path, "main")) >= count:
             return
         time.sleep(0.05)
     raise AssertionError(f"expected {count} tmux clients on {socket_path}")
+
+
+def _settled_client_input_at(socket_path: str, pty_fd: int, settle_s: float) -> float | None:
+    """Read the helper after *settle_s* seconds, draining the pty while waiting."""
+    import time
+
+    deadline = time.monotonic() + settle_s
+    while time.monotonic() < deadline:
+        _drain_pty(pty_fd)
+        time.sleep(0.1)
+    return native_cost_popup._tmux_last_client_input_at(socket_path, "main")
 
 
 def test_tmux_last_client_input_at_tracks_keypresses_not_control_clients() -> None:
@@ -489,16 +509,20 @@ def test_tmux_last_client_input_at_tracks_keypresses_not_control_clients() -> No
 
     The pane reaper uses this as its "a human is typing here" signal: a
     control-mode (web bridge) client alone must read as no input, a fresh CLI
-    attach as recent input, a later keypress must advance it, and a dead
-    server must read as "no evidence", never as an error.
+    attach as recent input, pane output and a resize must leave it unchanged,
+    a keypress must advance it, and a dead server must read as "no evidence",
+    never as an error.
     """
     import contextlib
+    import fcntl
     import os
     import pty
     import shutil
     import signal
+    import struct
     import subprocess
     import tempfile
+    import termios
     import time
 
     if shutil.which("tmux") is None:
@@ -528,20 +552,32 @@ def test_tmux_last_client_input_at_tracks_keypresses_not_control_clients() -> No
 
         pty_pid, pty_fd = pty.fork()
         if pty_pid == 0:  # pragma: no cover - child process
+            os.environ["TERM"] = "xterm-256color"  # tmux refuses to attach without one
             os.execvp("tmux", [*tmux, "attach", "-t", "main"])
         _wait_for_tmux_clients(socket_path, 2, pty_fd)
         attached_at = native_cost_popup._tmux_last_client_input_at(socket_path, "main")
         assert attached_at is not None
         assert abs(time.time() - attached_at) < 120.0
 
-        time.sleep(1.1)  # client_activity has one-second resolution
+        # client_activity has one-second resolution: settle past a boundary
+        # so an unchanged reading is meaningful, then prove output and a
+        # resize leave it alone and only a keypress advances it.
+        subprocess.run(
+            [*tmux, "send-keys", "-t", "main", "echo pane-output", "Enter"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        assert _settled_client_input_at(socket_path, pty_fd, 1.5) == attached_at
+        fcntl.ioctl(pty_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 10, 40, 0, 0))
+        os.kill(pty_pid, signal.SIGWINCH)
+        assert _settled_client_input_at(socket_path, pty_fd, 1.5) == attached_at
+
         os.write(pty_fd, b"x")
         deadline = time.monotonic() + 5.0
         typed_at = attached_at
         while time.monotonic() < deadline and typed_at <= attached_at:
-            _wait_for_tmux_clients(socket_path, 2, pty_fd)
-            typed_at = native_cost_popup._tmux_last_client_input_at(socket_path, "main") or 0.0
-            time.sleep(0.1)
+            typed_at = _settled_client_input_at(socket_path, pty_fd, 0.2) or 0.0
         assert typed_at > attached_at
     finally:
         subprocess.run([*tmux, "kill-server"], check=False, capture_output=True, timeout=10)
