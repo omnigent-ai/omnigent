@@ -1,15 +1,9 @@
 """UI journey: a Codex turn rejected for an account-unsupported model shows the
-provider's reason in chat, not the raw JSON error envelope.
+provider's reason in the chat error pill, not the raw JSON error envelope.
 
-A ChatGPT-account Codex provider rejects a model the account does not allow
-(here ``gpt-6-astra``) with an HTTP 400 whose body carries the reason. The
-Codex app-server relays that body as the error frame's top-level message, so
-the ``codex`` harness must unwrap it before the failed turn reaches the chat.
-
-The journey drives the real web SPA against a live server + runner and the real
-``codex`` CLI app-server, routed at the mock ``/v1/responses`` which returns the
-account's 400: start a session on a ``codex`` agent pinned to ``gpt-6-astra``,
-send a message, expand the error pill, and read the rendered error text.
+The real web SPA, a live server + runner and the real ``codex`` CLI app-server
+are driven against the mock ``/v1/responses``, which answers the turn with the
+HTTP 400 a ChatGPT account returns for a model it does not allow.
 """
 
 from __future__ import annotations

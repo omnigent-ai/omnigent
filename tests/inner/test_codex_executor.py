@@ -2789,13 +2789,7 @@ def test_format_codex_error_params_handles_missing_params() -> None:
 
 
 def test_unwrap_provider_error_json_extracts_responses_api_envelope() -> None:
-    """
-    A ChatGPT-account provider rejects a request with a Responses-API
-    error envelope — the reason nests under ``error.message`` rather
-    than a top-level ``message``. The unwrapper must extract the
-    human-readable reason (with the error code alongside), not return
-    the raw JSON envelope for the user to parse by eye.
-    """
+    """Unwrap a Responses-API envelope: the reason under ``error.message`` plus its code."""
     from omnigent.inner.codex_executor import _unwrap_provider_error_json
 
     envelope = (
@@ -2820,14 +2814,8 @@ def test_unwrap_provider_error_json_leaves_plain_text_unchanged() -> None:
 
 
 def test_format_codex_error_params_unwraps_top_level_provider_envelope() -> None:
-    """
-    Some app-server error frames put the provider's stringified JSON
-    envelope in the TOP-LEVEL ``message`` field (not nested under
-    ``params["error"]``). The formatter must unwrap that too — this is
-    the path that dumped the raw ``{"type":"error","status":400,...}``
-    blob into the chat as ``inner executor error: {json}`` when an
-    account-unsupported model was configured.
-    """
+    """An error frame can carry the provider's stringified envelope as its top-level
+    ``message`` (not under ``params["error"]``); the formatter must unwrap that too."""
     from omnigent.inner.codex_executor import _format_codex_error_params
 
     params = {
@@ -2847,12 +2835,7 @@ def test_format_codex_error_params_unwraps_top_level_provider_envelope() -> None
 
 
 async def test_run_turn_turn_failed_unwraps_provider_error_envelope() -> None:
-    """
-    A ``turn/failed`` frame can carry the provider's raw JSON error
-    envelope as its ``message``. The surfaced ``ExecutorError`` must
-    carry the extracted human-readable reason, not the envelope —
-    it is the text the user ultimately sees as the failed turn.
-    """
+    """A ``turn/failed`` frame carrying the provider's JSON envelope surfaces the reason."""
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd="/tmp/workspace",

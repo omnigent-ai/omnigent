@@ -1,47 +1,11 @@
-"""E2E regression: a Codex turn on an account-unsupported model surfaces the
-raw upstream 400 as an opaque ``inner executor error`` failure.
+"""E2E: a Codex turn rejected for an account-unsupported model surfaces the
+provider's reason, not the raw JSON error envelope.
 
-User journey (harness ``codex`` -- the ``codex app-server`` executor that renders
-in the web chat):
-
-1. A user runs a Codex session whose configured model the account does not allow
-   -- here ``gpt-6-astra`` on a ChatGPT-account-backed Codex provider.
-2. The user sends a message; the Codex app-server issues the Responses request.
-3. The provider rejects it with HTTP ``400 invalid_request_error``::
-
-       The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.
-
-4. Observable failure: the turn fails and surfaces to the chat UI as
-   ``turn surfaced to UI as failed for ... (harness=codex): {'code':
-   'runner_error', 'message': 'inner executor error: {"type":"error",
-   "status":400,"error":{"type":"invalid_request_error","message":"The
-   'gpt-6-astra' model is not supported ..."}}'}`` -- the raw provider JSON
-   error envelope is dumped verbatim rather than surfaced as a useful,
-   structured reason.
-
-This drives the REAL ``codex app-server`` via :class:`CodexExecutor` (the
-``harness=codex`` path) against a mock Responses endpoint that returns the exact
-production 400 -- injecting the upstream fault that a ChatGPT account produces
-for an unsupported model. The mock stands in for the real ChatGPT-account
-provider; the Omnigent surfacing code (``CodexExecutor``'s ``method == "error"``
-handler and the ``ExecutorAdapter`` ``inner executor error:`` wrapping in
-``omnigent/runtime/harnesses/_executor_adapter.py``) runs for real and produces
-the exact reported message.
-
-The ``ExecutorError`` this executor yields is what
-``ExecutorAdapter`` wraps verbatim into
-``RuntimeError(f"inner executor error: {detail}")`` and the runner/server then
-publish as the failed turn -- so asserting on ``ExecutorError.message`` asserts
-on the text a user ultimately sees in chat.
-
-Regression guard (holds before and after a fix): the turn genuinely fails on an
-unsupported model and the upstream reason is preserved. Fail->pass target
-(reproduces today; a fix flips it): the surfaced failure must carry a useful,
-structured reason -- not the raw provider JSON error envelope dumped verbatim.
-
-Usage::
-
-    pytest tests/e2e/test_codex_unsupported_model_e2e.py -v
+Drives the real ``codex app-server`` through :class:`CodexExecutor` against a
+local mock Responses endpoint that answers every turn with the exact HTTP 400 a
+ChatGPT account returns for a model it does not allow. The ``ExecutorError``
+message asserted here is what ``ExecutorAdapter`` wraps into
+``inner executor error: ...`` and the failed turn shows in chat.
 """
 
 from __future__ import annotations
@@ -157,10 +121,8 @@ async def test_codex_unsupported_model_surfaces_structured_reason(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    # Real ``codex app-server`` (harness=codex) routed at the mock provider, with
-    # the account-unsupported model pinned exactly as the bug reports. Retries are
-    # pinned off for determinism: a 400 invalid_request_error is a permanent
-    # client error and is never retried in production either.
+    # Retries are pinned off: a 400 is a permanent client error that production
+    # never retries either.
     executor = CodexExecutor(
         codex_path=codex_bin,
         cwd=str(workspace),
@@ -184,8 +146,7 @@ async def test_codex_unsupported_model_surfaces_structured_reason(
     completions = [event for event in events if isinstance(event, TurnComplete)]
     errors = [event for event in events if isinstance(event, ExecutorError)]
 
-    # Regression guard: the turn genuinely fails on an unsupported model and the
-    # upstream reason is preserved (must hold before AND after any fix).
+    # The turn must fail and keep the upstream reason.
     assert not completions, f"expected the turn to fail, got a completion: {events}"
     assert len(errors) == 1, f"expected exactly one executor error, got: {events}"
     surfaced = errors[0].message
@@ -194,11 +155,7 @@ async def test_codex_unsupported_model_surfaces_structured_reason(
         f"got: {surfaced!r}"
     )
 
-    # Fail->pass target (reproduces on the current build; a fix flips it): the
-    # user-facing failure must carry a useful, STRUCTURED reason -- not the raw
-    # provider JSON error envelope dumped verbatim. Today the message is the raw
-    # envelope, which reaches the chat as
-    # ``inner executor error: {"type":"error","status":400,...}``.
+    # The user-facing failure must be the reason, not the provider's JSON envelope.
     assert not surfaced.lstrip().startswith("{"), (
         "the surfaced failure is the raw provider JSON error envelope, not a "
         f"useful structured reason: {surfaced!r}"
