@@ -149,11 +149,12 @@ Once the set is genuinely green:
      instructions for optional sections such as Changelog. Do not replace the
      standard structure with custom `Root Cause`, `Validation`, or `Issues`
      sections.
-   - In **Summary**, lead with the user-visible problem and result, then explain
-     the cause and implementation in 1–3 short bullets or paragraphs. Use
-     complete sentences and plain language. Add a small diagram only when a
-     relationship or sequence is hard to follow in prose; do not add ELI5 or
-     diagram sections just to fill a template.
+   - In **Summary**, start non-trivial changes with a 1–2 sentence ELI5 of the
+     user-visible problem and result, inline rather than in a separate section.
+     Then explain the cause and implementation in 1–3 short bullets or
+     paragraphs. Use complete sentences and plain language. Add a small diagram
+     when a relationship or sequence is hard to follow in prose. Never include
+     placeholder diagrams or empty sections.
    - In **Test Plan**, group the proof into short, scannable bullets. Name the
      command or test, what failed before the fix, and what passes now. Do not
      paste `facets`, `test_transition`, other handoff fields, or a long comma-
