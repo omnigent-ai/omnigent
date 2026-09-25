@@ -90,6 +90,9 @@ deploy/
 ├── e2b/               ← E2B sandbox-provider guide (boots from a pre-built
 │   └── README.md         E2B template); NOT a server deploy target.
 │
+├── opensandbox/       ← OpenSandbox managed-host provider guide; connects an
+│   └── README.md         Omnigent server to an existing OpenSandbox deployment.
+│
 ├── gensee/            ← Gensee managed sandbox-provider guide (ephemeral
 │   └── README.md         provider-managed runtimes); NOT a server deploy target.
 │
@@ -287,7 +290,7 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, or Gensee).** With
+**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, OpenSandbox, or Gensee).** With
 *managed hosts*, creating a session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -309,9 +312,11 @@ Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
 Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`.
 Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY`.
-Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
-[`gensee/README.md`](gensee/README.md) for its managed-only configuration.
-All credentials come from the server environment.
+OpenSandbox reads `OPEN_SANDBOX_API_KEY`, `OPEN_SANDBOX_DOMAIN`, and optional
+protocol/proxy settings. Gensee reads `GENSEE_CONTROLLER_API_TOKEN`. All
+credentials come from the server environment; see
+[`opensandbox/README.md`](opensandbox/README.md) and
+[`gensee/README.md`](gensee/README.md) for their managed-only configuration.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
