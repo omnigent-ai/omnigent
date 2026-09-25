@@ -143,6 +143,7 @@ async def test_child_inherits_parent_model_override(
         parent_snapshot={
             "id": "conv_parent_inherit_override",
             "agent_id": "ag_parent",
+            "harness": "claude-sdk",
             "model_override": "databricks-claude-sonnet-4-6",
             "llm_model": "databricks-claude-opus-4-8",
         },
@@ -167,6 +168,7 @@ async def test_child_inherits_parent_llm_model_when_no_override(
         parent_snapshot={
             "id": "conv_parent_inherit_llm",
             "agent_id": "ag_parent",
+            "harness": "claude-sdk",
             "model_override": None,
             "llm_model": "databricks-claude-sonnet-4-6",
         },
@@ -317,14 +319,14 @@ async def test_unreachable_parent_snapshot_skips_inheritance(
 
 
 @pytest.mark.asyncio
-async def test_multi_model_child_of_different_parent_harness_skips(
+async def test_child_of_different_parent_harness_skips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A multi-model child (opencode) dispatched from a claude parent runs its own
-    default: opencode accepts any id but resolves it against its own provider,
-    where the parent's Claude id need not be servable. The child is created with
-    no ``model_override``.
+    A child on a different harness vendor (opencode) than the parent (claude)
+    runs its own default: opencode resolves the parent's Claude id against its
+    own provider, where it need not be servable. The child is created with no
+    ``model_override``.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
@@ -418,6 +420,32 @@ async def test_multi_model_child_native_variant_of_parent_inherits(
             "id": "conv_parent_pi_native",
             "agent_id": "ag_parent",
             "harness": "pi-native",
+            "model_override": "databricks-claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "databricks-claude-opus-5"
+
+
+@pytest.mark.asyncio
+async def test_child_shares_parent_vendor_across_sdk_native_split_inherits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``claude-sdk`` child of a ``claude-native`` parent inherits: the SDK and
+    native spellings of one vendor share a provider vocabulary, so the ``-native``
+    vs ``-sdk`` difference must not count them as foreign harnesses.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_parent_claude_variants",
+        parent_snapshot={
+            "id": "conv_parent_claude_variants",
+            "agent_id": "ag_parent",
+            "harness": "claude-native",
             "model_override": "databricks-claude-opus-5",
             "llm_model": None,
         },
