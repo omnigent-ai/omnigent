@@ -179,6 +179,13 @@ interface ElectronDesktopApi extends NativeShellApi {
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
 
+  /** Current Arca auto-connect status for the window's server. */
+  getArcaStatus?: () => Promise<ArcaStatus | null>;
+  /** Retry a failed Arca auto-connect. No-op unless the last run failed. */
+  retryArcaConnect?: () => Promise<ArcaStatus | null>;
+  /** Subscribe to Arca status changes for this window's server. Returns an unsubscribe. */
+  onArcaStatusChanged?: (callback: (status: ArcaStatus) => void) => () => void;
+
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
@@ -236,6 +243,30 @@ export interface DesktopFeatures {
    * window's server is Databricks-managed.
    */
   databricksInternalFeatures?: boolean;
+  /**
+   * Arca connect is offered for this window: the server is Databricks-managed
+   * and either the MDM flag is set, or the auto-connect feature flag is on and
+   * the arca CLI is installed.
+   * Older shells omit this field — treat absence as false.
+   */
+  arca?: boolean;
+}
+
+/** Live status of the Arca auto-connect for the window's server. */
+export interface ArcaStatus {
+  state: "unavailable" | "idle" | "starting" | "online" | "failed";
+  /** Exact `arca ssh …` command line the shell uses. */
+  command: string | null;
+  /** Online because the daemon was already running (warm launch). */
+  alreadyRunning?: boolean;
+  errorKind?:
+    "timeout" | "omni-auth" | "arca-auth" | "missing-remote-cli" | "unreachable" | "unknown";
+  /** User-facing error message. */
+  error?: string;
+  startedAt?: number;
+  finishedAt?: number;
+  /** Tail of the command output, for a Details view. */
+  output?: string;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -889,5 +920,53 @@ export async function resetCliPath(): Promise<CliStatus | null> {
   } catch (err) {
     console.warn("[nativeBridge] electron resetCliPath failed:", err);
     return null;
+  }
+}
+
+/**
+ * Get the current Arca auto-connect status from the desktop shell. Resolves
+ * `null` outside the Electron shell or under a shell too old to expose it.
+ */
+export async function getArcaStatus(): Promise<ArcaStatus | null> {
+  const electron = electronApi();
+  if (!electron?.getArcaStatus) return null;
+  try {
+    return await electron.getArcaStatus();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getArcaStatus failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Retry a failed Arca auto-connect. Only effective after a failure; resolves
+ * the current status otherwise. Resolves `null` outside the shell.
+ */
+export async function retryArcaConnect(): Promise<ArcaStatus | null> {
+  const electron = electronApi();
+  if (!electron?.retryArcaConnect) return null;
+  try {
+    return await electron.retryArcaConnect();
+  } catch (err) {
+    console.warn("[nativeBridge] electron retryArcaConnect failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Subscribe to Arca status changes from the desktop shell. The shell fires
+ * this whenever the auto-connect state changes for the window's server.
+ *
+ * Returns an unsubscribe function. A no-op outside the Electron shell or
+ * under a shell too old to push updates.
+ */
+export function onArcaStatusChanged(callback: (status: ArcaStatus) => void): () => void {
+  const electron = electronApi();
+  if (!electron?.onArcaStatusChanged) return () => {};
+  try {
+    return electron.onArcaStatusChanged(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] electron onArcaStatusChanged failed:", err);
+    return () => {};
   }
 }

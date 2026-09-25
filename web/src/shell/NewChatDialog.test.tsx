@@ -85,7 +85,9 @@ import {
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
+  retryArcaConnect,
 } from "@/lib/nativeBridge";
+import { useArcaStatus } from "@/hooks/useArcaAutoConnect";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readHarnessOptions } from "@/lib/modePreferences";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
@@ -183,6 +185,11 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   controlHost: vi.fn(async () => ({ ok: false })),
   getDesktopFeatures: vi.fn(async () => null),
   connectArcaHost: vi.fn(async () => ({ ok: false })),
+  retryArcaConnect: vi.fn(async () => null),
+}));
+// useArcaStatus: default null (outside Electron); Arca tests override per-test.
+vi.mock("@/hooks/useArcaAutoConnect", () => ({
+  useArcaStatus: vi.fn(() => null),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
@@ -3041,6 +3048,82 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     // selectHost persists the pick — the observable effect of auto-selection.
     await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
     expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Run on Arca — auto-connect UI extensions", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    mockHosts([]);
+    vi.mocked(isElectronShell).mockReturnValue(true);
+    vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: false, hostId: null });
+    vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
+    vi.mocked(getDesktopFeatures).mockResolvedValue({ arca: true });
+    vi.mocked(connectArcaHost).mockClear();
+    vi.mocked(fetchHosts).mockClear();
+    vi.mocked(useArcaStatus).mockReturnValue(null);
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.mocked(isElectronShell).mockReturnValue(false);
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+    vi.mocked(useArcaStatus).mockReturnValue(null);
+  });
+
+  async function openHostMenu() {
+    const chip = await screen.findByTestId("new-chat-landing-host-chip");
+    fireEvent.pointerDown(chip, { button: 0 });
+    fireEvent.click(chip);
+  }
+
+  it("shows the Arca option when features.arca is true without the MDM flag", async () => {
+    // The MDM flag is NOT set; only features.arca is true.
+    vi.mocked(getDesktopFeatures).mockResolvedValue({
+      arca: true,
+      databricksInternalFeatures: false,
+    });
+    renderLanding();
+    await openHostMenu();
+    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();
+  });
+
+  it("disables the Arca row and names the running command while auto-connect is starting", async () => {
+    vi.mocked(useArcaStatus).mockReturnValue({
+      state: "starting",
+      command:
+        "arca ssh isaac omni host --server https://example.com --background --non-interactive",
+    });
+    renderLanding();
+    await openHostMenu();
+
+    const item = await screen.findByTestId("new-chat-landing-run-on-arca");
+    expect(item.textContent).toContain("Arca • Running isaac omni host…");
+    expect(item).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("labels the Arca row as retry and calls retryArcaConnect when failed", async () => {
+    vi.mocked(useArcaStatus).mockReturnValue({
+      state: "failed",
+      command:
+        "arca ssh isaac omni host --server https://example.com --background --non-interactive",
+      errorKind: "timeout",
+      error: "Timed out.",
+      finishedAt: 1000,
+    });
+    renderLanding();
+    await openHostMenu();
+
+    const item = await screen.findByTestId("new-chat-landing-run-on-arca");
+    expect(item.textContent).toContain("Couldn't connect Arca • Retry");
+    expect(screen.getByTestId("new-chat-landing-arca-autoconnect-error").textContent).toBe(
+      "Timed out.",
+    );
+
+    // Selecting calls retryArcaConnect, not the manual consent flow.
+    fireEvent.click(item);
+    await waitFor(() => expect(vi.mocked(retryArcaConnect)).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(connectArcaHost)).not.toHaveBeenCalled();
   });
 });
 

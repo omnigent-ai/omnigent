@@ -23,7 +23,7 @@
  * injected so everything is unit-testable without Electron or a real arca.
  */
 
-const { execFileSync, spawn } = require("node:child_process");
+const { execFile, execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -43,6 +43,10 @@ const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
  * this set is refused outright.
  */
 const SAFE_URL_RE = /^[A-Za-z0-9\-._~:/?=&%]+$/;
+
+/**
+ * @typedef {"timeout" | "omni-auth" | "arca-auth" | "missing-remote-cli" | "unreachable" | "unknown"} ArcaErrorKind
+ */
 
 /**
  * Well-known install locations for the arca binary. Probed because a
@@ -113,6 +117,25 @@ function resolveArcaPath(deps = {}) {
 }
 
 /**
+ * {@link resolveArcaPath} without blocking the caller: the PATH probe runs the
+ * shell asynchronously, so the Electron main process never stalls on it.
+ *
+ * @param {{
+ *   isExecutableFile?: (p: string) => boolean,
+ *   candidatePaths?: () => string[],
+ * }} [deps]
+ * @returns {Promise<string | null>}
+ */
+function resolveArcaPathAsync(deps = {}) {
+  return new Promise((resolve) => {
+    execFile("/bin/sh", ["-c", "command -v arca"], { encoding: "utf8" }, (error, stdout) => {
+      const onPath = error ? null : String(stdout).trim() || null;
+      resolve(resolveArcaPath({ ...deps, whichArca: () => onPath }));
+    });
+  });
+}
+
+/**
  * Build the arca argv that connects the instance to `serverUrl`. Everything
  * after "ssh" is passed through to ssh and runs as the remote command.
  *
@@ -150,14 +173,18 @@ function buildConnectArgs(serverUrl) {
  * against known arca / omnigent CLI failure shapes; anything unrecognized
  * falls through to the captured output.
  *
+ * `errorKind` lets callers offer the one fix that applies (retry, sign in on
+ * Arca, or `arca login` on this machine).
+ *
  * @param {{ code: number | null, stdout: string, stderr: string, timedOut?: boolean }} run
- * @returns {{ ok: false, error: string, authError?: boolean }}
+ * @returns {{ ok: false, error: string, errorKind: ArcaErrorKind, authError?: boolean }}
  */
 function describeConnectFailure(run) {
   const output = `${run.stderr}\n${run.stdout}`;
   if (run.timedOut) {
     return {
       ok: false,
+      errorKind: "timeout",
       error:
         "Connecting to Arca timed out. The instance may still be starting — " +
         "check `arca status` and try again.",
@@ -169,6 +196,7 @@ function describeConnectFailure(run) {
     return {
       ok: false,
       authError: true,
+      errorKind: "omni-auth",
       error:
         "The Arca instance isn't signed in to this server. Run " +
         "`arca ssh` and sign in with `isaac omni login <server-url>`, then try again.",
@@ -179,14 +207,26 @@ function describeConnectFailure(run) {
   if (run.code === 127 || /(isaac|omni(gent)?):? .*(command )?not found/i.test(output)) {
     return {
       ok: false,
+      errorKind: "missing-remote-cli",
       error:
         "`isaac omni` isn't available on the Arca instance. " +
         "Check the isaac setup there (`arca ssh`, then `isaac omni --help`) and try again.",
     };
   }
+  // This machine's arca credentials are missing or expired, so ssh never
+  // reached the instance.
+  if (/arca (auth )?login|certificate.*expired|permission denied \(publickey/i.test(output)) {
+    return {
+      ok: false,
+      errorKind: "arca-auth",
+      error:
+        "Your arca sign-in on this machine has expired. Run `arca login` in a terminal, then try again.",
+    };
+  }
   if (/error connecting to arca/i.test(output)) {
     return {
       ok: false,
+      errorKind: "unreachable",
       error:
         "Couldn't reach the Arca instance. Try `arca stop && arca start` in a terminal, " +
         "then connect again.",
@@ -195,6 +235,7 @@ function describeConnectFailure(run) {
   const detail = run.stderr.trim() || run.stdout.trim();
   return {
     ok: false,
+    errorKind: "unknown",
     error: detail
       ? `Connecting to Arca failed: ${lastLine(detail)}`
       : `Connecting to Arca failed (exit code ${run.code ?? "unknown"}).`,
@@ -347,6 +388,8 @@ module.exports = {
   buildConnectArgs,
   connectArcaHost,
   describeConnectFailure,
+  isExecutableFile,
   resolveArcaPath,
+  resolveArcaPathAsync,
   startArcaConnect,
 };

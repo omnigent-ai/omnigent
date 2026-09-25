@@ -120,6 +120,21 @@ describe("arca connect failures", () => {
     );
   });
 
+  it("tags each failure with the kind of fix it needs", () => {
+    const kind = (run) =>
+      describeConnectFailure({ code: 1, stdout: "", stderr: "", ...run }).errorKind;
+    assert.equal(kind({ code: null, timedOut: true }), "timeout");
+    assert.equal(kind({ stderr: "Not signed in to https://srv." }), "omni-auth");
+    assert.equal(
+      kind({ code: 127, stderr: "bash: isaac: command not found" }),
+      "missing-remote-cli",
+    );
+    assert.equal(kind({ stderr: "Error connecting to arca." }), "unreachable");
+    assert.equal(kind({ stderr: "Your certificate has expired. Run `arca login`." }), "arca-auth");
+    assert.equal(kind({ stderr: "user@host: Permission denied (publickey)." }), "arca-auth");
+    assert.equal(kind({ stderr: "something else" }), "unknown");
+  });
+
   it("falls back to the last output line for unrecognized failures", () => {
     const result = describeConnectFailure({
       code: 1,
