@@ -11,7 +11,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from omnigent_client import StaleCursorError
+from omnigent_client import PaginatedList, StaleCursorError
 from omnigent_ui_sdk import OverlayTarget
 from rich.console import Console, RenderableType
 
@@ -65,12 +65,12 @@ class _Sessions:
 
     async def list_items(
         self, session_id: str, *, limit: int, after: str | None, order: str
-    ) -> list[dict[str, object]]:
+    ) -> PaginatedList:
         self.list_calls.append(after)
         page = self.pages.pop(0) if self.pages else []
         if isinstance(page, Exception):
             raise page
-        return page  # type: ignore[return-value]
+        return PaginatedList.from_dict({"data": page})
 
     async def get(self, session_id: str) -> SimpleNamespace:
         if self.get_error is not None:

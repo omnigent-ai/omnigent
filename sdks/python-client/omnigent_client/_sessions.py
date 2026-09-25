@@ -36,6 +36,7 @@ from omnigent.server.schemas import ServerStreamEvent
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _SSE_TIMEOUT
+from ._types import PaginatedList
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
@@ -500,11 +501,15 @@ class SessionsNamespace:
         not resolvable this way and raises ``LookupError``.
 
         Follows the listing cursor, so an agent past the first page
-        still resolves.
+        still resolves. The only quiet end of the walk is the server
+        reporting ``has_more`` false; a stalled listing raises instead
+        of masquerading as a clean miss.
 
         :param agent_name: Agent display name, e.g. ``"hello_world"``.
         :returns: The matching agent's id and advertised harness.
-        :raises OmnigentError: If the listing returns a non-2xx status.
+        :raises OmnigentError: If the listing returns a non-2xx status,
+            or reports ``has_more`` with a missing or non-advancing
+            ``last_id`` cursor (a stalled walk, not an absent agent).
         :raises LookupError: If no registered agent has that name.
         """
         # Cap the miss-path name list: a large deployment should not
@@ -539,8 +544,22 @@ class SessionsNamespace:
                 break
             last_id = listing.get("last_id")
             if not last_id:
-                break
-            after = str(last_id)
+                # Server reports more pages but provides no cursor to advance
+                # — raise rather than silently stopping, so callers can
+                # distinguish a pagination stall from "agent not found".
+                raise OmnigentError(
+                    f"agent listing stalled: server returned has_more=True but"
+                    f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
+                )
+            next_after = str(last_id)
+            if next_after == after:
+                # A cursor that does not advance would page forever; raise
+                # instead of looping on the same page.
+                raise OmnigentError(
+                    f"agent listing stalled: server repeated cursor {next_after!r}"
+                    f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
+                )
+            after = next_after
         available = ", ".join(names) + (", …" if truncated else "")
         raise LookupError(
             f"No agent named {agent_name!r} is registered on this server. Available: {available}"
@@ -886,7 +905,7 @@ class SessionsNamespace:
         limit: int = 100,
         after: str | None = None,
         order: str = "asc",
-    ) -> builtins.list[dict[str, Any]]:
+    ) -> PaginatedList:
         """
         List items in a session with cursor-based pagination.
 
@@ -900,7 +919,9 @@ class SessionsNamespace:
         :param after: Cursor — return items after this item ID.
         :param order: Sort order, ``"asc"`` (chronological) or
             ``"desc"``.
-        :returns: List of conversation item dicts.
+        :returns: :class:`PaginatedList` with ``data``, ``has_more``,
+            ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
+            ``after=`` to fetch the next page when ``result.has_more``.
         :raises StaleCursorError: If ``after`` names an item that has since
             been deleted. The walk cannot continue from that cursor —
             restart it from the first page with no cursor.
@@ -916,15 +937,15 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
-        data = body.get("data", [])
-        return data if isinstance(data, list) else []
+        return PaginatedList.from_dict(body)
 
     async def child_sessions(
         self,
         session_id: str,
         *,
         limit: int = 100,
-    ) -> builtins.list[dict[str, Any]]:
+        after: str | None = None,
+    ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
 
@@ -939,19 +960,23 @@ class SessionsNamespace:
             e.g. ``"conv_parent123"``.
         :param limit: Maximum number of children to return
             (1-1000, default 100).
-        :returns: List of child-session summary dicts (empty when the
-            session has no sub-agents).
+        :param after: Cursor — return children after this session ID.
+        :returns: :class:`PaginatedList` with ``data``, ``has_more``,
+            ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
+            ``after=`` to fetch the next page when ``result.has_more``.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """
+        params: dict[str, str | int] = {"limit": limit}
+        if after is not None:
+            params["after"] = after
         resp = await self._http.get(
             f"{self._base}/v1/sessions/{session_id}/child_sessions",
-            params={"limit": limit},
+            params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
-        data = body.get("data", [])
-        return data if isinstance(data, list) else []
+        return PaginatedList.from_dict(body)
 
     async def child_sessions_tree(
         self,
@@ -987,8 +1012,8 @@ class SessionsNamespace:
         while frontier and depth < max_depth:
             next_frontier: list[str] = []
             for parent_id in frontier:
-                rows = await self.child_sessions(parent_id, limit=limit)
-                for row in rows:
+                page = await self.child_sessions(parent_id, limit=limit)
+                for row in page.data:
                     if not isinstance(row, dict):
                         continue
                     sid = row.get("id")

@@ -83,7 +83,7 @@ def test_child_sessions_sdk_helpers_against_live_server(
     out = asyncio.run(_drive())
 
     # ── child_sessions: one level only (no grandchild).
-    one_ids = {r["id"] for r in out["one_level"]}  # type: ignore[union-attr]
+    one_ids = {r["id"] for r in out["one_level"].data}  # type: ignore[union-attr]
     assert one_ids == {child_a, child_b}, f"child_sessions one-level mismatch: {one_ids}"
 
     # ── child_sessions_tree: recurses to the grandchild + tags parent_id.
