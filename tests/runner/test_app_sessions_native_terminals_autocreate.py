@@ -2526,7 +2526,7 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
         "code": "native_terminal_start_failed",
         "error_id": error_id,
         "message": (
-            "Native Codex terminal failed to start; "
+            "Native Codex terminal failed to start (ImportError); "
             f"see the runner log for details: {pinned_runner_log} "
             f"Error ID: {error_id}."
         ),
@@ -2535,6 +2535,9 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     # logged for operators. If this fails, the redaction regressed (raw
     # text back in the payload) or the server-side log was dropped.
     assert "requires the 'codex' CLI" not in error["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in error["message"]
     assert "requires the 'codex' CLI on PATH." in caplog.text
     assert error_id in caplog.text
     assert [p.event for p in published] == [

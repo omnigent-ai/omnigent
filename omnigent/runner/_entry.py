@@ -1730,10 +1730,14 @@ async def _run_tunnel_from_env() -> None:
     # Set when the launcher adopts this runner (tmux detach); makes the
     # parent-death killer stand down so the runner outlives the CLI.
     adopted_event = threading.Event()
+    _shutting_down_state = getattr(app.state, "shutting_down", None)
     _install_signal_handlers(
         stop_event,
         adopted_event=adopted_event,
         record_reason=_record_exit_reason,
+        mark_shutting_down=(
+            _shutting_down_state.set if _shutting_down_state is not None else None
+        ),
     )
     # Set (instead of stop_event) on an idle-reaper shutdown so the tunnel
     # drains its session streams and closes cleanly — the server then sees an
@@ -1897,6 +1901,7 @@ def _install_signal_handlers(
     stop_event: asyncio.Event,
     adopted_event: threading.Event | None = None,
     record_reason: Callable[[str], None] | None = None,
+    mark_shutting_down: Callable[[], None] | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -1908,6 +1913,10 @@ def _install_signal_handlers(
     :param record_reason: Optional callback given the signal name when a
         shutdown signal arrives, so the exit log line can attribute the
         cause. ``None`` skips attribution.
+    :param mark_shutting_down: Optional callback invoked (no args) when a
+        shutdown signal arrives, before any teardown runs — lets app.py tell
+        an intentional stop from a real crash when a terminal watcher races
+        the shutdown. ``None`` skips it.
     :returns: None.
     """
     loop = asyncio.get_running_loop()
@@ -1920,6 +1929,8 @@ def _install_signal_handlers(
         """
         if record_reason is not None:
             record_reason(f"received {signal.Signals(sig).name}")
+        if mark_shutting_down is not None:
+            mark_shutting_down()
         stop_event.set()
 
     degraded = False

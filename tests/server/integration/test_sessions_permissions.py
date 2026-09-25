@@ -2730,6 +2730,64 @@ async def test_w7_2_session_scoped_agent_requires_owning_session_access(
     )
 
 
+async def test_fork_switch_binds_session_scoped_target_with_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Forking into a session-scoped custom agent the caller can read succeeds.
+
+    ``POST /v1/sessions/{id}/fork`` runs ``body.agent_id`` through the same
+    ``validate_session_agent`` check as ``POST /v1/sessions``, so corey can
+    fork his own session into a custom agent he also owns.
+    """
+    agent = await create_test_agent(auth_client, name="corey-custom-agent", user="corey")
+    source = await _create_session_as(auth_client, "", "corey", title="corey-source")
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{source['id']}/fork",
+        json={"agent_id": agent["id"]},
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert resp.status_code == 201, (
+        f"Expected 201 when corey forks into his own custom agent, "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    fork_id = resp.json()["id"]
+
+    agent_resp = await auth_client.get(
+        f"/v1/sessions/{fork_id}/agent",
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert agent_resp.status_code == 200, agent_resp.text
+    assert agent_resp.json()["name"] == "corey-custom-agent"
+
+
+async def test_fork_switch_denies_session_scoped_target_without_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Forking into a session-scoped custom agent the caller cannot read is denied.
+
+    Bryan owns the session that owns the custom agent. Corey forks his own
+    session and names Bryan's agent as the target with no grant on Bryan's
+    session, so ``validate_session_agent`` must reject the fork before it is
+    created.
+    """
+    agent = await create_test_agent(auth_client, name="bryan-custom-agent", user="bryan")
+    source = await _create_session_as(auth_client, "", "corey", title="corey-source")
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{source['id']}/fork",
+        json={"agent_id": agent["id"]},
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert resp.status_code in (403, 404), (
+        f"Expected 403/404 for a session-scoped target corey cannot read, "
+        f"got {resp.status_code}: {resp.text}"
+    )
+
+    corey_sessions = await _list_sessions_as(auth_client, "corey")
+    assert [s["id"] for s in corey_sessions] == [source["id"]]
+
+
 async def test_create_session_rejects_other_users_host(
     host_perm_app: FastAPI,
     host_perm_client: httpx.AsyncClient,

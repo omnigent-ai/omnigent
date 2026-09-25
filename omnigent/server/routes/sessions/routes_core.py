@@ -2926,7 +2926,7 @@ def register_core_routes(
 
         Deep-copies the source session's conversation items and
         clones the agent into a new session. When ``body.agent_id``
-        is set, the fork binds that built-in agent instead of the
+        is set, the fork binds that agent instead of the
         source's — switching harness (e.g. Claude-SDK → Claude Code,
         or Claude → Codex). The source's model settings carry over
         only within the same provider family; a same-family native
@@ -2973,9 +2973,10 @@ def register_core_routes(
         :param body: The validated :class:`SessionForkRequest`.
         :returns: A :class:`SessionResponse` describing the newly
             created fork (status ``"idle"``).
-        :raises OmnigentError: 404 if *source_id* does not exist
-            or ``body.agent_id`` is not a bindable built-in agent;
-            403 if the caller lacks read access; 400 if the source
+        :raises OmnigentError: 404 if *source_id* does not exist or
+            ``body.agent_id`` names no agent; 403/404 if the caller
+            lacks read access on the source, or on the session that
+            owns a session-scoped ``body.agent_id``; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
             for a sandbox this server has not configured.
@@ -3025,21 +3026,23 @@ def register_core_routes(
 
         # By default the fork clones the source's agent (same harness). When
         # ``body.agent_id`` names a different agent, the fork SWITCHES to it
-        # — e.g. fork a Claude-SDK session into Claude Code. Only built-in
-        # agents (``session_id IS NULL``) are bindable: a session-scoped
-        # agent belongs to one conversation (possibly another user's) and
-        # must never be cloned across sessions.
+        # — e.g. fork a Claude-SDK session into Claude Code. A session-scoped
+        # target is bindable if the caller can read the session that owns it.
         base_agent = source_agent
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
         if target_agent_id is not None and switching_agent:
-            target_agent = await asyncio.to_thread(agent_store.get, target_agent_id)
-            if target_agent is None or target_agent.session_id is not None:
-                raise OmnigentError(
-                    f"Agent not found or not bindable: {target_agent_id!r}",
-                    code=ErrorCode.NOT_FOUND,
-                )
-            base_agent = target_agent
+            from omnigent.server.routes._session_create_validation import (
+                validate_session_agent,
+            )
+
+            base_agent = await validate_session_agent(
+                user_id=user_id,
+                agent_id=target_agent_id,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
 
         if source.inference_snapshot is not None and switching_agent:
             from omnigent.harness_aliases import canonicalize_harness

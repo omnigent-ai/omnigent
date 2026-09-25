@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import errno
 import json
 import logging
 import os
@@ -7163,6 +7164,61 @@ def _measured_prefix_bytes(transcript_path: Path) -> int | None:
         return None
 
 
+_ERRNO_CHAIN_MAX_DEPTH = 3
+
+
+def _os_error_with_errno(exc: BaseException) -> OSError | None:
+    """
+    Find an ``OSError`` with a known errno in ``exc`` or its short cause chain.
+
+    Walks ``__cause__``/``__context__`` a few links so a wrapping exception
+    (e.g. a ``RuntimeError`` raised from a disk-full ``OSError``) still
+    surfaces the errno.
+
+    :param exc: Exception raised by the native terminal creation path.
+    :returns: The first ``OSError`` with a non-``None`` ``errno``, or
+        ``None`` if the chain has none.
+    """
+    current: BaseException | None = exc
+    for _ in range(_ERRNO_CHAIN_MAX_DEPTH):
+        if current is None:
+            return None
+        if isinstance(current, OSError) and current.errno is not None:
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _native_terminal_start_failure_cause(exc: BaseException) -> str:
+    """
+    Summarize a native terminal start exception using only structured facts.
+
+    Never includes free-form exception text (which can carry launch paths or
+    other sensitive detail) — only the exception type, an OS errno name
+    (walking a short cause chain), an ``OmnigentError`` code, or the direct
+    cause's type name.
+
+    :param exc: Exception raised by the native terminal creation path,
+        e.g. ``OSError(28, "No space left on device")``.
+    :returns: e.g. ``"OSError errno 28 ENOSPC"`` or
+        ``"RuntimeError (cause ReadTimeout)"``.
+    """
+    class_name = type(exc).__name__
+    os_error = _os_error_with_errno(exc)
+    if os_error is not None:
+        assert os_error.errno is not None
+        errno_name = errno.errorcode.get(os_error.errno)
+        detail = f"errno {os_error.errno}"
+        if errno_name:
+            detail = f"{detail} {errno_name}"
+        return f"{class_name} {detail}"
+    if isinstance(exc, OmnigentError):
+        return f"{class_name} code {exc.code}"
+    if exc.__cause__ is not None:
+        return f"{class_name} (cause {type(exc.__cause__).__name__})"
+    return class_name
+
+
 def _native_terminal_start_error_payload(
     exc: BaseException, runtime_name: str, *, session_id: str
 ) -> dict[str, str]:
@@ -7247,8 +7303,9 @@ def _native_terminal_start_error_payload(
         )
     else:
         log_reference = process_log_reference("runner")
+        cause = _native_terminal_start_failure_cause(exc)
         message = (
-            f"Native {runtime_name} terminal failed to start; "
+            f"Native {runtime_name} terminal failed to start ({cause}); "
             f"see the runner log for details: {log_reference}"
         )
     return {

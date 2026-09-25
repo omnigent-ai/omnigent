@@ -31,6 +31,14 @@ Put it where it belongs for the path you're on, and carry the same text in the
   **"Validate the fix live"** block as a PR comment (`gh pr comment <pr>`) so the
   reviewer and author get the command without you editing their description.
 
+Before syncing an authored PR body or writing the final handoff, refresh its
+Test Plan and Demo against the current authored commit (the final pushed head on
+direct runs). Distinguish tests rerun on that commit from earlier evidence and
+remove stale preview or footage claims. Keep the live-validation prompt short
+enough not to repeat the whole Test Plan. After editing the saved body, rerun
+the target's template validator and advisory hygiene checker when available.
+If a later push changes the evidence, repeat this review before the handoff.
+
 **Lead with the one command that runs it — and pick it by `validation_surface`
 (4.1).** The command shape differs by which side your fix runs on:
 

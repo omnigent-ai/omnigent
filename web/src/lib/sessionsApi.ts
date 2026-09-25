@@ -776,7 +776,7 @@ export async function createBundledSession(
  *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
  * @param options.title - Optional title for the new fork.
- * @param options.agentId - Optional built-in agent to switch the fork to
+ * @param options.agentId - Optional agent to switch the fork to
  *   (e.g. fork a Claude-SDK session into Claude Code). Omitted → keep the
  *   source's agent. The server carries model settings (and native
  *   history) across only within the same provider family.

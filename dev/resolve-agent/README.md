@@ -99,6 +99,13 @@ follows the existing PR's remediation and publication rules.
   generic publisher overlay: the agent commits locally, prepares no PR body, and
   the workflow suppresses publication.
 
+For authored PRs, Resolve reviews the added comments and, when available, runs
+the advisory PR hygiene check on the final diff and description. It flags
+comment blocks longer than three lines, descriptions over 600 visible words,
+and repeated prose. It does not delete necessary safety explanations or block
+publication. The internal publisher repeats the check before creating a PR,
+including when the target checkout predates the checker.
+
 Because direct publication may **push and open a PR**, and review mode may comment
 on an existing PR,
 `dev/resolve.py` asks you to confirm before it launches the agent (skip with

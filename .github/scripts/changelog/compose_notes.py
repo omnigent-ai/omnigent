@@ -92,6 +92,23 @@ def compose_notes(
             refs = ", ".join(_pr_link(credit["pr"], repo) for credit in group)
             contributions.append(f"{refs}, {_author_link(group[0])}")
         lines.extend(["; ".join(contributions), ""])
+    lines.extend(
+        [
+            "### 💜 Thanks to our community",
+            "",
+            (
+                "This release was shaped by the people who filed issues, opened PRs, and "
+                + "talked through feature requests with us on our Discord! Thank you for "
+                + "building omnigent with us, keep the bug reports, ideas and contributions "
+                + "coming :)"
+            ),
+            "",
+        ]
+    )
+    # Include highlighted authors too; GitHub handles are case-insensitive.
+    authors = {credit["author"].casefold(): credit for credit in credits if credit["author"]}
+    if authors:
+        lines.extend([", ".join(_author_link(authors[name]) for name in sorted(authors)), ""])
     lines.append(f"Full Changelog: https://github.com/{repo}/blob/main/CHANGELOG.md")
     return "\n".join(lines) + "\n"
 

@@ -25,6 +25,7 @@ import {
 import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
+  ArrowUpDownIcon,
   ArchiveRestoreIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
@@ -4868,27 +4869,32 @@ function ProjectFolderMenuItems({
         Project settings
       </C.Item>
       {actions.ordering && (
-        <>
-          <C.Separator />
-          {(["up", "down", "top", "bottom"] as const).map((destination) => (
-            <C.Item
-              key={destination}
-              disabled={
-                actions.ordering!.disabled ||
-                (destination === "up" || destination === "top"
-                  ? actions.ordering!.first
-                  : actions.ordering!.last)
-              }
-              onSelect={() => actions.ordering!.move(destination)}
-            >
-              {destination === "top" || destination === "bottom"
-                ? `Move to ${destination}`
-                : `Move ${destination}`}
-            </C.Item>
-          ))}
-          <C.Separator />
-        </>
+        <C.Sub>
+          <C.SubTrigger data-testid="move-project">
+            <ArrowUpDownIcon className="size-3.5" />
+            Move
+          </C.SubTrigger>
+          <C.SubContent>
+            {(["up", "down", "top", "bottom"] as const).map((destination) => (
+              <C.Item
+                key={destination}
+                disabled={
+                  actions.ordering!.disabled ||
+                  (destination === "up" || destination === "top"
+                    ? actions.ordering!.first
+                    : actions.ordering!.last)
+                }
+                onSelect={() => actions.ordering!.move(destination)}
+              >
+                {destination === "top" || destination === "bottom"
+                  ? `Move to ${destination}`
+                  : `Move ${destination}`}
+              </C.Item>
+            ))}
+          </C.SubContent>
+        </C.Sub>
       )}
+      <C.Separator />
       <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
         <Trash2Icon className="size-3.5" />
         Delete project

@@ -284,7 +284,7 @@ function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: (
 
 /**
  * Open the picker and commit (select + close) an agent by clicking its row.
- * The composed agents these tests use live under the "Custom agents"
+ * The composed agents these tests use live under the custom-agent "Other..."
  * submenu, so drill in when the row isn't already listed inline.
  */
 function selectAgent(agentId: string): void {

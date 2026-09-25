@@ -2488,6 +2488,75 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
     }
 
 
+@pytest.mark.parametrize(
+    ("payload_fields", "expected_detail"),
+    [
+        (
+            {"error": "server_error", "last_assistant_message": "API Error: 500 Overloaded"},
+            "API Error: 500 Overloaded",
+        ),
+        (
+            {"error": "rate_limit"},
+            "Claude Code ended the turn with an API error (rate_limit).",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
+    tmp_path: Path,
+    payload_fields: dict[str, str],
+    expected_detail: str,
+) -> None:
+    """
+    The failed edge carries the hook's own error text, else its category.
+
+    The transcript mirror can land the error after the edge or never, so
+    without this the server reports the turn's last prose or no detail.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "StopFailure", "session_id": "claude-session", **payload_fields},
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        request = await _get_recorded_request(server)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    # ``failure_detail``, not ``output``: wire output is labeled a Codex error.
+    assert request["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "failed", "failure_detail": expected_detail},
+    }
+
+
 @pytest.mark.asyncio
 async def test_forwarder_start_at_end_uses_byte_offset_for_new_lines(
     tmp_path: Path,
