@@ -106,6 +106,9 @@ from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
+from omnigent.server.routes.session_archive_retention import (
+    create_session_archive_retention_router,
+)
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
@@ -120,6 +123,10 @@ from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.session_archive_retention import (
+    SessionArchiveRetentionService,
+    SessionArchiveRetentionSweeper,
+)
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -133,6 +140,7 @@ from omnigent.stores.conversation_store import (
     SessionConnectivity,
     runner_seen_is_fresh,
 )
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -1763,9 +1771,27 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        retention_sweeper: SessionArchiveRetentionSweeper | None = None
+        retention_service = getattr(app_inst.state, "session_archive_retention", None)
+        if isinstance(retention_service, SessionArchiveRetentionService):
+            retention_sweeper = SessionArchiveRetentionSweeper(retention_service)
+            app_inst.state.session_archive_retention_sweeper = retention_sweeper
+            # Retention is housekeeping: a failure to arm the loop must not
+            # take down server boot. The next process start tries again.
+            try:
+                await retention_sweeper.start()
+            except Exception:
+                _logger.exception(
+                    "session archive retention sweeper failed to start; "
+                    "continuing without automatic archival"
+                )
+                retention_sweeper = None
+
         try:
             yield
         finally:
+            if retention_sweeper is not None:
+                await retention_sweeper.shutdown()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
@@ -3217,6 +3243,20 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
+    if isinstance(conversation_store, SqlAlchemyConversationStore):
+        retention_service = SessionArchiveRetentionService(
+            conversation_store,
+            enforce_ownership=permission_store is not None,
+        )
+        app.state.session_archive_retention = retention_service
+        app.include_router(
+            create_session_archive_retention_router(
+                retention_service,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["sessions"],
+        )
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.
     if project_store is not None:

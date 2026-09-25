@@ -5107,3 +5107,177 @@ class UpdateProjectRequest(BaseModel):
         if len(trimmed) > 100:
             raise ValueError("name must be at most 100 characters")
         return trimmed
+
+
+class SessionArchiveRetentionProtection(BaseModel):
+    """One visible protection rule for inactive-session archival.
+
+    :param kind: Which sessions the rule covers.
+    :param enabled: Whether the rule keeps matching sessions.
+    :param label_keys: Label keys that keep a session. Populated for
+        ``labeled``; empty for the other kinds.
+    """
+
+    kind: Literal["pinned", "shared", "project", "labeled"]
+    enabled: bool
+    label_keys: list[str] = Field(default_factory=list)
+
+
+class SessionArchiveRetentionRules(BaseModel):
+    """Deterministic exclusion rules, returned before the policy is enabled.
+
+    :param inactivity_basis: Persisted timestamp inactivity is measured from.
+    :param always_exclude: Reasons that always keep a session, even when the
+        optional protections are off.
+    :param protections: Optional protections and the always-on retain label.
+    """
+
+    inactivity_basis: Literal["updated_at"] = "updated_at"
+    always_exclude: list[Literal["active_work", "pending_user_input"]]
+    protections: list[SessionArchiveRetentionProtection]
+
+
+class SessionArchiveRetentionSession(BaseModel):
+    """One session named by a preview or a retention run.
+
+    :param id: Session id.
+    :param title: Session title, or ``None`` when untitled.
+    :param updated_at: Persisted last-activity time, epoch seconds.
+    :param reasons: Why the session was kept. Empty when it was or would be
+        archived.
+    """
+
+    id: str
+    title: str | None = None
+    updated_at: int
+    reasons: list[str] = Field(default_factory=list)
+
+
+class SessionArchiveRetentionRunRecord(BaseModel):
+    """Audit of the latest retention run, stored with the policy.
+
+    :param ran_at: Epoch seconds the run finished.
+    :param archived_session_ids: Sessions that run archived.
+    :param skipped: Inactive sessions the run left in place.
+    :param truncated: True when the stored lists were capped.
+    """
+
+    ran_at: int
+    archived_session_ids: list[str] = Field(default_factory=list)
+    skipped: list[SessionArchiveRetentionSession] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class SessionArchiveRetentionPolicyResponse(BaseModel):
+    """Response for ``GET`` and ``PUT /v1/session-archive-retention``.
+
+    :param enabled: Whether sweeps and manual runs archive sessions.
+    :param inactive_days: Configured inactivity period. ``None`` until set.
+    :param protect_pinned: Keep the caller's pinned sessions.
+    :param protect_shared: Keep sessions shared with someone else.
+    :param protect_project: Keep sessions filed in a project.
+    :param protect_label_keys: Extra label keys that keep a session.
+        ``omnigent.retain`` always protects and is listed under ``rules``.
+    :param rules: Protections as they will apply, including while disabled.
+    :param last_run: Audit of the latest apply, or ``None`` if it has never run.
+    """
+
+    object: Literal["session_archive_retention"] = "session_archive_retention"
+    enabled: bool
+    inactive_days: int | None = None
+    protect_pinned: bool
+    protect_shared: bool
+    protect_project: bool
+    protect_label_keys: list[str] = Field(default_factory=list)
+    rules: SessionArchiveRetentionRules
+    last_run: SessionArchiveRetentionRunRecord | None = None
+
+
+class UpdateSessionArchiveRetentionRequest(BaseModel):
+    """Body for ``PUT /v1/session-archive-retention``.
+
+    Enabling requires ``inactive_days``. Disabling keeps the saved period so
+    it can be turned back on without sending it again.
+
+    :param enabled: Turn the policy on or off.
+    :param inactive_days: Days of inactivity before a session is eligible.
+    :param protect_pinned: Keep pinned sessions.
+    :param protect_shared: Keep shared sessions.
+    :param protect_project: Keep project-filed sessions.
+    :param protect_label_keys: Extra label keys that keep a session.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    inactive_days: int | None = Field(default=None, ge=1, le=3650)
+    protect_pinned: bool = True
+    protect_shared: bool = True
+    protect_project: bool = True
+    protect_label_keys: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _enabled_needs_period(self) -> UpdateSessionArchiveRetentionRequest:
+        """Reject an enabled policy that has no retention period."""
+        if self.enabled and self.inactive_days is None:
+            raise ValueError("inactive_days is required when retention is enabled")
+        return self
+
+
+class SessionArchiveRetentionPreviewRequest(BaseModel):
+    """Body for ``POST /v1/session-archive-retention/preview``.
+
+    An empty body previews the saved period. ``inactive_days`` overrides the
+    period for this dry run and is not saved.
+
+    :param inactive_days: Period to preview, or ``None`` to use the saved one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    inactive_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class SessionArchiveRetentionPreviewResponse(BaseModel):
+    """Dry-run result. No session is archived.
+
+    :param enabled: Whether the saved policy is enabled. A preview still runs
+        when this is false.
+    :param inactive_days: Period used for this preview.
+    :param cutoff: Epoch seconds at or before which a session is inactive.
+        ``None`` when no period is configured.
+    :param would_archive: Inactive sessions a run would archive.
+    :param protected: Inactive sessions the rules would keep.
+    :param truncated: True when further matches were omitted.
+    :param rules: The rules applied to this preview.
+    """
+
+    object: Literal["session_archive_retention_preview"] = "session_archive_retention_preview"
+    dry_run: Literal[True] = True
+    enabled: bool
+    inactive_days: int | None = None
+    cutoff: int | None = None
+    would_archive: list[SessionArchiveRetentionSession] = Field(default_factory=list)
+    protected: list[SessionArchiveRetentionSession] = Field(default_factory=list)
+    truncated: bool = False
+    rules: SessionArchiveRetentionRules
+
+
+class SessionArchiveRetentionRunResponse(BaseModel):
+    """Result of ``POST /v1/session-archive-retention/run``.
+
+    :param applied: False when the policy is disabled or has no period, in
+        which case nothing is archived.
+    :param archived_session_ids: Sessions this call archived.
+    :param skipped: Inactive sessions left in place.
+    :param truncated: True when the returned lists were capped.
+    :param ran_at: Epoch seconds of the run, or ``None`` when it did not run.
+    """
+
+    object: Literal["session_archive_retention_run"] = "session_archive_retention_run"
+    dry_run: Literal[False] = False
+    applied: bool
+    archived_session_ids: list[str] = Field(default_factory=list)
+    skipped: list[SessionArchiveRetentionSession] = Field(default_factory=list)
+    truncated: bool = False
+    ran_at: int | None = None

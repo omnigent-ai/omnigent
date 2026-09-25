@@ -5034,6 +5034,400 @@
         "title": "SessionAgentChangedEvent",
         "type": "object"
       },
+      "SessionArchiveRetentionPolicyResponse": {
+        "description": "Response for `GET` and `PUT /v1/session-archive-retention`.",
+        "properties": {
+          "enabled": {
+            "description": "Whether sweeps and manual runs archive sessions.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "inactive_days": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Configured inactivity period. `None` until set.",
+            "title": "Inactive Days"
+          },
+          "last_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionArchiveRetentionRunRecord"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Audit of the latest apply, or `None` if it has never run."
+          },
+          "object": {
+            "const": "session_archive_retention",
+            "default": "session_archive_retention",
+            "title": "Object",
+            "type": "string"
+          },
+          "protect_label_keys": {
+            "description": "Extra label keys that keep a session. `omnigent.retain` always protects and is listed under `rules`.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Protect Label Keys",
+            "type": "array"
+          },
+          "protect_pinned": {
+            "description": "Keep the caller's pinned sessions.",
+            "title": "Protect Pinned",
+            "type": "boolean"
+          },
+          "protect_project": {
+            "description": "Keep sessions filed in a project.",
+            "title": "Protect Project",
+            "type": "boolean"
+          },
+          "protect_shared": {
+            "description": "Keep sessions shared with someone else.",
+            "title": "Protect Shared",
+            "type": "boolean"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/SessionArchiveRetentionRules",
+            "description": "Protections as they will apply, including while disabled."
+          }
+        },
+        "required": [
+          "enabled",
+          "protect_pinned",
+          "protect_shared",
+          "protect_project",
+          "rules"
+        ],
+        "title": "SessionArchiveRetentionPolicyResponse",
+        "type": "object"
+      },
+      "SessionArchiveRetentionPreviewRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/session-archive-retention/preview`.\n\nAn empty body previews the saved period. `inactive_days` overrides the\nperiod for this dry run and is not saved.",
+        "properties": {
+          "inactive_days": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Period to preview, or `None` to use the saved one.",
+            "title": "Inactive Days"
+          }
+        },
+        "title": "SessionArchiveRetentionPreviewRequest",
+        "type": "object"
+      },
+      "SessionArchiveRetentionPreviewResponse": {
+        "description": "Dry-run result. No session is archived.",
+        "properties": {
+          "cutoff": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds at or before which a session is inactive. `None` when no period is configured.",
+            "title": "Cutoff"
+          },
+          "dry_run": {
+            "const": true,
+            "default": true,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "enabled": {
+            "description": "Whether the saved policy is enabled. A preview still runs when this is false.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "inactive_days": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Period used for this preview.",
+            "title": "Inactive Days"
+          },
+          "object": {
+            "const": "session_archive_retention_preview",
+            "default": "session_archive_retention_preview",
+            "title": "Object",
+            "type": "string"
+          },
+          "protected": {
+            "description": "Inactive sessions the rules would keep.",
+            "items": {
+              "$ref": "#/components/schemas/SessionArchiveRetentionSession"
+            },
+            "title": "Protected",
+            "type": "array"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/SessionArchiveRetentionRules",
+            "description": "The rules applied to this preview."
+          },
+          "truncated": {
+            "default": false,
+            "description": "True when further matches were omitted.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "would_archive": {
+            "description": "Inactive sessions a run would archive.",
+            "items": {
+              "$ref": "#/components/schemas/SessionArchiveRetentionSession"
+            },
+            "title": "Would Archive",
+            "type": "array"
+          }
+        },
+        "required": [
+          "enabled",
+          "rules"
+        ],
+        "title": "SessionArchiveRetentionPreviewResponse",
+        "type": "object"
+      },
+      "SessionArchiveRetentionProtection": {
+        "description": "One visible protection rule for inactive-session archival.",
+        "properties": {
+          "enabled": {
+            "description": "Whether the rule keeps matching sessions.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "Which sessions the rule covers.",
+            "enum": [
+              "pinned",
+              "shared",
+              "project",
+              "labeled"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label_keys": {
+            "description": "Label keys that keep a session. Populated for `labeled`; empty for the other kinds.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Label Keys",
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "enabled"
+        ],
+        "title": "SessionArchiveRetentionProtection",
+        "type": "object"
+      },
+      "SessionArchiveRetentionRules": {
+        "description": "Deterministic exclusion rules, returned before the policy is enabled.",
+        "properties": {
+          "always_exclude": {
+            "description": "Reasons that always keep a session, even when the optional protections are off.",
+            "items": {
+              "enum": [
+                "active_work",
+                "pending_user_input"
+              ],
+              "type": "string"
+            },
+            "title": "Always Exclude",
+            "type": "array"
+          },
+          "inactivity_basis": {
+            "const": "updated_at",
+            "default": "updated_at",
+            "description": "Persisted timestamp inactivity is measured from.",
+            "title": "Inactivity Basis",
+            "type": "string"
+          },
+          "protections": {
+            "description": "Optional protections and the always-on retain label.",
+            "items": {
+              "$ref": "#/components/schemas/SessionArchiveRetentionProtection"
+            },
+            "title": "Protections",
+            "type": "array"
+          }
+        },
+        "required": [
+          "always_exclude",
+          "protections"
+        ],
+        "title": "SessionArchiveRetentionRules",
+        "type": "object"
+      },
+      "SessionArchiveRetentionRunRecord": {
+        "description": "Audit of the latest retention run, stored with the policy.",
+        "properties": {
+          "archived_session_ids": {
+            "description": "Sessions that run archived.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Archived Session Ids",
+            "type": "array"
+          },
+          "ran_at": {
+            "description": "Epoch seconds the run finished.",
+            "format": "int64",
+            "title": "Ran At",
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Inactive sessions the run left in place.",
+            "items": {
+              "$ref": "#/components/schemas/SessionArchiveRetentionSession"
+            },
+            "title": "Skipped",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "description": "True when the stored lists were capped.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ran_at"
+        ],
+        "title": "SessionArchiveRetentionRunRecord",
+        "type": "object"
+      },
+      "SessionArchiveRetentionRunResponse": {
+        "description": "Result of `POST /v1/session-archive-retention/run`.",
+        "properties": {
+          "applied": {
+            "description": "False when the policy is disabled or has no period, in which case nothing is archived.",
+            "title": "Applied",
+            "type": "boolean"
+          },
+          "archived_session_ids": {
+            "description": "Sessions this call archived.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Archived Session Ids",
+            "type": "array"
+          },
+          "dry_run": {
+            "const": false,
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "object": {
+            "const": "session_archive_retention_run",
+            "default": "session_archive_retention_run",
+            "title": "Object",
+            "type": "string"
+          },
+          "ran_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds of the run, or `None` when it did not run.",
+            "title": "Ran At"
+          },
+          "skipped": {
+            "description": "Inactive sessions left in place.",
+            "items": {
+              "$ref": "#/components/schemas/SessionArchiveRetentionSession"
+            },
+            "title": "Skipped",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "description": "True when the returned lists were capped.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "applied"
+        ],
+        "title": "SessionArchiveRetentionRunResponse",
+        "type": "object"
+      },
+      "SessionArchiveRetentionSession": {
+        "description": "One session named by a preview or a retention run.",
+        "properties": {
+          "id": {
+            "description": "Session id.",
+            "title": "Id",
+            "type": "string"
+          },
+          "reasons": {
+            "description": "Why the session was kept. Empty when it was or would be archived.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session title, or `None` when untitled.",
+            "title": "Title"
+          },
+          "updated_at": {
+            "description": "Persisted last-activity time, epoch seconds.",
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "updated_at"
+        ],
+        "title": "SessionArchiveRetentionSession",
+        "type": "object"
+      },
       "SessionBtwSidechatEvent": {
         "description": "A Claude Code `/btw` side-chat exchange to show transiently.\n\n`/btw` opens an ephemeral side conversation whose answer Claude Code\nkeeps only in its in-TUI overlay \u2014 it is never written to the session\ntranscript. The claude-native forwarder scrapes the settled overlay\nfrom the pane and emits this event so the managed web UI can show the\nsame ephemeral overlay (dismissed with Escape), WITHOUT adding a\npersisted side-chat turn to the main conversation.\n\nCategory: **transient** (SSE-only), live-only by design. Nothing is\npersisted and there is no SSE replay, so a reload drops the overlay \u2014\nmatching the terminal, where Escape closes it and leaves no history.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.btw_sidechat\", \"conversation_id\": <id>, \"question\": <str>, \"answer\": <str>, \"truncated\": <bool>}`.",
         "properties": {
@@ -8305,6 +8699,63 @@
         "title": "UpdateProjectRequest",
         "type": "object"
       },
+      "UpdateSessionArchiveRetentionRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PUT /v1/session-archive-retention`.\n\nEnabling requires `inactive_days`. Disabling keeps the saved period so\nit can be turned back on without sending it again.",
+        "properties": {
+          "enabled": {
+            "description": "Turn the policy on or off.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "inactive_days": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Days of inactivity before a session is eligible.",
+            "title": "Inactive Days"
+          },
+          "protect_label_keys": {
+            "description": "Extra label keys that keep a session.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Protect Label Keys",
+            "type": "array"
+          },
+          "protect_pinned": {
+            "default": true,
+            "description": "Keep pinned sessions.",
+            "title": "Protect Pinned",
+            "type": "boolean"
+          },
+          "protect_project": {
+            "default": true,
+            "description": "Keep project-filed sessions.",
+            "title": "Protect Project",
+            "type": "boolean"
+          },
+          "protect_shared": {
+            "default": true,
+            "description": "Keep shared sessions.",
+            "title": "Protect Shared",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "UpdateSessionArchiveRetentionRequest",
+        "type": "object"
+      },
       "UpdateSessionPolicyRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{session_id}/policies/{policy_id}`.\n\nAll fields are optional; `None` fields are left unchanged.\nUnknown fields (including `type`, which is immutable) are\nrejected with `422`.",
@@ -10924,6 +11375,139 @@
         "summary": "Model Options",
         "tags": [
           "sandbox inference"
+        ]
+      }
+    },
+    "/v1/session-archive-retention": {
+      "get": {
+        "description": "Return the caller's retention policy and the rules it will apply.",
+        "operationId": "get_session_archive_retention_v1_session_archive_retention_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionArchiveRetentionPolicyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Session Archive Retention",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "put": {
+        "description": "Configure, disable, or update the inactivity period and protections.",
+        "operationId": "put_session_archive_retention_v1_session_archive_retention_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSessionArchiveRetentionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionArchiveRetentionPolicyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Session Archive Retention",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/session-archive-retention/preview": {
+      "post": {
+        "description": "Dry-run the policy. No session is archived.",
+        "operationId": "preview_session_archive_retention_v1_session_archive_retention_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SessionArchiveRetentionPreviewRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionArchiveRetentionPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Session Archive Retention",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/session-archive-retention/run": {
+      "post": {
+        "description": "Archive eligible inactive sessions and record the policy action.",
+        "operationId": "run_session_archive_retention_v1_session_archive_retention_run_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionArchiveRetentionRunResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Run Session Archive Retention",
+        "tags": [
+          "sessions"
         ]
       }
     },
