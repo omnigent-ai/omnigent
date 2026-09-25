@@ -8,7 +8,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.inner.native_attachments import (
+    UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
+    reject_authored_framework_notices,
+)
 from omnigent.llms.adapters._content import redact_binary_payloads
 
 # Attachment markers the native executors prepend to prompt text
@@ -101,6 +104,8 @@ class Conversation:
         nested ``by_model`` object. Persisted as a JSON column and
         loaded by the policy engine builder at workflow start. Empty
         dict when no LLM calls have been recorded yet.
+    :param session_todos: Latest native Plan display snapshot, restored after
+        Server restart without invoking the harness or replaying task work.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
         Set at session creation via ``POST /v1/sessions`` metadata
@@ -240,8 +245,10 @@ class Conversation:
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)
+    session_todos: list[dict[str, Any]] = field(default_factory=list)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    inference_snapshot: dict[str, Any] | None = None
     reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
@@ -292,6 +299,9 @@ class MessageData(BaseModel):
         turn, e.g. Codex ``turn/completed`` with status
         ``"interrupted"``. Defaults to ``False`` and is omitted from
         serialized payloads in that case.
+    :param stream_message_id: Native live-preview stream finalized by
+        this assistant message. Persisted so reconnect snapshots can
+        suppress delayed preview chunks after the authoritative item.
     """
 
     role: Literal["user", "assistant"]
@@ -300,6 +310,13 @@ class MessageData(BaseModel):
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
+    stream_message_id: str | None = None
+
+    @field_validator("content")
+    @classmethod
+    def reject_framework_blocks(cls, content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        reject_authored_framework_notices(content)
+        return content
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:
@@ -518,6 +535,7 @@ class CompactionData(BaseModel):
         :returns: The list with binary payloads replaced by a marker,
             or ``None`` unchanged.
         """
+        reject_authored_framework_notices(value)
         return redact_binary_payloads(value, _binary_payload_omitted)
 
 
@@ -644,6 +662,11 @@ class RoutingDecisionData(BaseModel):
         must still round-trip through stored rows and the wire instead
         of failing validation. ``None`` on rows written before the
         field existed.
+    :param task_description: Human label of the task/spawn this decision
+        governed, e.g. ``"Research auth flows"`` — what ties a fan-out's
+        decision to its sub-agent when every spawn shares one
+        :attr:`agent` type. ``None`` when the spawn carried none, and on
+        rows written before the field existed.
     """
 
     model: str
@@ -659,6 +682,7 @@ class RoutingDecisionData(BaseModel):
     raw_model: str | None = None
     attempted_override: str | None = None
     router_source: str | None = None
+    task_description: str | None = None
 
     @field_validator("model")
     @classmethod

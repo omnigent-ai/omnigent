@@ -206,6 +206,10 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # test_switch_agent_native_e2e.py, test_sessions_fork_e2e.py).
         "sdk-chat-builtin",
         "sandbox-deps-os-env",
+        # spawn-bounds-dispatch: parent+worker bundle loaded by
+        # tests/e2e/test_spawn_bounds_subagent_dispatch_e2e.py. Hyphenated
+        # name, so it can't use the ``test_example_<name>.py`` convention.
+        "spawn-bounds-dispatch",
     }
 )
 

@@ -18,6 +18,7 @@ handling of un-tokenizable segments, which differs per policy).
 from __future__ import annotations
 
 import re
+import shlex
 
 # Every harness's shell / terminal tool, all of which surface the command as a
 # string ``command`` argument. This is the default gated surface for every
@@ -129,6 +130,74 @@ _INTERPRETER_C_FLAG = re.compile(r"-[A-Za-z]*c[A-Za-z]*$")
 
 # Guard against pathological nesting (``bash -c "bash -c …"``).
 MAX_SHELL_NESTING = 4
+
+
+# Utilities that RUN another command as a child process (``find … -exec git
+# push``, ``xargs git push``, ``perl -e 'exec("git",…)'``, ``python3 -c
+# "os.execvp('git',…)"``, ``awk 'system("git push …")'``, ``make``). Their
+# ``argv[0]`` is the utility, not the gated command, and the command they spawn
+# is buried in an ``-exec`` clause / trailing args / a ``-e`` / ``-c`` code
+# string / an ``awk`` program this module does not parse. Left unmodelled, the
+# head is not ``git``/``gh`` so the segment produces no op and the policy
+# abstains → ALLOW — an incomplete-fix bypass of the shell-parser fail-open
+# (CVE-2026-62676). Treating it as an unresolved invocation routes it through
+# each policy's keyword-gated fail-safe (ASK / the configured action) instead of
+# silently allowing it. Matched on the basename so an absolute path counts too.
+PROCESS_SPAWNING_UTILITIES: frozenset[str] = frozenset(
+    {
+        "find",
+        "xargs",
+        "perl",
+        "python",
+        "python2",
+        "python3",
+        "ruby",
+        "awk",
+        "gawk",
+        "mawk",
+        "make",
+    }
+)
+
+
+def spawns_gated_command_as_child(tokens: list[str]) -> bool:
+    """
+    Whether the real command is a process-spawning utility (:data:`PROCESS_SPAWNING_UTILITIES`).
+
+    Such a utility runs another command as a child process whose argv this
+    module does not parse, so its head is never ``git`` / ``gh`` / ``cd`` and a
+    gated child would slip past as "not a gated command". A policy should route
+    a ``True`` here through the same fail-safe it uses for an unresolved
+    invocation (keyword-gated ASK / configured action), not abstain.
+
+    :param tokens: The output of :func:`real_invocation_tokens`.
+    :returns: ``True`` when the head is a process-spawning utility.
+    """
+    return bool(tokens) and tokens[0].rsplit("/", 1)[-1] in PROCESS_SPAWNING_UTILITIES
+
+
+def is_shell_interpreter(tokens: list[str]) -> bool:
+    """
+    Whether the real command is a shell interpreter (:data:`SHELL_INTERPRETERS`).
+
+    A shell interpreter invoked without a ``-c`` command string reads its
+    program from stdin or a script file (``printf '…' | sh``, ``sh script.sh``,
+    a bare ``sh``). That program is opaque to this parser —
+    :func:`unwrap_shell_command` returns ``None`` — so a gated ``git push``
+    hidden in it would produce no op and the policy would abstain → ALLOW. A
+    policy should surface such an unclassifiable interpreter path for approval
+    rather than allow it. Matched on the basename so ``/bin/sh`` counts too.
+
+    This tests the head only, not the arguments, so it also returns ``True`` for
+    an interpreter that *does* carry a ``-c`` string. Call it after
+    :func:`unwrap_shell_command` has already returned ``None`` for the tokens
+    (as the github policy does): a readable ``-c`` form is unwrapped and
+    classified there first, so what reaches this check is the stdin/script form.
+
+    :param tokens: The output of :func:`real_invocation_tokens`.
+    :returns: ``True`` when the head is a shell interpreter.
+    """
+    return bool(tokens) and tokens[0].rsplit("/", 1)[-1] in SHELL_INTERPRETERS
 
 
 def _extract_command_substitutions(command: str) -> tuple[str, list[str]]:
@@ -329,6 +398,8 @@ def _skip_flag_wrapper_args(
                 captured = attached if equals else _value_at(tokens, index)
             if flag in value_flags and index < len(tokens):
                 index += 1
+            if captured is not None:
+                return index, captured
             continue
         bundle = flag[1:]
         position = next(
@@ -342,6 +413,8 @@ def _skip_flag_wrapper_args(
             captured = _value_at(tokens, index) if is_last else bundle[position + 1 :]
         if is_last and index < len(tokens):
             index += 1
+        if captured is not None:
+            return index, captured
     if has_duration and index < len(tokens):
         index += 1
     return index, captured
@@ -376,14 +449,18 @@ def unwrap_shell_command(tokens: list[str]) -> str | None:
     """
     head = tokens[0].rsplit("/", 1)[-1]
     if head == "env":
-        _, split_string = _skip_flag_wrapper_args(
+        index, split_string = _skip_flag_wrapper_args(
             tokens,
             1,
             value_flags=_FLAG_WRAPPERS["env"],
             has_duration=False,
             capture_flags=_ENV_SPLIT_STRING_FLAGS,
         )
-        return split_string
+        if split_string is None:
+            return None
+        # env inserts the split words before the remaining argv. Those words
+        # can contain more env options, while later arguments belong to the command.
+        return f"env {split_string} {shlex.join(tokens[index:])}"
     if head in SHELL_INTERPRETERS:
         for i, tok in enumerate(tokens):
             if _INTERPRETER_C_FLAG.fullmatch(tok) and i + 1 < len(tokens):

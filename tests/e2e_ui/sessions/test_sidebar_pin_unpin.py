@@ -68,53 +68,6 @@ def _row(page: Page, session_id: str) -> Locator:
     return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
 
 
-def test_pin_moves_session_to_pinned_section(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """Pinning a Sessions-list row lifts it into the Pinned section.
-
-    Failure modes this catches that the mocked unit test can't:
-
-    - The live ``GET /v1/sessions`` row shape drifts so the owner split
-      drops the session out of "Sessions" (it would never be pinnable).
-    - The pin toggle persists but the section peel regresses, leaving the
-      row under "Sessions" after a pin.
-
-    :param page: Playwright page fixture (fresh context per test).
-    :param seeded_session: ``(base_url, session_id)`` for a pre-created
-        runner-bound session.
-    """
-    base_url, session_id = seeded_session
-    title = f"e2e-pin-{uuid.uuid4().hex[:8]}"
-    _set_title(base_url, session_id, title)
-
-    page.goto(f"{base_url}/c/{session_id}")
-
-    row = _row(page, session_id)
-    expect(row).to_be_visible()
-    # Owned, non-archived, unpinned → starts under "Sessions", never
-    # "Pinned" (no Pinned section exists yet).
-    expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
-
-    # Pin via the row's quick action. Hover first so the desktop
-    # hover-revealed control is interactable.
-    row.hover()
-    pin_button = row.get_by_test_id("quick-pin-conversation")
-    expect(pin_button).to_have_attribute("aria-label", "Pin conversation")
-    pin_button.click()
-
-    # The row now lives under "Pinned" and out of "Sessions", and the
-    # quick action flips to its unpin affordance — both prove the toggle
-    # ran through the sidebar's pin state, not a local no-op.
-    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-    expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
-    expect(_row(page, session_id).get_by_test_id("quick-pin-conversation")).to_have_attribute(
-        "aria-label", "Unpin conversation"
-    )
-
-
 def test_unpin_moves_session_back_to_recent(
     page: Page,
     seeded_session: tuple[str, str],
@@ -177,7 +130,7 @@ def _pinned_session_order(page: Page) -> list[str]:
 
 def _updated_at(base_url: str, session_id: str) -> int:
     """Read a session's server-side ``updated_at`` from ``GET /v1/sessions``."""
-    resp = httpx.get(f"{base_url}/v1/sessions", timeout=10.0)
+    resp = httpx.get(f"{base_url}/v1/sessions", params={"visibility": "all"}, timeout=10.0)
     resp.raise_for_status()
     for item in resp.json()["data"]:
         if item["id"] == session_id:

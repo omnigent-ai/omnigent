@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import builtins
+import json
+from typing import Any
 
-from sqlalchemy import and_, asc, desc, or_, select
+from sqlalchemy import and_, asc, desc, func, or_, select
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlFile, current_workspace_id, normalize_uuid
+from omnigent.db.db_models import SqlFile, Uuid16, current_workspace_id, normalize_uuid
 from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
     generate_file_id,
@@ -34,7 +36,16 @@ def _to_entity(row: SqlFile) -> StoredFile:
         bytes=row.bytes,
         content_type=row.content_type,
         session_id=row.session_id,
+        blob_key=row.blob_key,
+        source_metadata=(
+            json.loads(row.source_metadata) if row.source_metadata is not None else None
+        ),
     )
+
+
+def _effective_blob_key(row: SqlFile) -> str:
+    """Artifact-store key for *row*'s bytes: ``blob_key`` or ``id`` if NULL."""
+    return row.blob_key if row.blob_key is not None else row.id
 
 
 class SqlAlchemyFileStore(FileStore):
@@ -70,6 +81,9 @@ class SqlAlchemyFileStore(FileStore):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        file_id: str | None = None,
+        blob_key: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
     ) -> StoredFile:
         """
         Record a new file in the database.
@@ -79,10 +93,24 @@ class SqlAlchemyFileStore(FileStore):
         :param content_type: MIME type.
         :param session_id: Owning session id, or ``None`` for
             global files.
+        :param file_id: Caller-chosen id (a fork pre-allocates ids for
+            the file copies it creates), or ``None`` to generate one.
+        :param blob_key: Artifact-store key for the row's bytes. A fork
+            passes the source row's blob so the copy shares the bytes;
+            ``None`` (default) points the row at its own ``file_id`` — an
+            independent blob the uploader is expected to ``put`` there.
+        :param source_metadata: Opaque JSON-able dict of metadata about
+            the original upload before any server-side transform, or
+            ``None`` when there is nothing to record.
         :returns: The newly created :class:`StoredFile`.
         """
-        file_id = generate_file_id()
+        file_id = file_id if file_id is not None else generate_file_id()
+        # New rows always store an explicit blob_key so the shared-blob
+        # reference count is a plain equality (no COALESCE needed for them);
+        # only pre-migration rows carry NULL and fall back to id on read.
+        blob_key = blob_key if blob_key is not None else file_id
         created_at = now_epoch()
+        encoded_metadata = json.dumps(source_metadata) if source_metadata is not None else None
 
         def write(session: Session) -> StoredFile:
             row = SqlFile(
@@ -92,11 +120,40 @@ class SqlAlchemyFileStore(FileStore):
                 bytes=bytes,
                 content_type=content_type,
                 session_id=session_id,
+                blob_key=blob_key,
+                source_metadata=encoded_metadata,
             )
             session.add(row)
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "insert_file", write)
+
+    def is_blob_key_orphaned(self, blob_key: str) -> bool:
+        """
+        Whether no file row references *blob_key* any more.
+
+        A blob is shared when a fork copies a row without copying the bytes,
+        so the artifact-store blob may only be deleted once the last file row
+        pointing at it is gone. Callers delete the row first, then check this
+        before removing the blob.
+
+        :param blob_key: The artifact-store key to test, e.g. an
+            :func:`_effective_blob_key` value.
+        :returns: ``True`` when the blob is safe to delete (no referrers).
+        """
+        with self._session("count_blob_key_refs") as session:
+            row = session.execute(
+                select(SqlFile.id)
+                .where(
+                    SqlFile.workspace_id == current_workspace_id(),
+                    # id/blob_key are Uuid16 (binary); type the COALESCE so the
+                    # bound value is encoded the same way, not compared as text.
+                    func.coalesce(SqlFile.blob_key, SqlFile.id, type_=Uuid16())
+                    == normalize_uuid(blob_key),
+                )
+                .limit(1)
+            ).first()
+            return row is None
 
     def get(
         self,
@@ -228,8 +285,14 @@ class SqlAlchemyFileStore(FileStore):
         """
         Delete all file metadata for a session.
 
+        Because a fork copy can share a blob (its ``blob_key`` points at
+        another session's row), the deleted rows' blobs may still be
+        referenced elsewhere. This returns only the blob keys that became
+        **orphaned** — the caller deletes exactly those artifact bytes, so a
+        fork's shared blob survives its source session's deletion.
+
         :param session_id: Owning session/conversation id.
-        :returns: List of deleted file ids for artifact cleanup.
+        :returns: The now-orphaned artifact-store keys to clean up.
         """
 
         def write(session: Session) -> builtins.list[str]:
@@ -239,9 +302,26 @@ class SqlAlchemyFileStore(FileStore):
             )
             with query_name_scope("omnigent.file_store.list_session_files_for_delete"):
                 rows = list(session.execute(stmt).scalars().all())
-            ids = [row.id for row in rows]
+            blob_keys = {_effective_blob_key(row) for row in rows}
             for row in rows:
                 session.delete(row)
-            return ids
+            session.flush()
+            # After the rows are gone, a blob is orphaned only if no surviving
+            # row (any session) still references it.
+            orphaned: builtins.list[str] = []
+            for blob_key in blob_keys:
+                with query_name_scope("omnigent.file_store.count_blob_key_refs"):
+                    still_referenced = session.execute(
+                        select(SqlFile.id)
+                        .where(
+                            SqlFile.workspace_id == current_workspace_id(),
+                            func.coalesce(SqlFile.blob_key, SqlFile.id, type_=Uuid16())
+                            == normalize_uuid(blob_key),
+                        )
+                        .limit(1)
+                    ).first()
+                if still_referenced is None:
+                    orphaned.append(blob_key)
+            return orphaned
 
         return run_write_transaction(self._session_immediate, "delete_session_files", write)

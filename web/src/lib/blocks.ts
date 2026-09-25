@@ -8,6 +8,9 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
+import { capitalizeAgentName } from "./agentLabels";
+import { agentRootName } from "./forkHarness";
+import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type { CodexPersistMode, RememberScope, Response } from "./types";
 
@@ -446,19 +449,68 @@ export interface ErrorBlock {
 
 /**
  * Extract the optional structured failure fields (`title` / `cause` /
- * `remediation`) from any error-shaped source, dropping absent ones so an
- * `ErrorBlock` stays minimal when the failure wasn't classified. Spread the
- * result into an `ErrorBlock` alongside `message` / `source` / `code`.
+ * `remediation`), naming the agent for otherwise unclassified turn errors.
+ * Capture the name with the failure so later agent switches cannot relabel it.
  */
 export function structuredErrorFields(
-  src: { title?: string | null; cause?: string | null; remediation?: string | null } | null,
+  src: {
+    code?: string | null;
+    source?: string | null;
+    level?: "error" | "info";
+    title?: string | null;
+    cause?: string | null;
+    remediation?: string | null;
+  } | null,
+  agentName?: string | null,
 ): Pick<ErrorBlock, "title" | "cause" | "remediation"> {
   const out: Pick<ErrorBlock, "title" | "cause" | "remediation"> = {};
   if (src?.title) out.title = src.title;
+  if (!out.title && src?.level !== "info" && isAgentTurnError(src) && agentName?.trim()) {
+    const rootName = agentRootName(agentName.trim());
+    const displayName =
+      nativeCodingAgentForAgentName(rootName)?.displayName ?? capitalizeAgentName(rootName);
+    out.title = `${displayName} ran into an error during this turn.`;
+  }
   if (src?.cause) out.cause = src.cause;
   if (src?.remediation) out.remediation = src.remediation;
   return out;
 }
+
+function isAgentTurnError(src: { code?: string | null; source?: string | null } | null): boolean {
+  if (src?.source === "tool") return false;
+  const code = src?.code ?? "";
+  if (AGENT_TURN_ERROR_CODES.has(code)) return true;
+  // Keep specific diagnoses and infrastructure failures in their existing words.
+  if (
+    SPECIFIC_ERROR_CODES.has(code) ||
+    /^(?:runner_|host_|workspace_|terminal_|required_terminal_|native_terminal_)/.test(code)
+  ) {
+    return false;
+  }
+  return src?.source === "harness" || src?.source === "llm" || src?.source === "execution";
+}
+
+const AGENT_TURN_ERROR_CODES = new Set([
+  "native_turn_error",
+  "codex_turn_error",
+  "executor_error",
+  "unknown_error",
+  "response_failed",
+  "RuntimeError",
+]);
+
+const SPECIFIC_ERROR_CODES = new Set([
+  "connection_error",
+  "context_length_exceeded",
+  "rate_limit_exceeded",
+  "codex_thread_reset",
+  "session_agent_missing",
+  "harness_not_configured",
+  "internal_error",
+  "wrong_replica",
+  "native_policy_not_enforced",
+  "model_change_not_applied",
+]);
 
 /** The server is retrying. */
 export interface RetryBlock {
