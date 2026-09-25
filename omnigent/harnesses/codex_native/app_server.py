@@ -60,6 +60,8 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _CODEX_HOME_COPY_FILES,
+    _CODEX_HOME_SYMLINK_FILES,
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
@@ -1403,10 +1405,11 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     ).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # The bridge skips files that already exist, and config.toml is copied
-    # (not symlinked), so drop the copy to re-read an edited source config.
-    with contextlib.suppress(OSError):
-        (home / "config.toml").unlink(missing_ok=True)
+    # The bridge skips paths that already exist (including dangling symlinks),
+    # so drop prior materialization before re-bridging from the current source.
+    for filename in (*_CODEX_HOME_SYMLINK_FILES, *_CODEX_HOME_COPY_FILES):
+        with contextlib.suppress(OSError):
+            (home / filename).unlink(missing_ok=True)
     # The probe drives the same native codex binary as a session launch, so
     # keep the full native effort ladder instead of clamping max/ultra.
     _populate_codex_home_config(
