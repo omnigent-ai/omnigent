@@ -914,8 +914,6 @@ class TestSqlHost:
 
 class TestSqlUserDailyCost:
     def test_persist_and_read(self, db_uri: str) -> None:
-        from omnigent.db.db_models import CROSS_HARNESS_SENTINEL
-
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
@@ -931,7 +929,7 @@ class TestSqlUserDailyCost:
 
         with managed() as session:
             loaded = session.get(
-                SqlUserDailyCost, (0, "alice@example.com", "2026-06-16", CROSS_HARNESS_SENTINEL)
+                SqlUserDailyCost, (0, "alice@example.com", "2026-06-16")
             )
             assert loaded is not None
             assert loaded.cost_usd == pytest.approx(1.23)
