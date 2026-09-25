@@ -1896,10 +1896,8 @@ module.exports = function (pi) {
         data: { model: startupModel },
       });
     }
-    await postEvent(config, {
-      type: "external_session_status",
-      data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
-    });
+    // Readiness is not turn completion: a queued prompt may already be running.
+    // Only agent_end publishes idle so startup cannot complete a child task.
   });
 
   pi.on("session_tree", async (_event, ctx) => {

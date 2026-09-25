@@ -134,6 +134,77 @@ without emitting a verdict handoff so the workflow retries. App, network,
 authentication, tooling, sandbox, workspace, timeout, and agent-crash failures
 are never `needs_more_info`. Don't narrate a clean preflight.
 
+## Coordinated reproduction records (optional)
+
+<!-- reproduction-contract:v1 -->
+
+Apply this procedure only when the launcher supplies a read-only report snapshot,
+run identity, plan template, and plan-ready signal format. Otherwise continue the
+normal workflow without a planning pause. The coordinator is automated; do not
+ask a person to register the plan, resume the session, or collect the account.
+
+Use the captured report and dated discussion to reconstruct the journey. Keep
+reported requirements separate from inferences and unknowns. Missing attachments,
+partial discussion, and later clarifications must remain visible; do not rewrite
+the captured report to fit available tools. Additional context you fetch is not
+part of that snapshot: identify its source and limitations rather than presenting
+it as a captured fact.
+
+Before driving the journey or emitting any verdict handoff:
+
+1. Write `.omnigent/reproduction-plan.json` using the supplied template. Separate
+   environment, setup, trigger, and observation. Cite captured source IDs, name
+   substitutions and their limitations, and specify the outcome and observation
+   interval or completion event that would distinguish the bug from expected
+   behavior. Retain unknown or unexercisable requirements rather than dropping
+   them, including when the eventual verdict may be `needs_more_info`.
+2. Emit the supplied plan-ready signal in your final assistant message and end
+   the turn. The coordinator checks and records the plan, then automatically
+   sends either a correction request or a continuation with the accepted plan
+   hash. Do not start executing the journey until that continuation arrives.
+3. If the plan needs to change, preserve its requirement IDs, cite the previous
+   accepted plan hash, explain the revision, and submit it through the same
+   automatic registration step before continuing. Never edit the coordinator's
+   records. On a new run, prior plans and accounts are history; submit a plan for
+   the new run's snapshot even when earlier tests or recordings can be reused.
+
+After the accepted-plan continuation, follow [environment preparation](recipes.md)
+for its environment/setup requirements. Inspect the prepared runtime and bootstrap
+record, install missing tools through the existing setup instructions, configure
+the required host/session, and recheck before driving the reported trigger. Retain
+before/after observations under the same requirement IDs. Keep reported failure
+conditions intact: if missing tools, offline state, or setup itself is the bug,
+exercise that as the journey. Disclose remaining differences in the existing plan
+revision/account; a setup check never verifies journey fidelity or proves the bug.
+
+<!-- reproduction-preparation:v1 -->
+When the coordinator supplies a preparation-only continuation, prepare the
+environment without driving the reported trigger. It supplies this checkout's
+recipe and collects observations before and after preparation. Put requested
+fact comparisons in the plan's `preparation.checks` using existing requirement
+IDs; unknown requirements remain unchecked. Finish with the supplied
+`REPRO_PREPARATION_DONE` signal and the actual selected host ID (or `-` if unknown
+or inapplicable), then wait for the execution continuation. This signals the end
+of preparation, including blocked attempts; it does not assert readiness. Keep
+remaining differences and failed setup attempts explicit. A planned host change
+or changed comparison needs a plan revision. Do not repair reported bad state
+merely to make an environment comparison match.
+
+After execution, write `.omnigent/reproduction-account.json` using the account
+template supplied with the continuation, alongside the normal handoff. Reference
+the current run, snapshot, and accepted plan. Cover every requirement exactly
+once as `exercised`, `substituted`, or `unverified`; describe what actually
+happened, cite evidence, and state limitations. A substitute does not count as
+performing the original action. Identify tested product sessions separately from
+your own repro-agent conversation. Preserve this account before your final
+handoff so the coordinator can collect it automatically.
+
+Registration checks record structure, not whether your interpretation is correct
+or the bug is proven. Your account remains a claim for independent review.
+Preserve uncertainty: missing evidence is unverified, and unsuccessful attempts
+do not by themselves disprove an intermittent report. Continue to follow the
+normal environment, evidence, recording, and verdict requirements below.
+
 ## Step 1 — Reconstruct the user journey
 
 Rebuild what the **user actually did** from the bug report at `bug_url` — not

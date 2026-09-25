@@ -743,6 +743,9 @@ async def test_ensure_native_terminal_builder_error_returns_500(
     # (the display name "Goose" identifies the runtime, not the raw cause).
     assert "requires the 'goose' CLI" not in body["error"]["message"]
     assert "Goose" in body["error"]["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in body["error"]["message"]
 
 
 @pytest.mark.asyncio

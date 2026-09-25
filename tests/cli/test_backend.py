@@ -909,6 +909,202 @@ def test_daemon_host_online_false_when_no_host_id(
     assert cli._daemon_host_online(record) is False
 
 
+def _server_record(target: str = "http://127.0.0.1:59999") -> cli._HostDaemonRecord:
+    """Build a server-mode daemon record pointing at *target*.
+
+    :param target: Configured server URL the daemon must register with.
+    :returns: A record with a host id, suitable for the registration wait.
+    """
+    return cli._HostDaemonRecord(
+        pid=4242,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=None,
+        started_at=1_000_000,
+        host_id="host_abc",
+    )
+
+
+def _patch_registration_wait(
+    monkeypatch: pytest.MonkeyPatch, probe_result: cli._HostHttpResult
+) -> None:
+    """Pin the registration wait to one probe outcome with zero grace.
+
+    :param monkeypatch: Fixture used to scope the patches.
+    :param probe_result: Result every status probe returns.
+    """
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
+    monkeypatch.setattr(cli, "_daemon_host_status_probe", lambda record, **_kw: probe_result)
+
+
+def test_registration_wait_names_server_while_waiting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A daemon that is not instantly online prompts a line naming the server.
+
+    Without it, `start` against a slow or unreachable server sits silent
+    for the whole registration grace and the user cannot tell what it is
+    waiting for.
+    """
+    _patch_registration_wait(
+        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
+    )
+
+    with pytest.raises(click.ClickException):
+        cli._confirm_background_host_registered(_server_record())
+
+    captured = capsys.readouterr()
+    assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
+    # Progress goes to stderr so scripts capturing the command's stdout
+    # result never receive the waiting line.
+    assert captured.out == ""
+
+
+def test_registration_wait_prints_nothing_when_immediately_online(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The happy path stays quiet — no waiting line on instant registration."""
+    _patch_registration_wait(
+        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "online"})
+    )
+
+    cli._confirm_background_host_registered(_server_record())
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_registration_timeout_names_unreachable_server_and_skips_stale_host_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server nothing answered at is named, with the transport failure.
+
+    The stale-host recovery hint targets HTTP 401 tunnel rejections; a
+    connection-refused failure cannot be one, so the hint is suppressed.
+    """
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _patch_registration_wait(
+        monkeypatch,
+        cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record())
+
+    message = str(excinfo.value)
+    assert "127.0.0.1:59999" in message
+    assert "Connection refused" in message
+    assert suppresses_recovery_hint(excinfo.value) is True
+
+
+def test_registration_diagnostics_never_expose_url_credentials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A configured server URL carrying userinfo is redacted in diagnostics.
+
+    Server configuration and daemon URL normalization both preserve URL
+    userinfo (``http://user:token@host``), so the waiting line and the
+    timeout error would otherwise echo credentials into the terminal and
+    persistent CLI diagnostics.
+    """
+    _patch_registration_wait(
+        monkeypatch,
+        cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        ),
+    )
+    record = _server_record("http://synthetic-user:synthetic-secret@127.0.0.1:59999")
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(record)
+
+    message = str(excinfo.value)
+    captured = capsys.readouterr()
+    for text in (message, captured.out, captured.err):
+        assert "synthetic-secret" not in text
+        assert "synthetic-user" not in text
+    # The server is still identified, just without its userinfo.
+    assert "http://127.0.0.1:59999" in message
+    assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
+
+
+def test_registration_target_display_preserves_ipv6_brackets() -> None:
+    """Userinfo redaction keeps an IPv6 literal's brackets intact.
+
+    Rebuilding the URL from ``hostname``/``port`` would render ``[::1]``
+    as ``::1`` and produce a malformed diagnostic URL; only the userinfo
+    may be dropped from the authority.
+    """
+    record = _server_record("http://synthetic-user:synthetic-secret@[::1]:59999")
+
+    assert cli._registration_target_display(record) == "http://[::1]:59999"
+
+
+def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that answered once and then became unreachable keeps the hint.
+
+    ``server_responded`` must stick across later transport failures: a
+    server that ever answered can genuinely have a stale host process, so
+    the generic registration timeout — with its recovery hint — applies,
+    not the unreachable-server wording.
+    """
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    responses = iter([cli._HostHttpResult(status_code=200, body={"status": "offline"})])
+    refused = cli._HostHttpResult(
+        status_code=0,
+        body="ConnectError: [Errno 111] Connection refused",
+        unreachable=True,
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.5)
+    monkeypatch.setattr(
+        cli, "_daemon_host_status_probe", lambda record, **_kw: next(responses, refused)
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record())
+
+    message = str(excinfo.value)
+    assert "did not register with the server at http://127.0.0.1:59999" in message
+    assert suppresses_recovery_hint(excinfo.value) is False
+
+
+def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reachable server that never reports the host online keeps the hint.
+
+    Here a stale host process really can be the cause (e.g. a rejected
+    tunnel), so the generic timeout still names the server but the
+    recovery hint stays.
+    """
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _patch_registration_wait(
+        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record())
+
+    message = str(excinfo.value)
+    assert "did not register with the server at http://127.0.0.1:59999" in message
+    assert suppresses_recovery_hint(excinfo.value) is False
+
+
 # Every proxy variable httpx consults, so the cases below see exactly the
 # ambient proxy configuration they set up (a developer's own ``NO_PROXY``
 # would otherwise exempt loopback and skip the proxy transport entirely).

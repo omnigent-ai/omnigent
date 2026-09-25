@@ -317,7 +317,7 @@ describe("ProjectSettingsDialog", () => {
     );
 
     // Open the agent picker dropdown (Radix opens on pointerdown), then the
-    // "Custom agents" submenu where composed agents are listed.
+    // custom-agent "Other..." submenu where composed agents are listed.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     expect(screen.getByTestId("new-chat-landing-agent-ag_1")).toBeInTheDocument();
@@ -352,7 +352,7 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
     await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
 
-    // Switch the default to a plain bundle agent (under "Custom agents") → the
+    // Switch the default to a plain bundle agent (under "Other...") → the
     // model field goes away.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));

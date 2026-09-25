@@ -388,6 +388,11 @@ request enforces this, so unsigned commits will block merging.
 
 ### Database migration reviews
 
+Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when
+changing schemas, queries, transactions, or storage code. Polly uses this
+reference in its reviews and treats violations of mandatory requirements as
+blocking findings.
+
 Changes under `omnigent/db/migrations/`, to `omnigent/db/alembic.ini`, or to
 [`.github/CODEOWNERS`](.github/CODEOWNERS) require a GitHub approval from at
 least one of Edwin He (`@Edwinhe03`), Aravind Segu (`@aravind-segu`), Corey

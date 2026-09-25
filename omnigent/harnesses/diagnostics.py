@@ -15,6 +15,21 @@ _TERMINAL_ESCAPE = re.compile(
     r"|\x1b[ -/]*[@-~]",
     re.DOTALL,
 )
+_URL_USERINFO = re.compile(r"(?i)((?<![\w+.-])[a-z][a-z0-9+.-]*://)[^/\s?#\"'<>]*@")
+_HTTP_COOKIE = re.compile(
+    r"(?i)((?<![\w-])(?:set-cookie|cookie)\b[\"']?[ \t]*[:=][ \t]*)"
+    # Rust HeaderValue debug leaves existing backslashes before its escaped quotes.
+    r'''("[^"\r\n]*(?:(?<=\\)"[^"\r\n]*)*(?<!\\)"'''
+    r"|'[^'\r\n]*(?:(?<=\\)'[^'\r\n]*)*(?<!\\)'"
+    r"|[^\r\n]*)"
+)
+
+
+def _redact_http_cookie(match: re.Match[str]) -> str:
+    """Keep the field's quoting without retaining any of its cookie value."""
+    quote = match[2][:1]
+    replacement = f"{quote}[REDACTED]{quote}" if quote in {"'", '"'} else "[REDACTED]"
+    return match[1] + replacement
 
 
 def sanitize_diagnostic_text(text: str) -> str:
@@ -24,6 +39,8 @@ def sanitize_diagnostic_text(text: str) -> str:
     cleaned = "".join(
         char for char in text if char == "\n" or unicodedata.category(char) not in {"Cc", "Cf"}
     ).rstrip()
+    cleaned = _URL_USERINFO.sub(r"\1[REDACTED]@", cleaned)
+    cleaned = _HTTP_COOKIE.sub(_redact_http_cookie, cleaned)
     return redact_log_text(cleaned, include_whitespace_credentials=True)
 
 

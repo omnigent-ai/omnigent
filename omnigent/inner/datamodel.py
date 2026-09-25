@@ -353,12 +353,14 @@ class ExecutorSpec:
         base_url). Carried through so the omnigent spec translator
         can forward it into the child :class:`ExecutorSpec` without
         re-reading raw YAML.
+    :param context_files: Pi context-file discovery override. None uses Pi's default.
     """
 
     model: str | None = None
     harness: str | None = None
     profile: str | None = None
     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
+    context_files: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -805,8 +807,8 @@ class TerminalEnvSpec:
         the pane's inner process exits (``remain-on-exit`` / ``exit-empty
         off``), so a single CLI exit no longer reaps the server and cascades
         into ``no server running``. Opt-in because it changes the
-        ``has-session``-means-alive contract; enabled for the claude-native
-        agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
+        ``has-session``-means-alive contract; enabled for runner-owned Claude
+        and Codex terminals, whose liveness is decided by ``#{pane_dead}``.
     """
 
     command: str | None = None

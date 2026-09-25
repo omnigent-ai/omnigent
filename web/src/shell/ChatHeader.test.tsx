@@ -587,7 +587,7 @@ describe("ChatHeader — floating mobile controls", () => {
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger.parentElement).not.toHaveClass("max-md:px-1", "max-md:py-1");
     expect(trigger).toHaveClass("size-10");
-    expect(toggle).toHaveClass("size-10");
+    expect(toggle).toHaveClass("size-6", "max-md:size-11");
   });
 
   it("folds the Chat/Terminal switch into the header kebab on mobile", () => {

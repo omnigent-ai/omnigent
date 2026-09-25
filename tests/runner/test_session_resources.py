@@ -2739,6 +2739,7 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
 
     from omnigent.runner.resource_registry import TerminalLifecycle
     from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
     class _Terminal(TerminalInstance):
         closed: bool = False
@@ -2764,6 +2765,8 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
         private_dir=tmp_path / "dead",
         running=True,
     )
+    dead._remember_exit_status("1 2")
+    dead._last_exit_snapshot = "startup parser error"
     successor = _Terminal(
         name="claude",
         session_key="main",
@@ -2776,7 +2779,7 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
     terminal_registry._by_conversation["conv_evict"] = {("claude", "main"): successor}
     terminal_registry._instance_locks[("conv_evict", "claude", "main")] = threading.Lock()
 
-    with pytest.raises(RuntimeError, match="is not running"):
+    with pytest.raises(TerminalExitedDuringLaunch, match="exit status 2") as exited:
         await registry._observe_terminal_with_lifecycle(
             TerminalLifecycle.AUXILIARY,
             session_id="conv_evict",
@@ -2785,6 +2788,9 @@ async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -
             instance=dead,
         )
 
+    assert exited.value.instance is dead
+    assert exited.value.instance.last_exit_status() == 2
+    assert exited.value.instance.last_exit_text() == "startup parser error"
     assert successor.closed is False, (
         "the live successor on this key must survive eviction of the dead instance"
     )
