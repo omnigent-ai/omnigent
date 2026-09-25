@@ -179,8 +179,7 @@ export function RunnerHealthProvider({ children }: { children: ReactNode }) {
   );
 }
 
-// `undefined` = not yet polled. Callers must treat it as "unknown" and
-// not block — only `false` means "known offline, skip the request".
+// `undefined` means not yet polled; callers decide whether they can proceed.
 export function useSessionRunnerOnline(sessionId: string | undefined): boolean | undefined {
   const map = useContext(RunnerHealthContext);
   if (!sessionId) return undefined;

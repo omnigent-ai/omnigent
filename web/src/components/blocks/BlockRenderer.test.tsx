@@ -15,6 +15,12 @@ import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { BlockRenderer } from "./BlockRenderer";
 
+const runnerOnlineMock = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useSessionRunnerOnline: runnerOnlineMock,
+}));
+
 afterEach(cleanup);
 
 // Stick-to-bottom lock fixture for the fold's expand snap. Module scope so
@@ -1800,6 +1806,7 @@ describe("BlockRenderer inline file-path linkification", () => {
   beforeEach(() => {
     fetchMock.mockReset();
     vi.stubGlobal("fetch", fetchMock);
+    runnerOnlineMock.mockReturnValue(true);
   });
 
   afterEach(() => {
