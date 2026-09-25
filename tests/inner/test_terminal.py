@@ -22,6 +22,7 @@ import pytest
 import omnigent.inner.terminal as terminal_mod
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import (
     TerminalInstance,
     _apply_utf8_locale_default,
@@ -2050,6 +2051,7 @@ async def _capture_launch_argv(
     keep_alive_after_exit: bool = False,
     command: str = "bash",
     args: list[str] | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
 ) -> list[str]:
     """
     Launch a terminal with mocked tmux and return the single setup argv.
@@ -2059,6 +2061,8 @@ async def _capture_launch_argv(
     :param keep_alive_after_exit: Value for the instance's opt-in flag.
     :param command: Executable to run inside tmux, e.g. ``"claude"``.
     :param args: Command arguments, e.g. a huge argv value.
+    :param sandbox_policy: Optional sandbox policy; an active one wraps the
+        command in the (mocked) exec launcher, as ``create_terminal_instance`` does.
     :returns: The flattened tmux launch argv.
     """
     captured: list[list[str]] = []
@@ -2091,6 +2095,7 @@ async def _capture_launch_argv(
         command=command,
         args=args or [],
         keep_alive_after_exit=keep_alive_after_exit,
+        sandbox_policy=sandbox_policy,
     )
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
@@ -3001,6 +3006,45 @@ async def test_launch_keeps_short_command_inline(
 
     assert not (tmp_path / "launch.sh").exists()
     assert any("--append-system-prompt" in arg for arg in cmd)
+
+
+@pytest.mark.asyncio
+async def test_launch_routes_oversized_sandboxed_command_through_launch_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An oversized argv under an active sandbox keeps the launcher as the pane entrypoint.
+
+    With a sandbox policy the pane command is ``<exec launcher> <args>`` and the
+    launcher applies the sandbox before spawning the CLI. The script route must
+    keep that shape byte-for-byte so the CLI still starts sandboxed and the
+    instructions still arrive.
+
+    :param tmp_path: Temporary directory used as the instance private dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
+    big_arg = "x" * 20_000
+    cmd = await _capture_launch_argv(
+        tmp_path,
+        monkeypatch,
+        command="claude",
+        args=["--append-system-prompt", big_arg],
+        sandbox_policy=SandboxPolicy(
+            backend_type="none",
+            active=True,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+
+    assert not any(big_arg in arg for arg in cmd)
+    script_text = (tmp_path / "launch.sh").read_text()
+    assert script_text.startswith("#!/bin/sh\nexec /test/launcher --append-system-prompt ")
+    assert big_arg in script_text
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
