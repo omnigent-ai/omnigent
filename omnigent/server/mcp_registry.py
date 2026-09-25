@@ -215,12 +215,12 @@ class McpRegistry:
                 self.store.get, user_id, f"mcp:{service.id}", with_secret=True
             )
             if conn is None or not conn.secret or not conn.secret.get("access_token"):
-                raise ConnectionError("Connect this MCP account in Sandbox Integrations")
+                raise ConnectionError("Connect this MCP account in Settings > MCP")
             expiry = conn.metadata.get("expires_at")
             if service.oauth and expiry is not None and float(expiry) <= time.time() + 30:
                 refresh = conn.secret.get("refresh_token")
                 if not refresh:
-                    raise ConnectionError("Reconnect this MCP account in Sandbox Integrations")
+                    raise ConnectionError("Reconnect this MCP account in Settings > MCP")
                 tokens = await self.exchange(
                     service, {"grant_type": "refresh_token", "refresh_token": refresh}
                 )

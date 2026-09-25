@@ -100,7 +100,7 @@ async def execute_registry_tool(
             "error": {
                 "code": -32000,
                 "message": (
-                    "MCP request failed. Check the connection in Sandbox Integrations; "
+                    "MCP request failed. Check the connection in Settings > MCP; "
                     "the operation was not retried."
                 ),
             }

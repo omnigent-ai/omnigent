@@ -284,6 +284,7 @@ async def test_create_with_existing_worktree_persists_without_creating(
     client: httpx.AsyncClient,
     app: FastAPI,
     select_registry: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Starting in an existing worktree persists its branch, creates nothing.
 
@@ -336,6 +337,40 @@ async def test_create_with_existing_worktree_persists_without_creating(
         assert body["agent_id"] != agent["id"]
         selected = await client.get(f"/v1/sessions/{body['id']}/agent")
         assert selected.json()["mcp_servers"][0]["name"] == "tracker"
+        assert selected.json()["mcp_servers"][0]["url"] is None
+
+        from unittest.mock import AsyncMock
+
+        from mcp.types import CallToolResult, TextContent, Tool
+
+        from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+        from omnigent.runtime import get_agent_cache, get_agent_store
+
+        execute = AsyncMock(
+            side_effect=[
+                [Tool(name="read_ticket", inputSchema={"type": "object"})],
+                CallToolResult(content=[TextContent(type="text", text="Ticket TEST-123")]),
+            ]
+        )
+        monkeypatch.setattr(app.state.mcp_registry, "execute", execute)
+        selected_agent = get_agent_store().get(body["agent_id"])
+        spec = (
+            get_agent_cache()
+            .load(selected_agent.id, selected_agent.bundle_location, expand_env=False)
+            .spec
+        )
+        proxy = ProxyMcpManager(session_id=body["id"], ap_client=client)
+        schemas = await proxy.schemas_for(spec)
+        assert "tracker__read_ticket" in schemas.tool_names
+        assert (
+            await proxy.call_tool(spec, "tracker__read_ticket", {"ticket_id": "TEST-123"})
+            == "Ticket TEST-123"
+        )
+        assert execute.await_args.args[:2] == ("tracker", RESERVED_USER_LOCAL)
+        assert execute.await_args.kwargs == {
+            "tool": "read_ticket",
+            "arguments": {"ticket_id": "TEST-123"},
+        }
 
 
 async def test_create_with_invalid_existing_worktree_branch_fails_400(
