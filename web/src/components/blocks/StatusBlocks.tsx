@@ -79,6 +79,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   codex_thread_reset:
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
   codex_turn_error: "Codex ran into an error during this turn.",
+  codex_input_too_large:
+    "Your message is too large for Codex's input limit. Shorten it or split large pasted content across turns.",
   native_turn_error: "The agent ran into an error during this turn.",
   rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
   budget_exhausted:

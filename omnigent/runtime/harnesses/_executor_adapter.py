@@ -112,6 +112,15 @@ def _is_host_tool(tool_name: str) -> bool:
     return _strip_mcp_tool_prefix(tool_name).startswith(_HOST_TOOL_PREFIX)
 
 
+class _InnerExecutorError(RuntimeError):
+    """A yielded :class:`ExecutorError` re-raised as a ``response.failed`` event; carries its
+    optional structured ``code`` so a known failure surfaces under it, not ``runner_error``."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.error_code = code
+
+
 class ExecutorAdapter(HarnessApp):
     """
     :class:`HarnessApp` subclass that drives any inner :class:`Executor`.
@@ -335,6 +344,10 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
+                        if event.code:
+                            raise _InnerExecutorError(
+                                f"inner executor error: {detail}", code=event.code
+                            )
                         raise RuntimeError(f"inner executor error: {detail}")
         except ElicitationDeclinedError:
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
@@ -940,6 +953,9 @@ class ExecutorAdapter(HarnessApp):
         """
         from omnigent.errors import OmnigentError
         from omnigent.server.schemas import ErrorDetail
+
+        if isinstance(exception, _InnerExecutorError):
+            return ErrorDetail(code=exception.error_code, message=str(exception))
 
         if isinstance(exception, OmnigentError):
             return ErrorDetail(code=exception.code, message=str(exception))

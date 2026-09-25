@@ -224,6 +224,7 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         ("runner_disconnected", "host dropped"),
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
+        ("codex_input_too_large", "too large for Codex"),
         ("rate_limit_exceeded", "You can retry this turn"),
         ("budget_exhausted", "budget"),
     ],

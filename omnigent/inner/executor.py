@@ -349,12 +349,18 @@ class ExecutorError(ExecutorEvent):
     :param preserve_session: The executor is idle and safe to reuse after this
         failure. Set only when no prompt or tool work remains in progress.
         Defaults to ``False`` so failed turns receive normal teardown.
+    :param code: Optional structured failure code for a known turn-level
+        condition (e.g. ``"codex_input_too_large"``). When set, the harness
+        surfaces it as the turn's failure code instead of the generic
+        runner_error, so the UI can show a specific reason. ``None`` leaves the
+        existing generic classification unchanged.
     """
 
     message: str
     retryable: bool = False
     usage: ExecutorUsage | None = None
     preserve_session: bool = False
+    code: str | None = None
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:
