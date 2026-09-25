@@ -51,6 +51,26 @@ internal class DatabricksTokenManager(
         flushPendingWrite(scope)
     }
 
+    /** Internal mutation seam used by debug-only authentication fault injection. */
+    @Synchronized
+    fun replaceStored(
+        scope: DatabricksCredentialScope,
+        transform: (DatabricksOAuthTokens) -> DatabricksOAuthTokens,
+    ): Boolean {
+        flushPendingWrite(scope)
+        val current = store.load(scope) ?: return false
+        save(scope, transform(current))
+        return true
+    }
+
+    @Synchronized
+    fun clearStoredIfPresent(scope: DatabricksCredentialScope): Boolean {
+        flushPendingWrite(scope)
+        if (store.load(scope) == null) return false
+        clear(scope)
+        return true
+    }
+
     @Synchronized
     fun isCurrent(
         scope: DatabricksCredentialScope,

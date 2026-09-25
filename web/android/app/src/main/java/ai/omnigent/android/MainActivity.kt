@@ -26,6 +26,7 @@ import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -69,6 +70,7 @@ class MainActivity : AppCompatActivity() {
     private val databricksAuthLauncher =
         AuthTabIntent.registerActivityResultLauncher(this, ::handleDatabricksAuthResult)
     private var workspaceCoordinator: DatabricksWorkspaceCoordinator? = null
+    private var workspaceTokens: DatabricksTokenManager? = null
     private var workspaceSignOuts: DatabricksSignOutManager? = null
     private var workspaceContext: DatabricksWebContext? = null
     private var pendingRecoveryContext: DatabricksWebContext? = null
@@ -172,6 +174,7 @@ class MainActivity : AppCompatActivity() {
             }
         workspaceContext?.let {
             val tokens = DatabricksTokenManager.shared(applicationContext)
+            workspaceTokens = tokens
             workspaceSignOuts = DatabricksSignOutManager(applicationContext, tokens)
             workspaceCoordinator = DatabricksWorkspaceCoordinator(applicationContext, tokens)
         }
@@ -1214,6 +1217,7 @@ class MainActivity : AppCompatActivity() {
             add(2, 4, 0, getString(R.string.menu_connect_new))
             if (workspaceSession != null) {
                 add(2, 5, 0, getString(R.string.menu_sign_out_workspace))
+                DatabricksAuthDebugMenu.addItems(this)
             }
         }
         popup.setOnMenuItemClickListener { item ->
@@ -1240,11 +1244,36 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 else -> {
-                    false
+                    if (DatabricksAuthDebugMenu.handles(item.itemId)) {
+                        runAuthenticationDebugFault(item.itemId)
+                        true
+                    } else {
+                        false
+                    }
                 }
             }
         }
         popup.show()
+    }
+
+    private fun runAuthenticationDebugFault(itemId: Int) {
+        val tokens = workspaceTokens ?: return
+        val context = workspaceContext ?: return
+        val profile = workspaceProfile ?: return
+        val session = workspaceSession ?: return
+        DatabricksAuthDebugMenu
+            .run(itemId, tokens, context, profile, session)
+            .whenComplete { message, rawError ->
+                runOnUiThread {
+                    val error = unwrapCompletionError(rawError)
+                    Toast
+                        .makeText(
+                            this,
+                            error?.message ?: message,
+                            Toast.LENGTH_LONG,
+                        ).show()
+                }
+            }
     }
 
     private fun isWorkspacePage(url: String?): Boolean =

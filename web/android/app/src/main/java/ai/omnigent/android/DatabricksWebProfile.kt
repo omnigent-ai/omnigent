@@ -86,6 +86,33 @@ internal class DatabricksWebProfile(
             future
         }
 
+    fun clearSessionCookie(session: DatabricksWebSession): CompletableFuture<Boolean> {
+        val cookie =
+            session.cookies.lastOrNull {
+                it.name == "DBAUTH" && !it.isDeletion && it.appliesTo(session.pageUri)
+            } ?: return CompletableFuture.completedFuture(false)
+        return enqueue(name) {
+            val future = CompletableFuture<Void>()
+            val deletion =
+                buildString {
+                    append("DBAUTH=; Max-Age=0; Path=").append(cookie.path)
+                    if (!cookie.hostOnly) append("; Domain=").append(cookie.domain)
+                    if (cookie.secure) append("; Secure")
+                    append("; HttpOnly")
+                }
+            backend.setCookie(cookie.sourceUri.toString(), deletion) { accepted ->
+                backend.flushCookies()
+                val visible = parseCookieHeader(backend.getCookie(session.pageUri.toString()))
+                if (accepted && visible["DBAUTH"].isNullOrEmpty()) {
+                    future.complete(null)
+                } else {
+                    future.completeExceptionally(DatabricksSessionException.UnsafeCookie())
+                }
+            }
+            future
+        }.thenApply { true }
+    }
+
     fun hasSessionCookie(pageUri: java.net.URI): CompletableFuture<Boolean> {
         val result = CompletableFuture<Boolean>()
         main.post {
