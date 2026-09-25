@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import secrets
 import time
-import uuid
 import weakref
 from collections.abc import Callable
 from typing import Any, Literal, cast
@@ -159,7 +159,6 @@ from omnigent.server.routes._sessions.helpers import (
     _is_devin_native_subagent,
     _launch_runner_on_host,
     _parse_background_tasks,
-    _parse_external_conversation_item,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
@@ -178,7 +177,6 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_compaction_failed,
     _publish_compaction_in_progress,
     _publish_elicitation_request_to_ancestors,
-    _publish_external_conversation_item,
     _publish_external_output_reasoning_delta,
     _publish_external_output_text_delta,
     _publish_external_tool_output_delta,
@@ -205,7 +203,6 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _child_session_summaries_from_conversations,
     _dispatch_session_event_to_runner,
-    _drive_terminal_resolved_elicitation,
     _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
@@ -220,6 +217,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
+    _persist_external_conversation_items,
     _persist_external_devin_subagent_start,
     _persist_external_session_usage,
     _persist_host_launch_failure_turn,
@@ -283,6 +281,30 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
         _EXTERNAL_SESSION_USAGE_TYPE,
     }
 )
+
+
+def _is_batchable_external_item(event: SessionEventInput) -> bool:
+    """
+    Whether a batch entry can skip :func:`_post_event_impl` and be appended
+    with its neighbors, which is the shape the claude-native forwarder posts.
+
+    For an external item that is not a user message (pending-input drain) or a
+    slash command (title seeding), the per-entry path only authorizes, persists
+    and broadcasts. Entries carrying ``created_by`` or ``tools`` also stay
+    per-entry so their validation is not duplicated here.
+    """
+    if (
+        event.type != _EXTERNAL_CONVERSATION_ITEM_TYPE
+        or event.created_by is not None
+        or event.tools
+    ):
+        return False
+    item_type = event.data.get("item_type")
+    item_data = event.data.get("item_data")
+    is_user_message = (
+        item_type == "message" and isinstance(item_data, dict) and item_data.get("role") == "user"
+    )
+    return item_type != "slash_command" and not is_user_message
 
 
 def _event_body_too_large() -> HTTPException:
@@ -521,6 +543,21 @@ def register_events_routes(
         runner_id = getattr(conv, "runner_id", None)
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
+    async def _authorized_conversation(
+        request: Request, session_id: str
+    ) -> tuple[str | None, Any]:
+        """Require EDIT on the session and return the caller and its conversation."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        return user_id, conv
+
     @event_router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -558,139 +595,31 @@ def register_events_routes(
                         "session event batch exceeds the 100-event limit",
                         code=ErrorCode.INVALID_INPUT,
                     )
-
-                def _is_coalescing_candidate(ev: SessionEventInput) -> bool:
-                    # True for external_conversation_item events other than user messages
-                    # and slash_command items, which need the per-entry pending-input drain
-                    # and title seeding.
-                    if ev.type != _EXTERNAL_CONVERSATION_ITEM_TYPE:
-                        return False
-                    _itype = ev.data.get("item_type")
-                    if _itype == "slash_command":
-                        return False
-                    if _itype == "message":
-                        _idata = ev.data.get("item_data")
-                        if isinstance(_idata, dict) and _idata.get("role") == "user":
-                            return False
-                    return True
-
-                if not any(_is_coalescing_candidate(e) for e in body):
-                    # Nothing to coalesce: every event takes the per-entry path.
-                    return [
-                        await _post_event_impl(
-                            request,
-                            session_id,
-                            event,
-                            in_flight=in_flight if event.type == "message" else None,
-                        )
-                        for event in body
-                    ]
-
-                # Authorize once for the batch; consecutive coalescable items are
-                # accumulated and flushed with one conversation_store.append call.
-                _b_user_id = _get_user_id(request, auth_provider)
-                _b_access = await _require_access_and_level(
-                    _b_user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-                )
-                _b_conv = _b_access.conversation
-                if _b_conv is None:
-                    _b_conv = await asyncio.to_thread(
-                        conversation_store.get_conversation, session_id
-                    )
-                    if _b_conv is None:
-                        raise _session_not_found()
-
-                add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
-
-                _acks: list[dict[str, bool | str]] = []
-                _buf_items: list[NewConversationItem] = []
-                _buf_evts: list[SessionEventInput] = []
-
-                async def _flush_coalesced() -> None:
-                    if not _buf_items:
-                        return
-                    # Re-tag after a non-coalesced event may have changed the label.
-                    add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
-                    _persisted = await asyncio.to_thread(
-                        conversation_store.append, session_id, _buf_items[:]
-                    )
-                    for _be, _bp in zip(_buf_evts, _persisted, strict=True):
-                        if not _bp.deduplicated:
-                            _msg_id = _be.data.get("message_id")
-                            _publish_external_conversation_item(
-                                session_id,
-                                _bp,
-                                message_id=_msg_id if isinstance(_msg_id, str) else None,
-                            )
-                            _drive_terminal_resolved_elicitation(session_id, _bp)
-                        _acks.append({"queued": False, "item_id": _bp.id})
-                    _buf_items.clear()
-                    _buf_evts.clear()
-
-                for _evt in body:
-                    if _is_coalescing_candidate(_evt):
-                        # Per-item validation; on any error flush accumulated items
-                        # so earlier ones remain applied (non-atomic batch contract).
-                        try:
-                            _evt_body_created_by = _attribution_user(_evt.created_by)
-                            if _evt_body_created_by is not None:
-                                if not _has_runner_created_by_authority(request, _b_conv):
-                                    raise OmnigentError(
-                                        "created_by is reserved for runner-originated"
-                                        " session events",
-                                        code=ErrorCode.FORBIDDEN,
-                                    )
-                            if _evt.tools:
-                                try:
-                                    parse_client_side_tool_specs(_evt.tools)
-                                except ValueError as _exc:
-                                    raise OmnigentError(
-                                        str(_exc), code=ErrorCode.INVALID_INPUT
-                                    ) from _exc
-                            _ni = _parse_external_conversation_item(_evt)
-                            _src = _evt.data.get("source_id")
-                            if _src is not None:
-                                if (
-                                    not isinstance(_src, str)
-                                    or not _src.strip()
-                                    or len(_src) > 256
-                                ):
-                                    raise OmnigentError(
-                                        "external_conversation_item data.source_id "
-                                        "must be a non-empty string of at most 256 "
-                                        "characters",
-                                        code=ErrorCode.INVALID_INPUT,
-                                    )
-                                _ni = _ni.model_copy(
-                                    update={
-                                        "stable_id": uuid.uuid5(
-                                            uuid.NAMESPACE_URL,
-                                            f"omnigent-external-item:{session_id}:{_src.strip()}",
-                                        ).hex
-                                    }
+                # A sub-agent transcript arrives as one array of up to 100 items with a
+                # 10 s client timeout, and persisting it per entry on a store with
+                # per-append overhead outlasts that. Each run of batchable entries is
+                # authorized once and appended in one store call; every other entry
+                # keeps the per-entry path, in order.
+                acks: list[dict[str, bool | str]] = []
+                for batchable, run in itertools.groupby(body, key=_is_batchable_external_item):
+                    if not batchable:
+                        for event in run:
+                            acks.append(
+                                await _post_event_impl(
+                                    request,
+                                    session_id,
+                                    event,
+                                    in_flight=in_flight if event.type == "message" else None,
                                 )
-                        except Exception:
-                            # Flush what is already accumulated; a client disconnect
-                            # is CancelledError (BaseException) and must not flush.
-                            await _flush_coalesced()
-                            raise
-                        _buf_items.append(_ni)
-                        _buf_evts.append(_evt)
-                    else:
-                        # Non-coalescable event: flush pending run then use the
-                        # per-entry path (its own auth + full checks).
-                        await _flush_coalesced()
-                        _acks.append(
-                            await _post_event_impl(
-                                request,
-                                session_id,
-                                _evt,
-                                in_flight=in_flight if _evt.type == "message" else None,
                             )
-                        )
-
-                await _flush_coalesced()
-                return _acks
+                        continue
+                    await _authorized_conversation(request, session_id)
+                    add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
+                    item_ids = await _persist_external_conversation_items(
+                        session_id, list(run), conversation_store
+                    )
+                    acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
+                return acks
             return await _post_event_impl(
                 request,
                 session_id,
@@ -795,15 +724,7 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-        )
-        conv = access.conversation
-        if conv is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
+        user_id, conv = await _authorized_conversation(request, session_id)
         if in_flight is not None:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.

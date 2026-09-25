@@ -2566,30 +2566,7 @@ async def _persist_external_conversation_item(
         no label is stamped in that case.
     :returns: Store-assigned conversation item id.
     """
-    item = _parse_external_conversation_item(body)
-    # An at-least-once producer (the native transcript forwarders) retries a
-    # timed-out POST it cannot know the disposition of, so the item's id is
-    # derived from its ``source_id`` and the append is idempotent — the
-    # dedupe check rides the append's own transaction, under its
-    # conversation lock, costing the hot path no extra query. A dedupe hit
-    # comes back flagged so the duplicate's side effects are unwound below
-    # (no re-broadcast, and a wrongly-drained pending input is restored).
-    source_id = body.data.get("source_id")
-    if source_id is not None:
-        if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256:
-            raise OmnigentError(
-                "external_conversation_item data.source_id must be a "
-                "non-empty string of at most 256 characters",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        item = item.model_copy(
-            update={
-                "stable_id": uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
-                ).hex
-            }
-        )
+    item = _new_external_conversation_item(session_id, body)
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -2674,6 +2651,50 @@ async def _persist_external_conversation_item(
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule(expected_seed_title=conv.title)
+    _publish_persisted_external_item(
+        session_id, body, persisted, cleared_pending_id=cleared_pending_id
+    )
+    return persisted.id
+
+
+def _new_external_conversation_item(
+    session_id: str, body: SessionEventInput
+) -> NewConversationItem:
+    """Parse an external item event, keyed by its ``source_id`` when it has one."""
+    item = _parse_external_conversation_item(body)
+    # An at-least-once producer (the native transcript forwarders) retries a
+    # timed-out POST it cannot know the disposition of, so the item's id is
+    # derived from its ``source_id`` and the append is idempotent — the
+    # dedupe check rides the append's own transaction, under its
+    # conversation lock, costing the hot path no extra query. A dedupe hit
+    # comes back flagged so the caller can unwind the duplicate's side effects
+    # (no re-broadcast, and a wrongly-drained pending input is restored).
+    source_id = body.data.get("source_id")
+    if source_id is not None:
+        if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256:
+            raise OmnigentError(
+                "external_conversation_item data.source_id must be a "
+                "non-empty string of at most 256 characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        item = item.model_copy(
+            update={
+                "stable_id": uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
+                ).hex
+            }
+        )
+    return item
+
+
+def _publish_persisted_external_item(
+    session_id: str,
+    body: SessionEventInput,
+    persisted: ConversationItem,
+    cleared_pending_id: str | None = None,
+) -> None:
+    """Broadcast a newly persisted external item and drive any elicitation it resolves."""
     message_id = body.data.get("message_id")
     _publish_external_conversation_item(
         session_id,
@@ -2682,7 +2703,39 @@ async def _persist_external_conversation_item(
         message_id=message_id if isinstance(message_id, str) else None,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
-    return persisted.id
+
+
+async def _persist_external_conversation_items(
+    session_id: str,
+    bodies: list[SessionEventInput],
+    conversation_store: ConversationStore,
+) -> list[str]:
+    """
+    Persist a run of external items with one store append.
+
+    Matches :func:`_persist_external_conversation_item` per body for items
+    that neither drain a pending input nor seed a title. As on the per-entry
+    path, a malformed body raises only after the bodies before it are applied.
+
+    :returns: Store-assigned item ids, in body order.
+    """
+    items: list[NewConversationItem] = []
+    error: Exception | None = None
+    for body in bodies:
+        try:
+            items.append(_new_external_conversation_item(session_id, body))
+        except Exception as exc:  # noqa: BLE001 — re-raised once the valid prefix is applied
+            error = exc
+            break
+    persisted_items = (
+        await asyncio.to_thread(conversation_store.append, session_id, items) if items else []
+    )
+    for body, persisted in zip(bodies[: len(items)], persisted_items, strict=True):
+        if not persisted.deduplicated:
+            _publish_persisted_external_item(session_id, body, persisted)
+    if error is not None:
+        raise error
+    return [persisted.id for persisted in persisted_items]
 
 
 def _build_skipped_kiro_items(
@@ -11192,6 +11245,7 @@ __all__ = [
     "_persist_external_antigravity_subagent_start",
     "_persist_external_codex_subagent_start",
     "_persist_external_conversation_item",
+    "_persist_external_conversation_items",
     "_persist_external_devin_subagent_start",
     "_persist_external_session_usage",
     "_persist_host_launch_failure_turn",
