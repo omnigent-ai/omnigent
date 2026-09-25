@@ -3050,6 +3050,9 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            register_runner_ingest=lambda handler: setattr(
+                app.state, "runner_event_ingest", handler
+            ),
         ),
         prefix="/v1",
         tags=["sessions"],

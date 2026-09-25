@@ -20,6 +20,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
+from typing import cast
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 
@@ -27,6 +28,10 @@ from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventBatchFrame,
+    EventReadyFrame,
     HelloFrame,
     PingFrame,
     PongFrame,
@@ -511,6 +516,11 @@ def create_runner_tunnel_router(
                 name=f"tunnel-receive:{runner_id}",
             )
 
+            if EVENT_INGEST_CAPABILITY in frame.capabilities and callable(
+                getattr(ws.app.state, "runner_event_ingest", None)
+            ):
+                await registry.send_text(session, encode_frame(EventReadyFrame()))
+
             if on_runner_connect is not None:
                 # Bounded so a slow / hung hook can't stall WS
                 # shutdown: helper tasks are already running, but
@@ -697,36 +707,85 @@ async def _receive_loop(
     :returns: None when the WebSocket disconnects or the session is
         no longer current.
     """
-    while True:
-        raw = await _receive_tunnel_text(ws, runner_id)
-        if not registry.mark_frame_seen(session):
-            return
-        if raw is None:
-            continue
+    ingest = cast(
+        "Callable[..., Awaitable[EventAckFrame]] | None",
+        getattr(ws.app.state, "runner_event_ingest", None),
+    )
+    slots = getattr(ws.app.state, "runner_event_ingest_slots", None)
+    if slots is None:
+        slots = asyncio.Semaphore(16)
+        ws.app.state.runner_event_ingest_slots = slots
+    active: set[asyncio.Task[None]] = set()
+
+    async def process(batch: EventBatchFrame) -> None:
         try:
-            resp_frame = decode_frame(raw)
-        except ValueError as exc:
-            _logger.warning(
-                "Runner %s sent malformed tunnel frame; dropping: %s",
-                runner_id,
-                exc,
+            if registry.get(runner_id) is not session or not callable(ingest):
+                return
+            ack = await ingest(
+                app=ws.app,
+                headers=ws.headers,
+                owner=session.owner,
+                runner_id=runner_id,
+                batch=batch,
             )
-            continue
-        if isinstance(resp_frame, PongFrame):
-            # Tunnel keepalive round-trip. DEBUG because pings are frequent —
-            # opt in via log level. ``ts`` is epoch-ms stamped when the server
-            # pinged, so now - ts is the runner round-trip latency.
-            _logger.debug(
-                "runner %s tunnel keepalive: pong rtt=%dms",
-                runner_id,
-                int(time.time() * 1000) - resp_frame.ts,
-            )
-            continue
-        if isinstance(resp_frame, (WSFrame, WSCloseFrame)):
-            registry.route_ws_inbound(runner_id, resp_frame, session=session)
-            continue
-        # Route response.* frames to the reassembly queue.
-        registry.route_response_frame(runner_id, resp_frame, session=session)
+        except Exception:
+            _logger.exception("Runner %s event ingestion failed", runner_id)
+            ack = EventAckFrame(batch.id, 0, "ingest failed", retryable=True)
+        finally:
+            slots.release()
+        if registry.get(runner_id) is session:
+            await registry.send_text(session, encode_frame(ack))
+
+    try:
+        while True:
+            raw = await _receive_tunnel_text(ws, runner_id)
+            if not registry.mark_frame_seen(session):
+                return
+            if raw is None:
+                continue
+            try:
+                resp_frame = decode_frame(raw)
+            except ValueError as exc:
+                _logger.warning(
+                    "Runner %s sent malformed tunnel frame; dropping: %s",
+                    runner_id,
+                    exc,
+                )
+                continue
+            if isinstance(resp_frame, EventBatchFrame):
+                if EVENT_INGEST_CAPABILITY not in session.hello.capabilities or not callable(
+                    ingest
+                ):
+                    continue
+                if slots.locked() or len(active) >= 2:
+                    await registry.send_text(
+                        session,
+                        encode_frame(EventAckFrame(resp_frame.id, 0, "busy", retryable=True)),
+                    )
+                    continue
+                await slots.acquire()
+                task = asyncio.create_task(process(resp_frame))
+                active.add(task)
+                task.add_done_callback(active.discard)
+                continue
+            if isinstance(resp_frame, PongFrame):
+                # Any frame (including pong) renews the tunnel's liveness.
+                _logger.debug(
+                    "runner %s tunnel keepalive: pong rtt=%dms",
+                    runner_id,
+                    int(time.time() * 1000) - resp_frame.ts,
+                )
+                continue
+            if isinstance(resp_frame, (WSFrame, WSCloseFrame)):
+                registry.route_ws_inbound(runner_id, resp_frame, session=session)
+                continue
+            # Route response.* frames to the reassembly queue.
+            registry.route_response_frame(runner_id, resp_frame, session=session)
+    finally:
+        for task in active:
+            task.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
 
 
 async def _keepalive_loop(runner_id: str) -> None:
