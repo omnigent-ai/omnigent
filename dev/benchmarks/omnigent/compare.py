@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import statistics
 import sys
 from pathlib import Path
 
@@ -20,6 +22,19 @@ from rich.console import Console
 from rich.table import Table
 
 console = Console()
+
+
+def _comparison_metric(data: dict, run_key: str, summary_key: str) -> float | None:
+    """Return the median run metric, falling back for summary-only reports."""
+    values = [
+        float(value)
+        for run in (data.get("runs") or [])
+        if isinstance((value := run.get(run_key)), (int, float)) and math.isfinite(value)
+    ]
+    if values:
+        return statistics.median(values)
+    value = data.get("summary", {}).get(summary_key)
+    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
 
 
 def _fmt_ms(v: float | None) -> str:
@@ -63,6 +78,10 @@ def compare_reports(
     :param candidate: Parsed candidate JSON report.
     :param threshold: Regression threshold as a fraction (e.g. 0.20 = 20%).
     :param backend: If set, only compare journeys whose ``backend`` key matches.
+    Run-level medians drive latency comparisons so one noisy timed run cannot
+    dominate a three-run report. Summary averages remain the fallback for
+    legacy reports that did not retain per-run metrics.
+
     :returns: ``(passed, rows)`` where *rows* hold per-journey comparison data.
     """
     baseline_journeys = baseline.get("journeys", {})
@@ -75,22 +94,23 @@ def compare_reports(
             continue
 
         c_summary = c_data.get("summary", {})
-        c_p50 = c_summary.get("avg_p50_ms")
-        c_p95 = c_summary.get("avg_p95_ms")
+        c_p50 = _comparison_metric(c_data, "p50_ms", "avg_p50_ms")
+        c_p95 = _comparison_metric(c_data, "p95_ms", "avg_p95_ms")
 
         # A skipped journey (or one whose runs all failed) carries no metric
         # keys. Report it as its own status instead of computing a delta off a
         # missing value (which would read as a spurious -100% improvement).
         c_req = c_summary.get("avg_http_requests_per_op")
         if c_p50 is None:
-            b_j_summary = baseline_journeys.get(name, {}).get("summary", {})
+            b_journey = baseline_journeys.get(name, {})
+            b_j_summary = b_journey.get("summary", {})
             rows.append(
                 {
                     "journey": name,
                     "status": "skipped",
-                    "b_p50": b_j_summary.get("avg_p50_ms"),
+                    "b_p50": _comparison_metric(b_journey, "p50_ms", "avg_p50_ms"),
                     "c_p50": None,
-                    "b_p95": b_j_summary.get("avg_p95_ms"),
+                    "b_p95": _comparison_metric(b_journey, "p95_ms", "avg_p95_ms"),
                     "c_p95": None,
                     "delta_p50": None,
                     "delta_p95": None,
@@ -137,8 +157,8 @@ def compare_reports(
             continue
 
         b_summary = b_data.get("summary", {})
-        b_p50 = b_summary.get("avg_p50_ms", 0.0)
-        b_p95 = b_summary.get("avg_p95_ms", 0.0)
+        b_p50 = _comparison_metric(b_data, "p50_ms", "avg_p50_ms") or 0.0
+        b_p95 = _comparison_metric(b_data, "p95_ms", "avg_p95_ms") or 0.0
         b_req = b_summary.get("avg_http_requests_per_op")
 
         c_p50 = c_p50 or 0.0
@@ -184,11 +204,11 @@ def print_table(rows: list[dict], threshold: float) -> None:
     )
     table.add_column("Journey", no_wrap=True)
     table.add_column("Status", justify="center")
-    table.add_column("Base P50 ms", justify="right")
-    table.add_column("Cand P50 ms", justify="right")
+    table.add_column("Base run-med P50 ms", justify="right")
+    table.add_column("Cand run-med P50 ms", justify="right")
     table.add_column("Δ P50", justify="right")
-    table.add_column("Base P95 ms", justify="right")
-    table.add_column("Cand P95 ms", justify="right")
+    table.add_column("Base run-med P95 ms", justify="right")
+    table.add_column("Cand run-med P95 ms", justify="right")
     table.add_column("Δ P95", justify="right")
     table.add_column("Req/op", justify="right")
 
@@ -225,10 +245,10 @@ def build_markdown(rows: list[dict], threshold: float, passed: bool) -> str:
     lines = [
         "## Benchmark comparison",
         "",
-        f"Regression threshold: **{threshold * 100:.0f}%** on avg P50 or avg P95.",
+        f"Regression threshold: **{threshold * 100:.0f}%** on run-median P50 or P95.",
         "",
-        "| Journey | Status | Base P50 ms | Cand P50 ms | Δ P50"
-        " | Base P95 ms | Cand P95 ms | Δ P95 | Req/op |",
+        "| Journey | Status | Base run-med P50 ms | Cand run-med P50 ms | Δ P50"
+        " | Base run-med P95 ms | Cand run-med P95 ms | Δ P95 | Req/op |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
 

@@ -115,7 +115,7 @@ fi
 
 echo "Smoke-testing API endpoints (expect 200):"
 status=0
-for path in / /health /docs /v1/agents /v1/sessions; do
+for path in / /health /docs /v1/agents '/v1/sessions?visibility=all'; do
   code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
     "http://127.0.0.1:${PORT}${path}")"
   printf "  %-14s %s\n" "$path" "$code"

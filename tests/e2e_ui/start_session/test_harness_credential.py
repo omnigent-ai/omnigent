@@ -1,14 +1,11 @@
-"""E2E: add a harness credential from the new-session setup dialog.
+"""E2E: needs-auth harnesses are disabled in the new-session picker.
 
-Covers the M3 journey where the selected agent's harness is installed but not
-configured (``needs-auth``): the setup dialog offers "Set up auth", which expands an
-inline credential form; pasting an API key POSTs the credential and the
-readiness warning clears once the host reports the harness ready.
+Covers the picker contract where an installed but unauthenticated harness stays
+visible and unselectable while its row-wide tooltip gives the login command.
 
 Uses the same route-stubbing approach as ``test_harness_install.py``:
-``/v1/info``, ``/v1/hosts``, ``/v1/agents``, ``/v1/harnesses``, the credential
-``POST`` and the adopt-detect ``GET`` are faked so the test drives the real UI
-without a live host or a real credential write.
+``/v1/info``, ``/v1/hosts``, and ``/v1/agents`` are faked so the test drives
+the real UI without a live host or a real credential write.
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
-from tests.e2e_ui.start_session.helpers import select_landing_agent, stub_empty_host_picker_data
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
 # The stub host reports codex installed-but-not-configured; the credential POST
@@ -208,11 +205,10 @@ async def _seed_workspace(page) -> None:
 # ── Tests ──────────────────────────────────────────────────────────
 
 
-def test_add_key_configures_needs_auth_harness(
+def test_needs_auth_harness_is_disabled_with_repair_tooltip(
     live_server: str,
 ) -> None:
-    """The setup dialog offers an inline credential form for a needs-auth
-    harness; pasting a key writes it and clears the readiness warning."""
+    """A needs-auth harness stays unselectable and explains how to authenticate."""
     base_url = live_server
     _run_in_fresh_loop(_drive_add_key(base_url))
 
@@ -231,43 +227,17 @@ async def _drive_add_key(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Commit the Codex agent (installed but needs-auth on the host). The
-            # composer auto-selects the built-in Claude Code, not our stubbed
-            # Codex, so select Codex explicitly — waiting for its row to render
-            # (it mounts only after the /v1/agents fetch resolves; can lag on CI).
-            await select_landing_agent(page, "ag_codex_e2e")
-
-            # "Set up →" opens the dialog; there's no Install (already installed).
-            setup = page.get_by_test_id("new-chat-landing-harness-setup")
-            await expect(setup).to_be_visible(timeout=60_000)
-            await setup.click()
-            await expect(page.get_by_test_id("harness-setup-install")).to_have_count(0)
-
-            # The auth step offers "Set up auth" → expands the inline credential form.
-            await page.get_by_test_id("harness-setup-add-credential").click()
-            await expect(page.get_by_test_id("harness-credential-form")).to_be_visible(
-                timeout=5_000
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await picker.click()
+            codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
+            await expect(codex_option).to_be_visible(timeout=60_000)
+            await expect(codex_option).to_have_attribute("aria-disabled", "true")
+            await codex_option.get_by_text("Codex", exact=True).hover()
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-tooltip-ag_codex_e2e")
+            ).to_contain_text(
+                "Codex needs Codex authentication on e2e-host — run codex login on that machine."
             )
-
-            # Paste a key and save → the credential POST is hit and the warning
-            # clears once the host reports the harness ready.
-            await page.get_by_test_id("harness-credential-key").fill("sk-ant-e2e-test")
-            await page.get_by_test_id("harness-credential-save").click()
-            await _wait_until(lambda: len(credential_requests) == 1)
-            assert credential_requests[0]["kind"] == "key"
-            assert credential_requests[0]["secret"] == "sk-ant-e2e-test"
-            await expect(page.get_by_test_id("new-chat-landing-harness-warning")).to_be_hidden(
-                timeout=10_000
-            )
+            assert credential_requests == []
         finally:
             await browser.close()
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")

@@ -16,6 +16,10 @@ from omnigent.host.connect import (
     _build_runner_env,
 )
 from omnigent.onboarding.provider_config import resolve_secret
+from omnigent.runner.identity import (
+    RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+    strip_runner_auth_secrets,
+)
 
 _REMOTE_SERVER_URL: Final = "https://example.databricksapps.com"
 _PROXY_ENV: Final = {
@@ -28,6 +32,69 @@ _PROXY_ENV: Final = {
     "all_proxy": "socks5://lower-proxy.example.com:1080",
     "no_proxy": "localhost,127.0.0.2",
 }
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+@pytest.mark.parametrize("codex_path", [None, "/selected install/bin/codex"])
+def test_codex_executable_selection_survives_daemon_and_runner_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+    codex_path: str | None,
+) -> None:
+    """Keep an explicit executable choice without widening secret forwarding."""
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, raising=False)
+    if codex_path is not None:
+        monkeypatch.setenv("OMNIGENT_CODEX_PATH", codex_path)
+    monkeypatch.setenv("OMNIGENT_UNRELATED_SECRET", "synthetic-secret")
+    monkeypatch.setenv("UNRELATED_SECRET", "synthetic-secret")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_codex_path",
+        binding_token="synthetic-binding-token",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+    terminal_env = strip_runner_auth_secrets(runner_env)
+
+    for env in (daemon_env, runner_env, terminal_env):
+        assert env.get("OMNIGENT_CODEX_PATH") == codex_path
+        assert "UNRELATED_SECRET" not in env
+    assert "OMNIGENT_UNRELATED_SECRET" not in runner_env
+    if server_url:
+        assert "OMNIGENT_UNRELATED_SECRET" not in daemon_env
+    assert runner_env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "synthetic-binding-token"
+    assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR not in terminal_env
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_pi_env_denylist_reaches_runner_through_host_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Pi's denylist crosses both hops without forwarding the named secrets."""
+    denylist = "ANTHROPIC_AUTH_TOKEN, UNRELATED_SECRET"
+    monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", denylist)
+    monkeypatch.setenv("UNRELATED_SECRET", "synthetic-unrelated-secret")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_pi_env",
+        binding_token="binding-pi-env",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    for env in (daemon_env, runner_env):
+        assert env["OMNIGENT_PI_ENV_UNSET"] == denylist
+        assert "UNRELATED_SECRET" not in env
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])

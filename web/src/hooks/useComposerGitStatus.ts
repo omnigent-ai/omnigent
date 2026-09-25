@@ -76,6 +76,8 @@ export interface ComposerGitStatus {
   creationBranch: string | null;
   /** `owner/repo` from the git remote, or `null`. */
   repoNameWithOwner: string | null;
+  /** GitHub association query state for fail-closed worktree and PR UI. */
+  githubState: "loading" | "ready" | "unknown";
   prCount: number;
   prNumber: number | null;
   /** Re-read live worktree + PR state from the host. */
@@ -165,6 +167,7 @@ export function useComposerGitStatus({
     worktreePath,
     creationBranch: creationBranch?.trim() || null,
     repoNameWithOwner: info?.repo?.name_with_owner ?? null,
+    githubState: github.isLoading ? "loading" : github.isError || !info ? "unknown" : "ready",
     prCount,
     prNumber,
     refresh,

@@ -18,19 +18,17 @@ from pathlib import Path
 import yaml
 
 from omnigent.config import global_config_path
+from omnigent.host import identity_env
 
 CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 
-# Env vars a server-managed sandbox host is launched with. The server
-# provisions the sandbox, generates the identity + launch token, and
-# injects all three so the host registers under the server-chosen
-# identity without persisting anything to the sandbox's config.yaml
-# (managed sandboxes are disposable). HOST_TOKEN is the tunnel
-# credential (see MANAGED_HOST_TOKEN_HEADER); HOST_ID / HOST_NAME
-# override the identity file and must be set together.
-HOST_TOKEN_ENV_VAR = "OMNIGENT_HOST_TOKEN"
-HOST_ID_ENV_VAR = "OMNIGENT_HOST_ID"
-HOST_NAME_ENV_VAR = "OMNIGENT_HOST_NAME"
+# The HOST_ID / HOST_NAME / HOST_TOKEN env-var names live in the dependency-free
+# leaf module omnigent.host.identity_env so the warm-pool readiness probe can
+# read them without importing this module's YAML/config dependencies. Bind them
+# here too so existing ``omnigent.host.identity`` callers keep working.
+HOST_ID_ENV_VAR = identity_env.HOST_ID_ENV_VAR
+HOST_NAME_ENV_VAR = identity_env.HOST_NAME_ENV_VAR
+HOST_TOKEN_ENV_VAR = identity_env.HOST_TOKEN_ENV_VAR
 
 # WebSocket upgrade header carrying a managed host's launch token.
 # Mirrors the runner tunnel's X-Omnigent-Runner-Tunnel-Token pattern:

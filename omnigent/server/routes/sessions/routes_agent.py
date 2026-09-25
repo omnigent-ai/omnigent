@@ -44,6 +44,9 @@ from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._auth_helpers import (
+    require_agent_owner as _require_agent_owner,
+)
+from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._content_type import (
@@ -302,6 +305,12 @@ def register_agent_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        # Owner-only: a session-scoped agent's bundle runs with runner
+        # authority, so a LEVEL_EDIT grant on the session (shared editors,
+        # reused-agent sessions) is not enough — only the creating user or an
+        # admin may replace it.
+        await asyncio.to_thread(_require_agent_owner, user_id, agent, permission_store)
+
         bundle_bytes = await bundle.read()
         # Run bundle validation (tar extraction + spec parse, both
         # blocking) off the event loop -- mirrors the POST
@@ -337,7 +346,7 @@ def register_agent_routes(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         artifact_store.put(new_loc, bundle_bytes)
-        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc)
+        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
         if updated is None:
             raise OmnigentError(
                 f"Agent not found: {agent.id!r}",

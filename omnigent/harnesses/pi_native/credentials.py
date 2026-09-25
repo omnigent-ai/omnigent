@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     # since ``ambient`` pulls in onboarding-only deps this module avoids on the
     # runner's session-create hot path).
     from omnigent.onboarding.ambient import CodexConfigTransport
+    from omnigent.spec.types import ExecutorAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -263,6 +264,10 @@ class PiProviderConfig:
     listing_provider: model_catalog.ResolvedModelProvider | None = field(
         default=None, hash=False, compare=False
     )
+    # Only configured tier maps with multiple distinct models scope the picker.
+    curated_models: bool = False
+    model_allowlist: tuple[str, ...] | None = None
+    inference_bound: bool = False
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -1331,6 +1336,8 @@ def _live_family_model_entries(
     :returns: The configured entries followed by every live model id, deduped;
         unchanged when the listing fails.
     """
+    if provider.model_allowlist is not None:
+        return list(provider.extra_models)
     listing_provider = provider.listing_provider
     if listing_provider is None:
         return list(provider.extra_models)
@@ -1364,7 +1371,7 @@ def _live_family_model_entries(
 
 
 def _inline_family_pi_provider(
-    entry: ProviderEntry, *, model: str | None
+    entry: ProviderEntry, *, model: str | None, preserve_model_ids: bool = False
 ) -> PiProviderConfig | None:
     """Resolve a key/gateway/local provider into Pi config from its family.
 
@@ -1400,7 +1407,14 @@ def _inline_family_pi_provider(
             auth_header = True
         else:
             continue
-        resolved_model = model or entry.family_default_model(family_name)
+        if model is not None:
+            resolved_model = model
+        else:
+            # A ``default:`` tier may name another tier (an alias such as
+            # ``deepseek-pro: deepseek-v4-pro``); launch with the id the
+            # endpoint actually serves, not the alias.
+            default_tier = entry.family_default_model(family_name)
+            resolved_model = family.resolve_model_tier(default_tier) if default_tier else None
         if not resolved_model:
             continue
         # A session override can arrive as a Databricks-gateway id, which only
@@ -1409,16 +1423,42 @@ def _inline_family_pi_provider(
         # front arbitrary inventories (a proxy fronting the Databricks AI
         # Gateway is addressed by the prefixed endpoint name). A configured
         # family default is exempt — it names an id its own endpoint serves.
-        if model is not None:
+        if model is not None and not preserve_model_ids:
             resolved_model = normalize_model_for_provider(resolved_model, entry.kind)
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
-        # Anthropic API but rejected by the Databricks AI Gateway.
-        resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
+        # Anthropic API but rejected by the Databricks AI Gateway, and in a Pi
+        # ``enabledModels`` ref the "[" would route the pattern through Pi's
+        # glob matcher instead of its exact reference match.
+        if not preserve_model_ids:
+            resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
         model_entry = _gateway_pi_model_entry(
             resolved_model,
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
         )
+        # Register the family's tiers alongside the selected model. Resolve
+        # aliases and strip bracket suffixes before deduplicating model ids.
+        tier_ids = list(
+            dict.fromkeys(
+                re.sub(r"\[.*?\]$", "", family.resolve_model_tier(tier_model))
+                for tier_model in family.models.values()
+                if isinstance(tier_model, str) and tier_model
+            )
+        )
+        shortlist: list[_PiModelEntry] = [model_entry]
+        # A session override must not turn a default-only setup into a shortlist.
+        curated_models = len(tier_ids) > 1
+        if curated_models:
+            for tier_id in tier_ids:
+                if tier_id == resolved_model:
+                    continue
+                shortlist.append(
+                    _gateway_pi_model_entry(
+                        tier_id,
+                        configured_context_window=family.context_window,
+                        configured_max_output_tokens=family.max_output_tokens,
+                    )
+                )
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,
@@ -1429,7 +1469,8 @@ def _inline_family_pi_provider(
             # Advisory when the model landed on the other family's wire; a raw
             # passthrough endpoint rejects it, and silence reads as a hang.
             credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
-            extra_models=[model_entry],
+            extra_models=shortlist,
+            curated_models=curated_models,
             # Record the endpoint the pre-launch picker can enumerate live; no
             # I/O happens here so session launch stays off the network.
             listing_provider=model_catalog.ResolvedModelProvider(
@@ -1448,6 +1489,7 @@ def resolve_pi_native_provider(
     *,
     model: str | None = None,
     config_loader: Callable[[], dict[str, object]] = load_config,
+    auth: ExecutorAuth | None = None,
 ) -> PiProviderConfig | None:
     """Resolve the omnigent-configured provider for a native Pi session.
 
@@ -1464,12 +1506,73 @@ def resolve_pi_native_provider(
     :returns: The resolved provider config, or ``None`` to fall back to Pi's
         own credentials.
     """
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
+
+    try:
+        if config_loader is load_config:
+            from omnigent.onboarding.provider_config import _load_config
+
+            base_config = _load_config()
+        else:
+            base_config = config_loader()
+    except Exception:  # noqa: BLE001 — legacy config failures fall back to Pi's own login
+        _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
+        return None
+    config = load_runtime_inference_config(base_config)
+    binding = binding_for_harness(config, "pi-native")
+    if binding is not None:
+        entry = resolve_bound_provider(config, "pi-native", auth)
+        selected = resolve_bound_model(config, "pi-native", model)
+        if entry is None:
+            raise ValueError("The Pi inference binding has no configured provider.")
+        resolved = _inline_family_pi_provider(entry, model=selected, preserve_model_ids=True)
+        if resolved is None:
+            raise ValueError(f"Configured provider {entry.name!r} cannot route Pi.")
+        if binding.model_allowlist is not None:
+            grouped: dict[str, PiProviderConfig] = {}
+            provider_ids = {
+                "anthropic-messages": _PI_PROVIDER_ID,
+                "openai-responses": _PI_OPENAI_PROVIDER_ID,
+                "openai-completions": _PI_COMPLETIONS_PROVIDER_ID,
+            }
+            for model_id in binding.model_allowlist:
+                routed = _inline_family_pi_provider(entry, model=model_id, preserve_model_ids=True)
+                if routed is None:
+                    raise ValueError(
+                        f"Configured provider {entry.name!r} cannot route {model_id!r}."
+                    )
+                provider_id = provider_ids[routed.api]
+                model_entry = next(row for row in routed.extra_models if row["id"] == model_id)
+                previous = grouped.get(provider_id)
+                grouped[provider_id] = replace(
+                    routed,
+                    provider_id=provider_id,
+                    extra_models=[*(previous.extra_models if previous else []), model_entry],
+                )
+            primary_id = provider_ids[resolved.api]
+            primary = grouped.pop(primary_id)
+            resolved = replace(
+                primary,
+                model=resolved.model,
+                additional_providers={
+                    pid: provider.to_models_config()["providers"][pid]
+                    for pid, provider in grouped.items()
+                },
+                curated_models=True,
+                model_allowlist=binding.model_allowlist,
+            )
+        return replace(resolved, inference_bound=True)
+
     selection = _split_pi_native_model_selection(model)
     unmanaged_prefix_warning: str | None = None
     if selection is not None:
         _, model = selection
     try:
-        config = config_loader()
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its
         # default exactly like the rest of the codebase — an explicit pi default
@@ -1611,6 +1714,26 @@ def write_pi_models_config(
     return models_path
 
 
+def _enabled_model_refs(rendered: _PiModelsConfig) -> list[str]:
+    """Build provider-qualified ``enabledModels`` refs for a rendered config.
+
+    This is a picker preference; users can toggle back to all models.
+
+    :param rendered: The rendered ``models.json`` mapping.
+    :returns: ``["provider/model", ...]`` refs in rendered order (deterministic,
+        matching the picker's listing order).
+    """
+    refs: list[str] = []
+    providers = rendered.get("providers", {})
+    for provider_id, payload in providers.items():
+        if not isinstance(payload, dict):
+            continue
+        for model in payload.get("models", []):
+            if isinstance(model, dict) and isinstance(model.get("id"), str) and model["id"]:
+                refs.append(f"{provider_id}/{model['id']}")
+    return refs
+
+
 class PiNativeLaunch(NamedTuple):
     """Env, CLI args and any effort notice for a managed pi-native launch.
 
@@ -1651,7 +1774,9 @@ def pi_native_provider_launch(
     # primary provider. Read the rendered config so family fallbacks agree.
     selected_model = provider.model
     model_provider_id = provider.provider_id
-    selection_parts = _split_pi_native_model_selection(selection)
+    selection_parts = (
+        None if provider.inference_bound else _split_pi_native_model_selection(selection)
+    )
     if selection_parts is not None:
         candidate_provider, candidate_model = selection_parts
         configured = rendered["providers"].get(candidate_provider)
@@ -1681,8 +1806,16 @@ def pi_native_provider_launch(
     # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
-    prepare_managed_pi_agent_dir(agent_dir, overlay={"defaultThinkingLevel": None})
+    overlay: dict[str, object] = {"defaultThinkingLevel": None}
+    # Only configured shortlists override the user's picker preferences.
+    # Qualified refs distinguish managed models from built-in providers.
+    enabled_refs = _enabled_model_refs(rendered)
+    if provider.curated_models and enabled_refs:
+        overlay["enabledModels"] = enabled_refs
+    prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
+    if provider.inference_bound:
+        env["OMNIGENT_PI_INFERENCE_BOUND"] = "1"
     # When the model id contains a "/" Pi's arg parser splits on the first
     # slash and treats the left part as a provider name, overriding
     # --provider. Pass the fully-qualified "provider/model" reference so Pi's

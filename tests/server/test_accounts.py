@@ -274,6 +274,7 @@ class _FakeReq:
     ) -> None:
         self.cookies = cookies or {}
         self.headers = headers or {}
+        self.scope: dict[str, object] = {}
 
 
 def test_accounts_source_reads_valid_cookie() -> None:
@@ -1660,6 +1661,65 @@ def test_admin_can_delete_normal_member(accounts_app: TestClient) -> None:
     assert "alice" not in {u["id"] for u in post["users"]}
 
 
+def test_delete_user_revokes_durable_authority(accounts_app: TestClient, tmp_path: Path) -> None:
+    """Deleting a user also kills everything that could act as them later.
+
+    Scheduled tasks are disabled, refresh grants revoked, hosts removed,
+    and an already-issued session cookie stops authenticating — all in
+    the same request, so a deleted identity cannot keep running
+    unattended work or minting new tokens.
+    """
+    import os
+    import uuid
+
+    from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+    from omnigent.stores.host_store import HostStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    cookie_secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    invite = admin.post("/auth/invite", json={}).json()["token"]
+    alice = TestClient(accounts_app.app)
+    r = alice.post(
+        "/auth/register",
+        json={"invite": invite, "username": "alice", "password": "alice-pw-1234"},
+    )
+    assert r.status_code == 200, r.text
+    r = alice.post(
+        "/auth/login",
+        json={"username": "alice", "password": "alice-pw-1234", "issue_refresh": True},
+    )
+    assert r.status_code == 200, r.text
+    refresh_token = r.json()["refresh_token"]
+    assert alice.get("/auth/me").status_code == 200
+
+    tasks = SqlAlchemyScheduledTaskStore(db_url)
+    task = tasks.create(
+        uuid.uuid4().hex, "nightly", "do it", "FREQ=DAILY", "alice", uuid.uuid4().hex, "UTC"
+    )
+    hosts = HostStore(db_url)
+    host = hosts.upsert_on_connect(uuid.uuid4().hex, "laptop", "alice")
+    grants = DeviceGrantStore(db_url)
+    grant = grants.get_by_refresh_hash(hash_secret(refresh_token, cookie_secret))
+    assert grant is not None and grant.user_id == "alice"
+
+    resp = admin.delete("/auth/users/alice")
+    assert resp.status_code == 204, resp.text
+
+    got = tasks.get(task.id)
+    assert got is not None and got.state == "deleted"
+    assert tasks.list_active() == []
+    assert grants.is_revoked(grant.id)
+    assert grants.get_by_refresh_hash(hash_secret(refresh_token, cookie_secret)) is None
+    assert hosts.get_host(host.host_id) is None
+    assert hosts.list_hosts("alice") == []
+    # The still-signed cookie no longer authenticates.
+    assert alice.get("/auth/me").status_code == 401
+
+
 def test_change_own_password_round_trip(accounts_app: TestClient) -> None:
     """POST /auth/users/me/password rotates the password.
 
@@ -1979,7 +2039,7 @@ def test_setup_creates_first_admin_and_signs_in(
 def test_setup_after_saving_no_auth_project_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A preference-only local user must not prevent first-admin setup."""
+    """Saved local preferences must not prevent first-admin setup."""
     from sqlalchemy.orm import Session
 
     from omnigent.db.db_models import SqlUser
@@ -1988,7 +2048,7 @@ def test_setup_after_saving_no_auth_project_order(
 
     db_url = f"sqlite:///{tmp_path}/test.db"
     project_store = SqlAlchemyProjectStore(db_url)
-    # Migrations seed a local admin; exercise lazy preference-owner creation instead.
+    # Migrations seed a local admin; exercise preferences without an account.
     with Session(get_or_create_engine(db_url)) as session:
         local = session.get(SqlUser, (0, "local"))
         if local is not None:
@@ -1997,10 +2057,7 @@ def test_setup_after_saving_no_auth_project_order(
     project = project_store.create("a" * 32, "Local project", None)
     project_store.save_order([project.id], user_id=None)
     with Session(get_or_create_engine(db_url)) as session:
-        local = session.get(SqlUser, (0, "local"))
-        assert local is not None
-        assert local.is_admin is False
-        assert local.password_hash is None
+        assert session.get(SqlUser, (0, "local")) is None
 
     with contextmanager(_build_accounts_app)(
         tmp_path, monkeypatch, init_admin_password=None

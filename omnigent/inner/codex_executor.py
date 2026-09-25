@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
 from omnigent._platform import resolve_cli_binary
+from omnigent.errors import HarnessTransportClosedError
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -936,6 +937,7 @@ def _populate_codex_home_config(
     minimal_config: bool | None = None,
     inject_hooks: bool = False,
     extend_model_catalog: bool = False,
+    supported_efforts: frozenset[str] = CODEX_EFFORTS,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -1060,7 +1062,7 @@ def _populate_codex_home_config(
             continue
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
-            _normalize_copied_codex_effort(dest_path)
+            _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
@@ -1787,7 +1789,11 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
-def _normalize_copied_codex_effort(config_path: Path) -> None:
+def _normalize_copied_codex_effort(
+    config_path: Path,
+    *,
+    supported_efforts: frozenset[str] = CODEX_EFFORTS,
+) -> None:
     """Rewrite a deprecated top-level ``model_reasoning_effort`` in the
     session's private copy of ``config.toml``.
 
@@ -1799,15 +1805,19 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
     verbatim into every per-session ``CODEX_HOME``, that one app-written key
     fails **every** codex turn on such machines.
 
-    Values already in :data:`CODEX_EFFORTS` are left untouched, as are
-    values with no known alias (codex surfaces its own error for those) and
-    anything below the first table header. Only the session's private copy
+    Values already in *supported_efforts* (defaults to :data:`CODEX_EFFORTS`,
+    or :data:`CODEX_NATIVE_EFFORTS` for native CLI runs) are left untouched,
+    as are values with no known alias (codex surfaces its own error for those)
+    and anything below the first table header. Only the session's private copy
     is modified — never the user's real ``~/.codex/config.toml``.
 
     :param config_path: The copied ``config.toml`` inside the per-session
         ``CODEX_HOME``. Unreadable/unwritable files are skipped (best
         effort — the copy already succeeded, so this only degrades back to
         the pre-normalization behavior).
+    :param supported_efforts: Set of effort values considered supported for
+        this session runtime (e.g. :data:`CODEX_EFFORTS` or
+        :data:`CODEX_NATIVE_EFFORTS`).
     """
     try:
         text = config_path.read_text(encoding="utf-8")
@@ -1826,7 +1836,7 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
             match = _EFFORT_KEY_RE.match(content)
             if match is not None:
                 value = match.group(2)
-                if value not in CODEX_EFFORTS:
+                if value not in supported_efforts:
                     replacement = EFFORT_ALIASES.get(value)
                     if replacement is not None:
                         line_ending = line[len(content) :]
@@ -2392,7 +2402,12 @@ class _CodexAppServerSession:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
-        self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
+        self._events: asyncio.Queue[CodexMessage | HarnessTransportClosedError] = asyncio.Queue()
+        self._transport_error: HarnessTransportClosedError | None = None
+        self._closing = False
+        self._native_progress_observed = False
+        self._reader_started_turn: str | None = None
+        self._reader_completed_turn: str | None = None
         self._next_id = 1
         self._started = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -2437,6 +2452,12 @@ class _CodexAppServerSession:
     async def start(self) -> None:
         if self._started:
             return
+        self._closing = False
+        self._transport_error = None
+        self._native_progress_observed = False
+        self._reader_started_turn = None
+        self._reader_completed_turn = None
+        self._events = asyncio.Queue()
         self._loop = asyncio.get_running_loop()
         codex_home_root = Path(tempfile.gettempdir())
         if self._cwd and self._cwd != "/":
@@ -2560,6 +2581,7 @@ class _CodexAppServerSession:
             raise
 
     async def close(self) -> None:
+        self._closing = True
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
             if self._proc is not None and self._proc.returncode is None:
@@ -2577,6 +2599,7 @@ class _CodexAppServerSession:
             self._cleanup_process_cwd()
             return
 
+        cancellation: asyncio.CancelledError | None = None
         if self._proc is not None and self._proc.returncode is None:
             _terminate_process_tree(self._proc)
             try:
@@ -2584,6 +2607,11 @@ class _CodexAppServerSession:
             except asyncio.TimeoutError:
                 _kill_process_tree(self._proc)
                 await self._proc.wait()
+            except asyncio.CancelledError as exc:
+                # Interrupt deadlines must still reap a child that ignores SIGTERM.
+                _kill_process_tree(self._proc)
+                await self._proc.wait()
+                cancellation = exc
         stdin = self._proc.stdin if self._proc is not None else None
         if stdin is not None:
             with suppress(Exception):
@@ -2610,6 +2638,8 @@ class _CodexAppServerSession:
         self.active_turn_id = None
         self._recent_events.clear()
         self._cleanup_process_cwd()
+        if cancellation is not None:
+            raise cancellation
 
     def _cleanup_process_cwd(self) -> None:
         if self._codex_home_dir is not None:
@@ -2677,6 +2707,9 @@ class _CodexAppServerSession:
                 message = await asyncio.wait_for(self._events.get(), timeout=remaining)
             except asyncio.TimeoutError:
                 return final_response
+            if isinstance(message, HarnessTransportClosedError):
+                # A completed turn remains successful when its process exits.
+                return final_response
             self._record_event(message)
             params = message.get("params", {})
             if not isinstance(params, dict):
@@ -2726,6 +2759,8 @@ class _CodexAppServerSession:
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
+
+        self._native_progress_observed = self._reader_started_turn != self._reader_completed_turn
 
         # Fresh turn: forget any prior turn's gateway-error signals and clear
         # the shared watchdog slot so a resolved earlier failure can't be
@@ -2848,17 +2883,29 @@ class _CodexAppServerSession:
         active_turn_id: str = raw_active_turn_id
         self.active_turn_id = active_turn_id
 
+        retained_events: list[CodexMessage | HarnessTransportClosedError] = []
+        retaining_current_turn = False
         while not self._events.empty():
             queued_message = self._events.get_nowait()
+            if isinstance(queued_message, HarnessTransportClosedError):
+                retained_events.append(queued_message)
+                continue
             queued_turn_id: str | None = None
             queued_params = queued_message.get("params")
             if isinstance(queued_params, dict):
                 raw_queued_turn_id = queued_params.get("turnId")
+                if raw_queued_turn_id is None:
+                    queued_turn = queued_params.get("turn")
+                    if isinstance(queued_turn, dict):
+                        raw_queued_turn_id = queued_turn.get("id")
                 if isinstance(raw_queued_turn_id, str):
                     queued_turn_id = raw_queued_turn_id
             if queued_turn_id is not None and queued_turn_id == active_turn_id:
-                self._events.put_nowait(queued_message)
-                break
+                retaining_current_turn = True
+            if retaining_current_turn:
+                retained_events.append(queued_message)
+        for queued_message in retained_events:
+            self._events.put_nowait(queued_message)
 
         message_buffers: dict[str, str] = {}
         last_reasoning_item_id: str | None = None
@@ -2974,6 +3021,8 @@ class _CodexAppServerSession:
                     )
                     return
                 message = event_task.result()
+                if isinstance(message, HarnessTransportClosedError):
+                    raise message
 
                 self._record_event(message)
                 raw_method = message.get("method")
@@ -3309,19 +3358,33 @@ class _CodexAppServerSession:
             return {"error": str(exc)}
 
     async def _request(self, method: str, params: CodexParams) -> CodexMessage:
+        if self._transport_error is not None:
+            raise self._transport_error
         request_id = self._next_id
         self._next_id += 1
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexMessage] = loop.create_future()
         self._pending_requests[request_id] = future
-        await self._send_message(
-            {
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-        )
-        response = await future
+        try:
+            try:
+                await self._send_message(
+                    {
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    }
+                )
+            except Exception as exc:
+                if self._transport_error is not None:
+                    raise self._transport_error from exc
+                raise
+            response = await future
+        finally:
+            self._pending_requests.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
         error = response.get("error")
         if error:
             raise RuntimeError(str(error))
@@ -3364,6 +3427,53 @@ class _CodexAppServerSession:
         if buffer:
             yield bytes(buffer)
 
+    def _note_native_activity(self, message: CodexMessage) -> None:
+        """Retain replay hazards even when an RPC reply has not arrived yet."""
+        method = message.get("method")
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            self._native_progress_observed = True
+            return
+        if method == "turn/started":
+            turn = params.get("turn", {})
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+                self._reader_started_turn = turn["id"]
+            else:
+                self._native_progress_observed = True
+            return
+        if method == "turn/completed":
+            turn = params.get("turn", {})
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+                self._reader_completed_turn = turn["id"]
+            self._native_progress_observed = True
+            return
+        if method in {
+            "thread/started",
+            "thread/status/changed",
+            "remoteControl/status/changed",
+            "mcpServer/startupStatus/updated",
+            "account/rateLimits/updated",
+        }:
+            return
+        if method in {"item/started", "item/completed"}:
+            item = params.get("item", {})
+            if isinstance(item, dict) and item.get("type") == "userMessage":
+                return
+        self._native_progress_observed = True
+
+    def _note_transport_closed(self, detail: str, *, clean_eof: bool) -> None:
+        if self._closing or self._transport_error is not None:
+            return
+        error = HarnessTransportClosedError(
+            detail, replay_safe=clean_eof and not self._native_progress_observed
+        )
+        self._transport_error = error
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.set_exception(error)
+        # Buffered terminal/output events must be consumed before EOF.
+        self._events.put_nowait(error)
+
     async def _reader_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         try:
@@ -3372,6 +3482,8 @@ class _CodexAppServerSession:
                 if not raw:
                     continue
                 message = json.loads(raw)
+                if not isinstance(message, dict):
+                    raise ValueError("Codex app-server frame is not an object")
                 if (
                     "id" in message
                     and "method" not in message
@@ -3381,11 +3493,14 @@ class _CodexAppServerSession:
                     if future is not None and not future.done():
                         future.set_result(message)
                     continue
+                self._note_native_activity(message)
                 await self._events.put(message)
+            self._note_transport_closed("Codex app-server closed stdout", clean_eof=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error  # pragma: no cover - defensive
             logger.debug("Codex App Server reader loop ended: %s", exc)
+            self._note_transport_closed(f"Codex app-server reader failed: {exc}", clean_eof=False)
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
@@ -3430,6 +3545,8 @@ class _CodexAppServerSession:
 class _CodexSessionState:
     app_session: _CodexAppServerSession | None = None
     signature: tuple[str | None, str, str, str] | None = None
+    closing: bool = False
+    close_task: asyncio.Task[None] | None = None
 
 
 class _AppSessionFactory(Protocol):
@@ -3768,26 +3885,72 @@ class CodexExecutor(Executor):
         return await state.app_session.enqueue_message(content)
 
     async def close_session(self, session_key: str) -> None:
-        state = self._session_states.pop(session_key, None)
+        state = self._session_states.get(session_key)
+        closed_session: _CodexAppServerSession | None = None
         if state is not None and state.app_session is not None:
-            await state.app_session.close()
+            closed_session = await self._close_state_app_session(state)
+        # Failed or cancelled cleanup must remain reachable for the next reap.
+        if (
+            state is not None
+            and self._session_states.get(session_key) is state
+            and state.app_session is closed_session
+        ):
+            del self._session_states[session_key]
 
     async def close(self) -> None:
         keys = list(self._session_states.keys())
         for key in keys:
             await self.close_session(key)
 
+    async def _close_state_app_session(
+        self, state: _CodexSessionState
+    ) -> _CodexAppServerSession | None:
+        app_session = state.app_session
+        if app_session is None:
+            return None
+        if state.close_task is None:
+            state.closing = True
+            state.close_task = asyncio.create_task(app_session.close())
+        close_task = state.close_task
+        try:
+            await close_task
+        except BaseException:
+            if state.close_task is close_task:
+                state.close_task = None
+            raise
+        if state.close_task is close_task:
+            state.close_task = None
+        return app_session
+
     async def _ensure_app_session(
         self,
+        session_key: str,
         state: _CodexSessionState,
         *,
         signature: tuple[str | None, str, str, str],
         effective_cwd: str,
     ) -> _CodexAppServerSession:
-        if state.signature == signature and state.app_session is not None:
-            return state.app_session
-        if state.app_session is not None:
-            await state.app_session.close()
+        while True:
+            if (
+                state.signature == signature
+                and state.app_session is not None
+                and not state.closing
+                and getattr(state.app_session, "_transport_error", None) is None
+                and not getattr(state.app_session, "_closing", False)
+            ):
+                return state.app_session
+            if state.app_session is None:
+                break
+            closed_session = await self._close_state_app_session(state)
+            if (
+                self._session_states.get(session_key) is state
+                and state.app_session is closed_session
+            ):
+                state.app_session = None
+                state.signature = None
+                state.closing = False
+            # Another waiter may have registered a replacement during cleanup.
+            state = self._session_states.setdefault(session_key, _CodexSessionState())
         app_session = self._app_session_factory(
             codex_path=self._codex_path,
             cwd=effective_cwd,
@@ -3854,6 +4017,7 @@ class CodexExecutor(Executor):
             return
 
         app_session = await self._ensure_app_session(
+            session_key,
             state,
             signature=signature,
             effective_cwd=effective_cwd,
@@ -3873,5 +4037,7 @@ class CodexExecutor(Executor):
                 reasoning_effort=reasoning_effort,
             ):
                 yield event
+        except HarnessTransportClosedError:
+            raise
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event
             yield ExecutorError(message=f"Codex executor error: {exc}")
