@@ -231,3 +231,136 @@ def test_model_pricing_config_validation():
 if __name__ == "__main__":
     # Run tests with pytest
     pytest.main([__file__, "-v"])
+
+
+def test_fetch_pricing_with_explicit_provider_entry_beats_default():
+    """An explicit provider_entry uses that entry's rates, not the default's.
+
+    This is the unit-level guard for the bug where _accumulate_session_usage
+    always resolves the default provider, so sessions on a non-default named
+    provider were charged the wrong rate.
+    """
+    from omnigent.onboarding.provider_config import _parse_provider
+
+    expensive_entry = _parse_provider(
+        "expensive-named",
+        {
+            "kind": "key",
+            "anthropic": {
+                "base_url": "https://expensive.example/v1",
+                "api_key": "expensive-key",
+                "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
+            },
+        },
+    )
+    provider_config = {
+        "providers": {
+            "cheap-default": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://cheap.example/v1",
+                    "api_key": "cheap-key",
+                    "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+                },
+            }
+        }
+    }
+
+    # Without provider_entry: returns the default (cheap) provider's rate.
+    default_pricing = fetch_model_pricing_with_provider(
+        model="claude-sonnet-4-6", provider_config=provider_config, harness="claude-sdk"
+    )
+    assert default_pricing is not None
+    assert default_pricing.input_per_token == pytest.approx(1.0 / 1_000_000)
+
+    # With provider_entry: returns the named (expensive) provider's rate.
+    named_pricing = fetch_model_pricing_with_provider(
+        model="claude-sonnet-4-6",
+        provider_config=provider_config,
+        harness="claude-sdk",
+        provider_entry=expensive_entry,
+    )
+    assert named_pricing is not None
+    assert named_pricing.input_per_token == pytest.approx(10.0 / 1_000_000)
+    assert named_pricing.output_per_token == pytest.approx(20.0 / 1_000_000)
+
+
+def test_fetch_pricing_provider_entry_without_pricing_falls_through_to_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the explicit provider_entry has no custom pricing, catalog is used."""
+    from omnigent.llms.context_window import ModelPricing
+    from omnigent.onboarding.provider_config import _parse_provider
+
+    # Entry with no pricing block.
+    entry_no_pricing = _parse_provider(
+        "bare-provider",
+        {
+            "kind": "key",
+            "anthropic": {
+                "base_url": "https://bare.example/v1",
+                "api_key": "bare-key",
+                # No pricing block.
+            },
+        },
+    )
+    catalog_pricing = ModelPricing(input_per_token=5.0, output_per_token=15.0)
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda _model: catalog_pricing,
+    )
+
+    pricing = fetch_model_pricing_with_provider(
+        model="claude-sonnet-4-6",
+        harness="claude-sdk",
+        provider_entry=entry_no_pricing,
+    )
+    assert pricing is catalog_pricing
+
+
+def test_fetch_pricing_provider_entry_takes_precedence_over_config_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """provider_entry beats the config default even when provider_config is also given."""
+    from omnigent.onboarding.provider_config import _parse_provider
+
+    explicit_entry = _parse_provider(
+        "explicit",
+        {
+            "kind": "key",
+            "anthropic": {
+                "base_url": "https://explicit.example/v1",
+                "api_key": "explicit-key",
+                "pricing": {"input_per_million": 42.0, "output_per_million": 84.0},
+            },
+        },
+    )
+    provider_config = {
+        "providers": {
+            "some-default": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://default.example/v1",
+                    "api_key": "default-key",
+                    "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+                },
+            }
+        }
+    }
+    # catalog must not be consulted
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda _model: (_ for _ in ()).throw(AssertionError("catalog must not be called")),
+    )
+
+    pricing = fetch_model_pricing_with_provider(
+        model="any-model",
+        provider_config=provider_config,
+        harness="claude-sdk",
+        provider_entry=explicit_entry,
+    )
+    assert pricing is not None
+    assert pricing.input_per_token == pytest.approx(42.0 / 1_000_000)
+    assert pricing.output_per_token == pytest.approx(84.0 / 1_000_000)
