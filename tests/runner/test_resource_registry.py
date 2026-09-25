@@ -19,6 +19,7 @@ from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
+    _TERMINAL_EXIT_OUTPUT_MAX_LINES,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
@@ -911,6 +912,33 @@ def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     trimmed = trim_terminal_output(line)
     assert trimmed is not None
     assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+
+
+def test_trim_terminal_output_collapses_dead_pane_padding_above_footer() -> None:
+    # A tall pane (remain-on-exit) redraws the banner, then pads with blank
+    # rows well past the line cap, then the footer. Without collapsing the
+    # padding, the cap keeps only blank lines and the banner is lost.
+    banner = "No changes made.\n\nResume this session with:\nclaude --resume abc123"
+    padding = "\n" * (_TERMINAL_EXIT_OUTPUT_MAX_LINES + 20)
+    footer = "Pane is dead (status 0, Thu Sep 24 12:29:07 2026)"
+    text = f"{banner}{padding}{footer}"
+    trimmed = trim_terminal_output(text)
+    assert trimmed is not None
+    assert "Resume this session with:" in trimmed
+    assert trimmed.endswith(footer)
+    # The banner's own blank separator line survives, but none of the tmux
+    # padding — no run of two-or-more consecutive blank lines.
+    lines = trimmed.splitlines()
+    assert not any(not lines[i] and not lines[i + 1] for i in range(len(lines) - 1))
+
+
+def test_trim_terminal_output_blank_padding_and_footer_returns_footer() -> None:
+    # Padding with no real content above the footer still yields something
+    # sensible: just the footer, not a page of blank lines.
+    footer = "Pane is dead (status 0, Thu Sep 24 12:29:07 2026)"
+    text = ("\n" * (_TERMINAL_EXIT_OUTPUT_MAX_LINES + 20)) + footer
+    trimmed = trim_terminal_output(text)
+    assert trimmed == footer
 
 
 def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:

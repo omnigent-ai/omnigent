@@ -3893,6 +3893,90 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
 
 
 @pytest.mark.asyncio
+async def test_required_terminal_voluntary_exit_survives_tall_pane_padding(
+    tmp_path: Path,
+) -> None:
+    """The voluntary-exit banner must survive the 40-line diagnostics cap.
+
+    Production panes are 60-140 rows tall. A clean quit leaves the banner near
+    the top, tens of blank padding rows, then tmux's "Pane is dead" footer.
+    This goes through the real ``_terminal_exit_diagnostics`` path (unlike
+    the marker test above, which hands ``TerminalExitEvent`` a pre-built
+    ``last_output``): without collapsing the padding before the line cap,
+    ``last_pane_text()`` trims down to nothing but blank rows, the
+    voluntary-exit marker never reaches ``TerminalExitEvent.last_output``, and
+    the clean quit is misreported as a crash.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import _TERMINAL_EXIT_OUTPUT_MAX_LINES
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = uuid.uuid4().hex
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    banner = "No changes made.\n\nResume this session with:\nclaude --resume abc123"
+    padding = "\n" * (_TERMINAL_EXIT_OUTPUT_MAX_LINES + 20)
+    footer = "Pane is dead (status 0, Thu Sep 24 12:29:07 2026)"
+    instance._remember_pane_snapshot(f"{banner}{padding}{footer}")
+    instance._remember_exit_status("1 0")
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+
+    try:
+        await resource_registry.observe_required_terminal(conv_id, "claude", "main", instance)
+
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        on_exit()
+        await resource_registry.wait_for_terminal_exit_cleanup()
+        release_task_name = f"required-terminal-release:{conv_id}"
+        pending_release = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == release_task_name and not task.done()
+        ]
+        if pending_release:
+            await asyncio.gather(*pending_release)
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    # The banner survived the diagnostics cap, so the exit is treated as a
+    # clean stop rather than a crash.
+    assert {"type": "session.status", "status": "idle"} in queued_events
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
 async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
     """A non-claude terminal exiting with the resume-banner text is still a failure.
 

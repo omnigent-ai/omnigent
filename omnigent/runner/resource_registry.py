@@ -190,6 +190,25 @@ class TerminalExitEvent:
     session_was_idle: bool = False
 
 
+def _collapse_dead_pane_padding(lines: list[str]) -> list[str]:
+    """Drop blank padding directly above a trailing ``Pane is dead (`` footer.
+
+    Tmux (``remain-on-exit``) redraws a dead pane as whatever the process last
+    printed, followed by blank rows filling out the pane height, then the
+    footer line. On a tall pane those blanks alone can exceed the line cap,
+    pushing real content — e.g. Claude's voluntary-exit banner — out of the
+    diagnostics. Same rule as :meth:`TerminalInstance.last_exit_text`.
+    """
+    if not lines or not lines[-1].startswith("Pane is dead ("):
+        return lines
+    footer = lines[-1]
+    body = lines[:-1]
+    while body and not body[-1].strip():
+        body.pop()
+    body.append(footer)
+    return body
+
+
 def trim_terminal_output(text: str | None) -> str | None:
     """Bound terminal-output diagnostics so a failure report stays compact."""
     if text is None:
@@ -197,7 +216,7 @@ def trim_terminal_output(text: str | None) -> str | None:
     stripped = text.strip()
     if not stripped:
         return None
-    lines = stripped.splitlines()
+    lines = _collapse_dead_pane_padding(stripped.splitlines())
     omitted_lines = 0
     if len(lines) > _TERMINAL_EXIT_OUTPUT_MAX_LINES:
         omitted_lines = len(lines) - _TERMINAL_EXIT_OUTPUT_MAX_LINES
