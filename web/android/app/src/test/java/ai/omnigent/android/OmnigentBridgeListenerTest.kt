@@ -6,8 +6,10 @@ import android.content.Context
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -157,6 +159,24 @@ class OmnigentBridgeListenerTest {
 
         assertEquals(1, pickerRequests.size)
         assertEquals(1, setupCalls.size)
+    }
+
+    @Test
+    fun `workspace bridge alone exposes and dispatches local sign out`() {
+        var signOuts = 0
+        val workspace =
+            OmnigentBridgeListener(
+                notifications = NativeNotificationManager(context),
+                blobSaver = BlobSaver(context),
+                onSignOut = { signOuts++ },
+            )
+
+        workspace.handle("""{"method":"signOut"}""")
+        listener.handle("""{"method":"signOut"}""")
+
+        assertEquals(1, signOuts)
+        assertTrue(NativeBridgeScript.source(managesWorkspace = true).contains("signOut()"))
+        assertFalse(NativeBridgeScript.source.contains("signOut()"))
     }
 
     @Test

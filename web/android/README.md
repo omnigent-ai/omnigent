@@ -66,7 +66,9 @@ SSO, while other servers keep the generic ticket/poll OIDC flow.
 
 The system WebView must support AndroidX WebKit's multi-profile feature; the app
 fails closed rather than putting workspace cookies in the process-wide default
-profile. Build/App Link setup and the security model are documented in
+profile. Expired web sessions recover from the retained native grant, and local
+workspace sign-out clears both that grant and its profile before reconnecting.
+Build/App Link setup and the security model are documented in
 [`docs/databricks-oauth.md`](docs/databricks-oauth.md).
 
 A Databricks workspace serves its own landing page at the root and mounts the

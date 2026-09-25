@@ -12,6 +12,18 @@ internal data class DatabricksWebContext(
     val profileName: String
         get() = "omnigent-databricks-${sha256Hex("web-profile-v1:${scope.account}")}".take(80)
 
+    fun navigatingTo(uri: URI): DatabricksWebContext {
+        val target = DatabricksCredentialScope.from(uri, configuration)
+        if (
+            scope.workspaceId != null &&
+            target.workspaceId != null &&
+            scope.workspaceId != target.workspaceId
+        ) {
+            throw DatabricksSessionException.WorkspaceChanged()
+        }
+        return copy(pageUri = uri)
+    }
+
     companion object {
         fun resolve(uri: URI): DatabricksWebContext? {
             if (serverAuthentication(originOf(uri.toString())) !=
@@ -54,6 +66,23 @@ internal data class DatabricksWebSession(
     fun isAuthenticationUri(uri: URI): Boolean =
         runCatching { DatabricksCredentialScope.from(uri, configuration) }.isSuccess &&
             isLoginPath(uri.path)
+
+    fun isSignOutUri(uri: URI): Boolean {
+        if (runCatching {
+                DatabricksCredentialScope.from(
+                    uri,
+                    configuration,
+                )
+            }.isFailure
+        ) {
+            return false
+        }
+        if (uri.path == "/auth/logout" || uri.path == "/logout") return true
+        return uri.path == "/login.html" &&
+            queryItems(uri).any {
+                it.first == "logout" && it.second == "1"
+            }
+    }
 
     companion object {
         fun isLoginPath(path: String): Boolean =

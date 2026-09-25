@@ -29,6 +29,8 @@ class OmnigentBridgeListener(
     private val onSwitchServer: (String) -> Unit = {},
     /** Web asked to open the shell's "connect to server" setup page. */
     private val onOpenServerSetup: () -> Unit = {},
+    /** Present only for a natively authenticated workspace bridge. */
+    private val onSignOut: (() -> Unit)? = null,
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -112,6 +114,10 @@ class OmnigentBridgeListener(
 
             "openServerSetup" -> {
                 onOpenServerSetup()
+            }
+
+            "signOut" -> {
+                onSignOut?.invoke()
             }
         }
     }

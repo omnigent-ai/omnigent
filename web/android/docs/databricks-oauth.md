@@ -171,6 +171,33 @@ name/value at the final page URL.
 On relaunch, a saved grant bootstraps silently. Missing credentials show an
 explicit Sign In action instead of opening the browser without user input. An
 explicit connection may start browser sign-in immediately. Cancellation returns
-to setup with the entered workspace preserved. Authentication navigation and
-main-frame 401/403 currently fail back to setup; bounded in-place recovery and
-local sign-out are layered on the same coordinator/profile primitives.
+to setup with the entered workspace preserved.
+
+## Session recovery
+
+Authentication navigation and main-frame HTTP 401 trigger native bootstrap again
+in the same profile while preserving the last accepted app route. Foregrounding
+the activity checks for a missing `DBAUTH` cookie and takes the same path. HTTP
+403 is a permission error and returns to setup instead of repeatedly signing in.
+
+Recovery can silently reuse or refresh a saved grant. If the grant is missing or
+revoked, the app presents an explicit Sign In action before opening the browser.
+A subsequent automatic recovery requires both a successfully ready page and a
+60-second cooldown; repeated failure returns to setup rather than looping.
+
+## Local sign-out
+
+A successfully bootstrapped workspace exposes **Sign Out of Workspace** in the
+native recovery menu and `window.omnigentNative.signOut()` to the trusted main
+frame. Other server types receive neither the JavaScript method nor a native
+sign-out callback.
+
+Sign-out records a non-secret pending-cleanup marker, invalidates browser login
+and refresh work, clears the scoped encrypted grant, then clears that profile's
+cookies and web storage. The current/default server is removed while recents are
+retained for an explicit future reconnect. A later connection must finish an
+interrupted cleanup before loading credentials or starting a new browser login.
+Other workspace profiles are not touched.
+
+This is local app sign-out. It does not revoke the provider grant globally or
+clear system-browser/IdP SSO, so a later explicit sign-in may reuse browser SSO.

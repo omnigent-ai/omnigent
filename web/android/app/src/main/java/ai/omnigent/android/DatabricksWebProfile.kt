@@ -86,6 +86,19 @@ internal class DatabricksWebProfile(
             future
         }
 
+    fun hasSessionCookie(pageUri: java.net.URI): CompletableFuture<Boolean> {
+        val result = CompletableFuture<Boolean>()
+        main.post {
+            try {
+                val value = parseCookieHeader(backend.getCookie(pageUri.toString()))["DBAUTH"]
+                result.complete(!value.isNullOrEmpty())
+            } catch (error: Throwable) {
+                result.completeExceptionally(error)
+            }
+        }
+        return result
+    }
+
     fun clear(): CompletableFuture<Void> =
         enqueue(name) {
             val future = CompletableFuture<Void>()

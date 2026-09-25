@@ -288,4 +288,17 @@ object NativeBridgeScript {
           });
         })();
         """.trimIndent()
+
+    fun source(managesWorkspace: Boolean): String {
+        if (!managesWorkspace) return source
+        val marker = "    openServerSetup() {"
+        val signOut =
+            """
+            signOut() {
+              post({ method: "signOut" });
+              return Promise.resolve();
+            },
+            """.trimIndent().prependIndent("    ")
+        return source.replace(marker, "$signOut\n$marker")
+    }
 }
