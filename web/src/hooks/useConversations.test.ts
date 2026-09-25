@@ -44,8 +44,16 @@ import {
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import type * as IdentityModule from "@/lib/identity";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
+
+// Keep identity deterministic while leaving authenticatedFetch real.
+const MOCK_VIEWER_ID = "user_me";
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => MOCK_VIEWER_ID,
+}));
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
@@ -3133,6 +3141,54 @@ describe("undoArchiveConversations optimistic restore", () => {
     expect(search?.pages[0].data).toEqual([]);
 
     resolvePatch(mockResponse(conversation({ id: "conv_a", archived: false, updated_at: 101 })));
+    await undo;
+  });
+
+  it("re-injects the viewer's own row into the visibility='mine' list (multi-user)", async () => {
+    // The owner-scoped cache requires viewer identity for synchronous restore.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false, null, "mine"],
+      infinitePage([conversation({ id: "conv_keep", owner: MOCK_VIEWER_ID })]),
+    );
+    // Hold the unarchive PATCH in flight so only the synchronous cache write can
+    // satisfy the assertion, never the network round-trip.
+    let resolvePatch!: (value: Response) => void;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvePatch = resolve;
+        }),
+    );
+
+    const undo = undoArchiveConversations(queryClient, [
+      conversation({ id: "conv_a", archived: true, owner: MOCK_VIEWER_ID }),
+    ]);
+
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+        null,
+        "mine",
+      ]);
+      expect(data?.pages[0].data.map((c) => c.id)).toEqual(["conv_a", "conv_keep"]);
+    });
+    const mine = queryClient.getQueryData<ConversationsInfiniteData>([
+      "conversations",
+      "",
+      false,
+      null,
+      "mine",
+    ]);
+    expect(mine?.pages[0].data[0].archived).toBe(false);
+
+    resolvePatch(
+      mockResponse(
+        conversation({ id: "conv_a", archived: false, owner: MOCK_VIEWER_ID, updated_at: 101 }),
+      ),
+    );
     await undo;
   });
 });

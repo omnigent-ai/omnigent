@@ -42,6 +42,9 @@ type LastSeenMap = Record<string, number>;
 let lastSeenMap: LastSeenMap = {};
 const explicitlyUnread = new Set<string>();
 
+// Undo owns its timestamp bump until the restore's seen anchor lands.
+const restoringSessions = new Set<string>();
+
 // localStorage persistence. Best-effort everywhere: storage can be
 // missing (SSR), full, or blocked — the in-memory mirror always works.
 const STORAGE_KEY = "omnigent.readState.v1";
@@ -201,6 +204,7 @@ export function useSeedReadState(conversations: readonly ReadStateSeed[] | undef
 export function resetReadStateForTests(): void {
   lastSeenMap = {};
   explicitlyUnread.clear();
+  restoringSessions.clear();
   seeded.clear();
   hydrated = false;
   try {
@@ -284,6 +288,18 @@ export function markConversationUnread(conversationId: string, updatedAt: number
   void syncReadState(conversationId);
 }
 
+/** Suppress unseen state until an Undo restore records its seen anchor. */
+export function beginUnseenSuppression(conversationId: string): void {
+  if (restoringSessions.has(conversationId)) return;
+  restoringSessions.add(conversationId);
+  notifySubscribers();
+}
+
+/** Release the {@link beginUnseenSuppression} hold once the restore settles. */
+export function endUnseenSuppression(conversationId: string): void {
+  if (restoringSessions.delete(conversationId)) notifySubscribers();
+}
+
 /**
  * Marks a conversation read on explicit user action — the inverse of
  * {@link markConversationUnread}, backing the row menu's and bulk bar's
@@ -357,6 +373,8 @@ export function isConversationUnseen(
   status: string | undefined,
 ): boolean {
   if (status === "running" || status === undefined) return false;
+  // Ignore the restore's own timestamp bump.
+  if (restoringSessions.has(conversationId)) return false;
   const stored = lastSeenMap[conversationId];
   if (stored === undefined) return false;
   return updatedAt > stored;

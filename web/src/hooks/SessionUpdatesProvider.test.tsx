@@ -12,7 +12,9 @@ import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  clearRecentlyCreated,
   clearSessionTombstones,
+  undoArchiveConversations,
   useArchiveConversation,
   type Conversation,
   type ConversationsPage,
@@ -115,6 +117,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  clearRecentlyCreated();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -433,6 +436,46 @@ describe("SessionUpdatesProvider archive tombstone", () => {
         .pages[0].data.find((row) => row.id === "conv_a"),
     ).toMatchObject({ title: "Late edit", archived: true });
     await waitFor(() => expect(archive.result.current.isSuccess).toBe(true));
+  });
+});
+
+describe("SessionUpdatesProvider unarchive tombstone", () => {
+  it("does not let a stale archived frame re-hide a row the user just restored", async () => {
+    // A late archived frame must not evict a row that Undo restored.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ ...conv("conv_a"), archived: false, updated_at: 101 }),
+      }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // "My sessions" tab: visibility="mine", includeArchived=false — the archived
+    // row was evicted, so only the optimistic restore brings it back.
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false, null, "mine"], {
+      pages: [{ data: [conv("conv_b")], first_id: "conv_b", last_id: "conv_b", has_more: false }],
+      pageParams: [undefined],
+    });
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const mineIds = () =>
+      client
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false, null, "mine"])!
+        .pages[0].data.map((row) => row.id);
+
+    // Undo restores conv_a (the toast holds the archived row).
+    await act(async () => {
+      await undoArchiveConversations(client, [{ ...conv("conv_a"), archived: true }]);
+    });
+    expect(mineIds()).toEqual(["conv_a", "conv_b"]);
+
+    // The archive's WS frame (archived=true) arrives after Undo cleared the mark.
+    act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), archived: true }] }));
+
+    // The row must remain — no flash. Without the unarchive tombstone it is
+    // dropped here (violatesKnownMembership evicts the archived row).
+    expect(mineIds()).toEqual(["conv_a", "conv_b"]);
   });
 });
 
