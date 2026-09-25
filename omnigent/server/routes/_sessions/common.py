@@ -49,6 +49,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
+from omnigent.stores.host_store import HostStore
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -987,6 +988,30 @@ def get_server_host_registry() -> HostRegistry | None:
     return _server_host_registry
 
 
+# Persistent host registrations, set once at app startup (see
+# :func:`set_server_host_store`). The runner-stream relay runs as a
+# background task with no request in scope, so it reads the host-offline
+# policy check from this module-level global rather than threading
+# ``host_store`` through every relay call site.
+_server_host_store: HostStore | None = None
+
+
+def set_server_host_store(host_store: HostStore | None) -> None:
+    """Stash the persistent host store for background-task host lookups.
+
+    :param host_store: Persistent host registrations, or ``None`` in
+        setups without host tunnels.
+    :returns: None.
+    """
+    global _server_host_store
+    _server_host_store = host_store
+
+
+def get_server_host_store() -> HostStore | None:
+    """Return the store stashed by :func:`set_server_host_store`."""
+    return _server_host_store
+
+
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
@@ -1166,6 +1191,7 @@ __all__ = [
     "_runner_status_probe_backoff",
     "_runner_status_probe_inflight",
     "_server_host_registry",
+    "_server_host_store",
     "_server_runner_router",
     "_session_active_response_cache",
     "_session_background_task_count_cache",
@@ -1175,9 +1201,11 @@ __all__ = [
     "_session_status_cache",
     "_session_terminal_pending_cache",
     "get_server_host_registry",
+    "get_server_host_store",
     "get_server_runner_router",
     "host_interactive_shells_for_request",
     "set_server_host_registry",
+    "set_server_host_store",
     "set_server_runner_router",
 ]
 

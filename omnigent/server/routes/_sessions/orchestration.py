@@ -3110,6 +3110,85 @@ async def _mark_runner_sessions_offline_impl(
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
 
 
+async def _session_host_offline(
+    conv: Conversation,
+    host_store: HostStore | None,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Report whether *conv*'s HOST looks offline rather than its runner dead.
+
+    A laptop asleep or off the network still owns a runner that is very
+    likely to come back, so that case must not be treated like a confirmed
+    runner crash. A sub-agent child has no ``host_id`` of its own — it rides
+    its parent's host — so its parent is resolved instead. A managed sandbox
+    has its own wake path and is excluded. Any unknown host or lookup error
+    reads as "unknown", which callers treat conservatively (not offline, so
+    they fail as before).
+
+    :param conv: The session row to check.
+    :param host_store: Persistent host registrations, or ``None``.
+    :param conversation_store: Store used to resolve a sub-agent's parent host.
+    :returns: ``True`` only when the host is known, unmanaged, and stale.
+    """
+    if host_store is None:
+        return False
+    host_id = conv.host_id
+    if host_id is None and conv.kind == "sub_agent" and conv.parent_conversation_id is not None:
+        try:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+        except Exception:  # noqa: BLE001 — an unreadable parent reads as unknown
+            return False
+        host_id = parent.host_id if parent is not None else None
+    if host_id is None:
+        return False
+    try:
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+    except Exception:  # noqa: BLE001 — an unreadable host row reads as unknown
+        return False
+    if host is None or host.sandbox_provider is not None:
+        return False
+    return not host_is_live(host)
+
+
+async def _partition_disconnect_targets(
+    convs: list[Conversation],
+    conversation_store: ConversationStore,
+    host_store: HostStore | None,
+) -> tuple[list[Conversation], list[Conversation]]:
+    """Split a departed runner's sessions into fail-now vs. hold-for-host-offline.
+
+    Mirrors :func:`_mark_runner_sessions_offline_impl`'s own interrupted-turn
+    gate: a session that was never mid-turn was never going to be failed
+    either way, so it is never checked against the host and never held —
+    it goes straight to the fail-now bucket, where the impl re-skips it as a
+    no-op. Only a mid-turn session whose host reads offline
+    (:func:`_session_host_offline`) is held; every other mid-turn session
+    keeps failing exactly as before.
+
+    :param convs: Sessions bound to the departed runner.
+    :param conversation_store: Store used to resolve a sub-agent's parent host.
+    :param host_store: Persistent host registrations, or ``None``.
+    :returns: ``(fail_now, hold)`` conversation lists.
+    """
+    fail_now: list[Conversation] = []
+    hold: list[Conversation] = []
+    for conv in convs:
+        if conv.id in _intentional_stop_sessions:
+            fail_now.append(conv)
+            continue
+        live = _session_status_cache.get(conv.id, conv.live_status)
+        if live not in _MID_TURN_STATUSES:
+            fail_now.append(conv)
+            continue
+        if await _session_host_offline(conv, host_store, conversation_store):
+            hold.append(conv)
+        else:
+            fail_now.append(conv)
+    return fail_now, hold
+
+
 async def _wait_for_host_bound_runner_client(
     session_id: str,
     runner_router: RunnerRouter | None,
@@ -6634,6 +6713,11 @@ async def _dispatch_session_event_to_runner_impl(
 # worst-case reconnect is ~15s plus handshake. 20s covers that cluster
 # and resolves transient drops silently; a runner still gone afterwards fails.
 RUNNER_DISCONNECT_GRACE_S: float = 20.0
+# A HOST going offline (laptop asleep, off the network) is a much slower,
+# much more recoverable outage than a dead runner process. A session held
+# on this timer only fails once its host has been gone this long with no
+# reconnect, instead of the ordinary disconnect grace.
+HOST_OFFLINE_HOLD_S: float = 6 * 3600.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
@@ -6817,6 +6901,36 @@ async def _relay_runner_stream(
                     extra={"session_id": session_id},
                 )
             else:
+                from omnigent.server.routes._sessions.common import get_server_host_store
+
+                try:
+                    conv_for_host_check = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                except Exception:  # noqa: BLE001 — unreadable row falls through, fails as before
+                    conv_for_host_check = None
+                if conv_for_host_check is not None and await _session_host_offline(
+                    conv_for_host_check, get_server_host_store(), conversation_store
+                ):
+                    # The HOST looks offline, not the runner dead. This drop shares
+                    # the same WS tunnel as the runner-connect callback
+                    # (_on_runner_disconnect), which already scheduled path 1's
+                    # bounded host-offline hold for this runner on this replica —
+                    # publishing a failure here would race a session path 1 is
+                    # still holding. Stay quiet; _on_runner_connect restarts this
+                    # relay once the runner reconnects.
+                    _logger.info(
+                        "Relay: runner gone but host offline for session=%s; "
+                        "deferring to the disconnect-grace hold",
+                        session_id,
+                        extra=debug_event(
+                            "runner_disconnect_held_host_offline",
+                            session_id=session_id,
+                            runner_id=conv_for_host_check.runner_id,
+                            host_id=conv_for_host_check.host_id,
+                        ),
+                    )
+                    return
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
                 disconnect_error = ErrorDetail(

@@ -38,6 +38,7 @@ import io
 import json
 import tarfile
 import threading
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 from tests.runtime.harnesses._test_scaffold_harnesses import _EchoHarness
@@ -342,10 +344,13 @@ class _TunnelStack:
     ap_client: httpx.AsyncClient
     ap_app: FastAPI
     fake_pm: FakeProcessManager
+    host_store: HostStore | None = None
 
 
 @pytest_asyncio.fixture()
-async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack]:
+async def tunnel_three_layer_stack(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> AsyncIterator[_TunnelStack]:
     """Wire Omnigent server + WS-tunneled runner + EchoHarness in-process.
 
     Lifecycle: build stores, init runtime, override the test harness
@@ -355,11 +360,20 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
     so resource paths can resolve it, then yield an
     ``httpx.AsyncClient`` to the AP.
 
+    Indirectly parametrize with ``True`` (e.g.
+    ``@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)``)
+    to wire a real, DB-backed ``HostStore`` into ``create_app`` — needed by
+    the host-offline-hold tests, which write host rows directly and never
+    touch the runner tunnel those rows would normally come from. Every other
+    test leaves it unparametrized, so ``host_store`` stays ``None`` exactly
+    as before.
+
     Teardown shuts down in reverse order (httpx → forwarder →
     communicator → fake PM → runtime globals → DBOS) so DBOS
     background threads observe a clean exit before pytest-asyncio
     closes the loop.
     """
+    wire_host_store = bool(getattr(request, "param", False))
     db_uri = f"sqlite:///{tmp_path / 'test.db'}"
 
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -400,6 +414,8 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
+    host_store = HostStore(db_uri) if wire_host_store else None
+
     # Build the Omnigent server. ``create_app`` constructs the
     # ``TunnelRegistry`` + ``RunnerRouter`` synchronously (before
     # lifespan) and threads ``runner_router`` into every router as a
@@ -414,6 +430,7 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
         conversation_store=conv_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
+        host_store=host_store,
     )
     set_runner_router(ap_app.state.runner_router)
 
@@ -437,7 +454,9 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
     )
 
     try:
-        yield _TunnelStack(ap_client=ap_client, ap_app=ap_app, fake_pm=fake_pm)
+        yield _TunnelStack(
+            ap_client=ap_client, ap_app=ap_app, fake_pm=fake_pm, host_store=host_store
+        )
     finally:
         # Cancel any AP-side background tasks (SSE relays, etc.) the
         # production lifespan would have owned. ``create_app`` does not
@@ -1757,6 +1776,589 @@ async def test_on_runner_disconnect_spares_idle_sessions_and_labels_interrupted_
             await communicator.wait(timeout=budget(2.0))
         for session_id in session_ids:
             sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def _connect_and_hello(ap_app: FastAPI, runner_id: str) -> ApplicationCommunicator:
+    """Open + handshake a dedicated runner tunnel for the host-offline tests."""
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    return communicator
+
+
+async def _connect_host_tunnel(ap_app: FastAPI, host_id: str) -> ApplicationCommunicator:
+    """Open + hello a real HOST tunnel (distinct from the runner tunnel).
+
+    Needed only by the crash-path test: sending a ``host.runner_exited``
+    report requires an actual host connection, since
+    ``_on_runner_exited`` is wired as that tunnel's callback.
+    """
+    from omnigent.host.frames import HostHelloFrame, encode_host_frame
+
+    path = f"/v1/hosts/{host_id}/tunnel"
+    communicator = ApplicationCommunicator(ap_app, _websocket_scope(path))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=budget(2.0))
+    assert accepted["type"] == "websocket.accept"
+    hello = encode_host_frame(
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="crash-report-host")
+    )
+    await communicator.send_input({"type": "websocket.receive", "text": hello})
+    registry = ap_app.state.host_registry
+
+    async def _registered() -> None:
+        while registry.get(host_id) is None:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_registered(), timeout=budget(2.0))
+    return communicator
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+async def test_disconnect_sweep_holds_session_when_host_offline(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-turn session whose HOST (not runner) is offline is held, not failed.
+
+    Drives a real WS disconnect for a runner bound to a session whose
+    ``host_id`` points at a host row this test has already marked
+    ``offline`` (an external host, e.g. laptop asleep). Past the grace, the
+    sweep must hold the session instead of failing it with
+    ``runner_disconnected``, and it must log the
+    ``runner_disconnect_held_host_offline`` debug event so the hold is
+    measurable.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes import sessions as sessions_module
+    from tests.debug_log_helpers import capture_debug_rows
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    host_store = tunnel_three_layer_stack.host_store
+    assert host_store is not None
+
+    grace = 0.05
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+
+    host_id = uuid.uuid4().hex
+    host_store.upsert_on_connect(
+        host_id=host_id, name="asleep-laptop", user_id=RESERVED_USER_LOCAL
+    )
+    host_store.set_offline(host_id)
+
+    store = get_conversation_store()
+    conv = store.create_conversation(agent_id=None, host_id=host_id, workspace="/tmp/ws-offline")
+    runner_id = "runner-host-offline-sweep-holds"
+    store.replace_runner_id(conv.id, runner_id)
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    communicator = await _connect_and_hello(ap_app, runner_id)
+    try:
+        with capture_debug_rows("server") as rows:
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+            await communicator.wait(timeout=budget(2.0))
+            await asyncio.sleep(grace * 6)
+
+        assert sessions_module._session_status_cache.get(conv.id) == "running", (
+            "a host-offline session was failed on the sweep instead of held"
+        )
+        conv_after = store.get_conversation(conv.id)
+        assert conv_after is not None
+        assert sessions_module._last_task_error_from_labels(conv_after.labels) is None
+
+        held_rows = [
+            r for r in rows if r.get("event_name") == "runner_disconnect_held_host_offline"
+        ]
+        assert held_rows, "no runner_disconnect_held_host_offline debug event logged"
+        attrs = held_rows[0]["attributes"]
+        assert attrs.get("runner_id") == runner_id
+        assert attrs.get("host_id") == host_id
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+async def test_disconnect_sweep_fails_managed_sandbox_even_when_offline(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed sandbox host still fails as before — it has its own wake path."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    host_store = tunnel_three_layer_stack.host_store
+    assert host_store is not None
+
+    grace = 0.05
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+
+    host_id = uuid.uuid4().hex
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-sandbox-offline",
+        user_id=RESERVED_USER_LOCAL,
+        token="tok-managed-sandbox-offline",
+        provider="modal",
+        sandbox_id="sb-managed-sandbox-offline",
+        token_expires_at=9_999_999_999,
+    )
+    host_store.set_offline(host_id)
+
+    store = get_conversation_store()
+    conv = store.create_conversation(agent_id=None, host_id=host_id, workspace="/tmp/ws-managed")
+    runner_id = "runner-managed-sandbox-offline"
+    store.replace_runner_id(conv.id, runner_id)
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    communicator = await _connect_and_hello(ap_app, runner_id)
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+
+        async def _failed() -> None:
+            while sessions_module._session_status_cache.get(conv.id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_failed(), timeout=budget(5.0))
+    finally:
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
+            await communicator.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(conv.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+async def test_host_offline_hold_expires_and_fails_with_runner_disconnected_code(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hold that outlasts its window fails, still coded ``runner_disconnected``.
+
+    The code stays ``runner_disconnected`` (not a new code) so the existing
+    disconnect recovery machinery — the web client's retry affordance and
+    :func:`_publish_runner_recovered_status`'s reconnect-clears-it path —
+    keeps working for an expired hold. The distinct ``failure_origin`` and
+    message are what make it measurable/distinguishable.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    host_store = tunnel_three_layer_stack.host_store
+    assert host_store is not None
+
+    grace = 0.05
+    hold = 0.3
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", hold)
+
+    host_id = uuid.uuid4().hex
+    host_store.upsert_on_connect(
+        host_id=host_id, name="never-returns", user_id=RESERVED_USER_LOCAL
+    )
+    host_store.set_offline(host_id)
+
+    store = get_conversation_store()
+    conv = store.create_conversation(agent_id=None, host_id=host_id, workspace="/tmp/ws-expiry")
+    runner_id = "runner-host-offline-hold-expiry"
+    store.replace_runner_id(conv.id, runner_id)
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    communicator = await _connect_and_hello(ap_app, runner_id)
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+
+        # Past the grace the session must be held (not failed) ...
+        await asyncio.sleep(grace * 4)
+        assert sessions_module._session_status_cache.get(conv.id) == "running"
+
+        # ... and past the (tiny, test-only) hold window it fails, still gone.
+        async def _failed() -> None:
+            while sessions_module._session_status_cache.get(conv.id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_failed(), timeout=budget(hold * 10))
+        conv_after = store.get_conversation(conv.id)
+        assert conv_after is not None
+        assert sessions_module._last_task_error_from_labels(conv_after.labels) == {
+            "code": "runner_disconnected",
+            "message": (
+                "The host for this session went offline and did not come back within 6 hours."
+            ),
+        }
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+async def test_host_offline_hold_expiry_is_cleared_on_later_reconnect(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired-hold failure clears on reconnect, the same as a plain disconnect.
+
+    Because the expiry keeps ``code="runner_disconnected"``,
+    ``_publish_runner_recovered_status``'s ``require_disconnect_code=True``
+    passive-reconnect guard recognizes and clears it — the same path a
+    same-runner tunnel drop/reconnect already relies on.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    host_store = tunnel_three_layer_stack.host_store
+    assert host_store is not None
+
+    grace = 0.05
+    hold = 0.2
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", hold)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    host_id = uuid.uuid4().hex
+    host_store.upsert_on_connect(
+        host_id=host_id, name="comes-back-late", user_id=RESERVED_USER_LOCAL
+    )
+    host_store.set_offline(host_id)
+
+    store = get_conversation_store()
+    conv = store.create_conversation(agent_id=None, host_id=host_id, workspace="/tmp/ws-recover")
+    runner_id = "runner-host-offline-hold-recover"
+    store.replace_runner_id(conv.id, runner_id)
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    communicator = await _connect_and_hello(ap_app, runner_id)
+    reconnect_communicator: ApplicationCommunicator | None = None
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+
+        async def _failed() -> None:
+            while sessions_module._session_status_cache.get(conv.id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_failed(), timeout=budget(hold * 10))
+        conv_after = store.get_conversation(conv.id)
+        assert conv_after is not None
+        assert sessions_module._last_task_error_from_labels(conv_after.labels) == {
+            "code": "runner_disconnected",
+            "message": (
+                "The host for this session went offline and did not come back within 6 hours."
+            ),
+        }
+
+        # The host wakes and the runner finally reconnects: the passive
+        # reconnect recovery must clear the expired-hold failure exactly as
+        # it clears an ordinary runner_disconnected failure.
+        reconnect_communicator = await _connect_and_hello(ap_app, runner_id)
+
+        async def _recovered() -> None:
+            while sessions_module._session_status_cache.get(conv.id) != "idle":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_recovered(), timeout=budget(5.0))
+        conv_recovered = store.get_conversation(conv.id)
+        assert conv_recovered is not None
+        assert sessions_module._last_task_error_from_labels(conv_recovered.labels) is None
+    finally:
+        if reconnect_communicator is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect_communicator.send_input(
+                    {"type": "websocket.disconnect", "code": 1000},
+                )
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect_communicator.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(conv.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+async def test_host_offline_hold_cancelled_on_reconnect(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner reconnect before the hold expires cancels it — no failure."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    host_store = tunnel_three_layer_stack.host_store
+    assert host_store is not None
+
+    grace = 0.05
+    hold = 0.3
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", hold)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    host_id = uuid.uuid4().hex
+    host_store.upsert_on_connect(host_id=host_id, name="comes-back", user_id=RESERVED_USER_LOCAL)
+    host_store.set_offline(host_id)
+
+    store = get_conversation_store()
+    conv = store.create_conversation(agent_id=None, host_id=host_id, workspace="/tmp/ws-reconnect")
+    runner_id = "runner-host-offline-hold-reconnect"
+    store.replace_runner_id(conv.id, runner_id)
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    communicator = await _connect_and_hello(ap_app, runner_id)
+    reconnect_communicator: ApplicationCommunicator | None = None
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+
+        # Past the grace the session is held ...
+        await asyncio.sleep(grace * 4)
+        assert sessions_module._session_status_cache.get(conv.id) == "running"
+
+        # ... the runner reconnects (host came back) well inside the hold ...
+        reconnect_communicator = await _connect_and_hello(ap_app, runner_id)
+
+        # ... so even long past the original hold window, the session never fails.
+        await asyncio.sleep(hold * 4)
+        assert sessions_module._session_status_cache.get(conv.id) == "running", (
+            "the hold fired even though the runner reconnected before it expired"
+        )
+    finally:
+        if reconnect_communicator is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect_communicator.send_input(
+                    {"type": "websocket.disconnect", "code": 1000},
+                )
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect_communicator.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(conv.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+async def test_host_offline_hold_no_failure_after_relaunch_onto_different_runner(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hold for the old runner must not fail a session relaunched elsewhere.
+
+    Rebinding ``runner_id`` (a relaunch) between the hold starting and
+    expiring means the new runner now owns this session's disconnect/crash
+    handling; the stale hold for the old runner must recognize the rebind
+    and stay quiet.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    host_store = tunnel_three_layer_stack.host_store
+    assert host_store is not None
+
+    grace = 0.05
+    hold = 0.2
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", hold)
+
+    host_id = uuid.uuid4().hex
+    host_store.upsert_on_connect(
+        host_id=host_id, name="relaunch-host", user_id=RESERVED_USER_LOCAL
+    )
+    host_store.set_offline(host_id)
+
+    store = get_conversation_store()
+    conv = store.create_conversation(agent_id=None, host_id=host_id, workspace="/tmp/ws-relaunch")
+    old_runner_id = "runner-host-offline-hold-relaunch-old"
+    store.replace_runner_id(conv.id, old_runner_id)
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    communicator = await _connect_and_hello(ap_app, old_runner_id)
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+
+        # Past the grace the session is held ...
+        await asyncio.sleep(grace * 4)
+        assert sessions_module._session_status_cache.get(conv.id) == "running"
+
+        # ... a relaunch rebinds it to a fresh runner, still mid-turn there ...
+        new_runner_id = "runner-host-offline-hold-relaunch-new"
+        store.replace_runner_id(conv.id, new_runner_id)
+        sessions_module._session_status_cache[conv.id] = "running"
+
+        # ... so the OLD runner's hold, once it wakes, must not fail it.
+        await asyncio.sleep(hold * 4)
+        assert sessions_module._session_status_cache.get(conv.id) == "running", (
+            "the stale hold fired against a session already relaunched onto a new runner"
+        )
+        conv_after = store.get_conversation(conv.id)
+        assert conv_after is not None
+        assert conv_after.runner_id == new_runner_id
+        assert sessions_module._last_task_error_from_labels(conv_after.labels) is None
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+async def test_host_offline_hold_no_failure_when_no_longer_mid_turn(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that settled to idle during the hold must not be failed.
+
+    Mirrors :func:`_mark_runner_sessions_offline_impl`'s own gate: a turn
+    that already finished (or was resolved some other way) while the hold
+    was waiting has nothing left for the hold to fail.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    host_store = tunnel_three_layer_stack.host_store
+    assert host_store is not None
+
+    grace = 0.05
+    hold = 0.2
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", hold)
+
+    host_id = uuid.uuid4().hex
+    host_store.upsert_on_connect(host_id=host_id, name="settles-idle", user_id=RESERVED_USER_LOCAL)
+    host_store.set_offline(host_id)
+
+    store = get_conversation_store()
+    conv = store.create_conversation(agent_id=None, host_id=host_id, workspace="/tmp/ws-idle")
+    runner_id = "runner-host-offline-hold-idle"
+    store.replace_runner_id(conv.id, runner_id)
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    communicator = await _connect_and_hello(ap_app, runner_id)
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+
+        # Past the grace the session is held ...
+        await asyncio.sleep(grace * 4)
+        assert sessions_module._session_status_cache.get(conv.id) == "running"
+
+        # ... the turn settles to idle by some other path (e.g. a delayed
+        # terminal event) while the hold is still waiting ...
+        sessions_module._session_status_cache[conv.id] = "idle"
+
+        # ... so the hold, once it wakes, must not flip it back to failed.
+        await asyncio.sleep(hold * 4)
+        assert sessions_module._session_status_cache.get(conv.id) == "idle", (
+            "the hold fired against a session that had already settled to idle"
+        )
+        conv_after = store.get_conversation(conv.id)
+        assert conv_after is not None
+        assert sessions_module._last_task_error_from_labels(conv_after.labels) is None
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+async def test_confirmed_crash_wins_over_a_pending_host_offline_hold(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A confirmed runner crash fails the session with its own cause, not the hold's.
+
+    Drives a real disconnect-sweep hold (host offline) for a runner, then a
+    real ``host.runner_exited`` crash report for that same runner over an
+    actual host tunnel. The crash path (``_on_runner_exited``) cancels the
+    pending hold before failing the session with the crash's own
+    ``runner_failed_to_start`` cause; asserts that cause lands immediately
+    and is still there well past when the (tiny, test-only) hold window
+    would otherwise have fired — i.e. the hold never got a chance to
+    overwrite the crash's failure with its own.
+
+    This does not reach into the private ``_host_offline_hold_tasks``
+    closure to assert the task object was cancelled (nothing in this
+    codebase's tests do that kind of white-box introspection into
+    ``create_app``'s closures — see ``_disconnect_grace_tasks``, which is
+    only ever tested behaviorally). The end-state assertion below is the
+    behavioral proxy for "the hold did not fire and clobber the crash".
+    """
+    from omnigent.host.frames import HostRunnerExitedFrame, encode_host_frame
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    host_store = tunnel_three_layer_stack.host_store
+    assert host_store is not None
+
+    grace = 0.05
+    hold = 0.2
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", hold)
+
+    host_id = uuid.uuid4().hex
+    host_comm = await _connect_host_tunnel(ap_app, host_id)
+    host_store.set_offline(host_id)
+
+    store = get_conversation_store()
+    conv = store.create_conversation(agent_id=None, host_id=host_id, workspace="/tmp/ws-crash")
+    runner_id = "runner-crash-cancels-hold"
+    store.replace_runner_id(conv.id, runner_id)
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    runner_comm = await _connect_and_hello(ap_app, runner_id)
+    try:
+        await runner_comm.send_input({"type": "websocket.disconnect", "code": 1006})
+        await runner_comm.wait(timeout=budget(2.0))
+
+        # Past the grace the session is held (not failed) ...
+        await asyncio.sleep(grace * 4)
+        assert sessions_module._session_status_cache.get(conv.id) == "running"
+
+        # ... then the host reports the runner crashed.
+        crash_frame = HostRunnerExitedFrame(runner_id=runner_id, error="boom, exit code 1")
+        await host_comm.send_input(
+            {"type": "websocket.receive", "text": encode_host_frame(crash_frame)}
+        )
+
+        async def _failed() -> None:
+            while sessions_module._session_status_cache.get(conv.id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_failed(), timeout=budget(5.0))
+        conv_after = store.get_conversation(conv.id)
+        assert conv_after is not None
+        assert sessions_module._last_task_error_from_labels(conv_after.labels) == {
+            "code": "runner_failed_to_start",
+            "message": "boom, exit code 1",
+        }
+
+        # Well past the (tiny) hold window: if the hold had survived, it
+        # would have overwritten this by now.
+        await asyncio.sleep(hold * 4)
+        conv_final = store.get_conversation(conv.id)
+        assert conv_final is not None
+        assert sessions_module._last_task_error_from_labels(conv_final.labels) == {
+            "code": "runner_failed_to_start",
+            "message": "boom, exit code 1",
+        }
+    finally:
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
+            await host_comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await host_comm.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(conv.id, None)
 
 
 def _drain_session_live_state() -> None:

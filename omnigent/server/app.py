@@ -45,6 +45,7 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
+from omnigent.entities import Conversation
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -113,6 +114,7 @@ from omnigent.server.routes.sessions import (
     announce_hosts_changed,
     create_sessions_router,
     set_server_host_registry,
+    set_server_host_store,
     set_server_runner_router,
 )
 from omnigent.server.routes.sharing import create_sharing_router
@@ -1948,6 +1950,11 @@ def create_app(
     # refill their model catalog from the session's host, from background
     # tasks with no request in scope.
     set_server_host_registry(host_registry)
+    # Same pattern for the persistent host store: the runner-stream relay
+    # (orchestration.py's ``_relay_runner_stream``) runs as a background task
+    # with no request in scope and needs it to tell a host-offline drop from
+    # a genuinely dead runner.
+    set_server_host_store(host_store)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
     # hold a session's runner tunnel serve the same sidebar fields. The
@@ -3244,13 +3251,125 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
+    # Pending per-session host-offline holds: a mid-turn session whose HOST
+    # (not just its runner) reads offline gets a long bounded wait instead of
+    # the ordinary disconnect grace, since a sleeping/offline host is far more
+    # likely to come back than a dead runner process. Keyed by session id
+    # (not runner id) so a hold survives independently of the disconnect-grace
+    # timer that scheduled it.
+    _host_offline_hold_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _cancel_host_offline_hold(session_id: str) -> None:
+        """Cancel and forget the pending host-offline hold, if any."""
+        pending = _host_offline_hold_tasks.pop(session_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+    async def _hold_session_while_host_offline(conv: Conversation, runner_id: str) -> None:
+        """Fail a host-offline session only after it stays gone past the hold.
+
+        Re-checks the runner's connectivity the same two ways the sidebar's
+        strict liveness check does (:func:`_bulk_session_liveness`): this
+        replica's tunnel registry, then the cross-replica
+        ``runner_last_seen`` stamp another replica may have refreshed. A
+        runner seen either way, or a host that comes back online, cancels or
+        no-ops the hold well before it fires. The session may also have moved
+        on entirely by the time the hold wakes — rebound to a fresh runner
+        (a relaunch) or settled off the mid-turn statuses
+        (:data:`_MID_TURN_STATUSES`, the same gate
+        :func:`_mark_runner_sessions_offline_impl` uses) — either of which
+        means there is nothing left here to fail. Reaching the failure below
+        means the host was genuinely gone, on the same runner, mid-turn, for
+        the whole window.
+
+        Uses ``code="runner_disconnected"`` (not a new code) so the
+        recovery paths that already special-case that code — web
+        ``RUNNER_DISCONNECT_CODES``/retry affordances, and
+        :func:`_publish_runner_recovered_status`'s ``require_disconnect_code``
+        clear-on-reconnect — keep working unchanged for an expired hold. The
+        distinct ``failure_origin`` keeps it distinguishable in telemetry.
+
+        :param conv: The held session's row, as seen when the hold started.
+        :param runner_id: The runner id whose disconnect started the hold.
+        """
+        from omnigent.server.routes._sessions.orchestration import _MID_TURN_STATUSES
+        from omnigent.server.routes.sessions import (
+            HOST_OFFLINE_HOLD_S,
+            _persist_session_status_error_labels,
+            _publish_status,
+            _session_host_offline,
+            _session_status_cache,
+        )
+        from omnigent.server.schemas import ErrorDetail
+
+        await asyncio.sleep(HOST_OFFLINE_HOLD_S)
+        if tunnel_registry.get(runner_id) is not None:
+            return
+        connectivity = await asyncio.to_thread(
+            conversation_store.get_session_connectivity, [conv.id]
+        )
+        conn = connectivity.get(conv.id)
+        if conn is not None and runner_seen_is_fresh(conn.runner_last_seen, now=int(time.time())):
+            return
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if fresh is None:
+            return
+        if fresh.runner_id != runner_id:
+            # Rebound to a different runner (a relaunch) since the hold
+            # started; that runner's own disconnect/crash handling owns this
+            # session now.
+            return
+        live = _session_status_cache.get(fresh.id, fresh.live_status)
+        if live not in _MID_TURN_STATUSES:
+            # The turn this hold was protecting is no longer in flight (it
+            # settled, or was already failed by something else); there is
+            # nothing left to fail.
+            return
+        if not await _session_host_offline(fresh, host_store, conversation_store):
+            # The host came back before the runner reconnected through this
+            # replica's callback; leave it to the ordinary reconnect path.
+            return
+        error = ErrorDetail(
+            source="execution",
+            code="runner_disconnected",
+            message=(
+                "The host for this session went offline and did not come back within 6 hours."
+            ),
+        )
+        _logger.warning(
+            "Session %s's host stayed offline past the %.0fs hold; failing it",
+            conv.id,
+            HOST_OFFLINE_HOLD_S,
+        )
+        _publish_status(fresh.id, "failed", error, failure_origin="host_offline_hold_expired")
+        await _persist_session_status_error_labels(fresh.id, error, conversation_store)
+
+    def _schedule_host_offline_hold(conv: Conversation, runner_id: str) -> None:
+        """Start (or restart) the bounded host-offline hold for one session."""
+        _cancel_host_offline_hold(conv.id)
+        task = asyncio.create_task(
+            _hold_session_while_host_offline(conv, runner_id),
+            name=f"host-offline-hold-{conv.id}",
+        )
+        _host_offline_hold_tasks[conv.id] = task
+
+        def _clear_hold_slot(t: asyncio.Task[None]) -> None:
+            if _host_offline_hold_tasks.get(conv.id) is t:
+                _host_offline_hold_tasks.pop(conv.id, None)
+
+        task.add_done_callback(_clear_hold_slot)
+
     async def _mark_disconnected_runner_failed(runner_id: str) -> None:
         """Reconcile a dropped runner's sessions once the grace expires.
 
         A runner that re-registered inside the grace makes this a no-op
         via the live-tunnel re-check (the same newest-wins rule the
-        immediate path used); one still gone hands its bound sessions to
-        :func:`_mark_runner_sessions_offline`, which fails only the
+        immediate path used); one still gone partitions its bound sessions
+        (:func:`_partition_disconnect_targets`): a mid-turn session whose
+        HOST reads offline gets a long bounded hold instead
+        (:func:`_hold_session_while_host_offline`) since that outage is far
+        more likely to self-heal than a dead runner, and everything else
+        hands to :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
 
         A server that is itself shutting down skips the marking too: it
@@ -3263,6 +3382,7 @@ def create_app(
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
+            _partition_disconnect_targets,
         )
         from omnigent.server.schemas import ErrorDetail
 
@@ -3294,8 +3414,24 @@ def create_app(
             runner_id,
             len(affected),
         )
+        fail_now, hold = await _partition_disconnect_targets(
+            affected, conversation_store, host_store
+        )
+        for conv in hold:
+            _logger.info(
+                "Session %s held: runner %s disconnected but its host looks offline",
+                conv.id,
+                runner_id,
+                extra=debug_event(
+                    "runner_disconnect_held_host_offline",
+                    session_id=conv.id,
+                    runner_id=runner_id,
+                    host_id=conv.host_id,
+                ),
+            )
+            _schedule_host_offline_hold(conv, runner_id)
         await _mark_runner_sessions_offline(
-            affected,
+            fail_now,
             ErrorDetail(
                 code="runner_disconnected",
                 message="Runner disconnected unexpectedly.",
@@ -3399,6 +3535,11 @@ def create_app(
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # A confirmed crash overrides any host-offline hold this runner's
+        # sessions were sitting in: the runner is not merely unreachable, it
+        # is dead, so the crash path fails it immediately like it always has.
+        for conv in affected:
+            _cancel_host_offline_hold(conv.id)
         _logger.warning(
             "Runner %s reported crashed; reconciling %d bound session(s): %s",
             runner_id,
@@ -3457,6 +3598,10 @@ def create_app(
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # The runner is back, so any host-offline hold on its sessions has
+        # served its purpose — reconciliation below takes over from here.
+        for conv in convs:
+            _cancel_host_offline_hold(conv.id)
         # Restore each tree from its root before ordinary child initialization
         # can clear the interruption status or cache an init without continuation.
         bound_ids = {conv.id for conv in convs}
