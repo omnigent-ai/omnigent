@@ -3705,10 +3705,10 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Top level: the built-in Claude row + the "Custom agents" submenu
+            # Top level: the built-in Claude row + the custom-agent "Other..." submenu
             # trigger — no duplicate "Claude Code" sneaks in via a leaked clone.
             await expect(page.locator("[data-harness-menu-row]")).to_have_count(1)
-            # The genuinely custom agent survives, inside the Custom agents submenu.
+            # The genuinely custom agent survives inside that submenu.
             await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
         finally:
