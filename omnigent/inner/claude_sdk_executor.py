@@ -2006,6 +2006,8 @@ class ClaudeSDKExecutor(Executor):
             return
         transport = getattr(state.client, "_transport", None)
         process = getattr(transport, "_process", None)
+        # A non-None returncode is exactly the reaped-corpse state the SDK's
+        # write() refuses; a missing transport/process reads as alive and is skipped.
         returncode = getattr(process, "returncode", None)
         if returncode is None:
             return

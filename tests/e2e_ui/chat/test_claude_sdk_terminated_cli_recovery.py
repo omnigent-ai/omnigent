@@ -160,6 +160,7 @@ def test_next_turn_recovers_when_claude_cli_was_terminated(
                     exit_code = proc.wait(timeout=20)
                     print(f"claude CLI pid {pid} exited with {exit_code}")
                 except psutil.NoSuchProcess:
+                    # Already exited and reaped before wait() could observe it.
                     pass
                 except psutil.TimeoutExpired:
                     proc.kill()
