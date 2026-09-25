@@ -3,12 +3,14 @@
 // opts in (the "Open links in the in-app browser" setting), that click must
 // instead route the URL into the conversation's embedded browser view and
 // surface the Browser pane — while modified clicks, non-web schemes, and
-// contexts with no conversation keep the default external path, and the
-// preference stays off by default.
+// contexts with no conversation keep the default external path, the
+// preference stays off by default, and a view that refuses the link falls
+// back to the external browser instead of swallowing the click.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { showToast } from "@/components/ui/toast";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import type * as NativeBridge from "@/lib/nativeBridge";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
@@ -19,6 +21,8 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridge>()),
   isNativeShell: () => true,
 }));
+
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 const LINK_URL = "https://example.com/page";
 const CONVERSATION_ID = "conv-embedded-browser";
@@ -38,6 +42,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.mocked(showToast).mockReset();
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
   window.localStorage.clear();
 });
@@ -82,18 +87,41 @@ describe("desktop chat link clicks with the in-app browser preference on", () =>
     writeOpenLinksInApp(true);
   });
 
-  it("routes a plain click into the conversation's embedded browser view", () => {
-    const openSpy = vi.spyOn(window, "open");
+  it("routes a plain click into the conversation's embedded browser view", async () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
     const surfaced: string[] = [];
     const unsubscribe = onInAppLinkOpen((conversationId) => surfaced.push(conversationId));
 
     const event = click(renderExternalLink());
-    unsubscribe();
 
     expect(event.defaultPrevented).toBe(true);
     expect(openOrNavigate).toHaveBeenCalledWith(CONVERSATION_ID, LINK_URL);
-    expect(surfaced).toEqual([CONVERSATION_ID]);
+    // The Browser tab surfaces once the view accepted the URL.
+    await vi.waitFor(() => expect(surfaced).toEqual([CONVERSATION_ID]));
+    unsubscribe();
     expect(openSpy).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the external browser when the embedded view refuses the link", async () => {
+    openOrNavigate.mockResolvedValue({ ok: false, error: "browser view cap reached — close one" });
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const surfaced: string[] = [];
+    const unsubscribe = onInAppLinkOpen((conversationId) => surfaced.push(conversationId));
+
+    const event = click(renderExternalLink());
+
+    // The anchor's own _blank navigation was cancelled, so the fallback is
+    // the only way the click still reaches a browser.
+    expect(event.defaultPrevented).toBe(true);
+    await vi.waitFor(() =>
+      expect(openSpy).toHaveBeenCalledWith(LINK_URL, "_blank", "noopener,noreferrer"),
+    );
+    unsubscribe();
+    expect(surfaced).toEqual([]);
+    expect(String(vi.mocked(showToast).mock.calls[0][0])).toContain(
+      "browser view cap reached — close one",
+    );
   });
 
   it.each([

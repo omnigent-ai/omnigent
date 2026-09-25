@@ -6,7 +6,9 @@ browser, and nothing routes into the embedded browser pane. Settings (General
 -> Links) offers a desktop-only "Open links in the in-app browser" toggle;
 once enabled, a plain click routes the link into the conversation's embedded
 browser view (``browserOpenOrNavigate``) and auto-surfaces the Browser
-workspace tab, while a modified click stays on the external path.
+workspace tab, while a modified click stays on the external path. When the
+view refuses the link (for example the per-window view cap), the click is
+not lost: the link falls back to the external browser and a toast says why.
 
 The e2e_ui harness runs the SPA in plain Chromium, not Electron, so the
 desktop path is exercised through a minimal ``window.omnigentDesktop`` stub
@@ -31,31 +33,45 @@ from tests.e2e_ui.conftest import seed_committed_turn
 # port instead of reaching the public internet.
 LINK_URL = "http://127.0.0.1:9/product-docs"
 
-# Minimal Electron-preload stand-in (see test_browser_tab.py), with a
-# recording ``browserOpenOrNavigate`` so tests can assert what the SPA routed
-# into the embedded browser view.
-_ELECTRON_SHELL_INIT_SCRIPT = """
+# The registry's refusal when a window already hosts its maximum of views.
+VIEW_CAP_ERROR = "browser view cap reached — close one"
+
+
+def _electron_shell_init_script(open_or_navigate_result: str) -> str:
+    """Minimal Electron-preload stand-in (see ``test_browser_tab.py``).
+
+    ``browserOpenOrNavigate`` records its calls and resolves
+    ``open_or_navigate_result`` (a JS object literal), so a test can drive
+    both an accepting view and one that refuses the link.
+    """
+    return f"""
 window.__openOrNavigateCalls = [];
-window.omnigentDesktop = {
+window.omnigentDesktop = {{
   kind: "electron",
-  setBadgeCount: function () {},
-  notify: function () { return Promise.resolve(false); },
-  onNotificationActivated: function () { return function () {}; },
-  getServerPicker: function () { return Promise.resolve(null); },
-  switchServer: function () { return Promise.resolve(); },
-  openServerSetup: function () {},
-  browserOpenOrNavigate: function (conversationId, url) {
-    window.__openOrNavigateCalls.push({ conversationId: conversationId, url: url });
-    return Promise.resolve({ ok: true, created: true });
-  },
-  browserHasView: function () { return Promise.resolve({ exists: false }); },
-  onBrowserViewCreated: function () { return function () {}; },
-  onBrowserHostActiveChanged: function () { return function () {}; },
-  onBrowserViewClosed: function () { return function () {}; },
-  onBrowserUrlChanged: function () { return function () {}; },
-  onBrowserNavState: function () { return function () {}; },
-};
+  setBadgeCount: function () {{}},
+  notify: function () {{ return Promise.resolve(false); }},
+  onNotificationActivated: function () {{ return function () {{}}; }},
+  getServerPicker: function () {{ return Promise.resolve(null); }},
+  switchServer: function () {{ return Promise.resolve(); }},
+  openServerSetup: function () {{}},
+  browserOpenOrNavigate: function (conversationId, url) {{
+    window.__openOrNavigateCalls.push({{ conversationId: conversationId, url: url }});
+    return Promise.resolve({open_or_navigate_result});
+  }},
+  browserHasView: function () {{ return Promise.resolve({{ exists: false }}); }},
+  onBrowserViewCreated: function () {{ return function () {{}}; }},
+  onBrowserHostActiveChanged: function () {{ return function () {{}}; }},
+  onBrowserViewClosed: function () {{ return function () {{}}; }},
+  onBrowserUrlChanged: function () {{ return function () {{}}; }},
+  onBrowserNavState: function () {{ return function () {{}}; }},
+}};
 """
+
+
+_ACCEPTING_SHELL_INIT_SCRIPT = _electron_shell_init_script("{ ok: true, created: true }")
+_REFUSING_SHELL_INIT_SCRIPT = _electron_shell_init_script(
+    f'{{ ok: false, error: "{VIEW_CAP_ERROR}" }}'
+)
 
 
 def _open_seeded_conversation(page: Page, base_url: str, session_id: str) -> None:
@@ -73,6 +89,28 @@ def _chat_link(page: Page):
     return page.get_by_role("link", name=re.compile("product-docs"))
 
 
+def _enable_open_links_in_app(page: Page, base_url: str, session_id: str) -> None:
+    """Opt in through the real Settings control, then return to the chat.
+
+    Drives conversation -> Settings (the General section's Links toggle) ->
+    back to the conversation the sidebar remembered.
+    """
+    page.get_by_test_id("settings-button").click()
+    expect(page).to_have_url(f"{base_url}/settings/general", timeout=30_000)
+    toggle = page.get_by_test_id("open-links-in-app-toggle")
+    expect(toggle).to_be_visible()
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-checked", "true")
+
+    page.get_by_role("link", name="Back", exact=True).click()
+    expect(page).to_have_url(f"{base_url}/c/{session_id}", timeout=30_000)
+
+
+def _selected_browser_tab(page: Page):
+    rail = page.get_by_role("complementary", name="Workspace")
+    return rail.get_by_role("tab", name=re.compile("Browser"), selected=True)
+
+
 def test_plain_click_keeps_external_default(
     page: Page,
     seeded_session: tuple[str, str],
@@ -85,7 +123,7 @@ def test_plain_click_keeps_external_default(
     called.
     """
     base_url, session_id = seeded_session
-    page.add_init_script(_ELECTRON_SHELL_INIT_SCRIPT)
+    page.add_init_script(_ACCEPTING_SHELL_INIT_SCRIPT)
     _open_seeded_conversation(page, base_url, session_id)
 
     link = _chat_link(page)
@@ -102,28 +140,16 @@ def test_settings_toggle_routes_plain_clicks_in_app(
 ) -> None:
     """Enable the setting in Settings; a plain click then opens in-app.
 
-    Drives the full user journey: conversation -> Settings (the General
-    section's Links toggle) -> back to the conversation -> plain click. The
-    click must route the URL into the conversation's embedded browser view
-    and auto-surface the Browser workspace tab. A ctrl/cmd-click afterwards
-    must stay external (no further in-app routing).
+    Drives the full user journey: conversation -> Settings -> back to the
+    conversation -> plain click. The click must route the URL into the
+    conversation's embedded browser view and auto-surface the Browser
+    workspace tab. A ctrl/cmd-click afterwards must stay external (no
+    further in-app routing).
     """
     base_url, session_id = seeded_session
-    page.add_init_script(_ELECTRON_SHELL_INIT_SCRIPT)
+    page.add_init_script(_ACCEPTING_SHELL_INIT_SCRIPT)
     _open_seeded_conversation(page, base_url, session_id)
-
-    # Opt in through the real Settings control (desktop-only: it renders
-    # because the stub marks the shell browser-capable).
-    page.get_by_test_id("settings-button").click()
-    expect(page).to_have_url(f"{base_url}/settings/general", timeout=30_000)
-    toggle = page.get_by_test_id("open-links-in-app-toggle")
-    expect(toggle).to_be_visible()
-    toggle.click()
-    expect(toggle).to_have_attribute("aria-checked", "true")
-
-    # Back to the conversation the sidebar remembered.
-    page.get_by_role("link", name="Back", exact=True).click()
-    expect(page).to_have_url(f"{base_url}/c/{session_id}", timeout=30_000)
+    _enable_open_links_in_app(page, base_url, session_id)
 
     link = _chat_link(page)
     expect(link).to_be_visible()
@@ -135,9 +161,7 @@ def test_settings_toggle_routes_plain_clicks_in_app(
         {"conversationId": session_id, "url": LINK_URL}
     ]
     # …and the Browser workspace tab auto-surfaced to host it.
-    rail = page.get_by_role("complementary", name="Workspace")
-    browser_tab = rail.get_by_role("tab", name=re.compile("Browser"))
-    expect(browser_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    expect(_selected_browser_tab(page)).to_be_visible(timeout=30_000)
     # The click was cancelled, so no _blank popup opened alongside.
     assert len(page.context.pages) == 1
 
@@ -145,6 +169,31 @@ def test_settings_toggle_routes_plain_clicks_in_app(
     link.click(modifiers=["ControlOrMeta"])
     page.wait_for_timeout(500)
     assert page.evaluate("window.__openOrNavigateCalls.length") == 1
+
+
+def test_in_app_refusal_falls_back_to_external_browser(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A view that refuses the link must not swallow the click.
+
+    With the setting on and the embedded browser refusing (the view cap is
+    reached), the link reopens on the external-browser path, a toast explains
+    why, and the Browser tab is not surfaced onto an empty pane.
+    """
+    base_url, session_id = seeded_session
+    page.add_init_script(_REFUSING_SHELL_INIT_SCRIPT)
+    _open_seeded_conversation(page, base_url, session_id)
+    _enable_open_links_in_app(page, base_url, session_id)
+
+    link = _chat_link(page)
+    expect(link).to_be_visible()
+    with page.expect_popup():
+        link.click()
+
+    page.wait_for_function("window.__openOrNavigateCalls.length === 1")
+    expect(page.get_by_test_id("toast").filter(has_text=VIEW_CAP_ERROR)).to_be_visible()
+    expect(_selected_browser_tab(page)).to_have_count(0)
 
 
 def test_toggle_hidden_in_plain_browser(
