@@ -1732,6 +1732,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # re-attach it on write, exactly as ``set_session_state`` does.
             current, todos = _decode_session_state(raw)
             mutate(current)
+            # A forged reserved key never persists; drop it from the returned
+            # view too so callers see exactly what a subsequent read exposes.
+            current.pop(_SESSION_TODOS_STATE_KEY, None)
             encoded = _encode_session_state(current, todos)
         else:
             current = dict(json.loads(raw)) if raw else {}

@@ -7025,6 +7025,37 @@ def test_two_real_writers_race_on_one_metadata_row(
     )
 
 
+def test_mutate_session_state_preserves_the_plan_snapshot(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The reserved Plan key survives the locked merge and stays invisible to it.
+
+    The native Plan snapshot shares the session_state column but is not
+    policy state: the mutate callback must never see it, a forged copy must
+    not persist or surface in the merged result, and the stored snapshot
+    must survive the merge — the same contract ``set_session_state`` pins.
+    """
+    conv = conversation_store.create_conversation()
+    todos = [{"content": "keep", "status": "pending", "activeForm": "keeping"}]
+    conversation_store.set_session_todos(conv.id, todos)
+
+    seen: list[dict[str, Any]] = []
+
+    def _mutate(state: dict[str, Any]) -> None:
+        seen.append(dict(state))
+        state["counter"] = state.get("counter", 0) + 1
+        state["_omnigent_native_plan_snapshot_v1"] = [{"forged": 1}]
+
+    merged = conversation_store.mutate_session_state(conv.id, _mutate)
+
+    assert seen == [{}], "the reserved Plan key leaked into the mutate callback"
+    assert merged == {"counter": 1}, merged
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.session_state == {"counter": 1}
+    assert fetched.session_todos == todos
+
+
 def _acl_perms(db_uri: str):
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
