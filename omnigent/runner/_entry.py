@@ -654,11 +654,7 @@ def _make_auth_token_factory(
         )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
-    from omnigent.inner.databricks_executor import (
-        DatabricksAuthError,
-        _DatabricksBearerAuth,
-        _resolve_databricks_auth,
-    )
+    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
 
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
@@ -671,57 +667,9 @@ def _make_auth_token_factory(
         if delegated_factory is not None:
             return delegated_factory
 
-    # Reused Databricks SDK auth, resolved once on first use and cached
-    # here for the life of the factory. Reusing one Config is the whole
-    # point: the SDK serves the minted OAuth token from its in-memory
-    # cache and only re-runs the Databricks CLI (~0.5s) when the token
-    # nears expiry. The previous implementation built a fresh Config on
-    # every call (via _read_databrickscfg), shelling out to the CLI on
-    # EVERY runner->AP request — ~6.5s across the ~13 requests of session
-    # establish alone, plus the same tax on every later turn.
-    # ``sdk_auth_resolved`` is the "have we tried resolving yet" flag;
-    # ``sdk_auth`` is the (possibly ``None``) reused auth once resolved.
-    sdk_auth: _DatabricksBearerAuth | None = None
-    sdk_auth_resolved = False
-
-    def _sdk_token() -> str | None:
-        """
-        Return a bearer token from the reused SDK auth, or ``None``.
-
-        Resolves the SDK auth on first call and reuses it thereafter, so
-        repeat fetches hit the SDK's in-memory token cache instead of
-        rebuilding ``Config`` / re-shelling to the Databricks CLI.
-
-        :returns: Bearer token string, or ``None`` when no Databricks
-            credentials resolve.
-        """
-        nonlocal sdk_auth, sdk_auth_resolved
-        if not sdk_auth_resolved:
-            # A stored Databricks Apps pointer record (from
-            # ``omnigent login <apps-url>``) names the exact workspace
-            # the Apps edge accepts tokens from, so it beats ambient
-            # profile resolution.
-            from omnigent.cli_auth import load_databricks_workspace_host
-
-            workspace_host = (
-                load_databricks_workspace_host(resolved_server_url)
-                if resolved_server_url
-                else None
-            )
-            try:
-                if workspace_host is not None:
-                    sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
-                else:
-                    sdk_auth, _host = _resolve_databricks_auth()
-            except (DatabricksAuthError, ImportError, ValueError):
-                sdk_auth = None
-            sdk_auth_resolved = True
-        if sdk_auth is None:
-            return None
-        try:
-            return sdk_auth.current_token()
-        except DatabricksAuthError:
-            return None
+    # Reuse the SDK token cache, but re-resolve auth if a mint fails after a
+    # CLI upgrade or other credential change.
+    sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
 
     def _factory() -> str | None:
         """Return a fresh auth token.
@@ -762,7 +710,7 @@ def _make_auth_token_factory(
             still_valid = load_token(resolved_server_url)
             if still_valid:
                 return still_valid
-        return _sdk_token()
+        return sdk_token_source.current_token()
 
     # Probe once to check if a user credential is available.
     try:

@@ -97,9 +97,8 @@ class _ConfigYamlLoader(yaml.SafeLoader):
 _BOOL_TAG = "tag:yaml.org,2002:bool"
 _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
-# ``executor.config`` keys kept as their nested YAML structure instead of
-# string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+# ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset({"context_files"})
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
 # from SafeLoader by reference, so in-place edits below would strip

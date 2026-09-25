@@ -712,6 +712,22 @@ async def _best_effort_stop(
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
 
+# Deferred archive stops still inside the undo grace, keyed by session id.
+# Scheduling a stop cancels the session's prior pending one, and an unarchive
+# cancels it outright — so a stale timer from an earlier archive can't fire
+# after an Undo + re-archive on the same replica. This is the same-replica
+# fast path; the persisted ``archived`` re-check in _archive_stop is the
+# cross-replica backstop. One entry per session.
+# custom-lint: disable-next=workspace-scoped-cache -- undo-window teardown timers
+_pending_archive_stops: dict[str, asyncio.Task[None]] = {}
+
+# When the deferred archive stop re-reads the row and that read fails, retry a
+# few times before giving up: a transient blip must not force a blind stop-or-
+# skip guess (either can be wrong). Small/short — this only rides out a brief
+# failure, not a sustained outage.
+_ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
+_ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+
 
 async def _archive_stop(
     session_id: str,
@@ -732,6 +748,14 @@ async def _archive_stop(
     Every step is best-effort: a wedged, offline, or already-stopped
     runner must not leave the session un-archived.
 
+    The persisted ``archived`` flag is the undo guard: archiving pops an
+    Undo pill, and teardown is deferred past that window (see
+    :func:`_spawn_archive_stop`). When it fires it re-reads the row and
+    skips when the session is no longer archived, so undoing keeps the
+    runner alive. Reading the persisted flag — not a per-replica in-memory
+    marker — makes this correct even when the Undo lands on a different
+    replica than the one holding the timer.
+
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
     :param runner_router: The ``RunnerRouter`` for runner-client
@@ -742,18 +766,40 @@ async def _archive_stop(
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
 
-    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
-    try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Archive host-runner teardown lookup failed for %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
+    # Re-read the row to honor a late Undo before tearing down. Neither guess on
+    # a failed read is safe — stopping could kill a session just unarchived on
+    # another replica (dead pane), skipping could leak a runner that should be
+    # down. So retry a transient blip a few times; only give up (and skip, the
+    # conservative choice that never kills a live session) on a sustained
+    # outage, which a later lifecycle event then reaps.
+    conv: Any = None
+    for _attempt in range(_ARCHIVE_STOP_LOOKUP_ATTEMPTS):
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            break
+        except Exception:  # noqa: BLE001
+            if _attempt + 1 >= _ARCHIVE_STOP_LOOKUP_ATTEMPTS:
+                _logger.warning(
+                    "Archive teardown lookup failed for %s after %d attempts; "
+                    "leaving the runner (reaped by a later lifecycle event)",
+                    session_id,
+                    _ARCHIVE_STOP_LOOKUP_ATTEMPTS,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                return
+            await asyncio.sleep(_ARCHIVE_STOP_LOOKUP_RETRY_S)
+    # Confirmed read: skip when the session is no longer archived (an Undo,
+    # possibly on another replica) — it's live again, so leave its runner alone.
+    if conv is None or not conv.archived:
         return
-    if conv is None or not conv.host_id or not conv.runner_id:
+    # Past the point of no return: unregister so a late cancel (an Undo racing
+    # this teardown) can't interrupt it mid-stop and strand the intentional-
+    # stop marker below, which would exclude the session from child recovery.
+    _pending_archive_stops.pop(session_id, None)
+
+    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    if not conv.host_id or not conv.runner_id:
         return
     # Mark the tunnel drop intentional BEFORE tearing it down so the relay
     # renders a quiet stopped state rather than "runner_disconnected".
@@ -786,13 +832,24 @@ def _spawn_archive_stop(
     host_registry: Any = None,
 ) -> None:
     """
-    Run :func:`_archive_stop` as a retained background task.
+    Defer :func:`_archive_stop` past the undo grace, as a retained task.
 
-    Archiving needs the stop to *happen*, not to have happened before
-    the response is written: awaiting it inline held the PATCH for the
-    stop's per-runner timeouts (seconds per running session against a
-    wedged or asleep runner) even though the archive proceeds
-    regardless of the stop's outcome.
+    Archiving pops an Undo pill; undoing it unarchives the session. A stop
+    that tore the runner down immediately would leave an unarchived
+    session with a dead pane, so the teardown sleeps past the grace
+    (``_ARCHIVE_STOP_UNDO_GRACE_S``, wider than the pill) and then re-reads
+    the persisted ``archived`` flag, skipping if the session was undone.
+    That store re-check is the guard that matters, and it holds across
+    replicas.
+
+    Awaiting the stop inline would hold the PATCH for its per-runner
+    timeouts (seconds against a wedged runner) even though the archive
+    proceeds regardless of the stop's outcome, so it is detached.
+
+    Scheduling here also cancels the session's prior pending stop, so a
+    re-archive replaces it rather than leaving two timers; that plus the
+    unarchive cancel in :func:`_cancel_pending_archive_stop` covers the
+    common same-replica undo without waiting out the grace.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
@@ -801,11 +858,52 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     """
-    task = asyncio.create_task(
-        _archive_stop(session_id, conversation_store, runner_router, host_registry)
-    )
+    # Replace any pending stop from an earlier archive of this session.
+    _cancel_pending_archive_stop(session_id)
+
+    async def _stop_after_grace() -> None:
+        # Resolve through the facade so a test's monkeypatch of the grace
+        # constant is honored here.
+        from omnigent.server.routes import sessions as _facade
+
+        try:
+            await asyncio.sleep(_facade._ARCHIVE_STOP_UNDO_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        await _archive_stop(session_id, conversation_store, runner_router, host_registry)
+
+    task = asyncio.create_task(_stop_after_grace())
+    _pending_archive_stops[session_id] = task
     _detached_stop_tasks.add(task)
-    task.add_done_callback(_detached_stop_tasks.discard)
+
+    def _done(t: asyncio.Task[None]) -> None:
+        _detached_stop_tasks.discard(t)
+        # Clear the map entry only if it still points at this task — a
+        # re-archive may have already replaced it.
+        if _pending_archive_stops.get(session_id) is t:
+            del _pending_archive_stops[session_id]
+
+    task.add_done_callback(_done)
+
+
+def _cancel_pending_archive_stop(session_id: str) -> None:
+    """
+    Cancel a session's pending deferred archive stop if it hasn't fired.
+
+    Called when a session is unarchived (Undo, or an explicit unarchive)
+    and when a re-archive supersedes an earlier one, so the common
+    same-replica undo keeps the runner alive without waiting out the
+    grace. A no-op when none is pending or it already ran. Cancelling only
+    reaches the grace sleep: once :func:`_archive_stop` begins the teardown
+    it unregisters itself, so this can't interrupt a stop in flight. The
+    persisted-flag re-check in :func:`_archive_stop` covers the case a
+    cross-replica Undo can't reach this in-memory timer.
+
+    :param session_id: Session/conversation identifier.
+    """
+    task = _pending_archive_stops.pop(session_id, None)
+    if task is not None:
+        task.cancel()
 
 
 def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
@@ -2652,9 +2750,10 @@ async def _enrich_terminal_status_with_subagent_output(
     with the terminal edge.
 
     A ``failed`` edge is filled only when the forwarder attached no detail of
-    its own. Its fallback must belong to the failed response, or (for older
-    forwarders without response ids) follow the latest user message. A failure
-    before any assistant output must not borrow an earlier turn's reply.
+    its own. A harness-reported ``failure_detail`` wins over the store; the
+    fallback must belong to the failed response, or (for older forwarders
+    without response ids) follow the latest user message. A failure before
+    any assistant output must not borrow an earlier turn's reply.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
@@ -2670,6 +2769,10 @@ async def _enrich_terminal_status_with_subagent_output(
     existing = data.get("output")
     if status == "failed" and isinstance(existing, str) and existing.strip():
         return data
+    # The store's latest assistant text can be prose that preceded the error.
+    failure_detail = data.get("failure_detail") if status == "failed" else None
+    if isinstance(failure_detail, str) and failure_detail.strip():
+        return {**data, "output": failure_detail.strip()}
     raw_response_id = data.get("response_id") if status == "failed" else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
     output = await asyncio.to_thread(
@@ -6527,13 +6630,10 @@ async def _dispatch_session_event_to_runner_impl(
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
 
-# Transient runner-tunnel drops (Apps ingress recycles, sleep-wake
-# reconnects) usually re-register in well under a second, and the worst
-# observed ingress-recycle burst took ~5s of failed attempts before the
-# tunnel was back. Hold the user-visible failure surface for double that
-# so those drops resolve silently; a runner still gone afterwards fails
-# as before. Crash-reported runner deaths bypass this grace entirely.
-RUNNER_DISCONNECT_GRACE_S: float = 10.0
+# Deployed runners back off to a 10s cap with ±50% jitter, so the
+# worst-case reconnect is ~15s plus handshake. 20s covers that cluster
+# and resolves transient drops silently; a runner still gone afterwards fails.
+RUNNER_DISCONNECT_GRACE_S: float = 20.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
@@ -11026,6 +11126,7 @@ __all__ = [
     "_build_native_terminal_message_event",
     "_build_session_list_item",
     "_build_session_response",
+    "_cancel_pending_archive_stop",
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",

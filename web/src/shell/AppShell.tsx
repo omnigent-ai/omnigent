@@ -1,5 +1,14 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
@@ -123,6 +132,11 @@ import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
+
+// Dev-only preview; lazy so the sample data never ships in production bundles.
+const ImportContextPreview = import.meta.env.DEV
+  ? lazy(() => import("@/components/onboarding/ImportContextPreview"))
+  : null;
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -2437,6 +2451,12 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          {/* Dev-only `?import-preview` for the post-setup import modal. */}
+          {ImportContextPreview && (
+            <Suspense fallback={null}>
+              <ImportContextPreview />
+            </Suspense>
+          )}
           {/* Global command palette (⌘K). Ungated so it works on every route
               and in embedded mode — the sidebar's "Search" button opens it
               there even though the ⌘K hotkey is disabled (it belongs to the

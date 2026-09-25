@@ -102,7 +102,7 @@ export function ImportSessionsPanel() {
 
   if (onlineHosts.length === 0) {
     return (
-      <p className="max-w-md text-sm text-muted-foreground" data-testid="import-no-hosts">
+      <p className="text-sm text-muted-foreground" data-testid="import-no-hosts">
         None of your machines are online. Start one with{" "}
         <code className="rounded bg-muted px-1 py-0.5 font-mono">omnigent host</code> from your
         terminal, then return here.
@@ -111,11 +111,11 @@ export function ImportSessionsPanel() {
   }
 
   return (
-    <div className="flex max-w-md flex-col gap-4" data-testid="import-sessions-panel">
-      <div className="flex flex-col gap-2">
-        <span className="text-sm font-medium text-muted-foreground">Machine</span>
+    <div className="flex flex-col" data-testid="import-sessions-panel">
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border pb-4">
+        <span className="text-ui font-medium">Machine</span>
         <Select value={hostId ?? ""} onValueChange={(v) => setHostId(v)}>
-          <SelectTrigger className="w-full text-sm" data-testid="import-host-select">
+          <SelectTrigger className="w-full sm:w-72 sm:shrink-0" data-testid="import-host-select">
             <SelectValue placeholder="Select a machine" />
           </SelectTrigger>
           <SelectContent>
@@ -132,8 +132,8 @@ export function ImportSessionsPanel() {
         </Select>
       </div>
 
-      <div className="flex flex-col gap-2">
-        <span className="text-sm font-medium text-muted-foreground">Import</span>
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border py-4">
+        <span className="text-ui font-medium">Import</span>
         <Select
           value={mode}
           onValueChange={(value) => {
@@ -142,7 +142,7 @@ export function ImportSessionsPanel() {
             if (nextMode === "session" && source === "all") setSource("claude");
           }}
         >
-          <SelectTrigger className="w-full text-sm" data-testid="import-mode-select">
+          <SelectTrigger className="w-full sm:w-56 sm:shrink-0" data-testid="import-mode-select">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -152,10 +152,10 @@ export function ImportSessionsPanel() {
         </Select>
       </div>
 
-      <div className="flex flex-col gap-2">
-        <span className="text-sm font-medium text-muted-foreground">Harness</span>
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border py-4">
+        <span className="text-ui font-medium">Harness</span>
         <Select value={source} onValueChange={(v) => setSource(v as ImportSourceSelector)}>
-          <SelectTrigger className="w-full text-sm" data-testid="import-source-select">
+          <SelectTrigger className="w-full sm:w-56 sm:shrink-0" data-testid="import-source-select">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -169,12 +169,18 @@ export function ImportSessionsPanel() {
       </div>
 
       {mode === "recent" ? (
-        <div className="flex flex-col gap-2">
-          <span className="text-sm font-medium text-muted-foreground">
-            How many recent sessions{source === "all" ? " (across all harnesses)" : ""}
-          </span>
+        <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 border-b border-border py-4">
+          <div className="flex min-w-0 flex-1 flex-col">
+            <span className="text-ui font-medium">
+              How many recent sessions{source === "all" ? " (across all harnesses)" : ""}
+            </span>
+            <p className="text-sm text-muted-foreground" data-testid="import-limit-help">
+              The most recent sessions you opened in the harness. Sub-agent and automation runs are
+              skipped, and sessions you've already imported are counted separately, not re-imported.
+            </p>
+          </div>
           <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v))}>
-            <SelectTrigger className="w-full text-sm" data-testid="import-limit-select">
+            <SelectTrigger className="w-full sm:w-56 sm:shrink-0" data-testid="import-limit-select">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -185,14 +191,10 @@ export function ImportSessionsPanel() {
               ))}
             </SelectContent>
           </Select>
-          <p className="text-xs text-muted-foreground" data-testid="import-limit-help">
-            The most recent sessions you opened in the harness. Sub-agent and automation runs are
-            skipped, and sessions you've already imported are counted separately, not re-imported.
-          </p>
         </div>
       ) : (
-        <div className="flex flex-col gap-2">
-          <label htmlFor="import-session-id" className="text-sm font-medium text-muted-foreground">
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border py-4">
+          <label htmlFor="import-session-id" className="text-ui font-medium">
             Session ID
           </label>
           <Input
@@ -202,6 +204,7 @@ export function ImportSessionsPanel() {
             maxLength={128}
             autoComplete="off"
             placeholder="Enter a session ID"
+            className="w-full sm:w-56 sm:shrink-0"
             onChange={(event) => setSessionId(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") void handleImport();
@@ -210,7 +213,7 @@ export function ImportSessionsPanel() {
         </div>
       )}
 
-      <div>
+      <div className="flex justify-end pt-4">
         <Button
           data-testid="import-submit"
           loading={submitting}
@@ -222,7 +225,7 @@ export function ImportSessionsPanel() {
       </div>
 
       {(result !== null || streamed.length > 0 || submitting) && (
-        <div className="flex flex-col gap-2">
+        <div className="mt-4 flex flex-col gap-2 border-t border-border pt-4">
           {result !== null ? (
             <p className="text-sm text-muted-foreground" data-testid="import-result">
               Imported {result.imported}

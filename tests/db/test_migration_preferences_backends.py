@@ -14,11 +14,11 @@ from omnigent.db.utils import (
 )
 
 
-def _downgrade_to_user_preferences(engine: sa.Engine, db_uri: str) -> None:
+def _downgrade(engine: sa.Engine, db_uri: str, revision: str) -> None:
     config = _build_alembic_config(db_uri)
     with engine.begin() as connection:
         config.attributes["connection"] = connection
-        command.downgrade(config, "ii1a2b3c4d5e")
+        command.downgrade(config, revision)
 
 
 @pytest.mark.parametrize("failed_attempts", [0, 2, 3])
@@ -29,9 +29,10 @@ def test_preferences_migration_round_trip_and_copy_failures(
     if engine.dialect.name == "cockroachdb":
         pytest.skip("CockroachDB transaction restarts are covered in test_cockroachdb.py")
 
-    # Reflection keeps these values raw: ORM compression must not transform migration data.
+    # Reflect the original destination type before recreating an interrupted migration.
+    _downgrade(engine, db_uri, "jj1a2b3c4d5e")
     preferences = sa.Table("preferences", sa.MetaData(), autoload_with=engine)
-    _downgrade_to_user_preferences(engine, db_uri)
+    _downgrade(engine, db_uri, "ii1a2b3c4d5e")
     users = sa.Table("users", sa.MetaData(), autoload_with=engine)
     original = {
         (0, "alice"): encode('{"sort_mode":"manual","ordered_project_ids":["' + "a" * 32 + '"]}'),
@@ -54,7 +55,7 @@ def test_preferences_migration_round_trip_and_copy_failures(
     expected = {
         (workspace_id, user_id, "project_order"): value
         for (workspace_id, user_id), value in original.items()
-        if value is not None and failed_attempts < 3
+        if value is not None and len(value) <= 65_535 and failed_attempts < 3
     }
     if failed_attempts == 0:
         preferences.create(engine)
@@ -104,7 +105,7 @@ def test_preferences_migration_round_trip_and_copy_failures(
         }
     assert saved == expected
 
-    _downgrade_to_user_preferences(engine, db_uri)
+    _downgrade(engine, db_uri, "ii1a2b3c4d5e")
     try:
         with engine.connect() as connection:
             restored = {

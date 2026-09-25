@@ -1527,3 +1527,27 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
+    """The grace must outlast the runner's worst-case jittered reconnect delay.
+
+    Runners back off to ``_MAX_RECONNECT_DELAY_S`` with up to
+    ``_RECONNECT_JITTER_FRACTION`` added jitter. If the grace is shorter than
+    that ceiling the server marks the session failed before a runner at full
+    backoff can reconnect. Pins the invariant so an inadvertent reduction of
+    the constant is caught immediately.
+    """
+    from omnigent.runner.transports.ws_tunnel.serve import (
+        _MAX_RECONNECT_DELAY_S,
+        _RECONNECT_JITTER_FRACTION,
+    )
+    from omnigent.server.routes._sessions.orchestration import RUNNER_DISCONNECT_GRACE_S
+
+    worst_case_reconnect_s = _MAX_RECONNECT_DELAY_S * (1 + _RECONNECT_JITTER_FRACTION)
+    assert worst_case_reconnect_s < RUNNER_DISCONNECT_GRACE_S, (
+        f"RUNNER_DISCONNECT_GRACE_S ({RUNNER_DISCONNECT_GRACE_S}s) must exceed "
+        f"the runner worst-case reconnect delay "
+        f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
+        f"{worst_case_reconnect_s}s)"
+    )

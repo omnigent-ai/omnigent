@@ -28,10 +28,9 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
-from sqlalchemy.dialects.mysql import LONGTEXT as MySQLLongText
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from omnigent.db.compression import CompressedLargeText, CompressedText
+from omnigent.db.compression import CompressedText
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
@@ -432,7 +431,7 @@ class SqlPreference(OmnigentBase):
     )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    value: Mapped[str] = mapped_column(CompressedLargeText, nullable=False)
+    value: Mapped[str] = mapped_column(CompressedText, nullable=False)
 
 
 class SqlAccountToken(OmnigentBase):
@@ -727,9 +726,7 @@ class SqlConversationMetadata(OmnigentBase):
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded provider binding and model catalog captured at session creation.
-    inference_snapshot: Mapped[str | None] = mapped_column(
-        Text().with_variant(MySQLLongText(), "mysql"), nullable=True
-    )
+    inference_snapshot: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.
     terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.

@@ -486,6 +486,20 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
 
 
+# How long an archive defers tearing down the session's runner, giving an Undo's
+# unarchive time to land first. When the teardown fires it re-reads the persisted
+# archived flag and skips if the session was unarchived, so any Undo whose
+# unarchive PERSISTS before this fires keeps the runner — across replicas, since
+# the guard is the shared row, not an in-memory timer.
+#
+# MUST stay above the client Undo pill's total lifetime, which the pill caps at
+# ARCHIVE_UNDO_MAX_LIFETIME_MS (5s) in web/src/shell/archiveUndoToast.tsx. The
+# pill merges successive archives, so without that cap it could linger past this
+# grace and offer an Undo AFTER the teardown already ran — and the re-check
+# can't un-stop a runner. The cap keeps the pill's Undo window inside this grace.
+_ARCHIVE_STOP_UNDO_GRACE_S = 8.0
+
+
 _HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
 
 

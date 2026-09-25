@@ -167,9 +167,12 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
+    _cancel_pending_archive_stop,
     _create_session_from_bundle,
     _create_session_from_existing_agent,
+    _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
+    _ensure_runner_session_initialized,
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
@@ -178,6 +181,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _run_managed_launch,
     _spawn_archive_stop,
     _validate_session_model_selection,
+    ensure_runner_connected,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -265,6 +269,51 @@ def _require_attachment_compatible_history(
                 code=ErrorCode.INVALID_INPUT,
             )
     return filename
+
+
+async def _wake_runner_for_model_change(
+    request: Request,
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> Conversation:
+    """Restore a sleeping native session before applying an explicit model pick."""
+    if await _get_runner_client(conv.id, runner_router) is not None:
+        return conv
+    runner_client, conv = await ensure_runner_connected(
+        session_id=conv.id,
+        conv=conv,
+        app_state=request.app.state,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        raise_host_refusal=True,
+    )
+    if runner_client is None:
+        raise OmnigentError(
+            "Cannot switch models while the session host is offline. Reconnect the host and retry.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    terminal_ready = await _ensure_runner_session_initialized(
+        conv.id,
+        conv,
+        runner_client,
+        conversation_store,
+        initializer=getattr(request.app.state, "runner_session_initializer", None),
+        suppress_recovery_turn=True,
+        require_success=True,
+    )
+    if not terminal_ready:
+        outcome = await _ensure_native_terminal_ready(
+            runner_client,
+            conv.id,
+            conv,
+            persist_resource_event=False,
+            runner_router=runner_router,
+        )
+        if outcome.error is not None:
+            raise OmnigentError(outcome.error.message, code=ErrorCode.RUNNER_UNAVAILABLE)
+    await _ensure_runner_relay_ready(conv.id, conv.runner_id, runner_client, conversation_store)
+    return conv
 
 
 async def _reset_runner_and_clear_todos_after_switch(
@@ -2551,6 +2600,19 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        live_model_change = not body.silent and (model_override is not None or clear_model)
+        wake_for_model_change = (
+            live_model_change
+            and conv is not None
+            and conv.host_id is not None
+            and _is_native_terminal_session(conv)
+        )
+        if wake_for_model_change:
+            assert conv is not None
+            conv = await _wake_runner_for_model_change(
+                request, conv, conversation_store, runner_router
+            )
+
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2578,32 +2640,29 @@ def register_core_routes(
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True:
             _prune_session_read_state(session_id)
-            # Stop the session now that the flag is committed, so a request
-            # rejected after this point can't leave a stopped-but-unarchived
-            # session. Detached, not awaited: the response must not wait out
-            # the stop's per-runner timeouts (seconds against a wedged or
-            # asleep runner). Archive has no client-side stop, so this also
-            # carries the host-runner teardown.
+            # Defer the stop now that the flag is committed, so a request
+            # rejected after this point can't leave a live runner on a session
+            # that ends up archived. Detached, not awaited: the response must
+            # not wait out the stop's per-runner timeouts (seconds against a
+            # wedged or asleep runner). The teardown sleeps past the Undo
+            # window, then re-reads the archived flag and skips if undone, so
+            # undoing keeps the runner alive. Archive has no client-side stop,
+            # so this also carries the host-runner teardown.
             _spawn_archive_stop(
                 session_id,
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
             )
-        # Notify the runner of effort / model changes so harnesses
-        # that can't re-read these from store at turn boundaries
-        # (today: claude-native, whose ``claude`` binary has
-        # ``--effort`` / ``--model`` baked in at spawn) get a chance
-        # to propagate them live. Best-effort — persisted values
-        # remain the authoritative fallback. Skip both when
-        # ``silent`` so bind-time auto-apply doesn't inject visible
-        # ``/model X`` items into a fresh pane.
-        # Effort and model both go through the unified ``/events``
-        # dispatch — Omnigent server stays harness-agnostic; the runner
-        # dispatches by harness (claude-native injects the slash
-        # command into tmux, other harnesses 204 no-op). See
-        # ``_forward_session_change_to_runner`` for the shared
-        # runner-client fallback + non-2xx logging.
+        elif body.archived is False:
+            # Unarchive (including Undo, which re-PATCHes archived=false within
+            # the pill's window): cancel a still-pending archive stop so the
+            # runner is kept alive instead of torn down for a session the user
+            # decided to keep. Same-replica fast path; the deferred stop's
+            # archived-flag re-check covers a cross-replica Undo.
+            _cancel_pending_archive_stop(session_id)
+        # The runner applies native settings live. Silent startup metadata
+        # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent
         if live_forward and (effort is not None or clear_effort):
             await _forward_session_change_to_runner(
@@ -2615,7 +2674,7 @@ def register_core_routes(
                 # command.
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
-        if live_forward and (model_override is not None or clear_model):
+        if live_model_change:
             _model_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -2631,19 +2690,16 @@ def register_core_routes(
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
-                # The injection is the only thing that moves a LIVE native
-                # pane's model, so a forward its runner refused must not pass as
-                # applied. A stopped session reaches no runner and stays quiet —
-                # its relaunch reads the override off the row.
+                # A recovered runner can disconnect again before the forward;
+                # neither a lost request nor a refusal confirms a model switch.
                 forward_failed = _surface_model_change_forward_failure(
                     session_id,
                     updated.model_override,
                     _model_forward,
                 )
-                if (
-                    forward_failed
-                    and conv is not None
-                    and configured_snapshot(conv.inference_snapshot)
+                if conv is not None and (
+                    (wake_for_model_change and (_model_forward is None or forward_failed))
+                    or (forward_failed and configured_snapshot(conv.inference_snapshot))
                 ):
                     await asyncio.to_thread(
                         conversation_store.update_conversation,
