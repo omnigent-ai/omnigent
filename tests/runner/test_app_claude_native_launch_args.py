@@ -365,6 +365,86 @@ def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
     assert config.api_key_helper
 
 
+def test_gateway_launch_disables_advisor_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gateway-routed config sets CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1.
+
+    Non-Anthropic gateways reject advisor_20260301 with an unsupported-tool
+    error; the kill-switch prevents the tool from being sent at all.
+    """
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", raising=False)
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://dbc-example.cloud.databricks.com/ai-gateway/anthropic"
+        },
+        api_key_helper="databricks auth token --host https://dbc-example.cloud.databricks.com",
+        model="system.ai.claude-sonnet-4-6[1m]",
+    )
+    terminal_env = build_native_claude_terminal_env(config)
+    assert terminal_env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == "1"
+
+
+def test_bedrock_gateway_launch_disables_advisor_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Bedrock-style config also sets CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1.
+
+    Bedrock endpoints reject advisor_20260301 the same way as custom gateways.
+    """
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", raising=False)
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "AWS_BEARER_TOKEN_BEDROCK": "tok",
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+        },
+        model="us.anthropic.claude-opus-4-5-20251101-v1:0",
+    )
+    terminal_env = build_native_claude_terminal_env(config)
+    assert terminal_env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == "1"
+
+
+def test_anthropic_direct_launch_does_not_disable_advisor_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Anthropic-direct launch leaves CLAUDE_CODE_DISABLE_ADVISOR_TOOL unset.
+
+    Advisor is only suppressed on non-Anthropic gateways; a native-auth or
+    anthropic.com session must be able to use the advisor normally.
+    """
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", raising=False)
+    # Clear ambient ANTHROPIC_BASE_URL so _ambient_env_is_non_anthropic_gateway
+    # returns False regardless of the dev-box environment.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    # No config → Claude Code's own login (Anthropic direct).
+    assert "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" not in build_native_claude_terminal_env(None)
+    # Explicit Anthropic base URL → still direct.
+    anthropic_config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        model="claude-opus-4-8",
+    )
+    assert "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" not in build_native_claude_terminal_env(
+        anthropic_config
+    )
+
+
+def test_explicit_user_advisor_env_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit CLAUDE_CODE_DISABLE_ADVISOR_TOOL in the user env is not overridden.
+
+    The user may set this to "0" to keep the advisor on a gateway that supports
+    it, or to any value for their own override. The harness must not stomp it.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "0")
+    gateway_config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://dbc-example.cloud.databricks.com/ai-gateway/anthropic"
+        },
+        api_key_helper="databricks auth token",
+        model="system.ai.claude-sonnet-4-6[1m]",
+    )
+    # The harness must not set the key; the user's env value passes through
+    # via the base process env, not the overlay dict.
+    terminal_env = build_native_claude_terminal_env(gateway_config)
+    assert "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" not in terminal_env
+
+
 @pytest.fixture
 def bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """
