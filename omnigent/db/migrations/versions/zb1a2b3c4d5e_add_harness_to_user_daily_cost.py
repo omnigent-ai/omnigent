@@ -68,7 +68,7 @@ def upgrade() -> None:
         # CockroachDB: cannot do PK change with other schema changes in same transaction
         # First add the column
         bind = op.get_bind()
-        op.execute(
+        bind.execute(
             sa.text(
                 "ALTER TABLE user_daily_cost "
                 "ADD COLUMN harness VARCHAR(64) NOT NULL DEFAULT '__all__'"
@@ -80,7 +80,7 @@ def upgrade() -> None:
         # Then rebuild PK with the new column
         old_pk_name = _existing_pk_name("user_daily_cost")
         if old_pk_name:
-            op.execute(
+            bind.execute(
                 sa.text(
                     f"ALTER TABLE user_daily_cost "
                     f'DROP CONSTRAINT "{old_pk_name}", '
@@ -123,7 +123,7 @@ def downgrade() -> None:
         bind = op.get_bind()
         columns = {col["name"] for col in sa.inspect(bind).get_columns("user_daily_cost")}
         if "harness" in columns:
-            op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
+            bind.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
     else:
         # Other databases: assume column exists
         op.execute(sa.text("DELETE FROM user_daily_cost WHERE harness != '__all__'"))
@@ -150,7 +150,7 @@ def downgrade() -> None:
             old_pk_name = _existing_pk_name("user_daily_cost")
             if old_pk_name:
                 # First rebuild the PK without harness
-                op.execute(
+                bind.execute(
                     sa.text(
                         f"ALTER TABLE user_daily_cost "
                         f'DROP CONSTRAINT "{old_pk_name}", '
@@ -162,7 +162,7 @@ def downgrade() -> None:
                 bind.commit()
                 bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
             # Then drop the harness column
-            op.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
+            bind.execute(sa.text("ALTER TABLE user_daily_cost DROP COLUMN harness"))
     else:
         # PostgreSQL/SQLite: use batch_alter_table
         old_pk_name = None if sqlite else _existing_pk_name("user_daily_cost")
