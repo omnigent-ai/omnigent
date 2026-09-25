@@ -10880,30 +10880,47 @@ _PRE_TOOL_USE_PAYLOAD: dict[str, object] = {
     "tool_input": {"command": "true"},
 }
 
+_USER_PROMPT_SUBMIT_PAYLOAD: dict[str, object] = {
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "do the thing",
+}
+
 
 class _ScriptedPolicyClient:
     """Fake runner policy client with a scripted body or failure.
 
-    :param body: JSON body for every response, or ``None`` to raise.
+    Evaluate POSTs (``/policies/evaluate``) return the scripted verdict (or
+    raise when ``body`` is ``None``); every other path — e.g. the
+    ``/events`` status post the block-surfacing helper makes — answers a
+    plain 200 and is captured in :attr:`events` for assertions.
+
+    :param body: JSON body for every evaluate response, or ``None`` to raise.
     """
 
     def __init__(self, body: dict[str, object] | None) -> None:
         """Store the script.
 
-        :param body: Response payload; ``None`` makes every call raise.
+        :param body: Evaluate response payload; ``None`` makes every
+            evaluate call raise.
         """
         self.body = body
         self.calls = 0
+        self.events: list[dict[str, object]] = []
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
-        """Return the scripted verdict or raise a transport error.
+        """Return the scripted verdict, capture an event post, or raise.
 
-        :param url: Evaluate path (ignored).
-        :param json: Forwarded EvaluationRequest (ignored).
+        :param url: Request path; a non-evaluate path is treated as an
+            event POST and captured.
+        :param json: Forwarded request body.
         :returns: Minimal httpx-Response-shaped namespace.
         """
         import json as _json
 
+        if not url.endswith("/policies/evaluate"):
+            if json is not None:
+                self.events.append(json)
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None)
         del url, json
         self.calls += 1
         if self.body is None:
@@ -11028,6 +11045,89 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_deny_surfaces_failed_status_to_web_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A UserPromptSubmit DENY blocks the prompt AND surfaces the reason.
+
+    A blocked prompt starts no turn and persists nothing, so the reason
+    would otherwise show only as Claude Code's terminal "blocked by hook"
+    line. The relay must also post a ``failed`` status carrying the reason
+    so the web chat view renders it (and the status pill clears).
+    """
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "over budget"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["decision"] == "block"
+        assert "over budget" in output["reason"]
+        assert len(client.events) == 1, f"expected one status post, saw {client.events!r}"
+        event = client.events[0]
+        assert event["type"] == "external_session_status"
+        assert event["data"]["status"] == "failed"
+        assert event["data"]["failure_detail"] == "over budget"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_fail_closed_surfaces_failed_status_to_web_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unevaluable UserPromptSubmit fails closed AND surfaces the reason.
+
+    The fail-closed request block is the reported incident's path; its
+    reason must reach the web chat view, not only the terminal.
+    """
+    client = _ScriptedPolicyClient(None)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["decision"] == "block"
+        assert len(client.events) == 1, f"expected one status post, saw {client.events!r}"
+        event = client.events[0]
+        assert event["data"]["status"] == "failed"
+        assert event["data"]["failure_detail"] == output["reason"]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_deny_does_not_surface_failed_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PreToolUse DENY posts no status edge — only prompts block a turn.
+
+    A tool-call block leaves the turn running (the tool is denied, not the
+    turn), so it must not masquerade as a failed turn in the web UI.
+    """
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "blocked by test"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert client.events == [], f"tool block must post no status edge, saw {client.events!r}"
     finally:
         relay.close()
 
