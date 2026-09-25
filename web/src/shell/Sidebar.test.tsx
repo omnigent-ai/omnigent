@@ -956,11 +956,13 @@ describe("Sidebar session list", () => {
     expect(search).toHaveAttribute("data-size", "icon-xs");
     expect(search).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(search).not.toHaveClass("rounded-sm");
-    expect(search.querySelector("svg")).toHaveClass("ui-icon");
+    expect(search.querySelector("svg")).toHaveClass("size-4");
+    expect(search.querySelector("svg")).not.toHaveClass("ui-icon");
     expect(settings).toHaveAttribute("aria-label", "Settings");
     expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6", "rounded-[var(--radius-md)]");
-    expect(settings.querySelector("svg")).toHaveClass("ui-icon");
+    expect(settings).toHaveClass("size-6", "rounded-[8px]");
+    expect(settings.querySelector("svg")).toHaveClass("size-4");
+    expect(settings.querySelector("svg")).not.toHaveClass("ui-icon");
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");

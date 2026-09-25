@@ -472,13 +472,13 @@ include = ["omnigent*"]
 # both work under auto.
 asyncio_mode = "auto"
 testpaths = ["tests"]
-# tests/e2e, tests/e2e_ui, and tests/e2e_live all require real LLM
-# credentials and/or extra setup (Databricks profile; npm build +
-# Playwright browsers for the UI suite; a deployed Databricks App URL
-# for the live suite). Opt-in via explicit pytest invocation.
+# tests/e2e, tests/e2e_ui, tests/browser_ui, and tests/e2e_live require
+# credentials and/or extra setup (Databricks profile; npm build + Playwright
+# browsers for the UI suites; a deployed Databricks App URL for the live
+# suite). Opt in via explicit pytest invocation.
 # structlog-config's pytest plugin clobbers unittest's private item._excinfo.
 # Disable it until the plugin stops writing to that attribute.
-addopts = "-p no:structlog_config --ignore=tests/e2e --ignore=tests/e2e_ui --ignore=tests/e2e_live --ignore=tests/integration"
+addopts = "-p no:structlog_config --ignore=tests/e2e --ignore=tests/e2e_ui --ignore=tests/browser_ui --ignore=tests/e2e_live --ignore=tests/integration"
 # Default per-test wallclock cap. Catches infinite hangs in any
 # suite (unit, inner, integration, e2e) without bothering tests
 # that actually finish. The longest legitimate integration tests

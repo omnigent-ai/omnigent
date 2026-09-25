@@ -172,6 +172,9 @@ describe("SubagentsPanel", () => {
 
     renderPanel({ rootSessionId: "conv_root" });
 
+    const heading = screen.getByRole("heading", { name: "Agents" });
+    expect(heading).toHaveClass("font-medium", "text-ui");
+    expect(heading.parentElement).toHaveClass("h-11");
     const main = screen.getByTestId("subagent-main-row");
     expect(main).toHaveAttribute("href", "/c/conv_root");
     expect(main).toHaveAttribute("data-root-session-id", "conv_root");

@@ -666,11 +666,15 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
             from omnigent.spec.parser import _parse_executor_auth
 
             auth = _parse_executor_auth(data, expand_env=True)
+        context_files = data.get("context_files")
+        if "context_files" in data and not isinstance(context_files, bool):
+            raise ValueError("executor.context_files must be a boolean")
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
             auth=auth,
+            context_files=context_files,
         )
     return None
 

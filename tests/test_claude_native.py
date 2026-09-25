@@ -9,6 +9,7 @@ import contextlib
 import importlib.metadata
 import io
 import json
+import logging
 import os
 import re
 import shlex
@@ -1117,6 +1118,80 @@ def test_ucode_config_uses_cached_models_when_live_refresh_fails(
     assert config is not None
     assert config.model == "system.ai.claude-opus-4-8"
     assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8"
+
+
+def _stage_cached_models_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route ucode config through a workspace whose live discovery fails."""
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={"opus": "system.ai.claude-opus-4-8"},
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-opus-4-8",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+
+    def _raise(profile: str | None) -> SimpleNamespace:
+        raise OSError(
+            "token-less profile; run `databricks auth login --profile test-profile` "
+            "to refresh the OAuth session"
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        _raise,
+    )
+
+
+def test_ucode_config_discovery_failure_warns_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cached-models fallback warns in one actionable line, frame-free."""
+    _stage_cached_models_fallback(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.main"):
+        config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    warning = next(
+        r for r in caplog.records if "live Databricks model discovery failed" in r.getMessage()
+    )
+    assert not warning.exc_info, (
+        "a recoverable cached-models fallback must not log a traceback at WARNING; "
+        "host logging mirrors it to the user's terminal"
+    )
+    assert "databricks auth login --profile test-profile" in warning.getMessage()
+
+
+def test_ucode_config_discovery_failure_keeps_frames_under_debug(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Debug logging retains the discovery-failure frames for post-mortem."""
+    _stage_cached_models_fallback(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.main"):
+        config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    warning = next(
+        r for r in caplog.records if "live Databricks model discovery failed" in r.getMessage()
+    )
+    assert warning.exc_info is not None and warning.exc_info[0] is OSError
 
 
 def test_ucode_config_rejects_authoritative_empty_live_catalog(

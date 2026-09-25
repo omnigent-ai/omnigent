@@ -1484,6 +1484,7 @@ def _build_pi_spawn_env(
     # Always set so the harness wrap doesn't fall back to ``"all"``
     # and override an explicit ``skills: none`` from the spec.
     env["HARNESS_PI_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    env["HARNESS_PI_CONTEXT_FILES"] = json.dumps(spec.executor.config.get("context_files", True))
     if spec.name:
         env["HARNESS_PI_AGENT_NAME"] = spec.name
     if cwd is not None:
@@ -1738,8 +1739,8 @@ def _build_acp_spawn_env(
     Like Goose, a generic ACP agent owns its own auth, so this wires **no**
     provider/gateway credential. A ``databricks-*`` model is dropped (not a valid
     third-party model id); the agent's own configured model (or a flag in its
-    command) then applies. When the slug is missing/unknown, falls back to the
-    first configured agent so a bare ``acp`` id still launches something.
+    command) then applies. A bare ``acp`` id uses the first configured agent;
+    an explicit unknown name fails instead of launching a different agent.
 
     :param spec: The agent spec.
     :param workdir: Accepted for signature parity with the other builders; the
@@ -1811,6 +1812,12 @@ def _build_acp_spawn_env(
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None
+        if raw_harness.startswith("acp:") and agent is None:
+            raise OmnigentError(
+                f"ACP agent {slug!r} is not configured on this runner. "
+                "Check the selected host's ACP configuration.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if agent is None:
             agents = acp_agents()
             agent = agents[0] if agents else None

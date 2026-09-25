@@ -30,6 +30,7 @@
   flex-shrink: 0;
   overflow: hidden;
   margin: -12px;
+  margin-bottom: 0;
   /* Hard cutoff at the band's bottom edge (matches the prototype's two-region
      split); the blob grid fades on its own, so no soft mask here. */
   border-radius: 14px 14px 0 0;

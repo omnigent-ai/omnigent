@@ -208,10 +208,10 @@ describe("SettingsSidebarBody", () => {
   it("renders group subtitles in sentence case at the text-sm tier", () => {
     renderBody();
     const heading = screen.getByRole("heading", { name: "General" });
-    expect(heading).toHaveClass("text-sm", "font-normal");
+    expect(heading).toHaveClass("h-7", "text-sm", "font-normal");
     expect(heading).not.toHaveClass("font-medium", "uppercase");
-    expect(heading.parentElement).toHaveClass("gap-0");
-    expect(heading.parentElement).not.toHaveClass("gap-0.5");
+    expect(heading.parentElement?.parentElement).toHaveClass("gap-4");
+    expect(heading.nextElementSibling).toHaveClass("mt-1", "gap-px");
   });
 
   it("marks the Keyboard shortcuts nav item hidden on mobile via max-md:hidden", () => {

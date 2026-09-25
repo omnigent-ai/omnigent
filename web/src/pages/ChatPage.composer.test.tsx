@@ -372,6 +372,23 @@ describe("Composer session drafts", () => {
     expect(getSessionDraft("temp:draft")).toBeUndefined();
     expect(getSessionDraft("conv_real")?.text).toBe("draft during startup");
   });
+
+  it("restores attached files when switching back to a conversation", async () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["hello"], "notes.txt", { type: "text/plain" })] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    await waitFor(() => expect(getSessionDraft("conv_draft")?.files).toHaveLength(1));
+
+    // The other conversation has no draft, so its composer is empty...
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(screen.queryByText("notes.txt")).toBeNull();
+
+    // ...and switching back re-arms the saved attachment as a chip.
+    act(() => useChatStore.setState({ conversationId: "conv_draft" }));
+    await waitFor(() => expect(screen.getByText("notes.txt")).toBeTruthy());
+  });
 });
 
 describe("Composer starting-session cancellation", () => {
@@ -1842,6 +1859,48 @@ describe("Composer model/effort label", () => {
     expect(label()).not.toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("Sonnet 4.6");
   });
+
+  it.each([
+    ["claude", true],
+    ["codex", true],
+    ["kiro", false],
+    ["pi", false],
+  ] as const)(
+    "shows model-change progress only for confirmation-based %s switches",
+    async (modelPickerKind, showsPending) => {
+      useChatStore.setState({
+        llmModel: "primary",
+        pendingModelChange: "alternate",
+        sessionModelSeeded: false,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showEffort: false,
+            showModels: true,
+            modelPickerKind,
+            codexModelOptions: [
+              { id: "primary", displayName: "Primary" },
+              { id: "alternate", displayName: "Alternate" },
+            ],
+          })}
+        />,
+      );
+
+      expect(label()).toHaveTextContent("Primary");
+      expect(label()).not.toHaveTextContent("Alternate");
+      if (showsPending) {
+        expect(screen.getByTestId("composer-model-pending")).toHaveAccessibleName(
+          "Model change pending",
+        );
+      } else {
+        expect(screen.queryByTestId("composer-model-pending")).toBeNull();
+      }
+
+      act(() => useChatStore.setState({ pendingModelChange: null }));
+      await waitFor(() => expect(screen.queryByTestId("composer-model-pending")).toBeNull());
+    },
+  );
 
   const CLAUDE_LIVE_OPTIONS = [
     { id: "opus", model: "system.ai.claude-opus-4-10", displayName: "Opus 4.10", isDefault: false },
@@ -4014,6 +4073,83 @@ describe("Composer paste", () => {
   });
 });
 
+// A send that fails before the server takes ownership hands its text and
+// files back to the composer for retry. The files re-enter through the same
+// up-front validation as a fresh attach — when the upload itself was what
+// failed (a 415 on an unsupported type), re-arming that file would only
+// fail again, so it is dropped with the same inline reason.
+describe("Composer failed-send attachment restore", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("restores the retriable files and flags the ones current limits reject", () => {
+    render(<Composer {...composerProps()} />);
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
+      }),
+    );
+
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    // The store entry drained on restore, so the draft can't come back twice.
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("skips the restore when the user attached a file while the send was in flight", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["mine"], "mine.txt", { type: "text/plain" })] },
+    });
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "message that failed",
+          files: [new File(["hello"], "notes.txt", { type: "text/plain" })],
+        },
+      }),
+    );
+
+    // The in-progress attachment wins over the restore: the failed message's
+    // text and files stay out, and the drained store entry does not return.
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+    expect(screen.queryByText("notes.txt")).toBeNull();
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("clears the failed-send rejection notice once the user types", () => {
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "",
+          files: [new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" })],
+        },
+      }),
+    );
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+
+    fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
+
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
+});
+
 // The "Chatting with sub-agent …" tray peeks above the composer only when a
 // sub-agent label is passed (the active session is a child). It must name the
 // sub-agent so the composer reads as messaging the child, not the orchestrator.
@@ -4079,7 +4215,6 @@ describe("Composer sub-agent tray", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
       "rounded-t-none",
-      "pl-2.5",
       "border-t-0",
       "border-border/50",
       "before:inset-x-4",
@@ -4764,15 +4899,73 @@ describe("Composer config gear", () => {
     expect(screen.getByRole("menuitemcheckbox", { name: "Latest" })).toBeVisible();
   });
 
-  it.each(["claude", "codex", "cursor", "kiro", "pi", "devin"] as const)(
-    "selects the default-marked %s row as an explicit model",
+  it.each([
+    "claude",
+    "codex",
+    "cursor",
+    "kiro",
+    "opencode",
+    "pi",
+    "devin",
+    "acp",
+    "configured",
+  ] as const)("selects alternate and reapplies the %s default row", async (modelPickerKind) => {
+    const options = [
+      { id: "primary", displayName: "Primary", isDefault: true },
+      { id: "alternate", displayName: "Alternate" },
+    ];
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel, codexModelOptions: options });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind,
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    // A catalog default alone is not evidence of the session's current model.
+    expect(screen.getByRole("menuitemcheckbox", { name: "Primary" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith("alternate", expect.anything()));
+    act(() => useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }));
+
+    await openSessionModels();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
+    const resetsToDefault =
+      modelPickerKind === "opencode" ||
+      modelPickerKind === "acp" ||
+      modelPickerKind === "configured";
+    await waitFor(() =>
+      expect(setModel).toHaveBeenLastCalledWith(resetsToDefault ? null : "primary", {
+        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+      }),
+    );
+    expect(setModel).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["opencode", "acp"] as const)(
+    "synthesizes a resettable Default row for %s catalogs without a marked default",
     async (modelPickerKind) => {
       const options = [
-        { id: "primary", displayName: "Primary", isDefault: true },
-        { id: "alternate", displayName: "Alternate" },
+        { id: "primary", displayName: "Primary", isDefault: false },
+        { id: "alternate", displayName: "Alternate", isDefault: false },
       ];
       const setModel = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ setModel, codexModelOptions: options });
+      useChatStore.setState({
+        setModel,
+        codexModelOptions: options,
+        llmModel: null,
+        sessionModelOverride: null,
+      });
       renderWithTooltips(
         <Composer
           {...composerProps({
@@ -4785,28 +4978,78 @@ describe("Composer config gear", () => {
       );
 
       await openSessionModels();
-      // A catalog default alone is not evidence of the session's current model.
-      expect(screen.getByRole("menuitemcheckbox", { name: "Primary" })).toHaveAttribute(
-        "aria-checked",
-        "false",
-      );
-      expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
-      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
-      await waitFor(() => expect(setModel).toHaveBeenCalledWith("alternate", expect.anything()));
+      const defaultRow = screen.getByTestId("composer-agent-model-default");
+      expect(defaultRow).toHaveTextContent("Default");
+      expect(defaultRow).toHaveAttribute("aria-checked", "true");
+      fireEvent.click(defaultRow);
+      await waitFor(() => expect(setModel).toHaveBeenCalledWith(null, expect.anything()));
+
       act(() =>
         useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }),
       );
-
       await openSessionModels();
-      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
-      await waitFor(() =>
-        expect(setModel).toHaveBeenLastCalledWith("primary", {
-          expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
-        }),
+      expect(screen.getByTestId("composer-agent-model-default")).toHaveAttribute(
+        "aria-checked",
+        "false",
       );
-      expect(setModel).toHaveBeenCalledTimes(2);
     },
   );
+
+  it.each([
+    ["claude", "sonnet[1m]", "Sonnet 5 (1M context)"],
+    ["codex", "gpt-5.5", "Codex Pretty 5.5"],
+    ["cursor", "composer-2.5", "Composer 2.5"],
+    ["kiro", "claude-haiku-4-5", "Claude Haiku 4.5"],
+    ["opencode", "anthropic/claude-sonnet-4", "anthropic/claude-sonnet-4"],
+    ["acp", "private/fast", "Private Fast"],
+  ] as const)(
+    "renders %s catalog metadata verbatim in the model row",
+    async (modelPickerKind, id, displayName) => {
+      useChatStore.setState({ llmModel: id, sessionModelOverride: id });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showEffort: false,
+            showModels: true,
+            modelPickerKind,
+            codexModelOptions: [{ id, model: `wire/${id}`, displayName }],
+          })}
+        />,
+      );
+
+      await openSessionModels();
+      const row = screen.getByRole("menuitemcheckbox", { name: displayName });
+      expect(row).toHaveAttribute("data-model-id", id);
+      expect(row).toHaveTextContent(displayName);
+    },
+  );
+
+  it("appends an unknown reported Codex model as the checked current row", async () => {
+    useChatStore.setState({
+      llmModel: "gpt-unlisted",
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: [{ id: "gpt-5.5", displayName: "Codex Pretty 5.5" }],
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "gpt-unlisted (current)" }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Codex Pretty 5.5" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
 
   it("names the model Codex's Default resolves to, like the new-session gear", async () => {
     const options = [

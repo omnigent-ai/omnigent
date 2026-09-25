@@ -830,6 +830,12 @@ def _patch_background_host_spawn(
     )
     monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked == pid)
     monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: True)
+    monkeypatch.setattr(
+        "omnigent.cli._daemon_host_status_probe",
+        lambda record, **kwargs: cli_module._HostHttpResult(
+            status_code=200, body={"status": "online"}
+        ),
+    )
     # Local mode waits for the server the daemon owns; no real server here.
     monkeypatch.setattr("omnigent.cli._discover_local_server_url", lambda: "http://127.0.0.1:6767")
     log_path = tmp_path / "host-test.log"
@@ -887,6 +893,14 @@ def test_host_background_fails_when_daemon_never_registers(
     _spawned, log_path = _patch_background_host_spawn(monkeypatch, tmp_path)
     log_path.write_text("Host registration failed: database unavailable\n")
     monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: False)
+    # The server answers (host row offline), so the failure is the generic
+    # registration timeout rather than the unreachable-server error.
+    monkeypatch.setattr(
+        "omnigent.cli._daemon_host_status_probe",
+        lambda record, **kwargs: cli_module._HostHttpResult(
+            status_code=200, body={"status": "offline"}
+        ),
+    )
     monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
     monkeypatch.setattr(
         "omnigent.cli._ensure_databricks_server_auth", lambda *args, **kwargs: None

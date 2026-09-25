@@ -654,7 +654,7 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55 shadow-xs">
+      <div className="overflow-hidden rounded-xl border bg-card/55">
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -1080,9 +1080,14 @@ function AppearanceSection() {
 function GitSection() {
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
-      <div className="flex flex-col gap-8">
-        <AlwaysUseWorktreeControl />
-        <DefaultBaseBranchControl />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Worktrees</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <AlwaysUseWorktreeControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <DefaultBaseBranchControl />
+          </div>
+        </div>
       </div>
     </Section>
   );
@@ -2050,7 +2055,7 @@ function StepperButton({
 function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList />
+      <KeyboardShortcutsList variant="settings" />
     </Section>
   );
 }
@@ -2583,7 +2588,12 @@ function ImportSection() {
       title="Import sessions"
       description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
     >
-      <ImportSessionsPanel />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Import from a machine</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ImportSessionsPanel />
+        </div>
+      </div>
     </Section>
   );
 }

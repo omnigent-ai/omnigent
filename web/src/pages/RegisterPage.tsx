@@ -176,7 +176,7 @@ export function RegisterPage() {
     return (
       <AuthCardShell panelHeight={showLanding ? 340 : undefined}>
         {showLanding ? (
-          <JoinTeamStep onAccept={() => setAccepted(true)} />
+          <JoinTeamStep onAccept={() => setAccepted(true)} serverUrl={window.location.host} />
         ) : (
           <div className="flex flex-col gap-6">{body}</div>
         )}

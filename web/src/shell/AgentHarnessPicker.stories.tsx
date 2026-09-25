@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { useState } from "react";
 import { expect, userEvent, within } from "storybook/test";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import type { Host } from "@/hooks/useHosts";
@@ -55,6 +56,39 @@ const customReviewer = agent({
   harness: "claude-sdk",
   builtin: false,
 });
+const openCode = agent({
+  id: "agent-opencode",
+  name: "opencode-native-ui",
+  display_name: "OpenCode",
+  harness: "opencode-native",
+});
+const pi = agent({
+  id: "agent-pi",
+  name: "pi-native-ui",
+  display_name: "Pi",
+  harness: "pi-native",
+});
+const extraHarnesses = [
+  agent({ id: "agent-kiro", name: "kiro-native-ui", display_name: "Kiro", harness: "kiro-native" }),
+  agent({
+    id: "agent-antigravity",
+    name: "antigravity-native-ui",
+    display_name: "Antigravity",
+    harness: "antigravity-native",
+  }),
+  agent({ id: "agent-kimi", name: "kimi-native-ui", display_name: "Kimi", harness: "kimi-native" }),
+];
+const otherHarnesses = [claude, codex, cursor, openCode, pi];
+const allHarnesses = [...otherHarnesses, ...extraHarnesses];
+const manyCustomAgents = Array.from({ length: 24 }, (_, index) =>
+  agent({
+    id: `agent-custom-${index}`,
+    name: `custom-agent-${index}`,
+    display_name: `Custom Agent ${index + 1}`,
+    harness: "claude-sdk",
+    builtin: false,
+  }),
+);
 
 const readyHost: Host = {
   host_id: "host-story",
@@ -69,6 +103,11 @@ const readyHost: Host = {
     "claude-native": true,
     "codex-native": true,
     "cursor-native": true,
+    "opencode-native": true,
+    "pi-native": true,
+    "kiro-native": true,
+    "antigravity-native": true,
+    "kimi-native": true,
   },
 };
 
@@ -200,6 +239,199 @@ export const SmartRoutingWithCustomAgents: Story = {
     onSelectAutoHarness: () => undefined,
     agentLabel: "Auto",
     triggerTooltip: "Smart Routing picks the harness per turn",
+  },
+  play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
+export const WithOtherHarnesses: Story = {
+  args: { harnessEntries: otherHarnesses },
+  play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
+function ExternallySelectedOtherHarness(args: React.ComponentProps<typeof AgentHarnessPicker>) {
+  const [selectedId, setSelectedId] = useState(claude.id);
+  return (
+    <AgentHarnessPicker
+      {...args}
+      effectiveAgentId={selectedId}
+      agentLabel="OpenCode"
+      onOpenChange={(open) => {
+        if (open) window.setTimeout(() => setSelectedId(openCode.id), 0);
+      }}
+    />
+  );
+}
+
+export const OtherHarnessSelected: Story = {
+  args: {
+    harnessEntries: [
+      claude,
+      codex,
+      cursor,
+      { ...openCode, display_name: "OpenCode Experimental Extended Harness" },
+      pi,
+    ],
+  },
+  render: (args) => <ExternallySelectedOtherHarness {...args} />,
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    await expect(
+      await within(canvasElement.ownerDocument.body).findByTestId("new-chat-landing-harness-more"),
+    ).toHaveTextContent("Other... (OpenCode Experimental Extended Harness)");
+  },
+};
+
+export const MobileMorePage: Story = {
+  args: { harnessEntries: otherHarnesses },
+  beforeEach: () => {
+    const original = window.matchMedia.bind(window);
+    window.matchMedia = (query) => {
+      if (query !== "(max-width: 767.98px)" && query !== "(pointer: coarse)")
+        return original(query);
+      return {
+        media: query,
+        matches: true,
+        onchange: null,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        dispatchEvent: () => true,
+      } satisfies MediaQueryList;
+    };
+    return () => {
+      window.matchMedia = original;
+    };
+  },
+  decorators: [
+    (Story) => (
+      <div className="w-[390px]">
+        <Story />
+      </div>
+    ),
+  ],
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await page.findByTestId("new-chat-landing-harness-more"));
+    await page.findByTestId("new-chat-landing-page-back");
+  },
+};
+
+export const CustomAgentsSubmenuOpen: Story = {
+  args: { agentEntries: [polly, debby, customReviewer, ...manyCustomAgents.slice(0, 3)] },
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    await userEvent.click(
+      await within(canvasElement.ownerDocument.body).findByTestId("new-chat-landing-custom-agents"),
+    );
+  },
+};
+
+export const LongLists: Story = {
+  args: { harnessEntries: allHarnesses, agentEntries: [polly, debby, ...manyCustomAgents] },
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    await userEvent.click(
+      await within(canvasElement.ownerDocument.body).findByTestId("new-chat-landing-custom-agents"),
+    );
+  },
+};
+
+export const LongHarnessList: Story = {
+  args: { harnessEntries: allHarnesses, agentEntries: [polly, debby, ...manyCustomAgents] },
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    await userEvent.click(
+      await within(canvasElement.ownerDocument.body).findByTestId("new-chat-landing-harness-more"),
+    );
+  },
+};
+
+export const LongNames: Story = {
+  args: {
+    harnessEntries: [
+      claude,
+      codex,
+      { ...cursor, display_name: "Cursor Experimental Harness With a Very Long Name" },
+    ],
+    effectiveAgentId: cursor.id,
+    agentLabel: "Cursor Experimental Harness With a Very Long Name",
+    agentEntries: [
+      polly,
+      debby,
+      {
+        ...customReviewer,
+        display_name: "Custom Reviewer Agent With a Very Long Name That Should Truncate",
+      },
+    ],
+    host: {
+      ...readyHost,
+      configured_harnesses: { ...readyHost.configured_harnesses, "cursor-native": false },
+    },
+    autoHarnessAvailable: true,
+    triggerTooltip:
+      "Smart Routing selects a harness and model from a very long project context description",
+  },
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    await userEvent.click(
+      await within(canvasElement.ownerDocument.body).findByTestId("new-chat-landing-custom-agents"),
+    );
+  },
+};
+
+export const LongSmartRoutingContext: Story = {
+  args: {
+    autoHarnessAvailable: true,
+    autoHarnessActive: true,
+    agentLabel: "Auto",
+    triggerTooltip:
+      "Smart Routing selects a harness and model from a very long project context description with several constraints and preferences",
+  },
+  play: async ({ canvasElement }) => {
+    const page = within(canvasElement.ownerDocument.body);
+    within(canvasElement).getByTestId("new-chat-landing-agent-select").focus();
+    await page.findByTestId("new-chat-landing-agent-tooltip");
+  },
+};
+
+export const NarrowWidth: Story = {
+  args: { harnessEntries: otherHarnesses, agentEntries: [polly, debby, customReviewer] },
+  decorators: [
+    (Story) => (
+      <div className="w-[320px]">
+        <Story />
+      </div>
+    ),
+  ],
+  play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
+export const NoAgents: Story = {
+  args: {
+    agentEntries: [],
+    harnessEntries: [],
+    effectiveAgentId: null,
+    agentLabel: "No agents",
+    hasAgents: false,
+  },
+  play: async ({ canvasElement }) => {
+    await expect(within(canvasElement).getByTestId("new-chat-landing-agent-select")).toBeDisabled();
+  },
+};
+
+export const EveryHarnessUnavailable: Story = {
+  args: {
+    host: {
+      ...readyHost,
+      configured_harnesses: {
+        "claude-sdk": true,
+        "claude-native": false,
+        "codex-native": false,
+        "cursor-native": false,
+      },
+    },
   },
   play: async ({ canvasElement }) => openPicker(canvasElement),
 };

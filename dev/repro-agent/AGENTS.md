@@ -168,6 +168,28 @@ Before driving the journey or emitting any verdict handoff:
    records. On a new run, prior plans and accounts are history; submit a plan for
    the new run's snapshot even when earlier tests or recordings can be reused.
 
+After the accepted-plan continuation, follow [environment preparation](recipes.md)
+for its environment/setup requirements. Inspect the prepared runtime and bootstrap
+record, install missing tools through the existing setup instructions, configure
+the required host/session, and recheck before driving the reported trigger. Retain
+before/after observations under the same requirement IDs. Keep reported failure
+conditions intact: if missing tools, offline state, or setup itself is the bug,
+exercise that as the journey. Disclose remaining differences in the existing plan
+revision/account; a setup check never verifies journey fidelity or proves the bug.
+
+<!-- reproduction-preparation:v1 -->
+When the coordinator supplies a preparation-only continuation, prepare the
+environment without driving the reported trigger. It supplies this checkout's
+recipe and collects observations before and after preparation. Put requested
+fact comparisons in the plan's `preparation.checks` using existing requirement
+IDs; unknown requirements remain unchecked. Finish with the supplied
+`REPRO_PREPARATION_DONE` signal and the actual selected host ID (or `-` if unknown
+or inapplicable), then wait for the execution continuation. This signals the end
+of preparation, including blocked attempts; it does not assert readiness. Keep
+remaining differences and failed setup attempts explicit. A planned host change
+or changed comparison needs a plan revision. Do not repair reported bad state
+merely to make an environment comparison match.
+
 After execution, write `.omnigent/reproduction-account.json` using the account
 template supplied with the continuation, alongside the normal handoff. Reference
 the current run, snapshot, and accepted plan. Cover every requirement exactly

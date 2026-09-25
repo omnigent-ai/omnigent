@@ -16,17 +16,16 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { LandingFooter } from "@/pages/onboarding/LandingFooter";
 import { LandingStep } from "@/pages/onboarding/LandingStep";
-import { HarnessIconRow, ModeSelectStep } from "@/pages/onboarding/ModeSelectStep";
-import { ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
+import { HarnessIconRow, LocalIntroStep } from "@/pages/onboarding/LocalIntroStep";
+import { ServerDetailStep } from "@/pages/onboarding/ServerDetailStep";
+import { ServerHeroIcons, ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
 /**
- * Outcome of a connect attempt. `needsConfirm` → the URL doesn't look like an
- * Omnigent server (re-try with force); `error` → the connect was rejected and
- * the message should be shown; neither → navigation is underway.
+ * Outcome of a connect attempt. `error` → the connect was rejected and the
+ * message should be shown; otherwise navigation is underway.
  */
 export interface ConnectResult {
-  needsConfirm?: boolean;
   error?: string;
 }
 
@@ -43,11 +42,17 @@ export interface ServerSelectorV2Setup {
   recentServers: string[];
   /** Organization-provided server URLs. */
   managedServers: string[];
-  /** Persist + navigate to a server URL. Resolves `{needsConfirm}` when the URL
-   *  doesn't look like an Omnigent server (call again with force), or `{error}`
-   *  when the connect was rejected — so the step can show it rather than
-   *  silently doing nothing. Navigation on success replaces this page. */
-  onConnect: (url: string, force?: boolean) => Promise<ConnectResult>;
+  /** Whether the `omnigent` CLI is already installed (returning user). Drives
+   *  the "Install" vs "Open" action label and the returning-user start step. */
+  installed?: boolean;
+  /** Mocks only: route Join / Install actions to the terminal step (which runs
+   *  the mocked local-server flow) instead of the no-op connect, so the install
+   *  screen is reachable from every path. Never set by the real shell. */
+  mockInstall?: boolean;
+  /** Persist + navigate to a server URL. Resolves `{error}` when the connect
+   *  was rejected — so the step can show it rather than silently doing nothing.
+   *  Navigation on success replaces this page. */
+  onConnect: (url: string) => Promise<ConnectResult>;
   /** Start (or reuse) the local server, then connect to it. Resolves the
    *  outcome so the terminal step can show ready/failed (on success the window
    *  navigates away, so it resolves only on failure in practice). */
@@ -56,6 +61,11 @@ export interface ServerSelectorV2Setup {
    *  an unsubscribe. Absent on older shells / browser preview → the terminal
    *  step shows the coarse phases only. */
   onSetupLog?: (cb: (line: string) => void) => () => void;
+  /** Install the omnigent CLI (macOS). Present only when the CLI is missing and
+   *  the shell supports it; absent → the install step is skipped. */
+  onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
+  onInstallLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
   onRemoveServer?: (url: string) => void;
   /** Copy text to the clipboard via the shell's native bridge. */
@@ -73,13 +83,14 @@ export interface ServerCheckResult {
   status: "ok" | "reachable" | "unreachable";
 }
 
-type Step = "landing" | "mode" | "server" | "terminal";
+type Step = "landing" | "local" | "detail" | "server" | "terminal";
 
 // Per-step card dimensions (px). The panel shrinks as steps gain content; the
 // card grows for the scrollable server list. Drives the CSS-transition resize.
 const CARD: Record<Step, { height: number; panelHeight: number }> = {
   landing: { height: 560, panelHeight: 308 },
-  mode: { height: 560, panelHeight: 150 },
+  local: { height: 560, panelHeight: 150 },
+  detail: { height: 600, panelHeight: 150 },
   server: { height: 600, panelHeight: 64 },
   terminal: { height: 560, panelHeight: 240 },
 };
@@ -88,15 +99,61 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // A failed connect reloads the wizard with an error (from ?error=&url=). That
   // only ever comes from the server-select flow, so open there — otherwise the
   // error banner renders on a step that isn't mounted and stays invisible.
-  // "Connect to new server…" also opens the list directly (initialStep).
+  // "Connect to new server…" also opens the list directly (initialStep). A
+  // returning user (CLI installed) skips the welcome and lands on the list too;
+  // Back still reaches the landing for the local path.
   const [step, setStep] = useState<Step>(
-    setup.error || setup.initialStep === "server" ? "server" : "landing",
+    setup.error || setup.initialStep === "server" || setup.installed ? "server" : "landing",
   );
-  const { height, panelHeight } = CARD[step];
+  // The preset server picked from the landing split button (drives the detail step).
+  const [detailUrl, setDetailUrl] = useState<string | null>(null);
+  // What the terminal step should run after any install: start the local server,
+  // or connect to a remote URL. Set by whichever action routed to "terminal".
+  const [terminalTarget, setTerminalTarget] = useState<
+    { kind: "local" } | { kind: "connect"; url: string }
+  >({ kind: "local" });
+  // Install runs in the terminal step only when the CLI is missing AND in-app
+  // install is actually offered (macOS — onInstallCli is present). A returning
+  // user ("Open Omnigent"), or any platform without install support, connects
+  // directly. Mocks force the install screen to show.
+  const needsInstall =
+    setup.mockInstall === true || (setup.installed === false && setup.onInstallCli != null);
+
+  // A server pick (list Join / preset detail): install-then-connect when the CLI
+  // is missing (route via terminal), else connect straight away. Resolves the
+  // ConnectResult so the list can still show a connect error when connecting
+  // directly.
+  const connect = async (url: string): Promise<ConnectResult> => {
+    if (needsInstall) {
+      setTerminalTarget({ kind: "connect", url });
+      setStep("terminal");
+      return {};
+    }
+    return setup.onConnect(url);
+  };
+  // Whether the server step is showing its URL-input ("add") view vs the list —
+  // reported up so the band can show the hero icons only in the add view.
+  const [serverAddMode, setServerAddMode] = useState(false);
+  const { height, panelHeight: basePanelHeight } = CARD[step];
+  // The server step's add (URL-input) view shows the hero band, which needs the
+  // taller panel; the list view keeps the contracted band.
+  const panelHeight = step === "server" && serverAddMode ? 150 : basePanelHeight;
+
+  // Panel band: harness icons on the local intro; server hero icons on the
+  // detail step and on the server step's add (URL-input) view.
+  const bandContent =
+    step === "local" ? (
+      <HarnessIconRow />
+    ) : step === "detail" || (step === "server" && serverAddMode) ? (
+      <ServerHeroIcons />
+    ) : undefined;
 
   return (
     <div
-      className="grid min-h-screen place-items-center p-6"
+      // Center the card in the space above the fixed footer: pb reserves the
+      // footer's band so the card never reaches it, and overflow-auto only
+      // kicks in when the viewport is too short for the card itself.
+      className="grid min-h-screen place-items-center overflow-auto p-6 pb-20"
       style={{ background: "var(--onboarding-wizard-background)" }}
     >
       {/* Top-right cog: settings for this setup surface. no-drag so it's
@@ -130,26 +187,58 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
       <AnimatedOmnigentPanel
         height={height}
         panelHeight={panelHeight}
-        bandContent={step === "mode" ? <HarnessIconRow /> : undefined}
+        bandContent={bandContent}
+        contracted={step === "server" && !serverAddMode}
       >
         {step === "landing" && (
           <LandingStep
-            onGetStarted={() => setStep("mode")}
+            managedServers={setup.managedServers}
+            onGetStarted={() => setStep("local")}
             onJoinServer={() => setStep("server")}
+            onJoinManaged={(url) => {
+              setDetailUrl(url);
+              setStep("detail");
+            }}
           />
         )}
-        {step === "mode" && (
-          <ModeSelectStep
+        {step === "local" && (
+          <LocalIntroStep
+            installed={setup.installed}
             onBack={() => setStep("landing")}
-            onBegin={() => setStep("terminal")}
-            onCloudSetup={setup.onCloudSetup}
+            onInstall={() => {
+              setTerminalTarget({ kind: "local" });
+              setStep("terminal");
+            }}
+          />
+        )}
+        {step === "detail" && detailUrl !== null && (
+          <ServerDetailStep
+            url={detailUrl}
+            installed={setup.installed}
+            onBack={() => setStep("landing")}
+            onConnect={connect}
+            onCopy={setup.onCopy}
+            onShowAll={() => setStep("server")}
           />
         )}
         {step === "terminal" && (
           <SetupTerminalStep
-            onStartLocal={setup.onStartLocal}
+            onInstallCli={needsInstall ? setup.onInstallCli : undefined}
+            onInstallLog={setup.onInstallLog}
+            onRun={
+              terminalTarget.kind === "connect"
+                ? async () => {
+                    const url = terminalTarget.url;
+                    const result = await setup.onConnect(url);
+                    // Success navigates the window away; a rejection surfaces as
+                    // an error here.
+                    return { ok: result.error === undefined, error: result.error };
+                  }
+                : setup.onStartLocal
+            }
             onSetupLog={setup.onSetupLog}
-            onBack={() => setStep("mode")}
+            onBack={() => setStep(terminalTarget.kind === "connect" ? "server" : "local")}
+            runningLabel={terminalTarget.kind === "connect" ? "Connecting" : "Starting Omnigent"}
           />
         )}
         {step === "server" && (
@@ -158,16 +247,18 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             error={setup.error}
             recentServers={setup.recentServers}
             managedServers={setup.managedServers}
+            installed={setup.installed}
             onBack={() => setStep("landing")}
-            onConnect={setup.onConnect}
+            onConnect={connect}
             onRemove={setup.onRemoveServer}
             onCopy={setup.onCopy}
             onCheckServer={setup.onCheckServer}
+            onAddModeChange={setServerAddMode}
           />
         )}
       </AnimatedOmnigentPanel>
 
-      {step === "landing" && <LandingFooter />}
+      <LandingFooter />
     </div>
   );
 }

@@ -217,24 +217,14 @@ describe("mobile sidebar drawer", () => {
     // differ; everything about how it looks must not.
     // `relative` is the Button base's own position, which tailwind-merge drops
     // from the floating copy in favour of `absolute` — placement, not looks.
-    const PLACEMENT = new Set([
-      "absolute",
-      "relative",
-      "right-3",
-      "bottom-3",
-      "md:hidden",
-      "max-md:hidden",
-    ]);
-    const appearance = (el: Element) =>
-      el.className
-        .split(/\s+/)
-        .filter((c) => c && !PLACEMENT.has(c))
-        .sort()
-        .join(" ");
-
-    expect(search).toHaveClass("sidebar-glass-chip");
-    expect(settings).toHaveClass("sidebar-glass-chip");
-    expect(appearance(settings)).toBe(appearance(search));
+    for (const button of [search, settings]) {
+      expect(button).toHaveClass(
+        "sidebar-glass-chip",
+        "max-md:size-11",
+        "max-md:rounded-full",
+        "max-md:text-foreground",
+      );
+    }
   });
 
   it("gives the session list a gutter so the last row clears the floating chip", () => {

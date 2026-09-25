@@ -94,6 +94,7 @@ import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
@@ -878,7 +879,7 @@ function FileViewerBody({
   useEffect(() => {
     if (!open || !isMonacoFindSurface) return;
     const handler = (e: KeyboardEvent) => {
-      if (!((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "f")) return;
+      if (!(hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "f")) return;
       if (!viewerIsActiveSurfaceRef.current) return;
       e.preventDefault();
       e.stopPropagation();
