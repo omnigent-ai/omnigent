@@ -1431,6 +1431,121 @@ async def test_an_ordinary_404_is_not_latched() -> None:
     assert client.permanently_unavailable is False
 
 
+# The gateway relaying that the router's own extraction call 404d: its
+# selection model (unset here, so the frozen default) is not served.
+_SELF_CALL_404_BODY = {
+    "error_code": "ENDPOINT_NOT_FOUND",
+    "message": (
+        'responses self-call returned status 404: {"error_code":"ENDPOINT_NOT_FOUND",'
+        '"message":"The given endpoint does not exist, please retry after checking '
+        'the specified model and version deployment exists."}'
+    ),
+}
+
+
+def test_router_permanently_disabled_matches_the_self_call_config_404() -> None:
+    """A relayed self-call 404 is configuration; anything else is retriable."""
+    from omnigent.server.smart_routing import router_permanently_disabled
+
+    assert router_permanently_disabled(404, json.dumps(_SELF_CALL_404_BODY)) is True
+    # Only a 404 answer carries the config shape; the same body elsewhere isn't one.
+    assert router_permanently_disabled(200, json.dumps(_SELF_CALL_404_BODY)) is False
+    # The extraction model erroring out is an outage, not configuration.
+    flaky = {"message": "responses self-call returned status 500: upstream overloaded"}
+    assert router_permanently_disabled(404, json.dumps(flaky)) is False
+
+
+def test_a_relayed_transient_self_call_4xx_is_not_latched() -> None:
+    """Only a relayed 404 proves the selection model is unserved; a relayed
+    rate limit, timeout, or request-specific error may clear on its own."""
+    from omnigent.server.smart_routing import router_permanently_disabled
+
+    for inner in (
+        "responses self-call returned status 429: too many requests",
+        "responses self-call returned status 408: request timeout",
+        "responses self-call returned status 400: bad request",
+    ):
+        assert router_permanently_disabled(404, json.dumps({"message": inner})) is False
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_self_call_429_is_retried_on_the_next_turn() -> None:
+    """A rate-limited extraction call must not disable routing for the process."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    served = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal served
+        served += 1
+        return httpx.Response(
+            404, json={"message": "responses self-call returned status 429: rate limited"}
+        )
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+        assert client.permanently_unavailable is False
+        assert await client.route("hi again", {"h": ["m"]}) is None
+    assert served == 2
+    assert client.permanently_unavailable is False
+
+
+@pytest.mark.asyncio
+async def test_an_unserved_selection_model_404_is_latched_and_asked_exactly_once() -> None:
+    """The self-call config 404 recurs identically, so it must latch like the
+    account-level one, with the config knob named in the reason."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    served = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal served
+        served += 1
+        return httpx.Response(404, json=_SELF_CALL_404_BODY)
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+        assert client.permanently_unavailable is True
+        assert await client.route("hi again", {"h": ["m"]}) is None
+    assert served == 1
+    # The reason survives the short circuit and says how to fix it.
+    assert client.last_error is not None
+    assert "routing.selection_model" in client.last_error
+    assert "default selection model" in client.last_error
+    assert "404" in client.last_error
+
+
+@pytest.mark.asyncio
+async def test_a_latched_selection_model_error_names_the_pinned_model() -> None:
+    """With ``selection_model`` set, the latched reason blames that model."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404, json=_SELF_CALL_404_BODY)
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1",
+        router_name="task_v1",
+        selection_model="system.ai.absent-model",
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+    assert client.permanently_unavailable is True
+    assert client.last_error is not None
+    assert "system.ai.absent-model" in client.last_error
+
+
 def test_router_error_detail_unwraps_nested_message() -> None:
     from omnigent.server.smart_routing import _router_error_detail
 

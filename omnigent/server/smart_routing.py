@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -756,22 +757,53 @@ def _router_error_detail(body: str) -> str:
     return text[:300]
 
 
-def router_permanently_disabled(status_code: int, body: str) -> bool:
-    """Whether the router's answer reports a condition no retry can clear.
+# The gateway relays a failure of the router's own extraction call as
+# ``responses self-call returned status <code>: ...``. A relayed 404 means the
+# selection model is not served on this workspace — configuration, not an
+# outage. Any other relayed status (429 rate limit, 408 timeout, 400
+# request-specific, 5xx outage) may clear on its own and stays retriable.
+_SELF_CALL_CONFIG_FAILURE = re.compile(r"self-call returned status 404")
 
-    A workspace without the routing API answers ``routes:select`` with a 404
-    saying it is not enabled for the account. That is configuration, not an
-    outage: every later call would 404 identically, so the client latches it
-    and the deployment's other backend answers instead.
+
+def router_selection_model_unserved(status_code: int, body: str) -> bool:
+    """Whether the router's own extraction (self-)call 404d on configuration.
+
+    Happens when ``routing.selection_model`` names a model the workspace does
+    not serve — or is unset and the router's frozen default does. Every later
+    call fails identically until the deployment config changes. Only a relayed
+    404 qualifies; other relayed statuses may be transient and stay retriable.
 
     :param status_code: The response status.
     :param body: The raw response text.
-    :returns: ``True`` when the service is disabled for this account.
+    :returns: ``True`` when the selector's model cannot be served.
+    """
+    if status_code != 404:
+        return False
+    return _SELF_CALL_CONFIG_FAILURE.search((body or "").lower()) is not None
+
+
+def router_permanently_disabled(status_code: int, body: str) -> bool:
+    """Whether the router's answer reports a condition no retry can clear.
+
+    Two shapes qualify. A workspace without the routing API answers
+    ``routes:select`` with a 404 saying it is not enabled for the account. And
+    a router whose own extraction call cannot run — its selection model is not
+    served here — relays that inner 404 in a 404 body
+    (:func:`router_selection_model_unserved`). Both are configuration, not an
+    outage: every later call would 404 identically, so the client latches it
+    and the deployment's other backend answers instead. Any other 404 stays
+    retriable.
+
+    :param status_code: The response status.
+    :param body: The raw response text.
+    :returns: ``True`` when no retry can get this router to answer.
     """
     if status_code != 404:
         return False
     text = (body or "").lower()
-    return "routes:select" in text and "not enabled" in text
+    if "routes:select" in text and "not enabled" in text:
+        return True
+    return router_selection_model_unserved(status_code, body)
 
 
 # ── Route-options seam ──────────────────────────────────────────────────────
@@ -956,7 +988,8 @@ class RoutingSettings:
     :param router_name: Router strategy to invoke, e.g. ``"task_v1"``.
     :param selection_model: Model the router should use for its own
         extraction call, sent as ``route_selector.config.model``. ``None``
-        leaves the router's frozen default in place.
+        leaves the router's frozen default in place — which a workspace may
+        not serve, making every ``routes:select`` 404 until one is pinned.
     :param model_prefixes: Prefixes this deployment's catalog attaches to
         model ids that the router keys bare; see :data:`MODEL_ID_PREFIXES`.
     :param menus: Scenario key (``cc`` / ``codex`` / ``both``) → the full arm
@@ -1887,10 +1920,25 @@ class ExternalRoutingClient:
                 f"router returned HTTP {resp.status_code}: {_router_error_detail(resp.text)}"
             )
             if router_permanently_disabled(resp.status_code, resp.text):
+                if router_selection_model_unserved(resp.status_code, resp.text):
+                    # Name the config knob: the raw relay body says nothing
+                    # about WHICH model 404d or how to fix it.
+                    selector = (
+                        f"selection model {self._selection_model!r}"
+                        if self._selection_model
+                        else "the router's default selection model"
+                    )
+                    self.last_error = (
+                        f"{selector} is not served on this workspace "
+                        f"(set routing.selection_model to a served model and "
+                        f"restart the server): {self.last_error}"
+                    )
                 _logger.warning(
-                    "ExternalRoutingClient: %s is not enabled for this account; "
-                    "no further routes:select calls will be made in this process",
+                    "ExternalRoutingClient: %s reported a permanent configuration "
+                    "failure (%s); no further routes:select calls will be made in "
+                    "this process",
                     self._url,
+                    self.last_error,
                 )
                 self.permanently_unavailable = True
                 self._permanent_error = self.last_error
