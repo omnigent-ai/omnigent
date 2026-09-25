@@ -521,13 +521,13 @@ class McpServerConnection:
     # ``_call_lock`` so only one call is active at a time.
     _active_session_id: str | None = field(default=None, init=False, repr=False)
     _session: ClientSession | None = field(default=None, init=False, repr=False)
-    # True once connect() has established a live session at least
-    # once. Distinguishes "never connected" (genuine caller misuse
-    # — call_tool before connect) from "the session died and needs
+    # True once connect() has established a live session, until
+    # close() runs. Distinguishes "never connected / closed" (caller
+    # misuse — a hard error) from "the session died and needs
     # rebuilding" (a transient transport fault that cleared, e.g. a
     # steady-state 401 from an expired bearer that has since
-    # refreshed). Only the former is a hard error; the latter must
-    # reconnect on the next call instead of wedging forever.
+    # refreshed), which must reconnect on the next call instead of
+    # wedging forever.
     _connected: bool = field(default=False, init=False, repr=False)
     # Single-flights session rebuilds: once a session dies, every
     # pooled caller classifies as needs-reconnect, so without this
@@ -826,6 +826,8 @@ class McpServerConnection:
         :attr:`_reconnect_lock` so only one rebuilds. A caller that
         waited its turn and finds a live session other than the one
         it observed dead returns without tearing that session down.
+        A caller that finds the connection closed raises instead of
+        rebuilding: a closed connection must stay closed.
 
         Same task-identity rule as :meth:`connect` applies: the
         new lifecycle task owns the new transport + session
@@ -834,12 +836,19 @@ class McpServerConnection:
         :param dead_session: The session this caller observed as
             dead, or ``None`` when it observed no session at all.
             Used to detect that another caller already rebuilt.
+        :raises RuntimeError: If :meth:`close` ran while this call
+            was retrying (pool eviction or shutdown).
         """
         async with self._reconnect_lock:
             # Another caller already rebuilt while we waited: a live
             # session exists and it is not the one we saw die.
             if self._session is not None and self._session is not dead_session:
                 return
+            if not self._connected:
+                raise RuntimeError(
+                    f"MCP server {self.config.name!r} was closed while a tool "
+                    f"call was reconnecting — not rebuilding the session"
+                )
             await self._teardown()
             loop = asyncio.get_running_loop()
             self._ready_future = loop.create_future()
@@ -982,11 +991,15 @@ class McpServerConnection:
         Also drops the connected latch, so a later ``call_tool()``
         is caller misuse again (hard error) rather than a dead
         session to silently resurrect — a closed connection must
-        stay closed. Safe to call multiple times or if
-        :meth:`connect` was never called.
+        stay closed. Serialized with :meth:`_reconnect` so a rebuild
+        in flight settles first and cannot re-latch afterwards. Safe
+        to call multiple times or if :meth:`connect` was never called.
         """
-        self._connected = False
-        await self._teardown()
+        async with self._reconnect_lock:
+            await self._teardown()
+            # The lifecycle task has exited by now, so nothing can
+            # flip the latch back on.
+            self._connected = False
 
     async def _teardown(self) -> None:
         """

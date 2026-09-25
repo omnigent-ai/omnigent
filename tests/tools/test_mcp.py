@@ -577,6 +577,88 @@ async def test_concurrent_calls_after_session_death_reconnect_once() -> None:
     await conn.close()
 
 
+@pytest.mark.asyncio()
+async def test_close_during_reconnect_backoff_does_not_resurrect_connection() -> None:
+    """
+    A pool that closes the connection while a caller sits between
+    reconnect attempts must win: the pending call fails instead of
+    rebuilding a lifecycle nobody will ever close.
+    """
+    config = MCPServerConfig(
+        name="evicted-mid-retry",
+        url="http://localhost:9000/mcp",
+        retry=RetryPolicy(max_retries=2, backoff_base_s=0.01, backoff_max_s=0.01, jitter=False),
+    )
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        mock_session.call_tool.side_effect = httpx.ReadError("connection reset")
+
+        rebuilds = 0
+        real_lifecycle = conn._run_lifecycle
+
+        async def _counting_lifecycle() -> None:
+            nonlocal rebuilds
+            rebuilds += 1
+            await real_lifecycle()
+
+        # The pool evicts the connection during the retry backoff.
+        async def _close_during_backoff(_seconds: float) -> None:
+            await conn.close()
+
+        with patch.object(conn, "_run_lifecycle", side_effect=_counting_lifecycle):
+            with patch("omnigent.tools.mcp._sleep", side_effect=_close_during_backoff):
+                with pytest.raises(RuntimeError, match="was closed while a tool call"):
+                    await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert rebuilds == 0
+        assert conn._connected is False
+        assert conn._session is None
+        assert conn._lifecycle_task is None
+
+
+@pytest.mark.asyncio()
+async def test_close_waits_for_in_flight_rebuild_and_stays_closed() -> None:
+    """
+    ``close()`` arriving while a rebuild is mid-connect lets that
+    rebuild settle, tears it down, and leaves the connection closed:
+    the rebuilt lifecycle's connected latch must not outlive close().
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        # Lifecycle death cleared the session (steady-state fault).
+        conn._session = None
+
+        release = asyncio.Event()
+        initializing = asyncio.Event()
+
+        async def _blocking_initialize() -> None:
+            initializing.set()
+            await release.wait()
+
+        mock_session.initialize = AsyncMock(side_effect=_blocking_initialize)
+
+        rebuild = asyncio.create_task(conn._reconnect())
+        await initializing.wait()
+        closer = asyncio.create_task(conn.close())
+        await asyncio.sleep(0.05)
+        assert not closer.done(), "close() must wait for the in-flight rebuild"
+
+        release.set()
+        await rebuild
+        await closer
+
+        assert conn._connected is False
+        assert conn._session is None
+        assert conn._lifecycle_task is None
+        with pytest.raises(RuntimeError, match="has no live session"):
+            await conn.call_tool("test_tool", {"query": "hi"})
+
+
 # ── McpServerConnection.close ────────────────────────────
 
 
