@@ -1470,6 +1470,465 @@ async def test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_own
     ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
 
 
+async def _inline_launch_native_session(
+    client: httpx.AsyncClient, comm: ApplicationCommunicator
+) -> dict[str, str]:
+    """Inline-launch a native-terminal, host-bound session.
+
+    Same round-trip as :func:`_inline_launch_session`, but the session
+    carries the ``omnigent.wrapper`` label so a message-relaunch failure
+    hits the native persist branch instead of the raise branch.
+
+    :param client: Test HTTP client bound to the host-wired app.
+    :param comm: Connected host communicator.
+    :returns: ``{"id": <session id>, "runner_id": <token-bound id>}``.
+    """
+    agent = await create_test_agent(client)
+    launch_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+        },
+    )
+    await launch_responder
+    assert create_resp.status_code == 201, create_resp.text
+    return {"id": create_resp.json()["id"], "runner_id": create_resp.json()["runner_id"]}
+
+
+async def test_native_message_relaunch_pre_connect_exit_names_cause(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A native session's persisted failure names the relaunched runner's exit.
+
+    Mirrors the non-native 503 case
+    (``test_message_relaunch_pre_connect_exit_surfaces_report_when_visible``):
+    the native persist path must carry the same phase-specific cause, not
+    the generic "may have failed to start" fallback, and log a correlated
+    ERROR naming the relaunched runner.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_native_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+    daemon_report = (
+        "runner process exited with code 1 (log on host: ~/logs/runner-ab.log)\n"
+        "--- runner log tail ---\n"
+        "ValueError: bad tunnel token"
+    )
+    msg_resp = await _relaunch_then_report_exit(client, comm, session_id, daemon_report)
+
+    assert msg_resp.status_code == 202, msg_resp.text
+    assert msg_resp.json()["queued"] is True
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    assert error_items[0]["code"] == "runner_failed_to_start"
+    message = error_items[0]["message"]
+    assert "exited before connecting" in message, message
+    assert "ValueError: bad tunnel token" in message, message
+    # Not the pre-fix generic fallback, which named no phase at all.
+    assert "it may have failed to start" not in message, message
+
+    correlated_errors = [
+        r for r in caplog.records if r.levelno == logging.ERROR and session_id in r.getMessage()
+    ]
+    assert correlated_errors, (
+        "expected a correlated ERROR naming the session; ERROR records seen: "
+        f"{[r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]}"
+    )
+
+
+async def test_native_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_owner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-owner viewer's persisted failure gets the phase, not the raw log.
+
+    Native mirror of
+    ``test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_owner``
+    — persisted error items are readable by any session viewer, so the
+    owner-scoping the 503 uses must apply here too.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_native_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    real_record = RunnerExitReports.record
+
+    def _record_as_host_owner(
+        self: RunnerExitReports, runner_id: str, error: str, owner: str | None
+    ) -> None:
+        del owner
+        real_record(self, runner_id, error, owner="host-owner@example.com")
+
+    monkeypatch.setattr(RunnerExitReports, "record", _record_as_host_owner)
+    monkeypatch.setattr(
+        routes_events, "_get_user_id", lambda request, auth_provider: "viewer@example.com"
+    )
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+    daemon_report = (
+        "runner process exited with code 1 (log on host: ~/logs/runner-ab.log)\n"
+        "--- runner log tail ---\n"
+        "SECRET_TOKEN=hunter2"
+    )
+    msg_resp = await _relaunch_then_report_exit(client, comm, session_id, daemon_report)
+
+    assert msg_resp.status_code == 202, msg_resp.text
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    message = error_items[0]["message"]
+    assert "exited before connecting" in message, message
+    assert "visible to the host owner" in message, message
+    assert "SECRET_TOKEN" not in message, message
+    # The operator-facing ERROR still carries the full report.
+    assert any(
+        r.levelno == logging.ERROR and "SECRET_TOKEN=hunter2" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+async def test_native_message_relaunch_host_refusal_names_reason(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native session's persisted failure carries a visible refusal reason.
+
+    Native mirror of
+    ``test_message_relaunch_host_failure_uncategorized_reports_startup_failure``.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_native_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+    launch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error="failed to spawn runner: boom",
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await launch_responder
+
+    assert msg_resp.status_code == 202, msg_resp.text
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    assert error_items[0]["code"] == "runner_failed_to_start"
+    message = error_items[0]["message"]
+    assert "could not start runner" in message, message
+    assert "failed to spawn runner: boom" in message, message
+    assert "never connected" not in message, message
+
+    # The refusal text must never enter RunnerExitReports: unlike the
+    # persisted item above (which any session viewer may legitimately
+    # read), that store feeds the unscoped ``last_task_error`` snapshot
+    # field handed to every viewer regardless of owner visibility.
+    snap = await client.get(f"/v1/sessions/{session_id}")
+    assert snap.status_code == 200, snap.text
+    assert snap.json().get("last_task_error") is None, (
+        "host launch-refusal text leaked into the unscoped last_task_error field"
+    )
+
+
+async def test_native_message_no_relaunch_exit_report_owner_sees_cause(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Owner sees the original runner's exit report in the persisted failure.
+
+    When no relaunch was attempted (the host disconnected before the message
+    arrived) and the host already sent an exit report for the original runner,
+    the owner must see the full report — not a generic fallback.  Mirrors the
+    scoping applied to the relaunch path.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_native_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+
+    # Send the exit report for the original runner while the host is still
+    # connected (so conn.owner is available for scoping), then drop the
+    # tunnel so no relaunch is attempted.
+    daemon_report = (
+        "runner process exited with code 1\n--- runner log tail ---\nValueError: bad tunnel token"
+    )
+    exit_frame = HostRunnerExitedFrame(runner_id=original_runner_id, error=daemon_report)
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(exit_frame)})
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is not None:
+        await asyncio.sleep(0.01)
+
+    msg_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert msg_resp.status_code == 202, msg_resp.text
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    assert error_items[0]["code"] == "runner_failed_to_start"
+    message = error_items[0]["message"]
+    # Unauthenticated fixture: user_id=None → get_visible always returns the
+    # full report (same rule as the relaunch path).
+    assert "ValueError: bad tunnel token" in message, message
+    assert "visible to the host owner" not in message, message
+
+    # The operator-facing ERROR carries the full report for all sessions.
+    assert any(
+        r.levelno == logging.ERROR
+        and session_id in r.getMessage()
+        and "ValueError: bad tunnel token" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+async def test_native_message_no_relaunch_exit_report_non_owner_gets_phase_message(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Non-owner viewer gets the phase message, not the raw host log tail.
+
+    The runner's exit report is host-owner-scoped; a different session
+    viewer must not see host-provided log text in the persisted error item
+    (it is readable by any session collaborator).  The full report still
+    lands in the operator ERROR log.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_native_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+
+    # Pin distinct owner and viewer identities and record the report as
+    # belonging to the host owner (not the viewer).
+    real_record = RunnerExitReports.record
+
+    def _record_as_host_owner(
+        self: RunnerExitReports, runner_id: str, error: str, owner: str | None
+    ) -> None:
+        del owner
+        real_record(self, runner_id, error, owner="host-owner@example.com")
+
+    monkeypatch.setattr(RunnerExitReports, "record", _record_as_host_owner)
+    monkeypatch.setattr(
+        routes_events, "_get_user_id", lambda request, auth_provider: "viewer@example.com"
+    )
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+
+    daemon_report = (
+        "runner process exited with code 1\n--- runner log tail ---\nSECRET_TOKEN=hunter2"
+    )
+    exit_frame = HostRunnerExitedFrame(runner_id=original_runner_id, error=daemon_report)
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(exit_frame)})
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is not None:
+        await asyncio.sleep(0.01)
+
+    msg_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert msg_resp.status_code == 202, msg_resp.text
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    message = error_items[0]["message"]
+    # Non-owner: phase-only, no secret log tail.
+    assert "exited" in message, message
+    assert "visible to the host owner" in message, message
+    assert "SECRET_TOKEN" not in message, message
+    # The operator-facing ERROR carries the full report.
+    assert any(
+        r.levelno == logging.ERROR and "SECRET_TOKEN=hunter2" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+async def test_native_message_no_host_tunnel_reports_host_offline(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-bound native session whose host disconnected gets the offline cause.
+
+    The session has ``host_id`` set (bound during create), but the host
+    tunnel drops before the message arrives. The server must say the host is
+    not connected, not the generic "may have failed to start".
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_native_session(client, comm)
+    session_id = session["id"]
+
+    # Drop the runner so dispatch enters the unavailable block.
+    set_runner_client(None)
+
+    # Disconnect the host tunnel and wait for it to leave the registry.
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is not None:
+        await asyncio.sleep(0.01)
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    assert error_items[0]["code"] == "runner_failed_to_start"
+    message = error_items[0]["message"]
+    assert "not connected" in message, message
+    assert "online" in message.lower(), message
+    assert "it may have failed to start" not in message, message
+
+
+async def test_native_message_no_host_id_uses_generic_message(
+    client: httpx.AsyncClient,
+) -> None:
+    """A native session with no host_id at all uses the generic unavailable message.
+
+    ``host_id is None`` means no host was ever bound — there is no host to
+    be offline. The host-offline wording must not appear; the generic
+    "may have failed to start" fallback is the right cause.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_hostless_native_session(client, agent["id"])
+    sid = session["id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    assert error_items[0]["code"] == "runner_failed_to_start"
+    message = error_items[0]["message"]
+    assert "it may have failed to start" in message, message
+    assert "not connected" not in message, message
+
+
+async def _create_hostless_native_session(
+    client: httpx.AsyncClient, agent_id: str
+) -> dict[str, str]:
+    """Create a native session with no host binding (``host_id`` is ``None``).
+
+    :param client: Test HTTP client.
+    :param agent_id: Agent to bind.
+    :returns: The ``POST /v1/sessions`` response body.
+    """
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_id,
+            "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
 async def test_host_reports_runner_unknown_skips_connect_grace(
     client: httpx.AsyncClient,
     app: FastAPI,

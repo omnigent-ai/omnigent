@@ -487,6 +487,109 @@ async def _retry_session_single_flight(
     return await asyncio.shield(task)
 
 
+def _relaunch_outcome_message(
+    *,
+    relaunched_runner_id: str,
+    relaunched_launch_refused: bool,
+    relaunch_refusal_reason: str | None,
+    relaunch_refusal_visible: bool,
+    relaunched_launch_acknowledged: bool,
+    runner_exit_reports: RunnerExitReports | None,
+    user_id: str | None,
+) -> tuple[str, str, str]:
+    """Classify why a relaunched runner never became reachable.
+
+    Shared by the native-terminal persist path and the non-native
+    RUNNER_UNAVAILABLE raise so both name the same failed phase and use the
+    same owner-scoped visibility for host-provided text.
+
+    :param relaunched_runner_id: The runner id the host was asked to launch.
+    :param relaunched_launch_refused: Whether the host answered "failed".
+    :param relaunch_refusal_reason: The host's refusal reason, if any.
+    :param relaunch_refusal_visible: Whether this requester may see the
+        refusal reason verbatim.
+    :param relaunched_launch_acknowledged: Whether the host acknowledged the
+        launch request at all.
+    :param runner_exit_reports: The exit-report store, if configured.
+    :param user_id: The requester's user id, for exit-report visibility.
+    :returns: ``(event_name, log_detail, launch_message)`` — ``event_name``
+        and ``log_detail`` for the correlated log, ``launch_message`` for the
+        user-facing text.
+    """
+    exit_report = (
+        runner_exit_reports.get(relaunched_runner_id) if runner_exit_reports is not None else None
+    )
+    # Host-produced log tails are owner-visible only; other viewers receive
+    # the phase, while operators get the full log.
+    visible_report = (
+        runner_exit_reports.get_visible(relaunched_runner_id, user_id)
+        if runner_exit_reports is not None
+        else None
+    )
+    if relaunched_launch_refused:
+        # The host answered "failed": no runner process started.
+        event_name = "runner_launch_failed"
+        log_detail = "the host reported the launch failed" + (
+            f": {relaunch_refusal_reason}" if relaunch_refusal_reason else ""
+        )
+        if relaunch_refusal_reason and relaunch_refusal_visible:
+            launch_detail = f"the host reported the launch failed: {relaunch_refusal_reason}"
+        else:
+            launch_detail = (
+                "the host reported the launch failed. The reason "
+                "is in the daemon log on the host, visible to the "
+                "host owner."
+            )
+        launch_message = (
+            f"The host could not start runner {relaunched_runner_id} "
+            f"for this session — {launch_detail}"
+        )
+    elif exit_report:
+        event_name = "runner_never_connected"
+        log_detail = f"the runner exited before connecting: {exit_report}"
+        if visible_report:
+            launch_detail = f"the runner exited before connecting: {visible_report}"
+        else:
+            launch_detail = (
+                "the runner exited before connecting. The exit "
+                "report is in the runner log on the host, visible "
+                "to the host owner."
+            )
+        launch_message = (
+            f"The host launched runner {relaunched_runner_id} for "
+            f"this session, but {launch_detail}"
+        )
+    elif relaunched_launch_acknowledged:
+        event_name = "runner_never_connected"
+        launch_detail = (
+            "it never connected to the server within "
+            f"{_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S:.0f}s — the "
+            "runner process may be hung or unable to reach the "
+            "server. Check the runner log on the host."
+        )
+        log_detail = launch_detail
+        launch_message = (
+            f"The host launched runner {relaunched_runner_id} for "
+            f"this session, but {launch_detail}"
+        )
+    else:
+        # No host acknowledgment: do not claim a launch happened.
+        event_name = "runner_never_connected"
+        launch_detail = (
+            "the host never confirmed the launch and no runner "
+            "connected to the server within "
+            f"{_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S:.0f}s. "
+            "Check the daemon and runner logs on the host."
+        )
+        log_detail = launch_detail
+        launch_message = (
+            f"The host was asked to launch runner "
+            f"{relaunched_runner_id} for this session, but "
+            f"{launch_detail}"
+        )
+    return event_name, log_detail, launch_message
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -2122,22 +2225,91 @@ def register_events_routes(
             # raise: their message would replay to a relaunched runner, so
             # persisting now WOULD desync the store from harness state.
             if body.type == "message" and _is_native_terminal_session(conv):
-                exit_cause = (
-                    runner_exit_reports.get(conv.runner_id)
-                    if runner_exit_reports is not None and conv.runner_id is not None
-                    else None
-                )
+                if relaunched_runner_id:
+                    # Name the failed phase, matching the non-native raise below.
+                    event_name, log_detail, offline_message = _relaunch_outcome_message(
+                        relaunched_runner_id=relaunched_runner_id,
+                        relaunched_launch_refused=relaunched_launch_refused,
+                        relaunch_refusal_reason=relaunch_refusal_reason,
+                        relaunch_refusal_visible=relaunch_refusal_visible,
+                        relaunched_launch_acknowledged=relaunched_launch_acknowledged,
+                        runner_exit_reports=runner_exit_reports,
+                        user_id=user_id,
+                    )
+                    _logger.error(
+                        "Runner %s for session %s did not become available after a "
+                        "relaunch on host %s; failing the send as runner_unavailable (%s)",
+                        relaunched_runner_id,
+                        session_id,
+                        conv.host_id,
+                        log_detail,
+                        extra=debug_event(
+                            event_name,
+                            session_id=session_id,
+                            runner_id=relaunched_runner_id,
+                            host_id=conv.host_id,
+                        ),
+                    )
+                else:
+                    exit_cause = (
+                        runner_exit_reports.get(conv.runner_id)
+                        if runner_exit_reports is not None and conv.runner_id is not None
+                        else None
+                    )
+                    if exit_cause:
+                        # Persist only what this requester is authorized to
+                        # read; other session viewers must not see
+                        # host-provided log tails.
+                        visible_cause = (
+                            runner_exit_reports.get_visible(conv.runner_id, user_id)
+                            if runner_exit_reports is not None and conv.runner_id is not None
+                            else None
+                        )
+                        _logger.error(
+                            "Runner %s for session %s exited before a message "
+                            "could be delivered: %s",
+                            conv.runner_id,
+                            session_id,
+                            exit_cause,
+                            extra=debug_event(
+                                "runner_exited_before_send",
+                                session_id=session_id,
+                                runner_id=conv.runner_id,
+                                host_id=conv.host_id,
+                            ),
+                        )
+                        offline_message = (
+                            visible_cause
+                            if visible_cause
+                            else (
+                                "The runner for this session exited. The exit "
+                                "report is in the runner log on the host, "
+                                "visible to the host owner."
+                            )
+                        )
+                    else:
+                        _host_reg_now = getattr(request.app.state, "host_registry", None)
+                        # Only report the host as offline when a host is
+                        # actually bound; a session with no host_id has
+                        # no host to be offline.
+                        _host_tunnel_absent = conv.host_id is not None and (
+                            _host_reg_now is None or _host_reg_now.get(conv.host_id) is None
+                        )
+                        if _host_tunnel_absent:
+                            offline_message = (
+                                "The host for this session is not connected — "
+                                "the machine running the host must be online "
+                                "for the runner to start."
+                            )
+                        else:
+                            offline_message = (
+                                "The runner for this session is not available — "
+                                "it may have failed to start. See the host logs."
+                            )
                 offline_error = ErrorData(
                     source="execution",
                     code="runner_failed_to_start",
-                    message=(
-                        exit_cause
-                        if exit_cause
-                        else (
-                            "The runner for this session is not available — "
-                            "it may have failed to start. See the host logs."
-                        )
-                    ),
+                    message=offline_message,
                 )
                 item_id = await _persist_native_terminal_failure(
                     session_id,
@@ -2156,81 +2328,15 @@ def register_events_routes(
             # would desync conversation store and harness state.
             if relaunched_runner_id:
                 # Name the failed phase to users and log a correlated ERROR.
-                exit_report = (
-                    runner_exit_reports.get(relaunched_runner_id)
-                    if runner_exit_reports is not None
-                    else None
+                event_name, log_detail, launch_message = _relaunch_outcome_message(
+                    relaunched_runner_id=relaunched_runner_id,
+                    relaunched_launch_refused=relaunched_launch_refused,
+                    relaunch_refusal_reason=relaunch_refusal_reason,
+                    relaunch_refusal_visible=relaunch_refusal_visible,
+                    relaunched_launch_acknowledged=relaunched_launch_acknowledged,
+                    runner_exit_reports=runner_exit_reports,
+                    user_id=user_id,
                 )
-                # Host-produced log tails are owner-visible only; other
-                # viewers receive the phase, while operators get the full log.
-                visible_report = (
-                    runner_exit_reports.get_visible(relaunched_runner_id, user_id)
-                    if runner_exit_reports is not None
-                    else None
-                )
-                if relaunched_launch_refused:
-                    # The host answered "failed": no runner process started.
-                    event_name = "runner_launch_failed"
-                    log_detail = "the host reported the launch failed" + (
-                        f": {relaunch_refusal_reason}" if relaunch_refusal_reason else ""
-                    )
-                    if relaunch_refusal_reason and relaunch_refusal_visible:
-                        launch_detail = (
-                            f"the host reported the launch failed: {relaunch_refusal_reason}"
-                        )
-                    else:
-                        launch_detail = (
-                            "the host reported the launch failed. The reason "
-                            "is in the daemon log on the host, visible to the "
-                            "host owner."
-                        )
-                    launch_message = (
-                        f"The host could not start runner {relaunched_runner_id} "
-                        f"for this session — {launch_detail}"
-                    )
-                elif exit_report:
-                    event_name = "runner_never_connected"
-                    log_detail = f"the runner exited before connecting: {exit_report}"
-                    if visible_report:
-                        launch_detail = f"the runner exited before connecting: {visible_report}"
-                    else:
-                        launch_detail = (
-                            "the runner exited before connecting. The exit "
-                            "report is in the runner log on the host, visible "
-                            "to the host owner."
-                        )
-                    launch_message = (
-                        f"The host launched runner {relaunched_runner_id} for "
-                        f"this session, but {launch_detail}"
-                    )
-                elif relaunched_launch_acknowledged:
-                    event_name = "runner_never_connected"
-                    launch_detail = (
-                        "it never connected to the server within "
-                        f"{_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S:.0f}s — the "
-                        "runner process may be hung or unable to reach the "
-                        "server. Check the runner log on the host."
-                    )
-                    log_detail = launch_detail
-                    launch_message = (
-                        f"The host launched runner {relaunched_runner_id} for "
-                        f"this session, but {launch_detail}"
-                    )
-                else:
-                    # No host acknowledgment: do not claim a launch happened.
-                    event_name = "runner_never_connected"
-                    launch_detail = (
-                        "the host never confirmed the launch and no runner "
-                        "connected to the server within "
-                        f"{_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S:.0f}s. "
-                        "Check the daemon and runner logs on the host."
-                    )
-                    log_detail = launch_detail
-                    launch_message = (
-                        f"The host was asked to launch runner "
-                        f"{relaunched_runner_id} for this session, but "
-                        f"{launch_detail}"
-                    )
                 _logger.error(
                     "Runner %s for session %s did not become available after a "
                     "relaunch on host %s; failing the send as runner_unavailable (%s)",
