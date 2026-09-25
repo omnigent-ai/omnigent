@@ -15,6 +15,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -620,45 +621,79 @@ class _SessionEventBatchCapability:
     supported: bool | None = None
 
 
+def _invalid_input_message(resp: httpx.Response) -> str | None:
+    """Return the ``invalid_input`` error message from a 400 response body.
+
+    :param resp: HTTP response to inspect.
+    :returns: The error message, or ``None`` when the body is not an
+        Omnigent ``code == "invalid_input"`` error envelope.
+    """
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or error.get("code") != "invalid_input":
+        return None
+    message = error.get("message")
+    return message if isinstance(message, str) else None
+
+
+_SubagentStatusMode = Literal["subagent_status", "quiesced", "unsupported"]
+
+
 @dataclass
 class _SubagentStatusCapability:
-    """Remember an unsupported idle event for this forwarder's server connection."""
+    """Remember which idle-observation event this forwarder's server accepts.
 
-    supported: bool = True
+    Servers predating ``subagent.status`` reject it as an unknown event type;
+    servers from before that but after ``quiesced`` was introduced accept a
+    ``quiesced`` ``external_session_status`` instead. Servers older than that
+    reject both, so idle observations for this forwarder are skipped.
+    """
+
+    mode: _SubagentStatusMode = "subagent_status"
 
     async def post_idle(self, client: httpx.AsyncClient, *, session_id: str) -> None:
-        """Post an idle observation, or skip it once an old server rejects the type.
+        """Post an idle observation, falling back for an older server, or skip.
 
         :param client: Omnigent HTTP client.
         :param session_id: Child session receiving the observation.
-        :raises httpx.HTTPError: For failures other than an unknown event type.
+        :raises httpx.HTTPError: For failures other than a recognized
+            unsupported-event or unsupported-status rejection.
         """
-        if not self.supported:
+        if self.mode == "unsupported":
             return
-        resp = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": "subagent.status", "data": {"idle": True}},
-        )
-        if resp.status_code == 400:
-            try:
-                payload = resp.json()
-            except ValueError:
-                payload = None
-            error = payload.get("error") if isinstance(payload, dict) else None
-            if (
-                isinstance(error, dict)
-                and error.get("code") == "invalid_input"
-                and isinstance(error.get("message"), str)
-                and error["message"].startswith("Unknown event type: 'subagent.status'.")
+        if self.mode == "subagent_status":
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "subagent.status", "data": {"idle": True}},
+            )
+            message = _invalid_input_message(resp) if resp.status_code == 400 else None
+            if message is not None and message.startswith(
+                "Unknown event type: 'subagent.status'."
             ):
-                if self.supported:
-                    _logger.info(
-                        "Omnigent server does not accept subagent.status; "
-                        "skipping idle observations until the forwarder restarts"
-                    )
-                self.supported = False
+                self.mode = "quiesced"
+            else:
+                resp.raise_for_status()
                 return
-        resp.raise_for_status()
+        try:
+            await post_external_session_status(client, session_id=session_id, status="quiesced")
+        except httpx.HTTPStatusError as exc:
+            message = _invalid_input_message(exc.response)
+            if (
+                exc.response.status_code == 400
+                and message is not None
+                and message.startswith("external_session_status requires data.status in ")
+            ):
+                _logger.info(
+                    "Omnigent server does not accept subagent.status or a "
+                    "quiesced external_session_status; skipping idle "
+                    "observations until the forwarder restarts"
+                )
+                self.mode = "unsupported"
+                return
+            raise
 
 
 class _SubagentStateCheckpoint:
@@ -2353,6 +2388,20 @@ async def _forward_one_subagent(
         decision = status_retry_tracker.record_failure(
             retry_key, exc, session_id=entry.child_conversation_id
         )
+        if decision.exhausted:
+            # The tracker forgets an exhausted key, so recording the status as
+            # delivered here is what stops the next poll from re-posting it.
+            _logger.error(
+                "Dropping claude-native sub-agent status after permanent HTTP "
+                "failures; child=%s status=%s attempts=%s http_status=%s",
+                entry.child_conversation_id,
+                desired_status,
+                decision.attempts,
+                _http_status_for_log(exc),
+                extra={"session_id": parent_session_id},
+            )
+            await checkpoint.put(replace(new_entry, last_status=desired_status))
+            return
         _logger.warning(
             "Failed to forward claude-native sub-agent status; child=%s status=%s "
             "attempt=%s next_retry_s=%.3f http_status=%s",
