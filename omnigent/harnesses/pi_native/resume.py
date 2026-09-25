@@ -222,7 +222,9 @@ def pi_session_records_from_session_items(
     - ``function_call_output`` -> Pi ``message`` with ``role: "toolResult"``.
 
     Interrupted assistant turns (and the rest of their response group) are
-    skipped so a cancelled turn isn't restored as completed history.
+    skipped so a cancelled turn isn't restored as completed history. A
+    repeated ``function_call_output`` for a ``call_id`` already replayed is
+    skipped too: Anthropic rejects a tool call with more than one result.
 
     :param items: Flat Omnigent item dicts in chronological order, e.g.
         ``{"type": "message", "role": "user", "content": [...]}``.
@@ -248,11 +250,18 @@ def pi_session_records_from_session_items(
     records: list[_JsonObject] = [header]
     parent_id: str | None = None
     skip_response_ids = _interrupted_response_ids(items)
+    replayed_call_ids: set[str] = set()
 
     for index, item in enumerate(items):
         response_id = item.get("response_id")
         if isinstance(response_id, str) and response_id in skip_response_ids:
             continue
+        if item.get("type") == "function_call_output":
+            call_id = item.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                if call_id in replayed_call_ids:
+                    continue
+                replayed_call_ids.add(call_id)
         entries = _pi_entries_from_session_item(
             item,
             session_id=session_id,

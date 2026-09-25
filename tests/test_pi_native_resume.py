@@ -197,6 +197,31 @@ def test_function_output_becomes_toolresult() -> None:
     assert msg["isError"] is False
 
 
+def test_duplicate_function_output_is_replayed_once() -> None:
+    """A second output for one call_id must not become a second toolResult (#8293)."""
+    items = [
+        _user_item("run ls", item_id="u1"),
+        _function_call_item(name="bash", call_id="c1", arguments='{"cmd":"ls"}', item_id="fc1"),
+        _function_output_item(call_id="c1", output="a.txt", item_id="fo1"),
+        _function_output_item(call_id="c1", output="a.txt", item_id="fo2"),
+        _assistant_item("Here is the listing.", item_id="a1"),
+    ]
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    results = [e for e in records[1:] if e["message"]["role"] == "toolResult"]
+    assert [r["message"]["toolCallId"] for r in results] == ["c1"]
+    assert [e["message"]["role"] for e in records[1:]] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "assistant",
+    ]
+
+
 def test_full_tool_roundtrip_chains_correctly() -> None:
     items = [
         _user_item("run ls", item_id="u1"),
