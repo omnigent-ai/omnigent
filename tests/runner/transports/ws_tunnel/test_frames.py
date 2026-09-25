@@ -12,6 +12,10 @@ import json
 import pytest
 
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventBatchFrame,
+    EventReadyFrame,
     FrameKind,
     HelloFrame,
     PingFrame,
@@ -29,6 +33,39 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 
 # ── Round-trip per frame kind ────────────────────────────
+
+
+def test_event_ingest_frames_round_trip() -> None:
+    hello = HelloFrame(
+        runner_version="0.1.2",
+        frame_protocol_version=1,
+        capabilities=[EVENT_INGEST_CAPABILITY],
+    )
+    assert decode_frame(encode_frame(hello)) == hello
+    ready = EventReadyFrame()
+    batch = EventBatchFrame(
+        id="batch-1",
+        session_id="session-1",
+        events=[{"type": "external_output_text_delta", "data": {"delta": "hi"}}],
+    )
+    ack = EventAckFrame(id="batch-1", applied=0, error="busy", retryable=True)
+    for frame in (ready, batch, ack, EventAckFrame(id="batch-1", applied=1)):
+        assert decode_frame(encode_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"kind": "event.batch", "id": "b", "session_id": "s", "events": []},
+        {"kind": "event.batch", "id": "b", "session_id": "s", "events": [{}]},
+        {"kind": "event.ack", "id": "b", "applied": -1},
+        {"kind": "event.ack", "id": "b", "applied": True},
+        {"kind": "event.ack", "id": "b", "applied": 0, "error": 123},
+    ],
+)
+def test_event_ingest_rejects_malformed_frames(frame: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        decode_frame(json.dumps(frame))
 
 
 def test_hello_round_trip() -> None:
