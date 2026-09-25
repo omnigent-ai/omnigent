@@ -210,6 +210,16 @@ class ErrorCode:
         session. Distinct from ``NOT_FOUND`` so terminal-ensure and
         turn-dispatch failures caused by a vanished agent are attributed to
         the lifecycle event rather than a generic runner startup fault.
+    :cvar SUB_AGENT_UNRESOLVED: A session was dispatched under a
+        ``sub_agent_name`` its parent spec does not declare (HTTP 410).
+        Sibling of ``SESSION_AGENT_MISSING``: the bound agent still
+        resolves, but the named child within it does not, so there is no
+        spec to run the session against. The alternative was to fall back
+        to the parent spec, which boots the child as a clone of its
+        orchestrator (parent prompt, tools and harness) and reports the
+        substituted work as a success. Distinct from ``NOT_FOUND`` so a
+        dispatching parent can tell a renamed or removed sub-agent from a
+        missing session or agent.
     :cvar UPSTREAM_CANCELLED: A backing upstream call (e.g. a gRPC
         dependency behind an embedding route) was cancelled by its peer
         mid-flight — an upstream teardown or restart, not our fault and
@@ -242,6 +252,7 @@ class ErrorCode:
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     WORKSPACE_MISSING = "workspace_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
+    SUB_AGENT_UNRESOLVED = "sub_agent_unresolved"
     UPSTREAM_CANCELLED = "upstream_cancelled"
     STALE_CURSOR = "stale_cursor"
 
@@ -277,6 +288,9 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
     # deleted; a retry cannot recreate it.
     ErrorCode.SESSION_AGENT_MISSING: 410,
+    # 410 Gone as well: the requested sub-agent is absent from the parent spec,
+    # and a retry cannot conjure it back.
+    ErrorCode.SUB_AGENT_UNRESOLVED: 410,
     # 499, not 5xx: the peer cancelling an in-flight backing call is expected
     # and retryable, so it must not read as a server fault (see the cvar).
     ErrorCode.UPSTREAM_CANCELLED: 499,
@@ -316,6 +330,10 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # The session's agent was deleted or rebound; the caller must recreate the
     # agent or start a new session. Not a runner/server fault.
     ErrorCode.SESSION_AGENT_MISSING: ErrorCategory.USER,
+    # The sub-agent was renamed or removed from the parent bundle, or the
+    # dispatch named one that never existed. The caller fixes the spec or the
+    # name; neither the runner nor the server is at fault.
+    ErrorCode.SUB_AGENT_UNRESOLVED: ErrorCategory.USER,
     # A dependency tore down the in-flight call; the fix (if any) is upstream.
     ErrorCode.UPSTREAM_CANCELLED: ErrorCategory.UPSTREAM,
     # A stale reference: the cursor row was deleted (often by the same user
@@ -350,6 +368,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorImpact.BLOCKING,
     ErrorCode.WORKSPACE_MISSING: ErrorImpact.BLOCKING,
     ErrorCode.SESSION_AGENT_MISSING: ErrorImpact.BLOCKING,
+    ErrorCode.SUB_AGENT_UNRESOLVED: ErrorImpact.BLOCKING,
     # Self-healing: a session state that resumes on reconnect, a routing
     # artifact the client re-addresses, and an upstream cancellation a retry
     # outlives. No progress is lost.
@@ -395,6 +414,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.SUB_AGENT_UNRESOLVED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
     # Context-driven: a backing call can be cancelled while serving any stage.

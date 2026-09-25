@@ -9079,12 +9079,10 @@ async def _create_session_from_existing_agent(
         )
 
     # Reject an undeclared sub-agent before persisting the row. Downstream
-    # spec swaps warn and keep the parent on a miss, which is right for a
-    # name that once resolved and has since been renamed or removed — but
-    # for a name the parent's spec NEVER declared it would boot the child as
-    # a parent clone for the session's whole life, off a request that was
-    # wrong when it arrived. Reject it while the caller is still here to be
-    # told, and leave the parent-fallback to the cases it fits.
+    # spec swaps fail the dispatch on a miss, so nothing boots as a parent
+    # clone either way, but that failure surfaces later and leaves a session
+    # row behind for a request that was already wrong when it arrived.
+    # Reject it while the caller is still here to be told.
     if body.sub_agent_name:
         await asyncio.to_thread(
             _require_declared_subagent,

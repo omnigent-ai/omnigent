@@ -7178,19 +7178,48 @@ def _native_terminal_start_error_payload(
         their safe message directly; other causes point to the runner log.
     """
     error_id = f"err_{uuid.uuid4().hex}"
+    unresolved_sub_agent = (
+        isinstance(exc, OmnigentError) and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED
+    )
     missing_agent = isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING
+    if unresolved_sub_agent:
+        reported_code = ErrorCode.SUB_AGENT_UNRESOLVED
+    elif missing_agent:
+        reported_code = ErrorCode.SESSION_AGENT_MISSING
+    else:
+        reported_code = _NATIVE_TERMINAL_START_FAILED_CODE
     extra = debug_event(
         "native_terminal_start_failed",
         session_id=session_id,
         error_id=error_id,
         runtime=runtime_name,
-        code=ErrorCode.SESSION_AGENT_MISSING
-        if missing_agent
-        else _NATIVE_TERMINAL_START_FAILED_CODE,
+        code=reported_code,
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
     )
+    if unresolved_sub_agent:
+        # Sibling of the lifecycle case below: the agent resolves, the
+        # dispatched child inside it does not. Also not a startup defect, so
+        # it is logged without a stack and keeps its own code rather than
+        # reading as a generic runner fault.
+        _logger.warning(
+            "Native %s terminal skipped; sub-agent unresolved; error_id=%s: %s",
+            runtime_name,
+            error_id,
+            exc,
+            extra=extra,
+        )
+        return {
+            "code": ErrorCode.SUB_AGENT_UNRESOLVED,
+            "error_id": error_id,
+            "message": (
+                "The sub-agent this session was dispatched as is not declared "
+                "in its parent agent; it was renamed, removed, or never "
+                "existed. Fix the parent agent's sub-agents or dispatch a "
+                f"declared name, then retry. Error ID: {error_id}."
+            ),
+        }
     if missing_agent:
         # Expected session-lifecycle condition: the session's agent was deleted
         # or rebound, so its bundle no longer resolves. This is not a
@@ -9405,12 +9434,16 @@ async def _ensure_native_terminal(
                 ),
             )
         except Exception as exc:
-            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
-                # Expected lifecycle event (agent deleted/rebound), not an
-                # ensure defect: log without a stack so it stays out of the
-                # terminal-startup error signal.
+            if isinstance(exc, OmnigentError) and exc.code in (
+                ErrorCode.SESSION_AGENT_MISSING,
+                ErrorCode.SUB_AGENT_UNRESOLVED,
+            ):
+                # Expected lifecycle event (agent deleted/rebound, or the
+                # dispatched sub-agent undeclared), not an ensure defect: log
+                # without a stack so it stays out of the terminal-startup
+                # error signal.
                 _logger.warning(
-                    "%s terminal ensure skipped; session %s agent unavailable: %s",
+                    "%s terminal ensure skipped; session %s has no spec to run: %s",
                     agent.display_name,
                     ctx.session_id,
                     exc,
@@ -9812,9 +9845,10 @@ def _resolve_sub_agent_spec_entry(parent_entry: Any, sub_agent_name: str) -> Res
     parent_spec = _unwrap_resolved_spec(parent_entry)
     child_spec = _find_spec_by_name(parent_spec, sub_agent_name)
     if child_spec is None:
-        # Callers in runtime/workflow.py keep the parent spec on a lookup
-        # miss, which boots the child as a clone of the parent. Unsafe, but
-        # pre-existing and out of scope here — tracked separately.
+        # Returning None is the whole signal: the runner's spec-swap sites
+        # raise SUB_AGENT_UNRESOLVED on it rather than keeping the parent
+        # spec, which used to boot the child as a clone of its orchestrator
+        # and report the substituted work as a success.
         _logger.warning(
             "Sub-agent %r not found under spec %r; no workdir resolved",
             sub_agent_name,

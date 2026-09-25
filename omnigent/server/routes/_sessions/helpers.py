@@ -6076,54 +6076,69 @@ async def _get_runner_client_for_resource_access_impl(
     return cast("httpx.AsyncClient | None", get_runner_client())
 
 
-# Client-safe message for a session whose bound agent no longer resolves.
-# Mirrors the native-terminal payload's wording: never forward the runner's
-# internal resolver text, which names the resolver and the raw agent id.
-_SESSION_AGENT_MISSING_CLIENT_MESSAGE = (
-    "This session's agent is no longer available; it was deleted or "
-    "replaced. Recreate the agent or start a new session, then retry."
-)
+# Client-safe messages for the runner errors that mean a session has no spec
+# to run against. Mirrors the native-terminal payload's wording: never forward
+# the runner's internal resolver text, which names the resolver and the raw
+# agent id. ``SUB_AGENT_UNRESOLVED`` is the sibling case where the bound agent
+# still resolves but the dispatched child within it does not.
+_SESSION_SPEC_UNAVAILABLE_CLIENT_MESSAGES: dict[str, str] = {
+    ErrorCode.SESSION_AGENT_MISSING: (
+        "This session's agent is no longer available; it was deleted or "
+        "replaced. Recreate the agent or start a new session, then retry."
+    ),
+    ErrorCode.SUB_AGENT_UNRESOLVED: (
+        "The sub-agent this session was dispatched as is not declared in its "
+        "parent agent; it was renamed, removed, or never existed. Fix the "
+        "parent agent's sub-agents or dispatch a declared name, then retry."
+    ),
+}
 
 
-def _raise_if_session_agent_missing_payload(payload: object) -> None:
-    """Re-raise a runner ``session_agent_missing`` error body as a typed 410.
+def _raise_if_session_spec_unavailable_payload(payload: object) -> None:
+    """Re-raise a runner session-spec error body as a typed 410.
 
-    Inspects an already-parsed runner error body for the typed
-    ``session_agent_missing`` code and re-derives the ``OmnigentError``
-    (``http_status`` 410, matching ``create_session_terminal``'s code
-    passthrough) so server proxies surface the session-lifecycle condition
-    instead of flattening it into a generic gateway failure or forwarding
-    the runner's raw message. Uses a fixed client-safe message — never the
-    runner's internal resolver text. No-op for any other body or code.
+    Inspects an already-parsed runner error body for a typed
+    ``session_agent_missing`` or ``sub_agent_unresolved`` code and re-derives
+    the ``OmnigentError`` (``http_status`` 410, matching
+    ``create_session_terminal``'s code passthrough) so server proxies surface
+    the session-lifecycle condition instead of flattening it into a generic
+    gateway failure or forwarding the runner's raw message. Uses a fixed
+    client-safe message, never the runner's internal resolver text. No-op for
+    any other body or code.
 
     :param payload: Parsed runner response body, e.g. ``resp.json()``.
-    :raises OmnigentError: Typed ``session_agent_missing`` (HTTP 410).
+    :raises OmnigentError: Typed ``session_agent_missing`` or
+        ``sub_agent_unresolved`` (HTTP 410).
     """
     if not isinstance(payload, dict):
         return
     error = payload.get("error")
-    if isinstance(error, dict) and error.get("code") == ErrorCode.SESSION_AGENT_MISSING:
-        raise OmnigentError(
-            _SESSION_AGENT_MISSING_CLIENT_MESSAGE,
-            code=ErrorCode.SESSION_AGENT_MISSING,
-        )
+    if not isinstance(error, dict):
+        return
+    code = error.get("code")
+    if not isinstance(code, str):
+        return
+    message = _SESSION_SPEC_UNAVAILABLE_CLIENT_MESSAGES.get(code)
+    if message is not None:
+        raise OmnigentError(message, code=code)
 
 
-def _raise_if_runner_session_agent_missing(resp: httpx.Response) -> None:
-    """Re-raise a runner ``session_agent_missing`` error as a typed 410.
+def _raise_if_runner_session_spec_unavailable(resp: httpx.Response) -> None:
+    """Re-raise a runner session-spec error as a typed 410.
 
     Response-level wrapper over
-    :func:`_raise_if_session_agent_missing_payload` for proxies that hold
+    :func:`_raise_if_session_spec_unavailable_payload` for proxies that hold
     the raw ``httpx.Response``. No-op for a non-JSON payload.
 
     :param resp: Runner HTTP response with a non-2xx status.
-    :raises OmnigentError: Typed ``session_agent_missing`` (HTTP 410).
+    :raises OmnigentError: Typed ``session_agent_missing`` or
+        ``sub_agent_unresolved`` (HTTP 410).
     """
     try:
         payload: object = resp.json()
     except ValueError:
         return
-    _raise_if_session_agent_missing_payload(payload)
+    _raise_if_session_spec_unavailable_payload(payload)
 
 
 async def _proxy_get_session_resources_to_runner(
@@ -6154,7 +6169,7 @@ async def _proxy_get_session_resources_to_runner(
         if resp.status_code != 200:
             # Re-derive the typed session-lifecycle 410 (agent deleted or
             # rebound) instead of flattening it to a generic 502.
-            _raise_if_runner_session_agent_missing(resp)
+            _raise_if_runner_session_spec_unavailable(resp)
             _logger.warning(
                 "session resources: runner returned %d for session=%s",
                 resp.status_code,
@@ -7106,7 +7121,7 @@ async def _resolve_skill_meta_text_via_runner(
         # This branch is reached because SESSION_AGENT_MISSING maps to 410
         # (non-404); if that HTTP mapping ever changed to 404, the 404 arm
         # below would swallow it as a skill-not-found INVALID_INPUT.
-        _raise_if_runner_session_agent_missing(resp)
+        _raise_if_runner_session_spec_unavailable(resp)
         raise OmnigentError(
             f"Runner failed to resolve skill {skill_name!r}: HTTP {resp.status_code}",
             code=ErrorCode.INTERNAL_ERROR,
@@ -9443,21 +9458,21 @@ def _require_declared_subagent(
     """
     Reject a ``sub_agent_name`` the parent's spec does not declare.
 
-    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and no
-    downstream spec-swap site rejects an unresolvable one: each warns and
-    runs the session against the PARENT spec instead. An undeclared name
-    would therefore be stored once and answered by the parent for the
-    session's whole life, with a warning as the only sign. This gate rejects
-    it up front, before any row is persisted, mirroring normal dispatch
-    (``tool_dispatch`` rejects an undeclared ``agent``) and the
-    ``AGENTSPEC.md`` contract that unlisted names are rejected.
+    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim. The
+    downstream spec-swap sites now fail an unresolvable one with
+    ``SUB_AGENT_UNRESOLVED`` rather than running the session against the
+    parent spec, but that failure arrives once the row exists and the caller
+    is gone. This gate rejects the name up front instead, before anything is
+    persisted, mirroring normal dispatch (``tool_dispatch`` rejects an
+    undeclared ``agent``) and the ``AGENTSPEC.md`` contract that unlisted
+    names are rejected.
 
-    It narrows, but does not bound, what can reach the downstream fallback.
-    The check runs only when the bundle LOADS and the name is positively
-    absent: with no agent cache, or on any load failure, it returns without
+    It narrows, but does not bound, what reaches the downstream failure. The
+    check runs only when the bundle LOADS and the name is positively absent:
+    with no agent cache, or on any load failure, it returns without
     adjudicating, so a never-declared name still reaches a swap site by
-    either route. What the gate guarantees is one direction only — a name
-    this check REJECTED never gets persisted.
+    either route. What the gate guarantees is one direction only: a name this
+    check REJECTED never gets persisted.
 
     :param agent: The parent agent row whose bundle declares the
         sub-agents.

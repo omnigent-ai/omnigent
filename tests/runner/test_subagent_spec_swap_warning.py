@@ -16,15 +16,17 @@ caches the CHILD. The turn path then reads that cached spec and searches it
 ``spec.sub_agents``, and the child has no child of its own, so the lookup
 always misses and the warning fires on a session that resolved perfectly.
 
-The warning matters because it names a real, silent failure mode (a child
-booting as a clone of an orchestrator parent), so firing it on healthy
-sessions makes the genuine case unreadable. The turn path therefore still
-looks the sub-agent up unconditionally and still swaps whenever it resolves;
-only the warning is gated, suppressed on a miss where the spec in hand
-already carries the sub-agent's name.
+The distinction matters more now than it did when this was only a warning:
+a name that genuinely does not resolve fails the dispatch with
+``SUB_AGENT_UNRESOLVED`` rather than booting the child as a clone of its
+orchestrator, so a false positive here would break healthy sessions instead
+of merely logging at them. The turn path therefore still looks the sub-agent
+up unconditionally and still swaps whenever it resolves; only the failure is
+gated, suppressed on a miss where the spec in hand already carries the
+sub-agent's name.
 
 Gating the LOOKUP on that same name check would be wrong, which is what the
-third test pins. A root may legally share its sub-agent's name — the
+last test pins. A root may legally share its sub-agent's name — the
 uniqueness check never compares the root's own name — and
 ``_find_spec_by_name`` still resolves the child there, so skipping the lookup
 drops a swap that would have succeeded and boots the child as a parent clone
@@ -61,6 +63,7 @@ SUB_AGENT_NAME = "claude_code"
 CHILD_HARNESS = "claude-native"
 UNRESOLVABLE_SUB_AGENT_NAME = "renamed_worker"
 _WARNING_FRAGMENT = "did not resolve in the parent spec"
+_UNRESOLVED_CODE = "sub_agent_unresolved"
 
 # A root may legally carry its own sub-agent's name: the uniqueness check
 # (``_check_unique_sub_agent_names``) seeds its ``seen`` set empty and only
@@ -140,8 +143,11 @@ async def _prime_spec_cache_then_turn(
     ``_session_spec_cache`` before the first turn (the live sequence is ``POST
     /v1/sessions``; the web UI's resource panels hit this one). The log
     capture is cleared between the phases so the assertions only see what the
-    TURN logged — priming legitimately warns for an unresolvable name, and
-    that warning is not what this module is about.
+    TURN logged.
+
+    Only resolvable names come through here: priming an unresolvable one now
+    fails the resource read outright, which
+    ``test_unresolvable_sub_agent_resolution_fails_with_typed_error`` pins.
 
     :param sub_agent_name: The name the server snapshot reports.
     :param caplog: pytest log capture, cleared between the phases.
@@ -217,23 +223,97 @@ async def test_declared_sub_agent_turn_does_not_warn_about_resolution(
     )
 
 
-@pytest.mark.asyncio
-async def test_unresolvable_sub_agent_turn_still_warns(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A name absent from the tree must still warn — that case is real.
+def _unresolvable_app() -> tuple[_FakeProcessManager, Any]:
+    """Build a runner app for a session naming a sub-agent the tree lacks.
 
-    Guards the fix against over-reach: when the cached spec is the PARENT
-    (the swap missed while priming too), the turn must keep surfacing the
-    fallback that silently boots the child as a parent clone.
+    :returns: ``(process_manager, app)``; the process manager records every
+        harness the runner asked to spawn.
     """
-    _pm, records = await _prime_spec_cache_then_turn(UNRESOLVABLE_SUB_AGENT_NAME, caplog)
+    pm = _FakeProcessManager(
+        _ScriptedHarnessClient(
+            [
+                _sse({"type": "response.created", "response": {"id": "r1"}}),
+                _sse({"type": "response.completed", "response": {"id": "r1"}}),
+            ]
+        )
+    )
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_parent_spec_resolver,
+        server_client=_SubAgentSnapshotServer(UNRESOLVABLE_SUB_AGENT_NAME),  # type: ignore[arg-type]
+    )
+    return pm, app
 
-    warned = [r for r in records if _WARNING_FRAGMENT in r.getMessage()]
-    assert warned, (
-        "a sub-agent name absent from the parent tree produced no "
-        "unresolved-sub-agent warning; the child silently boots with the "
-        "parent's prompt, tools and harness."
+
+@pytest.mark.asyncio
+async def test_unresolvable_sub_agent_resolution_fails_with_typed_error() -> None:
+    """A name absent from the parent tree must fail, not fall back.
+
+    Spec resolution for a session whose ``sub_agent_name`` names no declared
+    child has no spec to return. Returning the parent's runs the child as a
+    clone of its orchestrator, so resolution raises instead, and the typed
+    ``sub_agent_unresolved`` code is what lets a dispatching parent tell a
+    renamed or removed sub-agent from a missing session.
+    """
+    _pm, app = _unresolvable_app()
+
+    async with _runner_client(app) as client:
+        resp = await client.get(f"/v1/sessions/{CHILD_SESSION_ID}/resources")
+
+    assert resp.status_code == 410, (
+        f"resolution for an undeclared sub-agent returned {resp.status_code}; "
+        "expected 410, the session-lifecycle status its sibling "
+        "session_agent_missing uses."
+    )
+    body = resp.json()
+    assert body["error"]["code"] == _UNRESOLVED_CODE, (
+        f"expected a typed {_UNRESOLVED_CODE!r} error, got {body!r}"
+    )
+    assert UNRESOLVABLE_SUB_AGENT_NAME in body["error"]["message"], (
+        "the failure must name the sub-agent that was asked for, so the "
+        f"parent can act on it: {body['error']['message']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_sub_agent_turn_never_spawns_the_parent_harness() -> None:
+    """A turn for an undeclared sub-agent must not run on the parent spec.
+
+    The reported symptom: a fan-out of five sub-agents warned five times and
+    the parent received three "produced no output" completions plus one
+    preamble-only reply, all reported as successes. The turn must fail rather
+    than spawn anything, so the parent sees a failure instead of a child that
+    was never the agent it asked for.
+
+    No priming here: the turn has to resolve the parent tree fresh, which is
+    the state the fallback used to survive in.
+    """
+    pm, app = _unresolvable_app()
+
+    async with _runner_client(app) as client:
+        turn = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": PARENT_AGENT_ID,
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
+        )
+        assert turn.status_code == 202, f"{turn.status_code} {turn.text}"
+
+        # The turn runs in the background; give it room to reach (and fail at)
+        # harness selection before asserting nothing was spawned.
+        for _ in range(300):
+            if pm.get_client_calls:
+                break
+            await asyncio.sleep(0.01)
+
+    spawned = [(conv, h) for (conv, h, _env) in pm.get_client_calls if conv == CHILD_SESSION_ID]
+    assert not spawned, (
+        f"a turn for an undeclared sub-agent spawned {spawned!r}. Any spawn "
+        "here is the parent-clone fallback: the child would run with the "
+        "orchestrator's prompt, tools and harness and report success."
     )
 
 
