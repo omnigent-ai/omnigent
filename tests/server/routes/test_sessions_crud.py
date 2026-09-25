@@ -761,6 +761,31 @@ async def test_patch_rejects_client_supplied_archived_at_label(
     assert ARCHIVED_AT_LABEL_KEY not in conv.labels
 
 
+async def test_patch_rejects_client_supplied_archived_by_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """``omnigent.archived_by`` records that retention archived the session.
+
+    A client write would forge that audit, so it is rejected and nothing is
+    persisted.
+    """
+    from omnigent.stores.conversation_store import ARCHIVED_BY_LABEL_KEY
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {ARCHIVED_BY_LABEL_KEY: "retention"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert ARCHIVED_BY_LABEL_KEY not in conv.labels
+
+
 async def test_list_sessions_pinned_filter(
     client: httpx.AsyncClient,
     db_uri: str,

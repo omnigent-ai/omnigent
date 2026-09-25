@@ -94,6 +94,8 @@ from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    ARCHIVED_BY_LABEL_KEY,
+    ARCHIVED_BY_RETENTION_VALUE,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -104,6 +106,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     ConversationStore,
     CreatedSession,
+    RetentionCandidate,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -3308,7 +3311,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         delete(SqlConversationLabel).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),
                             SqlConversationLabel.conversation_id == conversation_id,
-                            SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
+                            SqlConversationLabel.key.in_(
+                                (ARCHIVED_AT_LABEL_KEY, ARCHIVED_BY_LABEL_KEY)
+                            ),
                         )
                     )
                 row.archived = archived
@@ -5128,3 +5133,323 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
 
         return True
+
+    def list_retention_candidates(
+        self,
+        *,
+        owner_user_id: str,
+        cutoff: int,
+        enforce_ownership: bool,
+        limit: int = 200,
+        after: tuple[int, str] | None = None,
+    ) -> list[RetentionCandidate]:
+        """List inactive top-level sessions for one retention pass.
+
+        See :meth:`ConversationStore.list_retention_candidates`.
+        """
+        from omnigent.server.auth import LEVEL_OWNER
+
+        rows = self._select_inactive_top_level(
+            owner_user_id=owner_user_id,
+            cutoff=cutoff,
+            enforce_ownership=enforce_ownership,
+            limit=limit,
+            after=after,
+            owner_level=LEVEL_OWNER,
+        )
+        if not rows:
+            return []
+        ids = [row[0] for row in rows]
+        with self._conv_session("read_labels_for_retention") as session:
+            labels = _fetch_labels_bulk(session, ids)
+        members = self._retention_tree_members(ids)
+        member_ids = [member_id for group in members.values() for member_id in group]
+        live = self._retention_live_state(member_ids)
+        grants = self._retention_grant_users(ids)
+        pin_key = pinned_label_key(owner_user_id)
+        candidates: list[RetentionCandidate] = []
+        for conv_id, title, updated_at in rows:
+            label_map = labels.get(conv_id, {})
+            tree_ids = members.get(conv_id, (conv_id,))
+            statuses: list[str] = []
+            pending = 0
+            project_id: str | None = None
+            for member_id in tree_ids:
+                status_code, pending_count, member_project = live.get(
+                    member_id, (None, None, None)
+                )
+                if member_id == conv_id:
+                    project_id = member_project
+                if status_code is not None:
+                    statuses.append(decode_session_live_status(status_code))
+                if pending_count:
+                    pending += pending_count
+            grant_users = grants.get(conv_id, ())
+            candidates.append(
+                RetentionCandidate(
+                    id=conv_id,
+                    title=title or None,
+                    updated_at=updated_at,
+                    project_id=project_id,
+                    label_keys=tuple(sorted(label_map)),
+                    pinned=bool(label_map.get(pin_key)),
+                    shared=any(user_id != owner_user_id for user_id in grant_users),
+                    tree_live_statuses=tuple(statuses),
+                    tree_pending_elicitation_count=pending,
+                    tree_ids=tree_ids,
+                )
+            )
+        return candidates
+
+    def claim_retention_archive(
+        self,
+        conversation_id: str,
+        *,
+        cutoff: int,
+        now: int,
+    ) -> bool:
+        """Archive one inactive session, or return False when it no longer qualifies.
+
+        See :meth:`ConversationStore.claim_retention_archive`.
+        """
+        if self._conv_engine is self._engine:
+            return self._claim_retention_archive_same_db(conversation_id, cutoff=cutoff, now=now)
+        if self._retention_tree_busy(conversation_id):
+            return False
+        return self._mark_retention_archive(conversation_id, cutoff=cutoff, now=now)
+
+    def _select_inactive_top_level(
+        self,
+        *,
+        owner_user_id: str,
+        cutoff: int,
+        enforce_ownership: bool,
+        limit: int,
+        after: tuple[int, str] | None,
+        owner_level: int,
+    ) -> list[tuple[str, str, int]]:
+        """Return ``(id, title, updated_at)`` for one inactive-session page."""
+        same_db = self._conv_engine is self._engine
+        owned_ids: list[str] | None = None
+        if enforce_ownership and not same_db:
+            with self._session("list_owned_sessions_for_retention") as meta_sess:
+                owned_ids = list(
+                    meta_sess.scalars(
+                        select(SqlSessionPermission.conversation_id).where(
+                            SqlSessionPermission.workspace_id == current_workspace_id(),
+                            SqlSessionPermission.user_id == owner_user_id,
+                            SqlSessionPermission.level >= owner_level,
+                        )
+                    )
+                )
+            if not owned_ids:
+                return []
+        with self._conv_session("list_inactive_sessions_for_retention") as session:
+            stmt = select(
+                SqlConversation.id,
+                SqlConversation.title,
+                SqlConversation.updated_at,
+            ).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.archived.is_(False),
+                SqlConversation.parent_conversation_id.is_(None),
+                SqlConversation.updated_at <= cutoff,
+            )
+            if owned_ids is not None:
+                stmt = stmt.where(SqlConversation.id.in_(owned_ids))
+            elif enforce_ownership and same_db:
+                stmt = stmt.where(
+                    select(SqlSessionPermission.conversation_id)
+                    .where(
+                        SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
+                        SqlSessionPermission.conversation_id == SqlConversation.id,
+                        SqlSessionPermission.user_id == owner_user_id,
+                        SqlSessionPermission.level >= owner_level,
+                    )
+                    .exists()
+                )
+            if after is not None:
+                after_updated_at, after_id = after
+                stmt = stmt.where(
+                    tuple_(SqlConversation.updated_at, SqlConversation.id)
+                    > tuple_(
+                        literal(after_updated_at, SqlConversation.updated_at.type),
+                        literal(after_id, SqlConversation.id.type),
+                    )
+                )
+            stmt = stmt.order_by(asc(SqlConversation.updated_at), asc(SqlConversation.id)).limit(
+                limit
+            )
+            return [(row[0], row[1], row[2]) for row in session.execute(stmt).all()]
+
+    def _retention_tree_members(self, root_ids: list[str]) -> dict[str, tuple[str, ...]]:
+        """Map each root id to the ids in its spawn tree, including itself."""
+        grouped: dict[str, list[str]] = {root_id: [root_id] for root_id in root_ids}
+        if not root_ids:
+            return {}
+        with self._conv_session("list_session_tree_for_retention") as session:
+            rows = session.execute(
+                select(SqlConversation.id, SqlConversation.root_conversation_id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.root_conversation_id.in_(root_ids),
+                )
+            ).all()
+        for conv_id, root_id in rows:
+            members = grouped.get(root_id)
+            if members is not None and conv_id not in members:
+                members.append(conv_id)
+        return {root_id: tuple(members) for root_id, members in grouped.items()}
+
+    def _retention_live_state(
+        self, conversation_ids: list[str]
+    ) -> dict[str, tuple[int | None, int | None, str | None]]:
+        """Return ``(live_status code, pending count, project id)`` per session."""
+        if not conversation_ids:
+            return {}
+        with self._session("read_live_state_for_retention") as session:
+            rows = session.execute(
+                select(
+                    SqlConversationMetadata.id,
+                    SqlConversationMetadata.live_status,
+                    SqlConversationMetadata.pending_elicitation_count,
+                    SqlConversationMetadata.project_id,
+                ).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_(conversation_ids),
+                )
+            ).all()
+        return {row[0]: (row[1], row[2], row[3]) for row in rows}
+
+    def _retention_grant_users(self, conversation_ids: list[str]) -> dict[str, tuple[str, ...]]:
+        """Return every grantee user id for the given sessions."""
+        if not conversation_ids:
+            return {}
+        with self._session("read_grants_for_retention") as session:
+            rows = session.execute(
+                select(
+                    SqlSessionPermission.conversation_id,
+                    SqlSessionPermission.user_id,
+                ).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id.in_(conversation_ids),
+                )
+            ).all()
+        grouped: dict[str, list[str]] = {}
+        for conv_id, user_id in rows:
+            grouped.setdefault(conv_id, []).append(user_id)
+        return {conv_id: tuple(user_ids) for conv_id, user_ids in grouped.items()}
+
+    def _retention_tree_busy(self, conversation_id: str) -> bool:
+        """Whether the session or a descendant is running, waiting, or awaiting approval."""
+        members = self._retention_tree_members([conversation_id]).get(
+            conversation_id, (conversation_id,)
+        )
+        busy = {
+            encode_session_live_status("running"),
+            encode_session_live_status("waiting"),
+        }
+        for status_code, pending_count, _project_id in self._retention_live_state(
+            list(members)
+        ).values():
+            if status_code in busy or (pending_count or 0) > 0:
+                return True
+        return False
+
+    def _claim_retention_archive_same_db(
+        self, conversation_id: str, *, cutoff: int, now: int
+    ) -> bool:
+        """Archive under one transaction when conversations and metadata share a database."""
+        busy = {
+            encode_session_live_status("running"),
+            encode_session_live_status("waiting"),
+        }
+
+        def write(session: Session) -> bool:
+            row_query = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                row_query = row_query.with_for_update()
+            row = session.scalar(row_query)
+            if (
+                row is None
+                or row.archived
+                or row.parent_conversation_id is not None
+                or row.updated_at > cutoff
+            ):
+                return False
+            member_ids = list(
+                session.scalars(
+                    select(SqlConversation.id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.root_conversation_id == row.root_conversation_id,
+                    )
+                )
+            )
+            if conversation_id not in member_ids:
+                member_ids.append(conversation_id)
+            meta_query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id.in_(member_ids),
+            )
+            if self._meta_supports_for_update:
+                meta_query = meta_query.with_for_update()
+            for meta in session.scalars(meta_query):
+                if meta.live_status in busy or (meta.pending_elicitation_count or 0) > 0:
+                    return False
+            row.archived = True
+            row.updated_at = now
+            _upsert_labels(
+                session,
+                conversation_id,
+                {
+                    ARCHIVED_AT_LABEL_KEY: str(now),
+                    ARCHIVED_BY_LABEL_KEY: ARCHIVED_BY_RETENTION_VALUE,
+                },
+                now,
+            )
+            return True
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "archive_inactive_session_for_retention",
+            write,
+        )
+
+    def _mark_retention_archive(self, conversation_id: str, *, cutoff: int, now: int) -> bool:
+        """Set the archive flag after a split-database busy check."""
+
+        def write(session: Session) -> bool:
+            row_query = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                row_query = row_query.with_for_update()
+            row = session.scalar(row_query)
+            if (
+                row is None
+                or row.archived
+                or row.parent_conversation_id is not None
+                or row.updated_at > cutoff
+            ):
+                return False
+            row.archived = True
+            row.updated_at = now
+            _upsert_labels(
+                session,
+                conversation_id,
+                {
+                    ARCHIVED_AT_LABEL_KEY: str(now),
+                    ARCHIVED_BY_LABEL_KEY: ARCHIVED_BY_RETENTION_VALUE,
+                },
+                now,
+            )
+            return True
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "archive_inactive_session_for_retention",
+            write,
+        )
