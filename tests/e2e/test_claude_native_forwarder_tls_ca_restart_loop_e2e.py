@@ -1,70 +1,25 @@
-"""E2E regression: a stale ``SSL_CERT_FILE`` must not kill Claude transcript
-forwarding in a permanent crash-restart loop.
+"""E2E regression: a stale ``SSL_CERT_FILE`` must not kill Claude transcript forwarding.
 
-Guarded bug
------------
-On a host whose ``SSL_CERT_FILE`` points at a CA bundle file that no longer
-exists (e.g. a dbcert-managed bundle that was rotated or removed), a
-claude-native session against a remote Omnigent server never mirrors the Claude
-transcript into the conversation store, and the runner logs::
+A claude-native session against a remote (non-loopback) Omnigent server mirrors
+its transcript through ``supervise_forwarder``, whose server clients come from
+``open_server_client``. That factory honors the CA environment for non-loopback
+URLs, so with ``SSL_CERT_FILE`` pointing at a file that no longer exists the
+client construction used to raise ``FileNotFoundError`` before the first poll,
+the supervisor restarted the identical crash forever, and the web chat view
+never received the transcript.
 
-    Claude transcript forwarder crashed; restarting in <n>.0s; session=...
-
-forever (305 log events/day from a single session in the report), each crash the
-identical ``FileNotFoundError`` raised while loading the TLS CA file.
-
-Mechanism (the seam this drives)
---------------------------------
-``cli_auth.open_server_client`` builds ``httpx.AsyncClient(trust_env=not
-is_loopback_url(server_url))``. For any non-loopback server URL (every real
-deployment) ``trust_env=True``, so httpx 0.28's ``create_ssl_context`` eagerly
-loads ``os.environ["SSL_CERT_FILE"]`` inside ``AsyncClient.__init__`` — even
-when the base URL is plain ``http`` — and raises ``FileNotFoundError`` when the
-file is missing. In ``forward_claude_transcript_to_session`` the two
-``open_server_client`` calls sit *outside* the loop's per-iteration
-``try/except``, so the coroutine dies before its first poll;
-``supervise_forwarder`` catches the crash and restarts with backoff capped at
-30s, forever — the restart loop is deterministic, never classified as
-permanent, and the transcript is never mirrored (the web chat view stays
-permanently desynced from the running terminal). The host forwards
-``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` into every spawned runner
-(``_RUNNER_ENV_ALLOWLIST`` in ``omnigent/host/connect.py``), so one stale host
-env poisons all runners.
-
-Environment fidelity
---------------------
-The report is against a macOS host talking to a Databricks Apps deployment
-whose dbcert-managed CA bundle went stale. This test is a **stand-in**: a local
-single-user ``omnigent server`` subprocess bound to ``0.0.0.0`` and reached at
-``http://<primary-ipv4>:PORT`` — the machine's real primary IPv4, which
-``is_loopback_url`` classifies as NON-loopback (so ``open_server_client`` takes
-the exact production remote-server branch, ``trust_env=True``) while still
-connecting to the local server. The crash itself happens before any network
-I/O, so the mechanism is environment-independent; only the server/host platform
-is substituted.
-
-This drives the REAL user path: a real ``omnigent server`` subprocess, a real
-claude-native session (production spec materializer + wrapper labels), a real
-bridge dir (``prepare_bridge_dir``), and the real ``supervise_forwarder`` — the
-exact supervisor from the reported stack — tailing a seeded Claude JSONL
-transcript.
-
-Desired behavior (asserted): the seeded transcript reaches the conversation
-store even though ``SSL_CERT_FILE`` points at a missing file — a stale CA env
-var affects at most TLS verification and must not kill forwarding to the
-server (falling back to the default trust roots, as
-``omnigent.util.tls.resolve_ca_file`` already does elsewhere), and the
-supervisor must not re-crash forever on a deterministic startup error. Buggy
-behavior: the forwarder crash-loops with the identical ``FileNotFoundError``
-and mirrors nothing — this test FAILS with the observed crash-restart count in
-the message.
+Stand-in environment: a real ``omnigent server`` subprocess bound to ``0.0.0.0``
+reached at a non-loopback alias that still routes to the local listener, so
+``open_server_client`` takes the same branch as a remote deployment. The real
+claude-native session, bridge dir, and ``supervise_forwarder`` are used; only a
+seeded one-turn JSONL transcript replaces a live Claude CLI.
 
 Run::
 
     .venv/bin/python -m pytest \
         tests/e2e/test_claude_native_forwarder_tls_ca_restart_loop_e2e.py -v
 
-No ``--llm-api-key`` / ``--profile`` needed -- no LLM is invoked.
+No ``--llm-api-key`` / ``--profile`` needed; no LLM is invoked.
 """
 
 from __future__ import annotations
@@ -93,7 +48,8 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# CI shells can carry an egress proxy; every HTTP call here targets 127.0.0.1.
+# CI shells can carry an egress proxy; every HTTP call here targets the local
+# server, so bypass it.
 _http = httpx.Client(trust_env=False)
 
 # The spawned server resolves worktree imports from the repo root and the SDKs.
@@ -133,36 +89,56 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _routable_nonloopback_host() -> str | None:
-    """Return a routable non-loopback IPv4 for this machine, or ``None``.
+def _nonloopback_url_candidates(port: int) -> list[str]:
+    """Ordered non-loopback ``http://host:port`` URLs that may reach the local listener.
 
-    The forwarder's server URL must classify as **non**-loopback so
-    ``open_server_client`` takes the production ``trust_env=True`` branch that
-    honors ``SSL_CERT_FILE`` -- the branch the reported crash lives in. A
-    literal like ``::ffff:127.0.0.1`` is fragile: CPython flipped IPv4-mapped
-    IPv6 loopback to classify as loopback across 3.12 patch releases, so the
-    precondition below would silently stop entering the buggy branch. The
-    machine's real primary IPv4 is non-loopback on every interpreter and, with
-    the server bound to ``0.0.0.0``, still reaches the local listener.
+    Most production-faithful first: the machine's primary IPv4, then ``0.0.0.0``
+    (Linux routes it to the local listener, so a loopback-only sandbox falls back
+    to it), then ``::ffff:127.0.0.1`` (interpreter-dependent classification, last
+    resort). Only the non-loopback classification is filtered here; the caller
+    verifies reachability against ``/health``.
 
-    A connected UDP socket picks the default-route source address without
-    sending packets; ``gethostname`` is the fallback.
-
-    :returns: A non-loopback IPv4 that routes to this host, or ``None`` when the
-        environment has only loopback interfaces.
+    :param port: The port the local server is bound to.
+    :returns: Candidate URLs, non-loopback-classified only.
     """
     from omnigent_client._http import is_loopback_url
 
-    candidates: list[str] = []
+    hosts: list[str] = []
     with contextlib.suppress(OSError):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.connect(("8.8.8.8", 80))  # no packets sent; selects the route
-            candidates.append(probe.getsockname()[0])
+            hosts.append(probe.getsockname()[0])
     with contextlib.suppress(OSError):
-        candidates.append(socket.gethostbyname(socket.gethostname()))
-    for host in candidates:
-        if host and not is_loopback_url(f"http://{host}"):
-            return host
+        hosts.append(socket.gethostbyname(socket.gethostname()))
+    hosts.extend(["0.0.0.0", "::ffff:127.0.0.1"])
+
+    seen: set[str] = set()
+    urls: list[str] = []
+    for host in hosts:
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        url = f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+        if not is_loopback_url(url):
+            urls.append(url)
+    return urls
+
+
+def _select_reachable_nonloopback_url(port: int, deadline: float) -> str | None:
+    """Return the first candidate non-loopback URL whose ``/health`` answers 200.
+
+    :param port: The port the local server is bound to.
+    :param deadline: Monotonic deadline for the whole selection.
+    :returns: A reachable non-loopback URL, or ``None`` when none qualifies.
+    """
+    for url in _nonloopback_url_candidates(port):
+        while time.monotonic() < deadline:
+            try:
+                if _http.get(f"{url}/health", timeout=2.0).status_code == 200:
+                    return url
+                break
+            except httpx.HTTPError:
+                break
     return None
 
 
@@ -228,12 +204,10 @@ def _wait_http_ok(url: str, deadline: float) -> None:
 
 
 def _create_claude_native_session(base_url: str) -> str:
-    """Create a claude-native wrapper session exactly like ``omnigent claude``.
+    """Create a claude-native wrapper session the way ``omnigent claude`` does.
 
-    Reuses the production spec materializer and stamps the same wrapper /
-    terminal-first labels the CLI writes, so the created session is a real
-    claude-native conversation -- the kind whose transcript the forwarder
-    mirrors in production.
+    Reuses the production spec materializer and the wrapper / terminal-first
+    labels, so the forwarder mirrors into a real claude-native conversation.
 
     :param base_url: Spawned server base URL.
     :returns: The new session/conversation id.
@@ -281,13 +255,11 @@ def _create_claude_native_session(base_url: str) -> str:
 def _seed_conversation_transcript(
     bridge_dir: Path, user_marker: str, assistant_marker: str
 ) -> Path:
-    """Write a one-turn Claude JSONL transcript + a Stop hook.
+    """Write a one-turn Claude JSONL transcript plus a ``Stop`` hook event.
 
-    Each record uses the shape a live Claude CLI writes: the ``type=user``
-    record carries ``message.role == "user"`` with plain-string content and a
-    distinct ``uuid`` (the forwarder's idempotency key); the ``type=assistant``
-    record carries a text content block. A recorded ``Stop`` hook reports the
-    transcript path so the loop resolves it on the first poll.
+    Records use the shape a live Claude CLI writes (``uuid`` is the forwarder's
+    idempotency key); the hook reports the transcript path so the first poll
+    resolves it.
 
     :param bridge_dir: Native Claude bridge directory.
     :param user_marker: Marker text for the user record.
@@ -331,11 +303,11 @@ def _seed_conversation_transcript(
 
 
 def _count_marker(base_url: str, session_id: str, marker: str) -> int:
-    """Count committed conversation items whose payload contains *marker*.
+    """Count committed conversation items whose serialized payload contains *marker*.
 
     :param base_url: Spawned server base URL.
     :param session_id: Conversation to query.
-    :param marker: Substring to match against each item's serialized data.
+    :param marker: Substring to match.
     :returns: Number of committed items carrying the marker.
     """
     resp = _http.get(
@@ -348,12 +320,7 @@ def _count_marker(base_url: str, session_id: str, marker: str) -> int:
 
 
 class _CrashLogCapture(logging.Handler):
-    """Capture the supervisor's crash-restart ERROR records.
-
-    Collects ``(message, exception_type_name)`` for every
-    ``"Claude transcript forwarder crashed; restarting in ..."`` record so the
-    test can count identical restarts and name the crash exception.
-    """
+    """Collect ``(message, exception type)`` for each supervisor crash-restart record."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.ERROR)
@@ -378,13 +345,10 @@ async def _drive_supervisor_until(
 ) -> _CrashLogCapture:
     """Run the real ``supervise_forwarder`` until *done* or *budget_s* elapses.
 
-    This is the exact production supervisor from the reported stack (the
-    runner awaits it in-process), driven with the same arguments the runner
-    passes. The supervisor never returns on its own; it is cancelled when the
-    predicate is satisfied or the budget runs out.
+    The supervisor never returns on its own; it is cancelled once the predicate
+    holds or the budget runs out.
 
-    :param base_url: Server base URL the forwarder posts to (the non-loopback
-        remote-style URL -- the ``trust_env=True`` branch).
+    :param base_url: Server base URL the forwarder posts to (the non-loopback alias).
     :param session_id: Conversation the forwarder mirrors into.
     :param bridge_dir: Seeded native Claude bridge directory.
     :param done: Early-exit predicate over the captured crash records.
@@ -427,48 +391,17 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
 ) -> None:
     """A stale ``SSL_CERT_FILE`` must not crash-loop the transcript forwarder.
 
-    Journey (the reporter's): the host machine's ``SSL_CERT_FILE`` points at a
-    CA bundle file that no longer exists (a rotated/removed dbcert bundle); the
-    user launches a claude-native session against a remote Omnigent server. The
-    terminal works, but the web chat view never mirrors the Claude transcript,
-    and the runner logs ``Claude transcript forwarder crashed; restarting in
-    <n>.0s`` every backoff interval, forever.
-
-    Expected: the transcript reaches the conversation store despite the stale
-    CA env var (which affects at most TLS verification -- the base URL here is
-    plain http), and the supervisor does not re-crash forever on a
-    deterministic startup error. Buggy behavior: ``open_server_client`` honors
-    the stale ``SSL_CERT_FILE`` (``trust_env=True`` for every non-loopback
-    URL), ``httpx.AsyncClient.__init__`` raises ``FileNotFoundError`` before
-    the first poll, and ``supervise_forwarder`` restarts the identical crash
-    forever -- nothing is ever mirrored, and this test FAILS with the observed
-    crash-restart count.
+    Control leg: a valid bundle at the non-loopback URL mirrors the seeded
+    transcript, proving the harness. Bug leg: ``SSL_CERT_FILE`` names a missing
+    file; the transcript must still be mirrored and the supervisor must not have
+    crash-restarted repeatedly. On the unfixed build the bug leg crash-loops with
+    ``FileNotFoundError`` and mirrors nothing.
 
     :param tmp_path: Per-test temp dir (server DB, artifacts, bridge dirs).
-    :param monkeypatch: Used to shape this process's env for the in-process
-        forwarder legs (proxy vars removed; ``SSL_CERT_FILE`` per leg).
+    :param monkeypatch: Shapes this process's env for the in-process forwarder legs.
     """
-    from omnigent_client._http import is_loopback_url
-
     port = _find_free_port()
     local_url = f"http://127.0.0.1:{port}"
-    # The machine's real primary IPv4 classifies as non-loopback on every
-    # interpreter, so open_server_client takes the production remote-server
-    # branch (trust_env=True) that honors SSL_CERT_FILE, while still reaching
-    # the server (bound to 0.0.0.0 below) over the loopback path.
-    nonloopback_host = _routable_nonloopback_host()
-    if nonloopback_host is None:
-        pytest.skip(
-            "no routable non-loopback interface here; cannot drive the "
-            "open_server_client trust_env=True branch the reported crash lives in"
-        )
-    remote_style_url = f"http://{nonloopback_host}:{port}"
-    assert not is_loopback_url(remote_style_url), (
-        "precondition: the remote-style URL must classify as non-loopback so "
-        "open_server_client sets trust_env=True (the reported deployment "
-        f"branch); {nonloopback_host!r} classified as loopback -- pick another "
-        "non-loopback alias for the local server"
-    )
 
     # The in-process forwarder legs must connect directly (trust_env=True
     # would otherwise route the non-loopback URL through any ambient proxy).
@@ -504,7 +437,18 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
             stdout=server_log,
             stderr=subprocess.STDOUT,
         )
-        _wait_http_ok(f"{local_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
+        health_deadline = time.monotonic() + _HEALTH_TIMEOUT_S
+        _wait_http_ok(f"{local_url}/health", health_deadline)
+
+        # Non-loopback alias that still reaches this server, so open_server_client
+        # takes the remote-server branch (trust_env=True) that honors SSL_CERT_FILE.
+        remote_style_url = _select_reachable_nonloopback_url(port, health_deadline)
+        if remote_style_url is None:
+            pytest.skip(
+                "no reachable non-loopback alias for the local server; cannot "
+                "drive the open_server_client trust_env=True branch the "
+                "reported crash lives in"
+            )
 
         from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
 
@@ -538,9 +482,9 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
             and _count_marker(local_url, control_session, _ASSISTANT_CONTROL) >= 1
         ), (
             "control-leg invariant: with a VALID SSL_CERT_FILE the forwarder "
-            "must mirror the seeded transcript through the non-loopback URL; "
-            f"crashes={control_cap.crashes} -- the environment (not the bug) "
-            f"is broken. server log tail:\n{server_tail}"
+            "must mirror the seeded transcript through the non-loopback URL "
+            f"({remote_style_url}); crashes={control_cap.crashes} -- the "
+            f"environment (not the bug) is broken. server log tail:\n{server_tail}"
         )
 
         # ---- Bug leg: SSL_CERT_FILE points at a file that no longer exists
@@ -577,10 +521,8 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
         assistant_mirrored = _count_marker(local_url, bug_session, _ASSISTANT_BUG)
         crash_kinds = sorted({exc for _, exc in bug_cap.crashes})
 
-        # The bug: with a stale SSL_CERT_FILE the forwarder never comes up --
-        # every restart re-raises the identical FileNotFoundError while
-        # building its HTTP client, so the transcript is never mirrored and
-        # the chat view stays permanently desynced from the terminal.
+        # On the unfixed build every restart re-raises the identical
+        # FileNotFoundError while building the HTTP client; nothing is mirrored.
         assert user_mirrored >= 1 and assistant_mirrored >= 1, (
             "A stale SSL_CERT_FILE (missing CA bundle file) killed Claude "
             "transcript forwarding: the forwarder crash-looped "

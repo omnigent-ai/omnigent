@@ -55,12 +55,9 @@ def resolve_ca_file() -> str:
 def resolve_ca_dir() -> str | None:
     """Return a valid hashed-cert CA directory (capath), or ``None``.
 
-    Honors ``SSL_CERT_DIR`` (surfaced through ``ssl.get_default_verify_paths``)
-    so a corporate CA distributed only as an OpenSSL hashed-cert directory --
-    with no ``SSL_CERT_FILE`` -- is still trusted. This is the trust source
-    httpx's ``trust_env`` env loading used to provide; resolving it here keeps
-    that behavior for callers that build their own context. A missing or
-    non-directory path is ignored (never raises).
+    Honors ``SSL_CERT_DIR`` via ``ssl.get_default_verify_paths`` so a corporate CA
+    shipped only as an OpenSSL hashed directory stays trusted; a missing or
+    non-directory path is ignored rather than raised.
 
     :returns: An existing capath directory, or ``None`` when none is configured.
     """
@@ -74,14 +71,11 @@ def resolve_ca_dir() -> str | None:
 def client_ssl_context() -> ssl.SSLContext:
     """Return a cached verifying client SSL context.
 
-    Built once (lazily) so a reconnect loop doesn't re-read the bundle on every
-    attempt. Keeps the secure defaults of :func:`ssl.create_default_context`
-    (hostname checking enabled, ``verify_mode == CERT_REQUIRED``). Trust is the
-    resolved CA bundle plus, when configured, the ``SSL_CERT_DIR`` hashed-cert
-    directory (:func:`resolve_ca_dir`), so a capath-only corporate CA is honored
-    exactly as httpx's ``trust_env`` loading did.
+    Built once so reconnect loops do not re-read the bundle. Trusts the resolved CA
+    bundle plus a configured ``SSL_CERT_DIR`` (:func:`resolve_ca_dir`) and keeps
+    :func:`ssl.create_default_context`'s hostname checking and ``CERT_REQUIRED``.
 
-    :returns: A shared :class:`ssl.SSLContext` trusting the resolved CA bundle.
+    :returns: A shared :class:`ssl.SSLContext`.
     """
     global _client_ssl_context
     if _client_ssl_context is None:

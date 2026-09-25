@@ -6,10 +6,15 @@ by ``omnigent login``.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import socket
 import sys
 import time
+from collections.abc import Iterator
+from pathlib import Path
 
+import httpx
 import pytest
 
 
@@ -1097,17 +1102,11 @@ def reset_tls_context_cache():
 def test_open_server_client_survives_stale_tls_ca_env(
     token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache
 ) -> None:
-    """A stale ``SSL_CERT_FILE``/``SSL_CERT_DIR`` must not crash construction.
+    """A stale ``SSL_CERT_FILE``/``SSL_CERT_DIR`` must not crash client construction.
 
-    Non-loopback server URLs honor env config (``trust_env=True``), and httpx
-    0.28 builds its SSL context eagerly in ``AsyncClient.__init__`` — even for
-    plain-http base URLs. A CA bundle path that no longer exists (e.g. a
-    rotated-away bundle) used to raise ``FileNotFoundError`` here, so every
-    caller of this factory died at startup — the Claude transcript forwarder
-    crash-restarted forever and never mirrored the transcript.
+    Non-loopback URLs use ``trust_env=True``, and httpx builds its SSL context
+    eagerly in ``AsyncClient.__init__``; a missing bundle path used to raise here.
     """
-    import asyncio
-
     import omnigent.util.tls as tls_module
     from omnigent.cli_auth import open_server_client
 
@@ -1126,13 +1125,7 @@ def test_open_server_client_survives_stale_tls_ca_env(
 def test_open_server_client_loopback_skips_shared_trust_context(
     token_dir, reset_tls_context_cache
 ) -> None:
-    """Loopback targets keep httpx defaults: no CA-bundle resolution or read.
-
-    ``trust_env`` is off for loopback (proxy bypass), so httpx never loads the
-    CA env vars there; the factory must not force a bundle read either.
-    """
-    import asyncio
-
+    """Loopback targets keep httpx defaults and never touch the shared trust context."""
     import omnigent.util.tls as tls_module
     from omnigent.cli_auth import open_server_client
 
@@ -1141,3 +1134,164 @@ def test_open_server_client_loopback_skips_shared_trust_context(
         assert tls_module._client_ssl_context is None
     finally:
         asyncio.run(client.aclose())
+
+
+# ``is_loopback_url`` classifies this alias as non-loopback (the remote-server
+# branch of ``open_server_client``) while Linux still routes it to the local
+# listener, so an in-process TLS server can stand in for a remote deployment.
+_WILDCARD_HOST = "0.0.0.0"
+
+
+def _wildcard_alias_reaches_local_listener() -> bool:
+    """Report whether connecting to ``0.0.0.0`` reaches a local listener here."""
+    with socket.socket() as listener:
+        listener.bind((_WILDCARD_HOST, 0))
+        listener.listen(1)
+        try:
+            with socket.create_connection((_WILDCARD_HOST, listener.getsockname()[1]), timeout=2):
+                return True
+        except OSError:
+            return False
+
+
+def _self_signed_server_cert(directory: Path) -> tuple[Path, Path]:
+    """Write a self-signed TLS server certificate for the ``0.0.0.0`` alias.
+
+    :param directory: Where ``server.pem`` / ``server.key`` are written.
+    :returns: ``(cert_path, key_path)``; the certificate is also its own CA.
+    """
+    import datetime as dt
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "omnigent-test-server")])
+    now = dt.datetime.now(dt.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(minutes=5))
+        .not_valid_after(now + dt.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(_WILDCARD_HOST))]),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = directory / "server.pem"
+    key_path = directory / "server.key"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return cert_path, key_path
+
+
+@contextlib.contextmanager
+def _https_listener(cert_path: Path, key_path: Path) -> Iterator[str]:
+    """Serve ``200`` for every GET over TLS on all interfaces.
+
+    :param cert_path: PEM certificate to present.
+    :param key_path: PEM private key for *cert_path*.
+    :yields: The ``https://0.0.0.0:<port>`` base URL of the listener.
+    """
+    import ssl
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = HTTPServer((_WILDCARD_HOST, 0), _Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert_path), str(key_path))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"https://{_WILDCARD_HOST}:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _get_health_status(client: httpx.AsyncClient) -> int:
+    """Run one ``GET /health`` on *client* (closing it) and return the status code."""
+
+    async def _get() -> int:
+        async with client:
+            return (await client.get("/health")).status_code
+
+    return asyncio.run(_get())
+
+
+def _direct_remote_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop proxy settings and any capath so the ``trust_env`` client connects directly."""
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
+
+def test_open_server_client_https_honors_valid_ssl_cert_file(
+    token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache
+) -> None:
+    """A valid ``SSL_CERT_FILE`` still verifies a real HTTPS listener end to end."""
+    if not _wildcard_alias_reaches_local_listener():
+        pytest.skip("0.0.0.0 does not reach a local listener on this platform")
+    from omnigent.cli_auth import open_server_client
+
+    cert_path, key_path = _self_signed_server_cert(tmp_path)
+    _direct_remote_env(monkeypatch)
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert_path))
+
+    with _https_listener(cert_path, key_path) as base_url:
+        assert _get_health_status(open_server_client(base_url)) == 200
+
+
+def test_open_server_client_https_stale_ssl_cert_file_keeps_verifying(
+    token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache
+) -> None:
+    """A stale ``SSL_CERT_FILE`` falls back to default roots, never to no verification.
+
+    Construction must succeed, and the handshake against a listener the default
+    roots do not trust must still fail closed.
+    """
+    if not _wildcard_alias_reaches_local_listener():
+        pytest.skip("0.0.0.0 does not reach a local listener on this platform")
+    from omnigent.cli_auth import open_server_client
+
+    cert_path, key_path = _self_signed_server_cert(tmp_path)
+    _direct_remote_env(monkeypatch)
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "rotated-away-ca.pem"))
+
+    with _https_listener(cert_path, key_path) as base_url:
+        client = open_server_client(base_url)
+        with pytest.raises(httpx.ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
+            _get_health_status(client)

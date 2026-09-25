@@ -111,16 +111,11 @@ def test_resolve_ca_dir_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None
     assert resolve_ca_dir() is None
 
 
-def test_client_ssl_context_honors_ssl_cert_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    """Capath trust (``SSL_CERT_DIR``) is loaded into the context.
+def test_client_ssl_context_honors_ssl_cert_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """A configured ``SSL_CERT_DIR`` (capath) is loaded into the shared context.
 
-    A corporate CA distributed only as an OpenSSL hashed-cert directory (no
-    ``SSL_CERT_FILE``) was trusted by httpx's ``trust_env`` env loading. Routing
-    trust through :func:`client_ssl_context` must not silently drop it, or such
-    a deployment hits ``CERTIFICATE_VERIFY_FAILED``. Asserts the context calls
-    ``load_verify_locations(capath=...)`` with the configured directory.
+    Dropping it would break deployments whose corporate CA ships only as an
+    OpenSSL hashed-cert directory.
     """
     capath = tmp_path / "certs"
     capath.mkdir()
