@@ -520,6 +520,21 @@ describe("ErrorBanner", () => {
     },
   );
 
+  it("headlines an output-limit failure as the model's cap, without retry", () => {
+    render(
+      <ErrorBanner
+        message="Output limit reached — the response exceeded the model’s maximum output length and was cut off."
+        source="execution"
+        code="output_limit_exceeded"
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model's response hit its maximum output length and was cut off.",
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
   it.each(["executor_error", "connection_error", "runner_error", "wrong_replica"])(
     "does not offer reconnect for live-runner code %s",
     (code) => {

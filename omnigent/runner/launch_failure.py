@@ -191,10 +191,19 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+# Claude Code's output-token-limit error, raw ("Claude's response exceeded the
+# 32000 output token maximum...") or as the claude-native bridge rewrites it
+# ("Output limit reached — ..."): the model's output cap, not an Omnigent fault.
+_OUTPUT_LIMIT_ERROR = re.compile(
+    r"response exceeded the [\d,]+ output token maximum|\boutput limit reached\b",
+    re.IGNORECASE,
+)
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
-    """Refine a native turn's generic code when its text identifies a rate limit.
+    """Refine a native turn's generic code when its text identifies an upstream limit.
+
+    Recognizes a rate limit and the model's output-token limit.
 
     Also corrects ``codex_reauth_required`` when the message reveals that the
     real cause is a budget/usage-limit exhaustion (older runners misclassify
@@ -209,6 +218,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return "budget_exhausted"
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code
+    if _OUTPUT_LIMIT_ERROR.search(message):
+        return "output_limit_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:
@@ -238,6 +249,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "runner_unavailable": "The session's runner isn't connected to the server.",
     "connection_error": "The connection to the agent dropped mid-turn.",
     "context_length_exceeded": "The conversation grew past the model's context window.",
+    "output_limit_exceeded": (
+        "The model's response hit its maximum output length and was cut off."
+    ),
     "executor_error": "The agent runtime hit an error while running the turn.",
     "codex_thread_reset": (
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."

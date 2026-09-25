@@ -2777,6 +2777,41 @@ def test_runner_reject_detail_tolerates_status_only_response_fake() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relayed_output_limit_failure_projects_as_output_limit_exceeded() -> None:
+    """A native turn that hit the model's output cap is not a generic turn error.
+
+    The claude-native forwarder relays the failure under the generic native
+    code; persisting and projecting it back yields ``output_limit_exceeded``
+    so the failure card headlines the model's limit.
+    """
+    from omnigent.server.routes.sessions import _last_task_error_from_labels
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(
+        code="native_turn_error",
+        message=(
+            "Output limit reached — the response exceeded the model’s maximum output "
+            "length and was cut off. Ask for a shorter answer, or break the request "
+            "into smaller pieces and continue step by step."
+        ),
+    )
+    await _persist_session_status_error_labels(
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore(), agent_name="claude-native-ui"
+    )  # type: ignore[arg-type]
+
+    projected = _last_task_error_from_labels(captured["aa11bb22cc33dd44ee55ff6677889900"])
+    assert projected is not None
+    assert projected["code"] == "output_limit_exceeded"
+    assert projected["message"] == error.message
+
+
+@pytest.mark.asyncio
 async def test_persist_and_project_structured_error_round_trip() -> None:
     """Structured title/cause/remediation survive persist → project.
 
