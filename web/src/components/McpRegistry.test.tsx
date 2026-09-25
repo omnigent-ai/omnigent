@@ -23,6 +23,17 @@ beforeEach(() => {
 });
 
 describe("MCP account connections", () => {
+  it.each(["github", "databricks"])(
+    "links shared %s accounts to their provider controls",
+    async (auth) => {
+      vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, auth }] });
+      render(<McpRegistryConnections />);
+      expect(
+        await screen.findByRole("link", { name: "Manage account in Sandbox Integrations" }),
+      ).toHaveAttribute("href", "/settings/integrations");
+    },
+  );
+
   it("saves a personal token, clears it, and tests the connected service", async () => {
     vi.mocked(registryRequest)
       .mockResolvedValueOnce({ data: [service] })
@@ -84,6 +95,10 @@ describe("MCP service selection", () => {
       ["attached", false],
     ]);
     expect(registryRequest).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("link", { name: "Manage MCP accounts" })).toHaveAttribute(
+      "href",
+      "/settings/mcp",
+    );
   });
 
   it("finishes sign-in before enabling a service", async () => {

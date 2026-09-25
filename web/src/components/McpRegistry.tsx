@@ -42,7 +42,7 @@ export function McpRegistryConnections() {
         <h3 className="text-sm font-medium">Managed MCP services</h3>
         <p className="text-sm text-muted-foreground">
           Connect once, then add these tools to any session. Your accounts are reused across
-          sessions and sandboxes in this workspace.
+          sessions on local machines, remote hosts, and sandboxes in this workspace.
         </p>
       </div>
       {callbackFailed && (
@@ -130,10 +130,12 @@ function ServiceConnection({
             {service.connected ? "Reconnect" : "Connect"}
           </Button>
         )}
-        {(service.auth === "github" || service.auth === "databricks") && !service.connected && (
+        {(service.auth === "github" || service.auth === "databricks") && (
           <p className="text-sm text-muted-foreground">
-            Connect {service.auth === "github" ? "GitHub" : "Databricks"} using the account controls
-            on this page.
+            Uses your shared {service.auth === "github" ? "GitHub" : "Databricks"} connection.{" "}
+            <a className="underline" href={withBasePath("/settings/integrations")}>
+              Manage account in Sandbox Integrations
+            </a>
           </p>
         )}
         {service.connected && (
@@ -376,11 +378,11 @@ export function McpRegistryPicker({
       </div>
       <a
         className="text-xs underline"
-        href={withBasePath("/settings/integrations")}
+        href={withBasePath("/settings/mcp")}
         target="_blank"
         rel="noopener noreferrer"
       >
-        Manage account connections
+        Manage MCP accounts
       </a>
     </div>
   );

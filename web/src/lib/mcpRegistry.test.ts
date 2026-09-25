@@ -32,12 +32,12 @@ it("waits for the server callback, honors a base path, and isolates the opener",
   const result = authorizeRegistryService(service, new AbortController().signal);
   expect(popup.opener).toBeNull();
   expect(popup.location.href).toContain(
-    "/omni/v1/connections/mcp-tracker/connect?return_to=%2Fomni%2Fsettings%2Fintegrations",
+    "/omni/v1/connections/mcp-tracker/connect?return_to=%2Fomni%2Fsettings%2Fmcp",
   );
   popup.location.href = "https://provider.example/authorize?mcp-tracker=connected";
   await vi.advanceTimersByTimeAsync(500);
   expect(popup.close).not.toHaveBeenCalled();
-  popup.location.href = `${window.location.origin}/omni/settings/integrations?mcp-tracker=connected`;
+  popup.location.href = `${window.location.origin}/omni/settings/mcp?mcp-tracker=connected`;
   await vi.advanceTimersByTimeAsync(500);
   await expect(result).resolves.toBeUndefined();
   expect(popup.close).toHaveBeenCalledOnce();
@@ -47,7 +47,7 @@ it("waits for the server callback, honors a base path, and isolates the opener",
 it("reports the server's OAuth rejection", async () => {
   const result = authorizeRegistryService(service, new AbortController().signal);
   const assertion = expect(result).rejects.toThrow("Sign-in failed");
-  popup.location.href = `${window.location.origin}/settings/integrations?mcp-tracker=error`;
+  popup.location.href = `${window.location.origin}/settings/mcp?mcp-tracker=error`;
   await vi.advanceTimersByTimeAsync(500);
   await assertion;
 });

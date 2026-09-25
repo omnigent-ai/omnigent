@@ -21,7 +21,7 @@ export async function registryRequest<T>(path = "", init?: RequestInit): Promise
 }
 
 export function authorizeRegistryService(service: RegistryService, signal: AbortSignal) {
-  const returnTo = withBasePath("/settings/integrations");
+  const returnTo = withBasePath("/settings/mcp");
   const url = withBasePath(
     `/v1/connections/${encodeURIComponent(service.connect_provider)}/connect?return_to=${encodeURIComponent(returnTo)}`,
   );

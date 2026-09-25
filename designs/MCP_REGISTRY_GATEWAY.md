@@ -2,10 +2,13 @@
 
 Users connect an account once, then select its MCP tools for individual sessions.
 The Omnigent server holds the upstream credentials and executes the remote calls.
-Replacing a sandbox does not require reconnecting the account.
+The same selection works on a connected local machine, remote host or sandbox.
+Replacing the execution host does not require reconnecting the account.
 
 This describes the implemented prototype. Follow the
 [Docker/Colima walkthrough](../examples/mcp-registry/README.md) to run it.
+The [API and integration contract](MCP_REGISTRY_API.md) describes the HTTP surface,
+existing Python hooks, and options for bringing an external registry or gateway.
 
 ## Components and ownership
 
@@ -19,7 +22,7 @@ flowchart LR
   subgraph browser[Browser]
     UI[Account connections and session MCP checkboxes]
   end
-  subgraph sandbox[Sandbox / execution host]
+  subgraph runner[Execution host: local machine / remote host / sandbox]
     H[Agent harness]
     P[ProxyMcpManager / native MCP relay]
     H --> P
@@ -53,15 +56,18 @@ flowchart LR
 - **Administrator:** configures approved destinations, auth and nonempty tool
   allowlists in `OMNIGENT_MCP_REGISTRY`. Optional user allowlists limit visibility
   and use. Config changes require a server restart.
-- **User:** connects an account through Settings or the launch picker, then
+- **User:** connects an account through **Settings → MCP** or the launch picker, then
   selects services per session. Selection and account connection are independent.
-- **Sandbox:** receives service references and tool schemas. A registry entry
-  starts no local upstream MCP subprocess. The native relay lives in the sandbox;
+- **Runner:** receives service references and tool schemas. A registry entry
+  starts no local upstream MCP subprocess. The native relay lives beside the harness;
   the remote MCP server lives at the administrator-configured URL.
 - **Server:** stores generic grants encrypted, scoped by workspace/user/service.
   Sessions contain references, not upstream credentials or caller-chosen URLs.
 
 Existing direct HTTP and stdio MCP configurations keep their current behavior.
+The runner must be connected to the Omnigent server; offline execution cannot use
+this gateway. Neither catalog access nor gateway execution requires a sandbox
+provider. Selecting an MCP service does not provision a sandbox.
 
 ## Connect, select and launch
 
@@ -72,7 +78,7 @@ sequenceDiagram
   participant O as External OAuth provider
   participant C as Server: encrypted credential store
   participant A as Server: agent and session stores
-  participant H as Sandbox: harness and relay
+  participant H as Execution host: harness and relay
   B->>S: GET /v1/mcp-registry/services
   S-->>B: Allowed services and connection status, no tokens
   opt Selected service is not connected
@@ -103,7 +109,7 @@ session require its runner to reload, as the UI indicates.
 
 ```mermaid
 sequenceDiagram
-  participant H as Sandbox: harness / MCP relay
+  participant H as Execution host: harness / MCP relay
   participant G as Server: session MCP gateway
   participant P as Server: existing policy layer
   participant C as Server: credential resolver
@@ -172,14 +178,16 @@ Reuse is valid only for an upstream trusted to receive that provider token with
 the appropriate audience and permissions; it performs no new token exchange.
 
 Disconnect deletes the local grant and pending authorization, not the provider's
-grant. Future resolution fails; an already-authorized call may finish. A refresh
-cannot recreate a connection deleted while that refresh was in progress.
+grant. Resolution fails while no grant exists; an already-authorized call may
+finish. A refresh cannot recreate a connection deleted while it was in progress.
+An OAuth callback already exchanging its code can still save a connection after
+disconnect; cancellation of that in-flight exchange remains a prototype limit.
 
 ## Gateway versus credential broker
 
 ```mermaid
 flowchart LR
-  subgraph sandbox[Sandbox]
+  subgraph runner[Execution host]
     H[Harness: tool request]
     CLI[CLI: needs a raw provider credential]
   end
@@ -209,12 +217,52 @@ remote gateway. Their existing connection names must not become OSS registry IDs
 No store interface is replaced. Downstream patch application/build compatibility
 still needs validation; architectural separation alone does not prove it.
 
-An internal identity or on-behalf-of exchange should reuse the deployment's
-server-side identity resolver. That adapter is not implemented by this prototype;
-standard OAuth configuration is not a substitute for an audience-specific exchange.
 Sandbox provisioning remains the sandbox provider's responsibility.
 
-Current limits:
+### Where enterprise identity fits
+
+An enterprise IdP is relevant, but there are three separate decisions:
+
+| Concern | Existing support | When more integration is needed |
+| --- | --- | --- |
+| Who is using Omnigent? | Existing OIDC login, trusted-header authentication or injected `AuthProvider`. | Map enterprise identity to a stable Omnigent user and workspace. |
+| Can that user access the MCP service? | Per-service OAuth with explicit endpoints, scopes and optional resource, plus stored grants and refresh. | Register the OAuth client and obtain enterprise consent for that resource. The authorization server may be the same IdP used for login. |
+| Does a gateway require delegated enterprise identity? | Existing GitHub/Databricks resolvers can be reused where their tokens are accepted. | An audience-specific or on-behalf-of exchange needs a server-side deployment adapter. It is not implemented by this prototype. |
+
+```mermaid
+flowchart LR
+  B[Browser]
+  subgraph server[Omnigent server]
+    Login[Existing login / AuthProvider]
+    User[Trusted user and workspace]
+    Grant[MCP OAuth connection and encrypted grant]
+    G[Session MCP gateway]
+    X[Optional deployment token exchange adapter: not implemented]
+    Login --> User
+    User --> G
+    Grant --> G
+    G -.-> X
+  end
+  subgraph identity[Enterprise identity infrastructure]
+    IdP[Login IdP]
+    Auth[MCP authorization server: may be the same IdP]
+    STS[Enterprise token exchange service]
+  end
+  B --> Login
+  Login <--> IdP
+  B -->|MCP consent| Auth
+  Grant <-->|Code exchange and refresh| Auth
+  X -.-> STS
+  G -->|Token intended for this resource| M[External MCP server / gateway]
+```
+
+Logging in does not itself grant MCP access. Do not forward a login ID token to an
+MCP server or assume the login access token has the required audience. Group-based
+entitlements, deprovisioning and token exchange need an explicit deployment contract.
+There is no need for a second Omnigent login system. Before adding an adapter, ask
+which issuer, audience, scopes and user delegation the external gateway requires.
+
+### Current limits
 
 - One server worker; refresh locks do not coordinate replicas.
 - Streamable HTTP tools only. No OAuth discovery/dynamic registration, legacy
@@ -234,6 +282,8 @@ Start with [registry and OAuth resolution](../omnigent/server/mcp_registry.py),
 [launch picker](../web/src/shell/McpRegistryLaunchPicker.tsx).
 
 The walkthrough lists runnable tests and manual checks. Verify discovery **and**
-an allowed call, OAuth reuse in a fresh sandbox, expiry refresh, a denied call,
-and disconnect. The prototype has been exercised with real GitHub OAuth and a
-native Claude sandbox; that does not validate every provider or harness.
+an allowed call, OAuth reuse across execution hosts, expiry refresh, a denied call,
+and disconnect. Browser tests cover local-host and sandbox selection on desktop
+and mobile. Backend integration covers local-host selection and calls through
+`ProxyMcpManager`. Real GitHub OAuth and a native Claude sandbox have also been
+exercised; that does not validate every provider or harness.
