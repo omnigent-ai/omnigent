@@ -379,7 +379,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
                         request.headers["Authorization"] = f"Bearer {token}"
                         yield request
                     return
-                raise httpx.RequestError("Databricks token refresh returned no token")
+                raise httpx.RequestError(_no_token_error_message(self._server_url))
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
         if self._factory is None:
@@ -390,6 +390,19 @@ class _RunnerDatabricksAuth(ThreadedAuth):
             if token:
                 request.headers["Authorization"] = f"Bearer {token}"
                 yield request
+
+
+def _no_token_error_message(server_url: str | None) -> str:
+    """Name the expired login when it caused token resolution to fail."""
+    if server_url:
+        from omnigent.cli_auth import stored_token_status
+
+        if stored_token_status(server_url) == "expired":
+            return (
+                f"Omnigent login for {server_url} has expired; run "
+                f"`omnigent login {server_url}` to re-authenticate"
+            )
+    return "Databricks token refresh returned no token"
 
 
 def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
@@ -512,10 +525,13 @@ class _InitialAuthTokenFactory:
         if self._fallback_factory is None:
             self._retry_discovery_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
             if not self._no_credential_logged:
+                from omnigent.util.server_url import display_server_url
+
                 self._no_credential_logged = True
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                    "to renew it; run `databricks auth login` to re-authenticate",
+                    "to renew it; run `omnigent login %s` to re-authenticate",
+                    display_server_url(self._server_url),
                     extra={"session_id": runner_primary_session_id()},
                 )
         elif token:
@@ -524,7 +540,7 @@ class _InitialAuthTokenFactory:
 
     @property
     def declined(self) -> bool:
-        """True when the inner fallback factory has definitively declined."""
+        """Return whether a bare request should replace failed token discovery."""
         with self._lock:
             return self._declined_locked()
 
@@ -533,6 +549,8 @@ class _InitialAuthTokenFactory:
 
         :returns: See :attr:`declined`.
         """
+        if self._initial_token is None and self._fallback_factory is None:
+            return True
         f = self._fallback_factory
         return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
 
@@ -710,6 +728,12 @@ def _make_auth_token_factory(
             still_valid = load_token(resolved_server_url)
             if still_valid:
                 return still_valid
+            # Expired login records must stop before Databricks fallback.
+            # Pointer records are "absent" and still reach the SDK below.
+            from omnigent.cli_auth import stored_token_status
+
+            if stored_token_status(resolved_server_url) == "expired":
+                return None
         return sdk_token_source.current_token()
 
     # Probe once to check if a user credential is available.

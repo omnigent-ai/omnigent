@@ -235,6 +235,145 @@ def test_make_auth_token_factory_returns_none_without_databricks_creds(
     assert _make_auth_token_factory() is None
 
 
+@pytest.fixture()
+def _accounts_login_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> str:
+    """Isolate the token store and remove non-accounts credential paths."""
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_creds(*args: Any, **kwargs: Any) -> tuple[Any, str]:
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    server_url = "https://omnigent.example.com"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("RUNNER_SERVER_URL", server_url)
+    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_DELEGATED_AUTH", raising=False)
+    monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
+    for var in list(os.environ):
+        if var.startswith("DATABRICKS_"):
+            monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _no_creds,
+    )
+    monkeypatch.setattr("omnigent.runner._entry._runner_auth_factory", None)
+    return server_url
+
+
+def test_expired_accounts_login_does_not_reach_databricks_path(
+    _accounts_login_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop before ambient Databricks auth for an expired accounts record."""
+    from omnigent.cli_auth import store_token
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        """Config double whose authenticate() yields a Bearer header."""
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer ambient-databricks-token"}
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda host=None, profile=None: (
+            _DatabricksBearerAuth(_Cfg(), profile_name=None),
+            "https://ws.example.databricks.com",
+        ),
+    )
+
+    server_url = _accounts_login_env
+
+    store_token(
+        server_url,
+        token="accounts-jwt",
+        user_id="alice@example.com",
+        expires_at=time.time() + 3600,
+    )
+    factory = _make_auth_token_factory(server_url=server_url)
+    assert factory is not None
+    assert factory() == "accounts-jwt"
+
+    store_token(
+        server_url,
+        token="accounts-jwt",
+        user_id="alice@example.com",
+        expires_at=time.time() - 1,
+    )
+
+    assert factory() is None, (
+        "an expired accounts login must not fall through to ambient Databricks credentials"
+    )
+
+
+def test_expired_accounts_login_error_names_login_not_databricks(
+    _accounts_login_env: str,
+) -> None:
+    """Name the expired login and its remedy in the callback error."""
+    from omnigent.cli_auth import store_token
+
+    server_url = _accounts_login_env
+
+    store_token(
+        server_url,
+        token="accounts-jwt",
+        user_id="alice@example.com",
+        expires_at=time.time() + 3600,
+    )
+    factory = _make_auth_token_factory(server_url=server_url)
+    assert factory is not None
+    store_token(
+        server_url,
+        token="accounts-jwt",
+        user_id="alice@example.com",
+        expires_at=time.time() - 1,
+    )
+
+    auth = _RunnerDatabricksAuth(factory, server_url=server_url)
+    request = httpx.Request("GET", server_url + "/v1/health")
+
+    with pytest.raises(httpx.RequestError) as excinfo:
+        next(auth.auth_flow(request))
+
+    message = str(excinfo.value)
+    assert "Databricks" not in message
+    assert "omnigent login" in message
+    assert server_url in message
+
+
+def test_databricks_pointer_record_still_uses_sdk_path(
+    _accounts_login_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep resolving Databricks pointer records through the SDK."""
+    from omnigent.cli_auth import store_databricks_auth
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    server_url = _accounts_login_env
+
+    class _Cfg:
+        """Config double whose authenticate() yields a Bearer header."""
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer sdk-token"}
+
+    store_databricks_auth(server_url, workspace_host="https://ws.example.databricks.com")
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda host=None, profile=None: (
+            _DatabricksBearerAuth(_Cfg(), profile_name=None),
+            "https://ws.example.databricks.com",
+        ),
+    )
+
+    factory = _make_auth_token_factory(server_url=server_url)
+    assert factory is not None
+    assert factory() == "sdk-token"
+
+
 def test_make_auth_token_factory_re_resolves_when_reused_sdk_auth_goes_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -442,6 +581,53 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
         "Bearer managed-minted-token",
     ]
     assert len(mint_calls) >= 1
+
+
+def test_initial_host_token_declines_when_no_credential_to_renew(
+    _accounts_login_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Send bare auth after a rejected host bearer cannot be renewed."""
+    server_url = _accounts_login_env
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+
+    factory = _make_auth_token_factory()
+    assert isinstance(factory, _InitialAuthTokenFactory)
+
+    assert factory() == "host-bootstrap-token"
+    assert factory.declined is False
+
+    factory.invalidate()
+    assert factory() is None
+    assert factory.declined is True
+
+    auth = _RunnerDatabricksAuth(factory, server_url=server_url)
+    request = httpx.Request("GET", server_url + "/v1/agents/ag_1/download")
+    sent = next(auth.auth_flow(request))
+    assert "Authorization" not in sent.headers
+
+
+def test_initial_host_token_no_credential_remedy_names_omnigent_login(
+    _accounts_login_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Name ``omnigent login`` in the terminal no-credential log."""
+    server_url = _accounts_login_env
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+
+    factory = _make_auth_token_factory()
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert factory() == "host-bootstrap-token"
+
+    factory.invalidate()
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner._entry"):
+        assert factory() is None
+
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "omnigent login" in messages
+    assert server_url in messages
+    assert "databricks auth login" not in messages.lower()
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
