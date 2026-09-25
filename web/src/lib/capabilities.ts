@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Runtime capabilities probe.
  *
  * Hits ``GET /v1/info`` once at app boot to learn what the server
@@ -57,7 +57,7 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas";
+export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "customize";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -404,6 +404,7 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
   lakebox: "Databricks",
   daytona: "Daytona",
   e2b: "E2B",
+  agent_sandbox: "Agent Sandbox",
 };
 
 /**
