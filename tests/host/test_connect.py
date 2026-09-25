@@ -7449,16 +7449,24 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
     ]
 
 
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (ValueError("truncated transcript"), "This session's transcript could not be read."),
+        (RuntimeError("normalizer blew up"), "This session could not be read."),
+    ],
+    ids=["expected-read-error", "unexpected-error"],
+)
 async def test_handle_import_local_recovered_skip_logs_below_error(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    reason: str,
 ) -> None:
     """A recovered per-session import skip must not produce an ERROR record.
 
-    The skip is expected and fully recovered (counted on the done frame, the
-    batch continues), so it must surface as a sub-ERROR diagnostic that still
-    names the reason. An ERROR here is mirrored to the user's ``omnigent
-    host`` terminal and counted against session reliability.
+    Both the loader's expected read failures and a surprise exception type are
+    counted on the done frame and must log below ERROR while naming the cause.
     """
     from omnigent.host.frames import HostImportLocalDoneFrame, decode_host_frame
 
@@ -7468,7 +7476,7 @@ async def test_handle_import_local_recovered_skip_logs_below_error(
         return [("claude", "bad")]
 
     def _fake_load(source: str, session_id: str) -> SimpleNamespace:
-        raise RuntimeError("normalizer blew up")
+        raise error
 
     monkeypatch.setattr(
         "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
@@ -7487,7 +7495,7 @@ async def test_handle_import_local_recovered_skip_logs_below_error(
             HostImportLocalFrame(request_id="req_skiplog", source="all", limit=5),
         )
 
-    # The recovery itself still holds: skip counted, stream closed ok.
+    # The recovery itself still holds: skip counted with its reason, stream closed ok.
     done_frames = [
         f
         for f in (decode_host_frame(text) for text in sent)
@@ -7495,15 +7503,16 @@ async def test_handle_import_local_recovered_skip_logs_below_error(
     ]
     assert len(done_frames) == 1
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1
-
-    skip_records = [
-        r for r in caplog.records if "import_local: skipping session" in r.getMessage()
+    assert done_frames[0].failures == [
+        {"external_session_id": "bad", "source": "claude", "reason": reason}
     ]
+
+    skip_records = [r for r in caplog.records if "id='bad'" in r.getMessage()]
     assert skip_records, caplog.text
-    # The diagnostic names the reason but stays below ERROR.
-    assert any("RuntimeError" in r.getMessage() for r in skip_records)
     over_warning = [r for r in skip_records if r.levelno > logging.WARNING]
     assert not over_warning, [f"{r.levelname}: {r.getMessage()}" for r in over_warning]
+    # Below ERROR, the diagnostic still names the cause.
+    assert any(type(error).__name__ in r.getMessage() for r in skip_records)
 
 
 async def test_handle_import_local_send_failure_skips_only_that_session(
