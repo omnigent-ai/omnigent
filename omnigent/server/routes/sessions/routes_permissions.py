@@ -12,6 +12,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.db.account_authority import target_account_scope
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
@@ -169,16 +170,18 @@ def register_permissions_routes(
                     "Public access is limited to read-only (level 1)",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
-        if existing is not None and existing.level == LEVEL_OWNER:
-            raise OmnigentError(
-                "Cannot modify owner permissions",
-                code=ErrorCode.FORBIDDEN,
+        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
+        with target_account_scope(body.user_id, target.account_generation if target else None):
+            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+            if existing is not None and existing.level == LEVEL_OWNER:
+                raise OmnigentError(
+                    "Cannot modify owner permissions",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
+            perm = await asyncio.to_thread(
+                permission_store.grant, body.user_id, session_id, body.level
             )
-        await asyncio.to_thread(permission_store.ensure_user, body.user_id)
-        perm = await asyncio.to_thread(
-            permission_store.grant, body.user_id, session_id, body.level
-        )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
@@ -423,10 +426,11 @@ def _to_agent_object(
                 and native_coding_agent_for_agent_name(loaded.spec.name) is not None
                 else list(loaded.spec.terminals or {})
             )
-            # Bundled skills only (mirrors GET /v1/agents); the merged
-            # bundled + host-discovered set lives on the session snapshot.
+            # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description) for s in loaded.spec.skills
+                SkillSummary(name=s.name, description=s.description)
+                for s in loaded.spec.skills
+                if s.user_invocable
             ]
             mcp_servers = [
                 MCPServerSummary(

@@ -469,6 +469,28 @@ describe("PermissionsModal", () => {
     });
   });
 
+  // Overflow regression: a `flex-row` footer override forced Copy link,
+  // "Open in mobile app", and Done onto one row at every width. On phones the
+  // row's min-content exceeds the dialog, and as a min-width:auto grid item it
+  // widens the whole dialog grid track, clipping every stretched sibling (the
+  // add-grant row's Grant button included) at the dialog's right edge. jsdom
+  // does no layout, so pin the class contract: stacked by default, a row only
+  // from sm: up.
+  describe("footer on a phone-width dialog", () => {
+    it("keeps the footer stacked below sm instead of forcing one row", async () => {
+      listMock.mockResolvedValue([]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => expect(screen.getByText("No grants yet.")).toBeInTheDocument());
+      const footer = document.querySelector('[data-slot="dialog-footer"]');
+      expect(footer).toHaveClass("flex-col-reverse", "sm:flex-row", "sm:justify-between");
+      expect(footer).not.toHaveClass("flex-row", "justify-between");
+    });
+  });
+
   describe("with a host user-search provider (combobox)", () => {
     beforeEach(() => {
       // Install a deterministic searcher so the add-user field upgrades to the

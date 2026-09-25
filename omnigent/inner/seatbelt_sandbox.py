@@ -371,6 +371,8 @@ class SeatbeltSandboxBackend(SandboxBackend):
             ``sandbox-exec`` binary cannot be located.
         """
         sandbox_spec = spec.sandbox or OSEnvSandboxSpec(type=self.type_name)
+        if any(grant.copy_on_write for grant in sandbox_spec.write_path_specs):
+            raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
 
         if sys.platform != "darwin":
             raise OSError(
@@ -394,10 +396,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
         # the spec opts in. Empty default honours the "no surprise
         # writes" contract — agents that need an editable project
         # tree opt in via ``write_paths: ["."]``.
-        write_paths_config = (
-            sandbox_spec.write_paths if sandbox_spec.write_paths is not None else []
-        )
-        write_roots = [_resolve_root(cwd, root) for root in write_paths_config]
+        write_roots = [_resolve_root(cwd, grant.path) for grant in sandbox_spec.write_path_specs]
 
         write_files: list[Path] = []
         if sandbox_spec.write_files is not None:
@@ -1130,6 +1129,11 @@ def _build_profile(
             lines.append(
                 f"(deny network-outbound (remote unix-socket (path-literal {_quote(canonical)})))"
             )
+
+    for source_path in policy.credential_source_paths or []:
+        quoted = _quote(str(source_path.resolve()))
+        lines.append(f"(deny file-read* file-write* (literal {quoted}))")
+        lines.append(f"(deny network-outbound (remote unix-socket (path-literal {quoted})))")
 
     return "\n".join(lines) + "\n"
 

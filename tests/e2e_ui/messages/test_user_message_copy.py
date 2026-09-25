@@ -1,13 +1,14 @@
 """E2E: the copy action on a user's own message bubble.
 
 Users can copy assistant responses; the same affordance now sits below their
-own messages. This drives the full browser → SPA → server stack: send a
-message, click the Copy control beneath the user bubble, and assert the text
-landed on the clipboard and the icon flipped to its copied state.
+own messages. This drives the full browser → SPA → server stack: send an
+HTML-like multiline message, reload it from persistence, click Copy, and
+assert the exact original text landed on the clipboard.
 
 Selectors:
   - user bubble: ``data-testid="message-bubble"`` + ``data-role="user"``
-  - copy button: accessible name "Copy" (MessageAction sr-only label/tooltip)
+  - copy button: accessible name "Copy" exactly (MessageAction sr-only);
+    exact match avoids colliding with the sibling "Copy link" deep-link control
   - copied state: lucide check icon (``svg.lucide-check``) replaces the copy
     icon (``svg.lucide-copy``) for ~2s after a successful write
   - composer: placeholder "Send a message…"
@@ -35,11 +36,12 @@ def test_user_message_copy_button_copies_text(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Clicking Copy under a user bubble writes its text to the clipboard.
+    """Reloaded HTML-like text remains literal and copies exactly.
 
     A failure means the copy affordance regressed: either the button is not
     rendered below the user bubble, its click handler no longer writes to
-    ``navigator.clipboard``, or the copied-state icon swap broke.
+    ``navigator.clipboard``, persistence changed the source text, literal tags
+    disappeared, or the copied-state icon swap broke.
 
     Clipboard read/write requires the ``clipboard-read``/``clipboard-write``
     permissions, granted on a dedicated context here so the default
@@ -47,6 +49,7 @@ def test_user_message_copy_button_copies_text(
     """
     base_url, session_id = seeded_session
     marker = f"copy-me-{uuid.uuid4().hex[:8]}"
+    message = f'<{marker} data-kind="example">\n  Keep <exact lines> visible.\n</{marker}>'
 
     ctx = browser.new_context()
     ctx.grant_permissions(["clipboard-read", "clipboard-write"])
@@ -54,12 +57,19 @@ def test_user_message_copy_button_copies_text(
         page = ctx.new_page()
         page.goto(f"{base_url}/c/{session_id}")
 
-        _send(page, marker)
+        _send(page, message)
 
         bubble = page.locator(_USER_BUBBLE).filter(has_text=marker)
         expect(bubble).to_be_visible(timeout=15_000)
+        expect(bubble.get_by_test_id("copy-message-link")).to_be_enabled(timeout=15_000)
 
-        copy_button = bubble.get_by_role("button", name="Copy")
+        page.reload()
+        bubble = page.locator(_USER_BUBBLE).filter(has_text=marker)
+        expect(bubble).to_contain_text(f'<{marker} data-kind="example">', timeout=15_000)
+        expect(bubble).to_contain_text("Keep <exact lines> visible.")
+        expect(bubble).to_contain_text(f"</{marker}>")
+
+        copy_button = bubble.get_by_role("button", name="Copy", exact=True)
         # Copy icon is present before the click; hover-reveal only affects
         # opacity, not DOM presence, so the button is always in the tree.
         expect(copy_button.locator("svg.lucide-copy")).to_have_count(1)
@@ -70,6 +80,6 @@ def test_user_message_copy_button_copies_text(
         expect(copy_button.locator("svg.lucide-check")).to_have_count(1, timeout=5_000)
 
         clipboard_text = page.evaluate("() => navigator.clipboard.readText()")
-        assert clipboard_text == marker
+        assert clipboard_text == message
     finally:
         ctx.close()

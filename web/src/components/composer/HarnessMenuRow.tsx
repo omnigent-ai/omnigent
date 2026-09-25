@@ -4,14 +4,27 @@ import { cn } from "@/lib/utils";
 export const HARNESS_MENU_CLASS_NAME =
   "composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[17.5rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2";
 
-export const COMPOSER_HARNESS_MENU_SIZE = "w-[17.5rem] min-w-0";
+export const COMPOSER_HARNESS_MENU_SIZE = "w-[17.5rem]";
 
 export const HARNESS_MENU_ROW_CLASS_NAME =
-  "composer-agent-row group/agent relative flex min-h-8 w-full items-center gap-1 rounded-lg pr-3 transition-colors hover:bg-muted focus:bg-muted [&>svg]:hidden";
+  "composer-agent-row group/agent relative flex min-h-8 w-full items-center rounded-lg";
 
 export function PickerSectionHeader({ children }: { children: ReactNode }) {
   return (
-    <div className="px-2 py-1 text-xs leading-5 font-normal text-muted-foreground">{children}</div>
+    <div
+      data-harness-menu-section-label=""
+      className="px-2 py-1 text-xs leading-5 font-normal text-muted-foreground"
+    >
+      {children}
+    </div>
+  );
+}
+
+export function HarnessMenuNavigationLabel({ children }: { children: ReactNode }) {
+  return (
+    <span data-harness-menu-navigation-label="" className="flex-1 text-left">
+      {children}
+    </span>
   );
 }
 
@@ -21,11 +34,14 @@ export function HarnessMenuRowContent({
   summary,
   description,
   active,
-  editable = true,
+  editable = false,
   isMobile = false,
+  showDetails = false,
+  keyboardNavigation = true,
   warning,
   summaryTestId,
   editTestId,
+  onEditPointerDown,
 }: {
   icon: ReactNode;
   label: string;
@@ -34,19 +50,30 @@ export function HarnessMenuRowContent({
   active: boolean;
   editable?: boolean;
   isMobile?: boolean;
+  showDetails?: boolean;
+  keyboardNavigation?: boolean;
   warning?: ReactNode;
   summaryTestId?: string;
   editTestId?: string;
+  onEditPointerDown?: () => void;
 }) {
-  const summaryVisibility = active
-    ? "opacity-100"
-    : "opacity-0 group-hover/agent:opacity-100 group-focus-within/agent:opacity-100";
+  const summaryVisibility =
+    showDetails || active
+      ? "opacity-100"
+      : cn(
+          "opacity-0",
+          keyboardNavigation
+            ? "group-focus-within/agent:opacity-100"
+            : "group-hover/agent:opacity-100",
+        );
   return (
     <>
-      <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-0 pl-2 text-[13px] leading-5">
+      <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-1 pl-2 text-[13px] leading-5">
         {icon}
         <span className={cn("flex min-w-0 items-center gap-1 text-left", active && "font-medium")}>
-          <span className="truncate">{label}</span>
+          <span data-harness-menu-choice-label="" className="truncate">
+            {label}
+          </span>
           {warning}
         </span>
         {description ? (
@@ -54,9 +81,11 @@ export function HarnessMenuRowContent({
             <span
               className={cn(
                 "block truncate",
-                active
+                showDetails || active
                   ? "invisible"
-                  : "group-hover/agent:invisible group-focus-within/agent:invisible",
+                  : keyboardNavigation
+                    ? "group-focus-within/agent:invisible"
+                    : "group-hover/agent:invisible",
               )}
             >
               {description}
@@ -68,8 +97,9 @@ export function HarnessMenuRowContent({
         ) : (
           <span
             data-testid={summaryTestId}
+            title={summary}
             className={cn(
-              "ml-auto min-w-0 flex-1 whitespace-normal break-words text-right text-xs leading-4 text-muted-foreground",
+              "ml-auto min-w-0 flex-1 truncate text-right text-xs leading-4 text-muted-foreground",
               summaryVisibility,
             )}
           >
@@ -81,8 +111,10 @@ export function HarnessMenuRowContent({
         <span
           aria-label={`Edit ${label} configuration`}
           data-testid={editTestId}
+          data-harness-edit=""
+          onPointerDown={onEditPointerDown}
           className={cn(
-            "composer-agent-edit flex h-8 shrink-0 cursor-pointer items-center rounded-none px-0 py-0 text-xs leading-4 text-muted-foreground focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
+            "composer-agent-edit flex h-8 shrink-0 cursor-pointer items-center rounded-none px-0 py-0 text-xs leading-4 text-muted-foreground underline-offset-2 hover:underline focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
             summaryVisibility,
             isMobile && "opacity-100",
           )}

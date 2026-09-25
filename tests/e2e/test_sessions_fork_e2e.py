@@ -41,11 +41,10 @@ from tests.e2e.conftest import (
     set_fallback_mock_llm,
 )
 
-# The fork-switch TARGET. Only BUILT-IN agents (``session_id IS NULL``)
-# are bindable fork targets — agents uploaded via multipart
-# ``POST /v1/sessions`` are session-scoped and the route rejects them.
-# The live-server fixture seeds this one via OMNIGENT_BUILTIN_AGENT_DIRS
-# precisely for fork/switch e2e tests (see conftest).
+# The fork-switch TARGET. A built-in agent, seeded by the live-server
+# fixture via OMNIGENT_BUILTIN_AGENT_DIRS precisely for fork/switch e2e
+# tests (see conftest) — session-scoped targets are bindable too,
+# but this fixture only has a built-in one on hand.
 _BUILTIN_TARGET = "sdk-chat-builtin"
 
 # Codewords the LLM could not produce unless they came through the

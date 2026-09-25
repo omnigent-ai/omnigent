@@ -9,14 +9,15 @@
  * (``editable: false``), the control is read-only.
  */
 
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { PageScroll } from "@/components/PageScroll";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { type SharingMode, isSingleUserMode } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { cn } from "@/lib/utils";
-import { useSetSharing, useSharing } from "@/hooks/useSharing";
+import { type DefaultPublicSessions, useSetSharing, useSharing } from "@/hooks/useSharing";
 
 /** The four tiers, most-permissive first, with human-readable copy. */
 const TIERS: { id: SharingMode; label: string; description: string }[] = [
@@ -45,6 +46,46 @@ const TIERS: { id: SharingMode; label: string; description: string }[] = [
       "Sharing is disabled. No new grants can be created and the Share control is hidden.",
   },
 ];
+
+/** Which new sessions start public, most-private first. */
+const DEFAULT_PUBLIC_OPTIONS: { id: DefaultPublicSessions; label: string; description: string }[] =
+  [
+    {
+      id: "off",
+      label: "Private",
+      description: "New sessions start private. Owners share them explicitly.",
+    },
+    {
+      id: "sandbox",
+      label: "Cloud sandbox sessions public",
+      description:
+        "Sessions running in a server-managed cloud sandbox start with public read access. Sessions on a user's own machine stay private.",
+    },
+    {
+      id: "all",
+      label: "All sessions public",
+      description: "Every new session starts with public read access.",
+    },
+  ];
+
+/**
+ * Greys out a control another setting overrides and explains why on hover.
+ * Renders children untouched when ``reason`` is null.
+ */
+function BlockedBy({ reason, children }: { reason: string | null; children: ReactNode }) {
+  if (reason === null) return children;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div tabIndex={0} className="cursor-not-allowed opacity-50" data-blocked="true">
+          <span className="sr-only">{reason}</span>
+          {children}
+        </div>
+      </TooltipTrigger>
+      <TooltipContent side="top">{reason}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 export function SharingPage() {
   const info = useServerInfo();
@@ -91,6 +132,22 @@ export function SharingPage() {
   const editable = state?.editable ?? false;
   const publicEnabled = state?.public_sharing_enabled ?? true;
   const publicEditable = state?.public_sharing_editable ?? false;
+  const defaultPublic = state?.default_public_sessions ?? "off";
+  const defaultPublicEditable = state?.default_public_sessions_editable ?? false;
+  // Settings a higher-level one overrides are greyed out and show their
+  // effective value; the saved value returns once the blocker is lifted.
+  const sharingOff = current === "off";
+  const publicBlockedReason = sharingOff ? "Turn sharing on to use public access." : null;
+  const defaultPublicBlockedReason = sharingOff
+    ? "Turn sharing on to change the default visibility."
+    : !publicEnabled
+      ? "Turn on public access to change the default visibility."
+      : null;
+  const effectivePublic = publicEnabled && !sharingOff;
+  const effectiveDefaultPublic = defaultPublicBlockedReason ? "off" : defaultPublic;
+  const publicDisabled = !publicEditable || setMode.isPending || publicBlockedReason !== null;
+  const defaultPublicDisabled =
+    !defaultPublicEditable || setMode.isPending || defaultPublicBlockedReason !== null;
 
   function choose(mode: SharingMode) {
     if (!editable || mode === current || setMode.isPending) return;
@@ -99,9 +156,15 @@ export function SharingPage() {
   }
 
   function togglePublic(next: boolean) {
-    if (!publicEditable || setMode.isPending) return;
+    if (publicDisabled) return;
     setError(null);
     setMode.mutate({ public_sharing: next }, { onError: (err) => setError(err.message) });
+  }
+
+  function chooseDefaultPublic(next: DefaultPublicSessions) {
+    if (defaultPublicDisabled || next === defaultPublic) return;
+    setError(null);
+    setMode.mutate({ default_public_sessions: next }, { onError: (err) => setError(err.message) });
   }
 
   return (
@@ -162,28 +225,82 @@ export function SharingPage() {
             </fieldset>
 
             {/* Public access — a separate switch from the tiers above. */}
-            <div className="mt-6 flex items-center justify-between rounded-lg border px-4 py-3">
-              <div className="pr-4">
-                <p className="text-ui font-medium">Public access</p>
-                <p className="mt-0.5 text-sm text-muted-foreground">
-                  Allow sharing a session with anyone who has the link (public read access). When
-                  off, the Share dialog's "Public access" toggle is hidden and new public grants are
-                  rejected; sessions already shared publicly stay public until revoked.
+            <BlockedBy reason={publicBlockedReason}>
+              <div className="mt-6 flex items-center justify-between rounded-lg border px-4 py-3">
+                <div className="pr-4">
+                  <p className="text-ui font-medium">Public access</p>
+                  <p className="mt-0.5 text-sm text-muted-foreground">
+                    Allow sharing a session with anyone who has the link (public read access). When
+                    off, the Share dialog's "Public access" toggle is hidden and new public grants
+                    are rejected; sessions already shared publicly stay public until revoked.
+                  </p>
+                  {!publicEditable && (
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      Managed by this deployment and can't be changed here.
+                    </p>
+                  )}
+                </div>
+                <Switch
+                  checked={effectivePublic}
+                  onCheckedChange={togglePublic}
+                  disabled={publicDisabled}
+                  aria-label="Public access"
+                  componentId="settings.sharing.public_access"
+                />
+              </div>
+            </BlockedBy>
+            {/* Default visibility of NEW sessions: writes a public read grant at creation. */}
+            <BlockedBy reason={defaultPublicBlockedReason}>
+              <div className="mt-6">
+                <p className="text-ui font-medium">Default visibility for new sessions</p>
+                <p className="mt-0.5 mb-2 text-sm text-muted-foreground">
+                  Whether new sessions start with public read access. Owners can still revoke it
+                  from the Share dialog. Existing sessions are unchanged.
                 </p>
-                {!publicEditable && (
-                  <p className="mt-1 text-sm text-muted-foreground">
+                {!defaultPublicEditable && (
+                  <p className="mb-2 text-sm text-muted-foreground">
                     Managed by this deployment and can't be changed here.
                   </p>
                 )}
+                <fieldset
+                  className="space-y-2"
+                  disabled={defaultPublicDisabled}
+                  aria-label="Default visibility for new sessions"
+                >
+                  {DEFAULT_PUBLIC_OPTIONS.map((option) => {
+                    const selected = option.id === effectiveDefaultPublic;
+                    return (
+                      <label
+                        key={option.id}
+                        className={cn(
+                          "flex cursor-pointer items-start gap-3 rounded-lg border px-4 py-3 transition-colors",
+                          selected
+                            ? "border-primary bg-primary/5"
+                            : "border-border hover:bg-muted/50",
+                          defaultPublicDisabled && "cursor-not-allowed opacity-70",
+                        )}
+                      >
+                        <input
+                          type="radio"
+                          name="default-public-sessions"
+                          value={option.id}
+                          checked={selected}
+                          onChange={() => chooseDefaultPublic(option.id)}
+                          disabled={defaultPublicDisabled}
+                          className="mt-1 size-4 accent-primary"
+                        />
+                        <span className="flex-1">
+                          <span className="block text-ui font-medium">{option.label}</span>
+                          <span className="mt-0.5 block text-sm text-muted-foreground">
+                            {option.description}
+                          </span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </fieldset>
               </div>
-              <Switch
-                checked={publicEnabled}
-                onCheckedChange={togglePublic}
-                disabled={!publicEditable || setMode.isPending}
-                aria-label="Public access"
-                componentId="settings.sharing.public_access"
-              />
-            </div>
+            </BlockedBy>
             {error && <p className="mt-3 text-ui text-destructive">{error}</p>}
           </>
         )}

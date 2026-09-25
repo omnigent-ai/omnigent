@@ -337,6 +337,27 @@ async def test_on_fire_exception_does_not_break_rearm() -> None:
     assert len(seam.live()) == 1  # re-armed despite the error
 
 
+async def test_inactive_fire_does_not_remove_a_replacement_timer() -> None:
+    reached, resume = asyncio.Event(), asyncio.Event()
+
+    async def on_fire(workspace_id, task_id):
+        reached.set()
+        await resume.wait()
+        return False
+
+    scheduler, _clock, seam, _fired = _make([_task("a")], on_fire=on_fire)
+    await scheduler.start()
+    firing = asyncio.create_task(seam.fire_latest())
+    try:
+        await reached.wait()
+        scheduler.update(_task("a", rrule="FREQ=DAILY"))
+    finally:
+        resume.set()
+        await firing
+    assert scheduler.job_count == 1
+    assert len(seam.live()) == 1
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 

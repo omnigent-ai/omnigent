@@ -61,7 +61,7 @@ def test_reconnecting_state_shows_spinner(
     """The in-flight retry's "Reconnecting" badge carries an animated spinner.
 
     Journey: a runner connection failure leaves an error pill in the chat;
-    the user clicks Retry; while the reconnection attempt is in flight the
+    the user clicks Resume session; while the reconnection attempt is in flight the
     pill reads "Reconnecting". The badge must pair that text with a spinner
     (the app's ``animate-spin`` loader, frozen automatically under
     ``prefers-reduced-motion`` by the global CSS gate) so the state reads as
@@ -98,7 +98,7 @@ def test_reconnecting_state_shows_spinner(
     expect(pill).to_contain_text("The connection to the host dropped unexpectedly")
 
     # The user retries; the pill swaps to the "Reconnecting" state.
-    pill.get_by_role("button", name="Retry").click()
+    pill.get_by_role("button", name="Resume session").click()
     reconnecting = page.get_by_test_id("error-reconnecting")
     expect(reconnecting).to_be_visible(timeout=15_000)
 

@@ -29,13 +29,17 @@ import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
-# Subscriber registry: user_key -> set of (queue, event_loop) pairs. The loop
-# reference lets a publisher running on a different thread/loop deliver into the
-# queue's owning loop via ``call_soon_threadsafe`` (matches session_stream).
-_subscribers: dict[
+from omnigent.db.workspace_cache import WorkspaceScopedCache
+
+# Subscriber registry: user_key -> set of (queue, event_loop) pairs, namespaced
+# by workspace so the same user_id in two workspaces on one pod never shares a
+# stream. The loop reference lets a publisher running on a different thread/loop
+# deliver into the queue's owning loop via ``call_soon_threadsafe`` (matches
+# session_stream).
+_subscribers: WorkspaceScopedCache[
     str,
     set[tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop]],
-] = {}
+] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 

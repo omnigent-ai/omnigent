@@ -14,12 +14,21 @@ export interface SharingState {
   public_sharing_enabled: boolean;
   /** False when the deployment manages public access itself (not file-backed). */
   public_sharing_editable: boolean;
+  /** Which new sessions start with a public read grant. */
+  default_public_sessions: DefaultPublicSessions;
+  /** False when the deployment manages this default itself (not file-backed). */
+  default_public_sessions_editable: boolean;
+  default_public_sessions_options: DefaultPublicSessions[];
 }
 
-/** Partial update for ``PUT /v1/sharing`` — set either or both. */
+/** ``off`` = all private, ``sandbox`` = cloud sandbox sessions public, ``all`` = every session. */
+export type DefaultPublicSessions = "off" | "sandbox" | "all";
+
+/** Partial update for ``PUT /v1/sharing``: set any subset. */
 export interface SharingUpdate {
   sharing_mode?: SharingMode;
   public_sharing?: boolean;
+  default_public_sessions?: DefaultPublicSessions;
 }
 
 const QUERY_KEY = ["sharing"];

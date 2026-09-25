@@ -227,6 +227,30 @@ def is_registered_handler(handler: str) -> bool:
     return handler in _registry_by_handler
 
 
+def function_policy_handler_allowed(
+    path: object,
+    arguments: dict[str, object] | None,
+) -> bool:
+    """Whether a function policy uses a registered handler.
+
+    Legacy wrappers are checked against their target handler. Non-string paths
+    are left to the spec parser to reject with a validation error.
+    """
+    if not isinstance(path, str):
+        return True
+    if is_registered_handler(path):
+        return True
+    # Local import keeps this module free of a spec-layer import at load time
+    # (registry is imported very early and widely); the shim path is only
+    # consulted when vetting a shim-wrapped policy.
+    from omnigent.spec._omnigent_legacy_shim import BUILD_PATH as _SHIM_BUILD_PATH
+
+    if path == _SHIM_BUILD_PATH:
+        target = arguments.get("target") if isinstance(arguments, dict) else None
+        return isinstance(target, str) and is_registered_handler(target)
+    return False
+
+
 def get_params_schema(handler: str) -> dict[str, object] | None:
     """Look up the params schema for a handler path.
 
