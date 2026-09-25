@@ -123,4 +123,8 @@ def test_mysql_account_migration_resumes_after_committed_column(db_uri, column):
             ).scalar_one()
             == "original-refresh-hash"
         )
-    assert _get_current_db_revision(engine) == "ar1b2c3d4e5f"
+    from alembic.script import ScriptDirectory
+
+    assert (
+        _get_current_db_revision(engine) == ScriptDirectory.from_config(config).get_current_head()
+    )

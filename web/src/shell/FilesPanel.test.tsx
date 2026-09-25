@@ -153,9 +153,10 @@ function searchResult(
   files: WorkspaceFile[] | undefined = undefined,
   isFetching = false,
   isPlaceholderData = false,
+  truncated = false,
 ) {
   return {
-    data: files,
+    data: files === undefined ? undefined : { files, truncated },
     isFetching,
     isPlaceholderData,
     isLoading: false,
@@ -175,6 +176,7 @@ function renderPanel({
   treeSearchResults = [],
   isSearching = false,
   isSearchPlaceholder = false,
+  isSearchTruncated = false,
   reachable = null,
   onFileSelect = vi.fn(),
 }: {
@@ -188,6 +190,7 @@ function renderPanel({
   treeSearchResults?: WorkspaceFile[] | undefined;
   isSearching?: boolean;
   isSearchPlaceholder?: boolean;
+  isSearchTruncated?: boolean;
   reachable?: {
     unconfined: boolean;
     roots: { path: string; access: string; origin: string }[];
@@ -198,7 +201,9 @@ function renderPanel({
   useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
   useDirectoryMock.mockReturnValue(directoryResult());
   useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
-  useSearchMock.mockReturnValue(searchResult(treeSearchResults, isSearching, isSearchPlaceholder));
+  useSearchMock.mockReturnValue(
+    searchResult(treeSearchResults, isSearching, isSearchPlaceholder, isSearchTruncated),
+  );
 
   return render(
     <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
@@ -802,6 +807,30 @@ describe("FilesPanel tree (Explore) search", () => {
     // on the flat result paths that prove search mode is active
     expect(screen.getByText((t) => t.includes("abc/test.md"))).toBeInTheDocument();
     expect(screen.getByText((t) => t.includes("src/main.py"))).toBeInTheDocument();
+  });
+
+  it("tells the user when the server stopped searching early instead of a flat no-match", () => {
+    // The hook now carries the server's truncated flag; the panel must hand it
+    // to the tree so an empty result on a huge repo is not shown as definitive.
+    vi.useFakeTimers();
+
+    renderPanel({
+      conversationId: "conv_tree_search_truncated",
+      files: [file("src/App.tsx")],
+      treeSearchResults: [],
+      isSearchTruncated: true,
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+      target: { value: "reyden" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(screen.getByText(/No files match "reyden"/)).toHaveTextContent(
+      "the search stopped early, so results may be incomplete",
+    );
   });
 
   it("does not render stale results from a previous query while the new one loads", () => {

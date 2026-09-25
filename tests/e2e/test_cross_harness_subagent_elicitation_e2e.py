@@ -125,6 +125,18 @@ def cross_harness_rig(
     claude_home = native_home / ".claude"
     for directory in (workspace, config_dir, codex_home, claude_home):
         directory.mkdir(parents=True)
+    # Seed before any Claude process (including model probes) can cache
+    # an incomplete config and later overwrite the runner's onboarding state.
+    (native_home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "hasCompletedOnboarding": True,
+                "theme": "dark",
+                "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
     (config_dir / "config.yaml").write_text(
         yaml.safe_dump(
             {

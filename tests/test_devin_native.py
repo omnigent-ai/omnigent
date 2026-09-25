@@ -6,6 +6,7 @@ import json
 import shutil
 from pathlib import Path
 
+import click
 import pytest
 
 from omnigent.harnesses.devin_native import bridge as bridge_module
@@ -602,6 +603,18 @@ class TestAgentInstructionsPreamble:
 
 class TestLaunchArgs:
     """Omnigent owns resume, workspace trust and the transcript export."""
+
+    def test_missing_cli_still_rejects_launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from omnigent.harnesses.devin_native import main as devin_native
+
+        monkeypatch.setattr(devin_native, "resolve_cli_binary", lambda *_args, **_kwargs: None)
+        with pytest.raises(click.ClickException, match="requires the 'devin' CLI"):
+            devin_native.build_devin_launch(
+                [],
+                bridge_dir=Path("/b"),
+                config_path=Path("/b/devin_config.json"),
+                export_file=Path("/b/transcript.atif.json"),
+            )
 
     def _args(self, **kwargs: object) -> list[str]:
         return build_devin_launch_args(

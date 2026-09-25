@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import pytest_asyncio
@@ -208,6 +209,37 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     assert updated.runner_id is not None, "runner_id should be written to session row"
     assert updated.runner_id.startswith("runner_token_"), "runner_id should be a token-bound id"
     assert updated.host_id == _HOST_ID, "host_id should be written to session row"
+
+
+async def test_sandbox_fork_cannot_launch_on_ordinary_host(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, registry, _hs, conv_store = binding_app
+    comm = await _connect_host(app, registry)
+    source = conv_store.create_conversation(
+        inference_snapshot={"runtime_config": {"providers": {}}}
+    )
+    fork = conv_store.fork_conversation(source.id)
+    assert fork.inference_snapshot == source.inference_snapshot
+    send = Mock(wraps=registry.send_text)
+    monkeypatch.setattr(registry, "send_text", send)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            with pytest.raises(OmnigentError, match="saved sandbox inference profile") as error:
+                await client.post(
+                    f"/v1/hosts/{_HOST_ID}/runners",
+                    json={"session_id": fork.id, "workspace": "/tmp"},
+                )
+        assert error.value.code == ErrorCode.INVALID_INPUT
+        send.assert_not_called()
+        saved = conv_store.get_conversation(fork.id)
+        assert saved is not None
+        assert saved.host_id is None
+        assert saved.runner_id is None
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=1.0)
 
 
 async def test_host_id_in_session_response(
@@ -1334,6 +1366,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
         workspace="/root/workspace",
         agent_id=None,
         sub_agent_name=None,
+        inference_snapshot=None,
     )
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)

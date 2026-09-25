@@ -178,6 +178,45 @@ def test_username_reuse_does_not_inherit_connections_projects_or_spending(db_uri
             )
         with pytest.raises(OmnigentError, match="revoked"):
             projects.create(uuid.uuid4().hex, "late-project", "alice")
+        for order in ([], None):
+            with pytest.raises(OmnigentError, match="revoked"):
+                projects.save_order(order, user_id="alice")
+
+
+def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlPreference, workspace_scope
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    for workspace_id in (101, 102):
+        with workspace_scope(workspace_id):
+            for user_id in ("alice", "bob"):
+                accounts.create_user_with_password(user_id, "test-password-hash")
+    with Session(accounts._engine) as session:
+        session.add_all(
+            SqlPreference(workspace_id=workspace_id, user_id=user_id, key=key, value="{}")
+            for workspace_id in (101, 102)
+            for user_id in ("alice", "bob")
+            for key in ("project_order", "theme")
+        )
+        session.commit()
+
+    with workspace_scope(101):
+        assert accounts.delete_user("alice") is True
+        accounts.create_user_with_password("alice", "replacement-password-hash")
+    with Session(accounts._engine) as session:
+        remaining = set(
+            session.execute(
+                select(SqlPreference.workspace_id, SqlPreference.user_id, SqlPreference.key)
+            ).all()
+        )
+    assert remaining == {
+        (workspace_id, user_id, key)
+        for workspace_id, user_id in ((101, "bob"), (102, "alice"), (102, "bob"))
+        for key in ("project_order", "theme")
+    }
 
 
 def test_cleanup_failure_rolls_back_revocation(

@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -129,6 +129,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.creation_logging import creation_metadata, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -201,6 +202,9 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _recent_mirrored_tool_calls,
     _RelayHandle,
     _runner_relay_tasks,
+    _runner_status_probe_backoff,
+    _runner_status_probe_inflight,
+    _RunnerStatusProbeBackoff,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -708,6 +712,22 @@ async def _best_effort_stop(
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
 
+# Deferred archive stops still inside the undo grace, keyed by session id.
+# Scheduling a stop cancels the session's prior pending one, and an unarchive
+# cancels it outright — so a stale timer from an earlier archive can't fire
+# after an Undo + re-archive on the same replica. This is the same-replica
+# fast path; the persisted ``archived`` re-check in _archive_stop is the
+# cross-replica backstop. One entry per session.
+# custom-lint: disable-next=workspace-scoped-cache -- undo-window teardown timers
+_pending_archive_stops: dict[str, asyncio.Task[None]] = {}
+
+# When the deferred archive stop re-reads the row and that read fails, retry a
+# few times before giving up: a transient blip must not force a blind stop-or-
+# skip guess (either can be wrong). Small/short — this only rides out a brief
+# failure, not a sustained outage.
+_ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
+_ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+
 
 async def _archive_stop(
     session_id: str,
@@ -728,6 +748,14 @@ async def _archive_stop(
     Every step is best-effort: a wedged, offline, or already-stopped
     runner must not leave the session un-archived.
 
+    The persisted ``archived`` flag is the undo guard: archiving pops an
+    Undo pill, and teardown is deferred past that window (see
+    :func:`_spawn_archive_stop`). When it fires it re-reads the row and
+    skips when the session is no longer archived, so undoing keeps the
+    runner alive. Reading the persisted flag — not a per-replica in-memory
+    marker — makes this correct even when the Undo lands on a different
+    replica than the one holding the timer.
+
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
     :param runner_router: The ``RunnerRouter`` for runner-client
@@ -738,18 +766,40 @@ async def _archive_stop(
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
 
-    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
-    try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Archive host-runner teardown lookup failed for %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
+    # Re-read the row to honor a late Undo before tearing down. Neither guess on
+    # a failed read is safe — stopping could kill a session just unarchived on
+    # another replica (dead pane), skipping could leak a runner that should be
+    # down. So retry a transient blip a few times; only give up (and skip, the
+    # conservative choice that never kills a live session) on a sustained
+    # outage, which a later lifecycle event then reaps.
+    conv: Any = None
+    for _attempt in range(_ARCHIVE_STOP_LOOKUP_ATTEMPTS):
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            break
+        except Exception:  # noqa: BLE001
+            if _attempt + 1 >= _ARCHIVE_STOP_LOOKUP_ATTEMPTS:
+                _logger.warning(
+                    "Archive teardown lookup failed for %s after %d attempts; "
+                    "leaving the runner (reaped by a later lifecycle event)",
+                    session_id,
+                    _ARCHIVE_STOP_LOOKUP_ATTEMPTS,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                return
+            await asyncio.sleep(_ARCHIVE_STOP_LOOKUP_RETRY_S)
+    # Confirmed read: skip when the session is no longer archived (an Undo,
+    # possibly on another replica) — it's live again, so leave its runner alone.
+    if conv is None or not conv.archived:
         return
-    if conv is None or not conv.host_id or not conv.runner_id:
+    # Past the point of no return: unregister so a late cancel (an Undo racing
+    # this teardown) can't interrupt it mid-stop and strand the intentional-
+    # stop marker below, which would exclude the session from child recovery.
+    _pending_archive_stops.pop(session_id, None)
+
+    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    if not conv.host_id or not conv.runner_id:
         return
     # Mark the tunnel drop intentional BEFORE tearing it down so the relay
     # renders a quiet stopped state rather than "runner_disconnected".
@@ -782,13 +832,24 @@ def _spawn_archive_stop(
     host_registry: Any = None,
 ) -> None:
     """
-    Run :func:`_archive_stop` as a retained background task.
+    Defer :func:`_archive_stop` past the undo grace, as a retained task.
 
-    Archiving needs the stop to *happen*, not to have happened before
-    the response is written: awaiting it inline held the PATCH for the
-    stop's per-runner timeouts (seconds per running session against a
-    wedged or asleep runner) even though the archive proceeds
-    regardless of the stop's outcome.
+    Archiving pops an Undo pill; undoing it unarchives the session. A stop
+    that tore the runner down immediately would leave an unarchived
+    session with a dead pane, so the teardown sleeps past the grace
+    (``_ARCHIVE_STOP_UNDO_GRACE_S``, wider than the pill) and then re-reads
+    the persisted ``archived`` flag, skipping if the session was undone.
+    That store re-check is the guard that matters, and it holds across
+    replicas.
+
+    Awaiting the stop inline would hold the PATCH for its per-runner
+    timeouts (seconds against a wedged runner) even though the archive
+    proceeds regardless of the stop's outcome, so it is detached.
+
+    Scheduling here also cancels the session's prior pending stop, so a
+    re-archive replaces it rather than leaving two timers; that plus the
+    unarchive cancel in :func:`_cancel_pending_archive_stop` covers the
+    common same-replica undo without waiting out the grace.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
@@ -797,11 +858,52 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     """
-    task = asyncio.create_task(
-        _archive_stop(session_id, conversation_store, runner_router, host_registry)
-    )
+    # Replace any pending stop from an earlier archive of this session.
+    _cancel_pending_archive_stop(session_id)
+
+    async def _stop_after_grace() -> None:
+        # Resolve through the facade so a test's monkeypatch of the grace
+        # constant is honored here.
+        from omnigent.server.routes import sessions as _facade
+
+        try:
+            await asyncio.sleep(_facade._ARCHIVE_STOP_UNDO_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        await _archive_stop(session_id, conversation_store, runner_router, host_registry)
+
+    task = asyncio.create_task(_stop_after_grace())
+    _pending_archive_stops[session_id] = task
     _detached_stop_tasks.add(task)
-    task.add_done_callback(_detached_stop_tasks.discard)
+
+    def _done(t: asyncio.Task[None]) -> None:
+        _detached_stop_tasks.discard(t)
+        # Clear the map entry only if it still points at this task — a
+        # re-archive may have already replaced it.
+        if _pending_archive_stops.get(session_id) is t:
+            del _pending_archive_stops[session_id]
+
+    task.add_done_callback(_done)
+
+
+def _cancel_pending_archive_stop(session_id: str) -> None:
+    """
+    Cancel a session's pending deferred archive stop if it hasn't fired.
+
+    Called when a session is unarchived (Undo, or an explicit unarchive)
+    and when a re-archive supersedes an earlier one, so the common
+    same-replica undo keeps the runner alive without waiting out the
+    grace. A no-op when none is pending or it already ran. Cancelling only
+    reaches the grace sleep: once :func:`_archive_stop` begins the teardown
+    it unregisters itself, so this can't interrupt a stop in flight. The
+    persisted-flag re-check in :func:`_archive_stop` covers the case a
+    cross-replica Undo can't reach this in-memory timer.
+
+    :param session_id: Session/conversation identifier.
+    """
+    task = _pending_archive_stops.pop(session_id, None)
+    if task is not None:
+        task.cancel()
 
 
 def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
@@ -2648,9 +2750,10 @@ async def _enrich_terminal_status_with_subagent_output(
     with the terminal edge.
 
     A ``failed`` edge is filled only when the forwarder attached no detail of
-    its own. Its fallback must belong to the failed response, or (for older
-    forwarders without response ids) follow the latest user message. A failure
-    before any assistant output must not borrow an earlier turn's reply.
+    its own. A harness-reported ``failure_detail`` wins over the store; the
+    fallback must belong to the failed response, or (for older forwarders
+    without response ids) follow the latest user message. A failure before
+    any assistant output must not borrow an earlier turn's reply.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
@@ -2666,6 +2769,10 @@ async def _enrich_terminal_status_with_subagent_output(
     existing = data.get("output")
     if status == "failed" and isinstance(existing, str) and existing.strip():
         return data
+    # The store's latest assistant text can be prose that preceded the error.
+    failure_detail = data.get("failure_detail") if status == "failed" else None
+    if isinstance(failure_detail, str) and failure_detail.strip():
+        return {**data, "output": failure_detail.strip()}
     raw_response_id = data.get("response_id") if status == "failed" else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
     output = await asyncio.to_thread(
@@ -3168,7 +3275,17 @@ async def _run_managed_launch(
         built-in gate into the runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
     """
-    from omnigent.server.managed_hosts import resolve_managed_agent_label
+    from omnigent.server.managed_hosts import (
+        deployment_with_inference_snapshot,
+        resolve_managed_agent_label,
+    )
+
+    saved_conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if saved_conversation is not None:
+        sandbox_config = deployment_with_inference_snapshot(
+            sandbox_config,
+            saved_conversation.inference_snapshot,
+        )
 
     agent_name: str | None = None
     if agent_store is not None and agent_id is not None:
@@ -3178,30 +3295,31 @@ async def _run_managed_launch(
             agent_id,
             session_id=session_id,
         )
-    managed = await _provision_managed_sandbox(
-        session_id=session_id,
-        owner=owner,
-        sandbox_config=sandbox_config,
-        repos=repos,
-        tracker=tracker,
-        host_store=host_store,
-        relaunch_host=relaunch_host,
-        provider=provider,
-        agent_name=agent_name,
-    )
-    if managed is None:
-        return
-    await _bind_and_launch_managed_runner(
-        session_id=session_id,
-        managed=managed,
-        sandbox_config=sandbox_config,
-        tracker=tracker,
-        conversation_store=conversation_store,
-        host_store=host_store,
-        host_registry=host_registry,
-        tunnel_registry=tunnel_registry,
-        relaunch_host=relaunch_host,
-    )
+    with runner_log_scope(session_id, None):
+        managed = await _provision_managed_sandbox(
+            session_id=session_id,
+            owner=owner,
+            sandbox_config=sandbox_config,
+            repos=repos,
+            tracker=tracker,
+            host_store=host_store,
+            relaunch_host=relaunch_host,
+            provider=provider,
+            agent_name=agent_name,
+        )
+        if managed is None:
+            return
+        await _bind_and_launch_managed_runner(
+            session_id=session_id,
+            managed=managed,
+            sandbox_config=sandbox_config,
+            tracker=tracker,
+            conversation_store=conversation_store,
+            host_store=host_store,
+            host_registry=host_registry,
+            tunnel_registry=tunnel_registry,
+            relaunch_host=relaunch_host,
+        )
 
 
 async def _bind_and_launch_managed_runner(
@@ -4011,11 +4129,13 @@ async def _run_managed_wake(
     """
     from omnigent.onboarding.sandboxes.base import SandboxGoneError
     from omnigent.server.managed_hosts import (
+        deployment_with_inference_snapshot,
         resolve_managed_agent_label,
         resume_managed_host,
     )
     from omnigent.server.routes import sessions as _facade
 
+    sandbox_config = deployment_with_inference_snapshot(sandbox_config, conv.inference_snapshot)
     host_id = conv.host_id
     if host_id is None:
         reason = "managed session has no host binding"
@@ -4263,6 +4383,13 @@ async def _ensure_runner_session_initialized(
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
+        from omnigent.server.runner_session_init import runner_inference_verified
+
+        if not runner_inference_verified(conv, resp):
+            raise OmnigentError(
+                "The runner did not accept this session's saved inference configuration",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
         # httpx only raises on transport errors; a 4xx/5xx means create_session
         # likely didn't run (terminal + forwarder not set up), so surface it
         # via the same warning path rather than silently forwarding into a
@@ -4276,7 +4403,7 @@ async def _ensure_runner_session_initialized(
             exc_info=True,
             extra={"session_id": session_id},
         )
-        if require_success:
+        if require_success or conv.inference_snapshot is not None:
             raise OmnigentError(
                 "The recovered runner did not finish session initialization.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -4353,6 +4480,7 @@ async def _ensure_native_terminal_ready(
     conv: Conversation,
     *,
     persist_resource_event: bool = True,
+    runner_router: RunnerRouter | None = None,
 ) -> _NativeTerminalEnsureOutcome:
     """
     Ask the runner to create or return the native terminal for a message.
@@ -4363,6 +4491,13 @@ async def _ensure_native_terminal_ready(
     durable error item; a 2xx response preserves the normal boot grace
     because the runner has accepted responsibility for terminal startup.
 
+    A runner tunnel that drops while the request is in flight is the one
+    transport failure that is not definitive: the runner is usually alive
+    but stalled and re-registers shortly. With a *runner_router* the probe
+    waits up to ``_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S`` for the
+    session's runner to reconnect and asks once more; the runner-side ensure
+    is idempotent, so a terminal created before the drop is simply returned.
+
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -4370,13 +4505,16 @@ async def _ensure_native_terminal_ready(
     :param persist_resource_event: Whether a newly created terminal should be
         appended to conversation history. Retry recovery disables persistence
         while retaining the live resource event for connected clients.
+    :param runner_router: Router used to wait for the session's runner to
+        reconnect after a tunnel drop. ``None`` fails a drop immediately.
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
-    try:
-        resp = await runner_client.post(
+
+    async def _post_ensure() -> httpx.Response:
+        return await runner_client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
             json={
                 "terminal": terminal_name,
@@ -4386,7 +4524,8 @@ async def _ensure_native_terminal_ready(
             },
             timeout=10.0,
         )
-    except (httpx.HTTPError, ConnectionError) as exc:
+
+    def _transport_failure(exc: httpx.HTTPError | ConnectionError) -> _NativeTerminalEnsureOutcome:
         # WSTunnelTransport raises bare ConnectionError on tunnel close
         # ("tunnel closed before request completed"); without this clause
         # a runner tunnel drop escaped to the catch-all handler and the
@@ -4396,12 +4535,46 @@ async def _ensure_native_terminal_ready(
             "%s terminal ensure transport failed for session=%s",
             display_name,
             session_id,
-            exc_info=True,
+            exc_info=exc,
             extra={"session_id": session_id},
         )
         return _NativeTerminalEnsureOutcome(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
         )
+
+    try:
+        resp = await _post_ensure()
+    except (httpx.HTTPError, ConnectionError) as exc:
+        if (
+            runner_router is None
+            or conv.runner_id is None
+            or not isinstance(exc, ConnectionError | httpx.ConnectError)
+        ):
+            return _transport_failure(exc)
+        _logger.warning(
+            "%s terminal ensure lost the runner tunnel for session=%s; waiting up to "
+            "%.0fs for runner %s to reconnect",
+            display_name,
+            session_id,
+            _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S,
+            conv.runner_id,
+            extra={"session_id": session_id},
+        )
+        if not await runner_router.wait_for_runner(
+            conv.runner_id, timeout_s=_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S
+        ):
+            return _transport_failure(exc)
+        _logger.info(
+            "Runner %s reconnected; repeating %s terminal ensure for session=%s",
+            conv.runner_id,
+            display_name,
+            session_id,
+            extra={"session_id": session_id},
+        )
+        try:
+            resp = await _post_ensure()
+        except (httpx.HTTPError, ConnectionError) as retry_exc:
+            return _transport_failure(retry_exc)
     if resp.status_code < 400:
         return _NativeTerminalEnsureOutcome(
             error=None,
@@ -4761,6 +4934,8 @@ async def _forward_native_terminal_message(
                 file_store,
                 artifact_store,
                 session_id=session_id,
+                # The native runner caches filesystem attachments itself.
+                defer_filesystem_files=True,
             )
         except (ValueError, KeyError):
             _logger.warning(
@@ -6108,6 +6283,7 @@ async def _dispatch_session_event_to_runner_impl(
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
+    host_registry: HostRegistry | None = None,
     background_titles_enabled: bool = True,
 ) -> _SessionEventDispatchResult:
     """
@@ -6204,6 +6380,7 @@ async def _dispatch_session_event_to_runner_impl(
                 runner_client,
                 session_id,
                 conv,
+                runner_router=runner_router,
             )
         )
         if ensure_outcome.error is not None:
@@ -6244,6 +6421,20 @@ async def _dispatch_session_event_to_runner_impl(
         opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
             _extract_user_text_for_routing(body)
         )
+        # An older host forwards `/side` to Codex as a plain prompt (no fork), so
+        # the web side chat opens and hangs and the question lands on the main
+        # thread. Refuse here — before the forward — with a clear reason instead.
+        if (
+            opens_side_chat
+            and conv.host_id is not None
+            and host_registry is not None
+            and not host_registry.host_supports_codex_side_chat(conv.host_id)
+        ):
+            raise OmnigentError(
+                "This session's host is too old to open a Codex side chat. Update "
+                "omnigent on the host (>= 0.15.0) and reconnect it, then try again.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -6439,15 +6630,16 @@ async def _dispatch_session_event_to_runner_impl(
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
 
-# Transient runner-tunnel drops (Apps ingress recycles, sleep-wake
-# reconnects) usually re-register in well under a second, and the worst
-# observed ingress-recycle burst took ~5s of failed attempts before the
-# tunnel was back. Hold the user-visible failure surface for double that
-# so those drops resolve silently; a runner still gone afterwards fails
-# as before. Crash-reported runner deaths bypass this grace entirely.
-RUNNER_DISCONNECT_GRACE_S: float = 10.0
+# Deployed runners back off to a 10s cap with ±50% jitter, so the
+# worst-case reconnect is ~15s plus handshake. 20s covers that cluster
+# and resolves transient drops silently; a runner still gone afterwards fails.
+RUNNER_DISCONNECT_GRACE_S: float = 20.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+# A tunnel that drops mid-ensure usually belongs to a runner that is alive but
+# stalled and re-registers once it can (observed: 24 s). Hold the message that
+# long before failing it instead of discarding it on a drop the runner outlives.
+_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 # Session statuses that mean a turn was in flight. A runner going away
 # only interrupts work in one of these states; from any other state the
 # departure is a benign disconnect, carried by liveness rather than a
@@ -6691,6 +6883,7 @@ async def _relay_runner_stream_once(
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
     current_model: str | None = None
+    failure_agent_name: str | None = None
     # Wall-clock time when the current turn's response.in_progress arrived,
     # used to compute per-turn latency in TurnEndEvent.
     _turn_start_s: float | None = None
@@ -6802,8 +6995,10 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     status_error,
                                     conversation_store,
+                                    agent_name=failure_agent_name,
                                 )
                             elif status == "running":
+                                failure_agent_name = None
                                 await _persist_session_status_error_labels(
                                     session_id,
                                     None,
@@ -6864,6 +7059,7 @@ async def _relay_runner_stream_once(
                         if isinstance(_rid, str) and _rid:
                             current_response_id = _rid
                         _model = resp_obj.get("model")
+                        failure_agent_name = _model if isinstance(_model, str) and _model else None
                         if isinstance(_model, str) and _model:
                             current_model = _model
 
@@ -7313,7 +7509,7 @@ async def _relay_runner_stream_once(
         _logger.info(
             "Relay: task exiting for session=%s",
             session_id,
-            extra={"session_id": session_id},
+            extra=debug_event("runner_stream_closed", session_id=session_id),
         )
         # Drop any in-flight assistant-text entry so a relay that exits
         # WITHOUT a terminal turn event (runner death / tunnel drop
@@ -7400,15 +7596,16 @@ def _ensure_runner_relay(
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
     relay_store = cast(ConversationStore, conversation_store)
-    task = asyncio.create_task(
-        _relay_runner_stream(
-            session_id,
-            runner_client,
-            relay_store,
-            ready,
-        ),
-        name=f"runner-relay-{session_id}",
-    )
+    with runner_log_scope(session_id, runner_id):
+        task = asyncio.create_task(
+            _relay_runner_stream(
+                session_id,
+                runner_client,
+                relay_store,
+                ready,
+            ),
+            name=f"runner-relay-{session_id}",
+        )
     handle = _RelayHandle(runner_id=runner_id, task=task, ready=ready)
     _runner_relay_tasks[session_id] = handle
 
@@ -8778,6 +8975,7 @@ async def _create_session_from_existing_agent(
         project_store=project_store,
     )
     body = project_resolution.body
+    creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
     assert body.agent_id is not None
 
     _reject_reserved_cost_control_label_seed(body.labels)
@@ -9025,6 +9223,7 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    inference_snapshot = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.models.model_catalog import (
@@ -9043,8 +9242,16 @@ async def _create_session_from_existing_agent(
                 )
             ).spec
         except (KeyError, AttributeError, ValueError, ImportError, OSError):
-            if model_override is not None:
-                raise
+            from omnigent.server.routes.sandbox_inference import managed_inference_configured
+
+            if model_override is not None or (
+                body.host_type == "managed"
+                and managed_inference_configured(request, body.sandbox_provider)
+            ):
+                raise OmnigentError(
+                    "Cannot load the agent to validate its configured inference provider",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from None
             # Without a selection, retain creation when the harness is unknown.
             _logger.debug(
                 "create-time model policy: agent %r failed to load", agent.name, exc_info=True
@@ -9052,8 +9259,32 @@ async def _create_session_from_existing_agent(
             selection_spec = None
         if selection_spec is not None and body.sub_agent_name:
             selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
+        from omnigent.server.routes.sandbox_inference import (
+            configured_snapshot,
+            prepare_create_inference,
+        )
+
+        if selection_spec is None and body.host_type == "managed":
+            from omnigent.server.routes.sandbox_inference import managed_inference_configured
+
+            if managed_inference_configured(request, body.sandbox_provider):
+                raise OmnigentError(
+                    "Cannot determine the harness for the configured inference provider",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if selection_spec is not None:
+            inference_snapshot, model_override = await prepare_create_inference(
+                request,
+                body,
+                selection_spec,
+                user_id,
+                conversation_store,
+                harness_override=harness_override,
+                model_override=model_override,
+            )
         if (
             selection_spec is not None
+            and not configured_snapshot(inference_snapshot)
             and canonicalize_harness(harness_override or _spec_harness(selection_spec)) == "acp"
         ):
             default_model = await asyncio.to_thread(_acp_launch_model, selection_spec)
@@ -9225,6 +9456,9 @@ async def _create_session_from_existing_agent(
                 reasoning_effort=spec_effort,
             )
 
+    snapshot_kwargs: dict[str, Any] = (
+        {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
+    )
     try:
         conv = conversation_store.create_conversation(
             agent_id=agent.id,
@@ -9238,6 +9472,7 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
             project_id=project_resolution.project_id,
+            **snapshot_kwargs,
         )
     except NameAlreadyExistsError as exc:
         if (
@@ -9287,6 +9522,7 @@ async def _create_session_from_existing_agent(
     # joins the session's session.id group.
     from omnigent.runtime import telemetry
 
+    session_created(conv.id, conv.runner_id)
     telemetry.set_session_id(conv.id)
 
     if (
@@ -9551,6 +9787,7 @@ async def _create_session_from_existing_agent(
         agent_store=agent_store,
         agent_cache=agent_cache,
         liveness_lookup=liveness_lookup,
+        request=request,
     )
 
 
@@ -9561,6 +9798,9 @@ def _create_session_from_bundle(
     bundle_bytes: bytes,
     runner_id: str | None = None,
     spec: AgentSpec | None = None,
+    inference_snapshot: dict[str, Any] | None = None,
+    inference_model: str | None = None,
+    created_by: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -9590,6 +9830,9 @@ def _create_session_from_bundle(
         ``os_env.cwd`` for workspace validation before any row
         exists) and passes the result here so the tarball isn't
         extracted twice. ``None`` validates in this function.
+    :param created_by: Identity of the creating user, recorded on the
+        new session-scoped agent so its code can only be mutated by the
+        owner. ``None`` in single-user mode.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -9609,7 +9852,9 @@ def _create_session_from_bundle(
         )
     assert spec.name is not None
 
-    if _spec_harness(spec) == "acp":
+    from omnigent.server.routes.sandbox_inference import configured_snapshot
+
+    if _spec_harness(spec) == "acp" and not configured_snapshot(inference_snapshot):
         from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
 
         validate_acp_model(spec, _acp_launch_model(spec))
@@ -9665,6 +9910,9 @@ def _create_session_from_bundle(
         agent_bundle_location=agent_bundle_location,
         agent_description=spec.description,
         runner_id=runner_id,
+        inference_snapshot=inference_snapshot,
+        inference_model=inference_model,
+        created_by=created_by,
     )
 
 
@@ -10423,6 +10671,137 @@ async def _load_acp_model_options(
     return options
 
 
+# The tunnel transport does not enforce httpx timeouts, so the runner status
+# probe below is bounded here. Healthy runners answer from memory (99.85% of
+# production probes finish inside 5 s), and the runner's own launch-config
+# read of this snapshot has a 10 s budget the bound must leave room for.
+_RUNNER_STATUS_PROBE_TIMEOUT_S: float = 5.0
+# A non-200 that arrives within this is a prompt answer from a responsive
+# runner (a freshly bound one answers 404 until session init lands) and is
+# asked again next snapshot; a slower one counts as a slow probe.
+_RUNNER_STATUS_PROBE_SLOW_S: float = 1.0
+# After a slow probe the session's probe is skipped for a window that doubles
+# per consecutive slow probe up to the cap, so a runner stalled for hours
+# costs a probe every few minutes instead of every window. A prompt answer
+# resets the streak.
+_RUNNER_STATUS_PROBE_BACKOFF_S: float = 30.0
+_RUNNER_STATUS_PROBE_BACKOFF_CAP_S: float = 300.0
+
+
+def _runner_status_probe_window_s(failures: int) -> float:
+    """
+    Return the skip window after *failures* consecutive slow probes.
+
+    :param failures: Consecutive slow probes so far, e.g. ``1`` after the first.
+    :returns: Seconds to skip the probe, e.g. ``30.0`` then ``60.0``, capped.
+    """
+    return min(
+        _RUNNER_STATUS_PROBE_BACKOFF_S * (2 ** (failures - 1)),
+        _RUNNER_STATUS_PROBE_BACKOFF_CAP_S,
+    )
+
+
+async def _probe_runner_live_status(
+    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None = None
+) -> str | None:
+    """
+    Ask a session's bound runner for its live status, bounded, shared, and backed off.
+
+    Concurrent snapshots of one session await the same in-flight probe. A 200
+    records the status in ``_session_status_cache``; a probe that timed out,
+    failed in transport, or answered slowly without a status puts the session
+    in a skip window that doubles per consecutive slow probe.
+
+    :param runner_client: HTTP client pointed at the session's runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_id: The session's bound runner, e.g.
+        ``"runner_0123456789abcdef"``. A skip window recorded against a
+        different runner is discarded so a rebound session is probed at once.
+    :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
+        probe is in backoff, timed out, failed, or returned a non-200.
+    """
+    probe = _runner_status_probe_inflight.get(session_id)
+    if probe is None:
+        backoff = _runner_status_probe_backoff.get(session_id)
+        if backoff is not None and backoff.runner_id != runner_id:
+            _runner_status_probe_backoff.pop(session_id, None)
+        elif backoff is not None and time.monotonic() < backoff.skip_until:
+            return None
+        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
+        _runner_status_probe_inflight[session_id] = probe
+    # Shielded so one cancelled snapshot request does not abort the probe the
+    # other waiters share.
+    return await asyncio.shield(probe)
+
+
+async def _run_runner_status_probe(
+    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None
+) -> str | None:
+    """
+    Run one bounded runner status probe and record its outcome.
+
+    :param runner_client: HTTP client pointed at the session's runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_id: The session's bound runner, recorded with any skip window.
+    :returns: The runner's raw status on a 200, else ``None``.
+    """
+    started = time.monotonic()
+    try:
+        try:
+            resp = await asyncio.wait_for(
+                runner_client.get(
+                    f"/v1/sessions/{session_id}", timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S
+                ),
+                timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            failure = f"no answer within {_RUNNER_STATUS_PROBE_TIMEOUT_S:g}s"
+        except (httpx.HTTPError, ConnectionError) as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+        else:
+            elapsed = time.monotonic() - started
+            if resp.status_code == 200:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    raw = str(payload.get("status", "idle"))
+                    _session_status_cache[session_id] = raw
+                    if raw in ("idle", "running", "waiting", "failed"):
+                        session_live_state.persist_live_status(session_id, raw)
+                    _runner_status_probe_backoff.pop(session_id, None)
+                    return raw
+                failure = "HTTP 200 with a malformed body"
+            elif elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
+                _runner_status_probe_backoff.pop(session_id, None)
+                _logger.debug(
+                    "Runner status probe for session=%s answered HTTP %s",
+                    session_id,
+                    resp.status_code,
+                    extra={"session_id": session_id},
+                )
+                return None
+            else:
+                failure = f"HTTP {resp.status_code} after {elapsed:.1f}s"
+        previous = _runner_status_probe_backoff.get(session_id)
+        failures = (previous.failures if previous is not None else 0) + 1
+        window = _runner_status_probe_window_s(failures)
+        _runner_status_probe_backoff[session_id] = _RunnerStatusProbeBackoff(
+            skip_until=time.monotonic() + window, failures=failures, runner_id=runner_id
+        )
+        _logger.warning(
+            "Runner status probe for session=%s failed (%s); skipping it for %.0fs",
+            session_id,
+            failure,
+            window,
+            extra={"session_id": session_id},
+        )
+        return None
+    finally:
+        _runner_status_probe_inflight.pop(session_id, None)
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -10437,6 +10816,8 @@ async def _get_session_snapshot(
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
     viewer_id: str | None = None,
+    request: Request | None = None,
+    include_usage: bool = True,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -10469,8 +10850,10 @@ async def _get_session_snapshot(
     :param include_items: When ``False``, skip the committed-items read
         and return ``items=[]``. Callers that hydrate the transcript
         through ``GET /sessions/{id}/items`` (the web chat surface)
-        pass ``False`` — the items read is the most expensive step of
-        the snapshot build and its result would be discarded.
+        pass ``False`` to avoid a redundant history read and serialization.
+    :param include_usage: When ``False``, skip subtree usage aggregation and
+        return unknown usage with ``usage_included=False``. Launch metadata
+        does not need usage; display clients can fetch it separately.
     :param refresh_state: When ``True``, clear runner-backed snapshot
         overlays for this session before building the response. Browser
         reloads use this so a refresh re-reads current live-session
@@ -10512,7 +10895,10 @@ async def _get_session_snapshot(
     runner_router = get_runner_router()
     if runner_router is not None:
         try:
-            routed = runner_router.client_for_session_resources(session_id)
+            # Pass the authorized row: the router's own point read would be a
+            # second read of the conversation this snapshot already holds, and on
+            # a split-DB deployment that is one round trip per backend.
+            routed = runner_router.client_for_session_resources(session_id, conversation=conv)
             runner_client = routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(
@@ -10550,23 +10936,11 @@ async def _get_session_snapshot(
         # relay values (``"waiting"`` → ``"running"``), so the raw cache value
         # is only needed here when it is actually missing (None).
         if _session_status_cache.get(session_id) is None and runner_client is not None:
-            try:
-                resp = await runner_client.get(
-                    f"/v1/sessions/{session_id}",
-                    timeout=5.0,
-                )
-                if resp.status_code == 200:
-                    raw = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = raw
-                    if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
-                    status = _session_status_from_cache(session_id)
-            except (httpx.HTTPError, ConnectionError):
-                _logger.debug(
-                    "Runner status query failed for %s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+            if (
+                await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
+                is not None
+            ):
+                status = _session_status_from_cache(session_id)
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None
@@ -10652,7 +11026,22 @@ async def _get_session_snapshot(
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed so a snapshot poll cannot wedge the
     # runner while a turn is active.
-    model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
+    from omnigent.server.routes.sandbox_inference import configured_snapshot, inference_service
+
+    inference_configured = configured_snapshot(conv.inference_snapshot)
+    inference_error = None
+    if inference_configured and conv.inference_snapshot is not None:
+        catalog = (
+            await inference_service(request).catalog(conv.inference_snapshot)
+            if request is not None
+            else conv.inference_snapshot["catalog"]
+        )
+        model_options = catalog["models"]
+        inference_error = catalog.get("error")
+        if not conv.reported_model:
+            llm_model = conv.model_override or catalog.get("default_model")
+    else:
+        model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
@@ -10673,18 +11062,17 @@ async def _get_session_snapshot(
         if result is not None:
             runner_online = result.runner_online
             host_online = result.host_online
-    # Subtree usage (this session + its sub-agent descendants) so the
-    # displayed cost includes sub-agents — a codex/claude sub-agent's spend
-    # is persisted on its own child conversation, not the parent's, so the
-    # parent's own session_usage would under-report. Off the event loop
-    # because it pages the conversation tree from the store. The authorized
-    # row's root is passed so the tree root isn't re-derived with a second
-    # point read of the row this handler already holds.
-    subtree_usage = await asyncio.to_thread(
-        load_session_usage,
-        conv.id,
-        conv_store,
-        root_conversation_id=conv.root_conversation_id,
+    # Display costs include descendants. Empty usage marks a skipped aggregate;
+    # None would fall back to the parent's own spend and under-report it.
+    subtree_usage = (
+        await asyncio.to_thread(
+            load_session_usage,
+            conv.id,
+            conv_store,
+            root_conversation_id=conv.root_conversation_id,
+        )
+        if include_usage
+        else {}
     )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
@@ -10697,7 +11085,7 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
-    return _build_session_response(
+    response = _build_session_response(
         conv,
         items,
         status,
@@ -10724,6 +11112,10 @@ async def _get_session_snapshot(
         agent_store=agent_store,
         agent_cache=agent_cache,
     )
+    response.inference_configured = inference_configured
+    response.inference_error = inference_error
+    response.usage_included = include_usage
+    return response
 
 
 __all__ = [
@@ -10734,6 +11126,7 @@ __all__ = [
     "_build_native_terminal_message_event",
     "_build_session_list_item",
     "_build_session_response",
+    "_cancel_pending_archive_stop",
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",

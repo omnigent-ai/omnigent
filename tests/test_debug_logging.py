@@ -36,6 +36,7 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         dl.ENDPOINT_ENV_VAR,
         dl.USER_ID_ENV_VAR,
         dl.PRIMARY_SESSION_ID_ENV_VAR,
+        dl.RUNNER_ID_ENV_VAR,
         dl.ORIGIN_WORKSPACE_ID_ENV_VAR,
         dl.APP_NAME_ENV_VAR,
         dl.SERVER_URL_ENV_VAR,
@@ -965,3 +966,44 @@ def test_sse_file_sink_attach_is_idempotent(
     sse_logger = logging.getLogger(dl.SSE_LOGGER_NAME)
     handlers = [h for h in sse_logger.handlers if isinstance(h, dl.SseFileHandler)]
     assert len(handlers) == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_log_scope_isolates_tasks_and_threads_and_restores_context() -> None:
+    import asyncio
+
+    def row() -> dict[str, object]:
+        record = logging.LogRecord("omnigent.test", logging.INFO, __file__, 1, "test", (), None)
+        return dl.record_to_row(record, "server")
+
+    async def launch(session_id: str, runner_id: str) -> dict[str, object]:
+        with dl.runner_log_scope(session_id, runner_id):
+            await asyncio.sleep(0)
+            return await asyncio.to_thread(row)
+
+    with dl.runner_log_scope(None, None):
+        first, second = await asyncio.gather(launch("s1", "r1"), launch("s2", "r2"))
+        assert first["session_id"] == "s1"
+        assert first["attributes"]["runner_id"] == "r1"
+        assert second["session_id"] == "s2"
+        assert second["attributes"]["runner_id"] == "r2"
+        assert row()["session_id"] is None
+        assert "runner_id" not in row()["attributes"]
+
+
+def test_runner_defaults_and_explicit_child_attribution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(dl.RUNNER_ID_ENV_VAR, "runner_env")
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "parent")
+    record = logging.LogRecord("omnigent.test", logging.INFO, __file__, 1, "test", (), None)
+    with dl.runner_log_scope(None, None):
+        assert dl.record_to_row(record, "runner")["attributes"]["runner_id"] == "runner_env"
+        assert "runner_id" not in dl.record_to_row(record, "host")["attributes"]
+        assert dl.record_to_row(record, "host")["session_id"] is None
+        assert dl.record_to_row(record, "server")["session_id"] is None
+        assert "runner_id" not in dl.record_to_row(record, "server")["attributes"]
+        with dl.current_session_id_scope("child"):
+            assert dl.record_to_row(record, "runner")["session_id"] == "child"
+        record.session_id = "explicit_child"
+        record.attributes = {"runner_id": "explicit_runner", "request_id": "explicit_request"}
+        assert dl.record_to_row(record, "runner")["session_id"] == "explicit_child"
+        assert dl.record_to_row(record, "runner")["attributes"]["runner_id"] == "explicit_runner"

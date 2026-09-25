@@ -5,7 +5,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Layout regression tests for the sidebar's bulk-action bar (selection
 // mode). The bar is a single bordered pill rendered under the Sessions
 // header: an inline Exit (X) button, the "N selected" count, and the
-// icon-only Archive/Delete actions grouped at the trailing edge. It lives
+// icon-only bulk actions grouped at the trailing edge. It lives
 // entirely in normal flow (no absolutely-positioned control, no
 // breakpoint-gated duplicate), which is what kept an earlier mobile-overflow
 // bug from recurring. These tests lock that structure in:
@@ -16,6 +16,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -187,27 +188,52 @@ describe("bulk-action bar layout", () => {
     expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
   });
 
+  it.each([
+    ["session-filter", "Filter sessions"],
+    ["toggle-selection-mode", "Exit selection"],
+    ["bulk-mark-unread", "Mark as unread"],
+    ["bulk-archive", "Archive"],
+    ["bulk-move-to-project", "Move to project"],
+    ["bulk-delete", "Delete"],
+  ])("shows the %s tooltip on hover", async (testId, label) => {
+    const user = userEvent.setup();
+    renderSidebar();
+    enterSelectionModeAndSelect();
+
+    const trigger = screen.getByTestId(testId);
+    if (testId === "session-filter" || testId === "bulk-move-to-project") {
+      expect(trigger).toHaveAttribute("data-slot", "dropdown-menu-trigger");
+      expect(trigger.parentElement).toHaveAttribute("data-slot", "tooltip-trigger");
+    }
+
+    await user.hover(trigger);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+  });
+
   it("shows Archive and Delete disabled at zero selection, enabling them once a row is picked", () => {
     renderSidebar();
     // Enter selection mode WITHOUT selecting anything yet.
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
 
-    // Both actions are present up front (not conditionally hidden) but
+    // All three actions are present up front (not conditionally hidden) but
     // disabled while nothing is selected.
     const archiveBtn = screen.getByTestId("bulk-archive");
     const deleteBtn = screen.getByTestId("bulk-delete");
+    const moveBtn = screen.getByTestId("bulk-move-to-project");
     expect(archiveBtn).toBeDisabled();
     expect(deleteBtn).toBeDisabled();
+    expect(moveBtn).toBeDisabled();
     expect(screen.getByText("0 selected")).toBeInTheDocument();
 
-    // Selecting a row enables both.
+    // Selecting a row enables all three actions.
     fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
     expect(archiveBtn).toBeEnabled();
     expect(deleteBtn).toBeEnabled();
+    expect(moveBtn).toBeEnabled();
     expect(screen.getByText("1 selected")).toBeInTheDocument();
   });
 
-  it("renders the row checkbox to the LEFT of the session title", () => {
+  it("renders the row checkbox to the LEFT of the title and removes it on exit", () => {
     renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
 
@@ -218,5 +244,14 @@ describe("bulk-action bar layout", () => {
     const marker = li.querySelector("svg.lucide-square")?.parentElement as HTMLElement;
     expect(marker.className).toMatch(/\bleft-2\b/);
     expect(marker.className).not.toMatch(/\bright-/);
+
+    fireEvent.click(row);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Exit selection mode" }));
+
+    expect(screen.getByRole("button", { name: "Select sessions" })).toBeInTheDocument();
+    expect(li.querySelector("svg.lucide-square")).toBeNull();
+    expect(li.querySelector("svg.lucide-square-check")).toBeNull();
+    expect(screen.queryByText(/\d+ selected/)).toBeNull();
   });
 });

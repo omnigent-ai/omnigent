@@ -119,6 +119,7 @@ def prune_orphaned_dirs(
     """
     if not bridge_root.exists():
         return 0
+    from omnigent.inner.native_attachments import attachment_cache_dir
     from omnigent.inner.terminal import _process_alive
 
     pruned = 0
@@ -149,7 +150,10 @@ def prune_orphaned_dirs(
                 continue
             if confirmed_pid != pid or _process_alive(confirmed_pid):
                 continue
+            cache_dir = attachment_cache_dir(entry)
             shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
             pruned += 1
     return pruned
 

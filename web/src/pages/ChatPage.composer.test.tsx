@@ -8,10 +8,13 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
@@ -29,6 +32,7 @@ import {
 } from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
@@ -52,40 +56,82 @@ vi.mock("@/hooks/useGithub", () => ({
 // composer renders in isolation (no QueryClient) with a neutral empty status.
 // The hoisted spy records the args so a test can assert the page passes the
 // real session id / host / workspace / creation branch (not fixtures).
-const { composerGitStatusArgsSpy } = vi.hoisted(() => ({ composerGitStatusArgsSpy: vi.fn() }));
+const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() => ({
+  composerGitStatusArgsSpy: vi.fn(),
+  composerGitStatusSnapshot: {
+    branch: null as string | null,
+    branchState: "unknown" as "loading" | "branch" | "detached" | "not-git" | "unknown",
+    isWorktree: null as boolean | null,
+    worktreePath: null as string | null,
+    creationBranch: null as string | null,
+    repoNameWithOwner: "omnigent-ai/omnigent" as string | null,
+    githubState: "ready" as "loading" | "ready" | "unknown",
+    prCount: 0,
+    prNumber: null as number | null,
+    refresh: vi.fn(),
+    refreshing: false,
+  },
+}));
+const { openGithubTabMock } = vi.hoisted(() => ({ openGithubTabMock: vi.fn() }));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: (args: unknown) => {
     composerGitStatusArgsSpy(args);
-    return {
+    return composerGitStatusSnapshot;
+  },
+}));
+vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileViewerContextModule>()),
+  useOpenGithubTab: () => openGithubTabMock,
+}));
+
+function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
+  Object.assign(
+    composerGitStatusSnapshot,
+    {
       branch: null,
       branchState: "unknown",
       isWorktree: null,
       worktreePath: null,
       creationBranch: null,
-      repoNameWithOwner: null,
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      githubState: "ready",
       prCount: 0,
       prNumber: null,
-      refresh: () => {},
       refreshing: false,
-    };
-  },
-}));
+    },
+    overrides,
+  );
+}
+
+afterEach(() => setComposerGitStatus());
 // SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
 // so the indicator self-hides (no active children) in isolated composer renders.
+const { childSessionsArgsSpy, composerChildSessions } = vi.hoisted(() => ({
+  childSessionsArgsSpy: vi.fn(),
+  composerChildSessions: { children: [] as ChildSessionInfo[] },
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
-  useChildSessions: () => ({ children: [] }),
+  useChildSessions: (conversationId: string | null) => {
+    childSessionsArgsSpy(conversationId);
+    return { children: composerChildSessions.children, isLoading: false, error: null };
+  },
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
-const { composerSnapshotHost } = vi.hoisted(() => ({
-  composerSnapshotHost: { id: null as string | null },
+const { composerSessionSnapshot } = vi.hoisted(() => ({
+  composerSessionSnapshot: {
+    hostId: null as string | null,
+    workspace: null as string | null,
+    labels: {} as Record<string, string>,
+    gitBranch: null as string | null,
+  },
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
   useSession: () => ({
-    session: { hostId: composerSnapshotHost.id },
+    session: composerSessionSnapshot,
     isLoading: false,
     error: null,
   }),
@@ -116,7 +162,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, shouldQueueSend } from "./ChatPage";
+import { Composer, computeIsWorking, shouldQueueSend } from "./ChatPage";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -326,6 +372,104 @@ describe("Composer session drafts", () => {
     expect(getSessionDraft("temp:draft")).toBeUndefined();
     expect(getSessionDraft("conv_real")?.text).toBe("draft during startup");
   });
+
+  it("restores attached files when switching back to a conversation", async () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["hello"], "notes.txt", { type: "text/plain" })] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    await waitFor(() => expect(getSessionDraft("conv_draft")?.files).toHaveLength(1));
+
+    // The other conversation has no draft, so its composer is empty...
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(screen.queryByText("notes.txt")).toBeNull();
+
+    // ...and switching back re-arms the saved attachment as a chip.
+    act(() => useChatStore.setState({ conversationId: "conv_draft" }));
+    await waitFor(() => expect(screen.getByText("notes.txt")).toBeTruthy());
+  });
+});
+
+describe("Composer starting-session cancellation", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    setComposerState({
+      conversationId: "temp:cancel_initial",
+      blocks: [],
+      failedSendDraft: null,
+      pendingUserMessages: [],
+      queuedMessages: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    setComposerState({ pendingUserMessages: [] });
+  });
+
+  it.each(["button", "Escape"])(
+    "keeps Interrupt available with a typed draft and cancels using %s",
+    (trigger) => {
+      const props = composerProps({
+        status: "streaming",
+        isWorking: true,
+        disabled: true,
+        unreachable: true,
+        permissionLevel: 1,
+        sendDisabledReason: "Starting the session…",
+      });
+      render(<Composer {...props} />);
+
+      fireEvent.change(textarea(), { target: { value: "a correction while choosing a model" } });
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(props.onStop).not.toHaveBeenCalled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("a correction while choosing a model");
+    },
+  );
+
+  it.each(["button", "Escape"])(
+    "keeps Interrupt available after real-ID promotion with a typed draft using %s",
+    (trigger) => {
+      setComposerState({
+        conversationId: "conv_initial_model_pending",
+        sessionStatus: "idle",
+        pendingUserMessages: [
+          {
+            tempId: "pend_initial",
+            content: [{ type: "input_text", text: "original task" }],
+            initialDraft: { text: "original task", files: [] },
+          },
+        ],
+      });
+      const props = composerProps({ status: "idle", isWorking: true });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "corrected task" } });
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("corrected task");
+    },
+  );
 });
 
 describe("Composer growth layout", () => {
@@ -415,6 +559,87 @@ describe("Composer send shortcut", () => {
     expect(onSend).toHaveBeenLastCalledWith("default shortcut", undefined);
   });
 
+  it.each([
+    [false, "metaKey"],
+    [false, "ctrlKey"],
+    [true, "metaKey"],
+    [true, "ctrlKey"],
+  ] as const)(
+    "steers the draft and backlog (alternate send: %s, modifier: %s)",
+    (alternate, modifier) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      const onSend = vi.fn((text: string, files?: File[]) => {
+        useChatStore.getState().enqueueMessage(text, files);
+      });
+      const sendQueued = vi.fn().mockResolvedValue(undefined);
+      const originalState = useChatStore.getState();
+      setComposerState({
+        boundAgentId: "agent_shortcut",
+        queuedMessages: [
+          { queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" },
+          { queueId: "q_2", text: "queued second", conversationId: "conv_shortcut" },
+        ],
+        sessionStatus: "running",
+        send: sendQueued,
+        status: "streaming",
+      });
+
+      try {
+        renderWithTooltips(
+          <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
+        );
+        if (alternate) {
+          fireEvent.change(textarea(), { target: { value: "normal draft" } });
+          fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true });
+          expect(sendQueued).not.toHaveBeenCalled();
+          expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+            "queued first",
+            "queued second",
+            "normal draft",
+          ]);
+        }
+        fireEvent.change(textarea(), { target: { value: "draft last" } });
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+
+        expect(onSend).toHaveBeenCalledWith("draft last", undefined);
+        expect(sendQueued.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+          ["queued first", "agent_shortcut"],
+          ["queued second", "agent_shortcut"],
+          ...(alternate ? [["normal draft", "agent_shortcut"]] : []),
+          ["draft last", "agent_shortcut"],
+        ]);
+        expect(onSend.mock.invocationCallOrder[0]).toBeLessThan(
+          sendQueued.mock.invocationCallOrder[0]!,
+        );
+        expect(useChatStore.getState().queuedMessages).toEqual([]);
+      } finally {
+        act(() =>
+          useChatStore.setState({
+            boundAgentId: originalState.boundAgentId,
+            queuedMessages: [],
+            send: originalState.send,
+            sessionStatus: originalState.sessionStatus,
+            status: originalState.status,
+          }),
+        );
+      }
+    },
+  );
+
+  it.each([
+    [false, "{Shift>}{Enter}{/Shift}"],
+    [true, "{Enter}"],
+    [true, "{Shift>}{Enter}{/Shift}"],
+  ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+    const onSend = vi.fn();
+    const user = userEvent.setup();
+    render(<Composer {...composerProps({ onSend })} />);
+    await user.type(textarea(), "first" + keys + "second");
+    expect(textarea().value).toBe("first\nsecond");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it("uses Mod+Enter after the alternate preference is restored", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();
@@ -454,6 +679,23 @@ describe("Composer send shortcut", () => {
 
       fireEvent.focus(screen.getByRole("button", { name: "Send" }));
       expect(screen.queryByRole("tooltip")).toBeNull();
+    } finally {
+      restorePointer();
+    }
+  });
+
+  it("leaves plain Enter as a newline on a coarse pointer, even with no menu open", async () => {
+    // Touch keyboards own the send action (the on-screen button), so Enter on
+    // a coarse pointer must stay a plain newline — same rule the landing
+    // composer follows on a phone viewport.
+    const restorePointer = forceDesktopCoarsePointer();
+    const onSend = vi.fn();
+    try {
+      const user = userEvent.setup();
+      render(<Composer {...composerProps({ onSend })} />);
+      await user.type(textarea(), "first{Enter}second");
+      expect(textarea().value).toBe("first\nsecond");
+      expect(onSend).not.toHaveBeenCalled();
     } finally {
       restorePointer();
     }
@@ -859,18 +1101,80 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("clears the override for /model default|off|reset", () => {
-    // The REPL clear aliases map to setModel(null) → server "default"
-    // sentinel. A wrong value here (e.g. the literal "default" string)
-    // would pin a bogus model instead of restoring the agent default.
+  it.each([
+    { kind: "claude", reset: false },
+    { kind: "opencode", reset: true },
+    { kind: "acp", reset: true },
+    { kind: "configured", reset: true },
+    { kind: null, reset: true },
+    { kind: null, reset: true, terminalFirst: true, harness: "claude-sdk" },
+    { kind: "codex", reset: false },
+    { kind: "pi", reset: false },
+    { kind: "cursor", reset: false },
+    { kind: "kiro", reset: false },
+    { kind: "devin", reset: false },
+    { kind: "codex", reset: true, configured: true },
+    { kind: "claude", reset: true, configured: true },
+  ] as const)("gates model reset consistently for $kind ($reset, $configured)", async (row) => {
     const setModel = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setModel });
-    render(<Composer {...composerProps()} />);
+    const onSend = vi.fn();
+    useChatStore.setState({ setModel, sessionHarness: "harness" in row ? row.harness : null });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          onSend,
+          showEffort: true,
+          showModels: row.kind !== null,
+          modelPickerKind: row.kind,
+          isTerminalFirst: "terminalFirst" in row && row.terminalFirst,
+          inferenceConfigured: "configured" in row && row.configured,
+          isNativeWrapper: row.kind !== null && row.kind !== "acp" && row.kind !== "configured",
+          codexModelOptions: [{ id: "primary", displayName: "Primary", isDefault: true }],
+        })}
+      />,
+    );
     const ta = textarea();
-    fireEvent.change(ta, { target: { value: "/model default" } });
-    fireEvent.keyDown(ta, { key: "Enter" });
+    fireEvent.change(ta, { target: { value: "/mod" } });
+    expect(screen.getByTestId("slash-menu-item-model").textContent?.includes("default")).toBe(
+      row.reset,
+    );
 
-    expect(setModel).toHaveBeenCalledWith(null, { expectConfirmation: false });
+    fireEvent.change(ta, { target: { value: "/help " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    const help = screen.getByText(/\/model — Switch the model/);
+    expect(help).toHaveTextContent("/model <name>");
+    expect(help.textContent?.includes("/model <name> | default")).toBe(row.reset);
+    expect(help).toHaveTextContent("/effort low | medium | high | default");
+
+    for (const alias of ["default", "off", "reset", "DEFAULT"]) {
+      setModel.mockClear();
+      fireEvent.change(ta, { target: { value: `/model ${alias}` } });
+      fireEvent.keyDown(ta, { key: "Enter" });
+      expect(onSend).not.toHaveBeenCalled();
+      if (row.reset) {
+        expect(setModel).toHaveBeenCalledWith(null, expect.anything());
+        expect(ta).toHaveValue("");
+      } else {
+        expect(setModel).not.toHaveBeenCalled();
+        expect(screen.getByText(/This session does not support resetting/)).toBeVisible();
+        expect(ta).toHaveValue(`/model ${alias}`);
+      }
+    }
+    setModel.mockClear();
+    fireEvent.change(ta, { target: { value: "/model primary" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(setModel).toHaveBeenCalledWith("primary", expect.anything());
+
+    if (row.kind !== null) {
+      await openSessionModels();
+      expect(screen.queryByRole("menuitem", { name: "Use default model" })).toBeNull();
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+      setModel.mockClear();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith(row.reset ? null : "primary", expect.anything()),
+      );
+    }
   });
 
   it("treats /model as plaintext on native-wrapper sessions without a model picker", () => {
@@ -1268,7 +1572,7 @@ describe("Composer cached model labels", () => {
     });
   beforeEach(() => {
     localStorage.clear();
-    composerSnapshotHost.id = scope.hostId;
+    composerSessionSnapshot.hostId = scope.hostId;
     vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("user-a");
     setComposerState({
@@ -1287,7 +1591,7 @@ describe("Composer cached model labels", () => {
   });
   afterEach(() => {
     cleanup();
-    composerSnapshotHost.id = null;
+    composerSessionSnapshot.hostId = null;
     vi.restoreAllMocks();
     localStorage.clear();
     useChatStore.setState({ sessionModelSeeded: false, sessionHostId: null, boundAgentId: null });
@@ -1368,7 +1672,7 @@ describe("Composer cached model labels", () => {
 
   it("does not reuse the creation host's cache after the snapshot host changes", () => {
     const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
-    composerSnapshotHost.id = "new-host";
+    composerSessionSnapshot.hostId = "new-host";
     first.rerender(
       <TooltipProvider>
         <Composer {...props()} codexModelOptions={[]} />
@@ -1556,6 +1860,48 @@ describe("Composer model/effort label", () => {
     expect(label()).not.toHaveTextContent("Sonnet 4.6");
   });
 
+  it.each([
+    ["claude", true],
+    ["codex", true],
+    ["kiro", false],
+    ["pi", false],
+  ] as const)(
+    "shows model-change progress only for confirmation-based %s switches",
+    async (modelPickerKind, showsPending) => {
+      useChatStore.setState({
+        llmModel: "primary",
+        pendingModelChange: "alternate",
+        sessionModelSeeded: false,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showEffort: false,
+            showModels: true,
+            modelPickerKind,
+            codexModelOptions: [
+              { id: "primary", displayName: "Primary" },
+              { id: "alternate", displayName: "Alternate" },
+            ],
+          })}
+        />,
+      );
+
+      expect(label()).toHaveTextContent("Primary");
+      expect(label()).not.toHaveTextContent("Alternate");
+      if (showsPending) {
+        expect(screen.getByTestId("composer-model-pending")).toHaveAccessibleName(
+          "Model change pending",
+        );
+      } else {
+        expect(screen.queryByTestId("composer-model-pending")).toBeNull();
+      }
+
+      act(() => useChatStore.setState({ pendingModelChange: null }));
+      await waitFor(() => expect(screen.queryByTestId("composer-model-pending")).toBeNull());
+    },
+  );
+
   const CLAUDE_LIVE_OPTIONS = [
     { id: "opus", model: "system.ai.claude-opus-4-10", displayName: "Opus 4.10", isDefault: false },
     { id: "sonnet", model: "system.ai.claude-sonnet-5", displayName: "Sonnet 5", isDefault: true },
@@ -1581,9 +1927,6 @@ describe("Composer model/effort label", () => {
 
     expect(label()).toHaveTextContent("Sonnet 5");
     expect(label()).not.toHaveTextContent("system.ai.claude-sonnet-5");
-    // The modal's catalog-default fallback (isDefault row when no concrete
-    // model) is exercised in the real browser by the claude model-picker e2e
-    // tests, where the Radix Select actually mounts its option rows.
   });
 
   it("keeps the harness visible when model and effort are unresolved", () => {
@@ -1807,9 +2150,9 @@ describe("Composer model/effort label", () => {
     );
 
     openSessionConfig();
-
     fireEvent.click(screen.getByTestId("composer-agent-edit"));
     expect(await screen.findByTestId("composer-agent-config-menu")).toBeTruthy();
+    expect(screen.getByTestId("composer-agent-model-opus")).toBeInTheDocument();
   });
 
   it("keeps the label click inert when the session is read-only", () => {
@@ -1865,6 +2208,20 @@ describe("Composer shared visible controls", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    childSessionsArgsSpy.mockClear();
+    composerChildSessions.children = [];
+    Object.assign(composerSessionSnapshot, {
+      hostId: null,
+      workspace: null,
+      labels: {},
+      gitBranch: null,
+    });
+    useChatStore.setState({
+      contextWindow: null,
+      tokensUsed: null,
+      backgroundTaskCount: 0,
+      backgroundTasks: [],
+    });
   });
 
   // The workspace/worktree popover markup moved into the shared
@@ -1897,13 +2254,14 @@ describe("Composer shared visible controls", () => {
     const [widthProbe, leading, trailing] = Array.from(actions.children);
     expect(widthProbe).toHaveClass("h-0");
     expect(leading).toContainElement(screen.getByRole("button", { name: "Add" }));
-    expect(trailing).toContainElement(screen.getByTestId("composer-config-gear"));
+    const harnessPicker = screen.getByTestId("composer-config-gear");
+    expect(screen.queryByTestId("composer-settings")).toBeNull();
+    expect(trailing.firstElementChild).toContainElement(harnessPicker);
     expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
-    // The branch text now flows through the shared ComposerWorkspaceStatus +
-    // useComposerGitStatus (covered by their own tests); here assert the shared
-    // branch control renders in the bar.
-    expect(within(workspace).getByTestId("composer-git-branch")).toBeInTheDocument();
+    expect(textarea().closest("form")).toHaveClass("pb-[max(20px,env(safe-area-inset-bottom))]");
+    // A normal working directory has no empty worktree affordance.
+    expect(within(workspace).queryByTestId("composer-git-branch")).toBeNull();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
     expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask for approval");
     const trigger = screen.getByTestId("composer-config-gear");
@@ -1912,6 +2270,129 @@ describe("Composer shared visible controls", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("transitions PR and worktree visibility across ready, empty, loading, and unknown GitHub states", () => {
+    setComposerGitStatus({
+      branch: "feature/shared-composer",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/repo-wt/feature",
+      githubState: "ready",
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      prCount: 1,
+      prNumber: 42,
+    });
+    const view = renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("#42");
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature/shared-composer");
+
+    setComposerGitStatus({
+      branch: "feature/shared-composer",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/repo-wt/feature",
+      githubState: "ready",
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      prCount: 0,
+      prNumber: null,
+    });
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...composerProps()} />
+      </TooltipProvider>,
+    );
+    expect(screen.queryByTestId("composer-pr-link")).toBeNull();
+    expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
+
+    setComposerGitStatus({ githubState: "loading", repoNameWithOwner: null });
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...composerProps()} />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-pr-loading")).toHaveTextContent("Checking PR…");
+    expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+
+    setComposerGitStatus({ githubState: "unknown" });
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...composerProps()} />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
+    expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+
+  it("keeps the PR to the right of the confirmed worktree status", () => {
+    setComposerGitStatus({
+      branch: "feature/shared-composer",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/repo-wt/feature",
+      githubState: "ready",
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      prCount: 1,
+      prNumber: 42,
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    const pr = screen.getByTestId("composer-pr-link");
+    const worktree = screen.getByTestId("composer-git-branch");
+    expect(worktree.compareDocumentPosition(pr) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("mounts task indicators before the context ring with sub-agent navigation", () => {
+    useChatStore.setState({
+      conversationId: "conv_parent",
+      contextWindow: 100_000,
+      tokensUsed: 25_000,
+      backgroundTaskCount: 1,
+      backgroundTasks: [],
+    });
+    composerChildSessions.children = [
+      {
+        id: "conv_child",
+        title: "developer:queue-tests",
+        task_summary: "Verify queue behavior",
+        tool: "developer",
+        session_name: "queue-tests",
+        labels: {},
+        current_task_status: "in_progress",
+        last_task_error: null,
+        busy: true,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+        routed_model: null,
+      },
+    ];
+
+    render(
+      <MemoryRouter initialEntries={["/c/conv_parent?file=README.md&debug=1"]}>
+        <TooltipProvider>
+          <Composer {...composerProps()} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+
+    const workspace = screen.getByTestId("composer-workspace-controls");
+    const taskIndicators = within(workspace).getByTestId("composer-task-indicators");
+    const context = within(workspace).getByTestId("composer-context-ring");
+    const background = within(workspace).getByTestId("background-task-pill");
+    const subagent = within(workspace).getByTestId("subagent-task-pill");
+    expect(
+      background.compareDocumentPosition(subagent) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(subagent.compareDocumentPosition(context) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
+      0,
+    );
+    expect(taskIndicators).toHaveClass("gap-0");
+    expect(context.parentElement).toHaveClass("gap-1");
+    expect(childSessionsArgsSpy).toHaveBeenCalledWith("conv_parent");
+
+    fireEvent.click(subagent);
+    expect(
+      screen.getByRole("link", { name: /Verify queue behavior.*Working.*developer/ }),
+    ).toHaveAttribute("href", "/c/conv_child?debug=1");
   });
 
   it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {
@@ -1927,6 +2408,63 @@ describe("Composer shared visible controls", () => {
         hostId: null,
         workspace: null,
       }),
+    );
+  });
+
+  it("prefers the session worktree over the source workspace stored in composer labels", () => {
+    composerGitStatusArgsSpy.mockClear();
+    Object.assign(composerSessionSnapshot, {
+      hostId: "host-worktree",
+      workspace: "/home/alice/worktrees/feature-x",
+      labels: composerContextToLabels({
+        workingDirectory: { kind: "selected", path: "/home/alice/source-repo" },
+        worktree: { kind: "new", branchName: "feature-x", baseBranch: "main" },
+      }),
+      gitBranch: "feature-x",
+    });
+    setComposerGitStatus({
+      branch: "feature-x",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/worktrees/feature-x",
+      creationBranch: "feature-x",
+    });
+    useChatStore.setState({ conversationId: "conv_worktree", gitBranch: "source-branch" });
+
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "conv_worktree",
+        hostId: "host-worktree",
+        workspace: "/home/alice/worktrees/feature-x",
+        creationBranch: "feature-x",
+      }),
+    );
+    expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
+      "Working directory: /home/alice/worktrees/feature-x",
+    );
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature-x");
+  });
+
+  it("falls back to the composer label when the session workspace is absent", () => {
+    composerGitStatusArgsSpy.mockClear();
+    Object.assign(composerSessionSnapshot, {
+      workspace: null,
+      labels: composerContextToLabels({
+        workingDirectory: { kind: "selected", path: "/home/alice/legacy-repo" },
+        worktree: { kind: "none" },
+      }),
+    });
+    useChatStore.setState({ conversationId: "conv_legacy_workspace", gitBranch: null });
+
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ workspace: "/home/alice/legacy-repo" }),
+    );
+    expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
+      "Working directory: /home/alice/legacy-repo",
     );
   });
 
@@ -2699,6 +3237,28 @@ describe("Composer pending elicitation", () => {
     expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
   });
 
+  it("keeps Interrupt available and preserves a draft typed during a pending elicitation", () => {
+    useChatStore.setState({ conversationId: "conv_interrupt_draft", blocks: [elicitationBlock()] });
+    const onStop = vi.fn();
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ isWorking: true, onStop, onSend })} />);
+
+    fireEvent.change(textarea(), { target: { value: "keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+
+    expect(onStop).toHaveBeenCalledTimes(1);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("keep this draft");
+  });
+
+  it("keeps ChatPage's waiting elicitation interruptible", () => {
+    // A pending request blocks sending but keeps the waiting turn interruptible.
+    useChatStore.setState({ conversationId: "conv_wiring", blocks: [elicitationBlock()] });
+    const isWorking = computeIsWorking("waiting");
+    render(<Composer {...composerProps({ isWorking, status: "streaming" })} />);
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+  });
+
   it("unlocks once the elicitation is responded", () => {
     useChatStore.setState({
       blocks: [elicitationBlock({ status: "responded", response: { action: "accept" } })],
@@ -3413,6 +3973,181 @@ describe("Composer file-attachment focus", () => {
 
     expect(screen.queryByText(/can't be attached/)).toBeNull();
   });
+
+  it("clears the rejection notice when the accepted chip is removed", () => {
+    // A mixed attach keeps the good file and flags the bad one; removing the
+    // surviving chip must also drop the stale notice (parity with the landing
+    // composer's mixed-drop behavior).
+    render(<Composer {...composerProps()} />);
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(fileInput(), { target: { files: [ok, bad] } });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
+
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
+});
+
+// Paste mirrors drop on the in-session composer: files on the clipboard attach
+// instead of inserting as text, while a plain-text paste is left to the
+// browser. Same contract as the landing composer's paste suite.
+describe("Composer paste", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  /** Clipboard items as a real paste carries them: text and/or file entries. */
+  function pastePayload({ text, files = [] }: { text?: string; files?: File[] }) {
+    const items: {
+      kind: string;
+      type: string;
+      getAsFile: () => File | null;
+      getAsString?: (callback: (value: string) => void) => void;
+    }[] = [];
+    if (text !== undefined) {
+      items.push({
+        kind: "string",
+        type: "text/plain",
+        getAsFile: () => null,
+        getAsString: (callback) => callback(text),
+      });
+    }
+    for (const file of files) {
+      items.push({ kind: "file", type: file.type, getAsFile: () => file });
+    }
+    return { clipboardData: { items } };
+  }
+
+  it("leaves a text-only paste to the browser", () => {
+    render(<Composer {...composerProps()} />);
+    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(true);
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+    expect(textarea().value).toBe("");
+  });
+
+  it("attaches a pasted file instead of inserting it as text", () => {
+    render(<Composer {...composerProps()} />);
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [file] }))).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(textarea().value).toBe("");
+  });
+
+  it("attaches every file from a multi-file paste", () => {
+    render(<Composer {...composerProps()} />);
+    const image = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    const notes = new File(["hello"], "notes.txt", { type: "text/plain" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [image, notes] }))).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+  });
+
+  it("attaches files pasted while the slash menu is open, closing the menu", () => {
+    // The slash menu only renders with no attachments (its visibility gate
+    // includes ``files.length === 0``), so pasting a file attaches it, keeps
+    // the drafted "/query" text, and dismisses the menu. The landing composer
+    // has no such gate — its menu stays open; the parity suite there records
+    // the divergence.
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/de" } });
+    expect(activeRow()).not.toBeNull();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(fireEvent.paste(textarea(), pastePayload({ files: [file] }))).toBe(false);
+
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
+    expect(textarea().value).toBe("/de");
+    expect(screen.queryByTestId("slash-menu-item-deslop")).toBeNull();
+  });
+});
+
+// A send that fails before the server takes ownership hands its text and
+// files back to the composer for retry. The files re-enter through the same
+// up-front validation as a fresh attach — when the upload itself was what
+// failed (a 415 on an unsupported type), re-arming that file would only
+// fail again, so it is dropped with the same inline reason.
+describe("Composer failed-send attachment restore", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("restores the retriable files and flags the ones current limits reject", () => {
+    render(<Composer {...composerProps()} />);
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
+      }),
+    );
+
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    // The store entry drained on restore, so the draft can't come back twice.
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("skips the restore when the user attached a file while the send was in flight", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["mine"], "mine.txt", { type: "text/plain" })] },
+    });
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "message that failed",
+          files: [new File(["hello"], "notes.txt", { type: "text/plain" })],
+        },
+      }),
+    );
+
+    // The in-progress attachment wins over the restore: the failed message's
+    // text and files stay out, and the drained store entry does not return.
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+    expect(screen.queryByText("notes.txt")).toBeNull();
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("clears the failed-send rejection notice once the user types", () => {
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "",
+          files: [new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" })],
+        },
+      }),
+    );
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+
+    fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
+
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
 });
 
 // The "Chatting with sub-agent …" tray peeks above the composer only when a
@@ -3452,6 +4187,7 @@ describe("Composer sub-agent tray", () => {
     // that some tray exists.
     expect(screen.getByText("check-account-eligibility")).toBeTruthy();
     expect(screen.getByText(/Chatting with sub-agent/)).toBeTruthy();
+    expect(screen.getByTestId("composer-workspace-controls")).not.toHaveClass("rounded-t-none");
   });
 
   // The sub-agent tray sits directly above the workspace bar, sharing its
@@ -3468,6 +4204,22 @@ describe("Composer sub-agent tray", () => {
     render(<Composer {...composerProps()} />);
     const bar = document.querySelector('[data-testid="composer-workspace-controls"]');
     expect(bar?.className).not.toContain("rounded-t-none");
+  });
+
+  it("removes the workspace bar's inner arc when the queue tray is docked above it", () => {
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      queuedMessages: [{ queueId: "q_1", text: "held follow-up", conversationId: "conv_test" }],
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
+      "rounded-t-none",
+      "border-t-0",
+      "border-border/50",
+      "before:inset-x-4",
+      "before:h-px",
+    );
   });
 });
 
@@ -3557,7 +4309,7 @@ describe("Composer — queued-message flush gating", () => {
   });
 });
 
-describe("Composer — ArrowUp edit of a queued message", () => {
+describe("Composer — editing queued messages", () => {
   const CONV = "conv_uparrow_edit";
   const QUEUED_TEXT = "queued follow-up recalled for editing";
 
@@ -3646,6 +4398,43 @@ describe("Composer — ArrowUp edit of a queued message", () => {
     await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+
+  it.each([
+    ["", "screenshot.png"],
+    ["Look at this", "screenshot.png"],
+    ["", ""],
+    ["Look at this", ""],
+  ])("preserves queued text %j and screenshot %j when edited and re-sent", (text, name) => {
+    const file = new File([new Uint8Array(10)], name, { type: "image/png" });
+    const displayName = name || "image.png";
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
+    });
+    const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+
+    const strip = screen.getByTestId("composer-queued-strip");
+    expect(strip).toHaveTextContent(displayName);
+    if (text) expect(strip).toHaveTextContent(text);
+    expect(useChatStore.getState().queuedMessages[0]?.text).toBe(text);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+
+    expect(textarea()).toHaveValue(text);
+    expect(screen.getByAltText(displayName)).toBeInTheDocument();
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSend).toHaveBeenCalledWith(text, [file]);
+    expect(onSend.mock.calls[0]?.[1]?.[0]).toBe(file);
+    expect(file.name).toBe(name);
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text, files: [file], conversationId: CONV }),
+    ]);
+    const requeuedStrip = screen.getByTestId("composer-queued-strip");
+    expect(requeuedStrip).toHaveTextContent(displayName);
+    if (text) expect(requeuedStrip).toHaveTextContent(text);
   });
 
   it("preserves a queued quoted reply and its attachments on re-send", () => {
@@ -4052,7 +4841,42 @@ describe("Composer config gear", () => {
     expect(screen.queryByText("Advanced settings…")).toBeNull();
   });
 
-  it("uses the Default sentinel when Kiro marks no catalog row as default", async () => {
+  it.each([null, "primary"])(
+    "explains an empty native catalog with current model %s and updates when choices arrive",
+    async (currentModel) => {
+      useChatStore.setState({ llmModel: currentModel });
+      const props = composerProps({
+        showEffort: false,
+        showModels: true,
+        modelPickerKind: "codex",
+        costRoutingEligible: true,
+        codexModelOptions: [],
+      });
+      const { rerender } = render(<Composer {...props} />, { wrapper: TooltipProvider });
+      await openSessionModels();
+      const models = screen.getByTestId("composer-agent-models");
+      expect(within(models).getByRole("status")).toHaveTextContent(
+        "No usable models are available for this session.",
+      );
+      expect(screen.getByRole("menuitem", { name: "Smart Routing" })).toBeVisible();
+      if (currentModel) {
+        expect(within(models).getByRole("menuitemcheckbox")).toHaveAttribute(
+          "aria-disabled",
+          "true",
+        );
+      } else {
+        expect(within(models).queryByRole("menuitemcheckbox")).toBeNull();
+      }
+
+      rerender(
+        <Composer {...props} codexModelOptions={[{ id: "primary", displayName: "Primary" }]} />,
+      );
+      expect(within(models).queryByRole("status")).toBeNull();
+      expect(within(models).getByRole("menuitemcheckbox", { name: "Primary" })).toBeVisible();
+    },
+  );
+
+  it("offers only explicit models when Kiro marks no catalog row as default", async () => {
     const options = [
       { id: "auto", displayName: "Automatic", isDefault: false },
       { id: "provider-latest", displayName: "Latest", isDefault: false },
@@ -4070,7 +4894,161 @@ describe("Composer config gear", () => {
 
     await openSessionModels();
     await screen.findByTestId("composer-agent-config-menu");
-    expect(screen.getByTestId("composer-agent-models")).toHaveTextContent("Default");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Automatic" })).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Latest" })).toBeVisible();
+  });
+
+  it.each([
+    "claude",
+    "codex",
+    "cursor",
+    "kiro",
+    "opencode",
+    "pi",
+    "devin",
+    "acp",
+    "configured",
+  ] as const)("selects alternate and reapplies the %s default row", async (modelPickerKind) => {
+    const options = [
+      { id: "primary", displayName: "Primary", isDefault: true },
+      { id: "alternate", displayName: "Alternate" },
+    ];
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel, codexModelOptions: options });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind,
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    // A catalog default alone is not evidence of the session's current model.
+    expect(screen.getByRole("menuitemcheckbox", { name: "Primary" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith("alternate", expect.anything()));
+    act(() => useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }));
+
+    await openSessionModels();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
+    const resetsToDefault =
+      modelPickerKind === "opencode" ||
+      modelPickerKind === "acp" ||
+      modelPickerKind === "configured";
+    await waitFor(() =>
+      expect(setModel).toHaveBeenLastCalledWith(resetsToDefault ? null : "primary", {
+        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+      }),
+    );
+    expect(setModel).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["opencode", "acp"] as const)(
+    "synthesizes a resettable Default row for %s catalogs without a marked default",
+    async (modelPickerKind) => {
+      const options = [
+        { id: "primary", displayName: "Primary", isDefault: false },
+        { id: "alternate", displayName: "Alternate", isDefault: false },
+      ];
+      const setModel = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({
+        setModel,
+        codexModelOptions: options,
+        llmModel: null,
+        sessionModelOverride: null,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showEffort: false,
+            showModels: true,
+            modelPickerKind,
+            codexModelOptions: options,
+          })}
+        />,
+      );
+
+      await openSessionModels();
+      const defaultRow = screen.getByTestId("composer-agent-model-default");
+      expect(defaultRow).toHaveTextContent("Default");
+      expect(defaultRow).toHaveAttribute("aria-checked", "true");
+      fireEvent.click(defaultRow);
+      await waitFor(() => expect(setModel).toHaveBeenCalledWith(null, expect.anything()));
+
+      act(() =>
+        useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }),
+      );
+      await openSessionModels();
+      expect(screen.getByTestId("composer-agent-model-default")).toHaveAttribute(
+        "aria-checked",
+        "false",
+      );
+    },
+  );
+
+  it.each([
+    ["claude", "sonnet[1m]", "Sonnet 5 (1M context)"],
+    ["codex", "gpt-5.5", "Codex Pretty 5.5"],
+    ["cursor", "composer-2.5", "Composer 2.5"],
+    ["kiro", "claude-haiku-4-5", "Claude Haiku 4.5"],
+    ["opencode", "anthropic/claude-sonnet-4", "anthropic/claude-sonnet-4"],
+    ["acp", "private/fast", "Private Fast"],
+  ] as const)(
+    "renders %s catalog metadata verbatim in the model row",
+    async (modelPickerKind, id, displayName) => {
+      useChatStore.setState({ llmModel: id, sessionModelOverride: id });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showEffort: false,
+            showModels: true,
+            modelPickerKind,
+            codexModelOptions: [{ id, model: `wire/${id}`, displayName }],
+          })}
+        />,
+      );
+
+      await openSessionModels();
+      const row = screen.getByRole("menuitemcheckbox", { name: displayName });
+      expect(row).toHaveAttribute("data-model-id", id);
+      expect(row).toHaveTextContent(displayName);
+    },
+  );
+
+  it("appends an unknown reported Codex model as the checked current row", async () => {
+    useChatStore.setState({
+      llmModel: "gpt-unlisted",
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: [{ id: "gpt-5.5", displayName: "Codex Pretty 5.5" }],
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "gpt-unlisted (current)" }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Codex Pretty 5.5" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
   });
 
   it("names the model Codex's Default resolves to, like the new-session gear", async () => {
@@ -4230,7 +5208,35 @@ describe("Composer config gear", () => {
     await openSessionEfforts();
     fireEvent.click(screen.getByTestId("composer-agent-effort-low"));
     await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
+    expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(calls).toEqual(["model", "effort"]);
+  });
+
+  it("shows a titled actionable tooltip when a session config update fails", async () => {
+    const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
+    const options = [
+      { id: "opus", model: "opus", displayName: "Opus" },
+      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+    ] as never;
+    useChatStore.setState({ setModel, codexModelOptions: options });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+    const error = await screen.findByTestId("composer-config-error");
+    fireEvent.focus(error);
+    const tooltip = await screen.findByTestId("composer-config-error-tooltip");
+    expect(tooltip).toHaveTextContent("Couldn’t update configuration");
+    expect(tooltip).toHaveTextContent("Host stopped responding");
+    expect(tooltip).toHaveTextContent("Try again");
   });
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {
@@ -4513,3 +5519,113 @@ function setComposerState(
     ...(skillsStatus === undefined ? {} : { skillsStatus }),
   });
 }
+
+describe("Composer attachment picker", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("accepts the workspace types in the file picker filter", () => {
+    render(<Composer {...composerProps()} />);
+
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    // Without these the OS picker hides the very files the server now accepts.
+    expect(input.accept).toContain(".zip");
+    expect(input.accept).toContain(".docx");
+  });
+});
+
+describe("saved sandbox inference policy", () => {
+  let previous: ChatState;
+  beforeEach(() => {
+    previous = useChatStore.getState();
+    useChatStore.setState({
+      conversationId: "conv_policy",
+      sessionHarness: "claude-sdk",
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+      llmModel: "private/default",
+      costControlModeOverride: null,
+      pendingModelChange: null,
+      setModel: vi.fn().mockResolvedValue(undefined),
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState(previous, true);
+  });
+
+  it.each(["private/default", "private/fast", null])(
+    "offers the saved shortlist with the known model %s checked",
+    async (llmModel) => {
+      useChatStore.setState({ llmModel });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            showEffort: false,
+            modelPickerKind: "configured",
+            inferenceConfigured: true,
+            codexModelOptions: [
+              { id: "private/default", displayName: "Primary", isDefault: true },
+              { id: "private/fast", displayName: "Fast" },
+            ],
+          })}
+        />,
+      );
+      await openSessionModels();
+      expect(screen.queryByTestId("composer-agent-model-default")).toBeNull();
+      expect(screen.getByRole("menuitemcheckbox", { name: "Primary" })).toHaveAttribute(
+        "aria-checked",
+        String(llmModel === "private/default"),
+      );
+      expect(screen.getByRole("menuitemcheckbox", { name: "Fast" })).toHaveAttribute(
+        "aria-checked",
+        String(llmModel === "private/fast"),
+      );
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Fast" }));
+      await waitFor(() =>
+        expect(useChatStore.getState().setModel).toHaveBeenCalledWith("private/fast", {
+          expectConfirmation: false,
+        }),
+      );
+    },
+  );
+
+  it.each([
+    { error: null, options: [] },
+    { error: "The gateway could not be reached.", options: [] },
+    {
+      error: "The gateway could not be reached.",
+      options: [{ id: "private/default", displayName: "Primary", isDefault: true }],
+    },
+  ])(
+    "disables reset when the saved catalog is unavailable ($error, $options)",
+    async ({ error, options }) => {
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            showEffort: false,
+            modelPickerKind: "configured",
+            inferenceConfigured: true,
+            inferenceError: error,
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      const models = within(screen.getByTestId("composer-agent-models"));
+      expect(models.getByRole("status")).toHaveTextContent(
+        error ?? "No usable models are available for this session.",
+      );
+      expect(screen.queryByRole("menuitem", { name: "Use default model" })).toBeNull();
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+      for (const choice of screen.getAllByRole("menuitemcheckbox")) {
+        expect(choice).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(choice);
+      }
+      expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
+    },
+  );
+});

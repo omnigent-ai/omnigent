@@ -147,8 +147,11 @@ it("keeps actions visible only on a final assistant message while idle", () => {
   const copyButtons = screen.getAllByRole("button", { name: "Copy" });
 
   expect(actionFooter(copyButtons[0]!)).toHaveClass("md:opacity-0");
-  expect(actionFooter(copyButtons[1]!)).not.toHaveClass("md:opacity-0");
-  expect(actionFooter(copyButtons[1]!)).toHaveClass("md:group-hover:opacity-100");
+  expect(actionFooter(copyButtons[1]!)).toHaveClass("opacity-100");
+  expect(actionFooter(copyButtons[1]!)).not.toHaveClass(
+    "md:opacity-0",
+    "md:group-hover:opacity-100",
+  );
 
   view.rerender(messageList(bubbles, false, false));
   expect(actionFooter(screen.getAllByRole("button", { name: "Copy" })[1]!)).toHaveClass(

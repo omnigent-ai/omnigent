@@ -104,6 +104,7 @@ import {
 import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
+import { withBasePath } from "@/lib/basePath";
 import {
   beginGithubConnect,
   disconnectGithub,
@@ -172,6 +173,13 @@ import {
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import {
+  canRememberTerminalClipboardPreference,
+  readTerminalClipboardPreference,
+  subscribeTerminalClipboardPreference,
+  writeTerminalClipboardPreference,
+  type TerminalClipboardPreference,
+} from "@/lib/terminalClipboardPreferences";
 import {
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
@@ -247,6 +255,7 @@ import {
   readBackgroundSessionTitlesEnabled,
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
+import { SettingsCustomizeSection } from "./settings/SettingsCustomizeSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -273,7 +282,7 @@ export function SettingsPage() {
   // A login session exists (accounts OR OIDC) when the server advertises a
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
-  const { section } = useSettingsRoute();
+  const { section, subSection } = useSettingsRoute();
   // Per-section page view: `settings.appearance`, `settings.account`, etc. The
   // hook re-keys on pathname, so switching sections re-fires under the new id.
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
@@ -298,6 +307,13 @@ export function SettingsPage() {
         )}
       </Suspense>
     );
+  }
+
+  // Nested sections own their own layout. useSettingsRoute only sets
+  // subSection for a valid, feature-enabled customize route, so no extra
+  // flag check is needed here.
+  if (section === "customize" && subSection) {
+    return <SettingsCustomizeSection subSection={subSection} />;
   }
 
   return (
@@ -638,7 +654,7 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55 shadow-xs">
+      <div className="overflow-hidden rounded-xl border bg-card/55">
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -1064,9 +1080,14 @@ function AppearanceSection() {
 function GitSection() {
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
-      <div className="flex flex-col gap-8">
-        <AlwaysUseWorktreeControl />
-        <DefaultBaseBranchControl />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Worktrees</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <AlwaysUseWorktreeControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <DefaultBaseBranchControl />
+          </div>
+        </div>
       </div>
     </Section>
   );
@@ -1500,6 +1521,75 @@ function BackgroundSessionTitlesControl() {
   );
 }
 
+function TerminalClipboardControl() {
+  const labelId = useId();
+  const descriptionId = useId();
+  const canRemember = canRememberTerminalClipboardPreference();
+  const [preference, setPreference] = useState<TerminalClipboardPreference>(
+    readTerminalClipboardPreference,
+  );
+  const [saveFailed, setSaveFailed] = useState(false);
+
+  useEffect(
+    () =>
+      subscribeTerminalClipboardPreference((value) => {
+        setPreference(value);
+        setSaveFailed(false);
+      }),
+    [],
+  );
+
+  const update = (value: string) => {
+    if (!canRemember) return;
+    if (value !== "ask" && value !== "allow" && value !== "block") return;
+    const saved = writeTerminalClipboardPreference(value);
+    if (saved) setPreference(value);
+    setSaveFailed(!saved);
+  };
+
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <span id={labelId} className="text-ui font-medium">
+          Copying from terminals
+        </span>
+        <span id={descriptionId} className="text-sm text-muted-foreground">
+          {canRemember
+            ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
+            : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."}
+        </span>
+        {saveFailed && (
+          <span role="alert" className="text-sm text-destructive">
+            Couldn&apos;t save this preference in this browser or app. Your previous setting is
+            unchanged.
+          </span>
+        )}
+      </div>
+      <Select
+        value={preference}
+        disabled={!canRemember}
+        onValueChange={update}
+        componentId="settings.general.terminal_clipboard"
+        valueHasNoPii
+      >
+        <SelectTrigger
+          aria-labelledby={labelId}
+          aria-describedby={descriptionId}
+          data-testid="terminal-clipboard-preference-select"
+          className="w-48 shrink-0"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="ask">Ask before copying</SelectItem>
+          <SelectItem value="allow">Allow copying</SelectItem>
+          <SelectItem value="block">Block copying</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   return (
@@ -1515,6 +1605,10 @@ function GeneralSection() {
         <h2 className="mt-3 text-ui font-medium">Sessions</h2>
         <div className="rounded-xl border border-border bg-card p-4">
           <BackgroundSessionTitlesControl />
+        </div>
+        <h2 className="mt-3 text-ui font-medium">Terminal</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <TerminalClipboardControl />
         </div>
       </div>
     </Section>
@@ -1961,7 +2055,7 @@ function StepperButton({
 function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList />
+      <KeyboardShortcutsList variant="settings" />
     </Section>
   );
 }
@@ -2256,14 +2350,14 @@ function AccountSection() {
       // the SPA login form.
       await logout();
       // Hard navigation so the chat store / react-query cache reset.
-      window.location.href = "/login";
+      window.location.href = withBasePath("/login");
       return;
     }
     // OIDC: logout is a server-side GET redirect at /auth/logout that clears
     // the session cookie (and honors the IdP end-session endpoint when
     // configured). A hard navigation lets the browser follow it and resets
     // client caches.
-    window.location.href = "/auth/logout";
+    window.location.href = withBasePath("/auth/logout");
   }, [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {
@@ -2494,7 +2588,12 @@ function ImportSection() {
       title="Import sessions"
       description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
     >
-      <ImportSessionsPanel />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Import from a machine</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ImportSessionsPanel />
+        </div>
+      </div>
     </Section>
   );
 }
@@ -2530,8 +2629,16 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
-  // The visible list, filtered server-side via ?project= when one is picked.
-  const listQuery = useConversations("", true, undefined, project);
+  // Named projects need the owner-scoped "all" query, including archived rows.
+  // The unfiltered view can request only archives across all accessible sessions.
+  // Keep includeArchived for older servers that ignore visibility.
+  const listQuery = useConversations(
+    "",
+    true,
+    undefined,
+    project,
+    project === undefined ? "archived" : undefined,
+  );
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],

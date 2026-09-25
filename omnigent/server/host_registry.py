@@ -38,7 +38,7 @@ from omnigent.db.account_authority import (
     current_account_user,
 )
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import HostHelloFrame, HostSkillsResultFrame
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame, HostSkillsResultFrame
 
 _logger = logging.getLogger(__name__)
 
@@ -544,6 +544,26 @@ class HostRegistry:
         if conn is None:
             return None
         return conn.hello.installation_id
+
+    def host_supports_codex_side_chat(self, host_id: str, workspace_id: int | None = None) -> bool:
+        """Whether the connected host's build can fork a codex `/side` chat.
+
+        Reads the capability the host advertised in its hello frame. An older
+        host that predates the feature sends no such token, so it reads as
+        unsupported with no version check. Fails OPEN (``True``) only when the
+        host is offline/unknown — we then can't prove it's too old, and the
+        forward will surface any real connection failure on its own.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: ``False`` only for a connected host that did not advertise the
+            codex side-chat capability.
+        """
+        conn = self.get(host_id, workspace_id)
+        if conn is None:
+            return True
+        return CAP_CODEX_SIDE_CHAT in conn.hello.capabilities
 
     def record_gateway_inference(
         self,

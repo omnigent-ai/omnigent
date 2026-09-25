@@ -19,9 +19,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+import subprocess
+import threading
 import time
+from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -29,12 +33,14 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
 from omnigent.entities import Conversation
+from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
+    HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
     HostStatFrame,
@@ -44,6 +50,8 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.identity import HostIdentity
+from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -224,9 +232,12 @@ async def _serve_one_launch(
     # Bounded so a routing bug can't hang the test: stat + launch are
     # 2 frames, the rest of the budget absorbs interleaved pings. One deadline
     # for the whole exchange — a per-receive budget would multiply by 40.
-    deadline = Deadline(20.0)
+    deadline = Deadline(30.0)
     for _ in range(40):
-        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
+        # Allow server work between stat and launch under CI load: a
+        # receive_output timeout cancels the mock host tunnel and makes
+        # a slow session create fail with a spurious "host is offline" 409.
+        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -1145,6 +1156,320 @@ async def test_stopped_host_session_message_relaunches_runner(
     )
 
 
+async def test_message_relaunch_never_connected_names_phase_and_logs_error(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Name the failed phase in the 503 and log a correlated ERROR."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # Bound the connect wait for this test.
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    # Force a host relaunch that never gains a runner connection.
+    set_runner_client(None)
+    caplog.set_level(logging.INFO)
+    launch_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await launch_responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    # Keep the phase-specific detail.
+    assert "never connected to the server" in error["message"], error["message"]
+    assert "runner_token_" in error["message"], error["message"]
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None and conv.runner_id is not None
+    correlated_errors = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR and conv.runner_id in r.getMessage()
+    ]
+    assert correlated_errors, (
+        "expected an ERROR-level record naming the launched runner token; "
+        "ERROR records seen: "
+        f"{[r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]}"
+    )
+    assert any(session_id in r.getMessage() for r in correlated_errors), (
+        "the never-connected ERROR must also carry the session id"
+    )
+
+
+async def _relaunch_then_report_exit(
+    client: httpx.AsyncClient,
+    comm: ApplicationCommunicator,
+    session_id: str,
+    daemon_report: str,
+) -> httpx.Response:
+    """Relaunch, then send a pre-connect exit report over the host tunnel.
+
+    The exit report should settle the pending send before its timeout.
+    """
+
+    async def _launch_then_report() -> None:
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        frame = HostRunnerExitedFrame(
+            runner_id=token_bound_runner_id(launch.binding_token),
+            error=daemon_report,
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(frame)})
+
+    responder = asyncio.create_task(_launch_then_report())
+    try:
+        return await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+
+async def test_message_relaunch_host_failure_uncategorized_reports_startup_failure(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report an uncategorized host refusal as a failed start, not launch."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+    launch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error="failed to spawn runner: boom",
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await launch_responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "could not start runner" in error["message"], error["message"]
+    assert "failed to spawn runner: boom" in error["message"], error["message"]
+    assert "The host launched" not in error["message"], error["message"]
+    assert "never connected" not in error["message"], error["message"]
+
+    # The refusal text must never enter RunnerExitReports: the session
+    # snapshot reads that store UNscoped (last_task_error), so a record
+    # here would hand any read-level collaborator the raw host text the
+    # 503 above deliberately owner-scopes.
+    snap = await client.get(f"/v1/sessions/{session_id}")
+    assert snap.status_code == 200, snap.text
+    assert "failed to spawn runner: boom" not in snap.text, (
+        "host launch-refusal text leaked into the session snapshot"
+    )
+
+
+async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not claim a launch when the host never acknowledged it."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+
+    async def _serve_stat_only() -> None:
+        """Answer the relaunch's stat and swallow the launch frame."""
+        deadline = Deadline(20.0)
+        for _ in range(40):
+            output = await comm.receive_output(timeout=deadline.next_wait(5.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostStatFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostStatResultFrame(
+                                request_id=frame.request_id,
+                                status="ok",
+                                exists=True,
+                                type="directory",
+                                canonical_path=frame.path,
+                            )
+                        ),
+                    }
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                return
+
+    responder = asyncio.create_task(_serve_stat_only())
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "never confirmed the launch" in error["message"], error["message"]
+    assert "The host was asked to launch runner" in error["message"], error["message"]
+    assert "The host launched" not in error["message"], error["message"]
+
+
+async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Include a visible pre-connect exit report in the 503 detail."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # Let the report, not the timeout, settle the send.
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+    daemon_report = (
+        "runner process exited with code 1 (log on host: ~/logs/runner-ab.log)\n"
+        "--- runner log tail ---\n"
+        "ValueError: bad tunnel token"
+    )
+    msg_resp = await _relaunch_then_report_exit(client, comm, session_id, daemon_report)
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "exited before connecting" in error["message"], error["message"]
+    assert "ValueError: bad tunnel token" in error["message"], error["message"]
+
+
+async def test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_owner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hide the host owner's log tail from another session viewer.
+
+    Operators still receive the full report in the correlated ERROR.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    # The fixture is unauthenticated; pin distinct identities and use the
+    # real get_visible owner check.
+    real_record = RunnerExitReports.record
+
+    def _record_as_host_owner(
+        self: RunnerExitReports, runner_id: str, error: str, owner: str | None
+    ) -> None:
+        del owner
+        real_record(self, runner_id, error, owner="host-owner@example.com")
+
+    monkeypatch.setattr(RunnerExitReports, "record", _record_as_host_owner)
+    monkeypatch.setattr(
+        routes_events, "_get_user_id", lambda request, auth_provider: "viewer@example.com"
+    )
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+    daemon_report = (
+        "runner process exited with code 1 (log on host: ~/logs/runner-ab.log)\n"
+        "--- runner log tail ---\n"
+        "SECRET_TOKEN=hunter2"
+    )
+    msg_resp = await _relaunch_then_report_exit(client, comm, session_id, daemon_report)
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "exited before connecting" in error["message"], error["message"]
+    assert "visible to the host owner" in error["message"], error["message"]
+    assert "SECRET_TOKEN" not in error["message"], error["message"]
+    # The operator-facing ERROR still carries the full report.
+    assert any(
+        r.levelno == logging.ERROR and "SECRET_TOKEN=hunter2" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
 async def test_host_reports_runner_unknown_skips_connect_grace(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -1303,6 +1628,162 @@ async def test_host_session_message_relaunches_offline_runner(
         "relaunch must mint a NEW runner_id (replace_runner_id); a stale id "
         "would keep routing messages to the dead runner"
     )
+
+
+async def test_first_message_during_host_spawn_does_not_launch_replacement(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Drive real host status and server recovery while the initial spawn is paused."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    host = HostProcess(
+        identity=HostIdentity(host_id=_HOST_ID, name="test"), server_url="http://testserver"
+    )
+    loop = asyncio.get_running_loop()
+    spawning = asyncio.Event()
+    status_started = asyncio.Event()
+    replacement_seen = asyncio.Event()
+    release_spawn = threading.Event()
+    launch_frames: list[HostLaunchRunnerFrame] = []
+    stop_frames: list[HostStopRunnerFrame] = []
+    status_results: list[str] = []
+    spawned: list[subprocess.Popen[bytes]] = []
+    forwarded: list[str] = []
+
+    def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        proc = Mock(spec=subprocess.Popen, pid=1234 + len(spawned))
+        proc.poll.return_value = None
+        spawned.append(proc)
+        loop.call_soon_threadsafe(spawning.set)
+        assert release_spawn.wait(budget(10.0)), "test did not release spawn"
+        return proc, tmp_path / "runner.log"
+
+    real_status = host._handle_runner_status
+
+    async def _status(frame: HostRunnerStatusFrame) -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await real_status(frame)
+
+    class HostWS:
+        async def send(self, raw: str) -> None:
+            frame = decode_host_frame(raw)
+            if isinstance(frame, HostRunnerStatusResultFrame):
+                status_results.append(frame.status)
+            await comm.send_input({"type": "websocket.receive", "text": raw})
+
+    ws = HostWS()
+
+    async def _serve_host() -> None:
+        while True:
+            output = await comm.receive_output(timeout=budget(20.0))
+            if output["type"] != "websocket.send":
+                continue
+            try:
+                frame = decode_host_frame(output["text"])
+            except ValueError:
+                continue
+            if isinstance(frame, HostLaunchRunnerFrame):
+                launch_frames.append(frame)
+                if len(launch_frames) > 1:
+                    replacement_seen.set()
+            if isinstance(frame, HostStopRunnerFrame):
+                stop_frames.append(frame)
+            host._start_frame_task(ws, output["text"])  # type: ignore[arg-type]
+
+    def _runner_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(request.url.path)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_request), base_url="http://runner"
+    )
+
+    async def _get_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient | None:
+        if (
+            launch_frames
+            and app.state.tunnel_registry.get(
+                token_bound_runner_id(launch_frames[0].binding_token)
+            )
+            is not None
+        ):
+            return fake_runner
+        return None
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda _harness: True)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    monkeypatch.setattr(host, "_stop_runner_proc", lambda _proc: None)
+    monkeypatch.setattr(host, "_handle_runner_status", _status)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    serve = asyncio.create_task(_serve_host())
+    create = asyncio.create_task(
+        client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": str(tmp_path),
+            },
+        )
+    )
+    post: asyncio.Task[httpx.Response] | None = None
+    try:
+        await asyncio.wait_for(spawning.wait(), budget(10.0))
+        initial = launch_frames[0]
+        session_id = initial.session_id
+        runner_id = token_bound_runner_id(initial.binding_token)
+        post = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+            )
+        )
+        await asyncio.wait_for(status_started.wait(), budget(5.0))
+        # If the buggy host answered immediately, let real server recovery
+        # consume that verdict so the failure identifies the duplicate launch.
+        if status_results == ["unknown"]:
+            await asyncio.wait_for(replacement_seen.wait(), budget(5.0))
+        assert len(launch_frames) == 1, "premature unknown caused a second runner launch"
+        assert not status_results, "status must await the pending spawn"
+
+        release_spawn.set()
+        response = await asyncio.wait_for(create, budget(5.0))
+        assert response.status_code == 201, response.text
+        await _wait_for_runner_connect_waiter(app, runner_id, timeout_s=budget(5.0))
+        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        response = await asyncio.wait_for(post, budget(5.0))
+        assert response.status_code < 300, response.text
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert conv is not None and conv.runner_id == runner_id
+        assert len(launch_frames) == len(spawned) == 1
+        assert stop_frames == []
+        assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
+    finally:
+        release_spawn.set()
+        for task in (create, post, serve):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(t for t in (create, post, serve) if t is not None), return_exceptions=True
+        )
+        await asyncio.gather(*host._frame_tasks, return_exceptions=True)
+        await host._drain_runner_stop_tasks()
+        await asyncio.gather(*host._watcher_tasks, return_exceptions=True)
+        await fake_runner.aclose()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
 
 
 async def test_host_session_message_waits_for_bound_runner_before_relaunch(
@@ -1997,7 +2478,7 @@ async def test_offline_runner_serves_file_content_and_changes_from_host(
         set_runner_router(prior_router)
         responder.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await responder
+            _ = await responder
 
 
 async def test_offline_runner_no_host_still_returns_503(

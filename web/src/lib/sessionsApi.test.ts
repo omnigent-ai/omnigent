@@ -18,6 +18,7 @@ import {
   forkSession,
   getSession,
   getSessionSlim,
+  getSessionUsage,
   importLocalSessions,
   interrupt,
   listRunners,
@@ -29,6 +30,7 @@ import {
   updateSession,
 } from "./sessionsApi";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
+import { getSessionHost, setSessionHost } from "./sessionHost";
 
 function mockJsonResponse(
   body: unknown,
@@ -150,6 +152,7 @@ describe("createSession", () => {
       labels: undefined,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
+      usageIncluded: true,
       totalCostUsd: undefined,
       usageByModel: null,
       llmModel: undefined,
@@ -175,6 +178,24 @@ describe("createSession", () => {
       workspace: null,
       gitBranch: null,
     });
+  });
+
+  it("preserves the saved inference policy on an empty session catalog", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_policy",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        inference_configured: true,
+        inference_error: "Gateway unavailable",
+        model_options: [],
+      }),
+    );
+    const session = await createSession("agent_xyz");
+    expect(session.inferenceConfigured).toBe(true);
+    expect(session.inferenceError).toBe("Gateway unavailable");
+    expect(session.codexModelOptions).toEqual([]);
   });
 
   it("forwards initial_items when provided", async () => {
@@ -823,7 +844,70 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv%20with%20space");
   });
 
-  it("getSessionSlim requests the snapshot without items or liveness", async () => {
+  it("routes a hostless sub-agent child by its parent's host", async () => {
+    // A sub-agent child runs on its parent's runner, whose tunnel lives on the
+    // replica keyed by the PARENT's host. The child row carries no host_id of
+    // its own, so its session-scoped requests must key by the parent — else
+    // they land keyless on the default replica and read "runner offline".
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_routing_parent",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        host_id: "host_devbox",
+      }),
+    );
+    await getSessionSlim("conv_routing_parent");
+
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_routing_child",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        host_id: null,
+        kind: "sub_agent",
+        parent_session_id: "conv_routing_parent",
+      }),
+    );
+    await getSessionSlim("conv_routing_child");
+
+    expect(getSessionHost("conv_routing_child")).toBe("host_devbox");
+  });
+
+  it("resolves the routing host through an arbitrarily deep child chain", async () => {
+    // Nesting has no depth limit; only the root is host-bound.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_deep_0",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        host_id: "host_root",
+      }),
+    );
+    await getSessionSlim("conv_deep_0");
+    for (let depth = 1; depth <= 6; depth++) {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: `conv_deep_${depth}`,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          host_id: null,
+          kind: "sub_agent",
+          parent_session_id: `conv_deep_${depth - 1}`,
+        }),
+      );
+      // oxlint-disable-next-line no-await-in-loop
+      await getSessionSlim(`conv_deep_${depth}`);
+    }
+
+    expect(getSessionHost("conv_deep_6")).toBe("host_root");
+  });
+
+  it("getSessionSlim skips items, liveness, and subtree usage", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -831,20 +915,23 @@ describe("getSession", () => {
         status: "idle",
         created_at: 1704067200,
         items: [],
+        usage_included: false,
+        total_cost_usd: null,
+        usage_by_model: null,
       }),
     );
 
     const session = await getSessionSlim("conv_abc");
 
     expect(fetchMock).toHaveBeenCalledOnce();
-    // The two skipped reads are the most expensive steps of the server's
-    // snapshot build; the chat surface loads items via /items and liveness
-    // via the /health poll, so it opts out of both.
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv_abc?include_items=false&include_liveness=false",
+      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false",
     );
     expect(session.agentId).toBe("agent_xyz");
     expect(session.items).toEqual([]);
+    expect(session.usageIncluded).toBe(false);
+    expect(session.totalCostUsd).toBeNull();
+    expect(session.usageByModel).toBeNull();
   });
 
   it("getSessionSlim can request a runner-backed state refresh", async () => {
@@ -862,8 +949,25 @@ describe("getSession", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&refresh_state=true",
+      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false&refresh_state=true",
     );
+  });
+
+  it("treats an older server's snapshot as already including usage", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        total_cost_usd: 4.5,
+      }),
+    );
+
+    const session = await getSessionSlim("conv_abc");
+
+    expect(session.usageIncluded).toBe(true);
+    expect(session.totalCostUsd).toBe(4.5);
   });
 
   it("maps permission_level from the wire to permissionLevel", async () => {
@@ -977,6 +1081,97 @@ describe("getSession", () => {
     );
     const session = await getSession("conv_top");
     expect(session.parentSessionId).toBeNull();
+  });
+});
+
+describe("getSessionUsage", () => {
+  it("requests usage without items, liveness, or runner-backed state refresh", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv with space",
+        total_cost_usd: 3.5,
+        usage_by_model: {
+          "model-a": { input_tokens: 10, total_cost_usd: 1 },
+          "model-b": { output_tokens: 20, total_cost_usd: 2.5 },
+        },
+      }),
+    );
+    const controller = new AbortController();
+
+    const usage = await getSessionUsage("conv with space", { signal: controller.signal });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv%20with%20space?include_usage=true&include_items=false&include_liveness=false&refresh_state=false",
+    );
+    expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
+    expect(usage).toEqual({
+      id: "conv with space",
+      totalCostUsd: 3.5,
+      usageByModel: {
+        "model-a": {
+          inputTokens: 10,
+          outputTokens: null,
+          totalTokens: null,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 1,
+        },
+        "model-b": {
+          inputTokens: null,
+          outputTokens: 20,
+          totalTokens: null,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 2.5,
+        },
+      },
+    });
+  });
+
+  it("ignores other snapshot fields without replacing host routing metadata", async () => {
+    setSessionHost("conv_usage_projection", "host_current");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_usage_projection",
+        agent_id: "agent_old",
+        host_id: "host_old",
+        status: "failed",
+        created_at: 0,
+        items: [],
+        total_cost_usd: 3.5,
+        usage_by_model: null,
+      }),
+    );
+
+    try {
+      expect(await getSessionUsage("conv_usage_projection")).toEqual({
+        id: "conv_usage_projection",
+        totalCostUsd: 3.5,
+        usageByModel: null,
+      });
+      expect(getSessionHost("conv_usage_projection")).toBe("host_current");
+    } finally {
+      setSessionHost("conv_usage_projection", null);
+    }
+  });
+
+  it.each([null, 0])("preserves unpriced versus priced-zero usage (%s)", async (cost) => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ id: "conv_abc", total_cost_usd: cost, usage_by_model: null }),
+    );
+
+    expect(await getSessionUsage("conv_abc")).toEqual({
+      id: "conv_abc",
+      totalCostUsd: cost,
+      usageByModel: null,
+    });
+  });
+
+  it("rejects a failed usage read instead of synthesizing zero spend", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 503 }));
+
+    await expect(getSessionUsage("conv_abc")).rejects.toMatchObject({ status: 503 });
   });
 });
 

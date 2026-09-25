@@ -126,9 +126,9 @@ export function BackgroundTaskIndicator() {
             size="xs"
             data-testid="background-task-pill"
             aria-label={`${countLabel} still running`}
-            className="shrink-0 px-0 font-normal tabular-nums text-muted-foreground md:px-2"
+            className="shrink-0 gap-1 px-1 font-normal tabular-nums text-muted-foreground md:px-2"
           >
-            <SquareTerminalIcon className="size-3.5" aria-hidden="true" />
+            <SquareTerminalIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
             {bgCount}
           </Button>
         </PopoverTrigger>
@@ -178,6 +178,22 @@ export function BackgroundTaskIndicator() {
                           </span>
                         )}
                       </div>
+                      <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                        <span
+                          role="status"
+                          aria-label="Running"
+                          className="size-3.5 animate-spin rounded-full motion-reduce:animate-none"
+                          style={{
+                            animationDuration: "1.6s",
+                            background:
+                              "conic-gradient(from 0deg, transparent 0deg, currentColor 360deg)",
+                            WebkitMask:
+                              "radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px))",
+                            mask: "radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px))",
+                          }}
+                        />
+                        <span aria-hidden="true">Running</span>
+                      </span>
                     </li>
                   );
                 })}

@@ -410,6 +410,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -1592,12 +1593,15 @@ class ConversationStore(ABC):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
+        created_by: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1639,6 +1643,9 @@ class ConversationStore(ABC):
         :param host_id: Optional external host the session binds to,
             e.g. ``"host_a1b2c3d4..."``. Requires a non-``None``
             ``workspace``. ``None`` leaves the session unbound.
+        :param created_by: Identity of the creating user, recorded on the
+            session-scoped agent so its code can only be mutated by the
+            owner. ``None`` in single-user mode.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -1673,6 +1680,7 @@ class ConversationStore(ABC):
         up_to_response_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
+        created_by: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -1782,6 +1790,9 @@ class ConversationStore(ABC):
             blocks, file resource events) are rewritten to the fork's copy,
             so the fork never references files it does not own. ``None`` or
             empty leaves every copied payload verbatim.
+        :param created_by: Identity of the forking user, recorded on the
+            cloned session-scoped agent so its code can only be mutated by
+            the owner. ``None`` in single-user mode or when no clone is made.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -1811,14 +1822,18 @@ class ConversationStore(ABC):
         conversation row — the transcript, comments, files, host,
         and workspace are untouched; only the agent/harness changes.
         In one transaction it: deletes the session's current
-        session-scoped agent (the unique ``session_id`` index forbids
-        two agents on one session, so the old must go before the new
-        binds), creates a new session-scoped agent from the supplied
-        bundle, points ``agent_id`` at it, applies the model-settings
-        and label deltas below, and clears ``external_session_id``
-        (the old harness's native runtime state). The whole operation
-        is atomic: any failure rolls back and the session stays on its
-        current agent.
+        session-scoped agent (now unreferenced once ``agent_id`` is
+        repointed), creates a new session-scoped agent from the
+        supplied bundle, points ``agent_id`` at it, applies the
+        model-settings and label deltas below, and clears
+        ``external_session_id`` (the old harness's native runtime
+        state). The whole operation is atomic: any failure rolls back
+        and the session stays on its current agent.
+
+        The replacement agent's ``created_by`` is left unset, so it is
+        admin-only to mutate until a full switch implementation assigns
+        the session owner (the delete is also not yet reference-safe for
+        an agent shared via reuse or named sub-agents).
 
         :param conversation_id: Session to switch, e.g.
             ``"conv_abc123"``.

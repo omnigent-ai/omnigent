@@ -223,12 +223,12 @@ describe("TurnRail", () => {
   });
 
   it("gives each tick a wide, full-height pointer hit band", () => {
-    // The clickable button is h-2.5 (full pitch) so clicking anywhere in a
+    // The clickable button is h-2 (full pitch) so clicking anywhere in a
     // tick's band navigates — matching the hover zone. A regression to the
-    // old h-2 dash-only target would strand clicks in the between-tick gap.
+    // dash-only target would strand clicks in the between-tick gap.
     renderRail(makeTurns(2));
     const tick = screen.getAllByRole("button")[0]!;
-    expect(tick).toHaveClass("h-2.5");
+    expect(tick).toHaveClass("h-2");
     expect(tick).toHaveClass("w-5");
     expect(tick).toHaveClass("cursor-pointer");
   });

@@ -752,7 +752,14 @@ def create_device_auth_router(
             created_at=now,
             expires_at=now + _DEVICE_CODE_TTL_SECONDS,
         )
-        verification_uri = f"{base_url}/oauth/device"
+        # Advertise the verification URL under the deployment base path so a
+        # subpath-only proxy can route the user to the consent page. Skip when
+        # base_url already carries it (accounts mode's public base_url may).
+        base_path: str = getattr(request.app.state, "base_path", "")
+        public_base = base_url.rstrip("/")
+        if base_path and not public_base.endswith(base_path):
+            public_base = f"{public_base}{base_path}"
+        verification_uri = f"{public_base}/oauth/device"
         verification_uri_complete = f"{verification_uri}?user_code={user_code}"
         _logger.info("device/authorize: issued grant for client=%s", client_id)
         return JSONResponse(
@@ -772,15 +779,17 @@ def create_device_auth_router(
 
     # ── Browser consent page ──────────────────────────────────────
 
-    def _bounce_to_login(user_code: str, *, reauth: bool) -> RedirectResponse:
+    def _bounce_to_login(request: Request, user_code: str, *, reauth: bool) -> RedirectResponse:
         """302 to the login page, returning to this consent URL afterward.
 
         ``reauth`` adds ``&reauth=1`` so the login page forces a fresh
         password submit instead of auto-bouncing an already-signed-in user
         (which would loop back here with the same stale session).
         """
-        login_url = auth_provider.login_url or "/login"
-        return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
+        base_path: str = getattr(request.app.state, "base_path", "")
+        login_url = base_path + (auth_provider.login_url or "/login")
+        return_to_path = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
+        return_to = base_path + return_to_path
         query = f"return_to={html.escape(return_to, quote=True)}"
         if reauth:
             query += "&reauth=1"
@@ -825,11 +834,14 @@ def create_device_auth_router(
         """
         user_id = auth_provider.get_user_id(request)
         user_code = (request.query_params.get("user_code") or "").strip()
+        base_path: str = getattr(request.app.state, "base_path", "")
         if user_id is None:
-            return _bounce_to_login(user_code, reauth=False)
+            return _bounce_to_login(request, user_code, reauth=False)
 
         if not user_code:
-            return HTMLResponse(_consent_html(prompt_for_code=True), status_code=200)
+            return HTMLResponse(
+                _consent_html(prompt_for_code=True, base_path=base_path), status_code=200
+            )
 
         grant = device_grant_store.get_by_user_code(user_code)
         now = int(time.time())
@@ -845,13 +857,14 @@ def create_device_auth_router(
         # rather than auto-returning the stale session (which would loop).
         session_iat = _session_iat(request)
         if session_iat is None or session_iat < grant.created_at:
-            return _bounce_to_login(user_code, reauth=True)
+            return _bounce_to_login(request, user_code, reauth=True)
 
         return HTMLResponse(
             _consent_html(
                 user_code=user_code,
                 user_id=user_id,
                 client_id=grant.client_id,
+                base_path=base_path,
             ),
             status_code=200,
         )
@@ -1003,6 +1016,7 @@ def _consent_html(
     error: str = "",
     approved_as: str = "",
     denied: bool = False,
+    base_path: str = "",
 ) -> str:
     """Render the minimal, dependency-free consent page.
 
@@ -1010,6 +1024,10 @@ def _consent_html(
     All interpolated values are HTML-escaped. The page is intentionally
     self-contained (no JS framework) so it works regardless of the
     server's front-end build.
+
+    The form actions carry *base_path* (e.g. ``"/proxy/6767"``) so the consent
+    POST/GET reaches the app behind a prefix-stripping proxy; this page is not
+    run through the SPA HTML rewrite. Empty for a root deployment (unchanged).
     """
 
     def esc(value: object) -> str:
@@ -1030,7 +1048,7 @@ def _consent_html(
     elif prompt_for_code:
         body = (
             "<h1>Link your account</h1>"
-            '<form method="get" action="/oauth/device">'
+            f'<form method="get" action="{base_path}/oauth/device">'
             "<label>Enter the code shown by the application:"
             '<input name="user_code" autofocus placeholder="XXXX-XXXX"></label>'
             '<button type="submit">Continue</button></form>'
@@ -1045,10 +1063,10 @@ def _consent_html(
             "login and this code matches the one the application showed you. If "
             "you didn't start it, click Deny — approving lets the application "
             "act as you.</p>"
-            '<form method="post" action="/oauth/device/approve" class="row">'
+            f'<form method="post" action="{base_path}/oauth/device/approve" class="row">'
             f'<input type="hidden" name="user_code" value="{esc(user_code)}">'
             '<button type="submit" class="primary">Approve</button></form>'
-            '<form method="post" action="/oauth/device/deny" class="row">'
+            f'<form method="post" action="{base_path}/oauth/device/deny" class="row">'
             f'<input type="hidden" name="user_code" value="{esc(user_code)}">'
             '<button type="submit">Deny</button></form>'
         )

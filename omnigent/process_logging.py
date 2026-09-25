@@ -23,6 +23,7 @@ LOG_TO_STDERR_ENV_VAR = "OMNIGENT_LOG_TO_STDERR"
 LOG_FORCE_COLOR_ENV_VAR = "OMNIGENT_LOG_FORCE_COLOR"
 PROCESS_LOG_FILE_ENV_VAR = "OMNIGENT_PROCESS_LOG_FILE"
 LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
+HARNESS_STDERR_ENABLED_ENV_VAR = "OMNIGENT_HARNESS_STDERR_ENABLED"
 
 
 class ChildLoggingPopenKwargs(TypedDict, total=False):
@@ -111,8 +112,21 @@ _AUTHORIZATION_PATTERN = re.compile(
     rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
 )
 _NAMED_SECRET_PATTERN = re.compile(
-    rf"(?i)(\b[\w.-]*(?:token|api[_-]?key|secret|password|credential)"
-    rf"\b[\"']?\s*[:=]\s*)({_QUOTED_OR_NONSPACE_VALUE})"
+    # Start once per possible key, avoiding retries within long dotted/hyphenated values.
+    rf"(?i)((?<![\w.-])[\w.-]*(?:token|api(?:[_-]|[ \t]+)?key|secret|password|credential)"
+    rf"\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
+)
+_WHITESPACE_SECRET_PATTERN = re.compile(
+    # Scan prefixes only from each key's start, as for assignment keys above.
+    # Generic token/secret/credential labels require a prefix to distinguish them from prose.
+    r"(?i)((?<![\w.-])(?:[\w.-]*(?:password|passwd|api(?:[_-]|[ \t]+)?key"
+    r"|(?:access|refresh|auth)(?:[_-]|[ \t]+)token|client(?:[_-]|[ \t]+)secret)"
+    r"|[\w.-]+(?:token|secret|credential))"
+    r"\b[\"']?[ \t]+)"
+    # Preserve clear diagnostic phrases, but still redact quoted or ambiguous single values.
+    r"(?!(?:(?:is|was)[ \t]+(?:missing|invalid|required|expired|not[ \t]+(?:set|found|configured))"
+    r"|has[ \t]+expired|(?:authentication|validation|refresh)[ \t]+failed)\b)"
+    rf"(?![:=])({_AUTHORIZATION_VALUE})"
 )
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Keep the broad standalone-bearer behavior: short or punctuation-heavy
@@ -149,10 +163,12 @@ def _replace_named_secret(match: re.Match[str]) -> str:
     return match.group(1) + replacement
 
 
-def redact_log_text(text: str) -> str:
-    """Replace secret- and token-shaped substrings in log text."""
+def redact_log_text(text: str, *, include_whitespace_credentials: bool = False) -> str:
+    """Redact secrets, optionally including ambiguous whitespace labels in diagnostics."""
     text = _AUTHORIZATION_PATTERN.sub(_replace_named_secret, text)
     text = _NAMED_SECRET_PATTERN.sub(_replace_named_secret, text)
+    if include_whitespace_credentials:
+        text = _WHITESPACE_SECRET_PATTERN.sub(_replace_named_secret, text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub(
             lambda match: match.group(1) + _REDACTED if match.lastindex else _REDACTED,
@@ -349,6 +365,16 @@ def effective_log_level(default: str = "INFO") -> int:
 def should_log_to_stderr() -> bool:
     """Return whether process logs should also mirror to an interactive stderr."""
     return env_truthy(os.environ.get(LOG_TO_STDERR_ENV_VAR))
+
+
+def harness_stderr_capture_enabled() -> bool:
+    """Return whether harness diagnostics may include captured stderr text."""
+    return os.environ.get(HARNESS_STDERR_ENABLED_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _process_log_file_from_env() -> Path | None:

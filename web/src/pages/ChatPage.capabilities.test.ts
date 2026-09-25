@@ -106,6 +106,14 @@ describe("shouldShowModelPicker", () => {
     expect(shouldShowModelPicker(conv, [{ id: "gpt-5.4" }])).toBe(false);
   });
 
+  it("keeps an explicit sandbox policy authoritative for SDK and single-model ACP sessions", () => {
+    for (const harness of ["claude-sdk", "acp"]) {
+      const conv = { labels: {}, harness, inferenceConfigured: true };
+      expect(modelPickerKindForConv(conv, [{ id: "private/model" }])).toBe("configured");
+      expect(shouldShowModelPicker(conv, [])).toBe(true);
+    }
+  });
+
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
     // A label-less session resolves its wrapper label from the harness
     // (nativeCodingAgentForHarness), so the negative cases pin harnesses that

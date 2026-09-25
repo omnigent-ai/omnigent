@@ -23,11 +23,11 @@ describe("ServerSelectStep", () => {
         onConnect={onConnect}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Join" }));
-    expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", false);
+    fireEvent.click(screen.getByRole("button", { name: /install omnigent/i }));
+    expect(onConnect).toHaveBeenCalledWith("https://team.example.com/");
   });
 
-  it("focusing the input deselects the recent and disables Join (exclusive)", () => {
+  it("with recents, starts on the list (no input) and 'Add server' opens the add view", () => {
     render(
       <ServerSelectStep
         {...baseProps}
@@ -35,11 +35,13 @@ describe("ServerSelectStep", () => {
         onConnect={vi.fn()}
       />,
     );
-    // A recent is pre-selected → Join enabled.
-    expect(screen.getByRole("button", { name: "Join" })).toBeEnabled();
-    // Focusing the input deselects → Join disabled; Add is the action now.
-    fireEvent.focus(screen.getByLabelText("Server URL"));
-    expect(screen.getByRole("button", { name: "Join" })).toBeDisabled();
+    // List mode: a recent is pre-selected → Install enabled, no URL input yet.
+    expect(screen.getByRole("button", { name: /install omnigent/i })).toBeEnabled();
+    expect(screen.queryByLabelText("Server URL")).not.toBeInTheDocument();
+    // "Add server" switches to the add view: input appears, action becomes Join.
+    fireEvent.click(screen.getByRole("button", { name: /add server/i }));
+    expect(screen.getByLabelText("Server URL")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Join" })).toBeInTheDocument();
   });
 
   it("Add validates, adds the URL to the list, selects it, and probes reachability", async () => {
@@ -49,12 +51,12 @@ describe("ServerSelectStep", () => {
     fireEvent.change(screen.getByLabelText("Server URL"), {
       target: { value: "my-server.example.com" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
 
     // Added + selected → Join enabled, connects to the normalized URL.
     const normalized = "http://my-server.example.com/";
     expect(onCheckServer).toHaveBeenCalledWith(normalized);
-    expect(screen.getByRole("button", { name: "Join" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /install omnigent/i })).toBeEnabled();
     // The probe result surfaces on the card.
     await waitFor(() => expect(screen.getByText("Omnigent server")).toBeInTheDocument());
   });
@@ -65,30 +67,9 @@ describe("ServerSelectStep", () => {
     fireEvent.change(screen.getByLabelText("Server URL"), {
       target: { value: "javascript:alert(1)" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
     expect(screen.getByRole("alert")).toHaveTextContent(/valid http\(s\) server URL/i);
     expect(onCheckServer).not.toHaveBeenCalled();
-  });
-
-  it("shows the confirm warning on Join, then forces on the second click", async () => {
-    const onConnect = vi
-      .fn()
-      .mockResolvedValueOnce({ needsConfirm: true })
-      .mockResolvedValueOnce({});
-    render(
-      <ServerSelectStep
-        {...baseProps}
-        recentServers={["https://amazon.com/"]}
-        onConnect={onConnect}
-      />,
-    );
-    const join = screen.getByRole("button", { name: "Join" });
-    fireEvent.click(join);
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      /doesn't look like an Omnigent server/i,
-    );
-    fireEvent.click(join);
-    expect(onConnect).toHaveBeenNthCalledWith(2, "https://amazon.com/", true);
   });
 
   it("surfaces a rejected-connect error instead of silently doing nothing", async () => {
@@ -100,7 +81,7 @@ describe("ServerSelectStep", () => {
         onConnect={onConnect}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+    fireEvent.click(screen.getByRole("button", { name: /install omnigent/i }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "That server rejected the connection.",
     );
