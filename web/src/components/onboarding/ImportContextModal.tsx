@@ -1,7 +1,6 @@
-// Post-setup "Your imports are ready" modal: reviews the credentials, MCP
-// servers, and skills Omnigent found in the user's existing harnesses. The
-// credentials are already adopted (read-only); MCPs and skills are opt-in
-// checkboxes, all selected by default, applied on Confirm.
+// Post-setup "Your imports are ready" modal: one tab per harness, showing the
+// credential Omnigent adopted (read-only) and the MCP servers, skills, and
+// plugins found there as opt-in checkboxes, all selected by default.
 
 import { useId, useState, type ReactNode } from "react";
 import { ArrowRight, Check, XIcon } from "lucide-react";
@@ -47,16 +46,25 @@ export interface ImportSkill {
   harness: ImportHarness;
 }
 
+export interface ImportPlugin {
+  id: string;
+  name: string;
+  harness: ImportHarness;
+  skillCount?: number;
+}
+
 export interface ImportContext {
   credentials: ImportCredential[];
   mcps: ImportMcpServer[];
   skills: ImportSkill[];
+  plugins: ImportPlugin[];
 }
 
-/** Ids of the MCP servers and skills left checked when the user confirmed. */
+/** Ids of the MCP servers, skills, and plugins left checked on Confirm. */
 export interface ImportSelection {
   mcps: string[];
   skills: string[];
+  plugins: string[];
 }
 
 /** Harness icons → Omnigent starfish, over the onboarding blob graphic. */
@@ -81,8 +89,8 @@ function ImportBand() {
   );
 }
 
-function EmptyTab({ label }: { label: string }) {
-  return <p className="py-6 text-center text-xs text-muted-foreground">No {label} detected</p>;
+function EmptyState({ children }: { children: ReactNode }) {
+  return <p className="py-6 text-center text-xs text-muted-foreground">{children}</p>;
 }
 
 /** Shared row chrome so credential and checkbox rows keep one divider/gap contract. */
@@ -94,27 +102,28 @@ function ImportRow({ children, className }: { children: ReactNode; className?: s
   );
 }
 
-function CredentialRows({ credentials }: { credentials: ImportCredential[] }) {
-  if (credentials.length === 0) return <EmptyTab label="credentials" />;
+function CredentialRow({ credential }: { credential: ImportCredential }) {
+  const { harness, source } = credential;
   return (
     <ul>
-      {credentials.map(({ harness, source }) => (
-        <ImportRow key={harness} className="py-3">
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
-            <HarnessBrandIcon harness={harness} size={16} />
+      <ImportRow className="py-3">
+        <span
+          className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted"
+          aria-hidden="true"
+        >
+          <HarnessBrandIcon harness={harness} size={16} />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate text-ui font-medium text-foreground">
+            {harnessDisplayName(harness)}
           </span>
-          <span className="flex min-w-0 flex-1 flex-col">
-            <span className="truncate text-ui font-medium text-foreground">
-              {harnessDisplayName(harness)}
-            </span>
-            <span className="truncate text-xs text-muted-foreground">{source}</span>
-          </span>
-          <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-            <Check className="size-3.5 text-success" aria-hidden="true" />
-            Imported
-          </span>
-        </ImportRow>
-      ))}
+          <span className="truncate text-xs text-muted-foreground">{source}</span>
+        </span>
+        <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+          <Check className="size-3.5 text-success" aria-hidden="true" />
+          Imported
+        </span>
+      </ImportRow>
     </ul>
   );
 }
@@ -122,54 +131,62 @@ function CredentialRows({ credentials }: { credentials: ImportCredential[] }) {
 interface SelectableRow {
   id: string;
   name: string;
-  metadata: string;
+  metadata?: string;
 }
 
-function SelectableRows({
-  kind,
+/** A labelled MCPs / Skills / Plugins list within a harness tab; hidden when empty. */
+function AssetGroup({
+  label,
   componentId,
   rows,
   selected,
   onToggle,
 }: {
-  kind: string;
+  label: string;
   componentId: string;
   rows: SelectableRow[];
   selected: ReadonlySet<string>;
   onToggle: (id: string, checked: boolean) => void;
 }) {
   const idPrefix = useId();
-  if (rows.length === 0) return <EmptyTab label={kind} />;
+  if (rows.length === 0) return null;
+  const headingId = `${idPrefix}-heading`;
   return (
-    <ul>
-      {rows.map(({ id, name, metadata }, index) => {
-        const inputId = `${idPrefix}-${index}`;
-        return (
-          <ImportRow key={id} className="py-2">
-            <Checkbox
-              id={inputId}
-              componentId={componentId}
-              checked={selected.has(id)}
-              onCheckedChange={(checked) => onToggle(id, checked === true)}
-            />
-            <label
-              htmlFor={inputId}
-              className="min-w-0 flex-1 cursor-pointer truncate text-ui font-medium text-foreground"
-            >
-              {name}
-            </label>
-            <span className="shrink-0 text-xs text-muted-foreground">{metadata}</span>
-          </ImportRow>
-        );
-      })}
-    </ul>
+    <section aria-labelledby={headingId} className="pt-3">
+      <h3 id={headingId} className="pb-1 text-xs font-medium text-muted-foreground">
+        {label} <span className="text-muted-foreground/70">{rows.length}</span>
+      </h3>
+      <ul>
+        {rows.map(({ id, name, metadata }, index) => {
+          const inputId = `${idPrefix}-${index}`;
+          return (
+            <ImportRow key={id} className="py-2">
+              <Checkbox
+                id={inputId}
+                componentId={componentId}
+                checked={selected.has(id)}
+                onCheckedChange={(checked) => onToggle(id, checked === true)}
+              />
+              <label
+                htmlFor={inputId}
+                className="min-w-0 flex-1 cursor-pointer truncate text-ui font-medium text-foreground"
+              >
+                {name}
+              </label>
+              {metadata && (
+                <span className="shrink-0 text-xs text-muted-foreground">{metadata}</span>
+              )}
+            </ImportRow>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 
-function mcpMetadata({ harness, toolCount }: ImportMcpServer): string {
-  const label = harnessDisplayName(harness);
-  if (toolCount == null) return label;
-  return `${toolCount} ${toolCount === 1 ? "tool" : "tools"} · ${label}`;
+function countLabel(count: number | undefined, noun: string): string | undefined {
+  if (count == null) return undefined;
+  return `${count} ${count === 1 ? noun : `${noun}s`}`;
 }
 
 function toggle(set: ReadonlySet<string>, id: string, checked: boolean): Set<string> {
@@ -177,6 +194,16 @@ function toggle(set: ReadonlySet<string>, id: string, checked: boolean): Set<str
   if (checked) next.add(id);
   else next.delete(id);
   return next;
+}
+
+/** Harnesses with a credential or any asset, in the shared brand order. */
+function detectedHarnesses(context: ImportContext): ImportHarness[] {
+  const found = new Set<ImportHarness>(
+    [...context.credentials, ...context.mcps, ...context.skills, ...context.plugins].map(
+      (item) => item.harness,
+    ),
+  );
+  return BRAND_HARNESSES.filter((harness) => found.has(harness));
 }
 
 export interface ImportContextModalProps {
@@ -216,17 +243,23 @@ function ImportContextBody({
   context,
   onConfirm,
 }: Pick<ImportContextModalProps, "context" | "onConfirm">) {
-  const [selectedMcps, setSelectedMcps] = useState<ReadonlySet<string>>(
-    () => new Set(context.mcps.map((mcp) => mcp.id)),
+  const allIds = (items: { id: string }[]) => new Set(items.map((item) => item.id));
+  const [selectedMcps, setSelectedMcps] = useState<ReadonlySet<string>>(() => allIds(context.mcps));
+  const [selectedSkills, setSelectedSkills] = useState<ReadonlySet<string>>(() =>
+    allIds(context.skills),
   );
-  const [selectedSkills, setSelectedSkills] = useState<ReadonlySet<string>>(
-    () => new Set(context.skills.map((skill) => skill.id)),
+  const [selectedPlugins, setSelectedPlugins] = useState<ReadonlySet<string>>(() =>
+    allIds(context.plugins),
   );
+  const harnesses = detectedHarnesses(context);
 
   const confirm = () => {
+    const kept = (items: { id: string }[], selected: ReadonlySet<string>) =>
+      items.filter((item) => selected.has(item.id)).map((item) => item.id);
     onConfirm({
-      mcps: context.mcps.filter((mcp) => selectedMcps.has(mcp.id)).map((mcp) => mcp.id),
-      skills: context.skills.filter((s) => selectedSkills.has(s.id)).map((s) => s.id),
+      mcps: kept(context.mcps, selectedMcps),
+      skills: kept(context.skills, selectedSkills),
+      plugins: kept(context.plugins, selectedPlugins),
     });
   };
 
@@ -251,53 +284,74 @@ function ImportContextBody({
           </DialogDescription>
         </div>
 
-        <Tabs
-          defaultValue="credentials"
-          componentId="onboarding.import.tabs"
-          className="mt-5 min-h-36 flex-1 gap-0"
-        >
-          <TabsList
-            variant="line"
-            className="h-9 w-full justify-start gap-4 rounded-none border-b border-border p-0"
+        {harnesses.length === 0 ? (
+          <EmptyState>Nothing to import from your harnesses</EmptyState>
+        ) : (
+          <Tabs
+            defaultValue={harnesses[0]}
+            componentId="onboarding.import.tabs"
+            className="mt-5 min-h-36 flex-1 gap-0"
           >
-            <TabsTrigger value="credentials" className="flex-none px-0">
-              Credentials
-            </TabsTrigger>
-            <TabsTrigger value="mcps" className="flex-none px-0">
-              MCPs
-            </TabsTrigger>
-            <TabsTrigger value="skills" className="flex-none px-0">
-              Skills
-            </TabsTrigger>
-          </TabsList>
-          <div className="no-scrollbar min-h-0 flex-1 overflow-y-auto pt-2">
-            <TabsContent value="credentials">
-              <CredentialRows credentials={context.credentials} />
-            </TabsContent>
-            <TabsContent value="mcps">
-              <SelectableRows
-                kind="MCPs"
-                componentId="onboarding.import.mcp"
-                rows={context.mcps.map((mcp) => ({ ...mcp, metadata: mcpMetadata(mcp) }))}
-                selected={selectedMcps}
-                onToggle={(id, checked) => setSelectedMcps((s) => toggle(s, id, checked))}
-              />
-            </TabsContent>
-            <TabsContent value="skills">
-              <SelectableRows
-                kind="skills"
-                componentId="onboarding.import.skill"
-                rows={context.skills.map((skill) => ({
-                  id: skill.id,
-                  name: `$${skill.name}`,
-                  metadata: harnessDisplayName(skill.harness),
-                }))}
-                selected={selectedSkills}
-                onToggle={(id, checked) => setSelectedSkills((s) => toggle(s, id, checked))}
-              />
-            </TabsContent>
-          </div>
-        </Tabs>
+            <TabsList
+              variant="line"
+              className="h-9 w-full justify-start gap-4 rounded-none border-b border-border p-0"
+            >
+              {harnesses.map((harness) => (
+                <TabsTrigger key={harness} value={harness} className="flex-none gap-1.5 px-0">
+                  <span aria-hidden="true" className="flex">
+                    <HarnessBrandIcon harness={harness} size={14} />
+                  </span>
+                  {harnessDisplayName(harness)}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+            <div className="no-scrollbar min-h-0 flex-1 overflow-y-auto pt-2">
+              {harnesses.map((harness) => {
+                const own = <T extends { harness: ImportHarness }>(items: T[]) =>
+                  items.filter((item) => item.harness === harness);
+                const credential = context.credentials.find((c) => c.harness === harness);
+                const mcps = own(context.mcps);
+                const skills = own(context.skills);
+                const plugins = own(context.plugins);
+                return (
+                  <TabsContent key={harness} value={harness}>
+                    {credential && <CredentialRow credential={credential} />}
+                    <AssetGroup
+                      label="MCPs"
+                      componentId="onboarding.import.mcp"
+                      rows={mcps.map((mcp) => ({
+                        ...mcp,
+                        metadata: countLabel(mcp.toolCount, "tool"),
+                      }))}
+                      selected={selectedMcps}
+                      onToggle={(id, checked) => setSelectedMcps((s) => toggle(s, id, checked))}
+                    />
+                    <AssetGroup
+                      label="Skills"
+                      componentId="onboarding.import.skill"
+                      rows={skills.map((skill) => ({ id: skill.id, name: `$${skill.name}` }))}
+                      selected={selectedSkills}
+                      onToggle={(id, checked) => setSelectedSkills((s) => toggle(s, id, checked))}
+                    />
+                    <AssetGroup
+                      label="Plugins"
+                      componentId="onboarding.import.plugin"
+                      rows={plugins.map((plugin) => ({
+                        ...plugin,
+                        metadata: countLabel(plugin.skillCount, "skill"),
+                      }))}
+                      selected={selectedPlugins}
+                      onToggle={(id, checked) => setSelectedPlugins((s) => toggle(s, id, checked))}
+                    />
+                    {mcps.length + skills.length + plugins.length === 0 && (
+                      <EmptyState>No MCPs, skills, or plugins detected</EmptyState>
+                    )}
+                  </TabsContent>
+                );
+              })}
+            </div>
+          </Tabs>
+        )}
       </div>
 
       <div className="flex shrink-0 justify-end px-5 pt-4 pb-5">
