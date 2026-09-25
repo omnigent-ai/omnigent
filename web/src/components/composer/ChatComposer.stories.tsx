@@ -77,21 +77,3 @@ export const Interrupt: Story = {
     },
   },
 };
-
-// A native-UI sub-agent mirror is driven by its parent session and has no
-// runner of its own, so the composer is read-only: the textarea and Send are
-// disabled and the placeholder carries the reason (see
-// ``readOnlyReasonForSessionLabels``).
-export const SubAgentReadOnly: Story = {
-  args: {
-    input: {
-      "aria-label": "Message",
-      placeholder: "This sub-agent is driven by its parent session and is read-only",
-      disabled: true,
-    },
-    actions: {
-      leading: <span className="text-ui text-muted-foreground">Context controls</span>,
-      trailing: <ComposerSendButton label="Send" disabled />,
-    },
-  },
-};

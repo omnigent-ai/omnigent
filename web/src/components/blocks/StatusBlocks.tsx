@@ -83,6 +83,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
   budget_exhausted:
     "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
+  subagent_runner_offline:
+    "This sub-agent's runner is offline. Resume it from its parent session to continue.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([

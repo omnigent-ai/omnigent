@@ -2382,6 +2382,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
+      // A parent-owned sub-agent can't launch its own runner, so redirect a
+      // runner-unavailable failure toward resuming the parent instead of a dead
+      // self-resume retry. Generic failures keep their message and code.
+      const subAgentOffline = subAgentRunnerOfflineBlock(code, failGet().subAgentName !== null);
+      const blockCode = subAgentOffline?.code ?? code;
+      const blockMessage = subAgentOffline?.message ?? message;
       // Roll back the optimistic bubble — no server idle will fire.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
@@ -2397,7 +2403,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           // a standalone error block so the user sees WHY nothing happened
           // instead of being left on a silent, empty composer. Skipped when the
           // caller owns the error UX (it surfaces the failure elsewhere).
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+          failSet((s) => ({
+            blocks: [...s.blocks, makeClientErrorBlock(blockMessage, blockCode)],
+          }));
         }
         failSet({
           status: "idle",
@@ -2413,7 +2421,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // would fail a live response, and settling status would end a turn that
         // is still running. Skipped when the caller owns the error UX.
         if (!callerHandlesError) {
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+          failSet((s) => ({
+            blocks: [...s.blocks, makeClientErrorBlock(blockMessage, blockCode)],
+          }));
         }
       }
     } finally {
@@ -7324,6 +7334,32 @@ const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
 
 // Replace only the server's no-context fallback; preserve phase-specific detail.
 const RUNNER_UNAVAILABLE_TERSE_MESSAGE = "No runner bound for session";
+
+// A sub-agent (a parent-owned mirror) has no runner of its own — it recovers
+// only when its parent session's runner does (see restore_active_children on
+// the server). So a runner-unavailable send here has no self-resume path: a
+// distinct code keeps it out of RETRYABLE_ERROR_CODES (no dead "Resume session"
+// button) and carries a parent-directed headline in StatusBlocks.
+const SUBAGENT_RUNNER_OFFLINE_CODE = "subagent_runner_offline";
+
+/**
+ * Rewrite a runner-unavailable send failure for a sub-agent target, or
+ * ``null`` to keep the generic surfacing.
+ *
+ * Only a runner-unavailable failure on a sub-agent is redirected: the child
+ * can't relaunch its own runner, so the generic "Resume session" retry can
+ * never succeed here.
+ */
+export function subAgentRunnerOfflineBlock(
+  code: string,
+  isSubAgent: boolean,
+): { code: string; message: string } | null {
+  if (code !== RUNNER_UNAVAILABLE_CODE || !isSubAgent) return null;
+  return {
+    code: SUBAGENT_RUNNER_OFFLINE_CODE,
+    message: "This sub-agent's runner is offline. Resume it from its parent session to continue.",
+  };
+}
 
 /**
  * Turn a thrown send failure into user-facing banner text + a code.

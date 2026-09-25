@@ -83,6 +83,7 @@ import {
   type PendingUserMessage,
   bindConversationForTest,
   releaseConversation,
+  subAgentRunnerOfflineBlock,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
 import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
@@ -15329,5 +15330,24 @@ describe("beginLocalConversation — optimistic model seed", () => {
     });
     const state = useChatStore.getState();
     expect(state.sessionReasoningEffort).toBe("low");
+  });
+});
+
+describe("subAgentRunnerOfflineBlock", () => {
+  it("redirects a runner-unavailable failure on a sub-agent to a parent-directed, non-retryable block", () => {
+    const block = subAgentRunnerOfflineBlock("runner_unavailable", true);
+    expect(block).toEqual({
+      code: "subagent_runner_offline",
+      message: "This sub-agent's runner is offline. Resume it from its parent session to continue.",
+    });
+  });
+
+  it("leaves a runner-unavailable failure on a top-level session untouched", () => {
+    expect(subAgentRunnerOfflineBlock("runner_unavailable", false)).toBeNull();
+  });
+
+  it("leaves non-runner-unavailable failures untouched even on a sub-agent", () => {
+    expect(subAgentRunnerOfflineBlock("runner_error", true)).toBeNull();
+    expect(subAgentRunnerOfflineBlock("rate_limit_exceeded", true)).toBeNull();
   });
 });
