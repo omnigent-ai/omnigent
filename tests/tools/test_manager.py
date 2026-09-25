@@ -25,8 +25,9 @@ from omnigent.spec.types import (
     ToolsConfig,
 )
 from omnigent.tools import ToolManager
-from omnigent.tools.base import ToolContext
+from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
+from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
@@ -1374,3 +1375,290 @@ def test_read_skill_file_registered_for_root_level_resources(tmp_path: Path) -> 
     )
 
     assert any_skill_has_resources([skill]) is True
+
+
+def test_uc_function_schema_tool_description_falls_back_for_non_dict_function() -> None:
+    tool = _UCFunctionSchemaTool(tool_name="warehouse_query", schema={"function": "oops"})
+
+    assert tool.name() == "warehouse_query"
+    assert tool.description() == ""
+    assert tool.get_schema() == {"function": "oops"}
+
+
+def test_async_inbox_tools_not_registered_when_async_disabled() -> None:
+    mgr = ToolManager(AgentSpec(spec_version=1, async_enabled=False))
+    names = {schema["function"]["name"] for schema in mgr.get_tool_schemas()}
+
+    assert "sys_cancel_task" in names
+    assert "sys_call_async" not in names
+    assert "sys_read_inbox" not in names
+    assert "sys_cancel_async" not in names
+
+
+def test_timer_tools_registered_when_enabled() -> None:
+    mgr = ToolManager(AgentSpec(spec_version=1, timers=True))
+    names = {schema["function"]["name"] for schema in mgr.get_tool_schemas()}
+
+    assert "sys_timer_set" in names
+    assert "sys_timer_cancel" in names
+
+
+def test_unknown_builtin_logs_warning_and_skips(caplog: pytest.LogCaptureFixture) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="definitely_missing")]),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec)
+
+    assert mgr.get_tool("definitely_missing") is None
+    assert "Unknown built-in tool 'definitely_missing'" in caplog.text
+
+
+def test_create_builtin_handles_web_fetch_and_upload_file() -> None:
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(spec_version=1, executor=ExecutorSpec(config={"harness": "pi"}))
+    mgr = ToolManager(spec)
+
+    web_fetch = mgr._create_builtin("web_fetch", None)
+    upload_file = mgr._create_builtin("upload_file", None)
+
+    assert web_fetch is not None
+    assert type(web_fetch).__name__ == "WebFetchTool"
+    assert web_fetch._parent_spec is spec
+    assert upload_file is not None
+    assert type(upload_file).__name__ == "UploadFileTool"
+
+
+def test_os_env_registration_noops_when_factory_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.spec.types import OSEnvSpec
+
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", lambda _spec: None)
+
+    mgr = ToolManager(AgentSpec(spec_version=1, os_env=OSEnvSpec()))
+
+    assert mgr._os_env is None
+    assert all(not name.startswith("sys_os_") for name in mgr.get_tool_names())
+
+
+def test_invalid_spec_declared_client_local_tool_name_is_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="bad name",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.CLIENT,
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec)
+
+    assert mgr.get_tool("bad name") is None
+    assert "Spec-declared client local tool 'bad name' has invalid name" in caplog.text
+
+
+def test_spec_declared_client_local_tool_requires_parameters() -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="open_in_editor",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.CLIENT,
+                parameters=None,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="has no ``parameters`` block"):
+        ToolManager(spec)
+
+
+def test_uc_function_local_tool_registers_schema_defaults_and_description() -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="warehouse_query",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.UC_FUNCTION,
+                parameters=None,
+                description="Run a warehouse SQL statement.",
+            )
+        ],
+    )
+    mgr = ToolManager(spec)
+
+    tool = mgr.get_tool("warehouse_query")
+
+    assert isinstance(tool, _UCFunctionSchemaTool)
+    assert tool.description() == "Run a warehouse SQL statement."
+    assert tool.get_schema() == {
+        "type": "function",
+        "function": {
+            "name": "warehouse_query",
+            "parameters": {"type": "object", "properties": {}},
+            "description": "Run a warehouse SQL statement.",
+        },
+    }
+
+
+def test_invalid_uc_function_name_is_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="bad name",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.UC_FUNCTION,
+            )
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec)
+
+    assert mgr.get_tool("bad name") is None
+    assert "UC function tool 'bad name' has invalid name" in caplog.text
+
+
+def test_invalid_local_python_tool_name_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _InvalidNameTool(Tool):
+        @classmethod
+        def name(cls) -> str:
+            return "bad name"
+
+        @classmethod
+        def description(cls) -> str:
+            return "invalid"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": self.name(), "parameters": {}}}
+
+    def _fake_load_local_python_tools(*_args: object, **_kwargs: object) -> list[Tool]:
+        return [_InvalidNameTool()]
+
+    monkeypatch.setattr(
+        "omnigent.tools.manager.load_local_python_tools",
+        _fake_load_local_python_tools,
+    )
+    monkeypatch.setattr(
+        "omnigent.tools.local_callable.load_local_callable_tools",
+        lambda _tools: [],
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="echo_tool",
+                path="tools/python/echo_tool.py",
+                language="python",
+            )
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr = ToolManager(spec, workdir=tmp_path)
+
+    assert mgr.get_tool("bad name") is None
+    assert "Local tool 'bad name' has invalid name" in caplog.text
+
+
+def test_omnigent_callable_tool_collision_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _CollidingCallableTool(Tool):
+        @classmethod
+        def name(cls) -> str:
+            return "load_skill"
+
+        @classmethod
+        def description(cls) -> str:
+            return "collides"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": self.name(), "parameters": {}}}
+
+    def _fake_load_local_python_tools(*_args: object, **_kwargs: object) -> list[Tool]:
+        return []
+
+    monkeypatch.setattr(
+        "omnigent.tools.manager.load_local_python_tools",
+        _fake_load_local_python_tools,
+    )
+    monkeypatch.setattr(
+        "omnigent.tools.local_callable.load_local_callable_tools",
+        lambda _tools: [_CollidingCallableTool()],
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        local_tools=[
+            LocalToolInfo(
+                name="callable_tool",
+                path="pkg.module.callable_tool",
+                language="omnigent-python-callable",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="omnigent callable tool 'load_skill' collides"):
+        ToolManager(spec)
+
+
+def test_shutdown_logs_close_and_tool_failures(caplog: pytest.LogCaptureFixture) -> None:
+    class _ExplodingOSEnv:
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    class _ExplodingTool(Tool):
+        @classmethod
+        def name(cls) -> str:
+            return "_exploding"
+
+        @classmethod
+        def description(cls) -> str:
+            return "exploding"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": "_exploding", "parameters": {}}}
+
+        def shutdown(self) -> None:
+            raise RuntimeError("shutdown failed")
+
+    mgr = ToolManager(AgentSpec(spec_version=1))
+    mgr._os_env = _ExplodingOSEnv()  # type: ignore[assignment]
+    mgr._pre_resolved_os_env = None
+    mgr._tools["_exploding"] = _ExplodingTool()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        mgr.shutdown()
+
+    assert "os_env.close() failed during shutdown" in caplog.text
+    assert "tool _exploding shutdown failed" in caplog.text
+
+
+def test_get_tool_names_returns_registered_names() -> None:
+    mgr = ToolManager(AgentSpec(spec_version=1, timers=True))
+
+    names = mgr.get_tool_names()
+
+    assert "load_skill" in names
+    assert "sys_timer_set" in names

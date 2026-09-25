@@ -103,6 +103,7 @@ def load_agent_def(
         custom handlers — the operator already has code execution, so
         the restriction would add no security there.
     """
+    path: Path | None = None
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
         with open(path) as f:
@@ -111,6 +112,17 @@ def load_agent_def(
     else:
         data = path_or_dict
         instructions_root = None
+    if not isinstance(data, dict):
+        # An empty or comments-only document loads as None, and a bare scalar or
+        # list loads as that value. Every reader below indexes it as a mapping,
+        # so without this guard the first ``data.get(...)`` raised a bare
+        # AttributeError — which the upload/validate path surfaced as an
+        # internal error instead of naming the malformed spec.
+        found = "an empty document" if data is None else f"a {type(data).__name__}"
+        where = f" in {path}" if path is not None else ""
+        raise ValueError(
+            f"Agent spec must be a YAML mapping of top-level keys; found {found}{where}."
+        )
     if enforce_handler_allowlist:
         _reject_unregistered_policy_handlers(data)
     return _parse_agent_def(data, instructions_root=instructions_root)
@@ -654,11 +666,15 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
             from omnigent.spec.parser import _parse_executor_auth
 
             auth = _parse_executor_auth(data, expand_env=True)
+        context_files = data.get("context_files")
+        if "context_files" in data and not isinstance(context_files, bool):
+            raise ValueError("executor.context_files must be a boolean")
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
             auth=auth,
+            context_files=context_files,
         )
     return None
 

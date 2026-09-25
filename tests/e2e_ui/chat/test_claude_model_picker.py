@@ -557,9 +557,9 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # The composer names the routable model using its advertised label.
-    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(
-        "databricks-claude-sonnet-4-5", timeout=15_000
+    # Visible labels omit the catalog prefix; routing keeps the full model id.
+    expect(page.get_by_test_id("composer-agent-config-value")).to_have_text(
+        "claude-sonnet-4-5", timeout=15_000
     )
     _screenshot(page, "unpinned-gateway-composer")
 
@@ -573,6 +573,7 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
     # resolver passes through verbatim.
     rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(1)
+    expect(rows.first).to_have_text("claude-sonnet-4-5")
     expect(rows.first).to_have_attribute("data-model-id", default_model)
     expect(rows.first).to_have_attribute("aria-checked", "true")
     _screenshot(page, "unpinned-gateway-picker")
@@ -814,7 +815,7 @@ def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
     # The catalog lands: its display name supersedes the fallback.
     catalog_state["ready"] = True
     _announce_catalog(page, session_id)
-    expect(label).to_contain_text("Sonnet 5 (1M context)", timeout=10_000)
+    expect(label).to_contain_text("Sonnet 5 1M", timeout=10_000)
 
     log = page.evaluate("window.__modelLabelLog")
     labels = [entry["text"] for entry in log if entry["text"]]

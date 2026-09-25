@@ -14,6 +14,7 @@ import {
   fetchConversationsPage,
   markSessionsDeleting,
   fetchAllArchivedProjectNames,
+  fetchProjectSessionIds,
   renameConversation,
   useArchiveConversation,
   useBulkArchiveConversations,
@@ -208,6 +209,7 @@ describe("useConversations project filter", () => {
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("include_archived=true");
     expect(url).toContain("project=Design");
+    expect(url).toContain("visibility=all");
   });
 
   it("url-encodes a project name with spaces", async () => {
@@ -252,6 +254,29 @@ describe("useConversations project filter", () => {
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("project=__all__");
   });
+});
+
+describe("fetchConversationsPage visibility", () => {
+  it.each([undefined, "mine", "shared", "archived"] as const)(
+    "sends explicit visibility for %s",
+    async (visibility) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+      const queryClient = new QueryClient();
+
+      await fetchConversationsPage({
+        searchQuery: "",
+        includeArchived: false,
+        visibility,
+        queryClient,
+      });
+
+      const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+      expect(params.get("visibility")).toBe(visibility ?? "all");
+      queryClient.clear();
+    },
+  );
 });
 
 describe("useConversations search timeout", () => {
@@ -378,7 +403,7 @@ describe("fetchAllArchivedProjectNames", () => {
         mockResponse({
           data: [
             { id: "a", archived: true, labels: { omni_project: "Beta" } },
-            // Active row — include_archived returns it, but it's not filterable here.
+            // Defensively ignore active rows if a server ignores the visibility filter.
             { id: "b", archived: false, labels: { omni_project: "Zeta" } },
             // Archived but unfiled — no project label to collect.
             { id: "c", archived: true, labels: {} },
@@ -391,7 +416,7 @@ describe("fetchAllArchivedProjectNames", () => {
       .mockResolvedValueOnce(
         mockResponse({
           data: [
-            { id: "d", archived: true, labels: { omni_project: "Alpha" } },
+            { id: "d", archived: true, owner: "bob", labels: { omni_project: "Alpha" } },
             // Duplicate project across pages collapses to one entry.
             { id: "e", archived: true, labels: { omni_project: "Beta" } },
           ],
@@ -413,6 +438,11 @@ describe("fetchAllArchivedProjectNames", () => {
     expect(url1).not.toContain("after=");
     // Page 2 follows the previous page's last_id cursor.
     expect(fetchMock.mock.calls[1][0]).toContain("after=c");
+    expect(
+      fetchMock.mock.calls.map(([url]) =>
+        new URL(String(url), "http://localhost").searchParams.get("visibility"),
+      ),
+    ).toEqual(["archived", "archived"]);
   });
 
   it("stops after one request when the first page has no more", async () => {
@@ -1498,6 +1528,43 @@ describe("useTogglePinnedConversation cache patching", () => {
     ).toEqual([]);
   });
 
+  it("keeps a concurrent move's optimistic project label on the unpin reconcile", async () => {
+    // A drag-drop files the row and unpins it in one gesture. The unpin PATCH
+    // usually resolves first, and its labels snapshot predates the move's
+    // PATCH — reconciling it wholesale would erase the optimistic
+    // omni_project label and bounce the row into the flat list.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "Session X",
+        created_at: 0,
+        labels: {},
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        conversation({
+          id: "conv_x",
+          updated_at: 150,
+          labels: { [PINNED_LABEL_KEY]: "123", omni_project: "Legacy" },
+        }),
+      ]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useTogglePinnedConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: false });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    const list = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    const row = list!.pages[0].data.find((c) => c.id === "conv_x")!;
+    expect(row.labels).toEqual({ omni_project: "Legacy" });
+  });
+
   it("does not blank an existing list row's updated_at (labels-only overlay)", async () => {
     const { queryClient, rendered } = seed(true);
 
@@ -2102,7 +2169,7 @@ describe("useProjectSessions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("fetches the project's non-archived sessions, newest-first, when enabled", async () => {
+  it("fetches the viewer's active project sessions, newest-first, when enabled", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
@@ -2123,9 +2190,28 @@ describe("useProjectSessions", () => {
     expect(url).toContain("order=desc");
     expect(url).toContain("sort_by=updated_at");
     expect(url).toContain("limit=20");
+    expect(url).toContain("visibility=mine");
     // Folders show active sessions only — archived ones leave the sidebar.
     expect(url).not.toContain("include_archived");
     expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+  });
+});
+
+describe("fetchProjectSessionIds", () => {
+  it("checks project membership across all accessible sessions, including archived", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [{ id: "conv_a" }, { id: "conv_b" }], has_more: false }),
+    );
+
+    await expect(fetchProjectSessionIds("Sprint 42")).resolves.toEqual(["conv_a", "conv_b"]);
+
+    const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+    expect(Object.fromEntries(params)).toMatchObject({
+      project: "Sprint 42",
+      limit: "2",
+      visibility: "all",
+      include_archived: "true",
+    });
   });
 });
 
@@ -2312,6 +2398,151 @@ describe("useMoveToProject", () => {
 
     resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("overlays label-only folder membership through the legacy label before the network resolves", async () => {
+    // The target folder exists only through another session's omni_project
+    // label (no first-class row → null id in the projects cache), so there is
+    // no id to overlay — membership must be written through the legacy label
+    // the sidebar dual-reads, or the row regroups into the flat list for the
+    // whole create-on-demand round trip (the pinned-drop flicker).
+    let resolveList: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveList = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", object: "project", name: "Legacy" }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_new",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Legacy" }]);
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
+    );
+    queryClient.setQueryData(
+      ["project-sessions", "Old folder"],
+      infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Legacy" });
+
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      const row = data!.pages[0].data.find((c) => c.id === "conv_move")!;
+      expect(row.labels).toEqual({ omni_project: "Legacy" });
+      expect(row.project_id).toBeNull();
+    });
+    // The old folder's pages drop the row immediately (no dual-show).
+    const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Old folder",
+    ]);
+    expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_move")).toBeUndefined();
+
+    resolveList(mockResponse({ object: "list", data: [] }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("skips the overlay when the name has no cached folder (brand-new project)", async () => {
+    // An uncached name renders no folder yet, so there is nowhere for an
+    // optimistic regroup to land; the row must stay put until the reconcile.
+    let resolveList: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveList = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", object: "project", name: "Fresh" }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_new",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Legacy" }]);
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move", labels: { keep: "me" } })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Fresh" });
+
+    // The name→id resolution request firing means onMutate has finished.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    const row = data!.pages[0].data.find((c) => c.id === "conv_move")!;
+    expect(row.labels).toEqual({ keep: "me" });
+
+    resolveList(mockResponse({ object: "list", data: [] }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("seeds the promoted folder's first-class id into the projects cache on success", async () => {
+    // The refetches the move fires race each other: a conversations refetch
+    // can land with the row's legacy label already cleared while the projects
+    // list still caches the folder id-less — that folder then can't claim the
+    // row by project_id and it flashes into the flat list. The PATCH response
+    // carries the promoted id, so it lands in the projects cache first.
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }))
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", object: "project", name: "Legacy" }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_new",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Legacy" }]);
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Legacy" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Legacy" }]);
   });
 
   it("unfiles optimistically without needing the projects cache", async () => {
@@ -2796,6 +3027,7 @@ describe("useDeleteProject", () => {
     const listUrl = fetchMock.mock.calls[0][0] as string;
     expect(listUrl).toContain("project=Sprint+42");
     expect(listUrl).toContain("include_archived=true");
+    expect(listUrl).toContain("visibility=all");
 
     // Each member is archived AND detached (project_id cleared + label removed)
     // via PATCH — never deleted.

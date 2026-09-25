@@ -8,6 +8,7 @@ import logging
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -16,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
@@ -1957,6 +1958,14 @@ def artifact_store() -> _InMemoryArtifactStore:
     return _InMemoryArtifactStore()
 
 
+class _NoAgentStore:
+    """Agent store stub for file tests: holds no agents."""
+
+    def get(self, agent_id: str) -> None:
+        """Return no agent for *agent_id*."""
+        del agent_id
+
+
 @pytest.fixture
 def file_app(
     runner_globals_reset: None,
@@ -1968,6 +1977,21 @@ def file_app(
     del runner_globals_reset
 
     test_app = FastAPI()
+    host_registry = HostRegistry()
+    host_registry.register(
+        "host_files",
+        Mock(),
+        HostHelloFrame(
+            version="0.15.0",
+            frame_protocol_version=1,
+            name="files",
+            capabilities=HOST_CAPABILITIES,
+        ),
+        owner=None,
+    )
+    test_app.state.host_registry = host_registry
+    for session_id in ("64a784c3aa907d1774f44313546947c6", "405bfe154d5c0e795a2b87021bc897bf"):
+        file_conv_store._conversations[session_id].host_id = "host_files"
 
     @test_app.exception_handler(OmnigentError)
     async def _handle(
@@ -1985,9 +2009,10 @@ def file_app(
     test_app.include_router(
         create_sessions_router(
             file_conv_store,  # type: ignore[arg-type]
-            object(),  # type: ignore[arg-type]  — stub agent store
+            _NoAgentStore(),  # type: ignore[arg-type]
             file_store=file_store,  # type: ignore[arg-type]
             artifact_store=artifact_store,  # type: ignore[arg-type]
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -2295,6 +2320,101 @@ async def test_copy_files_carries_source_metadata(
     copied = file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf")
     assert copied is not None
     assert copied.source_metadata == {"width": 6000, "height": 4000}
+
+
+def _seed_parent_zip(file_store: Any, artifact_store: _InMemoryArtifactStore, name: str) -> str:
+    """Store a zip in the parent session directly, bypassing the upload route."""
+    stored = file_store.create(
+        session_id="b460374fc8e697b296708f52dc9d8179",
+        filename=name,
+        bytes=4,
+        content_type="application/zip",
+    )
+    artifact_store.put(stored.id, b"PK\x03\x04")
+    return stored.id
+
+
+@pytest.mark.asyncio
+async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A copied zip would be dropped by an SDK child, as an uploaded one would."""
+    zip_id = _seed_parent_zip(file_store, artifact_store, "bundle.zip")
+
+    resp = await file_client.post(
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [zip_id]},
+    )
+
+    assert resp.status_code == 415, resp.text
+    assert "Claude Code or Codex" in resp.text
+    listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
+    assert listed.data == []
+
+
+@pytest.mark.asyncio
+async def test_copy_spends_the_child_workspace_quota(
+    file_client: httpx.AsyncClient,
+    file_conv_store: _ConversationStore,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copies count against the child's workspace quota, like uploads."""
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_file_limit",
+        lambda: 1,
+    )
+    file_conv_store._conversations["405bfe154d5c0e795a2b87021bc897bf"].labels.update(
+        CLAUDE_NATIVE_CODING_AGENT.presentation_labels
+    )
+    first = _seed_parent_zip(file_store, artifact_store, "first.zip")
+    second = _seed_parent_zip(file_store, artifact_store, "second.zip")
+    url = "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy"
+    source = "b460374fc8e697b296708f52dc9d8179"
+
+    ok = await file_client.post(url, json={"source_session_id": source, "file_ids": [first]})
+    assert ok.status_code == 200, ok.text
+    over = await file_client.post(url, json={"source_session_id": source, "file_ids": [second]})
+
+    assert over.status_code == 413, over.text
+    listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
+    assert [f.filename for f in listed.data] == ["first.zip"]
+
+
+@pytest.mark.asyncio
+async def test_native_forward_leaves_a_workspace_file_for_the_runner(
+    file_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A zip reaches the native runner as a file_id, with no resolution warning."""
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("bundle.zip", b"PK\x03\x04", "application/zip")},
+    )
+    assert upload.status_code == 201, upload.text
+    zip_block = {"type": "input_file", "file_id": upload.json()["id"], "filename": "bundle.zip"}
+
+    with caplog.at_level(logging.WARNING):
+        resp = await file_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "message", "data": {"role": "user", "content": [zip_block]}},
+        )
+
+    assert resp.status_code == 202, resp.text
+    forwarded = next(
+        body for path, body in fake_runner.post_json_calls if path.endswith("/events")
+    )
+    assert forwarded["content"] == [zip_block]
+    assert "File reference resolution failed" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -5004,6 +5124,340 @@ async def test_native_dispatch_tunnel_close_is_definitive_ensure_error() -> None
     )
 
 
+class _FailingEnsureRunnerClient(_FakeRunnerClient):
+    """Fake runner whose terminal-ensure POSTs fail with a scripted sequence, then succeed."""
+
+    def __init__(self, ensure_path: str, failures: list[Exception]) -> None:
+        super().__init__()
+        self._ensure_path = ensure_path
+        self._failures = list(failures)
+        self.drops = 0
+
+    def _make_response(self, method: str, url: str) -> httpx.Response:
+        if url == self._ensure_path and self._failures:
+            self.drops += 1
+            self.calls.append((method, url))
+            raise self._failures.pop(0)
+        return super()._make_response(method, url)
+
+
+def _ensure_request(path: str) -> httpx.Request:
+    return httpx.Request("POST", f"http://runner{path}")
+
+
+_TUNNEL_CLOSED = "tunnel closed before request completed"
+
+
+class _ReconnectWaitRouter:
+    """Fake router recording reconnect waits and answering them canned."""
+
+    def __init__(self, *, reconnects: bool) -> None:
+        self._reconnects = reconnects
+        self.waits: list[tuple[str, float]] = []
+
+    async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
+        self.waits.append((runner_id, timeout_s))
+        return self._reconnects
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_native_dispatch_tunnel_drop_retries_ensure_after_runner_reconnects(
+    drop_kind: str,
+) -> None:
+    """A tunnel drop mid-ensure waits for the runner and asks again.
+
+    The runner behind a dropped tunnel is usually alive but stalled; it
+    re-registers and the terminal it was creating is still there. Failing
+    the message on the drop threw the user's input away while the server
+    itself re-ran the ensure on reconnect moments later. Both shapes the
+    tunnel transport raises qualify: the bare ``ConnectionError`` of a drop
+    under an in-flight request and the ``httpx.ConnectError`` of a runner
+    already offline when the request is sent.
+    """
+    import dataclasses
+
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    drop: Exception = (
+        ConnectionError(_TUNNEL_CLOSED)
+        if drop_kind == "tunnel_closed"
+        else httpx.ConnectError(
+            "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+        )
+    )
+    client = _FailingEnsureRunnerClient(terminals_path, [drop])
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            "64a784c3aa907d1774f44313546947c6",
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name="claude-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by=None,
+            runner_router=router,  # type: ignore[arg-type]
+        )
+
+        assert router.waits == [
+            ("runner_one", orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S)
+        ]
+        assert client.drops == 1
+        # Two ensure attempts, then the message forwards as usual.
+        assert [call for call in client.calls if call[0] == "POST"] == [
+            ("POST", terminals_path),
+            ("POST", terminals_path),
+            ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
+        ]
+        assert result.pending_id is not None
+        assert [i.type for i in store.appended_items if i.type == "error"] == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_tunnel_drop_fails_when_runner_stays_gone() -> None:
+    """A runner that never re-registers within the grace fails the turn as before."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(terminals_path, [ConnectionError(_TUNNEL_CLOSED)])
+    router = _ReconnectWaitRouter(reconnects=False)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    assert len(router.waits) == 1
+    # No second ensure attempt against a runner that never came back.
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert (
+        errors[0].data.message
+        == "Native Claude terminal ensure request failed. tunnel closed before request completed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_unrelated_transport_error_fails_without_waiting() -> None:
+    """A transport error that is not a tunnel drop keeps the immediate durable failure."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path,
+        [httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))],
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    assert router.waits == []
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert errors[0].data.message == "Native Claude terminal ensure request failed. read timed out"
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_tunnel_drop_retry_failure_is_durable_after_one_attempt() -> None:
+    """A retry that also fails stops there and reports the retry's error."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path,
+        [
+            ConnectionError(_TUNNEL_CLOSED),
+            httpx.ConnectError(
+                "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+            ),
+        ],
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    # One wait, two ensure attempts, no third; the message is not forwarded.
+    assert len(router.waits) == 1
+    assert [call for call in client.calls if call[0] == "POST"] == [
+        ("POST", terminals_path),
+        ("POST", terminals_path),
+    ]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert (
+        errors[0].data.message
+        == "Native Claude terminal ensure request failed. runner 'runner_one' is offline"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_ready_retries_over_the_runners_new_tunnel() -> None:
+    """Over the real tunnel transport, a mid-request drop waits for re-registration and retries.
+
+    Uses the real ``TunnelRegistry``/``WSTunnelTransport``/``RunnerRouter``:
+    deregistering the runner aborts the in-flight ensure with the transport's
+    own ``ConnectionError``, and the probe must stay pending until the runner
+    registers a new tunnel, then repeat the request over it.
+    """
+    import dataclasses
+
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        HelloFrame,
+        ResponseBodyFrame,
+        ResponseEndFrame,
+        ResponseHeadFrame,
+    )
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes.sessions import _ensure_native_terminal_ready
+
+    class _IdleWS:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    hello = HelloFrame(
+        runner_version="0.1.0", frame_protocol_version=1, harnesses=["claude-native"], envs=[]
+    )
+    registry = TunnelRegistry()
+    registry.register("runner_one", _IdleWS(), hello)
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    router = RunnerRouter(registry=registry, conversation_store=store)  # type: ignore[arg-type]
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"), base_url="http://runner"
+    )
+
+    async def _in_flight_request_id() -> str:
+        for _ in range(400):
+            session = registry.get("runner_one")
+            if session is not None and session.in_flight:
+                return next(iter(session.in_flight))
+            await asyncio.sleep(0.005)
+        raise AssertionError("ensure request never reached the tunnel")
+
+    try:
+        task = asyncio.create_task(
+            _ensure_native_terminal_ready(client, conv.id, conv, runner_router=router)
+        )
+        await _in_flight_request_id()
+        # The runner's tunnel dies under the in-flight ensure.
+        registry.deregister("runner_one")
+        await asyncio.sleep(0.02)
+        assert not task.done(), "the drop must park the ensure, not fail it"
+
+        # The runner re-registers; the ensure repeats over the new tunnel.
+        registry.register("runner_one", _IdleWS(), hello)
+        req_id = await _in_flight_request_id()
+        registry.route_response_frame(
+            "runner_one",
+            ResponseHeadFrame(
+                id=req_id, status=200, headers=[["content-type", "application/json"]]
+            ),
+        )
+        registry.route_response_frame(
+            "runner_one", ResponseBodyFrame(id=req_id, body="{}", encoding="utf-8")
+        )
+        registry.route_response_frame("runner_one", ResponseEndFrame(id=req_id))
+
+        outcome = await asyncio.wait_for(task, timeout=5.0)
+        assert outcome.error is None
+    finally:
+        await client.aclose()
+        await router.aclose()
+
+
 @pytest.mark.asyncio
 async def test_native_dispatch_persists_error_for_each_user_retry() -> None:
     """A fresh user retry gets its own durable terminal error.
@@ -6835,3 +7289,75 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     assert response.status_code == 200, response.text
     assert captured["op"] == "github_prs_update"
     assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}
+
+
+@pytest.mark.asyncio
+async def test_copy_new_type_refuses_old_runtime(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A capable harness on an old host cannot receive a copied binary file."""
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    child = "405bfe154d5c0e795a2b87021bc897bf"
+    parent = "b460374fc8e697b296708f52dc9d8179"
+    file_conv_store._conversations[child].labels.update(
+        CLAUDE_NATIVE_CODING_AGENT.presentation_labels
+    )
+    file_app.state.host_registry.get("host_files").hello.capabilities = []
+    file_id = _seed_parent_zip(file_store, artifact_store, "archive.zip")
+    response = await file_client.post(
+        f"/v1/sessions/{child}/resources/files:copy",
+        json={"source_session_id": parent, "file_ids": [file_id]},
+    )
+    assert response.status_code == 409, response.text
+    assert file_store.list(child).data == []
+    assert file_store.get(file_id, session_id=parent) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained_history", [False, True])
+async def test_native_send_rechecks_runtime_after_upload(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    retained_history: bool,
+) -> None:
+    """A downgrade/fork binding rejects incoming and retained files before dispatch."""
+    from omnigent.entities import MessageData
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    set_runner_client(runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"data", "application/zip")},
+    )
+    assert upload.status_code == 201, upload.text
+    block = {"type": "input_file", "file_id": upload.json()["id"], "filename": "renamed.txt"}
+    content = [block]
+    if retained_history:
+        file_conv_store.appended_items.append(
+            ConversationItem(
+                id="f" * 32,
+                type="message",
+                status="completed",
+                response_id="e" * 32,
+                created_at=1,
+                data=MessageData(role="user", content=content),
+            )
+        )
+        content = [{"type": "input_text", "text": "Read the attached archive again"}]
+    file_app.state.host_registry.get("host_files").hello.capabilities = []
+    response = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+    assert response.status_code == 409, response.text
+    assert "Update Omnigent" in response.text
+    assert runner.post_json_calls == []
+    assert len(file_conv_store.appended_items) == 1 + int(retained_history)

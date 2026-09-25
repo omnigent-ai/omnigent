@@ -19,6 +19,9 @@ import { nativeCodingAgentForHarness, nativeCodingAgentForWrapper } from "@/lib/
 const HOST_OWNER_DESCRIPTION =
   "This session's host is offline. Run the command below from the host machine to reconnect.";
 
+const HOST_OWNER_THIS_MACHINE_DESCRIPTION =
+  "This session's host is this machine. Reconnect it below, or run the command from a terminal.";
+
 const HOST_VIEWER_DESCRIPTION =
   "This session's host machine is offline and only its owner can reconnect it. " +
   "Clone the session to continue in a copy you own.";
@@ -111,7 +114,8 @@ export function buildReconnectCommand({
  * - **Reconnect** — a one-line instruction plus the CLI command. For a
  *   non-owner of a `host_offline` session — who can't reach the host
  *   machine — the command is dropped and the text explains that only
- *   the owner can reconnect.
+ *   the owner can reconnect. If an in-app reconnect failed, the owner
+ *   can retry it here or use the terminal command.
  * - **Clone** — the same {@link ForkSessionForm} the header-menu Clone
  *   dialog uses (one fork implementation, two entry points), so the
  *   user can continue in a copy they own without leaving the dialog.
@@ -147,6 +151,7 @@ export function ReconnectSessionDialog({
   sourceWorkspace,
   sourceHostId,
   sourceGitBranch,
+  localReconnect,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -160,9 +165,16 @@ export function ReconnectSessionDialog({
   sourceWorkspace?: string | null;
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
+  localReconnect?: {
+    reconnecting: boolean;
+    error: string | null;
+    onReconnect: () => void;
+  };
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
   const isHostReconnect = state === "host_offline";
+  const canReconnectThisMachine = isHostReconnect && isOwner && localReconnect != null;
+
   // A non-owner can't reach the host machine to reconnect it, so the
   // CLI command is useless to them. Owners of both states, and anyone
   // on a local_stranded session, get a command.
@@ -173,7 +185,9 @@ export function ReconnectSessionDialog({
   const title = isHostReconnect ? "Host is offline" : "Agent disconnected";
   const description = isHostReconnect
     ? isOwner
-      ? HOST_OWNER_DESCRIPTION
+      ? canReconnectThisMachine
+        ? HOST_OWNER_THIS_MACHINE_DESCRIPTION
+        : HOST_OWNER_DESCRIPTION
       : HOST_VIEWER_DESCRIPTION
     : RUN_DESCRIPTION;
   return (
@@ -211,6 +225,28 @@ export function ReconnectSessionDialog({
               >
                 {description}
               </p>
+              {canReconnectThisMachine && localReconnect && (
+                <div className="flex flex-col gap-2">
+                  <Button
+                    className="self-start"
+                    data-testid="reconnect-session-this-machine"
+                    disabled={localReconnect.reconnecting}
+                    aria-busy={localReconnect.reconnecting}
+                    onClick={localReconnect.onReconnect}
+                  >
+                    {localReconnect.reconnecting ? "Reconnecting this machine…" : "Retry reconnect"}
+                  </Button>
+                  {localReconnect.error && (
+                    <p
+                      className="text-sm text-destructive select-text"
+                      role="alert"
+                      data-testid="reconnect-session-reconnect-error"
+                    >
+                      {localReconnect.error}
+                    </p>
+                  )}
+                </div>
+              )}
               {showCommand && (
                 <CliCommandBlock command={command} testIdPrefix="reconnect-session" />
               )}

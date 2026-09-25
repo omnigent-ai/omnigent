@@ -1,125 +1,83 @@
-"""Working indicators remain accurate while background-task controls are hidden.
-
-Real status events still drive working/sidebar state. The unfinished composer
-background-task entry point stays hidden across status changes and navigation.
-"""
+"""Full-stack coverage for background-task state across a reload."""
 
 from __future__ import annotations
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.chat._working_labels import WORKING_LABEL_RE as _WORKING_LABEL_RE
-
-_WORKING = '[data-testid="working-indicator"]'
 _PILL = '[data-testid="background-task-pill"]'
+_MONITOR_TASK = {
+    "id": "monitor-ci",
+    "type": "shell",
+    "status": "running",
+    "description": "Watch PR checks and review comments",
+    "command": "gh pr checks 123 --watch",
+}
 
 
-def _expect_hidden_pill(page: Page) -> None:
-    expect(page.get_by_test_id("composer-workspace-controls")).to_be_visible(timeout=15_000)
-    expect(page.locator(_PILL)).to_have_count(0)
+def _pill_badge(page: Page, count: int) -> Locator:
+    plural = "" if count == 1 else "s"
+    return page.get_by_role(
+        "button", name=f"{count} background task{plural} still running", exact=True
+    )
 
 
 def _publish_status(
     base_url: str,
     session_id: str,
-    status: str,
+    status: str = "idle",
     *,
+    response_id: str | None = None,
     background_task_count: int | None = None,
+    background_tasks: list[dict[str, str]] | None = None,
 ) -> None:
     """Publish a status edge; an omitted count preserves the sticky tally."""
     data: dict[str, object] = {"status": status}
+    if response_id is not None:
+        data["response_id"] = response_id
     if background_task_count is not None:
         data["background_task_count"] = background_task_count
-    resp = httpx.post(
+    if background_tasks is not None:
+        data["background_tasks"] = background_tasks
+    response = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},
         timeout=10.0,
     )
-    resp.raise_for_status()
+    response.raise_for_status()
 
 
-def test_background_task_control_stays_hidden_through_status_changes(
+def test_badge_survives_reload_and_tracks_updates_after_reconnect(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
+    """Snapshot hydration and the reconnected stream keep the tally current."""
     base_url, session_id = seeded_session
-    working = page.locator(_WORKING)
-    _publish_status(base_url, session_id, "idle", background_task_count=2)
+    _publish_status(
+        base_url,
+        session_id,
+        background_task_count=1,
+        background_tasks=[_MONITOR_TASK],
+    )
     page.goto(f"{base_url}/c/{session_id}")
-    _expect_hidden_pill(page)
-    expect(working).to_have_count(0)
+    expect(_pill_badge(page, 1)).to_have_text("1", timeout=15_000)
+    _pill_badge(page, 1).click()
+    expect(page.get_by_role("dialog", name="1 background task", exact=True)).to_be_visible()
 
-    _publish_status(base_url, session_id, "running")
-    expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
-    _expect_hidden_pill(page)
-
-    _publish_status(base_url, session_id, "idle", background_task_count=0)
-    expect(working).to_have_count(0, timeout=15_000)
-    _expect_hidden_pill(page)
-
-
-def test_working_shimmer_remains_visible_with_task_controls_hidden(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    base_url, session_id = seeded_session
-    working = page.locator(_WORKING)
-    _publish_status(base_url, session_id, "idle", background_task_count=2)
-    page.goto(f"{base_url}/c/{session_id}")
-    _expect_hidden_pill(page)
-    expect(working).to_have_count(0)
-
-    _publish_status(base_url, session_id, "running")
-    expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
-    _expect_hidden_pill(page)
-
-
-def test_sidebar_spinner_ignores_background_tasks(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    base_url, session_id = seeded_session
-    working = page.locator(_WORKING)
-    running_badge = page.locator('[data-testid="session-state-badge"][data-state="running"]')
-    _publish_status(base_url, session_id, "idle", background_task_count=1)
-    page.goto(f"{base_url}/c/{session_id}")
-    _expect_hidden_pill(page)
-    expect(running_badge).to_have_count(0)
-
-    _publish_status(base_url, session_id, "running")
-    expect(running_badge).to_have_count(1, timeout=15_000)
-
-    _publish_status(base_url, session_id, "idle", background_task_count=0)
-    expect(working).to_have_count(0, timeout=15_000)
-    expect(running_badge).to_have_count(0, timeout=15_000)
-
-
-def test_background_task_control_stays_hidden_after_reload(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    base_url, session_id = seeded_session
-    _publish_status(base_url, session_id, "idle", background_task_count=2)
-    page.goto(f"{base_url}/c/{session_id}")
-    _expect_hidden_pill(page)
     page.reload()
-    _expect_hidden_pill(page)
-    _publish_status(base_url, session_id, "idle", background_task_count=3)
-    _expect_hidden_pill(page)
-    _publish_status(base_url, session_id, "idle", background_task_count=0)
-    _expect_hidden_pill(page)
+    expect(_pill_badge(page, 1)).to_have_attribute("aria-expanded", "false", timeout=15_000)
+    _pill_badge(page, 1).click()
+    panel = page.get_by_role("dialog", name="1 background task", exact=True)
+    expect(panel.get_by_text(_MONITOR_TASK["description"], exact=True)).to_be_visible()
+    page.keyboard.press("Escape")
 
+    _publish_status(base_url, session_id, background_task_count=2)
+    expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
+    _pill_badge(page, 2).click()
+    panel = page.get_by_role("dialog", name="2 background tasks", exact=True)
+    expect(panel).to_contain_text("details unavailable")
+    expect(panel.get_by_role("listitem")).to_have_count(0)
 
-def test_background_task_control_stays_hidden_when_switching_sessions(
-    page: Page,
-    seeded_session_pair: tuple[str, str, str],
-) -> None:
-    base_url, session_a, session_b = seeded_session_pair
-    _publish_status(base_url, session_a, "idle", background_task_count=2)
-    page.goto(f"{base_url}/c/{session_a}")
-    _expect_hidden_pill(page)
-    page.goto(f"{base_url}/c/{session_b}")
-    _expect_hidden_pill(page)
-    page.goto(f"{base_url}/c/{session_a}")
-    _expect_hidden_pill(page)
+    _publish_status(base_url, session_id, background_task_count=0)
+    expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
+    expect(panel).to_have_count(0)

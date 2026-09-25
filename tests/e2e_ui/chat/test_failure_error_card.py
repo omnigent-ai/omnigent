@@ -118,7 +118,7 @@ def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
     page.goto(f"{base_url}/c/{session_id}")
 
     pills = page.get_by_test_id("error-pill")
-    expect(pills).to_have_count(2, timeout=15_000)
+    expect(pills).to_have_count(1, timeout=15_000)
     disconnect_pill = page.get_by_test_id("error-pill").filter(
         has_text="The connection to the host dropped unexpectedly"
     )
@@ -401,7 +401,7 @@ def test_persisted_failure_expands_retries_and_dismisses_locally(
     )
 
     # Retry triggers recovery and removes the pill rather than expanding it.
-    pill.get_by_role("button", name="Retry").click()
+    pill.get_by_role("button", name="Resume session").click()
     expect(pill).to_have_count(0)
     assert retry_payloads == [{"type": "retry_session", "data": {}}]
 

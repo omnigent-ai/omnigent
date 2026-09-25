@@ -42,7 +42,7 @@ export function readSessionModelLabelCache(key: string | null): string | null {
   }
 }
 
-// Only advertised display names belong here, never model selections or inferred labels.
+// Only formatted catalog display names belong here, never model selections or inferred labels.
 export function writeSessionModelLabelCache(key: string | null, displayName: string | null): void {
   if (key === null || typeof window === "undefined") return;
   try {

@@ -27,7 +27,12 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
-from omnigent.debug_logging import add_audit_attrs
+from omnigent.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    set_current_runner_id,
+    set_current_session_id,
+)
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -797,6 +802,8 @@ def create_hosts_router(
             permission_store=permission_store,
         )
         conn = target.conn
+        set_current_session_id(body.session_id)
+        add_audit_attrs(session_id=body.session_id, host_id=host_id)
 
         # W6: validate the requested workspace against the agent's
         # os_env.cwd sandbox boundary BEFORE binding — the same check
@@ -874,6 +881,15 @@ def create_hosts_router(
 
         async def _rollback_failed_launch() -> None:
             """Clear state created by a failed runner launch."""
+            _logger.error(
+                "Runner launch failed; clearing binding",
+                extra=debug_event(
+                    "runner_launch_failed",
+                    session_id=body.session_id,
+                    runner_id=runner_id,
+                    stage="runner_launch",
+                ),
+            )
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             await _rollback_worktree()
 
@@ -922,6 +938,17 @@ def create_hosts_router(
                     workspace = worktree.worktree_path
                     git_branch = worktree.branch
 
+            try:
+                await host_registry.admit_launch(
+                    conn,
+                    body.session_id,
+                    allow_unbound=True,
+                    transfer_from_host_id=target.conv.host_id,
+                )
+            except BaseException:
+                await _rollback_worktree()
+                raise
+
             bound = await asyncio.to_thread(
                 conversation_store.set_runner_id,
                 body.session_id,
@@ -958,6 +985,18 @@ def create_hosts_router(
                     await _settle_and_rollback()
                 raise
 
+        set_current_runner_id(runner_id)
+        add_audit_attrs(runner_id=runner_id)
+        _logger.info(
+            "Session bound to runner",
+            extra=debug_event(
+                "session_runner_bound",
+                session_id=body.session_id,
+                runner_id=runner_id,
+                operation="launch",
+                stage="runner_launch",
+            ),
+        )
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -969,6 +1008,11 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                inference_config=(
+                    target.conv.inference_snapshot["runtime_config"]
+                    if target.conv.inference_snapshot
+                    else None
+                ),
             )
         )
         try:
@@ -1567,7 +1611,7 @@ def create_hosts_router(
         :param path: Absolute path inside the repo on the host to list
             worktrees for, e.g. ``"/Users/alice/myrepo"``.
         :returns: ``{"object": "list", "data": [{path, branch,
-            is_main, detached}, ...]}`` (main first).
+            is_main, detached, updated_at?}, ...]}`` (main first).
         :raises HTTPException: 404 if host not found, 403 if not owned
             by caller, 409 if host is offline/unresponsive, 400 on path
             validation or a non-git path.

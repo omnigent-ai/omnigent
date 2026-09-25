@@ -7,12 +7,9 @@ import { useSessionActive, useTrailingInvalidate } from "@/hooks/useWorkspaceCha
 /**
  * Discriminated worktree-list outcome for a session's workspace.
  *
- * Distinct from {@link useHostWorktrees}, which collapses every HTTP 400
- * (genuinely-not-a-repo AND a transient git failure) into `[]`. That ambiguity
- * is fine for the new-session picker ("nothing to offer") but not for a status
- * bar, where `[]` must not be advertised as "not a git repository". Here only
- * an explicit not-a-repo error yields `not_git`; every other failure is
- * `unknown`.
+ * Both host and session probes recognize only explicit not-a-repo errors.
+ * Session status reports every other failure as `unknown` rather than
+ * rejecting the query, so the status bar never mislabels a failed probe.
  */
 export type SessionWorktreesResult =
   { status: "ok"; worktrees: HostWorktree[] } | { status: "not_git" } | { status: "unknown" };

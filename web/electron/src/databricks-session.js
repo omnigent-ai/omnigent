@@ -12,13 +12,14 @@
 
 const { net } = require("electron");
 const {
-  databricksOAuthConfigured,
   runInteractiveLogin,
   getValidStoredToken,
   saveWorkspaceToken,
   isTrustedDatabricksOrigin,
 } = require("./databricks-oauth");
 const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
+const { isDatabricksOAuthServerUrl } = require("./url");
+const { cookieMatchesOrigin } = require("./databricks-auth");
 
 const SESSION_CREATE_PATH = "/auth/session/create";
 // Bound on the session-create request so a stalled socket can't hang connect.
@@ -34,15 +35,14 @@ const NETWORK_TIMEOUT_MS = 20_000;
  *   window) instead of dropping into another window's workspace. A workspace URL
  *   re-authenticates directly (usually a silent browser SSO round-trip). The
  *   result is persisted keyed by the resolved workspace origin.
- * - Session expiry (``interactive: false``): reuse the stored token for this
+ * - Restore/renewal (``interactive: false``): reuse the stored token for this
  *   (already-resolved) workspace, refreshing if needed, and re-mint the cookie
  *   against the SAME workspace — no browser, no picker. This is the ONLY path
- *   that reads the cache. (Relaunch stays seamless via the persisted DBAUTH
- *   cookie and doesn't come through here.)
+ *   that reads the cache, including relaunch and additional windows.
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin The entered/pinned origin (account or workspace host).
- * @param {{ interactive?: boolean, nextPath?: string, workspaceId?: string,
+ * @param {{ interactive?: boolean, nextPath?: string, workspaceId?: string, signal?: AbortSignal,
  *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
  *     => Promise<{fqdn: string, name: string} | null> }} [opts]
  *   ``workspaceId`` (from a ``?o=`` hint) auto-selects that workspace for an
@@ -52,19 +52,34 @@ const NETWORK_TIMEOUT_MS = 20_000;
 async function ensureDatabricksSession(
   ses,
   origin,
-  { interactive = true, nextPath = "/omnigent", pickWorkspace, workspaceId } = {},
+  { interactive = true, nextPath = "/omnigent", pickWorkspace, workspaceId, signal } = {},
 ) {
+  signal?.throwIfAborted();
+  if (!isDatabricksOAuthServerUrl(origin)) {
+    throw new Error("Browser OAuth requires an HTTPS Databricks workspace/account URL");
+  }
+  console.log("[omnigent] databricks session: prepare", {
+    origin,
+    interactive,
+    workspaceHint: workspaceId ?? null,
+  });
   let bridgeOrigin;
   let accessToken;
 
   if (!interactive) {
-    // Silent expiry re-mint: reuse the stored token for this resolved workspace.
+    // Shared refreshes must persist rotated credentials even if this caller cancels.
+    // The cancellation check below stops this caller before cookie minting.
     accessToken = await getValidStoredToken(origin);
     bridgeOrigin = origin;
   } else {
     // Explicit login: authenticate fresh, never reusing the cache.
-    const { tokens, issuerOrigin } = await runInteractiveLogin(origin);
+    const { tokens, issuerOrigin } = await runInteractiveLogin(origin, { signal });
+    signal?.throwIfAborted();
     const account = parseAccountFromToken(tokens.access_token);
+    console.log("[omnigent] databricks session: token routing", {
+      issuerOrigin,
+      accountScoped: Boolean(account),
+    });
     if (account) {
       // Account-scoped (SPOG): the account host has no /auth/session/create, so
       // resolve the account's workspaces, let the user pick, and bridge to that
@@ -73,7 +88,12 @@ async function ensureDatabricksSession(
       if (!isTrustedDatabricksOrigin(account.accountOrigin)) {
         throw new Error(`refusing to use an untrusted account origin: ${account.accountOrigin}`);
       }
-      const workspaces = await listRunningWorkspaces(account, tokens.access_token);
+      const workspaces = await listRunningWorkspaces(account, tokens.access_token, { signal });
+      signal?.throwIfAborted();
+      console.log("[omnigent] databricks session: workspace lookup", {
+        accountOrigin: account.accountOrigin,
+        count: workspaces.length,
+      });
       if (workspaces.length === 0) {
         throw new Error("no running workspaces available for this account");
       }
@@ -96,7 +116,10 @@ async function ensureDatabricksSession(
         }
         picked = await pickWorkspace(workspaces);
       }
-      if (!picked) throw new Error("workspace selection cancelled");
+      signal?.throwIfAborted();
+      if (!picked) {
+        throw Object.assign(new Error("Workspace selection cancelled"), { name: "AbortError" });
+      }
       bridgeOrigin = `https://${picked.fqdn}`;
       saveWorkspaceToken(bridgeOrigin, tokens, {
         origin: account.accountOrigin,
@@ -111,12 +134,14 @@ async function ensureDatabricksSession(
     accessToken = tokens.access_token;
   }
 
+  signal?.throwIfAborted();
   // Never send the bearer to a non-Databricks host.
   if (!isTrustedDatabricksOrigin(bridgeOrigin)) {
     throw new Error(`refusing to send credentials to untrusted workspace origin: ${bridgeOrigin}`);
   }
 
-  await mintSessionCookie(ses, bridgeOrigin, accessToken, nextPath);
+  await mintSessionCookie(ses, bridgeOrigin, accessToken, nextPath, { signal });
+  signal?.throwIfAborted();
   return bridgeOrigin;
 }
 
@@ -127,46 +152,185 @@ async function ensureDatabricksSession(
  * hides Set-Cookie from the JS-visible redirect headers, so we read the jar
  * rather than parse the header), then confirm DBAUTH is present.
  */
-async function mintSessionCookie(ses, origin, accessToken, nextPath) {
-  const status = await new Promise((resolve, reject) => {
-    const url = `${origin}${SESSION_CREATE_PATH}?next_url=${encodeURIComponent(nextPath)}`;
-    // useSessionCookies:true is required for the response's Set-Cookie to be
-    // stored in `ses` (it defaults to false — session:ses alone won't persist
-    // cookies). Default redirect mode = follow, so Electron processes the 302
-    // (committing DBAUTH into the jar) before landing on next_url.
-    const request = net.request({ method: "GET", url, session: ses, useSessionCookies: true });
-    request.setHeader("Authorization", `Bearer ${accessToken}`);
-    const timer = setTimeout(() => request.abort(), NETWORK_TIMEOUT_MS);
-    request.on("response", (response) => {
-      response.on("data", () => {});
-      response.on("end", () => {
-        clearTimeout(timer);
-        resolve(response.statusCode);
-      });
-    });
-    request.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-    request.end();
+async function mintSessionCookie(
+  ses,
+  origin,
+  accessToken,
+  nextPath,
+  { signal, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {},
+) {
+  signal?.throwIfAborted();
+  const target = new URL(nextPath, origin);
+  if (!isDatabricksOAuthServerUrl(origin) || target.origin !== origin) {
+    throw new Error("Session creation requires a same-origin Databricks destination");
+  }
+  const writtenCookies = [];
+  const sameCookie = (a, b) =>
+    a.domain === b.domain &&
+    a.path === b.path &&
+    a.value === b.value &&
+    a.expirationDate === b.expirationDate;
+  const onCookieChanged = (_event, cookie, _cause, removed) => {
+    if (!removed && cookieMatchesOrigin(cookie, origin)) writtenCookies.push(cookie);
+  };
+  const before = await ses.cookies.get({ url: target.href, name: "DBAUTH" });
+  signal?.throwIfAborted();
+  console.log("[omnigent] databricks session: bridge request", {
+    origin,
+    path: SESSION_CREATE_PATH,
+    nextPath: target.pathname,
+    nextWorkspaceSelector: target.searchParams.get("o"),
+    existingCookies: before.length,
   });
-
-  // A successful bridge follows the 302 to next_url and ends < 400. An error
-  // (e.g. 401/403 when the endpoint isn't enabled for this account) ends >= 400
-  // and must NOT be reported as success just because a stale DBAUTH lingers.
-  if (status >= 400) {
-    throw new Error(`${SESSION_CREATE_PATH} returned HTTP ${status}`);
-  }
-  const jar = await ses.cookies.get({ url: origin, name: "DBAUTH" });
-  if (jar.length === 0) {
-    throw new Error(
-      `${SESSION_CREATE_PATH}: no DBAUTH cookie stored in the session (final HTTP ${status})`,
+  ses.cookies.on("changed", onCookieChanged);
+  let phase = "session-create";
+  let errorBody = "";
+  let requestId;
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const url = `${origin}${SESSION_CREATE_PATH}?next_url=${encodeURIComponent(nextPath)}`;
+      const request = net.request({
+        method: "GET",
+        url,
+        session: ses,
+        useSessionCookies: true,
+        redirect: "manual",
+      });
+      let settled = false;
+      let redirects = 0;
+      const finish = (error, code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeoutFn(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (error) {
+          console.warn("[omnigent] databricks session: bridge transport failed", { origin, phase });
+          reject(error);
+        } else resolve(code);
+      };
+      const abort = (message) => {
+        finish(new Error(message));
+        request.abort();
+      };
+      const onAbort = () => {
+        finish(signal.reason);
+        request.abort();
+      };
+      const timer = setTimeoutFn(
+        () => abort("Databricks session creation timed out"),
+        NETWORK_TIMEOUT_MS,
+      );
+      request.setHeader("Authorization", `Bearer ${accessToken}`);
+      request.on("redirect", (redirectStatus, method, redirectUrl) => {
+        let destination;
+        try {
+          destination = new URL(redirectUrl);
+        } catch {
+          /* Reject malformed redirects below. */
+        }
+        const accepted = ++redirects === 1 && redirectUrl === target.href;
+        console.log("[omnigent] databricks session: bridge redirect", {
+          origin,
+          status: redirectStatus,
+          method,
+          accepted,
+          targetOrigin: destination?.origin,
+          targetPath: destination?.pathname,
+          targetWorkspaceSelector: destination?.searchParams.get("o"),
+        });
+        // Follow only the intended app destination so Chromium commits Set-Cookie.
+        if (!accepted) {
+          abort(
+            "Databricks session creation redirected to authentication or an unexpected destination",
+          );
+          return;
+        }
+        phase = "workspace landing";
+        request.followRedirect();
+      });
+      request.on("response", (response) => {
+        const id =
+          response.headers?.["x-databricks-request-id"] ?? response.headers?.["x-request-id"];
+        if (typeof id === "string" && /^[a-zA-Z0-9._:-]{1,128}$/.test(id)) requestId = id;
+        console.log("[omnigent] databricks session: bridge response", {
+          origin,
+          phase,
+          status: response.statusCode,
+          requestId,
+          cookieWritesObserved: writtenCookies.length,
+        });
+        response.on("data", (chunk) => {
+          // Read only enough to extract a structured error code; never display the body.
+          if (response.statusCode >= 400 && errorBody.length < 4096) {
+            errorBody += String(chunk).slice(0, 4096 - errorBody.length);
+          }
+        });
+        response.on("end", () => finish(null, response.statusCode));
+        response.on("error", (error) => finish(error));
+        response.on("aborted", () => finish(new Error("Databricks session response aborted")));
+        response.on("close", () =>
+          finish(new Error("Databricks session response closed before completion")),
+        );
+      });
+      // ClientRequest's Writable closes after end(), before the response arrives.
+      // Only response completion, explicit failures, or the deadline settle the request.
+      request.on("error", (error) => finish(error));
+      request.on("abort", () => finish(new Error("Databricks session request aborted")));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      else request.end();
+    });
+    if (status < 200 || status >= 300) {
+      let errorCode;
+      try {
+        const body = JSON.parse(errorBody);
+        const code = body?.error_code ?? body?.error;
+        if (typeof code === "string" && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(code)) errorCode = code;
+      } catch {
+        /* HTML and unstructured errors are not displayed. */
+      }
+      const details = [errorCode, requestId && `request ID ${requestId}`]
+        .filter(Boolean)
+        .join(", ");
+      const source =
+        phase === "session-create"
+          ? `${SESSION_CREATE_PATH} (no redirect)`
+          : "workspace landing after /auth/session/create redirect";
+      const error = new Error(`${source} returned HTTP ${status}${details ? `: ${details}` : ""}`);
+      error.phase = phase;
+      error.status = status;
+      error.requestId = requestId;
+      error.errorCode = errorCode;
+      console.warn("[omnigent] databricks session: bridge rejected", {
+        origin,
+        phase,
+        status,
+        errorCode,
+        requestId,
+      });
+      throw error;
+    }
+    const jar = await ses.cookies.get({ url: target.href, name: "DBAUTH" });
+    signal?.throwIfAborted();
+    const minted = jar.some(
+      (cookie) =>
+        writtenCookies.some((c) => sameCookie(c, cookie)) ||
+        !before.some((c) => sameCookie(c, cookie)),
     );
+    console.log("[omnigent] databricks session: cookie confirmation", {
+      origin,
+      existingCookies: before.length,
+      currentCookies: jar.length,
+      cookieWritesObserved: writtenCookies.length,
+      minted,
+    });
+    if (!minted) {
+      throw new Error(`${SESSION_CREATE_PATH}: no new DBAUTH cookie stored`);
+    }
+    console.log(`[omnigent] databricks session: signed in to ${origin}`);
+  } finally {
+    ses.cookies.removeListener("changed", onCookieChanged);
   }
-  console.log(`[omnigent] databricks session: signed in to ${origin}`);
 }
 
-module.exports = {
-  databricksOAuthConfigured,
-  ensureDatabricksSession,
-};
+module.exports = { ensureDatabricksSession, mintSessionCookie };

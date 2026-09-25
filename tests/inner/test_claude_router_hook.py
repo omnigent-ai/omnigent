@@ -39,9 +39,12 @@ def _payload(
     tool_name: str = "Agent",
     subagent_type: str = "code-reviewer",
     prompt: str = "review the diff",
+    description: str | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
     tool_input: dict[str, Any] = {"subagent_type": subagent_type, "prompt": prompt}
+    if description is not None:
+        tool_input["description"] = description
     if model is not None:
         tool_input["model"] = model
     return {
@@ -125,6 +128,34 @@ def test_rewrite_allows_with_routed_model(tmp_path: Path, monkeypatch: pytest.Mo
             "permissionDecisionReason": "cheapest arm (applied as 'haiku')",
         }
     }
+
+
+def test_route_request_carries_the_task_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Task's human label rides the request, so a fan-out's persisted
+    decisions can each name the spawn they governed."""
+    router_dir = advertise_router(tmp_path)
+    _out, requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(description="Research auth flows"),
+        {"action": "allow", "rationale": "fine as-is"},
+    )
+    assert requests[0]["body"]["task_description"] == "Research auth flows"
+
+
+def test_a_spawn_without_a_description_sends_no_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router_dir = advertise_router(tmp_path)
+    _out, requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {"action": "allow", "rationale": "fine as-is"},
+    )
+    assert requests[0]["body"]["task_description"] is None
 
 
 @pytest.mark.parametrize(
@@ -342,6 +373,7 @@ def test_fork_typed_spawn_routes_like_any_other(
     assert body == {
         "harness": "claude-native",
         "task_name": "fork",
+        "task_description": None,
         "prompt": "review the diff",
         "parent_model": None,
         "requested_model": None,
@@ -611,6 +643,32 @@ async def test_sdk_callback_maps_rewrite(tmp_path: Path, monkeypatch: pytest.Mon
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "sonnet"
     assert bodies[0]["harness"] == "claude-sdk"
     assert bodies[0]["parent_model"] == "parent-model"
+
+
+async def test_sdk_callback_forwards_the_task_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-process SDK callback carries the spawn's label like the CLI hook."""
+    advertise_router(tmp_path)
+    monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
+    bodies: list[dict[str, Any]] = []
+
+    def fake_request(
+        endpoint: subagent_router.RouterEndpoint,
+        session_id: str,
+        body: dict[str, Any],
+        *,
+        timeout: float = 0.0,
+    ) -> dict[str, Any]:
+        bodies.append(body)
+        return {"action": "allow", "rationale": "fine as-is"}
+
+    monkeypatch.setattr(subagent_router, "request_decision", fake_request)
+    options = _install()
+    assert options.hooks is not None
+    callback = options.hooks["PreToolUse"][0].hooks[0]
+    await callback(_payload(description="Research auth flows"), "toolu_1", {"signal": None})
+    assert bodies[0]["task_description"] == "Research auth flows"
 
 
 async def test_sdk_callback_allows_unchanged_when_router_down(

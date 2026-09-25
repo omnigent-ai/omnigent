@@ -75,7 +75,14 @@ def conversation_url(base_url: str, conversation_id: str) -> str:
                 "",
             )
         )
-    return f"{base_url.rstrip('/')}/c/{encoded_id}"
+    # A local server started with --base-path serves the SPA (and its
+    # BrowserRouter basename) under that prefix, so a bare /c/<id> link would
+    # load a shell whose router matches nothing and render blank. Prefix it for
+    # our own local managed server only; "" for remote/root (probe-free).
+    from omnigent.host.local_server import local_server_base_path
+
+    base_path = local_server_base_path(base_url)
+    return f"{base_url.rstrip('/')}{base_path}/c/{encoded_id}"
 
 
 def open_conversation_url(url: str) -> bool:

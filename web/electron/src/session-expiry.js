@@ -1,16 +1,12 @@
-// Recovering the desktop window when its outer auth session expires — the
-// HTTP-redirect path.
+// Recovering embedded-auth connections when their outer auth session expires.
 //
 // A workspace-hosted Omnigent sits behind the Databricks SSO gate. Some
 // deployments answer an expired session with a 3xx redirect to a login page
 // (``/login``, ``/login/sso``, or ``/login.html``); this watches for that raw
 // redirect and reloads the window so the gate can re-challenge.
 //
-// NOTE: a managed Databricks workspace bounces an expired session via a
-// CLIENT-SIDE navigation, which webRequest never surfaces — so this seam does
-// not fire there. That case is handled by the away-watch's navigation
-// detection (see silentReauthManaged in main.js), which is the primary recovery
-// path. This HTTP-redirect seam remains for deployments that do emit a 3xx.
+// Databricks browser-auth connections are excluded by the caller. Their cookie
+// lifecycle and request guard live in databricks-auth.js, never embedded SSO.
 //
 // Kept Electron-free at its core (isLoginRedirect) so the matching logic is
 // unit-testable (test/session-expiry.test.js) without booting the app.
