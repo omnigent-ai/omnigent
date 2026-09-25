@@ -10,8 +10,14 @@ review is a sub-agent that returns a structured report, not a transcript
 anyone needs to read through.
 
 ## Procedure
-1. Get the task's diff — `sys_os_shell("gh pr diff <pr>")` (or
-   `git -C .worktrees/<task_id> diff main...HEAD`).
+1. Reuse the supplied diff file, or save the task's diff directly with a shell
+   redirect (`gh pr diff <pr> > <absolute shared diff path>` or
+   `git -C .worktrees/<task_id> diff <base-sha>...<head-sha> > <absolute shared diff path>`).
+   Use a unique snapshot outside the implementer's worktree, record its base and
+   head commit SHAs, and leave it unchanged until review finishes. The reviewer
+   must be able to read that path. For a different host or sandbox, transfer the
+   snapshot first or arrange access to both commits so it can compute the diff;
+   never regenerate the diff through model output.
 2. Run the deterministic gates first — tests / lint / typecheck via
    `sys_os_shell`. If red, re-dispatch the implementer to drive it green first;
    don't involve the reviewer yet.
@@ -26,10 +32,13 @@ anyone needs to read through.
    `codex` / `opencode` / `cursor` / `hermes` / `agy` / `pi`, and so on). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
    `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi", title="review-<task_slug>",
-   args={purpose: "review", input: "<the diff> + <the acceptance contract>.
+   args={purpose: "review", input: "Read the diff at <absolute shared diff path>
+   (base <base-sha>, head <head-sha>). <The acceptance contract>.
    Review ONLY against the contract. Report blocking / non-blocking /
-   suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
-   it at the implementer's worktree. Fetch the diff and emit the
+   suggestions. Do not edit code. If the snapshot is inaccessible, report that
+   failure rather than reviewing from a summary."})`. Pass the snapshot path,
+   not its contents; do NOT point the reviewer at the implementer's worktree.
+   Prepare the snapshot and emit the
    `sys_session_send` call in the SAME turn you decide to review — never end a
    turn having only announced "I'll load cross-review and fetch the diff" with
    no tool call (that dropped turn stalls the run; nothing dispatches and no
@@ -58,7 +67,7 @@ anyone needs to read through.
   is available on the machine, you CANNOT run independent cross-vendor review:
   don't dispatch a reviewer that can't boot, say so explicitly, and pull in the
   human at the plan gate.
-- Give the reviewer ONLY the diff + contract — never the implementer's
+- Give the reviewer ONLY the diff snapshot + contract — never the implementer's
   transcript or worktree. The cross-vendor independence is the whole point.
 - Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`agy`/`pi`) dispatched with
   `purpose: "review"` — a DIFFERENT vendor from the one that built the diff. It

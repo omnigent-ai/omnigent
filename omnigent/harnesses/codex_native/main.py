@@ -13,6 +13,7 @@ import shutil
 import socket
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ import httpx
 import yaml
 
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
+from omnigent._startup_events import record_startup_event
 from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
 )
@@ -47,6 +49,7 @@ from omnigent.harnesses.codex_native.app_server import (
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
+    codex_remote_resume_omits_permission_args,
     codex_session_meta_model_provider,
     codex_terminal_env,
     native_codex_launch_base_url,
@@ -66,7 +69,10 @@ from omnigent.harnesses.codex_native.bridge import (
     socket_path_for_bridge_dir,
     write_bridge_state,
 )
-from omnigent.harnesses.codex_native.forwarder import supervise_forwarder
+from omnigent.harnesses.codex_native.forwarder import (
+    _replay_dead_letters_before_resume,
+    supervise_forwarder,
+)
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
 from omnigent.host.daemon_launch import (
     error_text,
@@ -95,6 +101,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -381,7 +388,8 @@ class PreparedCodexTerminal:
         invocation owns it. ``None`` for reattached live terminals.
     :param event_client: App-server client already listening for the
         Codex thread. Fresh sessions keep this listener open after it
-        observes the TUI-created ``thread/started`` event.
+        observes the TUI-created ``thread/started`` event; resumed sessions
+        retain the preload subscription until forwarder teardown.
     :param reattached: ``True`` when an existing terminal was reused.
     """
 
@@ -853,6 +861,7 @@ def _run_with_remote_server(
                     prompt=prompt,
                     auth=attach_auth,
                 )
+                record_startup_event("initial_prompt_submitted")
             await _attach_terminal_resource(
                 base_url=base_url,
                 headers=headers,
@@ -938,6 +947,7 @@ async def _prepare_codex_terminal_via_daemon(
         else:
             _update_startup_progress(startup_progress, "Loading Codex session...")
             payload = await _fetch_codex_session(client, session_id)
+            record_startup_event("session_resolved", session_id=session_id)
             labels = payload.get("labels") if isinstance(payload, dict) else None
             if (
                 not isinstance(labels, dict)
@@ -956,6 +966,7 @@ async def _prepare_codex_terminal_via_daemon(
                         "terminal; restart the session terminal to apply them.",
                         err=True,
                     )
+                record_startup_event("terminal_available", session_id=session_id)
                 _update_startup_progress(startup_progress, "Codex terminal ready.")
                 return PreparedCodexTerminal(
                     session_id=session_id,
@@ -989,6 +1000,7 @@ async def _prepare_codex_terminal_via_daemon(
         if not fresh_session:
             await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
+        record_startup_event("runner_requested", session_id=session_id)
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
@@ -998,11 +1010,13 @@ async def _prepare_codex_terminal_via_daemon(
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
+        record_startup_event("runner_connected")
         # Must run AFTER wait_for_runner_online — unregistered runners
         # 400 on replace_runner_id. The daemon bind paths don't route
         # through replace_runner_id, so without this re-bind a stopped
         # session stays stopped.
         await _bind_session_runner(client, session_id, runner_id)
+        record_startup_event("session_runner_bound")
         _update_startup_progress(startup_progress, "Starting Codex terminal...")
         await _ensure_codex_terminal_on_runner(client, session_id)
         terminal = await _wait_for_codex_terminal_ready(
@@ -1010,6 +1024,7 @@ async def _prepare_codex_terminal_via_daemon(
             session_id,
             timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S,
         )
+        record_startup_event("terminal_available", session_id=session_id)
         _update_startup_progress(startup_progress, "Codex terminal ready.")
     return PreparedCodexTerminal(
         session_id=session_id,
@@ -1242,6 +1257,7 @@ async def _prepare_codex_terminal(
             _probe.bind(("127.0.0.1", 0))
             codex_ws_url = f"ws://127.0.0.1:{_probe.getsockname()[1]}"
         app_server = build_codex_native_server(
+            session_id=session_id,
             socket_path=socket_path,
             codex_home=codex_home,
             cwd=Path.cwd(),
@@ -1253,6 +1269,7 @@ async def _prepare_codex_terminal(
             ap_server_url=base_url,
             ap_auth_headers=headers,
             developer_instructions=developer_instructions,
+            terminal_launch_args=codex_args,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None
@@ -1267,10 +1284,14 @@ async def _prepare_codex_terminal(
                 )
                 await event_client.connect()
             else:
-                await preload_codex_thread_for_resume(
+                event_client = await preload_codex_thread_for_resume(
                     codex_ws_url,
                     thread_id,
                     terminal_launch_args=codex_args,
+                    cwd=Path.cwd(),
+                    retain_client=codex_remote_resume_omits_permission_args(
+                        app_server.codex_cli_version
+                    ),
                 )
                 write_bridge_state(
                     bridge_dir,
@@ -1297,20 +1318,25 @@ async def _prepare_codex_terminal(
                 # the app-server so it resolves the Omnigent provider
                 # and skips the OpenAI-login onboarding screen.
                 config_overrides=tuple(app_server.config_overrides),
+                codex_cli_version=app_server.codex_cli_version,
             )
             terminal_id = launched_terminal.terminal_id
             _update_startup_progress(startup_progress, "Codex terminal ready.")
-        except Exception:
-            if terminal_id is not None:
-                await _close_codex_terminal(
-                    base_url=base_url,
-                    headers=headers,
-                    session_id=session_id,
-                    terminal_id=terminal_id,
-                )
-            if event_client is not None:
-                await event_client.close()
-            await app_server.close()
+        except BaseException:
+            try:
+                if terminal_id is not None:
+                    await _close_codex_terminal(
+                        base_url=base_url,
+                        headers=headers,
+                        session_id=session_id,
+                        terminal_id=terminal_id,
+                    )
+            finally:
+                try:
+                    if event_client is not None:
+                        await event_client.close()
+                finally:
+                    await app_server.close()
             raise
     if launched_terminal is None:
         raise click.ClickException("Codex terminal was not launched.")
@@ -1408,10 +1434,15 @@ async def _attach_with_forwarder(
                 recover=recover,
             )
     finally:
-        if forwarder is not None:
-            forwarder.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await forwarder
+        try:
+            if forwarder is not None:
+                forwarder.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await forwarder
+        finally:
+            if prepared.event_client is not None:
+                with contextlib.suppress(Exception):
+                    await prepared.event_client.close()
         if not prepared.reattached:
             active_session_id = (
                 _active_codex_session_id(prepared.bridge_dir) or prepared.session_id
@@ -1614,7 +1645,9 @@ async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
         tmux_target,
         env=env,
     )
-    await process.wait()
+    record_startup_event("terminal_attach_started")
+    exit_code = await process.wait()
+    record_startup_event("terminal_attach_exited", exit_code=exit_code)
 
 
 async def _create_codex_session(
@@ -1659,6 +1692,7 @@ async def _create_codex_session(
     new_session_id = body.get("session_id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise click.ClickException("Codex session creation response did not include session_id.")
+    record_startup_event("session_resolved", session_id=new_session_id)
     return new_session_id
 
 
@@ -1889,9 +1923,11 @@ async def _ensure_local_codex_resume_rollout(
     ``resume <thread>`` reads that local rollout, so before launching a
     known-thread terminal we rewrite it from committed Omnigent items. This
     keeps the server transcript authoritative when a previous local rollout
-    has diverged. If server history is temporarily unavailable, a valid local
-    rollout remains a best-effort fallback. A successful server fetch wins
-    even when its committed history is empty or shorter than the local file;
+    has diverged. Before fetching that transcript, we best-effort replay any
+    proven-undelivered dead letters so successful recovery is reflected in the
+    same snapshot. If server history is temporarily unavailable, a valid local
+    rollout remains a best-effort fallback. A successful server fetch wins even
+    when its committed history is empty or shorter than the local file;
     local-only records are intentionally discarded.
 
     :param client: HTTP client pointed at the Omnigent server.
@@ -1926,6 +1962,7 @@ async def _ensure_local_codex_resume_rollout(
             f"Cannot resume Codex session {session_id!r}: persisted thread id "
             f"{external_session_id!r} is not a safe Codex rollout id."
         )
+    await _replay_dead_letters_before_resume(client, codex_home.parent)
     try:
         items = await _fetch_all_session_items_for_codex_resume(client, session_id)
     except _CodexResumeHistoryUnavailableError:
@@ -1941,6 +1978,12 @@ async def _ensure_local_codex_resume_rollout(
             )
             return existing
         raise
+    from omnigent.inner.native_attachments import resolve_session_item_file_references
+
+    # History stores attachments as raw file_ids; restore the files so the
+    # rebuilt thread can open local cached copies, as on a live turn.
+    items = await resolve_session_item_file_references(client, session_id=session_id, items=items)
+    items = _codex_items_with_attachment_references(items, bridge_dir=codex_home.parent)
     target = _codex_resume_rollout_path(codex_home, external_session_id)
     cli_version = None
     if codex_path is not None:
@@ -2182,19 +2225,59 @@ def _codex_rollout_records_from_session_items(
         }
     ]
     seen_turn_ids: set[str] = set()
+    open_function_calls: dict[str, _JsonObject] = {}
     interrupted_response_ids = _interrupted_response_ids_from_session_items(items)
+    remaining_function_outputs = _codex_function_output_counts(
+        items,
+        interrupted_response_ids=interrupted_response_ids,
+    )
     for index, item in enumerate(items):
         if _session_item_response_id(item) in interrupted_response_ids:
             continue
+        item_call_id = item.get("call_id")
+        if (
+            item.get("type") == "function_call_output"
+            and isinstance(item_call_id, str)
+            and item_call_id
+        ):
+            remaining_function_outputs[item_call_id] -= 1
+            if remaining_function_outputs[item_call_id] <= 0:
+                del remaining_function_outputs[item_call_id]
         # Compaction items carry the post-compaction context. Emit a
         # Compacted rollout record and discard all prior records — the
         # replacement_history replaces them.
         if item.get("type") == "compaction":
             compacted_msgs = item.get("compacted_messages")
-            if compacted_msgs:
+            if isinstance(compacted_msgs, list) and compacted_msgs:
+                replacement_history = [
+                    {
+                        **message,
+                        "content": sanitize_replayed_image_blocks(message["content"]),
+                    }
+                    if isinstance(message, dict)
+                    and message.get("type") == "message"
+                    and "content" in message
+                    else message
+                    for message in compacted_msgs
+                ]
+                replacement_call_ids = {
+                    message.get("call_id")
+                    for message in replacement_history
+                    if isinstance(message, dict)
+                    and message.get("type") == "function_call"
+                    and isinstance(message.get("call_id"), str)
+                }
+                # A tool can finish after the snapshot. Keep its open call so
+                # Codex does not discard the later output as an orphan.
+                replacement_history.extend(
+                    payload
+                    for call_id, payload in open_function_calls.items()
+                    if call_id in remaining_function_outputs
+                    and call_id not in replacement_call_ids
+                )
                 compacted_payload: _JsonObject = {
                     "message": item.get("summary", ""),
-                    "replacement_history": compacted_msgs,
+                    "replacement_history": replacement_history,
                 }
                 compacted_record: _JsonObject = {
                     "timestamp": timestamp,
@@ -2206,14 +2289,21 @@ def _codex_rollout_records_from_session_items(
                     compacted_payload["window_id"] = w_id
                 # Replace all prior response_item records — the
                 # replacement_history is the new context baseline.
-                # Keep only session_meta and turn_context records.
+                # Keep only session_meta; replacement_history is the new baseline.
                 records = [r for r in records if r.get("type") in ("session_meta",)]
                 records.append(compacted_record)
                 seen_turn_ids.clear()
+                open_function_calls = _codex_open_function_calls(replacement_history)
             continue
         payload = _codex_response_item_from_session_item(item)
         if payload is None:
             continue
+        call_id = payload.get("call_id")
+        if isinstance(call_id, str) and call_id:
+            if payload.get("type") == "function_call":
+                open_function_calls[call_id] = payload
+            elif payload.get("type") == "function_call_output":
+                open_function_calls.pop(call_id, None)
         turn_id = _codex_turn_id_for_session_item(
             session_id=session_id,
             external_session_id=external_session_id,
@@ -2244,6 +2334,38 @@ def _codex_rollout_records_from_session_items(
         if event_msg is not None:
             records.append(event_msg)
     return records
+
+
+def _codex_function_output_counts(
+    items: Sequence[_JsonObject],
+    *,
+    interrupted_response_ids: set[str],
+) -> Counter[str]:
+    """Count persisted outputs by call id, excluding interrupted responses."""
+    counts: Counter[str] = Counter()
+    for item in items:
+        if _session_item_response_id(item) in interrupted_response_ids:
+            continue
+        call_id = item.get("call_id")
+        if item.get("type") == "function_call_output" and isinstance(call_id, str) and call_id:
+            counts[call_id] += 1
+    return counts
+
+
+def _codex_open_function_calls(items: Sequence[object]) -> dict[str, _JsonObject]:
+    """Return function calls in Responses history that do not yet have outputs."""
+    open_calls: dict[str, _JsonObject] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        if item.get("type") == "function_call":
+            open_calls[call_id] = item
+        elif item.get("type") == "function_call_output":
+            open_calls.pop(call_id, None)
+    return open_calls
 
 
 def _codex_turn_context_policy_fields_from_launch_args(
@@ -2533,6 +2655,40 @@ def _codex_function_call_output_payload_from_session_item(
     }
 
 
+def _codex_items_with_attachment_references(
+    items: list[_JsonObject],
+    *,
+    bridge_dir: Path,
+) -> list[_JsonObject]:
+    """
+    Replace user attachment blocks with the reference lines a live turn sends.
+
+    Rollout history only carries text, so each attachment is written back to
+    the session attachment cache and referenced by path. A
+    block whose bytes never arrived becomes the could-not-load marker.
+
+    :param items: Flat Omnigent item dicts with file_ids already resolved.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
+    :returns: The same items with attachment blocks turned into ``input_text``.
+    """
+    from omnigent.inner.native_attachments import attachment_reference_line
+
+    for item in items:
+        content = item.get("content")
+        if item.get("role") != "user" or not isinstance(content, list):
+            continue
+        item["content"] = [
+            {
+                "type": "input_text",
+                "text": attachment_reference_line(block, bridge_dir),
+            }
+            if isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+            else block
+            for block in content
+        ]
+    return items
+
+
 def _codex_content_blocks_from_api_content(
     content: object,
     *,
@@ -2689,6 +2845,7 @@ async def _launch_codex_terminal(
     remote_url: str,
     env: dict[str, str],
     config_overrides: tuple[str, ...] = (),
+    codex_cli_version: tuple[int, int, int] | None = None,
 ) -> LaunchedCodexTerminal:
     """
     Launch the server-backed Codex terminal resource.
@@ -2708,6 +2865,7 @@ async def _launch_codex_terminal(
         screen). See :func:`build_codex_remote_args`. Empty for a plain
         Codex-login launch. E.g.
         ``('model_provider="omnigent_databricks"',)``.
+    :param codex_cli_version: Probed CLI version used to preserve older resume behavior.
     :returns: Launched terminal resource details.
     """
     terminal_args = build_codex_remote_args(
@@ -2715,6 +2873,7 @@ async def _launch_codex_terminal(
         thread_id=thread_id,
         remote_url=remote_url,
         config_overrides=config_overrides,
+        codex_cli_version=codex_cli_version,
     )
     body = {
         "terminal": _TERMINAL_NAME,

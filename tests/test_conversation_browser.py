@@ -23,6 +23,30 @@ def test_conversation_url_quotes_session_id() -> None:
     assert url == "https://example.com/app/c/conv%20with%2Fslash%3Fquery"
 
 
+def test_conversation_url_prefixes_local_server_base_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A conversation link for our local managed server carries its configured
+    base path (else the SPA loads at a path its router basename does not match
+    and renders blank); a remote --server is never prefixed. Probe-free: the
+    match is against the recorded pidfile, stubbed here for determinism."""
+    from omnigent.host import local_server
+
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
+
+    # Local managed server -> link carries the prefix.
+    assert (
+        browser.conversation_url("http://127.0.0.1:6767", "conv_abc")
+        == "http://127.0.0.1:6767/proxy/6767/c/conv_abc"
+    )
+    # A remote --server keeps its own root (no local prefix leaks in).
+    assert (
+        browser.conversation_url("https://remote.example.com", "conv_abc")
+        == "https://remote.example.com/c/conv_abc"
+    )
+
+
 def test_open_conversation_url_uses_macos_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

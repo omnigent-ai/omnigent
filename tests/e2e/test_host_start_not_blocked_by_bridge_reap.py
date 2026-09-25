@@ -33,26 +33,6 @@ from omnigent.host.connect import HostProcess
 from omnigent.host.identity import HostIdentity
 
 
-class _ConnectReachedThenStop:
-    """Async-CM stand-in for ``websockets.asyncio.client.connect``.
-
-    Signals (on the event loop) that the host reached its connect attempt —
-    the step that registers it with the server — then raises
-    ``CancelledError`` from ``__aenter__`` so ``HostProcess.run()`` breaks out
-    of its connect loop and returns cleanly.
-    """
-
-    def __init__(self, reached: asyncio.Event) -> None:
-        self._reached = reached
-
-    async def __aenter__(self) -> object:
-        self._reached.set()
-        raise asyncio.CancelledError()
-
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
-
-
 async def test_host_start_does_not_block_on_orphan_bridge_reap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -64,19 +44,13 @@ async def test_host_start_does_not_block_on_orphan_bridge_reap(
     """
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
 
-    # Isolate the WS connect + auth so no real network/credentials are touched.
-    import websockets.asyncio.client as ws_client
-
-    import omnigent.runner._entry as entry_mod
-
-    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
-
     connect_reached = asyncio.Event()
 
-    def _fake_connect(url: str, **kwargs: object) -> _ConnectReachedThenStop:
-        return _ConnectReachedThenStop(connect_reached)
+    async def _fake_connect_and_serve(_host: HostProcess) -> None:
+        connect_reached.set()
+        await asyncio.Event().wait()
 
-    monkeypatch.setattr(ws_client, "connect", _fake_connect)
+    monkeypatch.setattr(HostProcess, "_connect_and_serve", _fake_connect_and_serve)
 
     # A sweep that blocks in its worker thread (it runs via asyncio.to_thread)
     # until the test releases it, standing in for a genuinely slow sweep on a
@@ -102,24 +76,20 @@ async def test_host_start_does_not_block_on_orphan_bridge_reap(
     host._capabilities_initialized = True
 
     run_task = asyncio.create_task(host.run())
-    reached = False
     try:
         # The sweep runs in a worker thread and is held blocked. On the fixed
         # code the connect attempt is reached promptly (sweep is off the
         # critical path); on the buggy code run() is parked awaiting the sweep
         # and never reaches connect, so this times out.
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(connect_reached.wait(), timeout=10.0)
-            reached = True
+        await asyncio.wait_for(connect_reached.wait(), timeout=10.0)
+        sweep_ran = await asyncio.wait_for(
+            asyncio.to_thread(sweep_started.wait, 10.0),
+            timeout=15.0,
+        )
     finally:
         sweep_release.set()
         run_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await run_task
 
-    assert sweep_started.is_set(), "the orphan bridge-dir sweep never ran"
-    assert reached, (
-        "host startup blocked on the orphan bridge-dir sweep: the connect "
-        "attempt (host registration) was not reached while the sweep was "
-        "still in flight"
-    )
+    assert sweep_ran, "the delayed orphan bridge-dir sweep never ran"
