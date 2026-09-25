@@ -22,6 +22,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
@@ -647,13 +648,23 @@ async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
     :param ws: Accepted Starlette WebSocket.
     :param session: Current runner session whose queue this task
         drains.
-    :returns: None when the session is retired.
+    :returns: None when the session is retired, or when the socket was
+        closed by another task (ping timeout, retire) while a send
+        raced it.
     """
     while True:
         data = await session.outbound_queue.get()
         if data is None:
             return
-        await ws.send_text(data)
+        try:
+            await ws.send_text(data)
+        except RuntimeError:
+            if ws.application_state is WebSocketState.DISCONNECTED:
+                # The ping loop or registry retirement closed the socket
+                # concurrently; the disconnect is already logged there.
+                _logger.debug("Runner %s send raced a concurrent close", session.runner_id)
+                return
+            raise
 
 
 async def _receive_tunnel_text(ws: WebSocket, runner_id: str) -> str | None:

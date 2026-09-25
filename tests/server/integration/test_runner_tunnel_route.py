@@ -1257,3 +1257,106 @@ async def test_keepalive_loop_fires_faster_than_the_ping_interval(
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert len(calls) >= 3 and set(calls) == {"r1"}
+
+
+class _FakeSenderWebSocket:
+    """Minimal ``send_text`` stand-in for ``_sender_loop`` unit tests.
+
+    :param raises: Exception ``send_text`` raises, or ``None`` to
+        record the frame instead.
+    :param application_state: Post-raise state, mimicking Starlette's
+        synchronous state flip when a concurrent close wins the race.
+    """
+
+    def __init__(
+        self,
+        *,
+        raises: Exception | None = None,
+        application_state: object = None,
+    ) -> None:
+        from starlette.websockets import WebSocketState
+
+        self._raises = raises
+        self.application_state = (
+            application_state if application_state is not None else WebSocketState.CONNECTED
+        )
+        self.sent: list[str] = []
+
+    async def send_text(self, data: str) -> None:
+        if self._raises is not None:
+            raise self._raises
+        self.sent.append(data)
+
+
+async def test_sender_loop_swallows_send_after_close_race() -> None:
+    """A send racing a concurrent close (socket already DISCONNECTED)
+    ends the sender loop quietly instead of raising into the route."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import runner_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
+        application_state=WebSocketState.DISCONNECTED,
+    )
+    session = SimpleNamespace(runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue())
+    session.outbound_queue.put_nowait("frame")
+    await runner_tunnel._sender_loop(ws, session)  # returns without raising
+
+
+async def test_sender_loop_reraises_send_failure_while_connected() -> None:
+    """The same RuntimeError while the socket is still CONNECTED is a
+    real error and must propagate to the route's error-logging path."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import runner_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
+        application_state=WebSocketState.CONNECTED,
+    )
+    session = SimpleNamespace(runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue())
+    session.outbound_queue.put_nowait("frame")
+    with pytest.raises(RuntimeError):
+        await runner_tunnel._sender_loop(ws, session)
+
+
+async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
+    """A real Starlette socket closed while a frame is still in the transport
+    reports DISCONNECTED, so the transport's send-after-close error is benign."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocket
+
+    from omnigent.server.routes import runner_tunnel
+
+    close_sent = asyncio.Event()
+    frame_in_transport = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        return {"type": "websocket.connect"}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "websocket.send":
+            frame_in_transport.set()
+            await close_sent.wait()
+            # What uvicorn raises for a frame that lost the race to a close.
+            raise RuntimeError(
+                "Unexpected ASGI message 'websocket.send', after sending "
+                "'websocket.close' or response already completed."
+            )
+        if message["type"] == "websocket.close":
+            close_sent.set()
+
+    ws = WebSocket({"type": "websocket", "path": "/", "headers": []}, receive, send)
+    await ws.accept()
+    session = SimpleNamespace(runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue())
+    session.outbound_queue.put_nowait("frame")
+    sender = asyncio.create_task(runner_tunnel._sender_loop(ws, session))
+    await asyncio.wait_for(frame_in_transport.wait(), timeout=5)
+    await ws.close(code=4000)
+    await asyncio.wait_for(sender, timeout=5)  # returns instead of raising
