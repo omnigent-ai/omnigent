@@ -35,11 +35,12 @@ background work is caught and logged: a failed fire must never crash the
 scheduler, and the current retry policy is simply "the next occurrence fires
 normally".
 
-**Execution target.** Scheduled tasks currently support connected-host,
-existing-workspace runs only. Future execution modes include managed sandbox,
-branch selection, replay/backfill, completion tracking, and multi-replica
-leasing through shared session-create orchestration rather than this direct
-fire path.
+**Execution target.** Scheduled tasks run on a ``connected_host`` (pin/resolve
+the owner's own machine) or in a ``managed_sandbox`` — a FRESH server-provisioned
+sandbox minted per fire, using the normal runner-idle and provider keepalive
+lifecycle. Future execution modes include branch selection,
+replay/backfill, and multi-replica leasing through shared session-create
+orchestration rather than this direct fire path.
 """
 
 from __future__ import annotations
@@ -50,12 +51,15 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any
 
+from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -83,11 +87,13 @@ _DEFAULT_WORKSPACE = "~"
 # Strong references to in-flight background fire tasks. ``loop.create_task`` holds
 # only a weak reference, so without this a fire could be garbage-collected
 # mid-flight; each task is discarded from the set when it completes.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _PENDING_FIRES: set[asyncio.Task[None]] = set()
 
 # Fire path overlap guard keyed by tenant + task. The scheduler's job.running
 # only covers its short on_fire callback; this covers the background
 # create/grant/dispatch work that continues after on_fire returns.
+# custom-lint: disable-next=workspace-scoped-cache -- already keyed by (workspace_id, task_id)
 _IN_FLIGHT_TASKS: set[tuple[int, str]] = set()
 
 
@@ -98,8 +104,14 @@ LaunchDispatch = Callable[[Conversation, ScheduledTask], Awaitable[None]]
 ConnectedHostPreflight = Callable[[ScheduledTask], Awaitable[None]]
 
 
+class _FireResult(Enum):
+    STARTED = "started"
+    INACTIVE = "inactive"
+    IN_FLIGHT = "in_flight"
+
+
 class _CannotLaunchScheduledFire(RuntimeError):
-    """A fire cannot start because the connected-host target is not usable."""
+    """A fire cannot start because its execution target is not usable."""
 
     def __init__(self, message: str, *, error_code: str) -> None:
         super().__init__(message)
@@ -127,6 +139,26 @@ class FireDeps:
     tunnel_registry: Any | None = None
     file_store: Any | None = None
     artifact_store: Any | None = None
+    # Managed-sandbox execution target. Both are needed to provision a fresh
+    # sandbox per fire; ``None`` when the server has no ``sandbox:`` config, in
+    # which case a ``managed_sandbox`` task records a failed run.
+    sandbox_config: Any | None = None
+    managed_launches: Any | None = None
+
+
+@dataclass
+class _FireDispatch:
+    """The launch seams a fire may use, selected per task by ``execution_target``.
+
+    ``connected`` / ``connected_preflight`` drive the connected-host flow;
+    ``managed`` provisions a fresh sandbox. A test that injects a single
+    ``launch_dispatch`` gets it as both ``connected`` and ``managed`` (with no
+    preflight), so the injected fake serves whichever target the task selects.
+    """
+
+    connected: LaunchDispatch
+    connected_preflight: ConnectedHostPreflight | None
+    managed: LaunchDispatch
 
 
 def _prompt_event(prompt: str) -> SessionEventInput:
@@ -141,7 +173,7 @@ def build_on_fire(
     deps: FireDeps,
     *,
     launch_dispatch: LaunchDispatch | None = None,
-) -> Callable[[int, str], Awaitable[None]]:
+) -> Callable[[int, str], Awaitable[bool]]:
     """Build the real ``on_fire`` callback bound to server ``deps``.
 
     :param deps: Server stores/registries the fire path operates on.
@@ -149,24 +181,20 @@ def build_on_fire(
         prompt for a created session. Defaults to the real connected-host
         implementation; tests inject a fake.
     :returns: An ``async on_fire(workspace_id, scheduled_task_id)`` suitable for
-        :class:`ScheduledTaskScheduler`.
+        :class:`ScheduledTaskScheduler`. False tells it to remove an inactive
+        task's timer; an overlapping fire keeps its next occurrence armed.
     """
-    preflight: ConnectedHostPreflight | None = None
-    if launch_dispatch is None:
-        dispatch = _make_connected_host_dispatch(deps)
-        preflight = _make_connected_host_preflight(deps)
-    else:
-        dispatch = launch_dispatch
+    fire_dispatch = _build_fire_dispatch(deps, launch_dispatch)
 
-    async def on_fire(workspace_id: int, scheduled_task_id: str) -> None:
-        await _trigger_fire(
+    async def on_fire(workspace_id: int, scheduled_task_id: str) -> bool:
+        result = await _trigger_fire(
             deps,
             workspace_id,
             scheduled_task_id,
-            dispatch,
-            preflight,
+            fire_dispatch,
             require_active=True,
         )
+        return result is not _FireResult.INACTIVE
 
     return on_fire
 
@@ -195,35 +223,50 @@ def build_run_now(
         returns ``True`` if a fire was started, ``False`` if it was skipped
         (row gone, or a fire for that task is already in flight).
     """
-    preflight: ConnectedHostPreflight | None = None
-    if launch_dispatch is None:
-        dispatch = _make_connected_host_dispatch(deps)
-        preflight = _make_connected_host_preflight(deps)
-    else:
-        dispatch = launch_dispatch
+    fire_dispatch = _build_fire_dispatch(deps, launch_dispatch)
 
     async def run_now(workspace_id: int, scheduled_task_id: str) -> bool:
-        return await _trigger_fire(
+        result = await _trigger_fire(
             deps,
             workspace_id,
             scheduled_task_id,
-            dispatch,
-            preflight,
+            fire_dispatch,
             require_active=False,
         )
+        return result is _FireResult.STARTED
 
     return run_now
+
+
+def _build_fire_dispatch(deps: FireDeps, launch_dispatch: LaunchDispatch | None) -> _FireDispatch:
+    """Build the per-target launch seams shared by the scheduler and run-now.
+
+    A test-injected ``launch_dispatch`` is used for BOTH targets (no preflight),
+    so a fake fire can exercise either the connected-host or managed-sandbox
+    branch. The real path builds the connected-host dispatch/preflight plus the
+    managed-sandbox dispatch.
+    """
+    if launch_dispatch is not None:
+        return _FireDispatch(
+            connected=launch_dispatch,
+            connected_preflight=None,
+            managed=launch_dispatch,
+        )
+    return _FireDispatch(
+        connected=_make_connected_host_dispatch(deps),
+        connected_preflight=_make_connected_host_preflight(deps),
+        managed=_make_managed_sandbox_dispatch(deps),
+    )
 
 
 async def _trigger_fire(
     deps: FireDeps,
     workspace_id: int,
     scheduled_task_id: str,
-    dispatch: LaunchDispatch,
-    preflight: ConnectedHostPreflight | None,
+    fire_dispatch: _FireDispatch,
     *,
     require_active: bool,
-) -> bool:
+) -> _FireResult:
     """Synchronously guard a fire, then dispatch the run in the background.
 
     Shared by the scheduled fire path (``require_active=True``) and the manual
@@ -232,8 +275,8 @@ async def _trigger_fire(
     fire-and-forget so the caller (scheduler timer or ``POST /run`` route)
     returns immediately.
 
-    :returns: ``True`` if a background fire was started, ``False`` if skipped
-        (row gone / not active when required / already in flight).
+    :returns: Whether work started, the task is inactive, or a fire is already
+        in flight. Only an inactive task should lose its recurring timer.
     """
     # Re-read the row: never trust the caller. A deleted (or, for the scheduled
     # path, non-active) row is a logged no-op done synchronously.
@@ -241,40 +284,39 @@ async def _trigger_fire(
         task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
         if task is None:
             _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
-            return False
-        if require_active and task.state != "active":
+            return _FireResult.INACTIVE
+        if task.state == "deleted" or (require_active and task.state != "active"):
             _logger.info(
                 "scheduled fire: task %s is %s (not active) — skipping",
                 scheduled_task_id,
                 task.state,
             )
-            return False
+            return _FireResult.INACTIVE
 
     key = (workspace_id, scheduled_task_id)
     if key in _IN_FLIGHT_TASKS:
         _logger.info("scheduled fire: task %s already in flight — skipping", scheduled_task_id)
-        return False
+        return _FireResult.IN_FLIGHT
     _IN_FLIGHT_TASKS.add(key)
 
     # Fire-and-forget: the session create + launch runs in the background so the
     # caller returns immediately (the scheduler re-arms the timer now; the route
     # returns 202).
     fire_task = asyncio.create_task(
-        _run_fire(deps, workspace_id, scheduled_task_id, dispatch, preflight, require_active),
+        _run_fire(deps, workspace_id, scheduled_task_id, fire_dispatch, require_active),
         name=f"scheduled-fire-{scheduled_task_id}",
     )
     _PENDING_FIRES.add(fire_task)
     fire_task.add_done_callback(_PENDING_FIRES.discard)
     fire_task.add_done_callback(lambda _task: _IN_FLIGHT_TASKS.discard(key))
-    return True
+    return _FireResult.STARTED
 
 
 async def _run_fire(
     deps: FireDeps,
     workspace_id: int,
     scheduled_task_id: str,
-    dispatch: LaunchDispatch,
-    preflight: ConnectedHostPreflight | None,
+    fire_dispatch: _FireDispatch,
     require_active: bool = True,
 ) -> None:
     """Background body of a firing: create session, grant, launch, record run.
@@ -288,7 +330,7 @@ async def _run_fire(
         if task is None:
             _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
             return
-        if require_active and task.state != "active":
+        if task.state == "deleted" or (require_active and task.state != "active"):
             _logger.info(
                 "scheduled fire: task %s is %s (not active) — skipping",
                 scheduled_task_id,
@@ -298,7 +340,11 @@ async def _run_fire(
 
         scheduled_at = int(time.time())
         try:
-            await _run_fire_for_task(deps, task, dispatch, preflight, scheduled_at)
+            with (
+                account_authority_scope(task.user_id, task.account_generation),
+                host_owner_scope(task.user_id, task.account_generation),
+            ):
+                await _run_fire_for_task(deps, task, fire_dispatch, scheduled_at)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
 
@@ -306,13 +352,37 @@ async def _run_fire(
 async def _run_fire_for_task(
     deps: FireDeps,
     task: ScheduledTask,
-    dispatch: LaunchDispatch,
-    preflight: ConnectedHostPreflight | None,
+    fire_dispatch: _FireDispatch,
     scheduled_at: int,
 ) -> None:
-    """Run a freshly re-read active task inside its workspace scope."""
+    """Run a freshly re-read active task, routed by ``execution_target``.
+
+    ``managed_sandbox`` provisions a fresh sandbox per fire (never reusing an
+    existing one); ``connected_host`` runs the resolve/validate/launch flow
+    below. Any other target records a skipped run.
+    """
     try:
-        if task.execution_target != "connected_host":
+        # A deleted / rotated owner registration fires nothing — managed or
+        # connected — and disables the task.
+        if await _owner_is_deleted(deps, task):
+            _logger.warning(
+                "scheduled fire: task %s owner %r registration is inactive; disabling task",
+                task.id,
+                task.user_id,
+            )
+            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error=f"owner {task.user_id!r} registration is no longer active; task disabled",
+                error_code="owner_deleted",
+            )
+            return
+        managed = task.execution_target == "managed_sandbox"
+        if not managed and task.execution_target != "connected_host":
             _logger.info(
                 "scheduled fire: task %s target %r is not supported — skipping",
                 task.id,
@@ -330,17 +400,11 @@ async def _run_fire_for_task(
             )
             return
 
-        # Resolve the effective launch target. An unset ``host_id`` means "you
-        # didn't pin WHICH host", not "run hostless": resolve the owner's live
-        # host at fire time. An unset ``workspace`` (research / summaries /
-        # chat-only) defaults to the host's home directory so the runner still
-        # has a real cwd. If no live host can be resolved, this records a
-        # failed run — the same honest behavior as a pinned host that is offline.
-        #
-        # ``task`` stays the source of truth for the persisted row; ``effective``
-        # carries the resolved host_id / defaulted workspace through preflight,
-        # validation, create, and dispatch WITHOUT writing them back to the row
-        # (the next fire re-resolves the live host).
+        dispatch = fire_dispatch.managed if managed else fire_dispatch.connected
+        preflight = None if managed else fire_dispatch.connected_preflight
+
+        # Resolve this fire's host/workspace without changing the stored task.
+        # A managed launch starts hostless and binds a fresh sandbox afterward.
         try:
             effective = await _resolve_effective_task(deps, task)
         except _CannotLaunchScheduledFire as exc:
@@ -356,7 +420,7 @@ async def _run_fire_for_task(
             )
             return
 
-        input_error = _validate_connected_host_inputs(effective)
+        input_error = None if managed else _validate_connected_host_inputs(effective)
         if input_error is not None:
             error, error_code = input_error
             _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
@@ -387,17 +451,8 @@ async def _run_fire_for_task(
                 )
                 return
 
-        # Validate the RESOLVED host/workspace. ``effective.workspace`` is always
-        # an absolute realpath by this point — a caller-supplied path or the
-        # canonicalized default (HOME). Gating on ``effective.workspace`` (not the
-        # stored ``task.workspace``) means the agent's ``os_env.cwd`` boundary is
-        # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
-        # does — an agent that pins an absolute cwd outside HOME records a failed
-        # run instead of silently launching outside its declared boundary.
-        # Scheduled tasks have no project field, so there is nothing for the
-        # project-aware create resolver to do here. If tasks ever grow one,
-        # the create below must route through resolve_project_session_create
-        # so ownership/default-fill semantics match POST /v1/sessions.
+        # Check connected-host workspaces, including the resolved HOME default,
+        # against the agent's cwd boundary. A new sandbox has no workspace yet.
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace
@@ -479,12 +534,26 @@ async def _run_fire_for_task(
         _logger.exception("scheduled fire: task %s failed", task.id)
 
 
+async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
+    """True when the task's captured owner registration is no longer active.
+
+    A NULL owner (single-user / OSS) always resolves to
+    :data:`RESERVED_USER_LOCAL` and is never considered deleted; without a
+    permission store there is no account to check against.
+    """
+    if task.user_id is None or deps.permission_store is None:
+        return False
+    owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
+    return owner is None or owner.account_generation != task.account_generation
+
+
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
     """Resolve the host/workspace the fire actually launches against.
 
-    A task may omit ``host_id`` (run on the owner's live host, whichever it is)
-    and/or ``workspace`` (a task that does no code work — e.g. an MCP-only task).
-    This returns a copy of *task* with those holes filled for this one fire:
+    A managed-sandbox task starts hostless, even if a legacy row has a stale
+    host/workspace. The regular managed launch binds a fresh sandbox afterward.
+
+    For connected-host tasks, this fills omitted values for this one fire:
 
     * ``host_id`` unset → the owner's most-recently-active ONLINE host. No live
       host (or no host store/registry) raises :class:`_CannotLaunchScheduledFire`
@@ -498,6 +567,14 @@ async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> Schedu
     enforced by the existing preflight, not here. The resolved values are never
     written back to the stored row; the next fire re-resolves the live host.
     """
+    if task.execution_target == "managed_sandbox":
+        if deps.sandbox_config is None or not deps.sandbox_config.managed_launch_supported:
+            raise _CannotLaunchScheduledFire(
+                "managed sandboxes are not configured on this server",
+                error_code="managed_sandbox_unavailable",
+            )
+        return replace(task, host_id=None, workspace=None)
+
     host_id = task.host_id
     if host_id is None:
         host_id = await _resolve_owner_host(deps, task)
@@ -529,6 +606,13 @@ async def _resolve_owner_host(deps: FireDeps, task: ScheduledTask) -> str:
     ``list_hosts`` returns the owner's hosts most-recently-active first and
     includes offline ones, so the first that is live in the registry is the
     natural default. First-online is the v1 tiebreak.
+
+    Server-managed sandbox hosts (``sandbox_provider`` set) are skipped: they
+    are launch targets the server creates on demand, not machines a
+    connected-host automation should silently reuse (a warm sandbox from an
+    interactive session would leak its state into the run and break once it is
+    gone). An automation that wants a sandbox uses ``execution_target =
+    "managed_sandbox"``, which mints a fresh one.
     """
     if deps.host_store is None or deps.host_registry is None:
         raise _CannotLaunchScheduledFire(
@@ -538,6 +622,12 @@ async def _resolve_owner_host(deps: FireDeps, task: ScheduledTask) -> str:
     owner = task.user_id or RESERVED_USER_LOCAL
     hosts = await asyncio.to_thread(deps.host_store.list_hosts, owner)
     for host in hosts:
+        # Skip stale-generation hosts (owner account rotated) and server-managed
+        # sandbox hosts (never silently reuse a warm interactive sandbox).
+        if task.user_id is not None and host.account_generation != task.account_generation:
+            continue
+        if getattr(host, "sandbox_provider", None) is not None:
+            continue
         if deps.host_registry.get(host.host_id) is not None:
             return str(host.host_id)
     raise _CannotLaunchScheduledFire(
@@ -716,9 +806,6 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
-    # Connected-host, existing-workspace runs create the conversation directly.
-    # Future execution modes such as managed sandbox, branch selection, and
-    # replay/backfill must use shared session-create orchestration.
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
@@ -787,14 +874,18 @@ async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str
     """Write the LEVEL_OWNER grant so the run is visible to its owner.
 
     A NULL ``user_id`` (single-user / OSS) resolves to
-    :data:`RESERVED_USER_LOCAL`. When ``permission_store`` is ``None`` (no auth
-    configured) this is a no-op — the session is still accessible because auth
-    is disabled system-wide.
+    :data:`RESERVED_USER_LOCAL`, whose row is created on demand. A real owner's
+    row is never (re)created here — a deleted account must stay deleted. When
+    ``permission_store`` is ``None`` (no auth configured) this is a no-op — the
+    session is still accessible because auth is disabled system-wide.
     """
     if deps.permission_store is None:
         return
-    owner = task.user_id or RESERVED_USER_LOCAL
-    await asyncio.to_thread(deps.permission_store.ensure_user, owner)
+    if task.user_id is None:
+        await asyncio.to_thread(deps.permission_store.ensure_user, RESERVED_USER_LOCAL)
+        owner = RESERVED_USER_LOCAL
+    else:
+        owner = task.user_id
     await asyncio.to_thread(deps.permission_store.grant, owner, conversation_id, LEVEL_OWNER)
 
 
@@ -934,6 +1025,16 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
             f"connected host {host_id!r} is not owned by the scheduled task owner",
             error_code="host_not_owned",
         )
+    if task.user_id is not None and host.account_generation != task.account_generation:
+        raise _CannotLaunchScheduledFire(
+            f"connected host {host_id!r} belongs to a different account registration",
+            error_code="host_authority_revoked",
+        )
+    if host.sandbox_provider is not None:
+        raise _CannotLaunchScheduledFire(
+            "automations cannot use an existing sandbox; select a new sandbox for each run",
+            error_code="existing_sandbox_not_allowed",
+        )
 
 
 def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
@@ -1031,6 +1132,86 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         await _dispatch_session_event_to_runner(
             conv.id,
             conv_for_dispatch,
+            _prompt_event(task.prompt),
+            deps.conversation_store,
+            runner_client,
+            agent_name=None,
+            file_store=deps.file_store,
+            artifact_store=deps.artifact_store,
+            created_by=owner,
+            runner_router=deps.runner_router,
+        )
+
+    return _dispatch
+
+
+def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
+    """Build the managed-sandbox launch+dispatch seam.
+
+    Reuses the exact ``host_type="managed"`` pipeline ``POST /v1/sessions`` uses:
+    :func:`_run_managed_launch` provisions a FRESH sandbox (``relaunch_host`` left
+    unset), binds a clean ``$HOME/workspace`` + a new host to the session, launches
+    the runner, and waits for its tunnel. That pipeline does not dispatch the
+    prompt, so once it settles successfully this seam re-reads the bound runner and
+    dispatches the task's prompt — the same tail as the connected-host seam.
+    """
+
+    async def _dispatch(conv: Conversation, task: ScheduledTask) -> None:
+        from omnigent.server.routes.sessions import (
+            _dispatch_session_event_to_runner,
+            _ensure_runner_session_initialized,
+            _run_managed_launch,
+            _wait_for_runner_client,
+        )
+
+        if deps.sandbox_config is None or deps.managed_launches is None or deps.host_store is None:
+            raise RuntimeError("managed sandboxes are not configured")
+
+        owner = task.user_id or RESERVED_USER_LOCAL
+        # Register the tracker entry and hold a reference: the launch settles it
+        # (success removes it; failure records the reason on this same object).
+        deps.managed_launches.begin(conv.id)
+        launch = deps.managed_launches.get(conv.id)
+        await _run_managed_launch(
+            session_id=conv.id,
+            owner=owner,
+            sandbox_config=deps.sandbox_config,
+            repos=(),
+            tracker=deps.managed_launches,
+            conversation_store=deps.conversation_store,
+            host_store=deps.host_store,
+            host_registry=deps.host_registry,
+            tunnel_registry=deps.tunnel_registry,
+            provider=None,
+            agent_store=deps.agent_store,
+            agent_id=task.agent_id,
+        )
+        if launch is not None and launch.error is not None:
+            raise RuntimeError(f"managed sandbox launch failed: {launch.error}")
+
+        # A successful launch bound host + runner_id + workspace to the row and
+        # waited for the runner's tunnel. Re-read for the runner id, then
+        # dispatch the prompt exactly as the connected-host seam does.
+        fresh = await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)
+        if fresh is None or fresh.runner_id is None:
+            raise RuntimeError("managed sandbox launch did not bind a runner")
+
+        runner_client = await _wait_for_runner_client(
+            conv.id,
+            deps.runner_router,
+            deps.tunnel_registry,
+            runner_id=fresh.runner_id,
+            timeout_s=_RUNNER_CONNECT_TIMEOUT_S,
+        )
+        if runner_client is None:
+            raise RuntimeError("managed runner did not connect before timeout")
+
+        await _ensure_runner_session_initialized(
+            conv.id, fresh, runner_client, deps.conversation_store
+        )
+        await _dispatch_session_event_to_runner(
+            conv.id,
+            fresh,
             _prompt_event(task.prompt),
             deps.conversation_store,
             runner_client,

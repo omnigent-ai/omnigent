@@ -49,6 +49,8 @@ from typing import Any
 import httpx
 from playwright.async_api import Route, async_playwright
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 # Unique sentinels so each POST body is unambiguously identifiable.
 _PROMPT = "sentinel-initprompt-7b3e initial prompt bound to session A"
 _FOLLOWUP = "sentinel-followup-2d9a live send into session B"
@@ -212,6 +214,7 @@ async def _drive_initial_prompt_switch(base_url: str, session_a: str, session_b:
 
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, "host_e2e")
             await page.route("**/v1/agents", handle_agents)
             await page.route(_SESSIONS_RE, handle_sessions)
 

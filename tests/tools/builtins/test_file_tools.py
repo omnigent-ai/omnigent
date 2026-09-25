@@ -28,6 +28,8 @@ class _FakeFile:
     :param created_at: Unix timestamp.
     :param session_id: Owning session/conversation id, or ``None``
         for global (unscoped) files.
+    :param blob_key: Artifact-store key for the bytes, or ``None`` to
+        read them under ``id`` (matches :class:`StoredFile`).
     """
 
     id: str
@@ -36,6 +38,7 @@ class _FakeFile:
     content_type: str | None
     created_at: int
     session_id: str | None = None
+    blob_key: str | None = None
 
 
 @dataclass

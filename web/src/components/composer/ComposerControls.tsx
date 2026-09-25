@@ -1,4 +1,4 @@
-import { forwardRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import { forwardRef, useRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import {
   ChevronDownIcon,
   FolderIcon,
@@ -12,16 +12,37 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { permissionModeConcept } from "@/lib/nativeHarnessModes";
+import {
+  COMPOSER_COLLAPSED_LABEL_CLASS,
+  COMPOSER_CONTENT_INSET_CLASS,
+  COMPOSER_TRAY_INSET_CLASS,
+  COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
+  useCollapsedWorkspaceLabels,
+} from "./ChatComposer";
 
+/**
+ * The workspace tray docked above the composer card. A tray nests inside the
+ * card's outer edges by the shared inset rather than sharing its border box
+ * (see the layout contract in ChatComposer); its chips sit on the card's
+ * content inset line via the shared content inset; a chip's box starts there, and its
+ * own px-1 keeps the glyph off the edge.
+ */
 export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+  const barRef = useRef<HTMLDivElement>(null);
+  useCollapsedWorkspaceLabels(barRef);
   return (
     <div
+      ref={barRef}
       className={cn(
-        "relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-start gap-2 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 pt-1.5",
+        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-1.5 md:gap-2",
+        COMPOSER_CONTENT_INSET_CLASS,
+        COMPOSER_TRAY_INSET_CLASS,
         className,
       )}
       {...props}
@@ -31,21 +52,32 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
 
 export const ComposerWorkspaceTrigger = forwardRef<
   HTMLButtonElement,
-  ComponentPropsWithoutRef<"button"> & { kind: "directory" | "worktree"; label: string }
->(function ComposerWorkspaceTrigger({ kind, label, className, ...props }, ref) {
+  ComponentPropsWithoutRef<"button"> & {
+    kind: "directory" | "worktree";
+    label: string;
+    icon?: ReactNode;
+  }
+>(function ComposerWorkspaceTrigger({ kind, label, icon, className, ...props }, ref) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
   return (
     <button
       ref={ref}
       type="button"
+      // Icon-only while the bar is collapsed, so the label is the name.
+      aria-label={label}
       className={cn(
-        "relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50",
+        "relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
         className,
       )}
       {...props}
     >
-      <Icon className="size-3.5 shrink-0" />
-      <span className="min-w-0 truncate text-left">{label}</span>
+      {icon ?? <Icon className="size-3.5 shrink-0" />}
+      <span
+        data-workspace-collapse-label=""
+        className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+      >
+        {label}
+      </span>
       <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
     </button>
   );
@@ -96,31 +128,48 @@ export const ComposerHostTrigger = forwardRef<
 export function ComposerPermissionPicker({
   label,
   value,
+  harness,
+  selectedValue,
   options,
   disabled = false,
+  loading = false,
+  interactiveWhileLoading = false,
   onSelect,
   testIdPrefix = "composer",
 }: {
   label: string;
   value: string;
+  harness?: string | null;
+  selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  loading?: boolean;
+  interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
   testIdPrefix?: string;
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
+      <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
         <button
           type="button"
-          disabled={disabled}
-          className="flex h-8 w-auto shrink-0 cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7"
+          disabled={disabled || (loading && !interactiveWhileLoading)}
+          aria-busy={loading || undefined}
+          className={cn(
+            "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
+            loading && "disabled:opacity-100",
+          )}
           aria-label={`${label}: ${value}`}
           title={`${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
+          data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span className="whitespace-nowrap text-ui font-normal">{value}</span>
+          <span
+            className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+          >
+            {value}
+          </span>
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
@@ -128,18 +177,27 @@ export function ComposerPermissionPicker({
         align="start"
         className="w-max min-w-[13.75rem] max-w-[calc(100vw-2rem)]"
         data-testid={`${testIdPrefix}-permission-menu`}
+        onCloseAutoFocus={(event) => {
+          // A closing animation must not steal focus from a newly opened menu.
+          if (document.activeElement?.closest('[role="menu"][data-state="open"]')) {
+            event.preventDefault();
+          }
+        }}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
-        {options.map((option) => (
-          <DropdownMenuItem
-            key={option.value}
-            onSelect={() => onSelect(option.value)}
-            data-testid={`${testIdPrefix}-permission-option-${option.value}`}
-            className="whitespace-normal break-words"
-          >
-            {option.label}
-          </DropdownMenuItem>
-        ))}
+        <DropdownMenuRadioGroup value={selectedValue ?? undefined} onValueChange={onSelect}>
+          {options.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.value}
+              value={option.value}
+              data-testid={`${testIdPrefix}-permission-option-${option.value}`}
+              data-permission-concept={permissionModeConcept(harness, option.value)}
+              className="whitespace-normal break-words"
+            >
+              {option.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -170,6 +228,7 @@ export const ComposerHarnessTrigger = forwardRef<
   Omit<ComponentPropsWithoutRef<typeof Button>, "children"> & {
     label: string;
     model: string;
+    loading?: boolean;
     pending?: boolean;
     effort?: string;
     icon?: ReactNode;
@@ -182,6 +241,7 @@ export const ComposerHarnessTrigger = forwardRef<
     model,
     effort,
     icon,
+    loading = false,
     pending = false,
     testIdPrefix = "composer",
     labelClassName,
@@ -197,27 +257,43 @@ export const ComposerHarnessTrigger = forwardRef<
       variant="ghost"
       size="sm"
       aria-label={label}
+      aria-busy={loading || undefined}
       className={cn(
-        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
+        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg border-0 px-2 py-0 text-[13px] leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
         className,
       )}
       {...props}
     >
       {icon}
-      {pending && (
+      {loading && (
+        <Loader2Icon
+          role="status"
+          className="size-3 shrink-0 animate-spin"
+          aria-label="Loading model"
+          data-testid={`${testIdPrefix}-model-loading`}
+        />
+      )}
+      {pending && !loading && (
         <Loader2Icon
           className="size-3 shrink-0 animate-spin"
           aria-label="Model change pending"
           data-testid={`${testIdPrefix}-model-pending`}
         />
       )}
+      {/* Without an icon the text is the only identification, so it stays put
+          when the row collapses. */}
       <span
-        className={cn("inline-flex min-w-0 flex-wrap items-baseline gap-1", labelClassName)}
+        className={cn(
+          "inline-flex min-w-0 flex-nowrap items-baseline gap-1",
+          icon != null && COMPOSER_COLLAPSED_LABEL_CLASS,
+          labelClassName,
+        )}
         data-testid={`${testIdPrefix}-agent-config-value`}
       >
         {model && (
           <span
-            className="min-w-0 whitespace-normal break-words text-left text-ui font-medium text-foreground"
+            className="min-w-0 truncate text-left text-[13px] leading-5 font-medium text-foreground"
+            title={model}
             data-testid={`${testIdPrefix}-agent-model-value`}
           >
             {model}
@@ -225,7 +301,7 @@ export const ComposerHarnessTrigger = forwardRef<
         )}
         {effort && (
           <span
-            className="shrink-0 text-ui font-normal text-muted-foreground"
+            className="shrink-0 text-[13px] leading-5 font-normal text-muted-foreground"
             data-testid={`${testIdPrefix}-agent-effort-value`}
           >
             {effort}

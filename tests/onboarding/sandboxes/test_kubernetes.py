@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shlex
+import subprocess
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import click
@@ -150,6 +154,572 @@ def test_build_job_manifest_clones_multiple_repos_as_parallel_siblings() -> None
     assert script.count("python3 -c") == 1
 
 
+def _run_failed_clone_with_credential_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wire_mutation: str | None = None,
+    cwd: Path | None = None,
+    host_token: str = "test-launch-token-sentinel",
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]], list[str], list[str], Path]:
+    """Run workspace prep with a recording git that rejects the clone."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    argv_log = tmp_path / "git-argv.jsonl"
+    helper_argv_log = tmp_path / "helper-argv.jsonl"
+    config_log = tmp_path / "git-config-snapshots"
+    path_log = tmp_path / "git-config-paths"
+    mode_log = tmp_path / "git-config-modes"
+    for log in (argv_log, helper_argv_log, config_log, path_log, mode_log):
+        log.touch(mode=0o600)
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        + """import json
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1:2] == ["-c"]:
+    mutation = os.environ.get("WIRE_MUTATION")
+    if not mutation:
+        os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+    prefix = "import omnigent.git_credential_github as g; "
+    if mutation == "renamed_installer":
+        prefix += (
+            "del g._install_broker_helper; "
+            "g.configure_clone_credentials=lambda *_args:True; "
+        )
+    elif mutation == "missing_git_config":
+        prefix += "del g._git_config; "
+    elif mutation == "failed_config_write":
+        prefix += "g._git_config=lambda *_args:None; "
+    elif mutation == "failed_reset_write":
+        prefix += (
+            "orig=g._git_config; "
+            "g._git_config=lambda *args:None if args[0]=='--replace-all' else orig(*args); "
+        )
+    elif mutation == "unexpected_none":
+        prefix += "g.configure_clone_credentials=lambda *_args:None; "
+    elif mutation == "truthy_non_bool":
+        prefix += (
+            "configure=g.configure_clone_credentials; "
+            "g.configure_clone_credentials=lambda *args:configure(*args) and 1; "
+        )
+    elif mutation == "disconnected_broker":
+        prefix += "g.configure_clone_credentials=lambda *_args:False; "
+    os.execv(sys.executable, [sys.executable, "-c", prefix + sys.argv[2]])
+with Path(os.environ["HELPER_ARGV_LOG"]).open("a") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+"""
+    )
+    fake_python.chmod(0o755)
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        + """import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+args = sys.argv[1:]
+with Path(os.environ["ARGV_LOG"]).open("a") as handle:
+    handle.write(json.dumps(args) + "\\n")
+if args[:3] == ["config", "--global", "--get-all"]:
+    path = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    key = args[3]
+    values = []
+    for line in path.read_text().splitlines():
+        config_args = json.loads(line)
+        if len(config_args) >= 3 and config_args[1] == key:
+            values.append(config_args[-1])
+    if os.environ.get("WIRE_MUTATION") == "extra_helper":
+        values.append("!unsafe-helper")
+    print("\\n".join(values))
+    raise SystemExit(0 if values else 1)
+if args[:2] == ["config", "--global"]:
+    path = Path(os.environ.get("GIT_CONFIG_GLOBAL", Path(os.environ["HOME"]) / ".gitconfig"))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666)
+    with os.fdopen(fd, "a") as handle:
+        handle.write(json.dumps(args[2:]) + "\\n")
+    with Path(os.environ["CONFIG_LOG"]).open("a") as handle:
+        handle.write(path.read_text())
+    with Path(os.environ["PATH_LOG"]).open("a") as handle:
+        handle.write(str(path) + "\\n")
+    raise SystemExit(0)
+if args and args[0] == "clone":
+    config_path = Path(
+        os.environ.get("GIT_CONFIG_GLOBAL", Path(os.environ["HOME"]) / ".gitconfig")
+    )
+    helper = json.loads(config_path.read_text().splitlines()[-1])[-1]
+    subprocess.run(
+        ["bash", "-c", helper.removeprefix("!") + " get"],
+        input="protocol=https\\nhost=github.com\\n\\n",
+        text=True,
+        check=True,
+    )
+    print("simulated clone failure", file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(128)
+"""
+    )
+    fake_git.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    if wire_mutation == "disconnected_broker":
+        fallback_log = tmp_path / "fallback-used"
+        (home / ".gitconfig").write_text(
+            json.dumps(
+                [
+                    "--add",
+                    "credential.https://github.com.helper",
+                    '!f() { [ "$1" = get ] || return 0; '
+                    '[ -n "$GIT_TOKEN" ] || return 1; '
+                    'printf used > "$FALLBACK_LOG"; }; f',
+                ]
+            )
+            + "\n"
+        )
+        monkeypatch.setenv("FALLBACK_LOG", str(fallback_log))
+        monkeypatch.setenv("GIT_TOKEN", "shared-token-sentinel")
+    workspace = home / "workspace"
+    monkeypatch.setenv("ARGV_LOG", str(argv_log))
+    monkeypatch.setenv("HELPER_ARGV_LOG", str(helper_argv_log))
+    monkeypatch.setenv("CONFIG_LOG", str(config_log))
+    monkeypatch.setenv("PATH_LOG", str(path_log))
+    monkeypatch.setenv("MODE_LOG", str(mode_log))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", host_token)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    if wire_mutation is None:
+        monkeypatch.delenv("WIRE_MUTATION", raising=False)
+    else:
+        monkeypatch.setenv("WIRE_MUTATION", wire_mutation)
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [
+            RepoWorkspace(
+                url="https://github.com/org/private.git", branch=None, repo_name="private"
+            )
+        ],
+        ":",
+        "host-test",
+    )
+    mode_probe = f"""
+mktemp() {{
+  credential_path=$(command mktemp "$@") || return
+  {shlex.quote(sys.executable)} - "$credential_path" "$MODE_LOG" <<'PY'
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+mode = oct(stat.S_IMODE(path.stat().st_mode)) if path.exists() else "missing"
+with Path(sys.argv[2]).open("a") as handle:
+    handle.write(mode + "\\n")
+PY
+  printf '%s\n' "$credential_path"
+}}
+"""
+    result = subprocess.run(
+        ["bash", "-c", "umask 022\n" + mode_probe + command[2]],
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+        cwd=cwd,
+    )
+    argv = [
+        json.loads(line)
+        for log in (argv_log, helper_argv_log)
+        for line in log.read_text().splitlines()
+    ]
+    paths = path_log.read_text().splitlines()
+    modes = mode_log.read_text().splitlines()
+    return result, argv, paths, modes, config_log
+
+
+def test_failed_clone_removes_scoped_credential_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone failure leaves no credential helper configuration behind."""
+    result, _argv, paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch
+    )
+    assert result.returncode != 0
+    assert paths
+    assert all(not Path(path).exists() for path in paths)
+    assert not (tmp_path / "home" / ".gitconfig").exists()
+
+
+def test_clone_credentials_keep_launch_token_out_of_argv_and_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clone helper reads the launch token without persisting or execing it."""
+    _result, argv, _paths, _modes, config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch
+    )
+    token = os.environ["OMNIGENT_HOST_TOKEN"]
+    assert all(token not in argument for call in argv for argument in call)
+    assert token not in config_log.read_text()
+
+
+def test_clone_credential_config_is_private_at_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clone-scoped credential config is private before Git writes it."""
+    _result, _argv, _paths, modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch
+    )
+    assert modes == ["0o600"]
+
+
+@pytest.mark.parametrize(
+    "wire_mutation",
+    [
+        "renamed_installer",
+        "missing_git_config",
+        "failed_config_write",
+        "failed_reset_write",
+        "extra_helper",
+        "unexpected_none",
+        "truthy_non_bool",
+    ],
+)
+def test_credential_wiring_drift_aborts_before_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wire_mutation: str
+) -> None:
+    """Missing private hooks or an unwritable config abort before clone."""
+    result, argv, _paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, wire_mutation=wire_mutation
+    )
+    assert result.returncode != 0
+    assert not any(call and call[0] == "clone" for call in argv)
+
+
+def test_empty_launch_token_aborts_before_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty launch token cannot silently fall back to ambient credentials."""
+    result, argv, _paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, host_token=""
+    )
+    assert result.returncode != 0
+    assert not any(call and call[0] == "clone" for call in argv)
+
+
+def test_disconnected_broker_keeps_ambient_git_token_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disconnected broker leaves the image's shared Git helper active."""
+    result, argv, paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, wire_mutation="disconnected_broker"
+    )
+    assert result.returncode != 0
+    assert any(call and call[0] == "clone" for call in argv)
+    assert paths == []
+    assert (tmp_path / "fallback-used").read_text() == "used"
+
+
+def test_credential_python_ignores_workspace_package_shadow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Credential imports cannot be shadowed by the init container's working directory."""
+    shadow_dir = tmp_path / "shadow"
+    package = shadow_dir / "omnigent"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    marker = tmp_path / "shadow-imported"
+    (package / "git_credential_github.py").write_text(
+        'import os\nfrom pathlib import Path\nPath(os.environ["SHADOW_MARKER"]).touch()\n'
+    )
+    monkeypatch.setenv("SHADOW_MARKER", str(marker))
+
+    _run_failed_clone_with_credential_probe(tmp_path, monkeypatch, cwd=shadow_dir)
+
+    assert not marker.exists()
+
+
+def test_credential_python_ignores_pythonpath_package_shadow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Credential wiring cannot import a package planted on PYTHONPATH."""
+    shadow_dir = tmp_path / "shadow"
+    package = shadow_dir / "omnigent"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    marker = tmp_path / "shadow-imported"
+    (package / "git_credential_github.py").write_text(
+        'import os\nfrom pathlib import Path\nPath(os.environ["SHADOW_MARKER"]).touch()\n'
+    )
+    monkeypatch.setenv("PYTHONPATH", str(shadow_dir))
+    monkeypatch.setenv("SHADOW_MARKER", str(marker))
+
+    _run_failed_clone_with_credential_probe(tmp_path, monkeypatch)
+
+    assert not marker.exists()
+
+
+def _run_workspace_clone(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
+    """Run the real renderer with Git probing intact and clone side effects faked."""
+    target = workspace / "repo"
+    clone_log = workspace.parent / f"{workspace.name}-clone-log"
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")],
+        ":",
+        "host-test",
+    )
+    script = (
+        'python3() { if [ "$1" = "-c" ]; then return 0; fi; command python3 "$@"; }\n'
+        "git() {\n"
+        '  if [ "$1" = "-C" ]; then command git "$@"; return; fi\n'
+        '  printf "%s\\n" "$*" >> "$CLONE_LOG"\n'
+        '  clone_dir="${@: -1}"\n'
+        '  mkdir -p "$clone_dir/.git"\n'
+        '  printf "ref: refs/heads/main\\n" > "$clone_dir/.git/HEAD"\n'
+        "}\n" + command[2]
+    )
+    monkeypatch.setenv("CLONE_LOG", str(clone_log))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=os.environ.copy()
+    )
+    clones = clone_log.read_text().splitlines() if clone_log.exists() else []
+    return result, target, clones
+
+
+def _workspace_snapshot(workspace: Path) -> dict[str, tuple[str, bytes | str]]:
+    """Capture files and links for byte-exact refusal and preservation checks."""
+    snapshot = {}
+    for path in workspace.rglob("*"):
+        relative = str(path.relative_to(workspace))
+        if path.is_symlink():
+            snapshot[relative] = ("link", os.readlink(path))
+            resolved = path.resolve()
+            if resolved.is_dir():
+                for linked_path in resolved.rglob("*"):
+                    linked_relative = f"{relative}=>{linked_path.relative_to(resolved)}"
+                    if linked_path.is_symlink():
+                        snapshot[linked_relative] = ("link", os.readlink(linked_path))
+                    elif linked_path.is_file():
+                        snapshot[linked_relative] = ("file", linked_path.read_bytes())
+        elif path.is_file():
+            snapshot[relative] = ("file", path.read_bytes())
+    return snapshot
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ("git_directory", "preserve"),
+        ("gitfile", "preserve"),
+        ("real_worktree", "refuse"),
+        ("separate_git_dir", "refuse"),
+        ("symlink_checkout", "preserve"),
+        ("missing_head", "refuse"),
+        ("ancestor_checkout", "clone"),
+        ("git_dir", "clone"),
+        ("git_dir_work_tree", "clone"),
+        ("symlink_empty", "refuse"),
+        ("plain_empty", "clone"),
+        ("bare", "refuse"),
+        ("ancestor_core_worktree", "clone"),
+        ("gitfile_to_ancestor_core_worktree", "refuse"),
+        ("gitfile_to_ancestor", "refuse"),
+        ("ambient_work_tree_malformed", "refuse"),
+    ],
+)
+def test_workspace_prep_classifies_checkout_at_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+    expected: str,
+) -> None:
+    """Only a target-local checkout is preserved; occupied unsafe targets are refused."""
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    monkeypatch.delenv("GIT_WORK_TREE", raising=False)
+    workspace = tmp_path / "workspace"
+    if shape in {
+        "ancestor_checkout",
+        "ancestor_core_worktree",
+        "gitfile_to_ancestor",
+        "gitfile_to_ancestor_core_worktree",
+    }:
+        ancestor = tmp_path / "ancestor"
+        subprocess.run(["git", "init", "-q", str(ancestor)], check=True)
+        workspace = ancestor / "workspace"
+    target = workspace / "repo"
+
+    if shape == "git_directory":
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+    elif shape == "gitfile":
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+        separate_git_dir = target / ".git-data"
+        (target / ".git").rename(separate_git_dir)
+        (target / ".git").write_text(f"gitdir: {separate_git_dir}\n")
+    elif shape == "real_worktree":
+        main_checkout = tmp_path / "main-checkout"
+        subprocess.run(["git", "init", "-q", str(main_checkout)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(main_checkout),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "Initial commit",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(main_checkout), "worktree", "add", "-q", "-b", "test", str(target)],
+            check=True,
+        )
+    elif shape == "separate_git_dir":
+        separate_git_dir = tmp_path / "explicit-separate.git"
+        subprocess.run(
+            ["git", "init", "-q", "--separate-git-dir", str(separate_git_dir), str(target)],
+            check=True,
+        )
+    elif shape == "symlink_checkout":
+        checkout = tmp_path / "checkout"
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        workspace.mkdir(parents=True)
+        target.symlink_to(checkout, target_is_directory=True)
+    elif shape == "missing_head":
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+        (target / ".git" / "HEAD").unlink()
+        (target / "keep.txt").write_text("preserve me\n")
+    elif shape in {"gitfile_to_ancestor", "gitfile_to_ancestor_core_worktree"}:
+        target.mkdir(parents=True)
+        if shape == "gitfile_to_ancestor_core_worktree":
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(tmp_path / "ancestor"),
+                    "config",
+                    "core.worktree",
+                    str(target),
+                ],
+                check=True,
+            )
+        (target / ".git").write_text(f"gitdir: {tmp_path / 'ancestor' / '.git'}\n")
+        (target / "keep.txt").write_text("preserve me\n")
+    elif shape in {"ancestor_checkout", "plain_empty", "ancestor_core_worktree"}:
+        target.mkdir(parents=True)
+        if shape == "ancestor_core_worktree":
+            subprocess.run(
+                ["git", "-C", str(tmp_path / "ancestor"), "config", "core.worktree", str(target)],
+                check=True,
+            )
+    elif shape in {"git_dir", "git_dir_work_tree"}:
+        target.mkdir(parents=True)
+        ambient = tmp_path / "ambient"
+        subprocess.run(["git", "init", "-q", str(ambient)], check=True)
+        monkeypatch.setenv("GIT_DIR", str(ambient / ".git"))
+        if shape == "git_dir_work_tree":
+            monkeypatch.setenv("GIT_WORK_TREE", str(target))
+    elif shape == "ambient_work_tree_malformed":
+        (target / ".git").mkdir(parents=True)
+        (target / ".git" / "config").write_text("incomplete repository\n")
+        (target / "keep.txt").write_text("preserve me\n")
+        ambient_git_dir = target / ".ambient-git"
+        subprocess.run(["git", "init", "--bare", "-q", str(ambient_git_dir)], check=True)
+        monkeypatch.setenv("GIT_DIR", str(ambient_git_dir))
+        monkeypatch.setenv("GIT_WORK_TREE", str(target))
+    elif shape == "symlink_empty":
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        workspace.mkdir(parents=True)
+        target.symlink_to(empty, target_is_directory=True)
+    elif shape == "bare":
+        subprocess.run(["git", "init", "--bare", "-q", str(target)], check=True)
+
+    before = _workspace_snapshot(workspace)
+    result, target, clones = _run_workspace_clone(workspace, monkeypatch)
+
+    if expected == "clone":
+        assert result.returncode == 0, result.stderr
+        assert len(clones) == 1
+        assert (target / ".git" / "HEAD").read_text() == "ref: refs/heads/main\n"
+    elif expected == "preserve":
+        assert result.returncode == 0, result.stderr
+        assert clones == []
+        assert _workspace_snapshot(workspace) == before
+    else:
+        assert result.returncode != 0
+        assert "refusing to overwrite" in result.stderr
+        assert clones == []
+        assert _workspace_snapshot(workspace) == before
+
+
+def test_workspace_prep_refuses_malformed_directory_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed directory-shaped Git checkout is refused without edits."""
+    workspace = tmp_path / "workspace"
+    clone_dir = workspace / "repo"
+    git_dir = clone_dir / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("malformed head\n")
+    (clone_dir / "keep.txt").write_text("preserve me\n")
+    before = {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")],
+        ":",
+        "host-test",
+    )
+    result = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+    assert result.returncode != 0
+    assert "refusing to overwrite" in result.stderr
+    assert {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()} == before
+
+
+def test_workspace_prep_refuses_concurrent_target_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writer populating the destination during clone makes placement fail."""
+    workspace = tmp_path / "workspace"
+    target = workspace / "repo"
+    monkeypatch.setenv("RACE_TARGET", str(target))
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")],
+        ":",
+        "host-test",
+    )
+    script = (
+        'python3() { if [ "$1" = "-c" ]; then return 0; fi; command python3 "$@"; }\n'
+        "git() {\n"
+        '  if [ "$1" = "-C" ]; then return 128; fi\n'
+        '  clone_dir="${@: -1}"\n'
+        '  mkdir -p "$clone_dir/.git" "$RACE_TARGET/.git"\n'
+        '  printf "ref: refs/heads/main\\n" > "$clone_dir/.git/HEAD"\n'
+        '  printf "foreign\\n" > "$RACE_TARGET/.git/HEAD"\n'
+        "}\n" + command[2]
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert (target / ".git" / "HEAD").read_text() == "foreign\n"
+    assert not (target / "clone").exists()
+
+
 def test_build_job_manifest_disambiguates_same_named_repos() -> None:
     """Two repos with the same last-segment name clone into owner-qualified dirs,
     not one colliding directory that would fail the concurrent clone."""
@@ -164,6 +734,36 @@ def test_build_job_manifest_disambiguates_same_named_repos() -> None:
     assert "https://github.com/org-a/api /home/omnigent/workspace/org-a__api" in script
     assert "https://github.com/org-b/api /home/omnigent/workspace/org-b__api" in script
     assert "workspace/api " not in script  # no plain colliding dir
+
+
+def test_build_job_manifest_staging_never_collides_with_sibling_destination() -> None:
+    """Repo ``foo`` must not stage through ``foo.tmp`` when a sibling repo is
+    literally named ``foo.tmp`` — the staging-cleanup branch would refuse the
+    launch against that sibling's checkout, or remove it outright if it carried
+    a root-level ownership marker."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/foo.git", branch=None, repo_name="foo"),
+            RepoWorkspace(
+                url="https://github.com/org/foo.tmp.git", branch=None, repo_name="foo.tmp"
+            ),
+        ],
+    )
+    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    # foo stages through the suffixed name, not the sibling's destination.
+    assert "mkdir -- /home/omnigent/workspace/foo.tmp2\n" in script
+    assert (
+        "replace_empty_dir /home/omnigent/workspace/foo.tmp2/clone "
+        "/home/omnigent/workspace/foo " in script
+    )
+    # No cleanup fragment ever targets the sibling's checkout directory.
+    assert "rm -rf -- /home/omnigent/workspace/foo.tmp\n" not in script
+    # The sibling still clones into its own destination via its own staging.
+    assert (
+        "replace_empty_dir /home/omnigent/workspace/foo.tmp.tmp/clone "
+        "/home/omnigent/workspace/foo.tmp " in script
+    )
 
 
 def test_build_job_manifest_without_repo_has_no_clone() -> None:
@@ -617,6 +1217,7 @@ def test_render_workspace_prep_command(
     assert ("--branch release-1.2 --single-branch" in script) is expect_branch
     # The per-user broker is wired (connected-gated at runtime) only when cloning.
     assert ("configure_clone_credentials" in script) is expect_clone
+    assert script.count("python3 -c") == (1 if expect_clone else 0)
 
 
 def test_new_pod_name_and_token_secret_name() -> None:
