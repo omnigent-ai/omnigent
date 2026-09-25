@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import shutil
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -407,6 +408,56 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_executor_error_logs_structured_origin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The generic RuntimeError wrapper retains the executor and turn that produced it."""
+    import asyncio
+    from unittest.mock import Mock
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="startup path missing", retryable=False, preserve_session=True)]
+    )
+    adapter = ExecutorAdapter(executor_factory=Mock(return_value=executor))
+    request = CreateResponseRequest(model="jcode", input="hello")
+    ctx = TurnContext(
+        response_id="resp_diagnostic",
+        session_id="session_diagnostic",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+
+    with (
+        caplog.at_level(
+            logging.ERROR,
+            logger="omnigent.runtime.harnesses._executor_adapter",
+        ),
+        pytest.raises(RuntimeError, match="startup path missing"),
+    ):
+        await adapter.run_turn(request, ctx)
+
+    record = next(
+        record for record in caplog.records if record.event_name == "inner_executor_error"
+    )
+    assert record.session_id == "session_diagnostic"
+    assert record.attributes == {
+        "response_id": "resp_diagnostic",
+        "agent": "jcode",
+        "executor_type": "MockExecutor",
+        "retryable": False,
+        "preserve_session": True,
+        "has_usage": False,
+        "wrapper_error_code": "RuntimeError",
+    }
 
 
 @pytest.mark.asyncio

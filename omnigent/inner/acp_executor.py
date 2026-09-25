@@ -53,12 +53,14 @@ import math
 import os
 import secrets
 import shlex
+import shutil
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
@@ -508,22 +510,33 @@ class AcpExecutor(Executor):
         self._image_supported = False
         self._authenticated = False
         self._auth_advertisement = {}
-        env = self._build_spawn_env()
-        launch_path, argv = self._sandbox_launch(tuple(env.keys()))
-        _STREAM_LIMIT = 16 * 1024 * 1024
-        self._proc = await asyncio.create_subprocess_exec(
-            launch_path,
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=self._cwd,
-            limit=_STREAM_LIMIT,
-            # Own session/group: the sandbox launcher forks the real agent,
-            # and without a group boundary teardown reaches only the wrapper.
-            **_proc.spawn_kwargs(),
-        )
+        launch_path = self._argv[0]
+        env: dict[str, str] | None = None
+        try:
+            env = self._build_spawn_env()
+            launch_path, argv = self._sandbox_launch(tuple(env.keys()))
+            _STREAM_LIMIT = 16 * 1024 * 1024
+            self._proc = await asyncio.create_subprocess_exec(
+                launch_path,
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=self._cwd,
+                limit=_STREAM_LIMIT,
+                # Own session/group: the sandbox launcher forks the real agent,
+                # and without a group boundary teardown reaches only the wrapper.
+                **_proc.spawn_kwargs(),
+            )
+        except Exception as exc:
+            self._log_startup_failure(
+                exc,
+                phase="process_start",
+                launch_path=launch_path,
+                spawn_env=env,
+            )
+            raise
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
 
@@ -575,6 +588,46 @@ class AcpExecutor(Executor):
                 exc,
             )
             return binary, rest
+
+    def _log_startup_failure(
+        self,
+        exc: BaseException,
+        *,
+        phase: str,
+        launch_path: str | None = None,
+        spawn_env: dict[str, str] | None = None,
+    ) -> None:
+        """Log structured ACP startup context while the exception is still available."""
+        path = spawn_env.get("PATH") if spawn_env is not None else None
+        extra = debug_event(
+            "acp_startup_failed",
+            agent=self._config.name,
+            startup_phase=phase,
+            command=self._argv[0],
+            resolved_command=shutil.which(self._argv[0], path=path),
+            cwd=self._cwd,
+            cwd_exists=os.path.isdir(self._cwd),
+            launch_path=launch_path,
+            resolved_launch_path=(
+                shutil.which(launch_path, path=path) if launch_path is not None else None
+            ),
+            process_started=self._proc is not None,
+        )
+        attributes = extra["attributes"]
+        assert isinstance(attributes, dict)
+        if isinstance(exc, OSError):
+            attributes.update(
+                errno=exc.errno,
+                missing_filename=exc.filename,
+                secondary_filename=exc.filename2,
+            )
+        logger.error(
+            "ACP agent %s startup failed during %s",
+            self._config.name,
+            phase,
+            exc_info=exc,
+            extra=extra,
+        )
 
     def _startup_error_message(self, exc: BaseException) -> str:
         """Describe a handshake failure, quoting the agent's own stderr.
@@ -1742,12 +1795,19 @@ class AcpExecutor(Executor):
         # to back the MCP relay. Storing them when the relay is disabled would
         # let stale data accidentally reach the session/prompt path (#4917).
         self._omnigent_tools = (tools or []) if self._config.omnigent_mcp else []
-        try:
-            if self._proc is None or self._proc.returncode is not None:
+        if self._proc is None or self._proc.returncode is not None:
+            try:
                 await self._start_process()
+            except Exception as exc:  # noqa: BLE001
+                yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
+                return
+        startup_phase = "initialize"
+        try:
             await self._ensure_initialized()
+            startup_phase = "session_new"
             session_id = await self._ensure_session()
         except Exception as exc:  # noqa: BLE001
+            self._log_startup_failure(exc, phase=startup_phase)
             yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
             return
 

@@ -15,11 +15,14 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import os
 import shlex
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -73,6 +76,66 @@ def test_handles_tools_internally_and_streaming() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert ex.handles_tools_internally() is True
     assert ex.supports_streaming() is True
+
+
+@pytest.mark.asyncio
+async def test_process_start_failure_logs_path_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ENOENT logs the missing path plus the command and cwd used for the spawn."""
+    missing = FileNotFoundError(errno.ENOENT, "No such file or directory", "/missing/jcode")
+    ex = AcpExecutor(
+        AcpAgentConfig(command="jcode acp", name="Jcode"),
+        cwd="/missing/worktree",
+    )
+
+    fake_asyncio = SimpleNamespace(
+        create_subprocess_exec=AsyncMock(side_effect=missing),
+        subprocess=asyncio.subprocess,
+    )
+    with (
+        caplog.at_level(logging.ERROR, logger="omnigent.inner.acp_executor"),
+        patch.object(acp_executor_module, "asyncio", fake_asyncio),
+    ):
+        events = [event async for event in ex.run_turn([], [], "")]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    record = next(record for record in caplog.records if record.event_name == "acp_startup_failed")
+    assert record.exc_info is not None
+    assert record.attributes["agent"] == "Jcode"
+    assert record.attributes["startup_phase"] == "process_start"
+    assert record.attributes["command"] == "jcode"
+    assert record.attributes["launch_path"] == "jcode"
+    assert record.attributes["cwd"] == "/missing/worktree"
+    assert record.attributes["cwd_exists"] is False
+    assert record.attributes["process_started"] is False
+    assert record.attributes["errno"] == errno.ENOENT
+    assert record.attributes["missing_filename"] == "/missing/jcode"
+
+
+@pytest.mark.asyncio
+async def test_initialize_failure_logs_startup_phase(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Failures after spawn identify the ACP handshake phase and live process."""
+    ex = AcpExecutor(AcpAgentConfig(command="grok agent stdio", name="Grok"))
+    ex._proc = Mock(returncode=None, pid=123)
+    missing = FileNotFoundError(errno.ENOENT, "No such file or directory", "/missing/config")
+
+    with (
+        caplog.at_level(logging.ERROR, logger="omnigent.inner.acp_executor"),
+        patch.object(ex, "_ensure_initialized", new=AsyncMock(side_effect=missing)),
+    ):
+        events = [event async for event in ex.run_turn([], [], "")]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    record = next(record for record in caplog.records if record.event_name == "acp_startup_failed")
+    assert record.attributes["startup_phase"] == "initialize"
+    assert record.attributes["command"] == "grok"
+    assert record.attributes["process_started"] is True
+    assert record.attributes["missing_filename"] == "/missing/config"
 
 
 # ---------------------------------------------------------------------------

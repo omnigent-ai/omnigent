@@ -21,7 +21,7 @@ from typing import Any
 
 from fastapi import Response
 
-from omnigent.debug_logging import phase_scope
+from omnigent.debug_logging import debug_event, phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.inner.executor import (
     CompactionComplete,
@@ -335,6 +335,21 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
+                        _logger.error(
+                            "inner executor reported failure: %s",
+                            detail,
+                            extra=debug_event(
+                                "inner_executor_error",
+                                session_id=turn_session_id,
+                                response_id=ctx.response_id,
+                                agent=request.model,
+                                executor_type=type(executor).__name__,
+                                retryable=event.retryable,
+                                preserve_session=event.preserve_session,
+                                has_usage=event.usage is not None,
+                                wrapper_error_code="RuntimeError",
+                            ),
+                        )
                         raise RuntimeError(f"inner executor error: {detail}")
         except ElicitationDeclinedError:
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
