@@ -414,11 +414,11 @@ overrides this auto-selection.
 | `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Cloudflare Access, Tailscale Funnel, …) that injects an identity header | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Reads `X-Forwarded-Email` by default; set `OMNIGENT_AUTH_HEADER` for proxies that use another name (e.g. `Cf-Access-Authenticated-User-Email`), and `OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:` for Google IAP. Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
 
 > [!NOTE]
-> **Managed sandboxes need `header`/`oidc` or single-user auth.** Each session's
-> runner dials back with the *user's* identity, which the built-in `accounts` mode
-> (the deploy default above) can't supply over the runner WebSocket — it returns
-> `403` even though the host connects. Framework-level; applies to every sandbox
-> provider (Modal / Daytona / Islo / Kubernetes / …).
+> **Managed sandboxes support built-in accounts.** Hosts use a per-launch token.
+> Runners use owner-bound credentials issued by the server. With header or
+> OIDC-proxy authentication, the proxy must allow host and runner connections through to
+> Omnigent, including WebSocket upgrades. See
+> [managed sandbox authentication](cwsandbox/README.md#managed-hosts-and-server-auth).
 
 ### Browser origin allowlist
 
