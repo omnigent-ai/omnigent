@@ -179,6 +179,19 @@ def write_catalog(harness: str, fingerprint: str, rows: list[dict[str, Any]]) ->
 _inflight: dict[tuple[str, str], asyncio.Task[list[dict[str, Any]] | None]] = {}
 
 
+async def shutdown_catalog_probes() -> None:
+    """Cancel shared probes after consumers stop, before event-loop shutdown.
+
+    Drain them while asyncio's subprocess plumbing can still run; cancelling
+    every loop task at once can interrupt subprocess cleanup during spawn.
+    """
+    tasks = list(_inflight.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _inflight.clear()
+
+
 async def ensure_catalog(
     harness: str,
     fingerprint: str,
@@ -187,10 +200,10 @@ async def ensure_catalog(
     """Store-first catalog access with a single probe in flight per key.
 
     A hit serves immediately; a miss runs *resolve* once (concurrent
-    callers join it), persists a non-empty answer, and returns it. A hit
-    older than :data:`CATALOG_STALE_AFTER_S` still serves immediately but
-    kicks *resolve* in the background so the store converges — the probe's
-    own internal budgets bound it, so nothing here waits on it.
+    callers join it), persists a successful answer even when empty, and
+    returns it. A hit older than :data:`CATALOG_STALE_AFTER_S` still serves
+    immediately but kicks *resolve* in the background so the store converges.
+    The probe's own budgets bound the background work.
 
     :param harness: Canonical harness name.
     :param fingerprint: The launch-config fingerprint.
@@ -211,7 +224,7 @@ async def ensure_catalog(
                 rows = await resolve()
             finally:
                 _inflight.pop(key, None)
-            if rows:
+            if rows is not None:
                 write_catalog(harness, fingerprint, rows)
             return rows
 
@@ -243,7 +256,7 @@ def _refresh_in_background(
     async def _run() -> list[dict[str, Any]] | None:
         try:
             rows = await resolve()
-            if rows:
+            if rows is not None:
                 write_catalog(harness, fingerprint, rows)
             return rows
         except Exception:  # noqa: BLE001 — stale rows keep serving
@@ -316,5 +329,6 @@ __all__ = [
     "fingerprint_of",
     "read_catalog",
     "reprobe_catalog",
+    "shutdown_catalog_probes",
     "write_catalog",
 ]

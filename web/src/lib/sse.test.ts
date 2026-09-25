@@ -83,6 +83,29 @@ describe("withStallGuard", () => {
   });
 });
 
+describe("parseEvent — response.failed", () => {
+  const response = {
+    id: "resp_failed",
+    status: "failed",
+    model: "polly",
+    error: { code: "ValueError", message: "The harness failed." },
+  };
+
+  it("preserves the failure source alongside the response's agent identity", () => {
+    expect(parseEvent("response.failed", { source: "harness", response })).toMatchObject({
+      type: "response_failed",
+      source: "harness",
+      response,
+    });
+  });
+
+  it("does not invent a source when the server omits it", () => {
+    const event = parseEvent("response.failed", { response });
+    expect(event).toMatchObject({ type: "response_failed", response });
+    expect(event).not.toHaveProperty("source");
+  });
+});
+
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {
     // Ordinary in-process task streaming: only `delta` is present, and

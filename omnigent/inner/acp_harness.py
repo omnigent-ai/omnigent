@@ -22,6 +22,15 @@ Env vars read at startup:
 - ``HARNESS_ACP_NAME``: display label for logs / elicitation cards.
 - ``HARNESS_ACP_MODEL``: optional model id (only sent when the agent is
   configured to accept one in ``session/new``).
+- ``HARNESS_ACP_DEFAULT_MODEL``: model restored when an override is cleared.
+  Empty uses the ACP session's initial model; unset uses the launch model.
+- ``HARNESS_ACP_MODEL_LIST``: comma-separated curated model ids from the agent's
+  explicitly bound provider. When set, warm model switches to ids outside
+  the list are withheld; unset means any model the agent accepts.
+- ``HARNESS_ACP_ENV_UNSET``: comma-separated environment variable *names* to
+  strip from the spawn env handed to the vendor CLI (operator-declared, e.g.
+  dummy tokens for other providers that would activate the CLI's built-ins).
+  Names only — unset means no scrubbing.
 - ``HARNESS_ACP_SESSION_ID_MODE``: ``server`` (default) or ``client``.
 - ``HARNESS_ACP_SEND_MODEL``: ``"1"`` to send the model in ``session/new``.
 - ``HARNESS_ACP_OMNIGENT_MCP``: ``"0"`` to disable Omnigent's MCP relay;
@@ -57,6 +66,7 @@ from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -64,6 +74,9 @@ _logger = logging.getLogger(__name__)
 _ENV_COMMAND = "HARNESS_ACP_COMMAND"
 _ENV_NAME = "HARNESS_ACP_NAME"
 _ENV_MODEL = "HARNESS_ACP_MODEL"
+_ENV_DEFAULT_MODEL = "HARNESS_ACP_DEFAULT_MODEL"
+_ENV_MODEL_LIST = "HARNESS_ACP_MODEL_LIST"
+_ENV_ENV_UNSET = "HARNESS_ACP_ENV_UNSET"
 _ENV_SESSION_ID_MODE = "HARNESS_ACP_SESSION_ID_MODE"
 _ENV_SEND_MODEL = "HARNESS_ACP_SEND_MODEL"
 _ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
@@ -92,6 +105,17 @@ def _env_passthrough_names() -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _csv_names(env_name: str) -> tuple[str, ...]:
+    """Parse a comma-separated, deduplicated name list from the env."""
+    raw = os.environ.get(env_name, "")
+    names: list[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
 def _resolve_os_env() -> OSEnvSpec:
     """Resolve the inner-executor :class:`OSEnvSpec` from env config.
 
@@ -110,7 +134,7 @@ def _resolve_os_env() -> OSEnvSpec:
         if isinstance(payload, dict):
             sandbox_payload = payload.get("sandbox")
             sandbox = (
-                OSEnvSandboxSpec(**sandbox_payload) if isinstance(sandbox_payload, dict) else None
+                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
             )
             return OSEnvSpec(
                 type=str(payload.get("type", "caller_process")),
@@ -151,10 +175,13 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
         command=command,
         name=name,
         model=model,
+        default_model=os.environ.get(_ENV_DEFAULT_MODEL),
         session_id_mode=session_id_mode,
         send_model_in_session_new=send_model,
         omnigent_mcp=omnigent_mcp,
         env_passthrough=_env_passthrough_names(),
+        available_models=_csv_names(_ENV_MODEL_LIST),
+        env_unset=_csv_names(_ENV_ENV_UNSET),
         permission_mode=permission_mode,
         inject_system_prompt=inject_system_prompt,
     )
@@ -170,7 +197,7 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
 
     :param extension: Vendor behavior for the agent this process drives. A
         vendor's own wrap calls this with its extension (see
-        :mod:`omnigent.inner.devin.harness`); the runner calls it with no
+        a vendor wrap); the runner calls it with no
         argument for ``harness: acp`` and for a builtin ACP CLI row that declares
         no vendor behavior.
     :returns: The app the runner serves.

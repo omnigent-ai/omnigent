@@ -1002,6 +1002,7 @@ def test_token_authority_table(
     provider = _make_oidc_provider()
     token = token_factory()
     assert provider._check_cookie(_req("/v1/sessions", bearer=token)) == allowlisted, shape
+    assert provider._check_cookie(_req("/v1/skills", bearer=token)) == allowlisted, shape
     assert provider._check_cookie(_req("/auth/users", bearer=token)) == non_allowlisted, shape
 
 

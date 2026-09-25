@@ -34,6 +34,7 @@ from omnigent.runtime import (
     set_runner_router,
     set_runner_ws_factory,
 )
+from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -43,6 +44,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.ws_common import WS_CLOSE_WRONG_REPLICA
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -519,6 +521,30 @@ async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:
 
     assert exc_info.value.code == 1008
     assert interactive_factory.calls == []
+
+
+async def test_attach_terminal_wrong_replica_closes_with_retry_code(app: FastAPI) -> None:
+    """
+    A wrong-replica routing miss closes with the retryable code so the browser
+    re-dials without its slice key instead of reporting the runner offline.
+
+    :param app: The FastAPI app fixture.
+    """
+
+    def factory(path: str):
+        raise WrongReplicaWSError(f"tunnel for {path} lives on another replica")
+
+    set_runner_ws_factory(factory)
+
+    with (
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_pi_main/attach"
+        ) as ws,
+        pytest.raises(WebSocketDisconnect) as exc_info,
+    ):
+        ws.receive_bytes()
+
+    assert exc_info.value.code == WS_CLOSE_WRONG_REPLICA
 
 
 async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> None:

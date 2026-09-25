@@ -159,7 +159,7 @@ def _drive_self_termination(
         record.write_text(json.dumps(payload))
 
     # Clean return from the run loop surfaces the local-mode stop prompt.
-    child.expect(_PROMPT_MARKER, timeout=_SELF_TERMINATE_TIMEOUT)
+    child.expect_exact(_PROMPT_MARKER, timeout=_SELF_TERMINATE_TIMEOUT)
     child.send("n\r")
     child.expect(_LEFT_RUNNING_MARKER, timeout=_PROMPT_TIMEOUT)
     child.expect(pexpect.EOF, timeout=_EXIT_TIMEOUT)

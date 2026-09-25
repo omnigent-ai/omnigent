@@ -319,3 +319,193 @@ async def test_drain_session_streams_enqueues_done_sentinel() -> None:
     finally:
         _session_event_queues_ref.pop("conv_drain_a", None)
         _session_event_queues_ref.pop("conv_drain_b", None)
+
+
+async def _native_app_with_session(conv_id: str, harness: str = "pi-native") -> FastAPI:
+    """Build a runner app whose spec resolves to *harness* for *conv_id*.
+
+    :param conv_id: Session id the caller will create, e.g. ``"conv_native"``.
+    :param harness: Executor harness the spec declares, e.g. ``"pi-native"``.
+    :returns: Fresh FastAPI runner app.
+    """
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _ScriptedHarnessClient,
+        _spec_resolver_returning,
+        _sse,
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="native-idle-test",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": f"resp_{conv_id}"}}),
+            _sse({"type": "response.completed", "response": {"id": f"resp_{conv_id}"}}),
+        ]
+    )
+    return create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+
+async def _post_status(client: Any, conv_id: str, status: str) -> None:
+    """POST one forwarder-style ``external_session_status`` edge.
+
+    :param client: Runner test client.
+    :param conv_id: Session id, e.g. ``"conv_native"``.
+    :param status: Native status, e.g. ``"running"`` or ``"idle"``.
+    :returns: None.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{conv_id}/events",
+        json={"type": "external_session_status", "data": {"status": status}},
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "waiting"])
+async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: str) -> None:
+    """A native terminal's in-flight status holds the watchdog until it settles.
+
+    Native delivery leaves ``active_turns`` once the prompt is typed, so the
+    terminal's ``running`` / ``waiting`` edge is the only sign of live work.
+
+    :param status: In-flight native status to exercise.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_in_flight"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, status)
+        assert conv_id not in app.state.active_turns
+        assert app.state.has_active_work() is True
+
+        async def _release() -> None:
+            await _post_status(client, conv_id, "idle")
+
+        await _assert_monitor_blocked_then_shuts_down(
+            has_active_work=app.state.has_active_work,
+            release=_release,
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_failed_status_releases_idle_pin() -> None:
+    """A native ``failed`` edge settles the turn for the watchdog."""
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_failed"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is True
+        await _post_status(client, conv_id, "failed")
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
+    """A follow-up bound mid-turn does not strand the pin on the pane's one idle edge.
+
+    The pane watcher dedups edges, so a prompt queued while the terminal is
+    already running produces no fresh ``running`` — only the final ``idle``.
+    """
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_follow_up"
+    app = await _native_app_with_session(conv_id)
+    publish_pane_status = app.state.session_resource_registry._session_status_publisher
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        publish_pane_status(conv_id, "running", None)
+        assert app.state.has_active_work() is True
+        app.state.begin_turn_slot(conv_id)
+        app.state.active_turns.pop(conv_id, None)
+        publish_pane_status(conv_id, "idle", None)
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_required_native_terminal_exit_releases_idle_pin() -> None:
+    """A required terminal that dies after delivery cannot leave the runner pinned."""
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_exit"
+    app = await _native_app_with_session(conv_id)
+    registry = app.state.session_resource_registry
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is True
+        registry._terminal_exit_publisher(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal:pi:main",
+                terminal_name="pi",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                session_was_idle=True,
+            )
+        )
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_deleted_native_session_late_status_does_not_pin() -> None:
+    """A status callback that lands after DELETE cannot keep the runner alive."""
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_deleted"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "running")
+        deleted = await client.delete(f"/v1/sessions/{conv_id}")
+        assert deleted.status_code == 200, deleted.text
+        assert app.state.has_active_work() is False
+        await _post_status(client, conv_id, "running")
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
+    """An SDK harness's published status is covered by ``active_turns`` alone."""
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_sdk_status"
+    app = await _native_app_with_session(conv_id, harness="openai-agents")
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-model",
+                "agent_id": "agent_idle_test",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        for _ in range(100):
+            if conv_id not in app.state.active_turns:
+                break
+            await asyncio.sleep(0.01)
+        app.state.native_pane_status[conv_id] = "running"
+        assert app.state.has_active_work() is False

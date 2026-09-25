@@ -1,6 +1,22 @@
 import { useEffect, useState } from "react";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 
+/** Whether the initial viewer-identity request has settled, including failure. */
+export function useIdentityReady(): boolean {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const settle = () => {
+      if (!cancelled) setReady(true);
+    };
+    void resolveIdentity().then(settle, settle);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return ready;
+}
+
 /**
  * The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
  * (NOT `getCurrentAuthorId`): ownership compares against a session's `owner`
