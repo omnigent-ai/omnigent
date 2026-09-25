@@ -302,6 +302,7 @@ _SESSION_QUERY_TOOLS = frozenset(
         "sys_session_close",
         "sys_session_get_info",
         "sys_session_share",
+        "sys_session_respond_elicitation",
     }
 )
 
@@ -4803,6 +4804,8 @@ async def _execute_session_query_tool(
         return await _session_get_info_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_share":
         return await _session_share_via_rest(args, conversation_id, server_client, agent_spec)
+    if tool_name == "sys_session_respond_elicitation":
+        return await _session_respond_elicitation_via_rest(args, conversation_id, server_client)
     return await _session_close_via_rest(args, conversation_id, server_client)
 
 
@@ -6260,6 +6263,134 @@ async def _session_close_via_rest(
             "conversation_id": target_id,
             "agent": parsed.agent,
             "title": parsed.title,
+        }
+    )
+
+
+async def _session_respond_elicitation_via_rest(
+    args: _JsonObject,
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """
+    Answer a direct child's approval prompt over the server's resolve route.
+
+    Mirrors :class:`SysSessionRespondElicitationTool`. The elicitation index
+    and the resolve endpoint both live on the Omnigent server, so the runner
+    verifies the target against ``GET /v1/sessions/{id}`` and then POSTs the
+    MCP-shaped verdict to
+    ``/v1/sessions/{id}/elicitations/{eid}/resolve`` — the same route the web
+    client uses, so resolution semantics are identical.
+
+    Two gates the route itself cannot apply. The target must be a DIRECT
+    child of the caller: the route only requires edit access, which would let
+    an orchestrator answer prompts in unrelated sessions it happens to share.
+    And the elicitation must be one the target is actually parked on, so a
+    caller cannot pair a borrowed id with a session it does control.
+
+    :param args: Parsed tool arguments; requires ``session_id``,
+        ``elicitation_id`` and ``action``, with optional form ``content``.
+    :param conversation_id: The calling session's own id, e.g.
+        ``"conv_caller"`` — the parent the target is checked against.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON ``{"resolved": true, ...}`` on success; otherwise a JSON
+        error object: ``session_not_found``, ``access_denied``,
+        ``session_not_a_child``, or ``elicitation_not_found`` when the id is
+        unknown to the target or was already answered.
+    """
+    tool = "sys_session_respond_elicitation"
+    target_id = args.get("session_id")
+    if not isinstance(target_id, str) or not target_id:
+        return json.dumps({"error": f"{tool} requires a non-empty 'session_id' string"})
+    elicitation_id = args.get("elicitation_id")
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return json.dumps({"error": f"{tool} requires a non-empty 'elicitation_id' string"})
+    action = args.get("action")
+    if action not in ("accept", "decline", "cancel"):
+        return json.dumps({"error": f"{tool} requires 'action' to be accept, decline or cancel"})
+    content = args.get("content")
+    if content is not None and not isinstance(content, dict):
+        return json.dumps({"error": f"{tool} requires 'content' to be an object when provided"})
+
+    try:
+        snap = await server_client.get(
+            f"/v1/sessions/{target_id}",
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool} failed: {exc}"})
+    if snap.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target_id})
+    if snap.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": target_id})
+    if snap.status_code != 200:
+        return json.dumps({"error": f"{tool} returned {snap.status_code}"})
+    body = _string_object_dict(snap.json())
+    if body is None:
+        return json.dumps({"error": f"{tool} returned malformed session data"})
+
+    if body.get("parent_session_id") != conversation_id:
+        return json.dumps(
+            {
+                "error": "session_not_a_child",
+                "session_id": target_id,
+                "message": (
+                    "target session is not a direct child of the caller; "
+                    "answering approval prompts is confined to your own children."
+                ),
+            }
+        )
+    pending = body.get("pending_elicitations")
+    known = (
+        {e.get("elicitation_id") for e in pending if isinstance(e, dict)}
+        if isinstance(pending, list)
+        else set()
+    )
+    if elicitation_id not in known:
+        return json.dumps(
+            {
+                "error": "elicitation_not_found",
+                "session_id": target_id,
+                "elicitation_id": elicitation_id,
+                "message": (
+                    "the target is not waiting on this approval prompt; it may "
+                    "have been answered already or belong to another session."
+                ),
+            }
+        )
+
+    verdict: _JsonObject = {"action": action}
+    if content is not None:
+        verdict["content"] = content
+    try:
+        resolved = await server_client.post(
+            f"/v1/sessions/{target_id}/elicitations/{elicitation_id}/resolve",
+            json=verdict,
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool} failed: {exc}"})
+    if resolved.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": target_id})
+    if resolved.status_code == 404:
+        return json.dumps(
+            {
+                "error": "elicitation_not_found",
+                "session_id": target_id,
+                "elicitation_id": elicitation_id,
+            }
+        )
+    # The route answers 202 with a small acknowledgement; anything else means
+    # the verdict did not land and the child is still parked.
+    if resolved.status_code not in (200, 202):
+        return json.dumps({"error": f"{tool} returned {resolved.status_code}"})
+    return json.dumps(
+        {
+            "resolved": True,
+            "session_id": target_id,
+            "elicitation_id": elicitation_id,
+            "action": action,
         }
     )
 

@@ -12388,3 +12388,267 @@ async def test_send_by_session_id_reuses_running_child_without_restamp() -> None
     assert len(event_posts) == 1
     assert event_posts[0]["created_by"] == "alice@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
+
+
+def _elicitation_snapshot(
+    *,
+    parent: str | None = "conv_parent",
+    elicitation_ids: tuple[str, ...] = ("elicit_1",),
+) -> dict[str, object]:
+    """
+    Build the child snapshot the respond-elicitation gate reads.
+
+    :param parent: Value for ``parent_session_id``; ``None`` models a
+        top-level session, a different id models someone else's child.
+    :param elicitation_ids: Ids the child is parked on.
+    :returns: A ``GET /v1/sessions/{id}`` body.
+    """
+    return {
+        "id": "conv_child",
+        "parent_session_id": parent,
+        "pending_elicitations": [
+            {"type": "response.elicitation_request", "elicitation_id": eid}
+            for eid in elicitation_ids
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_respond_elicitation_resolves_a_direct_childs_prompt() -> None:
+    """
+    The happy path: verify the target, then POST the MCP verdict to the same
+    resolve route the web client uses, so the child stops waiting on a human.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    posted: list[tuple[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_elicitation_snapshot())
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(202, json={"queued": False})
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_respond_elicitation",
+                json.dumps(
+                    {
+                        "session_id": "conv_child",
+                        "elicitation_id": "elicit_1",
+                        "action": "accept",
+                    }
+                ),
+                conversation_id="conv_parent",
+                server_client=client,
+            )
+        )
+
+    assert out == {
+        "resolved": True,
+        "session_id": "conv_child",
+        "elicitation_id": "elicit_1",
+        "action": "accept",
+    }
+    # The id travels in the URL, not the body, matching the route's contract
+    # that the unguessable id is the capability scoping the resolution.
+    assert posted == [
+        ("/v1/sessions/conv_child/elicitations/elicit_1/resolve", {"action": "accept"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_respond_elicitation_forwards_decline_and_form_content() -> None:
+    """
+    ``decline`` and ``cancel`` are real verdicts, and form ``content`` is
+    forwarded only when the prompt asked for fields.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_elicitation_snapshot())
+        bodies.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    async with _session_query_client(handler) as client:
+        for action, content in (("decline", None), ("cancel", None), ("accept", {"reason": "ok"})):
+            args: dict[str, object] = {
+                "session_id": "conv_child",
+                "elicitation_id": "elicit_1",
+                "action": action,
+            }
+            if content is not None:
+                args["content"] = content
+            out = json.loads(
+                await _execute_session_query_tool(
+                    "sys_session_respond_elicitation",
+                    json.dumps(args),
+                    conversation_id="conv_parent",
+                    server_client=client,
+                )
+            )
+            assert out["resolved"] is True and out["action"] == action
+
+    assert bodies == [
+        {"action": "decline"},
+        {"action": "cancel"},
+        {"action": "accept", "content": {"reason": "ok"}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_respond_elicitation_refuses_a_session_that_is_not_our_child() -> None:
+    """
+    Confinement to direct children. The resolve route only requires edit
+    access, so without this gate an orchestrator could answer prompts in any
+    session it can reach — including a sibling in an unrelated tree.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    resolved: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_elicitation_snapshot(parent="conv_someone_else"))
+        resolved.append(request.url.path)
+        return httpx.Response(202, json={"queued": False})
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_respond_elicitation",
+                json.dumps(
+                    {
+                        "session_id": "conv_child",
+                        "elicitation_id": "elicit_1",
+                        "action": "accept",
+                    }
+                ),
+                conversation_id="conv_parent",
+                server_client=client,
+            )
+        )
+
+    assert out["error"] == "session_not_a_child"
+    assert resolved == [], "a refused call must never reach the resolve route"
+
+
+@pytest.mark.asyncio
+async def test_respond_elicitation_refuses_an_id_the_child_is_not_parked_on() -> None:
+    """
+    The prompt must belong to the named child, so a borrowed id cannot be
+    paired with a session the caller does control. Also covers the
+    already-answered case, where the id has left the child's index.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    resolved: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_elicitation_snapshot(elicitation_ids=()))
+        resolved.append(request.url.path)
+        return httpx.Response(202, json={"queued": False})
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_respond_elicitation",
+                json.dumps(
+                    {
+                        "session_id": "conv_child",
+                        "elicitation_id": "elicit_borrowed",
+                        "action": "accept",
+                    }
+                ),
+                conversation_id="conv_parent",
+                server_client=client,
+            )
+        )
+
+    assert out["error"] == "elicitation_not_found"
+    assert resolved == []
+
+
+@pytest.mark.asyncio
+async def test_respond_elicitation_rejects_unusable_arguments() -> None:
+    """
+    Argument validation happens before any request: a missing target, a
+    missing id, an action outside the MCP vocabulary, and a non-object
+    ``content`` are all refused without touching the server.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(200, json=_elicitation_snapshot())
+
+    bad_args: tuple[dict[str, object], ...] = (
+        {"elicitation_id": "elicit_1", "action": "accept"},
+        {"session_id": "conv_child", "action": "accept"},
+        {"session_id": "conv_child", "elicitation_id": "elicit_1", "action": "approve"},
+        {"session_id": "conv_child", "elicitation_id": "elicit_1"},
+        {
+            "session_id": "conv_child",
+            "elicitation_id": "elicit_1",
+            "action": "accept",
+            "content": "not-an-object",
+        },
+    )
+    async with _session_query_client(handler) as client:
+        for args in bad_args:
+            out = json.loads(
+                await _execute_session_query_tool(
+                    "sys_session_respond_elicitation",
+                    json.dumps(args),
+                    conversation_id="conv_parent",
+                    server_client=client,
+                )
+            )
+            assert "error" in out, f"expected a refusal for {args}"
+
+    assert requests == [], "argument validation must not reach the server"
+
+
+@pytest.mark.asyncio
+async def test_respond_elicitation_maps_server_refusals() -> None:
+    """
+    A missing target reads ``session_not_found`` and a denied read reads
+    ``access_denied``, matching the sibling session tools.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    status = {"code": 404}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status["code"], json={})
+
+    args = json.dumps(
+        {"session_id": "conv_child", "elicitation_id": "elicit_1", "action": "accept"}
+    )
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_respond_elicitation",
+                args,
+                conversation_id="conv_parent",
+                server_client=client,
+            )
+        )
+        assert out["error"] == "session_not_found"
+        status["code"] = 403
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_respond_elicitation",
+                args,
+                conversation_id="conv_parent",
+                server_client=client,
+            )
+        )
+        assert out["error"] == "access_denied"

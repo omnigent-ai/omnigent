@@ -40,6 +40,7 @@ from omnigent.tools.builtins import (
     SysSessionGetInfoTool,
     SysSessionListTool,
     SysSessionRenameTool,
+    SysSessionRespondElicitationTool,
     SysSessionSendTool,
     SysSessionShareTool,
     SysTimerCancelTool,
@@ -479,6 +480,10 @@ class ToolManager:
             sub_specs=sub_specs,
         )
         self._tools[SysSessionCloseTool.name()] = SysSessionCloseTool()
+        # Answering a child's approval prompt rides the same spawn grant:
+        # only an agent allowed to create children can unblock one, and the
+        # tool itself refuses any target that is not its own child.
+        self._tools[SysSessionRespondElicitationTool.name()] = SysSessionRespondElicitationTool()
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)

@@ -478,6 +478,48 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_share" not in names
 
 
+def test_respond_elicitation_rides_the_spawn_grant() -> None:
+    """
+    Answering a child's approval prompt is registered with the spawn writes
+    and withheld without the opt-in. Registering it by default would hand
+    every custom agent the ability to clear policy gates in sessions it can
+    reach; withholding it from spawn-capable agents leaves an orchestrator
+    watching a blocked child it cannot unblock, which is the whole gap.
+    """
+    spawner = AgentSpec(spec_version=1, spawn=True)
+    granted = {s["function"]["name"] for s in ToolManager(spawner).get_tool_schemas()}
+    assert "sys_session_respond_elicitation" in granted
+
+    plain = {s["function"]["name"] for s in ToolManager(_make_spec([])).get_tool_schemas()}
+    assert "sys_session_respond_elicitation" not in plain
+    # The read half stays always-on, so the asymmetry the feature closes is
+    # visible in the catalog: any agent can see a blocked child.
+    assert "sys_session_get_info" in plain
+
+
+def test_respond_elicitation_schema_admits_no_remember_option() -> None:
+    """
+    The verdict is per-call only. A ``remember`` flag would retire the gate
+    for a whole tool in the child rather than approving this one call, so
+    every later call of that shape would bypass the policy that is meant to
+    stay in the loop — pre-authorisation belongs in declared policy, not a
+    model-supplied argument.
+    """
+    spec = AgentSpec(spec_version=1, spawn=True)
+    schema = next(
+        s
+        for s in ToolManager(spec).get_tool_schemas()
+        if s["function"]["name"] == "sys_session_respond_elicitation"
+    )
+    params = schema["function"]["parameters"]
+    assert set(params["required"]) == {"session_id", "elicitation_id", "action"}
+    assert "remember" not in params["properties"]
+    # additionalProperties is what actually refuses a hallucinated remember.
+    assert params["additionalProperties"] is False
+    # All three MCP verdicts are offered: cancel is a dismissal, not a refusal.
+    assert params["properties"]["action"]["enum"] == ["accept", "decline", "cancel"]
+
+
 def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
     """
     With the ``spawn: true`` opt-in but no declared sub-agents,
