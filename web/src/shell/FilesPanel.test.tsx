@@ -14,6 +14,8 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import type * as ReactQueryModule from "@tanstack/react-query";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
@@ -61,6 +63,17 @@ vi.mock("./WorkspacePicker", async (importOriginal) => ({
 }));
 
 // The panel reads the session's host to point the directory browser at it.
+// The panel resolves a QueryClient (workdir PATCHes refresh the session
+// snapshot) and PATCHes the session on re-root; neither needs a live
+// react-query provider or network in these component tests.
+vi.mock("@tanstack/react-query", async (importOriginal) => ({
+  ...(await importOriginal<typeof ReactQueryModule>()),
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  updateSession: vi.fn(async () => ({}) as never),
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(() => ({ session: { hostId: "host_test" } })),
 }));
@@ -290,6 +303,76 @@ describe("FilesPanel working folder directory", () => {
     expect(screen.queryByText("Working folder")).toBeNull();
     // There should be no element with a title that looks like a path
     expect(screen.queryByTitle("/")).toBeNull();
+  });
+});
+
+describe("FilesPanel saved-workspace seed", () => {
+  const useSessionMock = vi.mocked(useSession);
+
+  afterEach(() => {
+    useSessionMock.mockReturnValue({ session: { hostId: "host_test" } } as never);
+  });
+
+  it("re-roots onto a saved in-root workspace after a reload", async () => {
+    useSessionMock.mockReturnValue({
+      session: {
+        hostId: "host_test",
+        workspace: "/home/user/workspace/sub",
+        permissionLevel: null,
+      },
+      isLoading: false,
+    } as never);
+    renderPanel({
+      conversationId: "conv_seed_in_root",
+      files: [],
+      workingDir: "/home/user/workspace",
+    });
+
+    await waitFor(() => {
+      expect(useAllFilesMock).toHaveBeenLastCalledWith(
+        "conv_seed_in_root",
+        { enabled: true },
+        "sub",
+      );
+    });
+  });
+
+  it("stays at the root when the saved workspace lies outside a session that cannot roam", async () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_test", workspace: "/browser-workspace", permissionLevel: null },
+      isLoading: false,
+    } as never);
+    renderPanel({ conversationId: "conv_seed_confined", files: [], workingDir: "/workspace" });
+
+    // Let the seed effect run before checking that it left the root alone.
+    await act(async () => {});
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_seed_confined", { enabled: true }, "");
+    expect(useAllFilesMock).not.toHaveBeenCalledWith(
+      "conv_seed_confined",
+      { enabled: true },
+      "/browser-workspace",
+    );
+  });
+
+  it("re-roots onto a saved out-of-root workspace when the owner can roam there", async () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_test", workspace: "/browser-workspace", permissionLevel: null },
+      isLoading: false,
+    } as never);
+    renderPanel({
+      conversationId: "conv_seed_roam",
+      files: [],
+      workingDir: "/workspace",
+      reachable: { unconfined: true, roots: [] },
+    });
+
+    await waitFor(() => {
+      expect(useAllFilesMock).toHaveBeenLastCalledWith(
+        "conv_seed_roam",
+        { enabled: true },
+        "/browser-workspace",
+      );
+    });
   });
 });
 
