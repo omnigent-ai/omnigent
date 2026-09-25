@@ -549,3 +549,96 @@ async def test_action_request_cross_user_forbidden(auth_client: httpx.AsyncClien
         headers={"X-Forwarded-Email": "bob@example.com"},
     )
     assert resp.status_code in (403, 404), resp.text
+
+
+@pytest.mark.parametrize("adapter", ["codex", "native", "claude-sdk"])
+async def test_browser_screenshot_reaches_adapters_and_replay_as_image(
+    client: httpx.AsyncClient, adapter: str
+) -> None:
+    """A claimed renderer screenshot retains its pixels and metadata past dispatch."""
+    import json
+
+    from omnigent.runner.tool_dispatch import _execute_browser_tool
+    from omnigent.runtime.tool_result_replay import tool_result_content_blocks
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    agent = await create_test_agent(client, "test-browser-image")
+    session_id = await _create_session(client, agent["id"])
+    subscribed = asyncio.Event()
+    drain = asyncio.create_task(_drain_until_action_request(session_id, subscribed=subscribed))
+    await subscribed.wait()
+    dispatch = asyncio.create_task(
+        _execute_browser_tool(
+            "browser_screenshot", {}, server_client=client, conversation_id=session_id
+        )
+    )
+    try:
+        event = await drain
+        assert event["action"] == "screenshot"
+        claim = await client.post(
+            f"/v1/sessions/{session_id}/browser/action_claim/{event['action_id']}"
+        )
+        claim.raise_for_status()
+        metadata = {"ok": True, "note": "Required late fact: amber", "width": 1, "height": 1}
+        response = await client.post(
+            f"/v1/sessions/{session_id}/browser/action_result/{event['action_id']}",
+            json={
+                "claim_token": claim.json()["claim_token"],
+                "result": {"data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}", **metadata},
+            },
+        )
+        assert response.status_code == 202
+        output = await asyncio.wait_for(dispatch, 5)
+    finally:
+        for task in (drain, dispatch):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(drain, dispatch, return_exceptions=True)
+
+    envelope = json.loads(output)
+    if adapter == "codex":
+        from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+
+        native = _dynamic_tool_result_payload(envelope)
+        assert native["success"] is True
+        content = native["contentItems"]
+        assert [block["type"] for block in content] == ["inputText", "inputImage"]
+        assert json.loads(content[0]["text"]) == metadata
+        assert content[1]["imageUrl"] == f"data:image/png;base64,{_TINY_PNG_BASE64}"
+    else:
+        if adapter == "native":
+            from omnigent.harnesses.claude_native.bridge import _mcp_response_from_tool_result
+
+            native = _mcp_response_from_tool_result(envelope)
+        else:
+            from claude_agent_sdk import create_sdk_mcp_server
+            from mcp.types import CallToolRequest, CallToolRequestParams
+
+            from omnigent.inner.claude_sdk_executor import _build_mcp_tools
+
+            async def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                assert name == "browser_screenshot"
+                return envelope
+
+            tools = _build_mcp_tools(
+                [{"name": "browser_screenshot", "description": "snapshot"}], execute
+            )
+            sdk_server = create_sdk_mcp_server(name="browser-image", tools=tools)["instance"]
+            sdk_result = await sdk_server.request_handlers[CallToolRequest](
+                CallToolRequest(
+                    method="tools/call",
+                    params=CallToolRequestParams(name="browser_screenshot", arguments={}),
+                )
+            )
+            native = sdk_result.root.model_dump(exclude_none=True)
+        assert native["isError"] is False
+        content = native["content"]
+        assert [block["type"] for block in content] == ["text", "image"]
+        assert json.loads(content[0]["text"]) == metadata
+        assert content[1]["data"] == _TINY_PNG_BASE64
+        assert content[1]["mimeType"] == "image/png"
+
+    replay = tool_result_content_blocks(output)
+    assert replay.blocks is not None
+    assert json.loads(replay.blocks[0]["text"]) == metadata
+    assert replay.blocks[1]["source"]["data"] == _TINY_PNG_BASE64
