@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from typing import Any
 
 from omnigent.entities import PagedList, StoredFile
 
@@ -39,9 +40,12 @@ class FileStore(ABC):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        file_id: str | None = None,
+        blob_key: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
     ) -> StoredFile:
         """
-        Record a new file. Generates a unique file_id.
+        Record a new file. Generates a unique file_id unless given one.
 
         :param filename: Original filename,
             e.g. ``"report.pdf"``.
@@ -50,7 +54,35 @@ class FileStore(ABC):
             e.g. ``"application/pdf"``.
         :param session_id: Owning session/conversation id. When
             set, the file is session-scoped; ``None`` for global.
+        :param file_id: Caller-chosen id for the new row. A fork
+            pre-allocates ids so the copied conversation items can
+            reference the copies it creates afterwards. ``None``
+            (default) generates a fresh id.
+        :param blob_key: Artifact-store key for the row's bytes. A fork
+            copy passes the source row's blob so it shares the bytes
+            instead of duplicating them; ``None`` (default) points the
+            row at its own ``file_id`` (an independent blob).
+        :param source_metadata: Optional opaque JSON-able dict of
+            metadata about the original upload before any server-side
+            transform (e.g. ``{"width", "height"}`` for a downscaled
+            image), or ``None`` when there is nothing to record.
         :returns: The newly created :class:`StoredFile`.
+        """
+        ...
+
+    @abstractmethod
+    def is_blob_key_orphaned(self, blob_key: str) -> bool:
+        """
+        Whether no file row references *blob_key* any more.
+
+        A blob is shared when a fork copies a file row without copying its
+        bytes, so the artifact-store blob must only be deleted once the last
+        referencing row is gone. Callers delete the row first, then consult
+        this before removing the blob.
+
+        :param blob_key: The artifact-store key to test.
+        :returns: ``True`` when the blob has no remaining referrers and is
+            safe to delete.
         """
         ...
 
@@ -127,10 +159,12 @@ class FileStore(ABC):
         """
         Delete all file metadata for a session.
 
-        Returns the list of deleted file ids so callers can
-        clean up artifact bytes.
+        Returns only the artifact-store keys that became **orphaned** by the
+        deletion (no surviving row references them), so the caller cleans up
+        exactly those bytes. A blob still shared by a fork in another session
+        is not returned and therefore survives.
 
         :param session_id: Owning session/conversation id.
-        :returns: List of deleted file ids.
+        :returns: The now-orphaned artifact-store keys to clean up.
         """
         ...

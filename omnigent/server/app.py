@@ -1,6 +1,8 @@
 """FastAPI application — main entry point for the omnigent server."""
 
 import asyncio
+import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -10,6 +12,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -36,10 +39,20 @@ from omnigent.debug_logging import (
     debug_event,
     debug_sink_enabled,
     reset_request_audit_attrs,
+    runner_log_scope,
+    set_current_request_id,
+    set_current_runner_id,
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    is_cancelled_rpc_error,
+)
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
     ResolvedBundle,
@@ -115,7 +128,11 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.comment_store import CommentStore
-from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    SessionConnectivity,
+    runner_seen_is_fresh,
+)
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -255,7 +272,202 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+# First-segment namespaces that must keep resolving at the origin root: the JSON
+# API (`api`, `v1`), auth flows (`auth`, `oauth`), health, `.well-known`,
+# FastAPI's built-in docs endpoints (`docs`, `redoc`, `openapi.json`), and the
+# SPA's own static-asset mount (`assets`) — a base path of `/assets` would be
+# indistinguishable from an already-destripped `/assets/<file>` request under a
+# prefix-stripping proxy, double-stripping it into a 404. Doubles as the
+# SPA-fallback allowlist and the base-path collision check (see
+# `_normalize_base_path` / `_is_web_ui_api_fallback_path`).
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset(
+    {
+        "api",
+        "assets",
+        "auth",
+        "docs",
+        "health",
+        "oauth",
+        "openapi.json",
+        "redoc",
+        "v1",
+        ".well-known",
+    }
+)
+
+# First segments of the SPA's own top-level routes (web/src/App.tsx). A base
+# path colliding with one of these is ambiguous for the frontend's
+# `withBasePath` (web/src/lib/basePath.ts): it treats a path already starting
+# with the configured base as "already prefixed" to avoid double-prefixing a
+# redirect target that genuinely is one (e.g. an already-absolute return_to
+# read back from `window.location`). With `--base-path /c`, a share link for
+# session `<id>` — the unprefixed app path `/c/<id>` — is misread as already
+# under the `/c` base and left unprefixed, producing a dead link instead of
+# `/c/c/<id>`. Rejected here rather than made "smarter" client-side: the
+# ambiguity is unresolvable in general (a base of `/login` has the same
+# problem for the post-login redirect). NOT folded into
+# `_WEB_UI_API_FALLBACK_PREFIXES`: unlike that set, these ARE legitimate SPA
+# routes that must still fall back to `index.html` when unmatched by a
+# static file, just never as a base-path prefix.
+_WEB_UI_ROUTE_PREFIXES = frozenset(
+    {
+        "approve",
+        "c",
+        "canvas",
+        "extensions",
+        "inbox",
+        "login",
+        "members",
+        "policies",
+        "register",
+        "settings",
+        "tasks",
+        "usage",
+    }
+)
+
+
+# RFC 3986 unreserved + path separator. Percent is deliberately excluded:
+# BasePathMiddleware matches the configured prefix against ASGI's already
+# percent-decoded request path, so an encoded prefix would never match and
+# routing would break silently. Reject it at config time instead.
+_BASE_PATH_ALLOWED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/"
+)
+
+
+def _normalize_base_path(value: str | None) -> str:
+    """Normalize ``OMNIGENT_WEB_BASE_PATH`` to a leading-slash, no-trailing-slash string.
+
+    ``None``, ``""`` and ``"/"`` all map to ``""`` (root deployment, today's
+    behavior). Mirrors the frontend's ``getBasePath`` (``web/src/lib/basePath.ts``)
+    so the two agree on the prefix.
+
+    :param value: Raw base path, e.g. ``"/proxy/6767/"`` or ``"proxy/6767"``.
+    :returns: Normalized path (``"/proxy/6767"``) or ``""``.
+    :raises ValueError: If the path starts with ``//`` (protocol-relative, a
+        cross-origin asset/redirect risk) or contains characters outside
+        ``_BASE_PATH_ALLOWED`` — quotes, angle brackets, spaces, backslashes,
+        percent, etc. The value is spliced into ``index.html`` unescaped, and
+        percent-encoding would also fail the decoded-path match in
+        ``BasePathMiddleware``.
+    """
+    if not value:
+        return ""
+    trimmed = value.strip()
+    if trimmed in ("", "/"):
+        return ""
+    if not trimmed.startswith("/"):
+        trimmed = f"/{trimmed}"
+    if trimmed.startswith("//"):
+        # Protocol-relative (`//evil.example`) spliced into an asset ref would
+        # point at another origin; a slash-only value (`//`, `///`) would rstrip
+        # to empty and hit an IndexError at `segments[1]` below. Reject both here,
+        # before the trailing-slash strip, so misconfiguration fails loud.
+        raise ValueError(f"Invalid base path {value!r}: must not start with '//'.")
+    trimmed = trimmed.rstrip("/")
+    invalid = set(trimmed) - _BASE_PATH_ALLOWED
+    if invalid:
+        raise ValueError(
+            f"Invalid base path {value!r}: only URL path characters "
+            f"(letters, digits, '-._~/') are allowed, got {sorted(invalid)!r}."
+        )
+    segments = trimmed.split("/")
+    if "." in segments or ".." in segments:
+        # A `.`/`..` segment (`/proxy/../app`) is normalized away by the browser,
+        # so the sent path would disagree with the literal prefix the middleware
+        # strips. Reject it.
+        raise ValueError(f"Invalid base path {value!r}: '.'/'..' segments are not allowed.")
+    if segments[1] in _WEB_UI_API_FALLBACK_PREFIXES:
+        # A base path whose first segment is a reserved API namespace (`/v1`,
+        # `/v1/sessions`, `/auth/...`) makes the strip middleware eat canonical
+        # `/{seg}/...` requests, breaking the root-API compatibility guarantee.
+        raise ValueError(
+            f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
+            "with a reserved API route namespace; choose a path outside it."
+        )
+    if segments[1] in _WEB_UI_ROUTE_PREFIXES:
+        # A base path whose first segment names one of the SPA's own routes
+        # (`/c`, `/login`, ...) is ambiguous for withBasePath's "already
+        # prefixed?" check on the frontend (web/src/lib/basePath.ts): an
+        # unprefixed app path like `/c/<id>` (a share link) is
+        # indistinguishable from an already-prefixed one under base `/c`, so
+        # it is left unprefixed instead of becoming `/c/c/<id>`.
+        raise ValueError(
+            f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
+            "with a top-level app route; choose a path outside it."
+        )
+    return trimmed
+
+
+def _rewrite_web_ui_index(html: str, base_path: str) -> str:
+    """Rebase the built ``index.html`` for the configured deployment base path.
+
+    The standalone build emits relative asset references (``./assets/...``,
+    ``./favicon.svg``) so dynamic code-split chunks resolve via
+    ``import.meta.url`` under any path prefix. Relative references break on a
+    deep-link refresh, so they are rewritten here to absolute
+    ``{base}/assets/...``. With an empty base this yields root-absolute
+    ``/assets/...`` — byte-identical in spirit to a non-prefixed deployment.
+
+    When a base path is configured, a small inline script publishes it as
+    ``window.__OMNIGENT_BASE_PATH__`` ahead of the entry module so the SPA can
+    prefix its own API/WebSocket/navigation URLs (see ``basePath.ts``).
+
+    :param html: Raw built ``index.html`` contents.
+    :param base_path: Normalized base path (``""`` or ``"/proxy/6767"``).
+    :returns: Rewritten HTML.
+    """
+    rewritten = html.replace('="./', f'="{base_path}/')
+    # Drop the ``<base href="/">`` fallback whenever we rewrite. The asset refs
+    # are absolute now, so it is redundant, and keeping it would resolve fragment
+    # refs (inline SVG ``url(#id)``, footnote/heading anchors) against the origin
+    # root instead of the current document. At root this restores the exact
+    # pre-rewrite markup; the source tag stays as a safety net for an older
+    # server that serves index.html without this rewrite (version skew).
+    rewritten = re.sub(r"<base\b[^>]*>", "", rewritten)
+    if base_path:
+        # JSON-encode and neutralize any ``</`` so a hostile base path can't
+        # break out of the inline script element.
+        literal = json.dumps(base_path).replace("</", "<\\/")
+        injection = f"<script>window.__OMNIGENT_BASE_PATH__ = {literal};</script>"
+        rewritten = rewritten.replace("<head>", f"<head>{injection}", 1)
+    return rewritten
+
+
+class BasePathMiddleware:
+    """Strip a configured public base path prefix from incoming request paths.
+
+    Lets one server work whether the reverse proxy forwards the prefix
+    (code-server ``/absproxy/<port>/``, a plain nginx/Traefik subpath) or
+    strips it (code-server ``/proxy/<port>/``): when the prefix is present it
+    is removed so routing matches the canonical ``/v1/...`` paths, and
+    ``root_path`` is set so server-generated URLs stay under the mount. A
+    no-op when no base path is configured, or for a request that does not
+    carry the prefix (the stripping-proxy case).
+
+    :param app: The wrapped ASGI application.
+    :param base_path: Normalized base path (``""`` disables the middleware).
+    """
+
+    def __init__(self, app: ASGIApp, base_path: str) -> None:
+        self.app = app
+        self.base_path = base_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.base_path and scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path == self.base_path or path.startswith(f"{self.base_path}/"):
+                scope = dict(scope)
+                scope["path"] = path[len(self.base_path) :] or "/"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, (bytes, bytearray)):
+                    prefix = self.base_path.encode()
+                    if raw_path.startswith(prefix):
+                        scope["raw_path"] = raw_path[len(prefix) :] or b"/"
+                scope["root_path"] = self.base_path
+        await self.app(scope, receive, send)
+
 
 # Envelope version of GET /.well-known/omnigent.json (see the route for the
 # full contract). Bump ONLY for a change a client cannot absorb by ignoring
@@ -271,6 +483,15 @@ _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
+
+# The exact message Starlette's BaseHTTPMiddleware.call_next raises when the
+# downstream app sent nothing and raised no Exception — which only a bare
+# CancelledError escaping a cancelled in-flight handler produces.
+_NO_RESPONSE_RETURNED = "No response returned."
+
+# Nginx's nonstandard "client closed request" status: the request was torn
+# down before a response could be sent.
+_HTTP_CLIENT_CLOSED_REQUEST = 499
 
 
 def _session_id_from_request(request: Request) -> str | None:
@@ -303,6 +524,11 @@ def _error_audit_extra(
     """
     route = request.scope.get("route")
     operation = getattr(route, "name", None) or "unmatched"
+    attributes.setdefault("method", request.method)
+    attributes.setdefault("route", getattr(route, "path", None) or "<unmatched>")
+    request_id = getattr(request.state, "audit_request_id", None)
+    if isinstance(request_id, str):
+        attributes.setdefault("request_id", request_id)
     return debug_event(
         operation,
         session_id=_session_id_from_request(request),
@@ -1097,6 +1323,7 @@ def create_app(
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
+    base_path: str | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1217,12 +1444,23 @@ def create_app(
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
+    :param base_path: Public URL prefix the server is served under by a
+        reverse proxy, e.g. ``"/proxy/6767"`` (code-server port proxy).
+        ``None`` reads ``OMNIGENT_WEB_BASE_PATH``; empty/``"/"`` is a normal
+        root deployment.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+
+    # Public base path for serving behind a subpath reverse proxy (issue
+    # #1031). Falls back to OMNIGENT_WEB_BASE_PATH so Docker/PaaS entrypoints
+    # pick it up without threading a kwarg. Empty → root deployment (default).
+    resolved_base_path = _normalize_base_path(
+        base_path if base_path is not None else os.environ.get("OMNIGENT_WEB_BASE_PATH")
+    )
 
     from omnigent.server.server_config import (
         load_branding_snapshot,
@@ -1289,6 +1527,8 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        conversation_store=conversation_store,
+        file_store=file_store,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1472,6 +1712,11 @@ def create_app(
                 tunnel_registry=tunnel_registry,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                # Managed-sandbox execution target: provision a fresh sandbox per
+                # fire. ``managed_launches`` is created during app construction
+                # (before this lifespan runs), so it is already on state here.
+                sandbox_config=sandbox_config,
+                managed_launches=app_inst.state.managed_launches,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -1554,6 +1799,14 @@ def create_app(
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
 
+    from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
+
+    runner_account_store = (
+        account_store
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        else None
+    )
+
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
     from omnigent.runtime import telemetry
 
@@ -1567,10 +1820,18 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    if host_store is not None:
+        host_registry.launch_authorizer = partial(
+            host_store.admit_launch, require_account_owner=runner_account_store is not None
+        )
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
+    # a full-page redirect (not covered by BasePathMiddleware's inbound-only
+    # strip) can prefix it themselves. "" for a root deployment.
+    app.state.base_path = resolved_base_path
     # GitHub App integration: enabled only when both the config and the
     # connection store are wired. The client is stateless (holds config),
     # built once and reused for the connect flow.
@@ -1718,7 +1979,10 @@ def create_app(
         :returns: The downstream route response.
         """
         request_id = uuid.uuid4().hex
+        request.state.audit_request_id = request_id
         set_request_id_for_access_log(request_id)
+        set_current_request_id(request_id)
+        set_current_runner_id(None)
         set_request_user_agent_for_access_log(
             request.headers.get("user-agent"),
         )
@@ -1747,6 +2011,11 @@ def create_app(
         operation, audit_route, audit_session_id = _resolve_audit_route(request)
         set_current_session_id(audit_session_id)
         reset_request_audit_attrs()
+        if operation == "create_session":
+            _logger.info(
+                "Session creation requested",
+                extra=debug_event("session_creation_started", operation="create"),
+            )
         # ``post_event`` is hit per streamed chunk (the harness echoes its own
         # output back), so a per-call ``start`` row is pure noise — emit only the
         # end row for it (and the handler suppresses even that for transient
@@ -1769,6 +2038,27 @@ def create_app(
             status_code = response.status_code
             response.headers["X-Request-Id"] = request_id
             return response
+        except RuntimeError as exc:
+            if str(exc) != _NO_RESPONSE_RETURNED:
+                failed = True
+                raise
+            # The downstream app was cancelled mid-flight (client disconnect /
+            # request teardown) before sending anything: BaseHTTPMiddleware
+            # captures every Exception it raises, so an empty response stream
+            # means a bare CancelledError escaped. A client-gone teardown, not
+            # a server fault — book a benign 499 instead of letting the
+            # catch-all log it as an unhandled UNKNOWN 500.
+            status_code = _HTTP_CLIENT_CLOSED_REQUEST
+            _logger.info(
+                "Request cancelled before a response was sent "
+                "(client disconnect / request teardown): %s %s",
+                request.method,
+                request.url.path,
+            )
+            return Response(
+                status_code=_HTTP_CLIENT_CLOSED_REQUEST,
+                headers={"X-Request-Id": request_id},
+            )
         except Exception:
             failed = True
             raise
@@ -1790,6 +2080,30 @@ def create_app(
             # never shadow an envelope field or collide with an _emit_audit_event
             # argument (session_id / phase would raise TypeError).
             _bag = current_request_audit_attrs()
+            if operation == "create_session":
+                creation_failed = failed or status_code is None or status_code >= 400
+                creation_log = _logger.error if creation_failed else _logger.info
+                creation_log(
+                    "Session creation request finished",
+                    extra=debug_event(
+                        "session_creation_failed"
+                        if creation_failed
+                        else "session_creation_accepted",
+                        session_id=_bag.get("session_id"),
+                        runner_id=_bag.get("runner_id"),
+                        operation="create",
+                        creation_kind=_bag.get("creation_kind", "unknown"),
+                        host_type=_bag.get("host_type", "unknown"),
+                        stage="create_request",
+                        status_code=status_code,
+                        error_code=(
+                            _bag.get("code")
+                            or (f"http_{status_code}" if status_code else "request_interrupted")
+                        )
+                        if creation_failed
+                        else None,
+                    ),
+                )
             # A handler can suppress the whole envelope for this request (e.g. a
             # transient POST /events echo). An error still logs — a failure is
             # never noise, and the exception handler carries the detail.
@@ -1940,6 +2254,51 @@ def create_app(
         )
         return await request_validation_exception_handler(request, exc)
 
+    @app.exception_handler(ConversationNotFoundError)
+    async def _handle_conversation_not_found(
+        request: Request,
+        exc: ConversationNotFoundError,
+    ) -> JSONResponse:
+        """
+        Map a missing conversation row to 404 rather than an unhandled 500.
+
+        Stores raise this when absence is not a benign no-op — creating a child
+        under a parent that is gone, for example. With no handler it reached the
+        catch-all and was booked as ``internal_error``, so a caller referencing
+        a deleted conversation read as a server fault and counted against the
+        mid-session error rate.
+
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
+        :param exc: The store's not-found error.
+        :returns: A 404 JSON response with the ``not_found`` code.
+        """
+        add_audit_attrs(
+            code=str(ErrorCode.NOT_FOUND),
+            http_status="404",
+            error_category=ErrorCategory.USER.value,
+            error_impact=ErrorImpact.BENIGN.value,
+            error_phase=ErrorPhase.REQUEST.value,
+        )
+        # Keep a trace: usually a caller referencing a deleted row, but this
+        # branch would otherwise mask a server-side id-threading defect. The
+        # audit extra carries the operation and session id, so a 404 that is
+        # really our bug stays queryable.
+        _logger.info(
+            "Conversation not found, mapped to 404: %s",
+            exc,
+            extra=_error_audit_extra(
+                request,
+                phase="not_found",
+                code=str(ErrorCode.NOT_FOUND),
+                http_status="404",
+            ),
+        )
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
+        )
+
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
         request: Request,
@@ -2016,6 +2375,31 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
+        if is_cancelled_rpc_error(exc):
+            # A peer-cancelled backing call (upstream teardown/restart) is an
+            # expected, retryable condition, not a fault: attribute it as
+            # transient upstream at WARNING — keeping the ERROR stream for real
+            # 500s — and answer with the coded 499 via the standard handler.
+            cancelled = OmnigentError(
+                "The backing service cancelled the call; please retry.",
+                code=ErrorCode.UPSTREAM_CANCELLED,
+            )
+            _logger.warning(
+                "Upstream call cancelled by its peer: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="cancelled",
+                    code=str(cancelled.code),
+                    http_status=str(cancelled.http_status),
+                    error_category=cancelled.category.value,
+                    error_impact=cancelled.impact.value,
+                    error_phase=cancelled.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, cancelled)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real
@@ -2034,8 +2418,10 @@ def create_app(
                 error_type=type(exc).__name__,
             ),
         )
+        request_id = getattr(request.state, "audit_request_id", None)
         return JSONResponse(
             status_code=500,
+            headers={"X-Request-Id": request_id} if isinstance(request_id, str) else None,
             content={
                 "error": {
                     "code": ErrorCode.INTERNAL_ERROR,
@@ -2728,6 +3114,19 @@ def create_app(
         prefix="/v1",
         tags=["extensions"],
     )
+    from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+
+    app.include_router(
+        create_sandbox_inference_router(
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["sandbox inference"],
+    )
     # Server-side speech-to-text behind the composer mic button
     # (designs/server-dictation.md). Availability is probed lazily, so
     # registering unconditionally is free for servers without the extra.
@@ -2944,6 +3343,10 @@ def create_app(
                 runner_id,
             )
             return
+        _logger.info(
+            "Runner disconnected",
+            extra=debug_event("runner_disconnected", runner_id=runner_id),
+        )
         runner_session_initializer.invalidate_runner(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
         # flip offline at once. Not on our own shutdown: the runner is alive and
@@ -3020,6 +3423,14 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
+        _logger.info(
+            "Runner connected",
+            extra=debug_event("runner_connected", runner_id=runner_id),
+        )
+        from omnigent.server.child_session_recovery import (
+            is_parent_owned_subagent,
+            restore_active_children,
+        )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
         )
@@ -3046,89 +3457,109 @@ def create_app(
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # Restore each tree from its root before ordinary child initialization
+        # can clear the interruption status or cache an init without continuation.
+        bound_ids = {conv.id for conv in convs}
+        convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
         _logger.info(
             "_on_runner_connect: runner=%s, %d bound session(s)",
             runner_id,
             len(convs),
         )
         for conv in convs:
-            _logger.info(
-                "_on_runner_connect: matched %s (agent=%s)",
-                conv.id,
-                conv.agent_id,
-            )
-            try:
-                routed = runner_router.client_for_session_resources(conv.id)
-            except OmnigentError:
-                _logger.exception(
-                    "Failed to resolve runner client for session %s on reconnect",
+            with runner_log_scope(conv.id, runner_id):
+                _logger.info(
+                    "_on_runner_connect: matched %s (agent=%s)",
                     conv.id,
+                    conv.agent_id,
                 )
-                continue
-            if not conv.agent_id:
-                # The runner's create_session requires agent_id (it 400s
-                # without one), so don't send a request it rejects by
-                # contract. The old list path filtered these rows out via
-                # has_agent_id=True; the by-runner lookup returns them, and
-                # the relay restart below still applies — the session is
-                # runner-bound regardless of having an agent.
-                _logger.debug(
-                    "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
-                    conv.id,
-                )
-            else:
                 try:
-                    await runner_session_initializer.initialize(
-                        conv,
-                        routed.client,
-                        timeout=10.0,
-                    )
-                except Exception:
+                    routed = runner_router.client_for_session_resources(conv.id)
+                except OmnigentError:
                     _logger.exception(
-                        "Failed to re-assign session %s on reconnect",
+                        "Failed to resolve runner client for session %s on reconnect",
                         conv.id,
                     )
-            _ensure_runner_relay(
-                conv.id,
-                runner_id,
-                routed.client,
-                conversation_store,
-            )
-            # The session's terminal exists as of the handshake above, so its
-            # model catalogs are answerable now. Warming them here is what
-            # keeps the first routed message off the runner round trip. The
-            # helper self-gates on routing state, so the plain sessions in this
-            # loop (and any archived row) cost nothing.
-            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
-            # Reconcile the persisted pending-elicitation count with this
-            # pod's live index. A runner that crashed with prompts parked
-            # leaves a stale row (no decrement is ever written on a crash),
-            # which the fresh index corrects to 0 here; a tunnel flap on the
-            # same pod resyncs the still-parked truth unchanged.
-            session_live_state.persist_pending_count(
-                conv.id, pending_elicitations.count_for(conv.id)
-            )
-            # A reconnect can land the runner back on an idle session with
-            # no new turn (a transient WS blip; the runner process
-            # survived). The disconnect left the session marked failed with
-            # persisted ``runner_disconnected`` labels, and without a
-            # ``running`` edge nothing clears them — the Subagents panel
-            # keeps the grey "Disconnected" dot until the next user
-            # message. Clearing on reconnect drops it as soon as the runner
-            # is reachable again. The helper self-guards: it only clears a
-            # session whose persisted failure is ``runner_disconnected``, so
-            # a genuine task failure survives the reconnect untouched.
-            await _publish_runner_recovered_status(
-                conv.id, conversation_store, require_disconnect_code=True
-            )
-            # A managed launch that outlived its connect timeout cached
-            # sandbox_status "failed"; this runner connecting proves the
-            # sandbox is live, so drop the stale banner. Only "failed" is
-            # cleared -- an in-flight launch (provisioning/connecting) must
-            # not be short-circuited by an older runner reconnecting.
-            cached_sandbox = _session_sandbox_status_cache.get(conv.id)
-            if cached_sandbox is not None and cached_sandbox.stage == "failed":
-                _publish_sandbox_status(conv.id, "ready")
+                    continue
+                if not conv.agent_id:
+                    # The runner's create_session requires agent_id (it 400s
+                    # without one), so don't send a request it rejects by
+                    # contract. The old list path filtered these rows out via
+                    # has_agent_id=True; the by-runner lookup returns them, and
+                    # the relay restart below still applies — the session is
+                    # runner-bound regardless of having an agent.
+                    _logger.debug(
+                        "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
+                        conv.id,
+                    )
+                elif not is_parent_owned_subagent(conv) and not (
+                    conv.parent_conversation_id in bound_ids and conv.host_id is None
+                ):
+                    try:
+                        init_response = await runner_session_initializer.initialize(
+                            conv,
+                            routed.client,
+                            timeout=10.0,
+                        )
+                        init_response.raise_for_status()
+                        await restore_active_children(
+                            conv, routed.client, conversation_store, runner_session_initializer
+                        )
+                    except Exception:
+                        _logger.exception(
+                            "Failed to re-assign session %s on reconnect",
+                            conv.id,
+                        )
+                _ensure_runner_relay(
+                    conv.id,
+                    runner_id,
+                    routed.client,
+                    conversation_store,
+                )
+                # The session's terminal exists as of the handshake above, so its
+                # model catalogs are answerable now. Warming them here is what
+                # keeps the first routed message off the runner round trip. The
+                # helper self-gates on routing state, so the plain sessions in this
+                # loop (and any archived row) cost nothing.
+                prefetch_session_routing_catalogs(conv.id, conv, routed.client)
+                # Reconcile the persisted pending-elicitation count with this
+                # pod's live index. A runner that crashed with prompts parked
+                # leaves a stale row (no decrement is ever written on a crash),
+                # which the fresh index corrects to 0 here; a tunnel flap on the
+                # same pod resyncs the still-parked truth unchanged.
+                session_live_state.persist_pending_count(
+                    conv.id, pending_elicitations.count_for(conv.id)
+                )
+                # A reconnect can land the runner back on an idle session with
+                # no new turn (a transient WS blip; the runner process
+                # survived). The disconnect left the session marked failed with
+                # persisted ``runner_disconnected`` labels, and without a
+                # ``running`` edge nothing clears them — the Subagents panel
+                # keeps the grey "Disconnected" dot until the next user
+                # message. Clearing on reconnect drops it as soon as the runner
+                # is reachable again. The helper self-guards: it only clears a
+                # session whose persisted failure is ``runner_disconnected``, so
+                # a genuine task failure survives the reconnect untouched.
+                if not is_parent_owned_subagent(conv) and not (
+                    conv.parent_conversation_id in bound_ids and conv.host_id is None
+                ):
+                    await _publish_runner_recovered_status(
+                        conv.id, conversation_store, require_disconnect_code=True
+                    )
+                # A managed launch that outlived its connect timeout cached
+                # sandbox_status "failed"; this runner connecting proves the
+                # sandbox is live, so drop the stale banner. Only "failed" is
+                # cleared -- an in-flight launch (provisioning/connecting) must
+                # not be short-circuited by an older runner reconnecting.
+                cached_sandbox = _session_sandbox_status_cache.get(conv.id)
+                if cached_sandbox is not None and cached_sandbox.stage == "failed":
+                    _publish_sandbox_status(conv.id, "ready")
+
+    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
+        assert runner_account_store is not None and auth_provider is not None
+        return runner_account_store.with_runner_authority(
+            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+        )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -3142,6 +3573,11 @@ def create_app(
         :returns: The session owner's user id, or ``None`` when no session
             is bound to this runner (the handshake is then refused).
         """
+        if runner_account_store is not None:
+            try:
+                return runner_account_store.with_runner_authority(runner_id, lambda owner: owner)
+            except OmnigentError:
+                return None
         for conv in conversation_store.list_conversations_by_runner_id(runner_id):
             owner = conversation_store.get_session_owner(conv.id)
             if owner is not None:
@@ -3158,6 +3594,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            mint_managed_runner_token=(
+                _mint_managed_runner_token if runner_account_store is not None else None
+            ),
         ),
         prefix="/v1",
         tags=["runners"],
@@ -3172,6 +3611,7 @@ def create_app(
     if host_store is not None:
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
+        from omnigent.server.routes.skills import create_skills_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
@@ -3203,6 +3643,19 @@ def create_app(
             ),
             prefix="/v1",
             tags=["hosts"],
+        )
+        app.include_router(
+            create_skills_router(
+                host_registry,
+                host_store,
+                conversation_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["skills"],
         )
         # Host-facing credential vending: a sandbox fetches its owner's
         # per-provider credential over the launch-token-authenticated channel
@@ -3278,10 +3731,15 @@ def create_app(
             and auth_provider._source == "accounts"
             and account_store is not None
         ):
+            from omnigent.server.auth import AccountAuthenticationMiddleware
             from omnigent.server.routes.accounts_auth import (
                 create_accounts_auth_router,
             )
 
+            # A deleted account's still-signed session JWTs must stop
+            # authenticating; every request checks the generation and tombstone.
+            auth_provider.set_account_check(account_store.accepts_generation)
+            app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
             app.include_router(
                 create_accounts_auth_router(
                     auth_provider,
@@ -3289,6 +3747,7 @@ def create_app(
                     admin_list,
                     permission_store,
                     device_grant_store,
+                    scheduled_task_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
@@ -3441,8 +3900,13 @@ def create_app(
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
-    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is
-    # registered AFTER all API routers so router routes win on overlap.
+    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount stays
+    # at the domain root regardless of `resolved_base_path` — a configured
+    # base path is instead handled by rebasing the served HTML/asset refs
+    # (see `_rewrite_web_ui_index`) and by `BasePathMiddleware` stripping the
+    # prefix from incoming requests, which is what lets one server work
+    # whether the fronting proxy forwards the prefix or strips it. The mount
+    # is registered AFTER all API routers so router routes win on overlap.
     # Skipping the mount when no build is present keeps API-only
     # deployments working (and ``/`` 404s cleanly instead of exploding at
     # startup).
@@ -3468,7 +3932,7 @@ def create_app(
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
-                _SPAStaticFiles(directory=web_ui_dist, html=True),
+                _SPAStaticFiles(directory=web_ui_dist, html=True, base_path=resolved_base_path),
                 minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE,
             ),
             name="web-ui",
@@ -3484,6 +3948,14 @@ def create_app(
         async def root() -> FileResponse:
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
+
+    app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
+    if resolved_base_path:
+        # Added last → outermost ASGI layer, so the prefix is stripped before
+        # routing and every other middleware sees canonical `/v1/...` paths.
+        # Only wired when a base path is configured: a root deployment pays
+        # no per-request cost.
+        app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
     return app
 
@@ -3503,7 +3975,33 @@ class _SPAStaticFiles(StaticFiles):
     and a path with a file extension (``.js``, ``.css``, ``.png``,
     ``.woff2``, …) returns the static 404 verbatim. Other extensionless
     paths fall back to ``index.html``.
+
+    The HTML shell is rebased for the deployment ``base_path`` once at
+    startup (see :func:`_rewrite_web_ui_index`) and served from memory with
+    a content ``etag`` so ``If-None-Match`` revalidation still yields ``304``.
     """
+
+    def __init__(self, *args: Any, base_path: str = "", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._index_html: bytes | None = None
+        self._index_etag: str | None = None
+        index_file = Path(self.directory) / "index.html"  # type: ignore[arg-type]
+        if index_file.is_file():
+            html = _rewrite_web_ui_index(index_file.read_text(encoding="utf-8"), base_path)
+            self._index_html = html.encode("utf-8")
+            self._index_etag = f'"{hashlib.md5(self._index_html).hexdigest()}"'
+
+    def _shell_response(self, scope: Scope) -> Response:
+        """Serve the rebased HTML shell from memory, honoring ``If-None-Match``."""
+        assert self._index_html is not None
+        if_none_match = next(
+            (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"if-none-match"),
+            None,
+        )
+        if self._index_etag is not None and if_none_match == self._index_etag:
+            return Response(status_code=304, headers={"etag": self._index_etag})
+        headers = {"etag": self._index_etag} if self._index_etag else {}
+        return Response(self._index_html, media_type="text/html", headers=headers)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # The mount is at "/" so it catches *every* unmatched path —
@@ -3520,6 +4018,11 @@ class _SPAStaticFiles(StaticFiles):
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
+        # The HTML shell (root, directory, or SPA history fallback) is served
+        # from the rebased in-memory copy rather than the file on disk, so
+        # asset refs and the injected base-path global reflect `base_path`.
+        if self._index_html is not None and path in ("", ".", "index.html"):
+            return _apply_web_ui_cache_headers(self._shell_response(scope), "index.html")
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
@@ -3543,7 +4046,11 @@ class _SPAStaticFiles(StaticFiles):
                 )
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
-                response = await super().get_response("index.html", scope)
+                response = (
+                    self._shell_response(scope)
+                    if self._index_html is not None
+                    else await super().get_response("index.html", scope)
+                )
             else:
                 raise
         return _apply_web_ui_cache_headers(response, served_path)

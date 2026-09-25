@@ -172,6 +172,9 @@ describe("SubagentsPanel", () => {
 
     renderPanel({ rootSessionId: "conv_root" });
 
+    const heading = screen.getByRole("heading", { name: "Agents" });
+    expect(heading).toHaveClass("font-medium", "text-ui");
+    expect(heading.parentElement).toHaveClass("h-11");
     const main = screen.getByTestId("subagent-main-row");
     expect(main).toHaveAttribute("href", "/c/conv_root");
     expect(main).toHaveAttribute("data-root-session-id", "conv_root");
@@ -1326,10 +1329,12 @@ describe("SubagentsPanel", () => {
     renderPanel({
       rootSessionId: "conv_root",
       // Simulate stale session-scoped params carried over from the
-      // previous session — the bug condition the fix targets. All four
-      // are listed so any regression that drops a key from
-      // SESSION_SCOPED_PARAMS surfaces here.
-      initialEntries: ["/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed"],
+      // previous session — the bug condition the fix targets. All five
+      // are listed so any regression that drops a key from the shared
+      // session-scoped search-param list surfaces here.
+      initialEntries: [
+        "/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed&message=msg_1",
+      ],
     });
 
     const main = screen.getByTestId("subagent-main-row");

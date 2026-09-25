@@ -44,6 +44,8 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
+
 # Per-conversation mapping of outstanding elicitation_id → original
 # event payload. Storing the full event (not just the id) lets
 # ``GET /v1/sessions/{id}`` replay the prompt into the UI on cold
@@ -53,7 +55,7 @@ from typing import Any
 # when a ``response.elicitation_resolved`` event flows through the
 # SSE chokepoint). Empty inner dicts are popped eagerly so
 # :func:`count_for` doesn't see stale keys.
-_pending: dict[str, dict[str, dict[str, Any]]] = {}
+_pending: WorkspaceScopedCache[str, dict[str, dict[str, Any]]] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 # Optional observer (``subagent_block_notifier``) run synchronously on every

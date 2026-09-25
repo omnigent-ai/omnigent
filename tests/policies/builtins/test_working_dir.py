@@ -177,6 +177,31 @@ def test_git_without_dash_c_abstains() -> None:
     assert policy(_sh("git commit -m wip")) is None
 
 
+@pytest.mark.parametrize(
+    "spawned",
+    [
+        "find . -maxdepth 0 -exec git -C /etc/secrets log +",
+        "xargs git worktree add /outside",
+    ],
+)
+def test_process_spawning_utility_escape_is_gated(spawned: str) -> None:
+    """A ``git -C`` / worktree escape spawned by find/xargs is gated.
+
+    The utility's head is not modelled here, so the segment abstained → ALLOW.
+    It is now treated as an unresolved invocation and, because the segment reads
+    as a directory/worktree op, surfaced via the configured action.
+    """
+    policy = block_working_dir_changes()
+    result = policy(_sh(spawned))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_process_spawning_utility_without_dir_op_abstains() -> None:
+    """A benign ``find`` naming no dir/worktree op is not over-blocked."""
+    policy = block_working_dir_changes()
+    assert policy(_sh("find . -name '*.py'")) is None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 1 — git worktree gating
 # ══════════════════════════════════════════════════════════════════════════════

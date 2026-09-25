@@ -14,6 +14,25 @@ import pytest
 from omnigent.db.compression import _MIN_COMPRESS_BYTES, decode, encode
 
 
+@pytest.mark.parametrize("write_content_size", [False, True])
+def test_bounded_decode_limits_zstd_frames(write_content_size: bool) -> None:
+    import zstandard
+
+    packed = zstandard.ZstdCompressor(write_content_size=write_content_size).compress(b"x" * 2048)
+    framed = b"\x00\x01" + packed
+    assert decode(framed, max_decoded_bytes=2048) == "x" * 2048
+    with pytest.raises((ValueError, zstandard.ZstdError)):
+        decode(framed, max_decoded_bytes=1024)
+    with pytest.raises(zstandard.ZstdError):
+        decode(framed[:-1], max_decoded_bytes=2048)
+
+
+@pytest.mark.parametrize("value", ["é" * 10, ("é" * 10).encode(), b"\x00\x00" + b"x" * 20])
+def test_bounded_decode_limits_legacy_and_raw_values(value: str | bytes) -> None:
+    with pytest.raises(ValueError, match="size limit"):
+        decode(value, max_decoded_bytes=15)
+
+
 def test_none_round_trips() -> None:
     """``None`` encodes to ``None`` and decodes back to ``None``."""
     assert encode(None) is None
