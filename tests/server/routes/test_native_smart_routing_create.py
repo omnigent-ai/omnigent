@@ -88,8 +88,8 @@ def _restore_runtime_globals() -> Iterator[None]:
         setattr(_globals, name, value)
 
 
-CLAUDE_MODEL = "databricks-claude-opus-4-8"
-GPT_MODEL = "databricks-gpt-5-5"
+CLAUDE_MODEL = "system.ai.claude-opus-4-8"
+GPT_MODEL = "system.ai.gpt-5-5"
 ROUTING_MESSAGE = "refactor the auth module and add tests"
 
 SPAWN_PAYLOAD = {
@@ -1542,8 +1542,8 @@ async def test_sdk_harness_create_is_not_gated_by_native_gateway_state(
 # current arms must be servable candidates — an arm missing from the candidate
 # set is substituted down a generation (a routed gpt-5-6-sol applying 5-5).
 
-SOL = "databricks-gpt-5-6-sol"
-LUNA = "databricks-gpt-5-6-luna"
+SOL = "system.ai.gpt-5-6-sol"
+LUNA = "system.ai.gpt-5-6-luna"
 HOST_GPT_CATALOG = [LUNA, SOL]
 
 
@@ -1622,8 +1622,8 @@ async def test_pre_session_catalog_is_offered_instead_of_the_static_table(
 @pytest.mark.parametrize(
     ("arm", "applied"),
     [
-        ("gpt-5-6-sol", "databricks-gpt-5-6-sol"),
-        ("gpt-5-6-luna", "databricks-gpt-5-6-luna"),
+        ("gpt-5-6-sol", "system.ai.gpt-5-6-sol"),
+        ("gpt-5-6-luna", "system.ai.gpt-5-6-luna"),
         # No discovery listing carries glm, so the static table is its only
         # source; it applies under the gateway's model-route spelling.
         ("glm-5-2", "system.ai.glm-5-2"),

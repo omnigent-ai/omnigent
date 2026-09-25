@@ -79,9 +79,15 @@ def parse_model_string(model: str) -> RoutedModel:
 # Used by :func:`infer_harness_from_model` when a spec doesn't name
 # a harness explicitly.
 _HARNESS_FOR_MODEL_PREFIX: dict[str, str] = {
+    "system.ai.claude-": "claude-sdk",
     "databricks-claude-": "claude-sdk",
     "anthropic/claude-": "claude-sdk",
+    "system.ai.gpt-": "openai-agents",
     "databricks-gpt-": "openai-agents",
+    "system.ai.glm-": "openai-agents",
+    "databricks-glm-": "openai-agents",
+    "system.ai.kimi-": "openai-agents",
+    "databricks-kimi-": "openai-agents",
     "openai/gpt-": "openai-agents",
     "gpt-": "openai-agents",
     # xAI is OpenAI-compatible; provider prefix required (bare grok- defaults to openai).

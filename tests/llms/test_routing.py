@@ -109,10 +109,14 @@ def test_unknown_provider_raises() -> None:
         # passthrough 400s for Claude).
         ("databricks-claude-sonnet-4", "claude-sdk"),
         ("databricks-claude-sonnet-4-6", "claude-sdk"),
+        ("system.ai.claude-sonnet-4-6", "claude-sdk"),
         # Anthropic-prefixed models also need claude-sdk.
         ("anthropic/claude-sonnet-4-20250514", "claude-sdk"),
         # Databricks-hosted GPT and plain OpenAI models → openai-agents.
         ("databricks-gpt-5-4", "openai-agents"),
+        ("system.ai.gpt-5-6-sol", "openai-agents"),
+        ("system.ai.glm-5-2", "openai-agents"),
+        ("system.ai.kimi-k2-6", "openai-agents"),
         ("openai/gpt-5.4", "openai-agents"),
         ("gpt-5.4", "openai-agents"),
         # xAI / Grok models -- provider prefix required.
