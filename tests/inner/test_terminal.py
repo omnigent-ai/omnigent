@@ -2109,13 +2109,7 @@ async def _failed_launch_error(
     monkeypatch: pytest.MonkeyPatch,
     process: _FailingProcess,
 ) -> str:
-    """Launch with a failing mocked tmux and return the raised error message.
-
-    :param tmp_path: Temporary directory for the fake tmux socket.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param process: The fake tmux process the launch observes.
-    :returns: The ``RuntimeError`` message ``launch`` raised.
-    """
+    """Launch with a failing mocked tmux and return the raised error message."""
 
     async def fake_create_subprocess_exec(
         *cmd: str,

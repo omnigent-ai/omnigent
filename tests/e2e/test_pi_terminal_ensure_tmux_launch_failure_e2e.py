@@ -1,18 +1,6 @@
-"""
-A failed Pi terminal launch must keep tmux's own diagnostic in the runner log.
-
-Spawns the real ``omnigent pi --server ''`` CLI under a pseudo-TTY (it
-auto-starts a local server, host daemon and runner) with a ``tmux`` shim first
-on ``PATH`` that passes the version preflight but exits 1 from ``new-session``
-with its reason on stdout. The CLI must die on the terminal ensure, and the
-runner log's ``tmux launch failed (rc=1): ...`` line must carry that reason
-instead of an empty string. No Pi model turn runs.
-
-Usage::
-
-    python -m pytest tests/e2e/test_pi_terminal_ensure_tmux_launch_failure_e2e.py \\
-        --timeout=420
-"""
+"""Run the real ``omnigent pi --server ''`` CLI with a tmux shim that passes ``-V`` but fails
+``new-session`` with its reason on stdout: the CLI must die on the terminal ensure, and the
+runner log's ``tmux launch failed (rc=1): ...`` line must carry that reason, never nothing."""
 
 from __future__ import annotations
 
