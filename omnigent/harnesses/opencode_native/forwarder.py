@@ -519,6 +519,11 @@ class OpenCodeNativeForwarder:
         }
         self._permission_tasks: dict[str, asyncio.Task[None]] = {}
         self._form_tasks: dict[str, asyncio.Task[None]] = {}
+        # Permission/form ids we are answering, and those the TUI resolved meanwhile.
+        self._answering: set[str] = set()
+        self._answered_elsewhere: set[str] = set()
+        # Request/form id -> OpenCode session whose running edge shows a failed reply.
+        self._blocked_replies: dict[str, str] = {}
         # assistantMessageID -> step usage (root session only).
         self._usage_by_message: dict[str, _AssistantUsage] = {}
         # Authoritative session totals from ``session.usage.updated``.
@@ -1398,6 +1403,15 @@ class OpenCodeNativeForwarder:
 
     async def _handle_permission(self, request: OpenCodePermissionRequest) -> None:
         """Resolve one permission and reply ``once`` or ``reject`` (never ``always``)."""
+        self._answering.add(request.request_id)
+        try:
+            await self._answer_permission(request)
+        finally:
+            self._answering.discard(request.request_id)
+            self._answered_elsewhere.discard(request.request_id)
+
+    async def _answer_permission(self, request: OpenCodePermissionRequest) -> None:
+        """Evaluate policy and send the reply; a failed reply surfaces ``blocked_on``."""
         decision = await self._resolve_permission(request_dict=request)
         # ``ask`` means no human resolution was obtained upstream: fail closed.
         reply = decision_to_reply(decision) or "reject"
@@ -1416,13 +1430,35 @@ class OpenCodeNativeForwarder:
                 request.request_id,
                 exc_info=True,
             )
-            turn = self._turns.get(request.session_id or self._opencode_session_id)
-            if turn is not None:
-                await self._post_status(
-                    turn,
-                    _STATUS_RUNNING,
-                    extra={"blocked_on": f"permission reply failed for {request.request_id}"},
-                )
+            await self._surface_reply_failure(
+                request.session_id or self._opencode_session_id,
+                request.request_id,
+                f"permission reply failed for {request.request_id}",
+            )
+
+    async def _surface_reply_failure(self, session_id: str, item_id: str, label: str) -> None:
+        """Show a failed reply as ``blocked_on`` unless the TUI already resolved it."""
+        if item_id in self._answered_elsewhere:
+            return
+        turn = self._turns.get(session_id)
+        if turn is None:
+            return
+        self._blocked_replies[item_id] = session_id
+        await self._post_status(turn, _STATUS_RUNNING, extra={"blocked_on": label})
+
+    async def _note_resolved_after_our_mark(self, item_id: str) -> None:
+        """A resolution event for an id we already marked: our echo, or a late TUI answer."""
+        if item_id in self._answering:
+            self._answered_elsewhere.add(item_id)
+            return
+        session_id = self._blocked_replies.pop(item_id, None)
+        turn = self._turns.get(session_id) if session_id is not None else None
+        if turn is not None and turn.turn_active:
+            await self._post_status(
+                turn,
+                _STATUS_RUNNING,
+                extra={"response_id": self._response_id(turn, turn.assistant_message_id)},
+            )
 
     async def _resolve_permission(
         self, *, request_dict: OpenCodePermissionRequest
@@ -1459,7 +1495,10 @@ class OpenCodeNativeForwarder:
         and clear the web card.
         """
         request_id = _str_field(event.data, "requestID")
-        if request_id is None or not self.state.mark(self._key("perm-replied", request_id)):
+        if request_id is None:
+            return
+        if not self.state.mark(self._key("perm-replied", request_id)):
+            await self._note_resolved_after_our_mark(request_id)
             return
         task = self._permission_tasks.pop(request_id, None)
         if task is not None and not task.done():
@@ -1483,6 +1522,15 @@ class OpenCodeNativeForwarder:
         task.add_done_callback(lambda _t, fid=form_id: self._form_tasks.pop(fid, None))
 
     async def _handle_form(self, session_id: str, form_id: str, form: dict[str, Any]) -> None:
+        """Park one form, reply, and track TUI answers that race our reply."""
+        self._answering.add(form_id)
+        try:
+            await self._answer_form(session_id, form_id, form)
+        finally:
+            self._answering.discard(form_id)
+            self._answered_elsewhere.discard(form_id)
+
+    async def _answer_form(self, session_id: str, form_id: str, form: dict[str, Any]) -> None:
         """Park one form as a web card and reply with the mapped answer.
 
         Any outcome other than a valid ``accept`` cancels the form so the
@@ -1529,13 +1577,9 @@ class OpenCodeNativeForwarder:
                 exc_info=True,
             )
             await self._cancel_form_quietly(session_id, form_id)
-            turn = self._turns.get(session_id)
-            if turn is not None:
-                await self._post_status(
-                    turn,
-                    _STATUS_RUNNING,
-                    extra={"blocked_on": f"form reply failed for {form_id}"},
-                )
+            await self._surface_reply_failure(
+                session_id, form_id, f"form reply failed for {form_id}"
+            )
 
     async def _cancel_form_quietly(self, session_id: str, form_id: str) -> None:
         """Best-effort cancel a form; a TUI answer commonly makes this 404."""
@@ -1607,7 +1651,10 @@ class OpenCodeNativeForwarder:
         task and clear the web card.
         """
         form_id = _str_field(event.data, "id")
-        if form_id is None or not self.state.mark(self._key("form-replied", form_id)):
+        if form_id is None:
+            return
+        if not self.state.mark(self._key("form-replied", form_id)):
+            await self._note_resolved_after_our_mark(form_id)
             return
         task = self._form_tasks.pop(form_id, None)
         if task is not None and not task.done():

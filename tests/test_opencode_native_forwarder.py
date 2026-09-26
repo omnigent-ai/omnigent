@@ -1247,6 +1247,42 @@ async def test_permission_reply_failure_is_surfaced() -> None:
     assert statuses[-1]["blocked_on"] == "permission reply failed for per_err"
 
 
+async def test_late_tui_permission_answer_clears_blocked_on() -> None:
+    """The TUI answering after our reply failed means OpenCode is no longer blocked."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+
+    async def failing_reply(*_args: Any, **_kwargs: Any) -> bool:
+        raise OpenCodeClientError("reply failed: 404")
+
+    opencode.reply_permission = failing_reply  # type: ignore[method-assign]
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_asked("per_late"))
+    await _drain(fwd)
+    assert _datas(server.posts, "external_session_status")[-1]["blocked_on"]
+    await fwd.handle_event(_event("permission.replied", requestID="per_late", reply="once"))
+    last = _datas(server.posts, "external_session_status")[-1]
+    assert last["status"] == "running"
+    assert "blocked_on" not in last
+
+
+async def test_tui_permission_answer_during_failed_reply_skips_blocked_on() -> None:
+    """A reply that lost the race to the TUI must not surface a blocked label."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+
+    async def racing_reply(*_args: Any, **_kwargs: Any) -> bool:
+        await fwd.handle_event(_event("permission.replied", requestID="per_race", reply="once"))
+        raise OpenCodeClientError("reply failed: 404")
+
+    opencode.reply_permission = racing_reply  # type: ignore[method-assign]
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_asked("per_race"))
+    await _drain(fwd)
+    statuses = _datas(server.posts, "external_session_status")
+    assert all("blocked_on" not in status for status in statuses)
+
+
 async def test_permission_evaluation_does_not_block_the_event_loop() -> None:
     """A parked approval must not stall later events for the session."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
@@ -1568,6 +1604,29 @@ async def test_form_unexpected_error_cancels_and_surfaces(
     statuses = _datas(server.posts, "external_session_status")
     assert statuses[-1]["blocked_on"] == "form reply failed for frm_1"
     assert any("conv_1" in r.getMessage() and "frm_1" in r.getMessage() for r in caplog.records)
+
+
+async def test_late_tui_form_answer_clears_blocked_on() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"q0": "Tabs"}}
+
+    async def failing_reply(*_args: Any, **_kwargs: Any) -> bool:
+        raise OpenCodeClientError("reply failed: 404")
+
+    async def failing_cancel(*_args: Any, **_kwargs: Any) -> bool:
+        raise OpenCodeClientError("cancel failed: 404")
+
+    opencode.reply_form = failing_reply  # type: ignore[method-assign]
+    opencode.cancel_form = failing_cancel  # type: ignore[method-assign]
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_form_event("frm_late", _SINGLE))
+    await _drain(fwd)
+    assert _datas(server.posts, "external_session_status")[-1]["blocked_on"]
+    await fwd.handle_event(_event("form.replied", id="frm_late", answer={"q0": "Tabs"}))
+    last = _datas(server.posts, "external_session_status")[-1]
+    assert last["status"] == "running"
+    assert "blocked_on" not in last
 
 
 async def test_form_hook_transport_failure_cancels_form() -> None:
