@@ -42,13 +42,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import threading
 import uuid
 from collections.abc import AsyncIterator, Coroutine
 from typing import Any
 
 import httpx
-from playwright.async_api import async_playwright, expect
+from playwright.async_api import Route, async_playwright, expect
 
 from omnigent.host.frames import (
     HostCreateDirFrame,
@@ -74,7 +75,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from tests.e2e_ui.start_session.helpers import open_landing_workspace_picker
+from tests.e2e_ui.start_session.helpers import (
+    commit_landing_workspace_picker,
+    open_landing_workspace_picker,
+)
 
 _HOST_NAME = "win11-e2e"
 _WIN_HOME = "C:\\Users\\alice"
@@ -520,3 +524,47 @@ async def _drive_create_directory(base_url: str) -> None:
         )
         created = resp.json()["path"]
         assert created.endswith("new-app"), created
+
+
+def test_windows_workspace_enables_send(live_server: str) -> None:
+    """A native Windows path chosen in the picker must enable Send."""
+    _run_in_fresh_loop(_drive_windows_workspace_enables_send(live_server))
+
+
+async def _drive_windows_workspace_enables_send(base_url: str) -> None:
+    async with _windows_host(base_url) as host_id, async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        video_dir = os.environ.get("OMNI_E2E_VIDEO_DIR")
+        context = await browser.new_context(
+            **({"record_video_dir": video_dir} if video_dir else {})
+        )
+        page = await context.new_page()
+        try:
+            # Isolate the workspace gate from agents left by other tests.
+            # Hosts and filesystem requests still use the real tunnel.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body='{"data": []}'
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await _open_picker_at_windows_home(page, base_url, host_id)
+
+            await page.get_by_test_id("workspace-picker-entry-work").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-entry-omnigent-app")).to_be_visible(
+                timeout=10_000
+            )
+            await commit_landing_workspace_picker(page)
+
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_attribute(
+                "aria-label", re.compile(r"^Working directory: C:[\\/]Users[\\/]alice[\\/]work$")
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("Work on this repository")
+            await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled(
+                timeout=10_000
+            )
+        finally:
+            await context.close()
+            await browser.close()
