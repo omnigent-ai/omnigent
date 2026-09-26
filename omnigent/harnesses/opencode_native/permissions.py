@@ -1,16 +1,10 @@
 """OpenCode permission normalization and policy/approval mapping.
 
-OpenCode requests approval for sensitive actions via permission events
-(``permission.v2.asked`` over SSE / ``GET /permission``) and accepts a
-reply of ``once`` / ``always`` / ``reject`` (``POST
-/permission/{requestID}/reply``). This module is the seam between
-OpenCode's permission surface and Omnigent's policy/approval model:
-
-1. Normalize a raw permission request into a flat policy-evaluation input.
-2. Map an Omnigent policy verdict (allow / allow-always / deny / ask) onto
-   an OpenCode reply.
-3. Fail closed: an unmapped verdict yields no auto-reply, so the caller
-   must obtain a human decision before answering.
+OpenCode 2.x emits ``permission.asked`` for every tool call the ask-all
+ruleset gates and accepts ``once`` / ``reject`` on
+``POST /api/session/{id}/permission/{requestID}/reply``. This module turns a
+request into a policy-evaluation input and maps the verdict back onto a
+reply; an unmapped verdict yields no auto-reply (fail closed).
 """
 
 from __future__ import annotations
@@ -23,8 +17,8 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 OPENCODE_NATIVE_HARNESS = "opencode-native"
 
-# OpenCode's accepted reply tokens.
-OpenCodeReply = Literal["once", "always", "reject"]
+# Reply tokens the forwarder sends; ``always`` is never used (see decision_to_reply).
+OpenCodeReply = Literal["once", "reject"]
 
 # Omnigent-side normalized decisions used by the forwarder.
 PolicyDecision = Literal["allow_once", "allow_always", "reject", "ask"]
@@ -35,71 +29,76 @@ _JsonMapping: TypeAlias = Mapping[str, object]
 @dataclass(frozen=True)
 class OpenCodePermissionRequest:
     """
-    A normalized OpenCode permission request.
+    A normalized OpenCode ``Permission.Request``.
 
-    :param request_id: OpenCode permission request id, e.g. ``"per_..."``.
-    :param session_id: OpenCode session id the request belongs to.
-    :param action: The action/tool name needing approval, e.g.
-        ``"bash"`` or ``"edit"``.
-    :param resources: Resource descriptors (command/path/url), as given.
-    :param metadata: Extra metadata supplied by OpenCode.
-    :param source: Where the request originated, when reported.
-    :param raw: The full raw payload for forward-compatibility.
+    :param request_id: Permission request id, e.g. ``"per_..."``.
+    :param session_id: OpenCode session id, e.g. ``"ses_..."``.
+    :param action: Permission action, e.g. ``"shell"``, ``"edit"``, or an MCP
+        tool name such as ``"omnigent_sys_session_list"``.
+    :param resources: Resource strings (command text, relative path, URL, pattern).
+    :param metadata: Tool-supplied metadata (e.g. ``{"filepath": ..., "diff": ...}``).
+    :param source: ``{"type": "tool", "messageID": ..., "id": ...}`` when raised by a tool.
+    :param message: Optional message a permission hook attached.
+    :param raw: The full payload.
     """
 
     request_id: str
     session_id: str | None
     action: str | None
-    resources: list[object] = field(default_factory=list)
+    resources: list[str] = field(default_factory=list)
     metadata: _JsonObject = field(default_factory=dict)
-    source: str | None = None
+    source: _JsonObject | None = None
+    message: str | None = None
     raw: _JsonObject = field(default_factory=dict)
 
+    @property
+    def tool_call_id(self) -> str | None:
+        """:returns: The originating tool call id (``source.id``), if any."""
+        value = self.source.get("id") if self.source else None
+        return value if isinstance(value, str) and value else None
 
-def parse_permission_request(payload: _JsonMapping) -> OpenCodePermissionRequest | None:
+    @property
+    def message_id(self) -> str | None:
+        """:returns: The originating assistant message id (``source.messageID``)."""
+        value = self.source.get("messageID") if self.source else None
+        return value if isinstance(value, str) and value else None
+
+
+# Cross-stage contract name.
+PermissionRequest = OpenCodePermissionRequest
+
+
+def parse_permission_request(data: _JsonMapping) -> OpenCodePermissionRequest | None:
     """
-    Parse a raw permission payload into :class:`OpenCodePermissionRequest`.
+    Parse a v2 ``permission.asked`` payload.
 
-    Accepts BOTH opencode permission event shapes (live-verified against
-    1.17.7, which emits v1 ``permission.asked``):
-
-    - **v1** (``permission.asked``): ``{id, sessionID, permission, patterns,
-      metadata, always, tool}`` — the tool/category is in ``permission``
-      (e.g. ``"bash"``/``"edit"``/``"read"``) and the resources are string
-      ``patterns``.
-    - **v2** (``permission.v2.asked``): ``{id, sessionID, action, resources,
-      save, metadata, source}`` — the category is in ``action``.
-
-    The category MUST be extracted (it becomes the policy-evaluation tool
-    name): reading only ``action``/``type`` left v1's ``permission`` field
-    unread, so every opencode tool reached the policy engine as the literal
-    name ``"permission"`` and matched no tool-name policy (e.g. "Require
-    Approval for File & Shell Operations" never fired). Also accepts entries
-    from ``GET /permission``.
-
-    :param payload: Raw permission object.
-    :returns: Parsed request, or ``None`` when no request id is present.
+    :param data: The event ``data`` object (``Permission.Request``).
+    :returns: Parsed request, or ``None`` when no ``id`` is present.
     """
-    request_id = payload.get("id") or payload.get("requestID") or payload.get("request_id")
+    request_id = data.get("id")
     if not isinstance(request_id, str) or not request_id:
         return None
-    session_id = payload.get("sessionID") or payload.get("session_id")
-    # v2 → ``action``; v1 → ``permission`` (the tool category, e.g. "bash").
-    action = payload.get("action") or payload.get("type") or payload.get("permission")
-    # v2 → ``resources`` (dicts); v1 → ``patterns`` (strings).
-    resources = payload.get("resources") or payload.get("patterns")
-    metadata = payload.get("metadata")
-    source = payload.get("source")
+    session_id = data.get("sessionID")
+    action = data.get("action")
+    resources = data.get("resources")
+    metadata = data.get("metadata")
+    source = data.get("source")
+    message = data.get("message")
     return OpenCodePermissionRequest(
         request_id=request_id,
         session_id=session_id if isinstance(session_id, str) else None,
-        action=action if isinstance(action, str) else None,
-        resources=list(resources) if isinstance(resources, list) else [],
+        action=action if isinstance(action, str) and action else None,
+        resources=[item for item in resources if isinstance(item, str)]
+        if isinstance(resources, list)
+        else [],
         metadata={key: value for key, value in metadata.items() if isinstance(key, str)}
         if isinstance(metadata, Mapping)
         else {},
-        source=source if isinstance(source, str) else None,
-        raw=dict(payload),
+        source={key: value for key, value in source.items() if isinstance(key, str)}
+        if isinstance(source, Mapping)
+        else None,
+        message=message if isinstance(message, str) and message else None,
+        raw=dict(data),
     )
 
 
