@@ -248,6 +248,27 @@ def record(
     return pending_id
 
 
+def find_by_stable_id(conversation_id: str, stable_id: str) -> str | None:
+    """
+    Return the live pending entry recorded for *stable_id*, if any.
+
+    Read-only companion to the dedup inside :func:`record`: the dispatch
+    pre-check answers a re-POST of a still-pending submission with the
+    original entry's id instead of forwarding the message to the pane again.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The web client's 32-hex submission id.
+    :returns: The matching entry's pending id, or ``None`` when no live
+        entry carries *stable_id*.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        for entry in _pending.get(conversation_id, {}).values():
+            if entry.stable_id == stable_id:
+                return entry.pending_id
+    return None
+
+
 def resolve(conversation_id: str, pending_id: str) -> None:
     """
     Drop a pending entry by id.

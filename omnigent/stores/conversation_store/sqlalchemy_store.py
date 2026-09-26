@@ -2335,6 +2335,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "type": encode_item_type(item.type),
                 "data": data,
                 "created_by": item.created_by,
+                "web_stable_id": item.web_stable_id,
             }
             # A backend may omit search_text (see _item_search_text): when it
             # returns None we drop the column so a schema without it still
@@ -2485,6 +2486,42 @@ class SqlAlchemyConversationStore(ConversationStore):
             "append_conversation_items",
             write,
         )
+
+    def find_web_submission_item_id(
+        self,
+        conversation_id: str,
+        stable_id: str,
+    ) -> str | None:
+        """
+        Return the committed message item for a web submission's stable id.
+
+        Backs the native re-send dedup pre-check: a repeated ``stable_id``
+        whose message the transcript forwarder has already committed must be
+        answered with that item instead of being pasted into the pane again.
+        The mirror is persisted either directly under the stable id (item id
+        ``== stable_id``) or under a forwarder-derived id carrying the
+        submission's ``web_stable_id`` — both are indexed point lookups.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param stable_id: The web client's 32-hex submission id.
+        :returns: The committed item's id, or ``None`` when no message item
+            in this conversation commits that submission.
+        """
+        with self._conv_session("find_web_submission_item") as session:
+            return session.execute(
+                select(SqlConversationItem.id)
+                .where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.type == encode_item_type("message"),
+                    or_(
+                        SqlConversationItem.id == stable_id,
+                        SqlConversationItem.web_stable_id == stable_id,
+                    ),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
 
     def list_projects(
         self,

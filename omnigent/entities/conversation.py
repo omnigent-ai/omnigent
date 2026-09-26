@@ -842,6 +842,12 @@ class NewConversationItem(BaseModel):
     # know whether a timed-out POST committed). Same 32-hex shape the store
     # mints itself; ``None`` keeps the store-assigned random id.
     stable_id: str | None = None
+    # The web client's stable id for the submission this item commits, when it
+    # differs from the item's own id (a native mirror whose id is derived from
+    # the forwarder's source_id). Persisted so a re-send of that stable id can
+    # be resolved to this item even after the in-memory pending index is gone
+    # (server restart / expiry) instead of pasting the prompt again.
+    web_stable_id: str | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -852,8 +858,10 @@ class NewConversationItem(BaseModel):
         :raises ValueError: If ``type`` does not match ``data``.
         """
         _validate_type_matches_data(self.type, self.data)
-        if self.stable_id is not None and not re.fullmatch(r"[0-9a-f]{32}", self.stable_id):
-            raise ValueError("stable_id must be a 32-char lowercase hex string")
+        for field_name in ("stable_id", "web_stable_id"):
+            value = getattr(self, field_name)
+            if value is not None and not re.fullmatch(r"[0-9a-f]{32}", value):
+                raise ValueError(f"{field_name} must be a 32-char lowercase hex string")
         return self
 
 

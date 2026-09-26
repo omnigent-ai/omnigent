@@ -7719,6 +7719,94 @@ def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
     assert len(conversation_store.list_items(conv.id).data) == 1
 
 
+# ── Web-submission lookup (web_stable_id) ──────────────────
+
+
+def test_find_web_submission_resolves_mirror_persisted_under_forwarder_id(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A mirror whose id is forwarder-derived resolves via ``web_stable_id``.
+
+    The codex-native shape: the committed item's id comes from the
+    forwarder's source_id, and the web submission id rides alongside so a
+    re-send can find the item after the in-memory pending index is gone.
+    """
+    conv = conversation_store.create_conversation()
+    submission = "2c" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="3d" * 16,
+        web_stable_id=submission,
+    )
+    [persisted] = conversation_store.append(conv.id, [item])
+
+    assert conversation_store.find_web_submission_item_id(conv.id, submission) == persisted.id
+
+
+def test_find_web_submission_resolves_mirror_persisted_under_the_stable_id(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A mirror committed directly under the submission id resolves by item id."""
+    conv = conversation_store.create_conversation()
+    submission = "4e" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=submission,
+    )
+    [persisted] = conversation_store.append(conv.id, [item])
+
+    assert persisted.id == submission
+    assert conversation_store.find_web_submission_item_id(conv.id, submission) == submission
+
+
+def test_find_web_submission_is_conversation_scoped_and_misses_unknown_ids(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv_a = conversation_store.create_conversation()
+    conv_b = conversation_store.create_conversation()
+    submission = "5f" * 16
+    conversation_store.append(
+        conv_a.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_x",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+                web_stable_id=submission,
+            )
+        ],
+    )
+
+    assert conversation_store.find_web_submission_item_id(conv_a.id, submission) is not None
+    assert conversation_store.find_web_submission_item_id(conv_b.id, submission) is None
+    assert conversation_store.find_web_submission_item_id(conv_a.id, "6a" * 16) is None
+
+
+def test_find_web_submission_ignores_non_message_items(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Only message items answer a re-send; another item type under the id does not."""
+    conv = conversation_store.create_conversation()
+    submission = "7b" * 16
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="error",
+                response_id="resp_x",
+                data=ErrorData(source="execution", code="boom", message="boom"),
+                stable_id=submission,
+            )
+        ],
+    )
+
+    assert conversation_store.find_web_submission_item_id(conv.id, submission) is None
+
+
 # ── Connection-checkout budget ─────────────────────────
 
 

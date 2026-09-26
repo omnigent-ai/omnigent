@@ -690,6 +690,28 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def find_web_submission_item_id(
+        self,
+        conversation_id: str,
+        stable_id: str,
+    ) -> str | None:
+        """
+        Return the committed message item id for a web submission's stable id.
+
+        A native mirror commits either directly under the stable id or under
+        a forwarder-derived id recorded with the submission's
+        ``web_stable_id``; both resolve here. Backs the re-send dedup
+        pre-check that must survive a server restart.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param stable_id: The web client's 32-hex submission id.
+        :returns: The committed item's id, or ``None`` when the submission
+            has no committed message item in this conversation.
+        """
+        ...
+
+    @abstractmethod
     def list_conversations(
         self,
         limit: int = 20,

@@ -2605,9 +2605,15 @@ async def _persist_external_conversation_item(
                 item = item.model_copy(update={"created_by": drained.created_by})
             # A web client that sends stable_id gets store-level idempotency:
             # use it directly as the item id so the append is a no-op on retry.
-            # source_id from the forwarder takes precedence when both are set.
-            if drained.stable_id is not None and item.stable_id is None:
-                item = item.model_copy(update={"stable_id": drained.stable_id})
+            # source_id from the forwarder takes precedence when both are set;
+            # the web stable_id is then persisted alongside the item so a
+            # re-send can be resolved to it even after a server restart wipes
+            # this in-memory index (the dispatch pre-check's durable lookup).
+            if drained.stable_id is not None:
+                if item.stable_id is None:
+                    item = item.model_copy(update={"stable_id": drained.stable_id})
+                else:
+                    item = item.model_copy(update={"web_stable_id": drained.stable_id})
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
@@ -6426,6 +6432,27 @@ async def _dispatch_session_event_to_runner_impl(
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
         _build_native_terminal_message_event(conv, body)
+        raw_stable_id = body.data.get("stable_id")
+        web_stable_id = (
+            raw_stable_id
+            if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+            else None
+        )
+        # A repeated stable_id is a client re-send of a submission this pane
+        # may already have received (its POST response was lost); pasting it
+        # again would duplicate the message. Answer a still-pending entry with
+        # its pending_id, and a submission the forwarder has already committed
+        # with that item — the store mapping survives a server restart, which
+        # wipes the in-memory pending index.
+        if web_stable_id is not None:
+            live_pending_id = pending_inputs.find_by_stable_id(session_id, web_stable_id)
+            if live_pending_id is not None:
+                return _SessionEventDispatchResult(item_id=None, pending_id=live_pending_id)
+            committed_item_id = await asyncio.to_thread(
+                conversation_store.find_web_submission_item_id, session_id, web_stable_id
+            )
+            if committed_item_id is not None:
+                return _SessionEventDispatchResult(item_id=committed_item_id, pending_id=None)
         ensure_outcome = (
             _NativeTerminalEnsureOutcome(error=None)
             if native_terminal_ready
@@ -6460,12 +6487,6 @@ async def _dispatch_session_event_to_runner_impl(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
-        raw_stable_id = body.data.get("stable_id")
-        web_stable_id = (
-            raw_stable_id
-            if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
-            else None
-        )
         # A codex /side command never reaches the main thread — the executor
         # forks it into a side chat — so the transcript forwarder never mirrors
         # it back and this bubble would sit in the parent chat forever.

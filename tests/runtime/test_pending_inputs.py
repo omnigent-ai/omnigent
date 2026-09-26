@@ -421,3 +421,26 @@ def test_stable_id_dedup_scoped_per_conversation() -> None:
     id_a = pending_inputs.record("conv_scope_a", [_text_block("x")], stable_id=stable)
     id_b = pending_inputs.record("conv_scope_b", [_text_block("x")], stable_id=stable)
     assert id_a != id_b
+
+
+def test_find_by_stable_id_returns_the_live_entry() -> None:
+    """A re-POST's dedup pre-check resolves a still-pending submission."""
+    stable = "ef" * 16
+    pending_id = pending_inputs.record("conv_find", [_text_block("hi")], stable_id=stable)
+    assert pending_inputs.find_by_stable_id("conv_find", stable) == pending_id
+    # Read-only: the entry stays queued for the transcript drain.
+    assert len(pending_inputs.snapshot_for("conv_find")) == 1
+
+
+def test_find_by_stable_id_misses_unknown_and_drained_entries() -> None:
+    stable = "0b" * 16
+    assert pending_inputs.find_by_stable_id("conv_find_miss", stable) is None
+    pending_inputs.record("conv_find_miss", [_text_block("hi")], stable_id=stable)
+    assert pending_inputs.resolve_oldest("conv_find_miss") is not None
+    assert pending_inputs.find_by_stable_id("conv_find_miss", stable) is None
+
+
+def test_find_by_stable_id_scoped_per_conversation() -> None:
+    stable = "1c" * 16
+    pending_inputs.record("conv_find_a", [_text_block("x")], stable_id=stable)
+    assert pending_inputs.find_by_stable_id("conv_find_b", stable) is None

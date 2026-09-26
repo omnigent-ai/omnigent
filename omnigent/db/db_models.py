@@ -985,6 +985,9 @@ class SqlConversationItem(ConversationBase):
     :param created_by: Identity of the human actor who authored the
         item, or ``None`` for agent/tool/system items and single-user
         mode. Mirrors :class:`SqlComment.created_by`.
+    :param web_stable_id: Stable id of the web submission this item
+        commits when it differs from ``id`` (native mirrors), else
+        ``None``.
     """
 
     __tablename__ = "conversation_items"
@@ -1021,6 +1024,10 @@ class SqlConversationItem(ConversationBase):
     data: Mapped[str] = mapped_column(Text)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # The web client's stable submission id for a native-mirror user message
+    # whose row id is forwarder-derived. Backs the re-send dedup lookup that
+    # must survive a server restart; ``None`` for every other item.
+    web_stable_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         # Backs the per-conversation position-ordered scan (the dominant read).
@@ -1055,6 +1062,15 @@ class SqlConversationItem(ConversationBase):
             "conversation_id",
             "type",
             text("position DESC"),
+        ),
+        # Point lookup answering a native web re-send from the committed
+        # mirror (dispatch pre-check). Non-unique so it needs no partition
+        # key; almost every row is NULL here.
+        Index(
+            "ix_conversation_items_web_stable_id",
+            "workspace_id",
+            "conversation_id",
+            "web_stable_id",
         ),
         CheckConstraint(
             "type IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)",
