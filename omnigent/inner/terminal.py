@@ -419,6 +419,11 @@ def _tmux_command_failed_error(
 # of an interaction.
 _CLIENT_INTERACTION_WINDOW_SECONDS = 0.75
 
+# How long a closed native pane's processes get to act on the hangup before
+# whatever still shares the pane's session is killed. Matches the app-server
+# shutdown grace.
+_PANE_SESSION_DRAIN_SECONDS = 5.0
+
 # Substrings that indicate the terminal is waiting for a human response even
 # while other cells on the pane keep changing (e.g. Codex's blinking spinner
 # glyph during a permission prompt). When any marker has been continuously
@@ -1798,8 +1803,11 @@ class TerminalInstance:
         # server (or a remain-on-exit pane), so cleanup must not trust that
         # advisory flag before issuing kill-server.
         if self.running or self.socket_path.exists():
+            pane_pids = await self._native_pane_pids()
             with contextlib.suppress(RuntimeError):
                 await self._tmux("kill-server")
+            for pane_pid in pane_pids:
+                await _reap_pane_session(pane_pid)
         self.running = False
 
         if self._clipboard_bridge is not None:
@@ -1829,6 +1837,28 @@ class TerminalInstance:
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():
             shutil.rmtree(self.private_dir, ignore_errors=True)
+
+    async def _native_pane_pids(self) -> list[int]:
+        """
+        Pids tmux exec'd into this server's panes, for a native agent terminal.
+
+        Each is a POSIX session leader, so after ``kill-server`` its session id
+        still finds every process the agent started, including MCP servers
+        that ignored the hangup. Empty for other terminals (a user's shell keeps
+        its ``nohup`` semantics) and when tmux cannot answer.
+
+        :returns: Pane pids, e.g. ``[70430]``.
+        """
+        # Deferred: omnigent.terminals imports this module at package init.
+        from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
+
+        if self.name not in NATIVE_PANE_TERMINAL_NAMES:
+            return []
+        try:
+            out = await self._tmux_output("list-panes", "-a", "-F", "#{pane_pid}")
+        except RuntimeError:
+            return []
+        return [int(line) for line in out.split() if line.isdigit()]
 
     def start_idle_watcher(
         self,
@@ -2553,6 +2583,27 @@ class TerminalInstance:
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, proc.stderr)
         return proc.stdout.decode()
+
+
+async def _reap_pane_session(pane_pid: int) -> None:
+    """
+    Kill what is left of a closed pane's session once the hangup grace is up.
+
+    ``kill-server`` hangs the pane up; processes that honor ``SIGHUP`` exit on
+    their own within :data:`_PANE_SESSION_DRAIN_SECONDS`, and the rest (an MCP
+    server that ignores it, say) would otherwise outlive the terminal as
+    orphans. No-op once the session is empty.
+
+    :param pane_pid: Pid tmux exec'd into the pane, a session leader.
+    :returns: None.
+    """
+    deadline = time.monotonic() + _PANE_SESSION_DRAIN_SECONDS
+    while _proc.session_member_pids(pane_pid):
+        if time.monotonic() >= deadline:
+            killed = _proc.kill_session(pane_pid)
+            logger.info("killed %d process(es) left in pane %d's session", killed, pane_pid)
+            return
+        await asyncio.sleep(0.1)
 
 
 def _shell_quote(s: str) -> str:

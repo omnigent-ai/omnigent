@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from omnigent.harnesses.codex_native.state import _codex_native_state_root
+from omnigent.inner import _proc
 
 try:
     import fcntl
@@ -214,6 +215,7 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 survivors.append(entry)
                 continue
             if not matches_entry:
+                _kill_session_stragglers(entry)
                 continue
             if not _terminate_process_group(entry):
                 survivors.append(entry)
@@ -440,10 +442,31 @@ def _terminate_process_group(entry: CodexNativeProcessEntry) -> bool:
     try:
         os.killpg(entry.pgid, signal.SIGTERM)
     except ProcessLookupError:
-        return True
+        pass
     except (PermissionError, OSError):
         return False
+    # Codex runs each stdio MCP server in its own process group: outside
+    # ``entry.pgid`` but still inside the app-server's session.
+    _proc.terminate_session(entry.pid)
     return True
+
+
+def _kill_session_stragglers(entry: CodexNativeProcessEntry) -> None:
+    """
+    ``SIGKILL`` what a dead app-server left behind in its session.
+
+    Codex runs each stdio MCP server in its own process group, so ``killpg``
+    on the recorded group never reached them and they outlive the app-server
+    as orphans that still carry its session id. Only for an entry whose pid
+    is gone: a live pid that failed the identity check was reused by an
+    unrelated process, which may lead a session of its own.
+
+    :param entry: Registry entry whose recorded process no longer matches.
+    :returns: None.
+    """
+    if os.name != "posix" or entry.pgid != entry.pid or _pid_alive(entry.pid):
+        return
+    _proc.kill_session(entry.pid)
 
 
 def _process_group_matches_entry(entry: CodexNativeProcessEntry) -> bool:
