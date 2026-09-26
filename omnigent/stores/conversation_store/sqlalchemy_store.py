@@ -2330,7 +2330,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "id": item_id,
                 "conversation_id": conversation_id,
                 "response_id": item.response_id,
-                "created_at": now,
+                "created_at": item.created_at if item.created_at is not None else now,
                 "status": completed_status,
                 "type": encode_item_type(item.type),
                 "data": data,
@@ -2458,7 +2458,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         type=item.type,
                         status="completed",
                         response_id=item.response_id,
-                        created_at=now,
+                        created_at=item.created_at if item.created_at is not None else now,
                         data=item.data,
                         created_by=item.created_by,
                     )
@@ -3973,6 +3973,33 @@ class SqlAlchemyConversationStore(ConversationStore):
             update_ap,
         )
         return _to_conversation(ap_row, meta, labels)
+
+    def set_conversation_timestamps(
+        self,
+        conversation_id: str,
+        *,
+        created_at: int,
+        updated_at: int,
+    ) -> Conversation:
+        """Set source activity times; see the store interface for the contract."""
+
+        def update_ap(ap_sess: Session) -> tuple[SqlConversation, dict[str, str]]:
+            ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.created_at = created_at
+            ap_row.updated_at = updated_at
+            labels = _fetch_labels(ap_sess, conversation_id)
+            return ap_row, labels
+
+        ap_row, labels = run_write_transaction(
+            self._conv_session_immediate,
+            "set_conversation_timestamps",
+            update_ap,
+        )
+        return _to_conversation(ap_row, self._get_meta(conversation_id), labels)
 
     def create_session_with_agent(
         self,

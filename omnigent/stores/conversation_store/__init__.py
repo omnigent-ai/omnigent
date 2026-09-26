@@ -672,7 +672,9 @@ class ConversationStore(ABC):
     ) -> list[ConversationItem]:
         """
         Append items to a conversation. Assigns a globally unique
-        ID and timestamp to each item.
+        ID and timestamp to each item. An item carrying its own
+        ``created_at`` (imported history) keeps that time instead of
+        the append time.
 
         An item carrying ``stable_id`` appends idempotently: its id is the
         stable id, and when an item with that id already exists the stored
@@ -1590,6 +1592,21 @@ class ConversationStore(ABC):
         :raises ValueError: If
             ``conversation.external_session_id`` is already set
             to a different value.
+        """
+        ...
+
+    @abstractmethod
+    def set_conversation_timestamps(
+        self,
+        conversation_id: str,
+        *,
+        created_at: int,
+        updated_at: int,
+    ) -> Conversation:
+        """Overwrite both activity times with source-provided Unix seconds.
+
+        Callers decide whether source provenance is authoritative.
+        Raises :class:`ConversationNotFoundError` for an unknown conversation.
         """
         ...
 

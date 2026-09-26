@@ -2696,8 +2696,21 @@
         "type": "object"
       },
       "ImportItemInput": {
-        "description": "One normalized existing Omnigent item received from the CLI.",
+        "description": "One normalized existing Omnigent item received from the CLI.\n\n`created_at` is the source record's own creation time (Unix seconds),\npreserved so imported history keeps when the work actually happened.\n`None` when the source transcript carries no per-record time; the store\nthen stamps the import time.",
         "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
           "data": {
             "additionalProperties": true,
             "title": "Data",

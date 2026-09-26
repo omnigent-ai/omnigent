@@ -1006,7 +1006,8 @@ class HostImportedLocalSession:
     :param external_session_id: Harness-native session id on the host.
     :param workspace: The session's recorded working directory, or ``None``.
     :param items: Items in ``/v1/imports`` wire shape —
-        ``{"type", "response_id", "data"}`` — ready to persist server-side.
+        ``{"type", "response_id", "data", optional "created_at"}`` — ready
+        to persist server-side.
     :param title: The harness's own session title, or ``None`` to let the
         server synthesize one from the first user message.
     :param source: Harness this session came from, e.g. ``"claude"``. Carried
