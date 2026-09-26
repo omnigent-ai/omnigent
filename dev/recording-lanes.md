@@ -125,6 +125,16 @@ cause is named from what you observed rather than guessed.
 
 Run the authored Playwright test with recording on.
 
+**Assert every visible state the caption will claim.** A caption's claims about
+on-screen state — which entry the picker shows selected, a notice present or
+absent — must each be backed by a driver assertion on that same rendered
+element. A green check on a backend value (a readiness map entry, an API
+response) says nothing about what the page displayed, and a label read only to
+enrich a failure message asserts nothing. If the journey's point is that a
+control keeps its value, assert the rendered value itself; if a notice must be
+gone, assert both its absence and that no replacement notice announced a swap
+("Authentication required. Using <other> instead.") in its place.
+
 **Record via `OMNIGENT_E2E_RECORD_DIR`, not `--video on`.** `--video on` only
 instruments pytest-playwright's own `page` fixture. Many e2e_ui tests (e.g. the
 whole `tests/e2e_ui/start_session/` suite) drive Playwright *manually* —
@@ -268,3 +278,11 @@ For each recording, write a short **`caption`** in its handoff entry describing
 what the clip shows: e.g. `"start a session → open the model picker → select the
 catalog → picker shows raw IDs"`. This is what a reader sees under the video on
 the ticket, so make it read like a journey, not a restatement of the bug title.
+
+Before declaring a clip, check its final frames (or the settled screenshot the
+run saved) and confirm they show every state the caption claims. A caption
+written from a test's internal assertion can contradict the footage: a
+readiness check passes while the screen shows the harness swapped away under a
+different notice. When the final frames disagree with the intended claim,
+caption what they actually show and treat the mismatch as a finding about the
+fix, not a wording problem to smooth over.
