@@ -11,6 +11,7 @@ from dev.opencode_v2_recon import (
     build_arg_parser,
     build_recon_opencode_config,
     credential_values_from_env,
+    form_answer_for,
     is_terminal_session_event,
     progress_has_incremental_output,
     read_stored_key,
@@ -306,3 +307,76 @@ def test_progress_has_incremental_output_collects_all_metadata_keys() -> None:
     has_incremental, keys = progress_has_incremental_output(events)
     assert has_incremental is True
     assert keys == ["output", "phase"]
+
+
+def test_form_answer_for_string_field_uses_option_value_not_option_object() -> None:
+    # Captured `form.created` shape: string-field options are {label, value,
+    # description?} objects, and `Form.Value` rejects anything but the
+    # `value`.
+    fields = [
+        {
+            "key": "q0",
+            "type": "string",
+            "options": [
+                {"label": "Option A", "value": "Option A", "description": "first choice"},
+                {"label": "Option B", "value": "Option B", "description": "second choice"},
+            ],
+        }
+    ]
+    assert form_answer_for(fields) == {"q0": "Option A"}
+
+
+def test_form_answer_for_string_field_falls_back_to_plain_string_option() -> None:
+    fields = [{"key": "q0", "type": "string", "options": ["A", "B"]}]
+    assert form_answer_for(fields) == {"q0": "A"}
+
+
+def test_form_answer_for_string_field_falls_back_to_a_with_no_options() -> None:
+    fields = [{"key": "q0", "type": "string"}]
+    assert form_answer_for(fields) == {"q0": "A"}
+
+
+def test_form_answer_for_boolean_field_is_true() -> None:
+    fields = [{"key": "q0", "type": "boolean"}]
+    assert form_answer_for(fields) == {"q0": True}
+
+
+def test_form_answer_for_number_and_integer_fields_are_one() -> None:
+    fields = [
+        {"key": "q0", "type": "number"},
+        {"key": "q1", "type": "integer"},
+    ]
+    assert form_answer_for(fields) == {"q0": 1, "q1": 1}
+
+
+def test_form_answer_for_multiselect_field_wraps_option_value_in_a_list() -> None:
+    fields = [
+        {
+            "key": "q0",
+            "type": "multiselect",
+            "options": [{"label": "Option A", "value": "Option A"}],
+        }
+    ]
+    assert form_answer_for(fields) == {"q0": ["Option A"]}
+
+
+def test_form_answer_for_external_field_is_true() -> None:
+    fields = [{"key": "q0", "type": "external"}]
+    assert form_answer_for(fields) == {"q0": True}
+
+
+def test_form_answer_for_mixed_fields() -> None:
+    fields = [
+        {"key": "q0", "type": "string", "options": [{"label": "A", "value": "A"}]},
+        {"key": "q1", "type": "boolean"},
+        {"key": "q2", "type": "number"},
+        {"key": "q3", "type": "multiselect", "options": [{"label": "X", "value": "X"}]},
+        {"key": "q4", "type": "external"},
+    ]
+    assert form_answer_for(fields) == {
+        "q0": "A",
+        "q1": True,
+        "q2": 1,
+        "q3": ["X"],
+        "q4": True,
+    }

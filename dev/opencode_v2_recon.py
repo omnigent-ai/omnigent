@@ -282,6 +282,46 @@ def build_recon_opencode_config(
     }
 
 
+def form_answer_for(fields: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Build a ``{field_key: value}`` answer picking the first option per field.
+
+    Each value must satisfy v2's ``Form.Value`` union — ``string | number |
+    boolean | string[]`` (``packages/schema/src/form.ts``) — not the raw
+    option object. A ``string``/``multiselect`` field's ``options`` are
+    ``{label, value, description?}`` objects (confirmed against a captured
+    ``form.created`` event), so the *value* to send is
+    ``option["value"]``, not the option itself; a bare string option (or no
+    options at all) is handled defensively too.
+
+    :param fields: The ``form.created`` event's ``data.form.fields`` array.
+    :returns: One valid ``Form.Value`` per field key, ready for
+        ``POST /api/session/{id}/form/{formId}/reply``'s ``answer``.
+    """
+
+    def option_value(field: dict[str, Any]) -> Any:
+        options = field.get("options") or []
+        if not options:
+            return "A"
+        first = options[0]
+        return first["value"] if isinstance(first, dict) else first
+
+    answer: dict[str, Any] = {}
+    for field in fields:
+        field_type = field.get("type")
+        if field_type == "boolean":
+            answer[field["key"]] = True
+        elif field_type in ("number", "integer"):
+            answer[field["key"]] = 1
+        elif field_type == "multiselect":
+            answer[field["key"]] = [option_value(field)]
+        elif field_type == "external":
+            answer[field["key"]] = True
+        else:
+            answer[field["key"]] = option_value(field)
+    return answer
+
+
 async def _wait_for_url(proc: subprocess.Popen[bytes], timeout: float = 30.0) -> str:
     """
     Read `opencode serve --stdio`'s one-line ``{"url": "..."}`` stdout frame.
@@ -430,12 +470,7 @@ async def _drive_prompts_until_terminal(
                 form_id = form["id"]
                 if form_id in answered_form_ids:
                     continue
-                answer = {
-                    field["key"]: (
-                        field.get("options", ["A"])[0] if field.get("type") == "string" else "A"
-                    )
-                    for field in form.get("fields", [])
-                }
+                answer = form_answer_for(form.get("fields", []))
                 reply = await client.post(
                     f"/api/session/{session_id}/form/{form_id}/reply",
                     json={"answer": answer},
@@ -552,19 +587,19 @@ def _fill_recon_findings(
             f"{'yes' if has_incremental else 'no'} (metadata keys seen: {keys_text})"
         )
 
-    mcp_calls = [
-        e
-        for e in events
-        if e.get("type") == "session.tool.called"
-        and "recon-echo" in str(e.get("data", {}).get("name", ""))
-    ]
+    # An MCP tool's permission action is namespaced `{mcp_server_name}_{tool}`
+    # (e.g. `recon-echo_echo`), so its `permission.asked` event is itself
+    # proof that a codemode:false MCP call raised one.
     mcp_permission_asks = [
         e
         for e in events
-        if e.get("type") == "permission.asked" and "recon-echo" in json.dumps(e.get("data", {}))
+        if e.get("type") == "permission.asked"
+        and str(e.get("data", {}).get("action", "")).startswith("recon-echo_")
     ]
     findings["4_codemode_false_mcp_raises_permission_asked"] = (
-        "no mcp call captured" if not mcp_calls else ("yes" if mcp_permission_asks else "no")
+        f"yes (action: {mcp_permission_asks[0]['data']['action']})"
+        if mcp_permission_asks
+        else "no"
     )
 
     actions = sorted({e["data"]["action"] for e in events if e.get("type") == "permission.asked"})
