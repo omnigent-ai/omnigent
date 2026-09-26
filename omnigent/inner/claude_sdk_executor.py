@@ -1282,6 +1282,48 @@ def _parse_optional_int(value: str | None) -> int | None:
         return None
 
 
+# The Claude CLI also anchors its per-uid runtime dir at this fixed root,
+# independent of $TMPDIR; on macOS that is the spelling it opens.
+_CLAUDE_CLI_TMP_ROOT = pathlib.Path("/tmp")
+
+
+def _claude_runtime_dirs() -> list[pathlib.Path]:
+    """Per-uid runtime dirs the Claude CLI writes, created owner-only.
+
+    Both live under shared temp roots, so a pre-existing leaf is granted only
+    when it is a real directory owned by this user. A planted symlink or
+    foreign directory is skipped with a warning instead of widening the sandbox
+    to wherever it points.
+    """
+    from omnigent.harnesses.claude_native.bridge import _ensure_private_dir
+
+    uid = stable_user_id()
+    my_uid = os.getuid() if hasattr(os, "getuid") else None
+    candidates = [pathlib.Path(tempfile.gettempdir()) / f"claude-{uid}"]
+    if os.name == "posix":
+        candidates.append(_CLAUDE_CLI_TMP_ROOT / f"claude-{uid}")
+    dirs: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
+    for candidate in candidates:
+        # Dedupe on the parent's real path; resolving the leaf itself would
+        # follow exactly the planted symlink rejected below.
+        key = candidate.parent.resolve(strict=False) / candidate.name
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            _ensure_private_dir(candidate, my_uid)
+        except (OSError, RuntimeError) as exc:
+            logger.warning(
+                "Not granting the Claude CLI runtime dir %s to the sandboxed CLI: %s",
+                candidate,
+                exc,
+            )
+            continue
+        dirs.append(candidate)
+    return dirs
+
+
 def _claude_internal_write_roots() -> list[pathlib.Path]:
     """Writable roots the Claude CLI needs for its own local session state."""
 
@@ -1291,11 +1333,10 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".claude" / "session-env",
         pathlib.Path.home() / ".claude" / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
-        pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
     ]
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
-    return roots
+    return roots + _claude_runtime_dirs()
 
 
 def _claude_internal_write_files() -> list[pathlib.Path]:

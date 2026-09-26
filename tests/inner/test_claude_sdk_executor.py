@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -1398,6 +1399,134 @@ class TestConstructor(unittest.TestCase):
                 paths = _claude_internal_write_files()
 
             self.assertEqual(paths, [config_path, credentials_path])
+
+    def _claude_runtime_roots(self, td: str, *, system_tmp: Path, cli_tmp: Path) -> list[Path]:
+        """Run ``_claude_internal_write_roots`` with HOME and both tmp roots under *td*."""
+        from omnigent.inner.claude_sdk_executor import _claude_internal_write_roots
+
+        home = Path(td) / "home"
+        home.mkdir(exist_ok=True)
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor.pathlib.Path.home",
+                return_value=home,
+            ),
+            patch.object(tempfile, "tempdir", str(system_tmp)),
+            patch("omnigent.inner.claude_sdk_executor._CLAUDE_CLI_TMP_ROOT", cli_tmp),
+        ):
+            return _claude_internal_write_roots()
+
+    def test_claude_internal_write_roots_grant_cli_tmp_runtime_dir(self):
+        """Both per-uid runtime dirs are granted and created owner-only when the
+        system tempdir (macOS: ``/var/folders/.../T``) is not the CLI's ``/tmp``."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            system_tmp = Path(td) / "var_folders" / "T"
+            system_tmp.mkdir(parents=True)
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+
+            roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+            for runtime_dir in (system_tmp / f"claude-{uid}", cli_tmp / f"claude-{uid}"):
+                self.assertIn(runtime_dir, roots)
+                self.assertEqual(stat.S_IMODE(runtime_dir.stat().st_mode), 0o700)
+
+    def test_claude_internal_write_roots_dedupe_when_tempdir_is_cli_tmp_root(self):
+        """When the system tempdir already is the CLI's root, one grant suffices."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+
+            roots = self._claude_runtime_roots(td, system_tmp=cli_tmp, cli_tmp=cli_tmp)
+
+            self.assertEqual(
+                [root for root in roots if root.name == f"claude-{uid}"],
+                [cli_tmp / f"claude-{uid}"],
+            )
+
+    def test_claude_internal_write_roots_skip_planted_symlink(self):
+        """A symlink planted at ``/tmp/claude-<uid>`` is neither followed nor granted."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            system_tmp = Path(td) / "var_folders" / "T"
+            system_tmp.mkdir(parents=True)
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+            elsewhere = Path(td) / "elsewhere"
+            elsewhere.mkdir()
+            planted = cli_tmp / f"claude-{uid}"
+            planted.symlink_to(elsewhere)
+
+            with self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs:
+                roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+            self.assertNotIn(planted, roots)
+            self.assertNotIn(elsewhere, roots)
+            self.assertIn(system_tmp / f"claude-{uid}", roots)
+            self.assertTrue(planted.is_symlink())
+            self.assertTrue(any("is a symlink" in line for line in logs.output), logs.output)
+
+    def test_claude_internal_write_roots_skip_non_directory_leaf(self):
+        """A regular file planted at the runtime dir path degrades to a warning."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            system_tmp = Path(td) / "var_folders" / "T"
+            system_tmp.mkdir(parents=True)
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+            planted = cli_tmp / f"claude-{uid}"
+            planted.write_text("")
+
+            with self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs:
+                roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+            self.assertNotIn(planted, roots)
+            self.assertIn(system_tmp / f"claude-{uid}", roots)
+            self.assertTrue(any("not a directory" in line for line in logs.output), logs.output)
+
+    def test_claude_internal_write_roots_tighten_loose_runtime_dir_mode(self):
+        """An existing runtime dir we own is granted and reset to owner-only."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            system_tmp = Path(td) / "var_folders" / "T"
+            system_tmp.mkdir(parents=True)
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+            existing = cli_tmp / f"claude-{uid}"
+            existing.mkdir()
+            existing.chmod(0o755)
+
+            roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+            self.assertIn(existing, roots)
+            self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o700)
 
 
 # ---------------------------------------------------------------------------
