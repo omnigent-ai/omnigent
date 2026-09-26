@@ -18,18 +18,8 @@
 # author_association is computed by GitHub from the actor's relationship to the
 # repo at event time; it is not attacker-settable from PR contents.
 #
-# Maintainer escape hatch: an untrusted PR can be waived by the
-# `skip-security-scan` label alone. Applying a label requires GitHub Triage
-# permission (or higher), which a fork author never has, so the label IS the
-# maintainer gate and no separate approval is required.
-#
-# ACCEPTED RISK (repo policy, not GitHub-enforced): GitHub allows the Triage role
-# to be granted independently of Write, so in principle a triage-only collaborator
-# could self-waive. We accept this because this repo grants Triage only to
-# write/admin collaborators -- everyone who can apply the label can already push
-# code, so the waiver grants no privilege they don't already have. This invariant
-# lives in repo settings, not in code; if Triage is ever granted without Write,
-# revisit (e.g. re-add a maintainer-list check). See the PR for the full rationale.
+# An untrusted PR needs both `skip-security-scan` and a maintainer's latest
+# decisive review to be APPROVED. Triage permission alone cannot waive scanning.
 #
 # The label is read from the API (trusted), and this script always runs from
 # `main`, so a PR cannot edit the decision. The waiver is only evaluated when the
@@ -42,8 +32,7 @@
 #                               allowlist, checked without an API call so the gate
 #                               pollers short-circuit too)
 #          MAINTAINERS         (space-separated, from merge-ready/load-maintainers.sh;
-#                               optional -- used only to trust private-membership
-#                               maintainer AUTHORS, not for the label waiver)
+#                               used for maintainer authors and review waivers)
 #          GH_TOKEN, REPO, PR  (for the label lookup + author check)
 # Out:     `scan=true|false` and `reason=<text>` on $GITHUB_OUTPUT.
 
@@ -57,10 +46,7 @@ emit() {
   echo "scan=$1 ($2)"
 }
 
-# 0 = the skip label is present; 1 otherwise. Label-only: applying the label
-# already requires Triage permission (or higher), so its mere presence is the
-# maintainer gate (see the accepted-risk note in the header). Fails closed on any
-# gap (missing token, etc).
+# Missing credentials or a failed label lookup cannot waive scanning.
 has_skip_label() {
   [[ -n "${GH_TOKEN:-}" && -n "${REPO:-}" && -n "${PR:-}" ]] || return 1
 
@@ -70,13 +56,33 @@ has_skip_label() {
   [[ "$has_label" == "true" ]]
 }
 
+# Fetch every review page before selecting each maintainer's latest decisive
+# review. Comments leave approvals intact; dismissals and changes requested revoke them.
+has_maintainer_waiver() {
+  [[ -n "${MAINTAINERS:-}" && -n "${MAINTAINERS// /}" ]] || return 1
+  has_skip_label || return 1
+
+  local reviews approvers maint_lc reviewer maintainer
+  reviews=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+    --paginate --slurp 2>/dev/null) || return 1
+  approvers=$(jq -r \
+    '[.[][] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+      | {login: ((.user.login // "") | ascii_downcase), state, submitted_at, id}]
+      | group_by(.login)[] | max_by([.submitted_at, .id])
+      | select(.state == "APPROVED") | .login' <<<"$reviews" 2>/dev/null) || return 1
+  maint_lc=$(echo "$MAINTAINERS" | tr '[:upper:]' '[:lower:]')
+  for reviewer in $approvers; do
+    for maintainer in $maint_lc; do
+      [[ "$reviewer" == "$maintainer" ]] && return 0
+    done
+  done
+  return 1
+}
+
 # Only PRs carry untrusted contributor code through the gate. Every other
 # trigger -- push to main, schedule, dispatch -- is a trusted context, so
-# proceed without scanning. pull_request_review is still
-# accepted (it carries the same pull_request + author_association fields, so the
-# gate evaluates identically) in case a workflow_call caller is wired to it, but
-# no workflow triggers a scan on review any more: the skip-security-scan waiver
-# is label-only, so the label event alone re-runs the scan and flips the check.
+# proceed without scanning. Reviews carry the same pull_request fields and
+# re-evaluate the waiver when an approval is submitted or dismissed.
 case "${EVENT_NAME:-}" in
   pull_request | pull_request_target | pull_request_review) ;;
   *)
@@ -129,8 +135,8 @@ case "${AUTHOR_ASSOCIATION:-}" in
   *)
     if author_is_maintainer; then
       emit false "trusted author (maintainer; author_association=${AUTHOR_ASSOCIATION:-unknown})"
-    elif has_skip_label; then
-      emit false "'$SKIP_LABEL' waiver (label requires a Triage+ collaborator to apply)"
+    elif has_maintainer_waiver; then
+      emit false "'$SKIP_LABEL' waiver (approved by a maintainer)"
     else
       emit true "untrusted author (author_association=${AUTHOR_ASSOCIATION:-unknown})"
     fi

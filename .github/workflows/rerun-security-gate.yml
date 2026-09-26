@@ -3,7 +3,7 @@ name: Rerun Security Gate
 # Stage 1 of a two-stage relay (the privileged half is rerun-security-gate-run.yml).
 #
 # When the skip-security-scan waiver could change verdict -- the label is added
-# or removed -- the per-workflow `Security Gate` pollers must re-run so they
+# or removed, or a review changes -- the `Security Gate` pollers must re-run so they
 # re-mirror the (now-flipped) single `Security Scan` check. Re-running another
 # workflow needs `actions: write`, but on a FORK PR the `pull_request_target`
 # token is held behind the fork-approval gate, so it cannot re-run anything
@@ -14,13 +14,13 @@ name: Rerun Security Gate
 # for forks and is not held behind the fork-approval gate.
 # https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
 #
-# Trigger: skip-security-scan labeled/unlabeled is the ONLY thing that can flip
-# the waiver (it is label-only -- see should-scan.sh; there is no approval half).
-# Other labels are ignored by the job `if:` below (stage 2 then no-ops).
+# Labels and reviews can change the waiver; unrelated labels record nothing.
 
 on:
   pull_request_target:
     types: [labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
 
 permissions:
   contents: read
@@ -35,9 +35,8 @@ concurrency:
 jobs:
   record:
     name: Record PR for gate re-run
-    # Only when the waiver state could have changed: the skip-security-scan
-    # label was added/removed. Unrelated labels record nothing, so stage 2 no-ops.
-    if: github.event.label.name == 'skip-security-scan'
+    # Comments do not revoke approval, but scanning on every review is harmless.
+    if: github.event_name == 'pull_request_review' || github.event.label.name == 'skip-security-scan'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

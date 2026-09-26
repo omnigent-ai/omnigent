@@ -22,12 +22,10 @@ name: Security Scan
 
 on:
   pull_request:
-    # labeled/unlabeled so applying or removing the skip label
-    # (skip-security-scan) re-runs the scan and flips this check. The waiver is
-    # label-only (should-scan.sh): applying it needs Triage permission, so the
-    # label alone is the maintainer gate -- no separate approval, hence no
-    # pull_request_review trigger.
+    # Label changes re-evaluate the maintainer-effective waiver.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
 
 permissions:
   contents: read
@@ -196,14 +194,12 @@ jobs:
 
       # Surfaced on ANY detector failure above (sensitive-path / secret / exfil
       # / workflow-misuse / semgrep): the detectors say WHAT they found; this
-      # says HOW a maintainer can waive it. The waiver is label-only: applying
-      # the 'skip-security-scan' label needs Triage permission, so the label is
-      # itself the maintainer gate (see should-scan.sh). Applying it re-runs this
-      # scan via the labeled trigger above.
+      # says HOW a maintainer can waive it. Both label and review changes
+      # re-evaluate the waiver against the current API state.
       - name: Explain the maintainer waiver (on failure)
         if: ${{ failure() }}
         run: |
-          MSG="A maintainer can skip the Security Scan by applying the 'skip-security-scan' label (this requires Triage permission, so a fork author cannot self-waive). Applying the label re-runs this scan automatically."
+          MSG="A maintainer can waive the Security Scan by approving the PR and applying 'skip-security-scan'. The label alone does not waive scanning. Removing the label, dismissing the approval, or requesting changes re-enables scanning."
           echo "::error::$MSG"
           {
             echo "### Security Scan failed"
