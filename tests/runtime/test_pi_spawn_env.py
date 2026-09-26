@@ -103,6 +103,22 @@ def test_pi_spawn_env_sets_context_files(
     assert env["HARNESS_PI_CONTEXT_FILES"] == ("false" if enabled is False else "true")
 
 
+@pytest.mark.parametrize("mode", [None, "append", "replace"])
+def test_pi_spawn_env_sets_system_prompt_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str | None
+) -> None:
+    spec = _make_spec()
+    if mode is not None:
+        spec.executor.config["system_prompt_mode"] = mode
+    monkeypatch.setenv(
+        "HARNESS_PI_SYSTEM_PROMPT_MODE", "append" if mode == "replace" else "replace"
+    )
+
+    env = _build_pi_spawn_env(spec)
+
+    assert env["HARNESS_PI_SYSTEM_PROMPT_MODE"] == (mode or "append")
+
+
 def _ucode_state_for_pi(
     monkeypatch: pytest.MonkeyPatch, *, model: str | None, with_pi_entry: bool
 ):

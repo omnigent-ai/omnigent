@@ -676,12 +676,16 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
         context_files = data.get("context_files")
         if "context_files" in data and not isinstance(context_files, bool):
             raise ValueError("executor.context_files must be a boolean")
+        system_prompt_mode = data.get("system_prompt_mode")
+        if "system_prompt_mode" in data and system_prompt_mode not in ("append", "replace"):
+            raise ValueError("executor.system_prompt_mode must be 'append' or 'replace'")
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
             auth=auth,
             context_files=context_files,
+            system_prompt_mode=system_prompt_mode,
         )
     return None
 

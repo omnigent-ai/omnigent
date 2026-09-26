@@ -63,6 +63,8 @@ Env vars read at startup:
   bundled-skill directory.
 - ``HARNESS_PI_CONTEXT_FILES``: Whether Pi automatically loads context files
   such as ``AGENTS.md`` and ``CLAUDE.md``. Defaults to true.
+- ``HARNESS_PI_SYSTEM_PROMPT_MODE``: ``append`` (default) or ``replace`` Pi's
+  base prompt with Omnigent's composed instructions.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
   future use; currently unused by Pi.
 """
@@ -101,6 +103,7 @@ _LEGACY_ENV_PI_PATH = "HARNESS_PI_PATH"
 _ENV_OS_ENV = "HARNESS_PI_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_PI_SKILLS_FILTER"
 _ENV_CONTEXT_FILES = "HARNESS_PI_CONTEXT_FILES"
+_ENV_SYSTEM_PROMPT_MODE = "HARNESS_PI_SYSTEM_PROMPT_MODE"
 _ENV_BUNDLE_DIR = "HARNESS_PI_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_PI_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
@@ -241,6 +244,7 @@ def _build_pi_executor() -> Executor:
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
         context_files=_parse_truthy(_ENV_CONTEXT_FILES, default=True),
+        system_prompt_mode=os.environ.get(_ENV_SYSTEM_PROMPT_MODE, "append"),
     )
 
 

@@ -158,6 +158,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
         harness=_raw_harness,
         profile=spec.executor.config.get("profile"),
         context_files=spec.executor.config.get("context_files"),
+        system_prompt_mode=spec.executor.config.get("system_prompt_mode"),
     )
 
     # ``AgentDef.name`` / ``AgentDef.prompt`` are ``str | None`` — pass
@@ -451,6 +452,7 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
             harness=harness,
             profile=profile,
             context_files=sub.executor.config.get("context_files"),
+            system_prompt_mode=sub.executor.config.get("system_prompt_mode"),
         ),
     )
 
@@ -1753,6 +1755,8 @@ def _translate_executor_from_def(
     }
     if oa_executor is not None and oa_executor.context_files is not None:
         config["context_files"] = oa_executor.context_files
+    if oa_executor is not None and oa_executor.system_prompt_mode is not None:
+        config["system_prompt_mode"] = oa_executor.system_prompt_mode
     # These are not fields on the omnigent inner ExecutorSpec, so read them
     # from the raw YAML dict and carry them forward explicitly.
     # The openai-agents harness spawn-env builder reads

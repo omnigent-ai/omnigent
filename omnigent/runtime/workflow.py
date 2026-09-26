@@ -1485,6 +1485,7 @@ def _build_pi_spawn_env(
     # and override an explicit ``skills: none`` from the spec.
     env["HARNESS_PI_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
     env["HARNESS_PI_CONTEXT_FILES"] = json.dumps(spec.executor.config.get("context_files", True))
+    env["HARNESS_PI_SYSTEM_PROMPT_MODE"] = spec.executor.config.get("system_prompt_mode", "append")
     if spec.name:
         env["HARNESS_PI_AGENT_NAME"] = spec.name
     if cwd is not None:

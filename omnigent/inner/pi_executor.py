@@ -1016,6 +1016,7 @@ class _PiRpcSession:
         cwd: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        system_prompt_mode: str = "append",
         thinking: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
@@ -1034,8 +1035,10 @@ class _PiRpcSession:
         :param model: Pi model selector, e.g.
             ``"databricks-anthropic/gateway-model-id"``.
             ``None`` lets Pi pick its default.
-        :param system_prompt: Text appended to Pi's default system
-            prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param system_prompt: Omnigent's composed instructions. ``None`` skips
+            injection in append mode; replace mode requires non-empty text.
+        :param system_prompt_mode: Append instructions to Pi's base prompt,
+            or replace it using ``--system-prompt``.
         :param thinking: Pi thinking level in Pi's own vocabulary
             (``off``/``minimal``/.../``max``), passed as ``--thinking``.
             ``None`` omits the flag so Pi's model default applies.
@@ -1055,11 +1058,13 @@ class _PiRpcSession:
             )
         if thinking:
             args.extend(["--thinking", thinking])
-        if system_prompt:
-            # Use --append-system-prompt instead of --system-prompt so Pi
-            # keeps its default prompt (which includes tool descriptions from
-            # promptSnippet and guidelines).  Using --system-prompt would
-            # replace the default prompt entirely, stripping tool awareness.
+        if system_prompt_mode == "replace":
+            if not system_prompt or not system_prompt.strip():
+                raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+            # An explicit empty append input suppresses APPEND_SYSTEM.md discovery.
+            args.extend(["--system-prompt", system_prompt, "--append-system-prompt", ""])
+        elif system_prompt:
+            # Keep Pi's tool snippets and default guidance in append mode.
             args.extend(["--append-system-prompt", system_prompt])
         if extra_args:
             args.extend(extra_args)
@@ -1730,6 +1735,7 @@ class PiExecutor(Executor):
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
         context_files: bool = True,
+        system_prompt_mode: str = "append",
         preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
@@ -1737,6 +1743,8 @@ class PiExecutor(Executor):
         :param cwd: Working directory for the Pi subprocess.
         :param context_files: Allow Pi to automatically load context files such
             as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+        :param system_prompt_mode: ``append`` retains Pi's base prompt;
+            ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
@@ -1792,6 +1800,9 @@ class PiExecutor(Executor):
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
         """
+        if system_prompt_mode not in ("append", "replace"):
+            raise ValueError("system_prompt_mode must be 'append' or 'replace'")
+        self._system_prompt_mode = system_prompt_mode
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
             raise ImportError(
@@ -2393,6 +2404,7 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
+            system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
         )

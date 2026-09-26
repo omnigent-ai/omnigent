@@ -1,4 +1,4 @@
-"""Real CLI → bundle → harness → Pi request coverage with a mock LLM."""
+"""Real CLI → bundle → harness → Pi prompt and tool coverage with a mock LLM."""
 
 from __future__ import annotations
 
@@ -20,18 +20,51 @@ pytestmark = pytest.mark.skipif(_PI_UNAVAILABLE is not None, reason=str(_PI_UNAV
 
 
 @pytest.mark.parametrize("directory", [False, True], ids=["yaml", "bundle"])
-@pytest.mark.parametrize("enabled", [None, True, False], ids=["default", "enabled", "disabled"])
-def test_pi_run_context_files(
+@pytest.mark.parametrize(
+    ("enabled", "mode", "custom_base"),
+    [
+        (None, None, False),
+        (True, "append", False),
+        (False, None, False),
+        (True, "replace", False),
+        (False, "replace", False),
+        (True, None, True),
+        (False, "replace", True),
+    ],
+    ids=[
+        "default",
+        "append",
+        "no-context",
+        "replace",
+        "replace-no-context",
+        "custom-base",
+        "replace-custom-base",
+    ],
+)
+def test_pi_run_prompt_settings(
     omnigent_python: Path,
     mock_credentials_env: dict[str, str],
     mock_llm_server_url: str,
     tmp_path: Path,
     directory: bool,
     enabled: bool | None,
+    mode: str | None,
+    custom_base: bool,
 ) -> None:
-    """Opting out removes discovered context but preserves authored/runtime instructions."""
+    """Replacing Pi's base prompt preserves instructions and the tool-call bridge."""
     model = f"mock-pi-context-{uuid.uuid4().hex[:8]}"
-    configure_mock_llm(mock_llm_server_url, [{"text": "Captured."}], key=model)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {"call_id": "call_inbox", "name": "sys_read_inbox", "arguments": "{}"}
+                ]
+            },
+            {"text": "Captured."},
+        ],
+        key=model,
+    )
     config_home = tmp_path / "config"
     config_home.mkdir()
     (config_home / "config.yaml").write_text(
@@ -56,16 +89,24 @@ def test_pi_run_context_files(
     workspace.mkdir(parents=True)
     (workspace.parent / "AGENTS.md").write_text("ANCESTOR_CONTEXT_73D2")
     (workspace / "CLAUDE.md").write_text("WORKSPACE_CONTEXT_94C1")
+    pi_config = workspace / ".pi"
+    pi_config.mkdir()
+    (pi_config / "APPEND_SYSTEM.md").write_text("AMBIENT_APPEND_31F7")
+    if custom_base:
+        (pi_config / "SYSTEM.md").write_text("AMBIENT_BASE_82A6")
     source = tmp_path / "agent"
     source.mkdir()
     executor: dict[str, object] = {"harness": "pi", "model": model}
     if enabled is not None:
         executor["context_files"] = enabled
+    if mode is not None:
+        executor["system_prompt_mode"] = mode
     config: dict[str, object] = {"name": "pi-context-probe", "skills": "none"}
     if directory:
+        executor.pop("model")
         config.update(
             spec_version=1,
-            executor={"type": "omnigent", "config": executor},
+            executor={"type": "omnigent", "model": model, "config": executor},
             instructions="AGENTS.md",
         )
         (source / "AGENTS.md").write_text("AUTHORED_PROMPT_42D9")
@@ -79,6 +120,7 @@ def test_pi_run_context_files(
     env = {**mock_credentials_env, "OMNIGENT_CONFIG_HOME": str(config_home)}
     # A stale ambient value must never override the YAML/default policy.
     env["HARNESS_PI_CONTEXT_FILES"] = "true" if enabled is False else "false"
+    env["HARNESS_PI_SYSTEM_PROMPT_MODE"] = "append" if mode == "replace" else "replace"
     result = subprocess.run(
         [
             str(omnigent_python),
@@ -86,8 +128,6 @@ def test_pi_run_context_files(
             "omnigent",
             "run",
             str(agent_path),
-            "--model",
-            model,
             "-p",
             "Hello",
             "--no-log",
@@ -112,3 +152,17 @@ def test_pi_run_context_files(
         assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION in system
         assert ("ANCESTOR_CONTEXT_73D2" in system) is (enabled is not False)
         assert ("WORKSPACE_CONTEXT_94C1" in system) is (enabled is not False)
+        assert ("You are an expert coding assistant operating inside pi" in system) is (
+            mode != "replace" and not custom_base
+        )
+        assert ("AMBIENT_BASE_82A6" in system) is (custom_base and mode != "replace")
+        assert "AMBIENT_APPEND_31F7" not in system
+        tools = {tool["function"]["name"]: tool["function"] for tool in request["tools"]}
+        assert tools["sys_read_inbox"]["parameters"]["type"] == "object"
+        assert "Drain the inbox" in tools["sys_read_inbox"]["description"]
+    assert any(
+        "Inbox is empty" in str(message.get("content", ""))
+        for request in requests
+        for message in request["messages"]
+        if message["role"] == "tool"
+    ), "The real inbox tool result must reach the model on its next request"

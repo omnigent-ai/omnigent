@@ -66,6 +66,19 @@ def test_executor_factory_reads_context_files(
     assert executor.call_args.kwargs["context_files"] is (value != "false")
 
 
+@pytest.mark.parametrize("mode", [None, "append", "replace"])
+def test_executor_factory_reads_system_prompt_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str | None
+) -> None:
+    if mode is None:
+        monkeypatch.delenv("HARNESS_PI_SYSTEM_PROMPT_MODE", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_PI_SYSTEM_PROMPT_MODE", mode)
+    with patch("omnigent.inner.pi_harness.PiExecutor") as executor:
+        pi_harness._build_pi_executor()
+    assert executor.call_args.kwargs["system_prompt_mode"] == (mode or "append")
+
+
 def test_executor_factory_reads_env_vars(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -354,6 +354,7 @@ class ExecutorSpec:
         can forward it into the child :class:`ExecutorSpec` without
         re-reading raw YAML.
     :param context_files: Pi context-file discovery override. None uses Pi's default.
+    :param system_prompt_mode: Pi prompt delivery: append (default) or replace its base prompt.
     """
 
     model: str | None = None
@@ -361,6 +362,7 @@ class ExecutorSpec:
     profile: str | None = None
     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
     context_files: bool | None = None
+    system_prompt_mode: str | None = None
 
 
 # ---------------------------------------------------------------------------
