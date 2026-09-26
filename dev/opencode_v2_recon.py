@@ -441,6 +441,31 @@ async def _wait_for_session_terminal(
     return None
 
 
+async def _wait_for_integration_loaded(
+    client: httpx.AsyncClient, provider: str, timeout: float = 30.0, interval: float = 0.5
+) -> bool:
+    """
+    Poll ``GET /api/integration/{provider}`` until it returns 200.
+
+    The server loads its integration catalog asynchronously after startup;
+    posting a credential (``POST /api/integration/{id}/connect/key``) before
+    that catalog is populated 404s with integration-not-found even though
+    the provider is valid, because ``service.get(id)`` is still empty. A 404
+    here just means "not loaded yet" and is retried; any other non-200
+    status is treated as a real error and stops the wait immediately.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        resp = await client.get(f"/api/integration/{provider}")
+        if resp.status_code == 200:
+            return True
+        if resp.status_code != 404:
+            return False
+        await asyncio.sleep(interval)
+    return False
+
+
 def _fill_recon_findings(
     events: list[dict[str, Any]], messages: dict[str, Any], findings: dict[str, str]
 ) -> None:
@@ -615,11 +640,32 @@ async def run_recon(args: argparse.Namespace) -> int:
                     findings["credential_seed_status"] = "no key credential found"
                 else:
                     secrets_to_redact.append(key)
+                    catalog_loaded = await _wait_for_integration_loaded(client, seed_provider)
+                    if not catalog_loaded:
+                        findings["credential_seed_status"] = (
+                            f"integration {seed_provider} never became available"
+                        )
+                        print(
+                            f"integration {seed_provider} never became available; "
+                            "aborting without writing fixtures",
+                            file=sys.stderr,
+                        )
+                        _write_debug_events(workdir, events)
+                        return None
                     connect_resp = await client.post(
                         f"/api/integration/{seed_provider}/connect/key",
                         json={"key": key},
                     )
                     findings["credential_seed_status"] = str(connect_resp.status_code)
+                    if not (200 <= connect_resp.status_code < 300):
+                        redacted_body = redact_secrets(connect_resp.text, secrets_to_redact)
+                        print(
+                            f"credential seed failed: {connect_resp.status_code} "
+                            f"{redacted_body}; aborting without writing fixtures",
+                            file=sys.stderr,
+                        )
+                        _write_debug_events(workdir, events)
+                        return None
 
             openapi = (await client.get("/openapi.json")).json()
 
