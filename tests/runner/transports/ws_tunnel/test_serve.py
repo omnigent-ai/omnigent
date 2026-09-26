@@ -9,7 +9,7 @@ import os
 import ssl
 import time
 from dataclasses import dataclass
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any, TypedDict
 
 import pytest
@@ -20,6 +20,7 @@ from websockets.exceptions import (
     InvalidURI,
     WebSocketException,
 )
+from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent.runner.identity import (
@@ -661,6 +662,13 @@ async def test_serve_tunnel_once_sends_bearer_header(
     class _FakeWS:
         """WebSocket stub that accepts hello then closes iteration."""
 
+        # What a real connection retains after the peer's clean 1001 close.
+        close_code = 1001
+        close_reason = "server shutdown"
+        protocol = SimpleNamespace(
+            close_rcvd=Close(1001, "server shutdown"), close_sent=Close(1001, "")
+        )
+
         async def send(self, data: str) -> None:
             """
             Record the hello frame payload.
@@ -735,7 +743,7 @@ async def test_serve_tunnel_once_sends_bearer_header(
     caplog.set_level(logging.INFO, logger="omnigent.runner.transports.ws_tunnel.serve")
     monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "session_auth")
     connected: list[int] = []
-    await _serve_tunnel_once(
+    close = await _serve_tunnel_once(
         _noop_app,
         tunnel_url="wss://example.databricksapps.com/v1/runners/runner_auth/tunnel",
         server_url="https://example.databricksapps.com",
@@ -749,6 +757,9 @@ async def test_serve_tunnel_once_sends_bearer_header(
     # The accepted upgrade fires the connected callback exactly once —
     # serve_tunnel relies on it to mark the runner as ever-connected.
     assert connected == [1]
+    # A clean close ends the iteration without an exception; the details the
+    # connection retains are returned so the reconnect loop's row can name them.
+    assert close == serve_module._CloseDetails(1001, "server shutdown", 1001, 1001)
     connected_rows = [
         r for r in caplog.records if getattr(r, "event_name", None) == "runner_connected"
     ]
@@ -1121,6 +1132,56 @@ async def test_serve_tunnel_disconnect_row_names_local_shutdown(
     assert rows[0]["error_type"] == "ConnectionError"
     # The loop slept once and then honoured the shutdown instead of reconnecting.
     assert len(sleeps) == 1
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_disconnect_row_names_clean_close_frames(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A peer's clean 1001 close is attributed from the connection, not an error.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.transports.ws_tunnel.serve")
+    outcomes = iter(["clean_close", "stop"])
+
+    async def _serve_once(app: Any, *, on_connected: Any = None, **_kwargs: Any) -> Any:
+        """Connect and end with the peer's 1001, then cancel to end the test."""
+        del app
+        if next(outcomes) == "clean_close":
+            on_connected()
+            return serve_module._CloseDetails(1001, "server shutdown", 1001, 1001)
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_clean_close",
+            runner_version="0.1.0",
+        )
+
+    rows = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel_disconnected"
+    ]
+    assert len(rows) == 1
+    assert rows[0]["disconnect_reason"] == "peer_closed"
+    assert rows[0]["connected"] is True
+    assert rows[0]["error_type"] is None
+    assert (rows[0]["close_code"], rows[0]["close_reason"]) == (1001, "server shutdown")
+    assert (rows[0]["close_rcvd_code"], rows[0]["close_sent_code"]) == (1001, 1001)
 
 
 @pytest.mark.parametrize(

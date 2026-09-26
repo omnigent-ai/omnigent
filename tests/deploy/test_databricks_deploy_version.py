@@ -60,6 +60,10 @@ def test_explicit_version_must_be_pep440(deploy_mod: ModuleType) -> None:
         deploy_mod._compute_deploy_version("0.16.0.dev0", "not-a-version")
 
 
+def test_explicit_version_is_normalized_like_a_wheel_filename(deploy_mod: ModuleType) -> None:
+    assert deploy_mod._compute_deploy_version("0.16.0.dev0", "1.0.0-BETA") == "1.0.0b0"
+
+
 def test_build_suffix_is_empty_outside_a_git_checkout(
     deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

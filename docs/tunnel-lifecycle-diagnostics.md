@@ -20,7 +20,9 @@ both ends.
   close handshake broke), `close_code`, `close_reason`, `close_rcvd_code` and
   `close_sent_code` (which side sent a close frame; a 1006 has neither),
   `error_type`, `connected`, `connection_age_s`, `recycle`, `backoff_reset`,
-  `delay_s`, `retry_in_s`.
+  `delay_s`, `retry_in_s`. A clean 1000/1001 close ends the read loop without
+  an exception, so its codes and reason come from the connection's own close
+  frames.
 - `runner_session_initialized`: `recovery_turn` (`history_resume`,
   `recovery_prompt` or `none`) with its inputs `recovery_id`,
   `resume_interrupted_turn`, `suppress_recovery_turn`, `execution_seen`,

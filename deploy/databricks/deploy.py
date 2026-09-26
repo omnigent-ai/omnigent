@@ -118,12 +118,12 @@ def _compute_deploy_version(base: str, explicit: str | None) -> str:
     if explicit:
         # Caller knows what they want — let it through after a sanity check.
         # The parser accepts every form this script generates, so a generated
-        # version can be fed back through `--skip-build --version`.
+        # version can be fed back through `--skip-build --version`; the
+        # normalized form is the one wheel filenames carry.
         try:
-            Version(explicit)
+            return str(Version(explicit))
         except InvalidVersion:
             raise SystemExit(f"--version {explicit!r} is not a valid PEP 440 version") from None
-        return explicit
     # Strip a previous deploy's stamp so suffixes don't stack if a prior
     # deploy left pyproject.toml dirty (or someone committed the bumped
     # value): the local segment first, then `.postN` / `.devN`.
@@ -1137,7 +1137,7 @@ def main() -> int:
             if not wheels:
                 raise SystemExit("--skip-build was set but dist/ has no wheels to redeploy")
             wheel_version = _derive_deploy_version_from_wheels(wheels)
-            if args.version and args.version != wheel_version:
+            if args.version and deploy_version != wheel_version:
                 raise SystemExit(
                     f"--version {args.version!r} does not match reused wheel "
                     f"version {wheel_version!r}"

@@ -22,6 +22,7 @@ import random
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -429,6 +430,7 @@ async def serve_tunnel(
             return
         connected_this_attempt = False
         disconnect_error: BaseException | None = None
+        close_details: _CloseDetails | None = None
         auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
         reconnecting = ever_connected
         retry_reason = "connection closed cleanly"
@@ -437,7 +439,7 @@ async def serve_tunnel(
         connection_id = uuid.uuid4().hex
         try:
             activity_kwargs = {"on_activity": on_activity} if on_activity is not None else {}
-            await _serve_tunnel_once(
+            close_details = await _serve_tunnel_once(
                 app,
                 tunnel_url=tunnel_url,
                 server_url=server_url,
@@ -626,6 +628,13 @@ async def serve_tunnel(
         jittered = delay_s * (
             1.0 + random.uniform(-_RECONNECT_JITTER_FRACTION, _RECONNECT_JITTER_FRACTION)
         )
+        # A clean 1000/1001 close ends the read loop without an exception, so
+        # its frames come from the connection rather than from an error.
+        close = (
+            _CloseDetails.from_error(disconnect_error)
+            if disconnect_error is not None
+            else (close_details if close_details is not None else _CloseDetails())
+        )
         # One row per attempt the runner retries: what ended the socket, how
         # long it lived and how long the runner waits. Fatal exits (persistent
         # auth or protocol rejection, cancellation) raise above instead.
@@ -650,10 +659,10 @@ async def serve_tunnel(
                 error_type=(
                     type(disconnect_error).__name__ if disconnect_error is not None else None
                 ),
-                close_code=websocket_close_code(disconnect_error),
-                close_reason=websocket_close_reason(disconnect_error),
-                close_rcvd_code=_close_frame_code(disconnect_error, "rcvd"),
-                close_sent_code=_close_frame_code(disconnect_error, "sent"),
+                close_code=close.code,
+                close_reason=close.reason,
+                close_rcvd_code=close.rcvd_code,
+                close_sent_code=close.sent_code,
                 recycle=recycle,
                 backoff_reset=backoff_reset,
                 delay_s=delay_s,
@@ -814,7 +823,7 @@ async def _serve_tunnel_once(
     reconnect: bool = False,
     attempt: int = 1,
     disconnected_monotonic: float | None = None,
-) -> None:
+) -> _CloseDetails:
     """Serve one WebSocket connection until it closes.
 
     :param app: Runner ASGI application.
@@ -857,7 +866,7 @@ async def _serve_tunnel_once(
     :param disconnected_monotonic: ``time.monotonic()`` when the previous
         connection ended, or ``None``. The gap to this connect is the
         outage the server saw.
-    :returns: None.
+    :returns: The close details the connection retained once it ended.
     """
     import websockets
 
@@ -1023,7 +1032,7 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
-                            return
+                            break
                         try:
                             raw = recv_task.result()
                         except ConnectionClosedOK:
@@ -1051,6 +1060,9 @@ async def _serve_tunnel_once(
                 await suspend_task
             await _cancel_dispatch_tasks(dispatch_tasks)
             await _cancel_ws_channels(ws_channels)
+    # Read after the context closed the socket: a clean 1000/1001 close ends
+    # the iteration without an exception, and only the connection knows its frames.
+    return _CloseDetails.from_connection(ws)
 
 
 async def _graceful_drain(
@@ -1530,19 +1542,56 @@ def _websocket_close_code(exc: WebSocketException) -> int | None:
     return None
 
 
-def _close_frame_code(exc: BaseException | None, direction: str) -> int | None:
-    """Return the close code the peer sent (``"rcvd"``) or this side sent (``"sent"``).
-
-    A 1006 carries neither: the transport died without a close handshake,
-    which is itself the signal an intermediary cut the connection.
-
-    :param exc: Exception that ended the connection, or ``None``.
-    :param direction: ``"rcvd"`` or ``"sent"``.
-    :returns: The close code, or ``None`` when no frame went that way.
-    """
-    close = getattr(exc, direction, None)
+def _frame_code(close: object) -> int | None:
+    """Return the code of a websockets ``Close`` frame object, if any."""
     code = getattr(close, "code", None)
     return code if isinstance(code, int) else None
+
+
+@dataclass(frozen=True)
+class _CloseDetails:
+    """Close-frame facts for one ended connection.
+
+    A 1006 carries no frame in either direction: the transport died without
+    a close handshake, which is itself the signal an intermediary cut it.
+
+    :param code: The connection's close code.
+    :param reason: The connection's close reason.
+    :param rcvd_code: Code of the close frame the peer sent, if any.
+    :param sent_code: Code of the close frame this side sent, if any.
+    """
+
+    code: int | None = None
+    reason: str | None = None
+    rcvd_code: int | None = None
+    sent_code: int | None = None
+
+    @classmethod
+    def from_error(cls, exc: BaseException) -> _CloseDetails:
+        """Details carried by the exception that ended the connection."""
+        return cls(
+            code=websocket_close_code(exc),
+            reason=websocket_close_reason(exc),
+            rcvd_code=_frame_code(getattr(exc, "rcvd", None)),
+            sent_code=_frame_code(getattr(exc, "sent", None)),
+        )
+
+    @classmethod
+    def from_connection(cls, ws: object) -> _CloseDetails:
+        """Details a connection retains after a clean close.
+
+        ``websockets`` keeps the frames on the protocol object (asyncio
+        client) or on the connection itself (legacy client).
+        """
+        protocol = getattr(ws, "protocol", ws)
+        code = getattr(ws, "close_code", None)
+        reason = getattr(ws, "close_reason", None)
+        return cls(
+            code=code if isinstance(code, int) else None,
+            reason=reason if isinstance(reason, str) and reason else None,
+            rcvd_code=_frame_code(getattr(protocol, "close_rcvd", None)),
+            sent_code=_frame_code(getattr(protocol, "close_sent", None)),
+        )
 
 
 def _round_seconds(value: float | None) -> float | None:
