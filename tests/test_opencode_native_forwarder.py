@@ -931,3 +931,42 @@ async def test_execution_failed_aborted_takes_idle_path() -> None:
     status = _status_edges(server.posts)[-1]
     assert status["status"] == "idle"
     assert "output" not in status
+
+
+# --- interruption -----------------------------------------------------------
+
+
+async def test_user_interrupt_posts_idle_only() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.execution.started"))
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+    assert "external_session_interrupted" not in _types(server.posts)
+    assert _status_edges(server.posts)[-1] == {"status": "idle", "response_id": "msg_1"}
+
+
+async def test_shutdown_interrupt_posts_interrupted_then_idle() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.execution.started"))
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_event("session.execution.interrupted", reason="shutdown"))
+    types = _types(server.posts)
+    assert _datas(server.posts, "external_session_interrupted") == [{"response_id": "msg_1"}]
+    assert types.index("external_session_interrupted") < len(types) - 1
+    assert _status_edges(server.posts)[-1]["status"] == "idle"
+
+
+async def test_interrupt_persists_partial_streamed_text() -> None:
+    """Streamed text without ``text.ended`` is kept and retires its preview."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event("session.text.delta", assistantMessageID="msg_1", ordinal=0, delta="Half an")
+    )
+    await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+    item = _items(server.posts)[-1]
+    assert item["item_data"]["content"][0]["text"] == "Half an"
+    assert item["message_id"] == "opencode:msg_1:text:0"

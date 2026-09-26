@@ -436,6 +436,7 @@ class OpenCodeNativeForwarder:
     ) -> None:
         """Post the terminal edge stamped with the turn's id and reset per-turn state."""
         await self._flush_pending_text(turn)
+        await self._persist_partial_text(turn)
         turn.turn_active = False
         turn.delta_index.clear()
         turn.reasoning_started.clear()
@@ -920,6 +921,39 @@ class OpenCodeNativeForwarder:
             await self._post_session_usage()
         await self._end_turn(turn, status=_STATUS_FAILED, extra=extra)
 
+    async def _persist_partial_text(self, turn: _SessionTurn) -> None:
+        """Persist streamed text whose ``session.text.ended`` never arrived."""
+        for (message_id, ordinal), text in list(turn.streamed_text.items()):
+            turn.streamed_text.pop((message_id, ordinal), None)
+            if not text:
+                continue
+            if not self.state.mark(self._key("text-final", message_id, str(ordinal))):
+                continue
+            await self._post_assistant_text(
+                turn,
+                text,
+                message_id=message_id,
+                stream_id=self._stream_id(message_id, "text", ordinal),
+            )
+
+    async def _on_execution_interrupted(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.execution.interrupted {reason}``.
+
+        A ``user`` interrupt (web Stop or TUI Esc) is an ordinary idle; any
+        other reason (``shutdown``/``superseded``/``inactivity``) also posts
+        ``external_session_interrupted`` so the web marks the turn cut short.
+        """
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        if event.data.get("reason") != "user":
+            await self._post_event(
+                _EXTERNAL_SESSION_INTERRUPTED,
+                {"response_id": self._response_id(turn, turn.assistant_message_id)},
+                conversation_id=turn.conversation_id,
+            )
+        await self._end_turn(turn)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -964,4 +998,5 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.usage.updated": OpenCodeNativeForwarder._on_usage_updated,
     "session.step.failed": OpenCodeNativeForwarder._on_step_ended,
     "session.execution.failed": OpenCodeNativeForwarder._on_execution_failed,
+    "session.execution.interrupted": OpenCodeNativeForwarder._on_execution_interrupted,
 }
