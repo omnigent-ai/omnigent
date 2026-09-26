@@ -420,6 +420,7 @@ class AcpExecutor(Executor):
         # and the live model value, both learned from ``config_option_update``.
         self._config_option_ids: set[str] = set()
         self._active_model: str | None = None
+        self._model_config_option_id: str | None = None
         self._initial_model: str | None = None
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
@@ -1573,7 +1574,8 @@ class AcpExecutor(Executor):
             if not isinstance(opt_id, str):
                 continue
             self._config_option_ids.add(opt_id)
-            if opt_id == _CONFIG_OPTION_MODEL:
+            if opt.get("category") == _CONFIG_OPTION_MODEL or opt_id == _CONFIG_OPTION_MODEL:
+                self._model_config_option_id = opt_id
                 current = opt.get("currentValue")
                 if isinstance(current, str) and current:
                     self._active_model = current
@@ -1623,7 +1625,7 @@ class AcpExecutor(Executor):
             await self._set_model_via_catalog(session_id, model)
             return
         # Before the first config update, the RPC response determines support.
-        if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+        if self._config_option_ids and self._model_config_option_id is None:
             if available:
                 raise _AcpModelSwitchError(
                     f"ACP agent exposes no model option for switching to {model!r}."
@@ -1638,7 +1640,11 @@ class AcpExecutor(Executor):
 
         response = await self._rpc(
             _AGENT_METHOD_SET_CONFIG_OPTION,
-            {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
+            {
+                "sessionId": session_id,
+                "configId": self._model_config_option_id or _CONFIG_OPTION_MODEL,
+                "value": model,
+            },
         )
         if "error" in response:
             if available:
@@ -1830,7 +1836,18 @@ class AcpExecutor(Executor):
                 stale = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
+            if not isinstance(stale, dict):
+                continue
+            if stale.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                # A pre-prompt model report (e.g. sent right after session/new)
+                # must not be lost to the drain: note it before discarding.
+                update = (stale.get("params") or {}).get("update")
+                if (
+                    isinstance(update, dict)
+                    and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                ):
+                    self._note_config_options(update.get("configOptions"))
+            elif stale.get("id") is not None and stale.get("method"):
                 await self._respond_to_agent_request(stale)
 
         self._rpc_id += 1
