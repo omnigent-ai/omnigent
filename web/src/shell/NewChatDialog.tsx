@@ -118,6 +118,7 @@ import {
   harnessWarningBadgeText,
   isCodexHarness,
   isNativeCursorHarness,
+  isNativeOpenCodeHarness,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -811,6 +812,16 @@ function harnessWarningMessage(
       <>
         {agentName} needs Cursor login on {hostName} — run <code>cursor-agent login</code> on that
         machine.
+      </>
+    );
+  }
+  // OpenCode 2.x ships as a new npm package; an in-place 1.x upgrade can't reach it.
+  if (reason === "version-too-low" && !!harness && isNativeOpenCodeHarness(harness)) {
+    return (
+      <>
+        {agentName} needs OpenCode 2.0 on {hostName} — run{" "}
+        <code>npm i -g @opencode/cli@~2.0.18</code> (after <code>npm rm -g opencode-ai</code>) or{" "}
+        <code>omni setup</code> on that machine.
       </>
     );
   }
