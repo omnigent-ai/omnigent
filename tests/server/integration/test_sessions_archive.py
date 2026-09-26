@@ -175,10 +175,12 @@ async def test_archive_does_not_block_on_slow_stop(
     session_id = session["id"]
 
     release = asyncio.Event()
+    started = asyncio.Event()
     stopped: list[str] = []
 
     async def _parked_stop(sid: str, *_args: object) -> None:
         stopped.append(sid)
+        started.set()
         await release.wait()
 
     _sessions_common._session_status_cache[session_id] = "running"
@@ -192,16 +194,14 @@ async def test_archive_does_not_block_on_slow_stop(
             )
             assert resp.status_code == 200
             assert resp.json()["archived"] is True
-            # The detached task starts on a subsequent loop pass and parks
-            # on the release gate — the stop still runs.
-            for _ in range(100):
-                if stopped:
-                    break
-                await asyncio.sleep(0)
+            # The detached task must run after the PATCH responds. It first
+            # re-reads the session row on a worker thread, so scheduler yields
+            # alone are not a reliable synchronization boundary under CI load.
+            await asyncio.wait_for(started.wait(), timeout=5.0)
             assert stopped == [session_id]
-            release.set()
-            await _drain_detached_stops()
     finally:
+        release.set()
+        await _drain_detached_stops()
         _sessions_common._session_status_cache.pop(session_id, None)
 
 
