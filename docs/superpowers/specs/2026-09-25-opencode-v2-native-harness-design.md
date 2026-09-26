@@ -226,11 +226,14 @@ running cost/tokens, last seen model.
   is removed (in v2 it is a wrapper over the same endpoint and needs the
   background service).
 - Session import (`session_import/local.py`): `opencode export` is gone and
-  `opencode session list` is scoped to one project. Import starts a short-lived
-  `opencode serve --stdio` against the user's real data dir (throwaway config
-  home so user plugins and MCP servers never start), lists with
-  `GET /api/session?parentID=null`, and reads `GET /api/session/{id}/message`,
-  parsing the v2 `content[]` model.
+  `opencode session list` is scoped to one project. Import snapshots the user's
+  `opencode.db` (read-only SQLite backup, in-flight claims cleared) into a
+  throwaway bridge dir and starts a short-lived isolated `opencode serve --stdio`
+  on that copy (throwaway config home so user plugins and MCP servers never
+  start), lists with `GET /api/session?parentID=null`, and reads
+  `GET /api/session/{id}/message`, parsing the v2 `content[]` model. The live
+  store is never opened read-write: OpenCode 2.x resumes suspended sessions at
+  startup, so serving it directly could re-run a user's in-flight turn.
 - Docs: OpenCode section in `docs/` and the omnigent.ai configuration page
   (supported 2.0.x, `@opencode/cli`, `opencode auth login`, YAML example);
   fix the stale e2e docstring citing a vendored 1.17.7 OpenAPI; `CHANGELOG.md`
