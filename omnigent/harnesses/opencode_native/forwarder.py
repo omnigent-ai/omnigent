@@ -141,6 +141,40 @@ def _message_is_complete(info: Mapping[str, Any] | None) -> bool:
     return isinstance(time_info.get("completed"), (int, float))
 
 
+def _web_question_options(
+    raw_options: list[Any],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Translate one question's opencode options into web card options.
+
+    opencode's terminal renders a blank-label option via its description, so the
+    chat card must show it too rather than drop the whole question. A blank
+    label gets a derived display label (the description's first line, else its
+    position), deduplicated within the question. Returns the web options plus a
+    map from each derived display label back to the original label, so a chat
+    answer replies with exactly what a terminal answer would send.
+    """
+    used = {opt["label"] for opt in raw_options if opt["label"]}
+    options: list[dict[str, Any]] = []
+    label_map: dict[str, str] = {}
+    for position, opt in enumerate(raw_options):
+        label = opt["label"]
+        if not label:
+            description = opt.get("description")
+            snippet = ""
+            if isinstance(description, str) and description.strip():
+                snippet = description.strip().splitlines()[0].strip()[:80]
+            base = snippet if snippet else f"Option {position + 1}"
+            display, suffix = base, 2
+            while display in used:
+                display = f"{base} ({suffix})"
+                suffix += 1
+            used.add(display)
+            label_map[display] = label
+            label = display
+        options.append({"label": label})
+    return options, label_map
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's SSE stream into Omnigent events.
@@ -1071,9 +1105,11 @@ class OpenCodeNativeForwarder:
 
         Translates the opencode question shape into the web ``ask_user_question``
         form (preserving each question's ORIGINAL index as its ``id`` so answers
-        realign), POSTs it to the native permission hook, then maps the web
-        verdict back onto ``reply_question`` (one selected-label list per original
-        question, in order) or ``reject_question``. A ``None`` verdict (the TUI
+        realign; blank option labels get derived display labels — see
+        :func:`_web_question_options`), POSTs it to the native permission hook,
+        then maps the web verdict back onto ``reply_question`` (one
+        selected-label list per original question, in order, derived labels
+        translated back to the originals) or ``reject_question``. A ``None`` verdict (the TUI
         answered, or the wait timed out) rejects to unblock opencode.
 
         ``asyncio.CancelledError`` PROPAGATES (it is raised by
@@ -1083,6 +1119,7 @@ class OpenCodeNativeForwarder:
         """
         del tool  # Currently unused; accepted for forward-compat / logging parity.
         web_questions: list[dict[str, Any]] = []
+        answer_label_maps: dict[int, dict[str, str]] = {}
         for index, question in enumerate(questions):
             if not isinstance(question, dict):
                 await self._reject_question_quietly(request_id)
@@ -1092,22 +1129,21 @@ class OpenCodeNativeForwarder:
             if not isinstance(prompt, str) or not prompt or not isinstance(raw_options, list):
                 await self._reject_question_quietly(request_id)
                 return
-            options = [
-                {"label": opt["label"]}
-                for opt in raw_options
-                if isinstance(opt, dict) and isinstance(opt.get("label"), str) and opt["label"]
-            ]
-            if not options or len(options) != len(raw_options):
+            if not raw_options or not all(
+                isinstance(opt, dict) and isinstance(opt.get("label"), str) for opt in raw_options
+            ):
                 await self._reject_question_quietly(request_id)
                 return
+            options, label_map = _web_question_options(raw_options)
+            if label_map:
+                answer_label_maps[index] = label_map
             web_questions.append(
                 {
                     "question": prompt,
                     "options": options,
                     "multiSelect": question.get("multiple") is True,
-                    # ORIGINAL index — the answer for question ``i`` is read back
-                    # under ``str(i)`` so skipped/malformed questions don't shift
-                    # the alignment.
+                    # ORIGINAL index — the answer for question ``i`` is read
+                    # back under ``str(i)``.
                     "id": str(index),
                 }
             )
@@ -1135,11 +1171,16 @@ class OpenCodeNativeForwarder:
                 for i in range(len(questions)):
                     val = content.get(str(i))
                     if isinstance(val, str):
-                        answers.append([val])
+                        selected = [val]
                     elif isinstance(val, list):
-                        answers.append([x for x in val if isinstance(x, str)])
+                        selected = [x for x in val if isinstance(x, str)]
                     else:
-                        answers.append([])
+                        selected = []
+                    label_map = answer_label_maps.get(i)
+                    if label_map:
+                        # Custom typed answers miss the map and pass through as-is.
+                        selected = [label_map.get(x, x) for x in selected]
+                    answers.append(selected)
                 await self._opencode.reply_question(request_id, answers)
             else:
                 # ``decline`` / ``cancel`` / anything else → reject.
