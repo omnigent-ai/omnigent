@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -181,3 +182,17 @@ def test_prepare_native_fork_skips_unreachable_source(bridge_root: Path) -> None
 )
 def test_sanitize_opencode_tui_args(args: list[str], expected: list[str]) -> None:
     assert _sanitize_opencode_tui_args(args) == expected
+
+
+def test_auto_create_opencode_terminal_accepts_fresh() -> None:
+    parameter = inspect.signature(orchestration._auto_create_opencode_terminal).parameters["fresh"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False
+
+
+def test_auto_create_opencode_terminal_has_no_v1_session_calls() -> None:
+    source = inspect.getsource(orchestration._auto_create_opencode_terminal)
+    assert "create_session({" not in source, "v1 dict-payload create_session must be gone"
+    assert "_resolve_opencode_session(" in source
+    assert "_prepare_opencode_native_fork(" in source
+    assert "_sanitize_opencode_tui_args(" in source

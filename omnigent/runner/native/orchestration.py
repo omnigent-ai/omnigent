@@ -1578,16 +1578,15 @@ async def _auto_create_opencode_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    fresh: bool = False,
 ) -> SessionResourceView:
     """
     Auto-create an OpenCode terminal for an opencode-native session.
 
-    Mirrors :func:`_auto_create_codex_terminal`, substituting ``opencode
-    serve`` / ``opencode --server`` for Codex's app-server/remote transport:
-    boots a per-session ``opencode serve`` process, resumes-or-creates the
-    OpenCode session, persists bridge state + ``external_session_id``,
-    starts the SSE forwarder, then registers the ``opencode --server`` TUI as
-    a streamable terminal resource attached to that server.
+    Boots a per-conversation ``opencode serve --stdio``, resumes, forks, or
+    creates the OpenCode session, persists bridge state and
+    ``external_session_id``, starts the SSE forwarder, then registers the
+    ``opencode --server <url> --session <id>`` TUI as a streamable terminal.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :param resource_registry: Registry used to launch the terminal.
@@ -1595,9 +1594,9 @@ async def _auto_create_opencode_terminal(
     :param agent_spec: Optional resolved agent spec (os_env + model).
     :param server_client: Runner Omnigent server HTTP client.
     :param ensure_comment_relay: Callback that starts the Omnigent builtin-tool
-        relay for this session's bridge dir (the nested
-        ``_ensure_comment_relay_started``). ``None`` skips wiring the Omnigent
-        MCP relay (tests / no server).
+        relay for this session's bridge dir. ``None`` skips the relay.
+    :param fresh: ``True`` for ``/clear``: start an empty session and skip
+        resume, fork, and transcript seeding.
     :returns: The created terminal resource view.
     """
     from omnigent.harnesses.opencode_native.app_server import (
@@ -1782,6 +1781,15 @@ async def _auto_create_opencode_terminal(
             await_notify=False,
         )
 
+    # A forked clone copies the source conversation's DB before its own server
+    # opens it, so the source session can be forked natively.
+    fork_source_session_id = (
+        None
+        if fresh
+        else _prepare_opencode_native_fork(
+            launch_config, bridge_dir=bridge_dir, workspace=workspace
+        )
+    )
     server = OpenCodeNativeServer(
         bridge_dir=bridge_dir,
         workspace=launch_config.workspace,
@@ -1793,42 +1801,27 @@ async def _auto_create_opencode_terminal(
     try:
         client = server.client()
         try:
-            opencode_session_id: str | None = None
-            resume_lost_history = False
-            if launch_config.external_session_id is not None:
-                existing = await client.get_session(launch_config.external_session_id)
-                if existing is not None:
-                    opencode_session_id = existing.id
-                else:
-                    # The persisted opencode session is gone (new host / wiped
-                    # XDG store) — we'll rehydrate from the Omnigent transcript
-                    # below instead of silently starting empty.
-                    resume_lost_history = True
-            if opencode_session_id is None:
-                created = await client.create_session(
-                    title=f"omnigent:{session_id}", directory=workspace
-                )
-                opencode_session_id = created.id
-                # Rehydrate prior context (text-prefix replay) when this is a
-                # lost-session resume OR a forked clone carrying history — both
-                # seed the copied Omnigent transcript as a noReply preamble.
-                if resume_lost_history or launch_config.fork_carry_history:
-                    await _rehydrate_opencode_session_from_transcript(
-                        opencode_client=client,
-                        opencode_session_id=opencode_session_id,
-                        omnigent_session_id=session_id,
-                        server_client=server_client,
+            opencode_session_id = await _resolve_opencode_session(
+                client=client,
+                launch_config=launch_config,
+                omnigent_session_id=session_id,
+                workspace=workspace,
+                server_client=server_client,
+                fork_source_session_id=fork_source_session_id,
+                fresh=fresh,
+            )
+            # Persist a newly created or forked session id so a relaunch resumes it.
+            if (
+                server_client is not None
+                and opencode_session_id != launch_config.external_session_id
+            ):
+                with contextlib.suppress(httpx.HTTPError):
+                    await server_client.patch(
+                        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                        json={"external_session_id": opencode_session_id},
+                        params={"include_usage": "false"},
+                        timeout=10.0,
                     )
-                # Persist the OpenCode session id so a later relaunch resumes
-                # it (best effort, like codex-native).
-                if server_client is not None:
-                    with contextlib.suppress(httpx.HTTPError):
-                        await server_client.patch(
-                            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                            json={"external_session_id": opencode_session_id},
-                            params={"include_usage": "false"},
-                            timeout=10.0,
-                        )
         finally:
             await client.aclose()
 
@@ -1888,7 +1881,7 @@ async def _auto_create_opencode_terminal(
         base_url=server.base_url,
         session_id=opencode_session_id,
         workspace=workspace,
-        extra_args=tuple(launch_config.terminal_launch_args or ()),
+        extra_args=_sanitize_opencode_tui_args(launch_config.terminal_launch_args or ()),
     )
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     try:
