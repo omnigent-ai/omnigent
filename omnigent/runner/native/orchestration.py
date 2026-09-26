@@ -7892,6 +7892,7 @@ async def _auto_create_claude_terminal(
         build_native_claude_terminal_env,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
+        endpoint_disallowed_claude_tools,
         resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
@@ -8419,6 +8420,7 @@ async def _auto_create_claude_terminal(
         )
         or None,
         allowed_tools=routed_spawn_tools,
+        disallowed_tools=endpoint_disallowed_claude_tools(claude_config),
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
