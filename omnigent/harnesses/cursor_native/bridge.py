@@ -644,8 +644,12 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
-def _session_alive(socket_path: str, tmux_target: str) -> bool:
-    """Return whether the tmux session/pane still exists (the TUI is running)."""
+class CursorPaneGoneError(RuntimeError):
+    """Raised when tmux confirms the advertised Cursor pane is gone (expected teardown)."""
+
+
+def _probe_session(socket_path: str, tmux_target: str) -> bool | None:
+    """Return the ``tmux has-session`` answer, or ``None`` when the probe itself failed."""
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "has-session", "-t", tmux_target],
@@ -655,8 +659,13 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return False
+        return None
     return proc.returncode == 0
+
+
+def _session_alive(socket_path: str, tmux_target: str) -> bool:
+    """Return whether the tmux session/pane still exists (the TUI is running)."""
+    return _probe_session(socket_path, tmux_target) is True
 
 
 def capture_cursor_pane(bridge_dir: Path) -> str | None:
@@ -692,13 +701,25 @@ def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
 
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
     :param keys: tmux key arguments, e.g. ``"y"`` or ``"Escape"``.
+    :raises CursorPaneGoneError: If tmux confirms the advertised pane no longer
+        exists (the TUI exited or its tmux server was torn down).
     :raises RuntimeError: If the tmux target is not advertised or the
-        ``send-keys`` invocation fails.
+        ``send-keys`` invocation fails without tmux confirming the pane is gone.
     """
     info = read_tmux_info(bridge_dir)
     if info is None:
         raise RuntimeError("cursor-native tmux target not advertised")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    if _probe_session(socket_path, tmux_target) is False:
+        raise CursorPaneGoneError("cursor pane no longer exists (TUI exited)")
+    try:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+    except RuntimeError as exc:
+        # send-keys can race the pane's teardown. Only a confirmed-missing pane
+        # is reported as gone; an unanswered probe keeps the delivery error.
+        if _probe_session(socket_path, tmux_target) is False:
+            raise CursorPaneGoneError("cursor pane no longer exists (TUI exited)") from exc
+        raise
 
 
 def _submit_needle(content: str) -> str:
