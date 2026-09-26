@@ -71,6 +71,9 @@ class OpenCodeNativeExecutor(NativeServerHarness):
         just a later web turn. A per-turn ``config.model`` (if any) still
         wins: the base ``run_turn`` only fills the model when the prompt
         leaves it unset, so it skips a prompt this method already pinned.
+        A ``variant_override`` pinned alongside the model (e.g. from
+        ``executor.variant`` in the agent spec) rides with it, so the serve
+        receives the pair the session was launched with.
 
         :param content: Executor message content (string or content blocks).
         :returns: The prompt with the resolved model applied, or ``None``
@@ -80,10 +83,13 @@ class OpenCodeNativeExecutor(NativeServerHarness):
         if prompt is None or prompt.model:
             return prompt
         state = read_bridge_state(self._bridge_dir)
-        model = state.model_override if state is not None else None
-        if not model:
+        if state is None or not state.model_override:
             return prompt
-        return dataclasses.replace(prompt, model=model)
+        return dataclasses.replace(
+            prompt,
+            model=state.model_override,
+            variant=prompt.variant or state.variant_override,
+        )
 
     async def _resolve_opencode_session_id(self) -> str | None:
         """

@@ -1452,6 +1452,7 @@ async def _auto_create_opencode_terminal(
         clear_bridge_state,
         prepare_bridge_dir,
         seed_opencode_auth,
+        split_model_variant,
         write_bridge_state,
         write_opencode_policy_plugin,
         write_relay_bridge_config,
@@ -1481,6 +1482,13 @@ async def _auto_create_opencode_terminal(
     clear_bridge_state(bridge_dir)
 
     model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
+    # A variant pin (executor.variant, or a model#variant suffix — the explicit
+    # field wins) is carried in bridge state and sent as a top-level prompt
+    # key; the gateway/config resolution below sees only the base model id.
+    variant_override = _opencode_native_variant_from_spec(agent_spec)
+    if model_override:
+        model_override, suffix_variant = split_model_variant(model_override)
+        variant_override = variant_override or suffix_variant
     # Route opencode through the Databricks AI gateway when the spec names a
     # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
     # CLI translates), opencode reads provider/auth from its own config file, so
@@ -1726,6 +1734,7 @@ async def _auto_create_opencode_terminal(
                 xdg_data_home=str(server.xdg_data_home),
                 xdg_config_home=str(server.xdg_config_home),
                 model_override=model_override,
+                variant_override=variant_override,
                 workspace=workspace,
             ),
         )
@@ -1965,6 +1974,21 @@ def _opencode_native_model_from_spec(
         return _resolve_spec_model(spec)
     except Exception:  # noqa: BLE001 - model resolution is best effort.
         return None
+
+
+def _opencode_native_variant_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
+    """
+    Resolve the OpenCode variant pin from a resolved agent spec.
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's ``executor.variant``, or ``None``.
+    """
+    if agent_spec is None:
+        return None
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    return spec.executor.variant
 
 
 def _resolve_opencode_compact_model(

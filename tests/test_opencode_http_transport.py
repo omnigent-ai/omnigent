@@ -44,6 +44,43 @@ def test_build_prompt_payload_bare_model_id_is_dropped() -> None:
     assert "model" not in build_prompt_payload(NativePrompt(text="hi", model="just-a-name"))
 
 
+def test_build_prompt_payload_explicit_variant() -> None:
+    body = build_prompt_payload(
+        NativePrompt(text="hi", model="opencode-go/deepseek-v4.1-flash", variant="max")
+    )
+    assert body["model"] == {"providerID": "opencode-go", "modelID": "deepseek-v4.1-flash"}
+    assert body["variant"] == "max"
+
+
+def test_build_prompt_payload_model_hash_suffix_becomes_variant() -> None:
+    body = build_prompt_payload(
+        NativePrompt(text="hi", model="opencode-go/muse-spark-1.3-contributor#xhigh")
+    )
+    assert body["model"] == {"providerID": "opencode-go", "modelID": "muse-spark-1.3-contributor"}
+    assert body["variant"] == "xhigh"
+
+
+def test_build_prompt_payload_explicit_variant_wins_over_suffix() -> None:
+    body = build_prompt_payload(
+        NativePrompt(text="hi", model="opencode-go/muse-spark-1.3-contributor#low", variant="max")
+    )
+    assert body["model"] == {"providerID": "opencode-go", "modelID": "muse-spark-1.3-contributor"}
+    assert body["variant"] == "max"
+
+
+def test_build_prompt_payload_variant_without_model() -> None:
+    # A bare variant pin applies to the session's current model.
+    body = build_prompt_payload(NativePrompt(text="hi", variant="max"))
+    assert "model" not in body
+    assert body["variant"] == "max"
+
+
+def test_build_prompt_payload_dangling_hash_is_dropped() -> None:
+    body = build_prompt_payload(NativePrompt(text="hi", model="opencode-go/deepseek-v4.1-flash#"))
+    assert body["model"] == {"providerID": "opencode-go", "modelID": "deepseek-v4.1-flash"}
+    assert "variant" not in body
+
+
 def test_build_prompt_payload_image_and_file_attachments() -> None:
     prompt = NativePrompt(
         text="look",

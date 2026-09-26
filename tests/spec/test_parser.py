@@ -188,6 +188,28 @@ def test_parse_executor_reasoning_effort_supersedes_llm(tmp_path: Path) -> None:
     assert spec.llm.extra.get("reasoning_effort") == "high"
 
 
+def test_parse_executor_variant(tmp_path: Path) -> None:
+    """``executor.variant`` survives parse as a typed field."""
+    config = {
+        "spec_version": 1,
+        "name": "variant-agent",
+        "executor": {
+            "type": "omnigent",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "variant": "max",
+            "config": {"harness": "opencode-native"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.variant == "max"
+    assert spec.executor.config == {"harness": "opencode-native"}
+
+
+def test_parse_executor_variant_defaults_to_none(agent_dir: Path) -> None:
+    assert parse(agent_dir).executor.variant is None
+
+
 def test_parse_llm_missing_model(tmp_path: Path) -> None:
     config = {"spec_version": 1, "llm": {"max_completion_tokens": 100}}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))

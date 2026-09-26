@@ -67,6 +67,9 @@ class NativePrompt:
     :param attachments: Attachment descriptors (image/file blocks).
     :param system_prompt: Optional per-prompt system override.
     :param model: Optional per-prompt model id.
+    :param variant: Optional model-variant pin (e.g. OpenCode's top-level
+        prompt ``variant`` key); wins over a ``model#variant`` suffix on
+        :attr:`model` when both are set.
     :param metadata: Transport-specific extras.
     """
 
@@ -74,6 +77,7 @@ class NativePrompt:
     attachments: tuple[Mapping[str, object], ...] = ()
     system_prompt: str | None = None
     model: str | None = None
+    variant: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
