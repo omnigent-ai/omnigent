@@ -709,6 +709,34 @@ class OpenCodeNativeForwarder:
         )
         await self._post_tool_output(turn, call_id, output, message_id=message_id)
 
+    async def _on_tool_progress(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.tool.progress`` — stream incremental tool output.
+
+        v2 progress metadata is a replacement snapshot. Built-in tools report
+        ids only (shell ``{shellID}``, subagent ``{sessionID, status}``), so
+        output streams only when a tool reports a growing ``metadata.output``
+        string; only the new suffix is forwarded.
+        """
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        call_id = _str_field(event.data, "id")
+        metadata = event.data.get("metadata")
+        if call_id is None or not isinstance(metadata, Mapping):
+            return
+        output = metadata.get("output")
+        if not isinstance(output, str):
+            return
+        previous = turn.tool_output.get(call_id, "")
+        turn.tool_output[call_id] = output
+        if len(output) <= len(previous) or not output.startswith(previous):
+            return
+        await self._post_event(
+            _EXTERNAL_TOOL_OUTPUT_DELTA,
+            {"call_id": call_id, "delta": output[len(previous) :]},
+            conversation_id=turn.conversation_id,
+        )
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -748,4 +776,5 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.tool.called": OpenCodeNativeForwarder._on_tool_called,
     "session.tool.success": OpenCodeNativeForwarder._on_tool_success,
     "session.tool.failed": OpenCodeNativeForwarder._on_tool_failed,
+    "session.tool.progress": OpenCodeNativeForwarder._on_tool_progress,
 }

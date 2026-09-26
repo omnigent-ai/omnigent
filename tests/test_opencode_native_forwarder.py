@@ -688,3 +688,54 @@ async def test_text_before_tool_call_lands_first() -> None:
         _event("session.tool.called", assistantMessageID="msg_1", id="c1", input={}, executed=True)
     )
     assert [i["item_type"] for i in _items(server.posts)] == ["message", "function_call"]
+
+
+# --- tool progress ----------------------------------------------------------
+
+
+async def test_tool_progress_streams_growing_output_suffix() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    for output in ("line1\n", "line1\nline2\n", "line1\nline2\n"):
+        await fwd.handle_event(
+            _event(
+                "session.tool.progress",
+                assistantMessageID="msg_1",
+                id="c1",
+                metadata={"output": output},
+            )
+        )
+    assert _datas(server.posts, "external_tool_output_delta") == [
+        {"call_id": "c1", "delta": "line1\n"},
+        {"call_id": "c1", "delta": "line2\n"},
+    ]
+
+
+async def test_tool_progress_replacement_output_is_not_streamed() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    for output in ("abc", "xyz-longer"):
+        await fwd.handle_event(
+            _event(
+                "session.tool.progress",
+                assistantMessageID="msg_1",
+                id="c1",
+                metadata={"output": output},
+            )
+        )
+    assert _datas(server.posts, "external_tool_output_delta") == [
+        {"call_id": "c1", "delta": "abc"}
+    ]
+
+
+async def test_fixture_shell_progress_without_output_is_dropped() -> None:
+    """v2 shell progress is ``{shellID}`` only (tool/plugin/shell.ts), so nothing streams."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    progress = _fixture("session.tool.progress")
+    assert "output" not in progress.data["metadata"]
+    await fwd.handle_event(_fixture("session.step.started"))
+    await fwd.handle_event(progress)
+    assert "external_tool_output_delta" not in _types(server.posts)
