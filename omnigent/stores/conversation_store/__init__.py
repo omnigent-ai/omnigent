@@ -1475,11 +1475,8 @@ class ConversationStore(ABC):
         bound and the binding fields persisted, but the launch
         failed and any worktree was rolled back. Clearing all four
         fields in one transaction keeps the row consistent with the
-        host's actual state (no runner, no worktree) and, unlike
-        :meth:`set_host_id` (which treats ``None`` as "leave
-        untouched" and so cannot clear ``git_branch``), lets a later
-        rebind that omits a worktree start from a clean slate rather
-        than inheriting a stale branch. Nulling ``host_id`` and
+        host's actual state (no runner, no worktree) and lets a later
+        rebind start from a clean slate. Nulling ``host_id`` and
         ``workspace`` together never violates
         ``ck_conversations_workspace_required_for_host`` (workspace
         is only required while ``host_id`` is set).
@@ -1551,8 +1548,9 @@ class ConversationStore(ABC):
         :param git_branch: Optional git branch checked out in a
             server-created worktree, e.g. ``"feature/login"``. Set
             when binding an existing session to a freshly created
-            worktree (the fork resume path). ``None`` leaves it
-            untouched.
+            worktree (the fork resume path). ``None`` preserves the
+            branch on the same host/workspace, but clears it when
+            the host or an explicitly supplied workspace changes.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.

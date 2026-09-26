@@ -269,6 +269,8 @@ export interface Session {
    */
   agentName: string | null;
   runnerId?: string | null;
+  /** Current runner reachability; absent when the snapshot omits liveness. */
+  runnerOnline?: boolean;
   /**
    * Host that launched (or should launch) the runner, e.g.
    * ``"host_a1b2"``; ``null`` for CLI/local sessions. Carried on the
@@ -281,6 +283,8 @@ export interface Session {
    * older recorded fixtures may omit it (treated as `null`).
    */
   hostId?: string | null;
+  /** Current host reachability; absent when the snapshot omits liveness. */
+  hostOnline?: boolean;
   /**
    * Whether this session's host is a dormant resumable managed host the
    * server can wake on the next message. Carried on the snapshot so the open
