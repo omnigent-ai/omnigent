@@ -1405,3 +1405,124 @@ def test_form_answer_drops_inactive_conditional_fields() -> None:
         "mode": "b",
         "detail": "x",
     }
+
+
+# --- form.created -----------------------------------------------------------
+
+
+def _sample_answer(question: fwd_mod.FormQuestion) -> str | list[str]:
+    """A web-form answer the mapper accepts for *question*'s field type."""
+    labels = [option["label"] for option in question.question["options"]]
+    if question.kind == "multiselect":
+        return labels[:1]
+    if question.kind in ("number", "integer"):
+        return "1"
+    return labels[0] if labels else "typed answer"
+
+
+async def test_fixture_form_accept_replies_with_mapped_answer() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    created = _fixture("form.created")
+    form = created.data["form"]
+    questions = fwd_mod.form_questions(form["fields"])
+    assert questions
+    content = {question.key: _sample_answer(question) for question in questions}
+    server.hook_response = {"action": "accept", "content": content}
+    await fwd.handle_event(created)
+    await _drain(fwd)
+    hook = _hook_post(server)
+    assert hook is not None
+    assert hook["elicitation_id"] == form["id"]
+    assert hook["operation_type"] == "question"
+    assert hook["agent"] == "OpenCode"
+    assert hook["policy_name"] == "opencode_native_question"
+    assert [q["id"] for q in hook["ask_user_question"]["questions"]] == [q.key for q in questions]
+    expected = fwd_mod.form_answer(questions, form["fields"], content)
+    assert expected is not None
+    assert opencode.form_replies == [(_FIX_SESSION, form["id"], expected)]
+    assert opencode.form_cancels == []
+
+
+def _form_event(
+    form_id: str, fields: list[dict[str, Any]], title: str = "Questions"
+) -> OpenCodeEvent:
+    return OpenCodeEvent(
+        id=None,
+        type="form.created",
+        data={"form": {"id": form_id, "sessionID": _SESSION, "title": title, "fields": fields}},
+        location=None,
+    )
+
+
+_SINGLE = [
+    {
+        "key": "q0",
+        "type": "string",
+        "title": "Formatting",
+        "description": "Indent style?",
+        "options": [{"value": "Tabs", "label": "Tabs"}, {"value": "Spaces", "label": "Spaces"}],
+        "custom": True,
+    }
+]
+
+
+async def test_form_decline_cancels_without_reply() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "decline"}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_form_event("frm_1", _SINGLE))
+    await _drain(fwd)
+    assert opencode.form_cancels == [(_SESSION, "frm_1")]
+    assert opencode.form_replies == []
+
+
+async def test_form_empty_verdict_cancels() -> None:
+    """An empty 200 (TUI answered / timed out) cancels so OpenCode is not wedged."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_form_event("frm_1", _SINGLE))
+    await _drain(fwd)
+    assert _hook_post(server) is not None
+    assert opencode.form_cancels == [(_SESSION, "frm_1")]
+
+
+async def test_unrenderable_form_cancels_without_hook() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_form_event("frm_1", [{"key": "x", "type": "date"}]))
+    await _drain(fwd)
+    assert _hook_post(server) is None
+    assert opencode.form_cancels == [(_SESSION, "frm_1")]
+
+
+async def test_all_hidden_form_replies_empty_answer_without_hook() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_form_event("frm_1", [{"key": "t", "type": "string", "hidden": True}]))
+    await _drain(fwd)
+    assert _hook_post(server) is None
+    assert opencode.form_replies == [(_SESSION, "frm_1", {})]
+
+
+async def test_invalid_form_answer_cancels() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"n": "not a number"}}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_form_event("frm_1", [{"key": "n", "type": "number"}]))
+    await _drain(fwd)
+    assert opencode.form_cancels == [(_SESSION, "frm_1")]
+    assert opencode.form_replies == []
+
+
+async def test_form_created_dedupes() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"q0": "Tabs"}}
+    fwd = _forwarder(server, opencode)
+    event = _form_event("frm_1", _SINGLE)
+    await fwd.handle_event(event)
+    task = fwd._form_tasks["frm_1"]
+    await fwd.handle_event(event)
+    assert fwd._form_tasks["frm_1"] is task
+    await _drain(fwd)
+    assert opencode.form_replies == [(_SESSION, "frm_1", {"q0": "Tabs"})]

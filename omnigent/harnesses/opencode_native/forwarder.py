@@ -29,6 +29,7 @@ import httpx
 from omnigent.harnesses.opencode_native.bridge import update_active_message_id
 from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
+    OpenCodeClientError,
     OpenCodeEvent,
 )
 from omnigent.harnesses.opencode_native.permissions import (
@@ -1389,6 +1390,118 @@ class OpenCodeNativeForwarder:
             await asyncio.gather(task, return_exceptions=True)
         await self._post_event(_EXTERNAL_ELICITATION_RESOLVED, {"elicitation_id": request_id})
 
+    async def _on_form_created(self, event: OpenCodeEvent) -> None:
+        """Handle ``form.created`` — park a web question card in the background."""
+        form = event.data.get("form")
+        if not isinstance(form, Mapping):
+            return
+        form_id = _str_field(form, "id")
+        session_id = _str_field(form, "sessionID")
+        if form_id is None or session_id is None:
+            return
+        if not self.state.mark(self._key("form", form_id)):
+            return
+        task = asyncio.create_task(self._handle_form(session_id, form_id, dict(form)))
+        self._form_tasks[form_id] = task
+        task.add_done_callback(lambda _t, fid=form_id: self._form_tasks.pop(fid, None))
+
+    async def _handle_form(self, session_id: str, form_id: str, form: dict[str, Any]) -> None:
+        """Park one form as a web card and reply with the mapped answer.
+
+        Any outcome other than a valid ``accept`` cancels the form so the
+        OpenCode turn is never wedged. ``CancelledError`` propagates: it means
+        the TUI answered first (see :meth:`_on_permission_replied`-style flow).
+        """
+        fields = form.get("fields")
+        questions = form_questions(fields)
+        if questions is None or not isinstance(fields, list):
+            await self._cancel_form_quietly(session_id, form_id)
+            return
+        try:
+            if not questions:
+                await self._opencode.reply_form(session_id, form_id, {})
+                return
+            title = _str_field(form, "title")
+            first_prompt = questions[0].question["question"]
+            verdict = await self._park_elicitation(
+                form_id,
+                message=title or "OpenCode is asking a question",
+                payload={"questions": [question.question for question in questions]},
+                preview=first_prompt[:1024] if isinstance(first_prompt, str) else None,
+            )
+            if verdict is None or verdict.get("action") != "accept":
+                await self._cancel_form_quietly(session_id, form_id)
+                return
+            content = verdict.get("content")
+            answer = form_answer(questions, fields, content if isinstance(content, dict) else {})
+            if answer is None:
+                await self._cancel_form_quietly(session_id, form_id)
+                return
+            await self._opencode.reply_form(session_id, form_id, answer)
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, OpenCodeClientError) as exc:
+            _logger.warning("OpenCode form handling failed for form=%s: %s", form_id, exc)
+            await self._cancel_form_quietly(session_id, form_id)
+
+    async def _cancel_form_quietly(self, session_id: str, form_id: str) -> None:
+        """Best-effort cancel a form; a TUI answer commonly makes this 404."""
+        try:
+            await self._opencode.cancel_form(session_id, form_id)
+        except (httpx.HTTPError, OpenCodeClientError):
+            _logger.debug("OpenCode form cancel for form=%s failed", form_id, exc_info=True)
+
+    async def _park_elicitation(
+        self,
+        elicitation_id: str,
+        *,
+        message: str,
+        payload: dict[str, Any],
+        preview: str | None,
+    ) -> dict[str, Any] | None:
+        """POST the native permission hook for a form; return the web verdict.
+
+        Returns ``None`` for every "no answer" outcome (transport error, status
+        >= 400, empty body, or non-dict JSON). The structured
+        ``ask_user_question`` is the payload the web UI renders.
+        """
+        body: dict[str, Any] = {
+            "elicitation_id": elicitation_id,
+            "operation_type": "question",
+            "agent": "OpenCode",
+            "policy_name": "opencode_native_question",
+            "message": message,
+            "ask_user_question": payload,
+        }
+        if preview is not None:
+            body["content_preview"] = preview
+        url = f"/v1/sessions/{quote(self._session_id, safe='')}/hooks/native-permission-request"
+        try:
+            response = await self._server.post(url, json=body)
+        except httpx.HTTPError:
+            _logger.warning(
+                "OpenCode form hook POST failed for session=%s form=%s",
+                self._session_id,
+                elicitation_id,
+                exc_info=True,
+            )
+            return None
+        if response.status_code >= 400:
+            _logger.warning(
+                "OpenCode form hook rejected: status=%s body=%s",
+                response.status_code,
+                response.text[:512],
+            )
+            return None
+        if not response.content:
+            return None
+        try:
+            result = response.json()
+        except ValueError:
+            _logger.warning("OpenCode form hook returned non-JSON: %s", response.text[:512])
+            return None
+        return result if isinstance(result, dict) else None
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -1443,4 +1556,5 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.inbox.cancelled": OpenCodeNativeForwarder._on_inbox_cancelled,
     "permission.asked": OpenCodeNativeForwarder._on_permission_asked,
     "permission.replied": OpenCodeNativeForwarder._on_permission_replied,
+    "form.created": OpenCodeNativeForwarder._on_form_created,
 }
