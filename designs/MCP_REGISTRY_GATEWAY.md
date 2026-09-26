@@ -13,9 +13,9 @@ existing Python hooks, and options for bringing an external registry or gateway.
 ## Components and ownership
 
 The registry and gateway are modules in the existing Omnigent server, not new
-services to deploy. The registry defines **what may be connected**. The gateway
-decides **whether this actor may make this call**, resolves the credential, and
-calls the approved upstream.
+services to deploy. The registry defines **what may be connected**. The **policy adapter** decides whether this actor may make this call using trusted
+session context. The **gateway backend** resolves credentials and calls the approved
+upstream. The backend may be replaced without moving Omnigent policies to the runner.
 
 ```mermaid
 flowchart LR
@@ -30,7 +30,7 @@ flowchart LR
   subgraph server[Omnigent server]
     R[Registry YAML: services, URLs, auth, allowlists]
     A[Catalog, OAuth and session APIs]
-    G[Session MCP gateway]
+    G[General MCP endpoint and policy adapter]
     Policy[Existing access checks and tool policies]
     C[CredentialStore and provider resolvers]
     K[Vault Transit / KMS]
@@ -38,7 +38,8 @@ flowchart LR
     R --> G
     A --> C
     G <--> Policy
-    G --> C
+    G --> E[McpGatewayBackend]
+    E --> C
     C --> K
   end
   subgraph external[External provider infrastructure]
@@ -49,8 +50,8 @@ flowchart LR
   UI -->|Browser consent| O
   A -->|Code exchange| O
   C -->|Refresh when needed| O
-  P -->|Session-authenticated discovery and calls| G
-  G -->|HTTPS with upstream access token| M
+  P -->|POST /v1/mcp/service with authenticated session context| G
+  E -->|HTTPS with upstream access token| M
 ```
 
 - **Administrator:** configures approved destinations, auth and nonempty tool
@@ -110,17 +111,18 @@ session require its runner to reload, as the UI indicates.
 ```mermaid
 sequenceDiagram
   participant H as Execution host: harness / MCP relay
-  participant G as Server: session MCP gateway
+  participant G as Server: /v1/mcp/service and policy adapter
   participant P as Server: existing policy layer
   participant C as Server: credential resolver
   participant M as External MCP server
-  H->>G: POST /v1/sessions/{id}/mcp: tools/list
+  H->>G: tools/list + X-Omnigent-Session-Id
   G->>G: Authenticate session and resolve trusted user
   G->>C: Resolve credential for each selected service
   G->>M: Initialize and list upstream tools
   M-->>G: Tool schemas
-  G-->>H: Filtered schemas named service__tool
-  H->>G: tools/call with name and arguments
+  G-->>H: Filtered upstream schemas
+  H->>H: Expose service__tool through relay
+  H->>G: tools/call with upstream name, arguments and session context
   G->>P: Existing tool-call policy / approval
   P-->>G: Allow, otherwise stop here
   G->>G: Check service access and registry/session tool allowlists
@@ -133,6 +135,9 @@ sequenceDiagram
 
 Each operation opens a fresh upstream connection. Native harnesses discover tools
 through `ProxyMcpManager` and advertise them on their existing persistent relay.
+The runner reads registry references from the session spec and routes each service
+to its own gateway URL. Existing custom MCPs and runtime tools retain their session
+proxy route; older runners remain compatible.
 They do not need their own OAuth implementation.
 
 **Discovery is not a tool-permission check.** An upstream may advertise a tool but
@@ -147,6 +152,50 @@ record service/tool and failure category/status; gateway call logs also identify
 the session. They do not include exception text, request headers, response bodies
 or tokens. Tool calls are not automatically retried: a failed response does not
 prove that a write did not execute.
+
+## Policy adapter and external gateways
+
+`POST /v1/mcp/{service_id}` has a session-independent URL. Its Omnigent adapter
+requires `X-Omnigent-Session-Id` and authenticates the caller before checking edit
+access, session selection, the trusted turn actor and service/tool allowlists.
+The header is a context reference, not a credential. Sessionless calls are not
+supported by this adapter. No separate policy service needs to be deployed.
+
+```mermaid
+flowchart LR
+  subgraph runner[Local machine / remote host / sandbox]
+    H[Harness]
+    R[MCP relay with selected services]
+    H --> R
+  end
+  subgraph server[Omnigent server]
+    S[Session selection and trusted policy context]
+    A[McpPolicyAdapter: authentication and policies]
+    B[McpGatewayBackend extension point]
+    D[Default backend: credentials and refresh]
+    S --> A
+    A <-->|Approved calls / returned results| B
+    B --> D
+  end
+  R <-->|General MCP route plus session context| A
+  D <--> M[Remote MCP server or standard enterprise gateway]
+  B <-->|Injected partner client| G[Proprietary enterprise gateway]
+```
+
+The adapter reuses the existing policy handler. Before execution, request policies
+can deny, transform arguments, or require approval. Approval retains the reviewed
+arguments and session/tool/actor identity server-side. After execution, response
+policies can transform or suppress output. Result-phase ASK withholds output;
+interactive result review is not implemented. Suppression does not undo an upstream
+side effect. These policies cover traffic through Omnigent's gateway; independently
+configured local MCPs are outside this path.
+
+`McpGatewayBackend` exposes `list_tools` and `call_tool` with an approved service and
+trusted user. It does not receive the session object. Standard external gateways
+work through the default HTTP backend; proprietary gateways can supply an injected
+implementation. Both are wrapped by the same policy adapter, including response
+filtering. An external gateway owns its downstream credentials; Omnigent stores
+only the credential needed to call that gateway. See the API doc for exact types.
 
 ## Credential lifecycle and refresh
 
@@ -236,7 +285,7 @@ flowchart LR
     Login[Existing login / AuthProvider]
     User[Trusted user and workspace]
     Grant[MCP OAuth connection and encrypted grant]
-    G[Session MCP gateway]
+    G[General MCP endpoint and policy adapter]
     X[Optional deployment token exchange adapter: not implemented]
     Login --> User
     User --> G
@@ -270,14 +319,17 @@ which issuer, audience, scopes and user delegation the external gateway requires
 - No upstream connection pooling or discovery cache. Unavailable/disconnected
   services are omitted from discovery.
 - Non-text result blocks become text/JSON, not native media streams.
-- No automatic retry or refresh-and-replay after a provider 401.
+- No automatic retry or refresh-and-replay after a provider 401 or lost response.
+- Request approval is supported; result-review ASK withholds output without an
+  interactive result-review flow. The policy adapter requires session context.
 - User allowlists are not organization/group entitlement management. The gateway
   does not enforce sandbox network egress or replace sandbox isolation.
 
 ## Code and verification
 
 Start with [registry and OAuth resolution](../omnigent/server/mcp_registry.py),
-[gateway execution](../omnigent/server/registry_gateway.py),
+[gateway backend](../omnigent/server/mcp_gateway.py),
+[policy adapter](../omnigent/server/mcp_policy_adapter.py),
 [session selection](../omnigent/server/routes/session_mcp_servers.py) and
 [launch picker](../web/src/shell/McpRegistryLaunchPicker.tsx).
 
