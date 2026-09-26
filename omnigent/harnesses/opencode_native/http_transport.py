@@ -29,7 +29,6 @@ from omnigent.harnesses.opencode_native.client import OpenCodeClient
 from omnigent.native.native_server_transport import (
     NativeEvent,
     NativeLaunchConfig,
-    NativePermissionDecision,
     NativePrompt,
     NativeServerHandle,
 )
@@ -298,17 +297,5 @@ class OpenCodeHttpTransport:
         try:
             forked = await client.fork(session_id, before=at_message_id)
             return forked.id
-        finally:
-            await client.aclose()
-
-    async def reply_permission(self, decision: NativePermissionDecision) -> None:
-        """Relay a permission decision via ``POST /permission/{id}/reply``."""
-        reply_map = {"allow_once": "once", "allow_always": "always", "reject": "reject"}
-        client = self._client()
-        try:
-            await client.reply_permission(
-                decision.request_id,
-                {"reply": reply_map[decision.decision], "message": decision.message or ""},
-            )
         finally:
             await client.aclose()

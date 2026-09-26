@@ -233,37 +233,139 @@ async def test_auth_and_directory_headers_applied() -> None:
     await client.aclose()
 
 
-async def test_list_models() -> None:
+async def test_reply_permission_posts_decision() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(204)
+
+    client = _client(handler)
+    assert await client.reply_permission("ses_1", "per_1", "once") is True
+    assert seen["path"] == "/api/session/ses_1/permission/per_1/reply"
+    assert seen["body"] == {"decision": "once"}
+    await client.aclose()
+
+
+async def test_reply_permission_plain_reject_omits_message() -> None:
+    """A reject with feedback lets the model continue, so a plain reject sends none."""
+    bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    client = _client(handler)
+    await client.reply_permission("ses_1", "per_1", "reject")
+    await client.reply_permission("ses_1", "per_2", "reject", message="use the test runner")
+    assert bodies == [
+        {"decision": "reject"},
+        {"decision": "reject", "message": "use the test runner"},
+    ]
+    await client.aclose()
+
+
+async def test_reply_permission_refuses_always() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(204)
+
+    client = _client(handler)
+    with pytest.raises(ValueError):
+        await client.reply_permission("ses_1", "per_1", "always")
+    assert requests == []
+    await client.aclose()
+
+
+async def test_reply_permission_http_error_raises() -> None:
+    client = _client(
+        lambda _r: httpx.Response(
+            404,
+            json={"_tag": "PermissionNotFoundError", "requestID": "per_x", "message": "gone"},
+        )
+    )
+    with pytest.raises(OpenCodeClientError) as exc_info:
+        await client.reply_permission("ses_1", "per_x", "reject", message="denied by policy")
+    assert exc_info.value.status_code == 404
+    await client.aclose()
+
+
+async def test_reply_form_posts_typed_answer() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(204)
+
+    client = _client(handler)
+    answer = {"indent": "tabs", "count": 3, "confirm": True, "langs": ["py", "ts"]}
+    assert await client.reply_form("ses_1", "frm_1", answer) is True
+    assert seen["path"] == "/api/session/ses_1/form/frm_1/reply"
+    assert seen["body"] == {"answer": answer}
+    await client.aclose()
+
+
+async def test_cancel_form_deletes() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"], seen["path"] = request.method, request.url.path
+        return httpx.Response(204)
+
+    client = _client(handler)
+    assert await client.cancel_form("ses_1", "frm_1") is True
+    assert seen == {"method": "DELETE", "path": "/api/session/ses_1/form/frm_1"}
+    await client.aclose()
+
+
+async def test_list_models_unwraps_location_envelope() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/model"
-        return httpx.Response(200, json={"models": [{"id": "opencode-go/glm-5.2"}]})
+        return httpx.Response(
+            200,
+            json={
+                "location": {"directory": "/repo"},
+                "data": [{"id": "big-pickle", "providerID": "opencode", "name": "Big Pickle"}],
+            },
+        )
 
     client = _client(handler)
-    assert await client.list_models() == [{"id": "opencode-go/glm-5.2"}]
+    assert await client.list_models() == [
+        {"id": "big-pickle", "providerID": "opencode", "name": "Big Pickle"}
+    ]
     await client.aclose()
 
 
-async def test_reply_permission() -> None:
-    captured: dict[str, object] = {}
-
+async def test_list_providers() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/permission/per_1/reply"
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={})
+        assert request.url.path == "/api/provider"
+        return httpx.Response(
+            200, json={"location": {"directory": "/repo"}, "data": [{"id": "opencode"}]}
+        )
 
     client = _client(handler)
-    assert await client.reply_permission("per_1", {"reply": "once"}) is True
-    assert captured["body"] == {"reply": "once"}
+    assert await client.list_providers() == [{"id": "opencode"}]
     await client.aclose()
 
 
-async def test_list_permissions() -> None:
+async def test_connect_provider_key() -> None:
+    seen: dict[str, object] = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=[{"id": "per_1", "action": "bash"}])
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"data": {"id": "crd_1"}})
 
     client = _client(handler)
-    perms = await client.list_permissions()
-    assert perms == [{"id": "per_1", "action": "bash"}]
+    assert await client.connect_provider_key("anthropic", "sk-test") is True
+    assert seen == {
+        "path": "/api/integration/anthropic/connect/key",
+        "body": {"key": "sk-test"},
+    }
     await client.aclose()
 
 
@@ -489,44 +591,4 @@ async def test_request_json_http_error_raises() -> None:
     client = _client(lambda _r: httpx.Response(503, json={"error": "down"}))
     with pytest.raises(OpenCodeClientError):
         await client.list_messages("ses_1")
-    await client.aclose()
-
-
-async def test_reply_question_posts_global_endpoint() -> None:
-    seen: dict[str, object] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["method"] = request.method
-        seen["path"] = request.url.path
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json=True)
-
-    client = _client(handler)
-    assert await client.reply_question("que_1", [["Tabs"]])
-    assert seen["method"] == "POST"
-    # GLOBAL /question path (NOT session-scoped) — live-verified.
-    assert seen["path"] == "/question/que_1/reply"
-    assert seen["body"] == {"answers": [["Tabs"]]}
-    await client.aclose()
-
-
-async def test_reply_question_raises_on_error() -> None:
-    client = _client(lambda _r: httpx.Response(404, json={"error": "unknown question"}))
-    with pytest.raises(OpenCodeClientError):
-        await client.reply_question("que_x", [["A"]])
-    await client.aclose()
-
-
-async def test_reject_question_posts_global_endpoint() -> None:
-    seen: dict[str, object] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["method"] = request.method
-        seen["path"] = request.url.path
-        return httpx.Response(200, json=True)
-
-    client = _client(handler)
-    assert await client.reject_question("que_1")
-    assert seen["method"] == "POST"
-    assert seen["path"] == "/question/que_1/reject"
     await client.aclose()

@@ -18,7 +18,6 @@ from omnigent.harnesses.opencode_native.http_transport import (
 )
 from omnigent.native.native_server_transport import (
     NativeLaunchConfig,
-    NativePermissionDecision,
     NativePrompt,
 )
 
@@ -90,10 +89,6 @@ class _FakeClient:
     async def fork(self, session_id: str, *, before: str | None = None) -> SimpleNamespace:
         self.calls.append(("fork", (session_id, before)))
         return SimpleNamespace(id="ses_fork")
-
-    async def reply_permission(self, request_id: str, reply: Any) -> bool:
-        self.calls.append(("reply_permission", (request_id, reply)))
-        return True
 
     async def set_model(
         self,
@@ -221,14 +216,6 @@ async def test_fork_with_and_without_message_id() -> None:
     assert await transport.fork("ses_1", at_message_id="msg_9") == "ses_fork"
     assert ("fork", ("ses_1", "msg_9")) in client.calls
     assert ("fork", ("ses_1", None)) in client.calls
-
-
-async def test_reply_permission_maps_decision() -> None:
-    client = _FakeClient()
-    await _transport(client).reply_permission(
-        NativePermissionDecision(request_id="per_1", decision="allow_always", message="ok")
-    )
-    assert ("reply_permission", ("per_1", {"reply": "always", "message": "ok"})) in client.calls
 
 
 async def test_no_connection_coordinates_raises() -> None:

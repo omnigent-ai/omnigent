@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -98,29 +98,13 @@ class NativeEvent:
     raw: Mapping[str, object]
 
 
-@dataclass(frozen=True)
-class NativePermissionDecision:
-    """
-    A permission decision to relay to the native server.
-
-    :param request_id: Native permission request id.
-    :param decision: Normalized decision.
-    :param message: Optional human-readable note.
-    """
-
-    request_id: str
-    decision: Literal["allow_once", "allow_always", "reject"]
-    message: str | None = None
-
-
 @runtime_checkable
 class NativeServerTransport(Protocol):
     """
     Protocol every native-server transport implements.
 
     Implementations encapsulate all wire details (process launch, session
-    lifecycle, prompt injection, abort, event stream, fork, permission
-    replies). The shared
+    lifecycle, prompt injection, abort, event stream, fork). The shared
     :class:`~omnigent.native.native_server_harness.NativeServerHarness` calls only
     these methods.
     """
@@ -157,8 +141,4 @@ class NativeServerTransport(Protocol):
 
     async def fork(self, session_id: str, *, at_message_id: str | None = None) -> str:
         """Fork the native session; return the new session id."""
-        raise NotImplementedError
-
-    async def reply_permission(self, decision: NativePermissionDecision) -> None:
-        """Relay a permission decision to the native server."""
         raise NotImplementedError

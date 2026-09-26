@@ -41,6 +41,10 @@ _JsonMapping: TypeAlias = Mapping[str, object]
 # Upper bound on message pages fetched by list_messages (guards a cursor loop).
 _MAX_MESSAGE_PAGES = 1000
 
+# Permission decisions Omnigent sends; "always" would persist an OpenCode rule
+# that later tool calls bypass policy with.
+_PERMISSION_DECISIONS = frozenset({"once", "reject"})
+
 
 def _unwrap(body: object) -> object:
     """
@@ -417,15 +421,43 @@ class OpenCodeClient:
         """
         List available models (``GET /api/model``).
 
-        :returns: A list of model objects; empty when the server exposes
-            no model catalog.
+        :returns: v2 ``Model.Info`` rows, e.g.
+            ``{"id": "big-pickle", "providerID": "opencode", "name": ...}``.
+        :raises OpenCodeClientError: On a non-2xx status.
         """
         data = await self._request_json("GET", "/api/model")
-        if isinstance(data, dict):
-            models = data.get("models")
-            if isinstance(models, list):
-                return [m for m in models if isinstance(m, dict)]
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
         return []
+
+    async def list_providers(self) -> list[_JsonObject]:
+        """
+        List configured providers (``GET /api/provider``).
+
+        :returns: v2 ``Provider.Info`` rows, e.g. ``{"id": "opencode", ...}``.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        data = await self._request_json("GET", "/api/provider")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return []
+
+    async def connect_provider_key(self, provider_id: str, api_key: str) -> bool:
+        """
+        Store an API key for a provider integration
+        (``POST /api/integration/{id}/connect/key``).
+
+        :param provider_id: Integration id, e.g. ``"anthropic"``.
+        :param api_key: The key to store in the server's credential DB.
+        :returns: ``True`` on a 2xx response.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        await self._request_json(
+            "POST",
+            f"/api/integration/{provider_id}/connect/key",
+            json_body={"key": api_key},
+        )
+        return True
 
     async def prompt(
         self,
@@ -531,41 +563,6 @@ class OpenCodeClient:
         data = await self._request_json("POST", f"/api/session/{session_id}/compact", json_body={})
         return data if isinstance(data, dict) else {}
 
-    async def reply_question(self, request_id: str, answers: list[list[str]]) -> bool:
-        """
-        Answer a ``question`` tool request (``POST /question/{id}/reply``).
-
-        The opencode ``question`` tool blocks until answered. ``answers`` is one
-        entry per question, each a list of the selected option labels (single
-        choice → a one-element list). Verified live against ``opencode serve``
-        1.17.7: ``{"answers": [["Tabs"]]}`` resolves the question (emits
-        ``question.replied`` → ``session.idle``). The GLOBAL ``/question`` path
-        is used (the session-scoped one is not an API route).
-
-        :param request_id: OpenCode question request id (``que_…``).
-        :param answers: Selected labels per question, in question order.
-        :returns: ``True`` on a 2xx response.
-        :raises OpenCodeClientError: On a non-2xx status.
-        """
-        await self._request_json(
-            "POST", f"/question/{request_id}/reply", json_body={"answers": answers}
-        )
-        return True
-
-    async def reject_question(self, request_id: str) -> bool:
-        """
-        Reject a ``question`` tool request (``POST /question/{id}/reject``).
-
-        Unblocks the opencode ``question`` tool without an answer (the tool
-        reports the question was declined).
-
-        :param request_id: OpenCode question request id (``que_…``).
-        :returns: ``True`` on a 2xx response.
-        :raises OpenCodeClientError: On a non-2xx status.
-        """
-        await self._request_json("POST", f"/question/{request_id}/reject")
-        return True
-
     async def fork(self, session_id: str, *, before: str | None = None) -> OpenCodeSession:
         """
         Fork a session (``POST /api/session/{id}/fork``).
@@ -581,35 +578,72 @@ class OpenCodeClient:
             raise OpenCodeClientError("OpenCode fork returned a non-object body")
         return OpenCodeSession.from_payload(data)
 
-    # --- permissions -----------------------------------------------------
+    # --- permissions and forms --------------------------------------------
 
-    async def list_permissions(self) -> list[_JsonObject]:
+    async def reply_permission(
+        self,
+        session_id: str,
+        request_id: str,
+        decision: str,
+        message: str | None = None,
+    ) -> bool:
         """
-        List pending permission requests (``GET /permission``).
+        Answer a permission request
+        (``POST /api/session/{id}/permission/{requestID}/reply``).
 
-        :returns: A list of permission request objects.
-        """
-        data = await self._request_json("GET", "/permission")
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
-        return []
-
-    async def reply_permission(self, request_id: str, reply: _JsonMapping) -> bool:
-        """
-        Reply to a permission request (``POST /permission/{id}/reply``).
-
-        :param request_id: OpenCode permission request id.
-        :param reply: Reply body, e.g. ``{"reply": "once"}`` where reply is
-            one of ``once`` / ``always`` / ``reject``.
+        :param session_id: OpenCode session id the request belongs to.
+        :param request_id: Permission request id, e.g. ``"per_abc"``.
+        :param decision: ``"once"`` or ``"reject"``.
+        :param message: Feedback for the model. OpenCode treats a reject that
+            carries a message as a correction the model continues from; omit
+            it to stop the tool call outright.
         :returns: ``True`` on a 2xx response.
+        :raises ValueError: For any other decision (``"always"`` is refused).
+        :raises OpenCodeClientError: On a non-2xx status.
         """
-        response = await self._client.request(
-            "POST", f"/permission/{request_id}/reply", json=dict(reply)
+        if decision not in _PERMISSION_DECISIONS:
+            raise ValueError(f"Unsupported OpenCode permission decision {decision!r}")
+        body: _JsonObject = {"decision": decision}
+        if message is not None:
+            body["message"] = message
+        await self._request_json(
+            "POST",
+            f"/api/session/{session_id}/permission/{request_id}/reply",
+            json_body=body,
         )
-        if response.status_code >= 400:
-            raise OpenCodeClientError(
-                f"OpenCode reply_permission failed: {response.status_code} {response.text[:500]}"
-            )
+        return True
+
+    async def reply_form(
+        self, session_id: str, form_id: str, answer: Mapping[str, object]
+    ) -> bool:
+        """
+        Answer a form (``POST /api/session/{id}/form/{formID}/reply``).
+
+        :param session_id: OpenCode session id.
+        :param form_id: Form id from ``form.created``.
+        :param answer: ``{field_key: value}``; values are strings, numbers,
+            booleans, or string lists.
+        :returns: ``True`` on a 2xx response.
+        :raises OpenCodeClientError: On a non-2xx status (e.g. 409 when the
+            form was already settled from the TUI).
+        """
+        await self._request_json(
+            "POST",
+            f"/api/session/{session_id}/form/{form_id}/reply",
+            json_body={"answer": dict(answer)},
+        )
+        return True
+
+    async def cancel_form(self, session_id: str, form_id: str) -> bool:
+        """
+        Cancel a form (``DELETE /api/session/{id}/form/{formID}``).
+
+        :param session_id: OpenCode session id.
+        :param form_id: Form id from ``form.created``.
+        :returns: ``True`` on a 2xx response.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        await self._request_json("DELETE", f"/api/session/{session_id}/form/{form_id}")
         return True
 
     # --- events ----------------------------------------------------------
