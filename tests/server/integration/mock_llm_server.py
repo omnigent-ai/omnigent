@@ -790,6 +790,8 @@ class QueuedResponse:
     status_code: int = 500
     delay: float = 0.0
     truncate_after: int | None = None
+    # Reject non-null request params with an xAI-style 400 until omitted.
+    reject_params: list[str] | None = None
     # Usage overrides. On ``/v1/responses`` merged into the response usage.
     # On ``/v1/messages`` merged into the Anthropic
     # ``message_start`` event (e.g. {"input_tokens": 50000}) so a test can
@@ -1023,6 +1025,24 @@ class MockState:
 _state = MockState()
 
 
+def _reject_unsupported_param(qr: QueuedResponse, parsed: object) -> JSONResponse | None:
+    """Return a 400 when a queued response rejects a present request param."""
+    if not qr.reject_params or not isinstance(parsed, dict):
+        return None
+    for key in qr.reject_params:
+        if parsed.get(key) is not None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Argument not supported on this model: {key}",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+    return None
+
+
 # ── Endpoints ────────────────────────────────────────────
 
 
@@ -1054,6 +1074,10 @@ async def create_response(
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
         await asyncio.sleep(qr.delay)
+
+    rejected = _reject_unsupported_param(qr, parsed)
+    if rejected is not None:
+        return rejected
 
     # Error response
     if qr.error is not None:
@@ -1255,6 +1279,10 @@ async def create_chat_completion(
     if qr.delay:
         await asyncio.sleep(qr.delay)
 
+    rejected = _reject_unsupported_param(qr, parsed)
+    if rejected is not None:
+        return rejected
+
     if qr.error is not None:
         return JSONResponse(
             status_code=qr.status_code,
@@ -1424,6 +1452,7 @@ async def configure(request: Request) -> dict[str, object]:
                     status_code=entry.get("status_code", 500),
                     delay=entry.get("delay", 0.0),
                     truncate_after=entry.get("truncate_after"),
+                    reject_params=entry.get("reject_params"),
                     usage=entry.get("usage"),
                     refusal_category=entry.get("refusal_category"),
                     thinking=entry.get("thinking"),
