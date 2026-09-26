@@ -1854,6 +1854,53 @@ async def test_events_compact_on_opencode_native_503_when_summarize_raises(
 
 
 @pytest.mark.asyncio
+async def test_events_clear_on_opencode_native_relaunches_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``/clear`` relaunches OpenCode without resuming, forking, or seeding."""
+    import omnigent.runner.app as runner_app
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "4f1c2b7e9d0a4c55b1e7a3c9d2f60a18"
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_auto_create(*args: Any, **kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(runner_app, "_auto_create_opencode_terminal", _fake_auto_create)
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("opencode", "main")] = instance
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    async with _runner_client(app) as http_client:
+        create_resp = await http_client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_1"}
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await http_client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 1
+    assert calls[0]["fresh"] is True
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

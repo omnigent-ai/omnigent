@@ -7024,6 +7024,7 @@ def create_runner_app(
                 agent_spec=spec,
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
+                fresh=True,
             )
         except Exception as exc:  # noqa: BLE001 - report relaunch failure to caller.
             return JSONResponse(
