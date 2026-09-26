@@ -1,6 +1,26 @@
 import "@testing-library/jest-dom/vitest";
 import { vi } from "vitest";
 
+// Node 25+ predefines localStorage (as undefined) and sessionStorage on
+// globalThis, and vitest keeps pre-existing globals, so jsdom's storages never
+// reach tests. Re-expose them; vitest rewrites defaultView, hence the getter.
+const jsdomWindow = Object.getOwnPropertyDescriptor(Document.prototype, "defaultView")?.get?.call(
+  document,
+) as (Window & typeof globalThis) | null | undefined;
+if (jsdomWindow && jsdomWindow !== globalThis) {
+  for (const name of ["localStorage", "sessionStorage"] as const) {
+    let current: Storage = jsdomWindow[name];
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      enumerable: true,
+      get: () => current,
+      set: (value: Storage) => {
+        current = value;
+      },
+    });
+  }
+}
+
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
 // import them can still load in tests. (The Antigravity glyph additionally
