@@ -54,6 +54,8 @@ class AcpCliHarness:
     :param args: Argv appended after the binary to start the CLI's ACP stdio
         server, e.g. ``("--acp",)`` or ``("agent", "stdio")``.
     :param aliases: Accepted alternate spellings, canonicalized to the row key.
+    :param icon: Optional ACP icon. Emoji works directly; a relative image path
+        resolves to no icon because generated ACP bundles contain no image assets.
     :param omnigent_mcp: Whether to offer Omnigent's MCP server in
         ``session/new``. Some vendor CLIs don't yet support session-scoped
         MCP and ignore ``mcpServers``, configuring MCP out of band instead
@@ -64,6 +66,7 @@ class AcpCliHarness:
     install: HarnessInstallSpec
     args: tuple[str, ...]
     aliases: tuple[str, ...] = ()
+    icon: str | None = None
     omnigent_mcp: bool = True
 
     @property

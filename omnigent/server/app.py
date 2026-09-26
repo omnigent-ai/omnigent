@@ -1065,7 +1065,7 @@ _ACP_AGENT_PROMPT = (
 )
 
 
-def _build_acp_bundle(*, harness: str, name: str) -> bytes:
+def _build_acp_bundle(*, harness: str, name: str, icon: str | None = None) -> bytes:
     """
     Materialize a one-file ACP picker agent and tar it.
 
@@ -1078,6 +1078,8 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
     :param harness: The harness id, e.g. ``"acp:devin"`` or ``"grok"``.
     :param name: The agent name / stable-id seed — a valid ``[a-zA-Z0-9_-]+``
         slug (e.g. ``"devin"``, ``"grok"``), never a display label with spaces.
+    :param icon: Optional ACP icon. Emoji works directly; a relative image path
+        resolves to no icon because generated ACP bundles contain no image assets.
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
     import tempfile
@@ -1093,6 +1095,8 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
         "executor": {"type": "omnigent", "config": {"harness": harness}},
         "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
     }
+    if icon:
+        raw["icon"] = icon
     with tempfile.TemporaryDirectory() as tmpdir:
         source = Path(tmpdir) / "src"
         source.mkdir()
@@ -1126,8 +1130,9 @@ def _ensure_default_acp_agents(
     :func:`shadowed_builtin_acp_rows`).
 
     Purely additive: it only adds picker rows and never touches native seeding.
-    A malformed ``acp:`` block is logged and skipped, never fatal to startup
-    (mirrors the dynamic ``acp:*`` catalog rows in ``harness_plugins``).
+    A malformed ``acp:`` block or invalid generated spec is logged and skipped,
+    never fatal to startup (mirrors the dynamic ``acp:*`` catalog rows in
+    ``harness_plugins``).
 
     Note: a seeded row is keyed by the agent's display name, so renaming a
     configured ACP agent leaves the old picker row behind until the store is
@@ -1137,7 +1142,30 @@ def _ensure_default_acp_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
+    import tempfile
+
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.spec import load
+
+    def seed(name: str, harness: str, icon: str | None) -> None:
+        try:
+            bundle_bytes = _build_acp_bundle(harness=harness, name=name, icon=icon)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                load(
+                    bundle_bytes,
+                    dest=Path(tmpdir) / "agent",
+                    expand_env=True,
+                    prune_invalid_sub_agents=True,
+                )
+            _ensure_builtin_agent(
+                agent_store,
+                artifact_store,
+                agent_cache,
+                name=name,
+                bundle_bytes=bundle_bytes,
+            )
+        except OmnigentError as exc:
+            _logger.warning("Skipping invalid ACP agent %s: %s", name, exc)
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
     try:
@@ -1154,28 +1182,16 @@ def _ensure_default_acp_agents(
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
         # like "Gemini CLI" would fail to load. The web picker capitalizes the slug
         # for display (e.g. ``devin`` -> "Devin").
-        _ensure_builtin_agent(
-            agent_store,
-            artifact_store,
-            agent_cache,
-            name=agent.slug,
-            bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
-        )
+        seed(agent.slug, f"acp:{agent.slug}", agent.icon)
 
     # (2) Builtin ACP CLI harnesses — one row each, seeded like the natives because
     # the vendor CLI runs on the executing host, not here. Keyed by the catalog id
     # (already a valid slug), not the display label. A row a configured agent already
     # claims is skipped: both seed the same ``builtin_agent_id``.
-    for key in ACP_CLI_HARNESSES:
+    for key, harness in ACP_CLI_HARNESSES.items():
         if key in shadowed:
             continue
-        _ensure_builtin_agent(
-            agent_store,
-            artifact_store,
-            agent_cache,
-            name=key,
-            bundle_bytes=_build_acp_bundle(harness=key, name=key),
-        )
+        seed(key, key, harness.icon)
 
 
 def _build_debby_bundle() -> bytes:

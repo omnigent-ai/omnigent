@@ -19,6 +19,7 @@ vi.mock("@/components/icons/ClaudeIcon", () => ({ ClaudeIcon: stub("claude") }))
 vi.mock("@/components/icons/CodexIcon", () => ({ CodexIcon: stub("codex") }));
 vi.mock("@/components/icons/CursorIcon", () => ({ CursorIcon: stub("cursor") }));
 vi.mock("@/components/icons/GooseIcon", () => ({ GooseIcon: stub("goose") }));
+vi.mock("@/components/icons/GrokIcon", () => ({ GrokIcon: stub("grok") }));
 vi.mock("@/components/icons/KiroIcon", () => ({ KiroIcon: stub("kiro") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
 vi.mock("@/components/icons/OpenCodeIcon", () => ({ OpenCodeIcon: stub("opencode") }));
@@ -72,6 +73,8 @@ describe("AgentCard icon selection", () => {
     { name: "x", harness: "antigravity", expected: "antigravity" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
     { name: "pi", harness: "pi", expected: "pi" },
+    { name: "x", harness: "grok", expected: "grok" },
+    { name: "x", harness: "grok-native", expected: "grok" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
     { name: "spec-gen", harness: "openapi", expected: "bot" },
   ])("uses the $expected glyph for harness $harness", ({ name, harness, expected }) => {
@@ -92,6 +95,35 @@ describe("AgentCard icon selection", () => {
     // Neither the codex/claude harness match nor the nessie name match
     // fires, so the generic bot is the floor.
     expect(chosenIcon(agent({ name: "mystery", harness: "agents_sdk" }))).toBe("bot");
+  });
+
+  it("renders a declared emoji icon as the grapheme, over the harness glyph", () => {
+    // A codex-harnessed agent would otherwise get the Codex glyph; a declared
+    // emoji wins, and no brand glyph is rendered.
+    const { container } = render(
+      <AgentCard
+        agent={agent({ name: "x", harness: "codex", icon: "🦊" })}
+        selected={false}
+        onSelect={() => {}}
+      />,
+    );
+    expect(container).toHaveTextContent("🦊");
+    expect(container.querySelector("[data-icon]")).toBeNull();
+  });
+
+  it("renders a declared path icon as an <img> pointing at the icon endpoint", () => {
+    const { container } = render(
+      <AgentCard
+        agent={agent({ id: "ag_9", name: "x", harness: "codex", icon: "brand/logo.svg" })}
+        selected={false}
+        onSelect={() => {}}
+      />,
+    );
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img).toHaveAttribute("src", "/v1/agents/ag_9/icon");
+    // The harness glyph must not also render.
+    expect(container.querySelector("[data-icon]")).toBeNull();
   });
 });
 
