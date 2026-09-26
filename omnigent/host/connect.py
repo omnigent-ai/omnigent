@@ -265,6 +265,21 @@ _LOG_TAIL_MAX_BYTES = 4096
 # the error summary above it remains visible.
 _LOG_TAIL_MAX_LINES = 15
 
+# Bytes scanned for the runner's own exit reason; the crash hook logs it above
+# a traceback that appears twice, well outside the shown tail.
+_EXIT_REASON_SCAN_BYTES = 64 * 1024
+
+# The runner records why it is stopping (see ``runner._entry``) as its last words.
+_RUNNER_EXIT_REASON_MARKER = "runner exiting: "
+
+# Final line of a Python traceback, e.g. ``OSError: [Errno 28] No space left on device``.
+_TRACEBACK_FINAL_LINE = re.compile(
+    r"^(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception|Exit|Interrupt): \S.*$"
+)
+
+# Bound on the stated cause; the shown tail still carries the rest.
+_EXIT_REASON_MAX_CHARS = 512
+
 # Poll cadence for the per-runner exit watcher. 0.5s matches the client's
 # steady-state online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
 # so a crashed runner is reported within about one client poll.
@@ -347,31 +362,38 @@ def _redact_log_tail(tail: str) -> str:
     return redact_log_text(tail, include_whitespace_credentials=True)
 
 
+def _runner_exit_reason(scanned: str, shown_tail: list[str]) -> str | None:
+    """Return the runner's own ``runner exiting: <reason>`` line from *scanned*, else
+    the final ``SomeError: ...`` line of a traceback in *shown_tail*, else ``None``."""
+    for line in reversed(scanned.splitlines()):
+        marker_at = line.find(_RUNNER_EXIT_REASON_MARKER)
+        if marker_at != -1:
+            reason = line[marker_at + len(_RUNNER_EXIT_REASON_MARKER) :].strip()
+            if reason:
+                return reason[:_EXIT_REASON_MAX_CHARS]
+    for line in reversed(shown_tail):
+        if _TRACEBACK_FINAL_LINE.match(line.strip()):
+            return line.strip()[:_EXIT_REASON_MAX_CHARS]
+    return None
+
+
 def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
-    """Compose the human-readable error for a runner that died.
-
-    Carries the actual cause to the user: exit code, the host-side log
-    path (for the full log), and the trailing log lines — the part that
-    usually holds the traceback or tunnel-rejection message. Without
-    this, the cause stays in a file on the host and every consumer just
-    sees a connect timeout. Credential-shaped values in the tail are
-    masked (see :func:`_redact_log_tail`) because the report travels to
-    session viewers, not just host operators.
-
-    :param exit_code: The runner process's exit code, e.g. ``1``.
-        ``None`` when unknown.
-    :param log_path: The runner's captured stdout/stderr log file.
-    :returns: A multi-line error message ready to surface verbatim in
-        a CLI error or API ``error`` field.
-    """
+    """Compose the error for a runner that died: ``runner process exited with code N
+    (log on host: ...)``, then ``cause: <the reason the runner itself recorded>``,
+    then the log tail, both redacted because the report reaches session viewers."""
     message = "runner process exited"
     if exit_code is not None:
         message += f" with code {exit_code}"
     message += f" (log on host: {display_log_path(log_path)})"
-    tail = _read_log_tail(log_path)
-    if tail.strip():
-        lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
-        message += "\n--- runner log tail ---\n" + _redact_log_tail("\n".join(lines))
+    scanned = _read_log_tail(log_path, max_bytes=_EXIT_REASON_SCAN_BYTES)
+    if not scanned.strip():
+        return message
+    lines = scanned.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
+    tail = "\n".join(lines)[-_LOG_TAIL_MAX_BYTES:]
+    reason = _runner_exit_reason(scanned, lines)
+    if reason is not None:
+        message += f"\ncause: {_redact_log_tail(reason)}"
+    message += "\n--- runner log tail ---\n" + _redact_log_tail(tail)
     return message
 
 

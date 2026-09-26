@@ -1513,6 +1513,118 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     assert "code 3" in error
 
 
+_TAIL_SEPARATOR = "\n--- runner log tail ---\n"
+
+_TUNNEL_REJECTION = (
+    "runner tunnel rejected by server (HTTP 403 persisted across 3 attempts); "
+    "run `omnigent login https://example.cloud.databricks.com/omnigent` to re-authenticate"
+)
+
+
+def test_runner_exit_error_leads_with_the_runners_stated_reason(tmp_path: Path) -> None:
+    """The report names the runner's own exit reason before the raw log tail,
+    even when a shutdown traceback sits right above that reason."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "During handling of the above exception, another exception occurred:\n"
+        "\n"
+        "Traceback (most recent call last):\n"
+        '  File "/venv/lib/python3.12/site-packages/starlette/routing.py", line 655, in lifespan\n'
+        "    await receive()\n"
+        '  File "/usr/lib/python3.12/asyncio/queues.py", line 158, in get\n'
+        "    await getter\n"
+        "asyncio.exceptions.CancelledError\n"
+        f"ERROR 09-10 17:15:27.891 runner._entry main | runner exiting: {_TUNNEL_REJECTION}\n"
+        f"error: {_TUNNEL_REJECTION}\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    headline, separator, tail = error.partition(_TAIL_SEPARATOR)
+    assert separator, error
+    first, cause = headline.splitlines()
+    assert first.startswith("runner process exited with code 1 (log on host: ")
+    assert cause == f"cause: {_TUNNEL_REJECTION}"
+    # The raw tail stays attached for anyone who needs the full context.
+    assert "asyncio.exceptions.CancelledError" in tail
+
+
+def test_runner_exit_error_finds_the_reason_above_the_displayed_tail(tmp_path: Path) -> None:
+    """A crash-hook reason logged above the 15-line tail window (the traceback
+    is printed twice below it) still leads the report."""
+    log = tmp_path / "runner-x.log"
+    cause = "[Errno 28] No space left on device: '/tmp/runner-specs-runner_token_ab12-qncoiwzp'"
+    frames = "".join(
+        f'  File "/venv/lib/python3.12/site-packages/pkg{n}.py", line {n}, in step{n}\n'
+        f"    step{n}()\n"
+        for n in range(20)
+    )
+    traceback = f"Traceback (most recent call last):\n{frames}OSError: {cause}\n"
+    log.write_text(
+        "CRITICAL 09-10 17:15:27.891 runner._entry _log_uncaught | "
+        f"runner exiting: uncaught OSError: {cause}\n{traceback}{traceback}",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    headline, _, tail = error.partition(_TAIL_SEPARATOR)
+    assert headline.splitlines()[1] == f"cause: uncaught OSError: {cause}"
+    tail_lines = tail.splitlines()
+    assert len(tail_lines) == 15
+    assert "runner exiting" not in tail
+    assert tail_lines[-1] == f"OSError: {cause}"
+
+
+def test_runner_exit_error_falls_back_to_the_final_traceback_line(tmp_path: Path) -> None:
+    """Without a stated reason (an import error dies before the crash hook is
+    installed), the traceback's final line names the cause."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "<frozen runpy>", line 198, in _run_module_as_main\n'
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 31, in <module>\n'
+        "    from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel\n"
+        "ModuleNotFoundError: No module named 'websockets'\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert error.splitlines()[1] == "cause: ModuleNotFoundError: No module named 'websockets'"
+
+
+def test_runner_exit_error_without_a_recognizable_cause_keeps_the_plain_report(
+    tmp_path: Path,
+) -> None:
+    """Unstructured output is not promoted to a cause; the tail alone carries it."""
+    log = tmp_path / "runner-x.log"
+    log.write_text("boot: starting\nwarming caches\nkilled\n", encoding="utf-8")
+
+    error = _runner_exit_error(137, log)
+
+    lines = error.splitlines()
+    assert lines[0].startswith("runner process exited with code 137 (log on host: ")
+    assert lines[1] == "--- runner log tail ---"
+    assert "cause:" not in error
+
+
+def test_runner_exit_error_redacts_the_stated_reason(tmp_path: Path) -> None:
+    """A credential inside the runner's reason is masked like the tail."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "CRITICAL 09-10 17:15:27.891 runner._entry _log_uncaught | runner exiting: uncaught "
+        "RuntimeError: mint failed for Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert "eyJhbGciOiJIUzI1NiJ9" not in error
+    assert "cause: uncaught RuntimeError: mint failed for" in error
+
+
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
