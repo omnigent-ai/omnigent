@@ -6658,12 +6658,7 @@ async def test_subagent_watcher_registers_a_fork_under_the_root_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fork's inherited copy of its own spawn call must not make the spawn ambiguous.
-
-    Its transcript opens with a ``fork-context-ref`` and the parent's spawning
-    record as a sidechain; counting that copy as a second owner left the fork
-    unregistered and re-read every transcript on every poll.
-    """
+    """A fork's inherited copy of its own spawn call must not make the spawn ambiguous."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -6714,12 +6709,7 @@ async def test_subagent_watcher_registers_a_fork_under_the_root_session(
 async def test_subagent_watcher_registers_a_fork_of_a_sub_agent_and_its_sibling(
     tmp_path: Path,
 ) -> None:
-    """A fork spawned by a sub-agent inlines that parent's records; none of them are its own.
-
-    The inherited copy also carries a sibling spawned by the same message, so
-    both must resolve to the parent, while a spawn the fork makes afterwards
-    still belongs to the fork.
-    """
+    """A fork spawned by a sub-agent inlines that parent's records; none of them are its own."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")

@@ -924,12 +924,7 @@ class _PostRetryDecision:
 
 @dataclass(frozen=True)
 class _SubagentResolveDecision:
-    """Outcome of one failed attempt to resolve a sub-agent's spawn.
-
-    :param attempts: Misses recorded for this sub-agent so far.
-    :param delay_s: Seconds before the watcher should try it again.
-    :param exhausted: Whether the budget is spent and the sub-agent should be parked.
-    """
+    """Outcome of one failed attempt to resolve a sub-agent's spawn."""
 
     attempts: int
     delay_s: float
@@ -937,12 +932,7 @@ class _SubagentResolveDecision:
 
 
 class _SubagentResolveTracker:
-    """Bound how often an unregistered ``.meta.json`` triggers transcript correlation.
-
-    Each resolve attempt re-reads every transcript, so misses back off
-    exponentially within a finite budget; once it is spent the watcher parks
-    the sub-agent instead of retrying on every poll.
-    """
+    """Back off between resolve attempts for an unregistered ``.meta.json``, then park it."""
 
     def __init__(
         self,
@@ -951,11 +941,6 @@ class _SubagentResolveTracker:
         base_delay_s: float = _SUBAGENT_RESOLVE_RETRY_BASE_DELAY_S,
         max_delay_s: float = _SUBAGENT_RESOLVE_RETRY_MAX_DELAY_S,
     ) -> None:
-        """
-        :param max_attempts: Misses before the budget is exhausted.
-        :param base_delay_s: Backoff after the first miss, doubled per miss.
-        :param max_delay_s: Ceiling on the backoff.
-        """
         self._max_attempts = max(1, max_attempts)
         self._base_delay_s = max(0.0, base_delay_s)
         self._max_delay_s = max(0.0, max_delay_s)
@@ -970,10 +955,7 @@ class _SubagentResolveTracker:
         return remaining if remaining > 0 else None
 
     def record_miss(self, subagent_id: str) -> _SubagentResolveDecision:
-        """Record one unresolved attempt and schedule the next.
-
-        :returns: The attempt count, next delay, and whether the budget is spent.
-        """
+        """Record one unresolved attempt and schedule the next; ``exhausted`` means park it."""
         entry = self._entries.setdefault(subagent_id, _PostRetryEntry())
         entry.attempts += 1
         exponent = min(entry.attempts - 1, _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT)
@@ -2584,18 +2566,7 @@ async def _defer_or_park_unresolved_subagent(
     resolve_tracker: _SubagentResolveTracker,
     state: SubagentForwardState,
 ) -> SubagentForwardState:
-    """
-    Record one failed attempt to resolve a sub-agent's spawn.
-
-    Until the resolve budget is spent the sub-agent is deferred to a later poll,
-    backing off so the transcript correlation does not re-run every tick. Once
-    spent it is parked like a dropped sub-agent, with one WARNING.
-
-    :param tool_use_id: The spawn id from the meta, or ``None`` when the meta
-        itself could not be read.
-    :param reason: Short description of the miss for the log line.
-    :returns: ``state``, or the state with the sub-agent parked.
-    """
+    """Defer an unresolved sub-agent to a later poll, or park it once its budget is spent."""
     decision = resolve_tracker.record_miss(subagent_id)
     if not decision.exhausted:
         _logger.debug(

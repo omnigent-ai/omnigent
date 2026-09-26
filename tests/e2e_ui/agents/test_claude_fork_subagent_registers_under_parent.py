@@ -1,13 +1,4 @@
-"""A Claude Code fork sub-agent must register under its parent session.
-
-A fork inherits the parent's conversation, so its transcript also carries the
-parent's spawning ``Agent`` call as a sidechain record. Treating that copy as a
-second owner left the fork unregistered and made every poll re-read the parent
-and sub-agent transcripts in full for the rest of the session.
-
-Drives the reported journey with the real ``claude`` CLI in a runner-bound
-claude-native session; skips when the CLI is unavailable.
-"""
+"""A Claude Code fork sub-agent must register under its parent session (real ``claude`` CLI)."""
 
 from __future__ import annotations
 
@@ -101,11 +92,7 @@ def _correlation_reads_per_tick(
     monkeypatch: pytest.MonkeyPatch,
     ticks: int,
 ) -> list[int]:
-    """Run the runner's sub-agent poll over the on-disk tree; return bytes re-parsed per tick.
-
-    Posts go to an accepting mock server so nothing reaches the live parent.
-    Only the transcript reads made to correlate spawn ids are counted.
-    """
+    """Poll sub-agents against a mock server; return spawn-correlation bytes read per tick."""
     reads: list[int] = []
     original = forwarder._tool_use_ids_in_transcript
 
