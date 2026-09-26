@@ -1617,6 +1617,10 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param launch_timed_out: Whether the recorded ``failed`` came from the
+        launch-liveness reaper rather than from the child itself. Such a
+        failure is a guess ("no start acknowledgment"), so a genuine
+        terminal edge from the child afterwards must replace it.
     """
 
     parent_session_id: str
@@ -1631,6 +1635,7 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    launch_timed_out: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2149,6 +2154,16 @@ def mark_subagent_work_terminal(
             entry.completed_at = time.time()
             entry.delivered = False
             return _deliver_subagent_completion(entry)
+        # A launch-liveness ``failed`` is a guess made without any edge from
+        # the child; the child's own terminal edge afterwards is the truth
+        # and must replace it, or the parent waits on a result it never sees.
+        if entry.launch_timed_out and status in ("completed", "failed"):
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            entry.launch_timed_out = False
+            return _deliver_subagent_completion(entry)
         if entry.delivered:
             return _SubagentDeliveryAck(
                 entry=entry,
@@ -2269,6 +2284,7 @@ def reap_stalled_subagent_launches(
             entry.parent_session_id,
             entry.child_session_id,
         )
+        entry.launch_timed_out = True
         deliver(
             entry.child_session_id,
             status="failed",
@@ -7635,6 +7651,11 @@ def create_runner_app(
                 status="completed",
                 output=_extract_last_assistant_text(conv_id),
             )
+        elif _is_native_harness(conv_id):
+            # A clean native turn end means the prompt was verifiably submitted
+            # into the terminal: first-hand proof the child took it, so the
+            # dispatch leaves ``launching`` even when no running edge is relayed.
+            mark_subagent_work_started(conv_id)
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(

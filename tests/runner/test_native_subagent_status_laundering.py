@@ -369,3 +369,108 @@ def test_launch_timeout_resolver_rejects_non_finite(
     assert runner_app.resolve_subagent_launch_timeout_s() == 45.5
     monkeypatch.delenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S")
     assert runner_app.resolve_subagent_launch_timeout_s() == default
+
+
+@pytest.mark.asyncio
+async def test_real_completion_replaces_a_launch_timeout_failure() -> None:
+    """
+    A child's own terminal edge overrides the reaper's "no start acknowledgment".
+
+    User journey: a parent sends a follow-up to a worker that is already busy;
+    no fresh ``running`` edge is relayed, so the launch-liveness reaper fails
+    the dispatch at the budget and tells the parent. Minutes later the worker
+    genuinely finishes and its ``idle`` edge arrives as ``completed``. That
+    completion must be delivered — the reaper's failure was a guess made
+    without a single edge from the child — or the parent waits forever on a
+    report that is sitting in the child's transcript.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[parent_id] = inbox
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="claude-native",
+        title="critique-desktop",
+    )
+    try:
+        runner_app.reap_stalled_subagent_launches(now=entry.created_at + 200.0, timeout_s=180.0)
+        assert entry.status == "failed" and entry.delivered
+        assert inbox.get_nowait()["status"] == "failed"
+
+        ack = runner_app.mark_subagent_work_terminal(
+            child_id, status="completed", output="Both assessments are in. Full report: ..."
+        )
+        assert ack.delivered_now, (
+            "the child's genuine completion after a launch-timeout guess must be "
+            f"delivered to the parent, got reason={ack.reason!r}"
+        )
+        assert entry.status == "completed"
+        payload = inbox.get_nowait()
+        assert payload["status"] == "completed"
+        assert "Full report" in str(payload["output"])
+        # The guess is spent: a later trailing idle is not re-delivered.
+        again = runner_app.mark_subagent_work_terminal(child_id, status="completed", output="")
+        assert not again.delivered_now and inbox.empty()
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_real_failure_still_replaces_a_launch_timeout_failure() -> None:
+    """A genuine ``failed`` edge after the reaper's guess carries the real error text."""
+    from omnigent.runner import app as runner_app
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[parent_id] = inbox
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude-native", title="x"
+    )
+    try:
+        runner_app.reap_stalled_subagent_launches(now=entry.created_at + 200.0, timeout_s=180.0)
+        inbox.get_nowait()
+        ack = runner_app.mark_subagent_work_terminal(
+            child_id, status="failed", output="Error: 400 from the model API"
+        )
+        assert ack.delivered_now
+        assert inbox.get_nowait()["output"] == "Error: 400 from the model API"
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
+    """
+    The runner's own verified prompt delivery counts as the launch proof.
+
+    A follow-up sent to a child that is already active yields no fresh
+    ``running`` edge, so the only evidence the child took the message is the
+    runner's verified paste. Once it is delivered the dispatch must leave
+    ``launching`` so the reaper cannot fail a working child.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude-native", title="x"
+    )
+    try:
+        assert runner_app.mark_subagent_work_started(uuid.uuid4().hex) is None
+        assert runner_app.mark_subagent_work_started(child_id) is entry
+        assert entry.status == "running"
+        assert (
+            runner_app.reap_stalled_subagent_launches(
+                now=entry.created_at + 900.0, timeout_s=180.0
+            )
+            == []
+        )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
