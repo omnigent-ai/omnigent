@@ -177,7 +177,10 @@ running cost/tokens, last seen model.
   - `mcp.servers.omnigent` for the relay (`type:"local"`, same `serve-mcp`
     argv, `codemode:false` so relay tools keep their names and are individually
     gated), plus `spec.mcp_servers` entries (`local`/`remote`, Databricks bearer
-    header where applicable).
+    header where applicable). Merged user MCP servers get `codemode:false`
+    too. OpenCode's `opencode_list_mcp_resources` / `opencode_read_mcp_resource`
+    builtins still reach any server and cannot be disabled by config, so
+    `ask_on_os_tools` gates them as OS tools.
   - `plugins: ["<bridge>/omnigent-policy"]`: v2 silently drops a plugin
     given as a file path, so each plugin is a directory with `package.json`
     (`"type": "module"`) and `server.js`. A bare-path plugin cannot import

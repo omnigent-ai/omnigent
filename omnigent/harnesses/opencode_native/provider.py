@@ -819,6 +819,10 @@ def _user_mcp_servers(user: Mapping[str, object]) -> dict[str, object]:
         for name, entry in native.items():
             if isinstance(entry, Mapping):
                 servers[str(name)] = dict(entry)
+    # Keep merged servers out of Code Mode so each call is asked as `<server>_<tool>`.
+    for entry in servers.values():
+        if isinstance(entry, dict):
+            entry["codemode"] = False
     return servers
 
 

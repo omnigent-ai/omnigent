@@ -220,10 +220,31 @@ def test_ask_on_os_tools_ignores_non_file_opencode_actions(tool: str) -> None:
     assert ask_on_os_tools(tc(tool, {}))["result"] == "ALLOW"
 
 
+@pytest.mark.parametrize("tool", ["opencode_list_mcp_resources", "opencode_read_mcp_resource"])
+def test_ask_on_os_tools_asks_for_opencode_mcp_builtins(tool: str) -> None:
+    """OpenCode's own MCP builtins reach MCP servers without a relay tool name."""
+    result = ask_on_os_tools(tc(tool, {}))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+
+
 def test_opencode_os_tool_set_is_v2_action_names() -> None:
     from omnigent.policies.builtins.safety import _OPENCODE_NATIVE_OS_TOOLS
 
-    assert frozenset({"shell", "edit", "read", "grep", "glob"}) == _OPENCODE_NATIVE_OS_TOOLS
+    assert (
+        frozenset(
+            {
+                "shell",
+                "edit",
+                "read",
+                "grep",
+                "glob",
+                "opencode_list_mcp_resources",
+                "opencode_read_mcp_resource",
+            }
+        )
+        == _OPENCODE_NATIVE_OS_TOOLS
+    )
 
 
 def test_block_skills_blocks_opencode_skill_action() -> None:

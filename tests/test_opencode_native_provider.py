@@ -498,8 +498,24 @@ def test_merge_mcp_v1_flat_and_v2_servers(monkeypatch: pytest.MonkeyPatch, tmp_p
         "command": ["x"],
         "disabled": True,
         "timeout": {"catalog": 5000, "execution": 5000},
+        "codemode": False,
     }
-    assert servers["modern"] == {"type": "remote", "url": "https://m"}
+    assert servers["modern"] == {"type": "remote", "url": "https://m", "codemode": False}
+
+
+def test_merge_forces_codemode_off_on_user_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Merged servers stay out of Code Mode so each tool call is asked by name."""
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        '{"mcp": {"flat": {"type": "local", "command": ["x"], "codemode": true},'
+        ' "servers": {"nested": {"type": "remote", "url": "https://n", "codemode": true}}}}',
+    )
+    servers = maybe_merge_user_provider_config({})["mcp"]["servers"]
+    assert servers["flat"]["codemode"] is False
+    assert servers["nested"]["codemode"] is False
 
 
 def test_merge_lifts_flat_synthesized_mcp_into_servers(
@@ -516,7 +532,7 @@ def test_merge_lifts_flat_synthesized_mcp_into_servers(
     assert result["mcp"] == {
         "servers": {
             "omnigent": {"type": "local", "command": ["r"]},
-            "gh": {"type": "remote", "url": "https://gh"},
+            "gh": {"type": "remote", "url": "https://gh", "codemode": False},
         }
     }
 

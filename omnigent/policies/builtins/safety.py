@@ -76,10 +76,20 @@ _GOOSE_NATIVE_OS_TOOLS = frozenset(
     }
 )
 
-# opencode 2.x ``permission.asked`` actions (``shell``; write/edit/patch
-# collapsed into ``edit``), used as the policy tool name by the SSE forwarder.
-# Listed explicitly so coverage does not depend on the pi / codex sets.
-_OPENCODE_NATIVE_OS_TOOLS = frozenset({"shell", "edit", "read", "grep", "glob"})
+# opencode 2.x ``permission.asked`` actions (write/patch collapse into ``edit``).
+# The ``opencode_*`` MCP resource builtins reach MCP servers under no relay tool
+# name and have no config switch, so they are gated as OS tools too.
+_OPENCODE_NATIVE_OS_TOOLS = frozenset(
+    {
+        "shell",
+        "edit",
+        "read",
+        "grep",
+        "glob",
+        "opencode_list_mcp_resources",
+        "opencode_read_mcp_resource",
+    }
+)
 
 # Codex in-process harness tool names surfaced as observational
 # ``ToolCallRequest`` events. The codex app-server executor translates
