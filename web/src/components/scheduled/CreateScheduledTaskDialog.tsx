@@ -2,7 +2,7 @@
 // host, and workspace pickers where the backend can persist those fields.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { TriangleAlertIcon } from "lucide-react";
+import { FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -24,7 +24,7 @@ import {
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
-import { WorkspacePicker } from "@/shell/WorkspacePicker";
+import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
@@ -173,6 +173,7 @@ export function CreateScheduledTaskDialog({
   // Radix reports as "interact outside" is absorbed. See `guardDialogDismiss`.
   const selectOpenCountRef = useRef(0);
   const selectClosedAtRef = useRef(0);
+  const [workspaceBrowserOpen, setWorkspaceBrowserOpen] = useState(false);
   function handleSelectOpenChange(isOpen: boolean) {
     if (isOpen) {
       selectOpenCountRef.current += 1;
@@ -190,6 +191,10 @@ export function CreateScheduledTaskDialog({
    * grace window — this is the fix for backdrop-click-to-close being swallowed.
    * Escape + Cancel are unaffected (they don't route through this guard). */
   function guardDialogDismiss(event: { target: EventTarget | null; preventDefault: () => void }) {
+    if (workspaceBrowserOpen) {
+      event.preventDefault();
+      return;
+    }
     if (
       shouldGuardDialogDismiss(event.target, {
         selectOpen: selectOpenCountRef.current > 0,
@@ -291,6 +296,7 @@ export function CreateScheduledTaskDialog({
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
+    setWorkspaceBrowserOpen(false);
     setSandboxMode(false);
     setError(null);
     setScheduleUnsupported(false);
@@ -542,6 +548,7 @@ export function CreateScheduledTaskDialog({
                   setSandboxMode(true);
                   setHostId("");
                   setWorkspace("");
+                  setWorkspaceBrowserOpen(false);
                   return;
                 }
                 if (preservePinnedHost && v === UNSET_HOST) return;
@@ -550,6 +557,7 @@ export function CreateScheduledTaskDialog({
                 setHostId(next);
                 // Clearing the host invalidates any pinned workspace.
                 if (next === "") setWorkspace("");
+                setWorkspaceBrowserOpen(false);
               }}
               onOpenChange={handleSelectOpenChange}
             >
@@ -585,13 +593,23 @@ export function CreateScheduledTaskDialog({
               <p className="text-sm text-muted-foreground">
                 Defaults to the host&apos;s home directory. Pick a directory to pin it.
               </p>
-              <div className="h-56 overflow-hidden rounded-md border border-border">
-                <WorkspacePicker
-                  hostId={hostId}
-                  onNavigate={setWorkspace}
-                  initialPath={workspace || undefined}
-                />
-              </div>
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full justify-start gap-2"
+                onClick={() => setWorkspaceBrowserOpen(true)}
+                data-testid="task-workspace-browse"
+              >
+                <FolderOpenIcon className="size-4 text-muted-foreground" />
+                <span className="truncate">{workspace || "Browse folders…"}</span>
+              </Button>
+              <WorkspacePickerDialog
+                open={workspaceBrowserOpen}
+                onOpenChange={setWorkspaceBrowserOpen}
+                hostId={hostId}
+                initialPath={workspace}
+                onConfirm={setWorkspace}
+              />
               {workspace && (
                 <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
               )}

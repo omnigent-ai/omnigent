@@ -57,10 +57,22 @@ describe("RecentWorkspaceList", () => {
     cleanup();
   });
 
-  it("keeps zero inter-row gap and preserves each row's hit height", () => {
+  it("matches the modal list's compact dimensions and one-pixel gap", () => {
     renderList();
-    expect(screen.getByTestId("recent-workspace-list")).toHaveClass("gap-0");
-    expect(screen.getByTestId("recent-workspace-select-0")).toHaveClass("py-1.5");
+    expect(screen.getByTestId("recent-workspace-list")).toHaveClass("gap-px");
+    expect(screen.getByTestId("recent-workspace-row-0")).toHaveClass("h-7", "rounded-md");
+    expect(screen.getByTestId("recent-workspace-select-0")).toHaveClass(
+      "h-full",
+      "gap-2",
+      "px-2",
+      "py-[3px]",
+      "text-ui",
+      "leading-4",
+    );
+    expect(screen.getByTestId("recent-workspace-select-0").querySelector("svg")).toHaveClass(
+      "size-4",
+    );
+    expect(screen.getByTestId("recent-workspace-browse-0")).toHaveClass("size-5", "rounded-md");
   });
 
   it("keeps select and browse as sibling actions without cross-triggering", () => {

@@ -53,10 +53,15 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 // real path helpers stay, since other code under test imports them.
 vi.mock("./WorkspacePicker", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
-    <button type="button" data-testid="stub-picker-navigate" onClick={() => onNavigate?.("/etc")}>
-      pick /etc
-    </button>
+  WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
+    <>
+      <button type="button" data-testid="stub-picker-navigate">
+        browse /etc
+      </button>
+      <button type="button" data-testid="stub-picker-confirm" onClick={() => onSelect?.("/etc")}>
+        confirm /etc
+      </button>
+    </>
   ),
 }));
 
@@ -1596,6 +1601,7 @@ describe("FilesPanel browse location", () => {
     );
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     fireEvent.click(screen.getByText("hosts"));
 
@@ -1614,6 +1620,8 @@ describe("FilesPanel browse location", () => {
 
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    expect(useAllFilesMock).not.toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
     expect(useSearchMock).toHaveBeenLastCalledWith(
@@ -1646,6 +1654,7 @@ describe("FilesPanel browse location", () => {
     });
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     expect(useAllFilesMock).toHaveBeenLastCalledWith(
       "conv_viewer_roundtrip",
       expect.anything(),
@@ -1678,6 +1687,7 @@ describe("FilesPanel browse location", () => {
     });
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     first.unmount();
 
     renderPanel({
@@ -1858,6 +1868,7 @@ describe("FilesPanel header copy path", () => {
 
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     fireEvent.click(screen.getByRole("button", { name: "Copy folder path: etc" }));
 

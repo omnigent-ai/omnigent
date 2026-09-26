@@ -589,6 +589,7 @@ describe("WorkspacePicker live selection (onNavigate)", () => {
     // The live-update callers drop the explicit commit button entirely.
     render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={vi.fn()} />);
     expect(screen.queryByTestId("workspace-picker-select")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass("h-7", "px-2", "py-[3px]");
   });
 });
 
@@ -702,8 +703,36 @@ describe("WorkspacePicker modal actions", () => {
     );
 
     expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Use this folder" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Use this folder" }));
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy();
+    expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass("h-7", "px-2", "py-[3px]");
+    expect(screen.getByTestId("workspace-picker-listing")).toHaveClass("space-y-px", "px-2");
+    expect(screen.getByTestId("workspace-picker-header")).toHaveClass("h-12", "px-3", "py-0");
+    expect(screen.getByTestId("workspace-picker-breadcrumbs")).toHaveClass("px-1");
+    expect(screen.getByTestId("workspace-picker-search-row")).toHaveClass("border-b-0");
+    expect(screen.getByTestId("workspace-picker-search-field")).toHaveClass(
+      "h-8",
+      "rounded-lg",
+      "border-input",
+      "px-2.5",
+    );
+    expect(screen.getByTestId("workspace-picker-search-icon")).toHaveClass("size-4");
+    const newFolder = screen.getByTestId("workspace-picker-new-folder");
+    const hiddenToggle = screen.getByTestId("workspace-picker-show-hidden");
+    expect(screen.getByTestId("workspace-picker-header")).toContainElement(newFolder);
+    expect(newFolder.compareDocumentPosition(hiddenToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(screen.getByTestId("workspace-picker-search-row")).not.toContainElement(newFolder);
+    for (const testId of [
+      "workspace-picker-up",
+      "workspace-picker-new-folder",
+      "workspace-picker-show-hidden",
+      "workspace-picker-close",
+    ]) {
+      expect(screen.getByTestId(testId)).toHaveAttribute("data-variant", "ghost");
+      expect(screen.getByTestId(testId)).toHaveAttribute("data-size", "icon");
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/repo");
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -757,12 +786,20 @@ describe("WorkspacePicker modal actions", () => {
 
       expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toContain("repo");
       expect(screen.getByRole("complementary", { name: "Worktrees" })).toBeInTheDocument();
+      expect(screen.getByTestId("workspace-picker-worktrees-label")).toHaveClass(
+        "h-12",
+        "text-xs",
+        "text-muted-foreground",
+      );
+      expect(
+        screen.getByTestId("workspace-picker-worktrees-label").querySelector("svg"),
+      ).toBeNull();
       expect(screen.getByText("Don't use")).toBeInTheDocument();
       expect(screen.getByText("feature-layout")).toBeInTheDocument();
       expect(screen.queryByText("main")).toBeNull();
 
       expect(screen.getByTestId("workspace-picker")).toHaveClass(
-        "h-[min(520px,calc(100dvh-4rem))]",
+        "h-[min(600px,calc(100dvh-4rem))]",
         "w-[min(800px,calc(100vw-2rem))]",
         "rounded-[20px]",
       );
@@ -781,8 +818,12 @@ describe("WorkspacePicker modal actions", () => {
       expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toHaveClass(
         ...spaciousInputClasses,
       );
+      expect(screen.getByRole("radiogroup", { name: "Choose a worktree" })).toHaveClass(
+        "space-y-px",
+        "px-2",
+      );
       expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass(
-        "min-h-[27px]",
+        "h-7",
         "px-2",
         "py-[3px]",
       );
@@ -797,7 +838,7 @@ describe("WorkspacePicker modal actions", () => {
         screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
       ).toHaveClass("bg-muted");
       expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
-      fireEvent.click(screen.getByRole("button", { name: "Use this folder" }));
+      fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
       expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
       expect(onSelect).toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
     },
@@ -898,28 +939,28 @@ describe("WorkspacePicker modal actions", () => {
     expect(useHostWorktreesMock).toHaveBeenCalledWith("host_1", windowsPath);
   });
 
-  it("keeps compact callers single-pane and uses the fixed viewport-safe modal frame", () => {
+  it("uses the same fixed frame and compact rows regardless of callback shape", () => {
     const { rerender } = render(
       <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onNavigate={vi.fn()} />,
     );
 
     expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
-    expect(screen.getByTestId("workspace-picker").className).toContain("max-h-80");
+    const liveClass = screen.getByTestId("workspace-picker").className;
+    expect(liveClass).toContain("h-[min(600px,calc(100dvh-4rem))]");
+    expect(liveClass).toContain("w-[min(800px,calc(100vw-2rem))]");
 
     rerender(
       <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />,
     );
     const modalClass = screen.getByTestId("workspace-picker").className;
-    expect(modalClass).toContain("h-[min(520px,calc(100dvh-4rem))]");
-    expect(modalClass).toContain("w-[min(800px,calc(100vw-2rem))]");
-    expect(modalClass).not.toContain("min-h-80");
+    expect(modalClass).toBe(liveClass);
   });
 
   it("keeps full-dialog geometry invariant as worktree states change", async () => {
     const fullPicker = () => screen.getByTestId("workspace-picker");
     const header = () => screen.getByTestId("workspace-picker-header");
     const footer = () => screen.getByTestId("workspace-picker-footer");
-    const frameClasses = ["h-[min(520px,calc(100dvh-4rem))]", "w-[min(800px,calc(100vw-2rem))]"];
+    const frameClasses = ["h-[min(600px,calc(100dvh-4rem))]", "w-[min(800px,calc(100vw-2rem))]"];
     const expectFixedFrame = (expectedClassName: string) => {
       expect(fullPicker().className).toBe(expectedClassName);
       for (const className of frameClasses) expect(fullPicker().className).toContain(className);

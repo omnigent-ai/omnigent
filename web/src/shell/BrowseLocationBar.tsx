@@ -2,10 +2,9 @@ import { ArrowLeftIcon, FolderDotIcon } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { WorkspaceReach } from "@/hooks/useWorkspaceChangedFiles";
-import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
 interface BrowseLocationBarProps {
   /** Absolute path currently shown. */
@@ -35,8 +34,8 @@ interface BrowseLocationBarProps {
  * The path opens the same directory browser the new-session flow uses to pick
  * a workspace, so choosing where to look is one interaction the user has
  * already learned — and it brings that browser's typed path, Up / Home, and
- * show-hidden along with it. Navigation applies live as the user browses (no
- * separate confirm), matching the new-session chip.
+ * show-hidden along with it. Navigation remains provisional until Confirm,
+ * matching every other workspace-browser invocation.
  *
  * Falls back to a plain path label when the full browser is unavailable. The
  * parent button remains enabled only while moving upward stays inside the
@@ -89,29 +88,26 @@ export function BrowseLocationBar({
       <span className="flex min-w-0 items-center gap-[2px]">
         <ParentFolderButton parent={navigableParent} onNavigate={onNavigate} />
         <WorkspaceRootButton current={current} workspace={workspace} onNavigate={onNavigate} />
-        <Popover open={open} onOpenChange={setOpen}>
-          <PopoverTrigger asChild>
-            <button
-              type="button"
-              title={current}
-              aria-label={`Working folder: ${current}. Click to browse.`}
-              className="min-w-0 flex-1 cursor-pointer rounded px-1 py-0.5 text-left hover:bg-muted hover:text-foreground"
-              data-testid="browse-location-path"
-            >
-              <PathText path={current} />
-            </button>
-          </PopoverTrigger>
-          {/* Cap to the viewport so the browser can't overflow a narrow panel. */}
-          <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
-            <WorkspacePicker
-              hostId={hostId}
-              initialPath={isNavigablePath(current) ? current : undefined}
-              workspacePath={workspace}
-              onNavigate={onNavigate}
-            />
-          </PopoverContent>
-        </Popover>
+        <button
+          type="button"
+          title={open ? undefined : current}
+          aria-label={`Working folder: ${current}. Click to browse.`}
+          aria-expanded={open}
+          onClick={() => setOpen(true)}
+          className="min-w-0 flex-1 cursor-pointer rounded px-1 py-0.5 text-left hover:bg-muted hover:text-foreground"
+          data-testid="browse-location-path"
+        >
+          <PathText path={current} />
+        </button>
       </span>
+      <WorkspacePickerDialog
+        open={open}
+        onOpenChange={setOpen}
+        hostId={hostId}
+        initialPath={current}
+        workspacePath={workspace}
+        onConfirm={onNavigate}
+      />
       {error && (
         <span className="truncate text-[10px] text-destructive" data-testid="browse-location-error">
           {error}

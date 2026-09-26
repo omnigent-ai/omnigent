@@ -94,7 +94,9 @@ export function SharingPage() {
   const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
 
-  const { data: state, isLoading } = useSharing();
+  // Wait for `/v1/me`: the server promotes a file-listed admin there, and
+  // fetching first would 403 (and a non-admin needn't fetch at all).
+  const { data: state, isLoading } = useSharing({ enabled: isSingleUser || meIsAdmin === true });
   const setMode = useSetSharing();
   const [error, setError] = useState<string | null>(null);
 

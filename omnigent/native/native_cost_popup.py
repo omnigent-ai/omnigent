@@ -164,6 +164,61 @@ def _tmux_window_activity_at(socket_path: str, tmux_target: str) -> float | None
         return None
 
 
+def _tmux_last_client_input_at(socket_path: str, tmux_target: str) -> float | None:
+    """
+    Epoch seconds of the last human input on a regular tmux client of *tmux_target*.
+
+    tmux advances a regular (terminal) client's ``client_activity`` when it
+    attaches and on every keypress — never for idle time, pane output, or a
+    resize — so it is direct evidence that someone is driving the pane from a
+    CLI attach. Control-mode clients (the web attach bridge, ``tmux -C``) never
+    advance it after attaching, even while forwarding keystrokes, so they are
+    skipped; the bridge stamps its own interactions on the terminal instance.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux target whose session's clients to inspect, e.g.
+        ``"main"``.
+    :returns: Epoch seconds of the newest attach-or-keypress across regular
+        attached clients, or ``None`` when none is attached, the tmux
+        server/target is gone, or the output is unparseable.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "list-clients",
+                "-t",
+                tmux_target,
+                "-F",
+                "#{client_control_mode} #{client_activity}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_LIST_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    newest: float | None = None
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or fields[0] != "0":
+            continue
+        try:
+            activity_at = float(fields[1])
+        except ValueError:
+            return None
+        newest = activity_at if newest is None else max(newest, activity_at)
+    return newest
+
+
 def launch_cost_popup(
     socket_path: str,
     tmux_target: str,

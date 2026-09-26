@@ -28,6 +28,7 @@ import shlex
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, ClassVar
 
 import click
@@ -510,6 +511,11 @@ class SandboxLifecycle(ABC):
             file_copy=self._is_capability_overridden("put"),
             streaming_exec=self._is_capability_overridden("stream_exec"),
             foreground_exec=self._is_capability_overridden("exec_foreground"),
+            git_clone_options=(
+                getattr(type(self), "start_host", None) is ExecModelHostLauncher.start_host
+                and getattr(type(self), "materialize_workspace", None)
+                is ExecModelHostLauncher.materialize_workspace
+            ),
         )
 
     def _is_capability_overridden(self, name: str) -> bool:
@@ -1000,6 +1006,12 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
 
         :returns: The absolute in-sandbox workspace path.
         """
+        if any(repo.git_clone != _sandbox_types.GitCloneOptions() for repo in repos):
+            if not self.capabilities.git_clone_options:
+                raise click.ClickException(
+                    f"sandbox provider '{self.provider}' does not support "
+                    "sandbox.git_clone options"
+                )
         home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
         if not home:
             raise click.ClickException(
@@ -1013,16 +1025,21 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
                 on_stage("cloning")
             # Distinct URLs can derive the same repo_name (e.g. two orgs' "api");
             # disambiguate so they don't clone into one colliding directory.
-            clone_dirs = [
-                self.materialize_workspace(
-                    sandbox_id,
-                    workspace=workspace,
-                    repo_url=repo.url,
-                    repo_branch=repo.branch,
-                    repo_name=dirname,
+            clone_dirs = []
+            for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True):
+                materialize = self.materialize_workspace
+                # Preserve the old override signature when no policy was configured.
+                if repo.git_clone != _sandbox_types.GitCloneOptions():
+                    materialize = partial(materialize, git_clone=repo.git_clone)
+                clone_dirs.append(
+                    materialize(
+                        sandbox_id,
+                        workspace=workspace,
+                        repo_url=repo.url,
+                        repo_branch=repo.branch,
+                        repo_name=dirname,
+                    )
                 )
-                for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True)
-            ]
             # One repo → drop the agent straight into it; several → the
             # workspace root that parents them all.
             workspace = clone_dirs[0] if len(clone_dirs) == 1 else workspace
@@ -1053,6 +1070,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         repo_branch: str | None,
         repo_name: str | None,
         on_stage: Callable[[str], None] | None = None,
+        git_clone: _sandbox_types.GitCloneOptions = _sandbox_types.GitCloneOptions(),
     ) -> str:
         """
         Materialize the requested repository into the sandbox and return the
@@ -1064,15 +1082,13 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         if on_stage is not None:
             on_stage("cloning")
         clone_dir = f"{workspace}/{repo_name}"
-        branch_args = (
-            f"--branch {shlex.quote(repo_branch)} --single-branch "
-            if repo_branch is not None
-            else ""
+        command = shlex.join(
+            ["git", "clone", *git_clone.clone_args(repo_branch), "--", repo_url, clone_dir]
         )
         try:
             self.run(
                 sandbox_id,
-                f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
+                command,
             )
         except click.ClickException as exc:
             raise click.ClickException(

@@ -3863,7 +3863,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             server-created worktree, e.g. ``"feature/login"``. Set
             together with ``host_id``/``workspace`` when binding an
             existing session to a freshly created worktree (the fork
-            resume path). ``None`` (default) leaves it untouched.
+            resume path). ``None`` preserves the branch on the same
+            host/workspace, but clears it when the host or an explicitly
+            supplied workspace changes.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
@@ -3879,10 +3881,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            binding_changed = meta.host_id != host_id or (
+                workspace is not None and meta.workspace != workspace
+            )
             meta.host_id = host_id
             if workspace is not None:
                 meta.workspace = workspace
-            if git_branch is not None:
+            if git_branch is not None or binding_changed:
                 meta.git_branch = git_branch
             return meta
 

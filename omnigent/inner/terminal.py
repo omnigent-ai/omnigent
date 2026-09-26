@@ -1113,6 +1113,20 @@ class TerminalInstance:
         """
         self._last_client_interaction_at = time.monotonic()
 
+    def client_interaction_within(self, window_s: float) -> bool:
+        """
+        Whether a web client interacted with this terminal in the last *window_s* seconds.
+
+        Read by the native pane reaper as its "a human is here" signal for
+        browser viewers: tmux cannot see control-mode input, so the bridge's
+        own stamp (:meth:`note_client_interaction`) stands in for it.
+
+        :param window_s: Recency window in seconds, e.g. ``120.0``.
+        :returns: ``True`` when the last interaction is younger than *window_s*;
+            ``False`` when none was ever observed.
+        """
+        return time.monotonic() - self._last_client_interaction_at < window_s
+
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
 

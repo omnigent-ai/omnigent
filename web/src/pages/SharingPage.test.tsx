@@ -292,4 +292,41 @@ describe("SharingPage", () => {
       expect(setModeMutate).not.toHaveBeenCalled();
     });
   });
+
+  describe("waits for identity before loading settings", () => {
+    const enabledArgs = () =>
+      vi.mocked(sharingHook.useSharing).mock.calls.map((c) => c[0]?.enabled);
+
+    beforeEach(() => vi.mocked(sharingHook.useSharing).mockClear());
+
+    it("does not load while /v1/me is pending, then loads for an admin", async () => {
+      let resolveMe: (id: string) => void = () => {};
+      vi.mocked(identity.resolveIdentity).mockReturnValue(
+        new Promise<string>((r) => {
+          resolveMe = r;
+        }),
+      );
+      setSharingState(state());
+
+      renderPage();
+      expect(enabledArgs()).toEqual(expect.arrayContaining([false]));
+      expect(enabledArgs()).not.toContain(true);
+
+      resolveMe("admin@example.com");
+      await waitFor(() => expect(enabledArgs()).toContain(true));
+    });
+
+    it("never loads for a non-admin", async () => {
+      vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+      setSharingState(undefined);
+
+      renderPage();
+      await waitFor(() =>
+        expect(
+          screen.getByText("You don't have permission to manage session sharing."),
+        ).toBeInTheDocument(),
+      );
+      expect(enabledArgs().every((enabled) => enabled === false)).toBe(true);
+    });
+  });
 });

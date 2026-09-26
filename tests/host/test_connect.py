@@ -25,6 +25,7 @@ from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
+    ModelOptionsResult,
     _build_runner_env,
     _runner_exit_error,
     _RunnerHandle,
@@ -85,6 +86,8 @@ from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 
 pytestmark = pytest.mark.asyncio
 
+_REAL_PREWARM_MODEL_OPTIONS = HostProcess._prewarm_model_options
+
 
 @pytest.fixture(autouse=True)
 def _isolated_model_catalog_store(
@@ -116,6 +119,16 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_model_catalog_prewarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host-loop tests from executing installed native harness CLIs."""
+
+    async def _noop(_host: HostProcess) -> bool:
+        return True
+
+    monkeypatch.setattr(HostProcess, "_prewarm_model_options", _noop)
 
 
 @pytest.fixture(autouse=True)
@@ -2561,6 +2574,247 @@ async def test_run_prewarms_zygote_during_capability_discovery(
         assert not host._capabilities_initialized
     finally:
         await _cancel(run_task)
+
+
+async def test_run_keeps_one_model_catalog_prewarm_across_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog prewarm belongs to the host lifetime, not a tunnel generation."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_started = asyncio.Event()
+    prewarm_cancelled = asyncio.Event()
+    prewarm_calls = 0
+    connect_calls = 0
+    prewarm_cancelled_while_connecting = False
+
+    async def _prewarm() -> None:
+        nonlocal prewarm_calls
+        prewarm_calls += 1
+        prewarm_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            prewarm_cancelled.set()
+
+    async def _connect_and_serve() -> None:
+        nonlocal connect_calls, prewarm_cancelled_while_connecting
+        connect_calls += 1
+        await asyncio.wait_for(prewarm_started.wait(), timeout=1.0)
+        prewarm_cancelled_while_connecting |= prewarm_cancelled.is_set()
+        if connect_calls < 3:
+            raise ConnectionError("test disconnect")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+
+    await host.run()
+
+    assert connect_calls == 3
+    assert prewarm_calls == 1
+    assert not prewarm_cancelled_while_connecting
+    assert prewarm_cancelled.is_set()
+    assert host._model_options_prewarm_task is None
+
+
+async def test_run_does_not_retry_failed_model_catalog_prewarm_while_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection failures do not repeatedly restart native catalog probes."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_calls = 0
+    connect_calls = 0
+
+    async def _prewarm() -> bool:
+        nonlocal prewarm_calls
+        prewarm_calls += 1
+        await asyncio.sleep(0)
+        return False
+
+    async def _connect_and_serve() -> None:
+        nonlocal connect_calls
+        connect_calls += 1
+        task = host._model_options_prewarm_task
+        assert task is not None
+        await task
+        if connect_calls < 3:
+            raise ConnectionError("test disconnect")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+
+    await host.run()
+
+    assert connect_calls == 3
+    assert prewarm_calls == 1
+    assert host._model_options_prewarm_task is None
+
+
+async def test_registration_retries_failed_model_catalog_prewarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed boot probe gets another chance after host registration."""
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+
+    async def _failed_prewarm() -> bool:
+        return False
+
+    first_task = asyncio.create_task(_failed_prewarm())
+    await first_task
+    host._model_options_prewarm_task = first_task
+    prewarm_calls = 0
+
+    async def _successful_prewarm() -> bool:
+        nonlocal prewarm_calls
+        prewarm_calls += 1
+        return True
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _successful_prewarm)
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(_FakeTunnel())  # type: ignore[arg-type]
+
+    retry_task = host._model_options_prewarm_task
+    assert retry_task is not None
+    assert retry_task is not first_task
+    assert await retry_task
+    assert prewarm_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("codex_available", "claude_available", "expected"),
+    [(False, True, False), (True, True, True)],
+)
+async def test_model_catalog_prewarm_requires_both_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+    codex_available: bool,
+    claude_available: bool,
+    expected: bool,
+) -> None:
+    """Only two available catalogs count as a successful prewarm."""
+    host = _make_host_process()
+    available = ModelOptionsResult(models=[], routable_models=[])
+    monkeypatch.setattr(
+        host,
+        "_probed_codex_model_options",
+        AsyncMock(return_value=available if codex_available else None),
+    )
+    monkeypatch.setattr(
+        host,
+        "_probed_claude_model_options",
+        AsyncMock(return_value=available if claude_available else None),
+    )
+
+    assert await _REAL_PREWARM_MODEL_OPTIONS(host) is expected
+
+
+async def test_model_catalog_prewarm_failure_does_not_block_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Best-effort catalog failures do not prevent connection startup."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_finished = asyncio.Event()
+    connection_started = asyncio.Event()
+
+    async def _prewarm() -> None:
+        prewarm_finished.set()
+        raise RuntimeError("catalog unavailable")
+
+    async def _connect_and_serve() -> None:
+        connection_started.set()
+        await asyncio.wait_for(prewarm_finished.wait(), timeout=1.0)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+
+    await host.run()
+
+    assert connection_started.is_set()
+    assert host._model_options_prewarm_task is None
+
+
+async def test_run_cleans_up_model_catalog_prewarm_after_teardown_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Earlier teardown failures cannot skip host-owned prewarm cancellation."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_started = asyncio.Event()
+    prewarm_cancelled = asyncio.Event()
+
+    async def _prewarm() -> bool:
+        prewarm_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            prewarm_cancelled.set()
+
+    async def _connect_and_serve() -> None:
+        await asyncio.wait_for(prewarm_started.wait(), timeout=1.0)
+        raise KeyboardInterrupt
+
+    async def _fail_teardown() -> None:
+        raise RuntimeError("test teardown failure")
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(host, "_quiesce_frame_tasks", _fail_teardown)
+
+    with pytest.raises(RuntimeError, match="test teardown failure"):
+        await host.run()
+
+    assert prewarm_cancelled.is_set()
+    assert host._model_options_prewarm_task is None
+
+
+async def test_run_cleans_up_model_catalog_prewarm_after_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup failures after prewarm begins still run host-owned cleanup."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_started = asyncio.Event()
+    prewarm_cancelled = asyncio.Event()
+
+    async def _prewarm() -> bool:
+        prewarm_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            prewarm_cancelled.set()
+
+    prewarm_task = asyncio.create_task(_prewarm())
+    await asyncio.wait_for(prewarm_started.wait(), timeout=1.0)
+    host._model_options_prewarm_task = prewarm_task
+
+    def _fail_startup() -> None:
+        raise RuntimeError("test startup failure")
+
+    monkeypatch.setattr(host, "_start_capability_discovery", _fail_startup)
+
+    with pytest.raises(RuntimeError, match="test startup failure"):
+        await host.run()
+
+    assert prewarm_cancelled.is_set()
+    assert prewarm_task.cancelled()
+    assert host._model_options_prewarm_task is None
 
 
 async def test_run_cancels_inflight_capability_discovery_on_shutdown(

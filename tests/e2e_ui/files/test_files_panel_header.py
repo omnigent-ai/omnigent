@@ -294,6 +294,7 @@ def test_files_panel_browses_to_a_directory_outside_the_workspace(
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible(timeout=15_000)
     picker.get_by_test_id(f"workspace-picker-entry-{outside.name}").click()
+    picker.get_by_test_id("workspace-picker-select").click()
 
     # Re-rooted: the header names the new directory and the tree lists its
     # contents, served by the real runner from outside the workspace.
@@ -324,6 +325,7 @@ def test_files_panel_browses_to_a_directory_outside_the_workspace(
     # One click back to where the agent actually is.
     path_button.click()
     page.get_by_test_id("workspace-picker-workspace").click()
+    page.get_by_test_id("workspace-picker-select").click()
     expect(rail.get_by_text("sentinel.txt")).to_have_count(0, timeout=30_000)
 
 
@@ -457,6 +459,7 @@ def test_absolute_browse_survives_a_slash_merging_proxy(
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible(timeout=15_000)
     picker.get_by_test_id(f"workspace-picker-entry-{outside.name}").click()
+    picker.get_by_test_id("workspace-picker-select").click()
 
     # Re-rooted through the proxy: the tree lists the outside directory's real
     # contents rather than collapsing to an empty "No files in workspace".

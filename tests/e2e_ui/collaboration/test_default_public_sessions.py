@@ -18,7 +18,6 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
-from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
@@ -38,11 +37,11 @@ def default_public_server(
 ) -> Iterator[MultiUserServer]:
     """A dedicated multi-user server with an isolated sharing data dir.
 
-    Header auth has no login step to promote the admin-list identity, and the
-    sharing routes read only the database flag, so the admin is flagged there.
+    The admin comes only from the admin-list file (never flagged in the
+    database), so this also covers the page loading for a file-listed admin.
     """
     server_tmp = tmp_path_factory.mktemp("e2e_ui_default_public")
-    servers = spawn_multi_user_server(
+    yield from spawn_multi_user_server(
         mock_llm_server_url,
         server_tmp,
         extra_server_env={
@@ -50,14 +49,6 @@ def default_public_server(
             "OMNIGENT_DEFAULT_PUBLIC_SESSIONS": "",
         },
     )
-    server = next(servers)
-    try:
-        SqlAlchemyPermissionStore(f"sqlite:///{server_tmp / 'test.db'}").set_admin(
-            ADMIN_EMAIL, True
-        )
-        yield server
-    finally:
-        servers.close()
 
 
 def _permissions(base_url: str, session_id: str) -> dict[str, int]:
