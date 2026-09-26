@@ -739,3 +739,106 @@ async def test_fixture_shell_progress_without_output_is_dropped() -> None:
     await fwd.handle_event(_fixture("session.step.started"))
     await fwd.handle_event(progress)
     assert "external_tool_output_delta" not in _types(server.posts)
+
+
+# --- usage ------------------------------------------------------------------
+
+
+async def test_step_ended_posts_session_usage() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_a"))
+    await fwd.handle_event(
+        _step_ended(
+            "msg_a",
+            cost=0.012,
+            tokens={
+                "input": 1000,
+                "output": 50,
+                "reasoning": 0,
+                "cache": {"read": 200, "write": 0},
+            },
+        )
+    )
+    usage = _datas(server.posts, "external_session_usage")[-1]
+    assert usage["cumulative_cost_usd"] == 0.012
+    assert usage["cumulative_input_tokens"] == 1000
+    assert usage["cumulative_output_tokens"] == 50
+    assert usage["cumulative_cache_read_input_tokens"] == 200
+    assert usage["context_tokens"] == 1200
+    assert usage["model"] == "anthropic/claude-sonnet-4-5"
+    assert usage["context_window"] > 0
+
+
+async def test_usage_updated_overrides_cumulative_totals() -> None:
+    """``session.usage.updated`` totals win over the per-step sum (they include compaction)."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_a"))
+    await fwd.handle_event(
+        _step_ended(
+            "msg_a",
+            cost=0.01,
+            tokens={"input": 100, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "session.usage.updated",
+            cost=0.05,
+            tokens={"input": 900, "output": 40, "reasoning": 0, "cache": {"read": 30, "write": 0}},
+        )
+    )
+    usage = _datas(server.posts, "external_session_usage")[-1]
+    assert usage["cumulative_cost_usd"] == 0.05
+    assert usage["cumulative_input_tokens"] == 900
+    assert usage["cumulative_output_tokens"] == 40
+    assert usage["cumulative_cache_read_input_tokens"] == 30
+    assert usage["context_tokens"] == 100  # latest step, not the totals
+
+
+async def test_usage_dedupes_identical_posts() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_a"))
+    ended = _step_ended(
+        "msg_a",
+        cost=0.01,
+        tokens={"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+    )
+    await fwd.handle_event(ended)
+    await fwd.handle_event(ended)
+    assert len(_datas(server.posts, "external_session_usage")) == 1
+
+
+async def test_step_failed_flushes_text_and_records_usage() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_a"))
+    await fwd.handle_event(
+        _event("session.text.ended", assistantMessageID="msg_a", ordinal=0, text="partial answer")
+    )
+    await fwd.handle_event(
+        _event(
+            "session.step.failed",
+            assistantMessageID="msg_a",
+            error={"type": "provider.transport", "message": "reset"},
+            cost=0.002,
+            tokens={"input": 10, "output": 2, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        )
+    )
+    assert [i["item_data"]["content"][0]["text"] for i in _items(server.posts)] == [
+        "partial answer"
+    ]
+    assert _datas(server.posts, "external_session_usage")[-1]["cumulative_cost_usd"] == 0.002
+
+
+async def test_fixture_usage_updated_matches_captured_totals() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    raw = events_of_type("session.usage.updated")[-1]["data"]
+    await fwd.handle_event(_fixture("session.usage.updated", -1))
+    usage = _datas(server.posts, "external_session_usage")[-1]
+    assert usage["cumulative_cost_usd"] == round(raw["cost"], 6)
+    assert usage["cumulative_input_tokens"] == int(raw["tokens"]["input"])
+    assert usage["cumulative_output_tokens"] == int(raw["tokens"]["output"])

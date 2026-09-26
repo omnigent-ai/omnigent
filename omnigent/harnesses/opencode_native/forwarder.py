@@ -21,7 +21,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypedDict
 from urllib.parse import quote
 
 import httpx
@@ -202,6 +202,27 @@ def opencode_tool_content_text(content: object, *, error: object = None) -> str:
     return text
 
 
+class _AssistantUsage(TypedDict):
+    cost: float
+    tokens: _JsonObject
+    model: str | None
+    model_id: str | None
+
+
+class _UsageTotals(TypedDict):
+    cost: float
+    tokens: _JsonObject
+
+
+def _int_or_zero(value: object) -> int:
+    """Coerce an OpenCode token count (int or float) to a non-negative int."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    return 0
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's v2 event stream into Omnigent events.
@@ -252,6 +273,11 @@ class OpenCodeNativeForwarder:
         }
         self._permission_tasks: dict[str, asyncio.Task[None]] = {}
         self._form_tasks: dict[str, asyncio.Task[None]] = {}
+        # assistantMessageID -> step usage (root session only).
+        self._usage_by_message: dict[str, _AssistantUsage] = {}
+        # Authoritative session totals from ``session.usage.updated``.
+        self._session_totals: _UsageTotals | None = None
+        self._last_usage_signature: tuple[tuple[str, object], ...] | None = None
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -427,6 +453,7 @@ class OpenCodeNativeForwarder:
         """End an active turn as idle; a second terminal signal is a no-op."""
         if not turn.turn_active:
             return
+        await self._post_session_usage()
         await self._end_turn(turn)
 
     async def _on_execution_started(self, event: OpenCodeEvent) -> None:
@@ -551,11 +578,16 @@ class OpenCodeNativeForwarder:
             )
 
     async def _on_step_ended(self, event: OpenCodeEvent) -> None:
-        """Handle ``session.step.ended`` — flush the step's buffered text."""
+        """Handle ``session.step.ended`` / ``.failed`` — flush text, record usage."""
         turn = await self._active_turn(event)
         if turn is None:
             return
         await self._flush_pending_text(turn)
+        message_id = _str_field(event.data, "assistantMessageID")
+        if message_id is None or not self._is_root(turn):
+            return
+        self._record_step_usage(message_id, event.data, turn.step_model)
+        await self._post_session_usage()
 
     async def _on_reasoning_delta(self, event: OpenCodeEvent) -> None:
         """Handle ``session.reasoning.delta`` — transient reasoning chunk."""
@@ -737,6 +769,102 @@ class OpenCodeNativeForwarder:
             conversation_id=turn.conversation_id,
         )
 
+    def _record_step_usage(
+        self, message_id: str, data: Mapping[str, Any], model: str | None
+    ) -> None:
+        """Cache one assistant message's ``cost`` (USD) + ``tokens`` + model."""
+        tokens = data.get("tokens")
+        cost = data.get("cost")
+        if not isinstance(tokens, Mapping) and not isinstance(cost, (int, float)):
+            return
+        self._usage_by_message[message_id] = {
+            "cost": float(cost) if isinstance(cost, (int, float)) else 0.0,
+            "tokens": {key: value for key, value in tokens.items() if isinstance(key, str)}
+            if isinstance(tokens, Mapping)
+            else {},
+            "model": model,
+            "model_id": model.split("/", 1)[1] if model else None,
+        }
+
+    async def _on_usage_updated(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.usage.updated`` — authoritative cumulative totals."""
+        turn = await self._active_turn(event)
+        if turn is None or not self._is_root(turn):
+            return
+        tokens = event.data.get("tokens")
+        cost = event.data.get("cost")
+        if not isinstance(tokens, Mapping) or not isinstance(cost, (int, float)):
+            return
+        self._session_totals = {
+            "cost": float(cost),
+            "tokens": {key: value for key, value in tokens.items() if isinstance(key, str)},
+        }
+        await self._post_session_usage()
+
+    async def _post_session_usage(self) -> None:
+        """Post cumulative cost/tokens + context occupancy as ``external_session_usage``.
+
+        Cumulative fields come from ``session.usage.updated`` when seen, else
+        the sum of per-step usage; the latest step's input + cache tokens drive
+        the context ring. Deduped so repeated edges don't spam identical posts.
+        """
+        if not self._usage_by_message and self._session_totals is None:
+            return
+        cum_cost = 0.0
+        cum_in = cum_out = cum_cache = 0
+        latest: _AssistantUsage | None = None
+        for entry in self._usage_by_message.values():
+            cum_cost += entry["cost"]
+            tokens = entry["tokens"]
+            cum_in += _int_or_zero(tokens.get("input"))
+            cum_out += _int_or_zero(tokens.get("output"))
+            cache = tokens.get("cache")
+            if isinstance(cache, Mapping):
+                cum_cache += _int_or_zero(cache.get("read"))
+            latest = entry
+        if self._session_totals is not None:
+            totals = self._session_totals["tokens"]
+            cum_cost = self._session_totals["cost"]
+            cum_in = _int_or_zero(totals.get("input"))
+            cum_out = _int_or_zero(totals.get("output"))
+            totals_cache = totals.get("cache")
+            cum_cache = (
+                _int_or_zero(totals_cache.get("read")) if isinstance(totals_cache, Mapping) else 0
+            )
+        data: _JsonObject = {
+            "cumulative_cost_usd": round(cum_cost, 6),
+            "cumulative_input_tokens": cum_in,
+            "cumulative_output_tokens": cum_out,
+            "cumulative_cache_read_input_tokens": cum_cache,
+        }
+        if latest is not None:
+            latest_tokens = latest["tokens"]
+            raw_cache = latest_tokens.get("cache")
+            latest_cache = raw_cache if isinstance(raw_cache, Mapping) else {}
+            ctx = (
+                _int_or_zero(latest_tokens.get("input"))
+                + _int_or_zero(latest_cache.get("read"))
+                + _int_or_zero(latest_cache.get("write"))
+            )
+            if ctx > 0:
+                data["context_tokens"] = ctx
+            model_id = latest["model_id"]
+            if model_id:
+                try:
+                    from omnigent.llms.context_window import get_model_context_window
+
+                    data["context_window"] = get_model_context_window(model_id)
+                except Exception:  # noqa: BLE001 - context window is best effort.
+                    pass
+            model = latest["model"]
+            if model:
+                data["model"] = model
+        signature = tuple(sorted(data.items()))
+        if signature == self._last_usage_signature:
+            return
+        self._last_usage_signature = signature
+        await self._post_event(_EXTERNAL_SESSION_USAGE, data)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -777,4 +905,6 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.tool.success": OpenCodeNativeForwarder._on_tool_success,
     "session.tool.failed": OpenCodeNativeForwarder._on_tool_failed,
     "session.tool.progress": OpenCodeNativeForwarder._on_tool_progress,
+    "session.usage.updated": OpenCodeNativeForwarder._on_usage_updated,
+    "session.step.failed": OpenCodeNativeForwarder._on_step_ended,
 }
