@@ -146,6 +146,74 @@ async def test_connection_error_preserves_a_valid_queued_failure() -> None:
     assert error["type"] == "ReadError"
 
 
+async def _failed_status_error(app: FastAPI) -> dict[str, Any]:
+    """Send a synthetic turn and return the error on the queued ``failed`` status."""
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{_SESSION_ID}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness": "openai-agents",
+            },
+        )
+        queued = _drain_session_event_queue(app.state.session_event_queues.get(_SESSION_ID))
+
+    assert response.status_code == 200
+    failed = [
+        event
+        for event in queued
+        if event["type"] == "session.status" and event["status"] == "failed"
+    ]
+    assert len(failed) == 1, queued
+    return failed[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_failed_status_keeps_the_harness_error_code() -> None:
+    """A classified harness failure fails the turn under its own code, not ``runner_error``."""
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_test"}}),
+            _sse(
+                {
+                    "type": "response.failed",
+                    "error": {"code": "connection_error", "message": "Connection error."},
+                }
+            ),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    assert await _failed_status_error(app) == {
+        "code": "connection_error",
+        "message": "Connection error.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_status_prefers_the_code_over_the_exception_type() -> None:
+    """A harness stream drop fails the turn as ``connection_error``, not ``ReadError``."""
+
+    class DisconnectedHarnessClient(_ScriptedHarnessClient):
+        @contextlib.asynccontextmanager
+        async def stream(
+            self, method: str, url: str, *, json: dict[str, Any], timeout: Any
+        ) -> AsyncIterator[httpx.Response]:
+            raise httpx.ReadError("synthetic harness disconnect")
+            yield  # pragma: no cover
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(DisconnectedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    assert (await _failed_status_error(app))["code"] == "connection_error"
+
+
 @pytest.mark.asyncio
 async def test_context_overflow_preserves_a_valid_queued_failure() -> None:
     harness = _ScriptedHarnessClient(
