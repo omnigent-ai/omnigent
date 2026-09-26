@@ -84,10 +84,9 @@ _ENV_PASSTHROUGH_KEYS = (
     "https_proxy",
 )
 _RUNNER_ENV_PASSTHROUGH_ENV_VAR = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
-# OpenCode env the parent must never leak into the isolated per-session server:
-# global config paths, a foreign SQLite store, or another server's password.
-# Dropped even though they match the ``OPENCODE_`` passthrough prefix; the
-# launcher sets its own DB and password below.
+# OpenCode env the parent must never leak into the isolated per-session server
+# (global config, a foreign SQLite store, another server's password). Dropped
+# despite matching the ``OPENCODE_`` passthrough prefix; the launcher sets its own below.
 _ENV_OPENCODE_DENYLIST = frozenset(
     {
         "OPENCODE_CONFIG",
@@ -588,10 +587,13 @@ class OpenCodeNativeServer:
         try:
             body = response.json()
         except ValueError:
+            _logger.debug("opencode serve /api/info body was not JSON")
             return
         version = body.get("version") if isinstance(body, dict) else None
         if isinstance(version, str) and version:
             self.version = version
+        else:
+            _logger.debug("opencode serve /api/info body had no version: %r", body)
 
     def client(self, *, directory: str | None = None) -> OpenCodeClient:
         """
