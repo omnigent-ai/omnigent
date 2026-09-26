@@ -8602,6 +8602,20 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
     "space, or /clear to start a new conversation."
 )
 
+# Claude Code's record for a response that ended with stop_reason "max_tokens";
+# its remedy (CLAUDE_CODE_MAX_OUTPUT_TOKENS on the CLI process) is a dead end in
+# the web chat. Loose on count, apostrophe and prefix so a CLI wording bump matches.
+_OUTPUT_TOKEN_LIMIT_RE = re.compile(
+    r"^(?:API Error: )?Claude['’]s response exceeded the [\d,]+ output token maximum\.",
+    re.IGNORECASE,
+)
+
+_OUTPUT_TOKEN_LIMIT_REPLACEMENT = (
+    "Output limit reached — the response exceeded the model’s maximum "
+    "output length and was cut off. Ask for a shorter answer, or break "
+    "the request into smaller pieces and continue step by step."
+)
+
 # Claude Code points its auth failures at ``/login`` — a dead end in the
 # web chat, where ``/login`` is a dropped command: it is escaped into
 # plain text and answered by the same expired session with the same
@@ -8699,8 +8713,8 @@ def _assistant_message_item(
     :param text: Assistant text block.
     :param is_api_error: Whether Claude Code flagged the record as its
         own API error (see :func:`_is_api_error_entry`). Gates the
-        ``/login`` guidance append, which is safe only on CLI-authored
-        text.
+        output-limit rewrite and the ``/login`` guidance append, which
+        are safe only on CLI-authored text.
     :returns: Parsed transcript item.
     """
     return ClaudeTranscriptItem(
@@ -8723,12 +8737,15 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
 
     :param text: Assistant or CLI error text, e.g. ``"Prompt is too long"``.
     :param is_api_error: Whether Claude Code authored the text as its own
-        error; gates the ``/login`` guidance append.
+        error; gates the output-limit rewrite and the ``/login`` guidance
+        append.
     :returns: The text to show, e.g. the context-overflow guidance.
     """
     stripped = text.strip()
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
+    if is_api_error and _OUTPUT_TOKEN_LIMIT_RE.match(stripped):
+        return _OUTPUT_TOKEN_LIMIT_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return text

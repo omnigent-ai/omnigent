@@ -206,6 +206,51 @@ def test_classifies_budget_exhausted(code: str, message: str) -> None:
     assert classify_native_turn_error(code, message) == "budget_exhausted"
 
 
+# Claude Code's constant for a response that ended with stop_reason "max_tokens",
+# and the guidance the claude-native bridge rewrites it into.
+_RAW_OUTPUT_LIMIT_ERROR = (
+    "API Error: Claude's response exceeded the 32000 output token maximum. "
+    "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS "
+    "environment variable."
+)
+_REWRITTEN_OUTPUT_LIMIT_ERROR = (
+    "Output limit reached — the response exceeded the model’s maximum output "
+    "length and was cut off. Ask for a shorter answer, or break the request "
+    "into smaller pieces and continue step by step."
+)
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        _RAW_OUTPUT_LIMIT_ERROR,
+        # The constant without its "API Error: " prefix, at a raised limit.
+        "Claude’s response exceeded the 64,000 output token maximum.",
+        _REWRITTEN_OUTPUT_LIMIT_ERROR,
+    ],
+)
+def test_classifies_output_limit_exceeded(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "output_limit_exceeded"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Mentions the cap without a response having exceeded it.
+        "The model supports a 32000 output token maximum.",
+        "Output tokens: 32000",
+    ],
+)
+def test_output_limit_wording_alone_is_not_the_limit_error(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
+def test_output_limit_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _RAW_OUTPUT_LIMIT_ERROR) == code
+
+
 def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
     """A real auth failure under codex_reauth_required must not be reclassified."""
     message = (
@@ -226,6 +271,7 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
         ("budget_exhausted", "budget"),
+        ("output_limit_exceeded", "output length"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
