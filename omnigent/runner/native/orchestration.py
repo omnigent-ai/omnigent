@@ -1985,13 +1985,12 @@ def _build_opencode_policy_evaluator(
     """
     Build the policy evaluator the OpenCode permission forwarder consults.
 
-    Mirrors codex-native's policy hook exactly: every OpenCode
-    ``permission.asked`` request is POSTed to this session's
-    ``/v1/sessions/{id}/policies/evaluate`` endpoint as a
-    ``PHASE_TOOL_CALL`` event. The server evaluates configured policies and
-    — for an ``ASK`` verdict — parks a human approval card and blocks until
-    it is resolved, returning a hard ``ALLOW``/``DENY``. The forwarder turns
-    that into an OpenCode ``once``/``always``/``reject`` reply.
+    Every OpenCode ``permission.asked`` request is POSTed to this session's
+    ``/v1/sessions/{id}/policies/evaluate`` endpoint as a ``PHASE_TOOL_CALL``
+    event named after the v2 action (``shell``, ``edit``, ``subagent``, ...).
+    The server evaluates configured policies and, for an ``ASK`` verdict,
+    parks a human approval card and blocks until it is resolved. The
+    forwarder turns the verdict into an OpenCode ``once`` or ``reject`` reply.
 
     Fails CLOSED: an unreachable server, a non-200, a malformed body, or an
     unresolved ``ASK`` all yield a ``deny``/``ask`` verdict the forwarder
