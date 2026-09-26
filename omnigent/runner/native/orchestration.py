@@ -5625,16 +5625,39 @@ async def _codex_discover_thread_and_forward(
             # error is a bug and propagates.
             try:
                 diagnostics = collect_codex_startup_diagnostics(app_server)
-                if isinstance(exc, _CodexTerminalExited):
+                # Capture the TUI's own exit status/output, not just the
+                # app-server's stderr (which stays healthy while the client
+                # dies). On a terminal-exited failure this is the raised
+                # instance; on a timeout/event-stream failure the TUI may have
+                # exited without the discovery wait catching it (an unwatched
+                # instance, or a pane kept alive by remain-on-exit), so fall
+                # back to this launch's instance and refresh its liveness so
+                # ``#{pane_dead_status}`` and the final frame are recorded.
+                diag_instance = (
+                    exc.instance if isinstance(exc, _CodexTerminalExited) else terminal_instance
+                )
+                if diag_instance is not None:
                     from omnigent.process_logging import harness_stderr_capture_enabled
 
+                    if not isinstance(exc, _CodexTerminalExited):
+                        with contextlib.suppress(Exception):
+                            await diag_instance.is_alive()
+                    terminal_exit_status = diag_instance.last_exit_status()
                     diagnostics.update(
-                        terminal_instance_id=exc.instance.diagnostic_id,
-                        terminal_exit_status=exc.instance.last_exit_status(),
+                        terminal_instance_id=diag_instance.diagnostic_id,
+                        terminal_exit_status=terminal_exit_status,
+                        # A non-``_CodexTerminalExited`` failure whose TUI has a
+                        # recorded exit status means the client died but the
+                        # wait timed out anyway; distinguish it from a TUI that
+                        # is alive-but-never-ready (status ``None``).
+                        terminal_exited_undetected=(
+                            not isinstance(exc, _CodexTerminalExited)
+                            and terminal_exit_status is not None
+                        ),
                     )
                     if harness_stderr_capture_enabled():
                         diagnostics["terminal_last_output"] = _codex_startup_terminal_output(
-                            exc.instance
+                            diag_instance
                         )
             except Exception as diagnostics_error:  # noqa: BLE001
                 # Diagnostics must not replace the startup error or prevent cleanup.
