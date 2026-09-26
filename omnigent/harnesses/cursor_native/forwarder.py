@@ -254,14 +254,38 @@ def clear_cursor_bridge_state(bridge_dir: Path) -> None:
         (bridge_dir / _STATE_FILE).unlink()
 
 
+def _live_sibling_claims(bridge_dir: Path, store_path: Path) -> list[tuple[str, _ForwardState]]:
+    """Return ``(bridge-dir name, state)`` for live sibling claims on *store_path*.
+
+    A sibling bridge dir under the same root claims the chat when its persisted
+    state names the same store with a heartbeat fresher than ``_CLAIM_FRESH_MS``;
+    an older heartbeat is a dead session's leftover claim and is ignored.
+    """
+    root = bridge_dir.parent
+    if not root.is_dir():
+        return []
+    target = str(store_path)
+    now_ms = int(time.time() * 1000)
+    me = bridge_dir.name
+    claims: list[tuple[str, _ForwardState]] = []
+    for sibling in root.iterdir():
+        if sibling.name == me or not sibling.is_dir():
+            continue
+        other = _read_state(sibling)
+        if other.store_path != target:
+            continue
+        if now_ms - other.heartbeat_ms > _CLAIM_FRESH_MS:
+            continue  # stale claim — the owning session is gone; ignore it
+        claims.append((sibling.name, other))
+    return claims
+
+
 def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int) -> bool:
     """Whether another LIVE session is already mirroring *store_path*.
 
     cursor keeps one chat per working directory, so two cursor-native sessions
     launched in the same cwd discover the SAME store — without this guard both
     would mirror it into two separate conversations (the duplicate-session bug).
-    A sibling bridge dir under the same root claims the chat when its persisted
-    state names the same store with a heartbeat fresher than ``_CLAIM_FRESH_MS``.
     Ties resolve toward the EARLIER-launched session (then the lexicographically
     smaller bridge-dir name, for a deterministic, symmetric verdict), so the
     established session keeps the chat and a duplicate later launch yields.
@@ -272,25 +296,21 @@ def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int
     :returns: ``True`` if a different live session owns the chat (so this session
         should not mirror it); ``False`` otherwise.
     """
-    root = bridge_dir.parent
-    if not root.is_dir():
-        return False
-    target = str(store_path)
-    now_ms = int(time.time() * 1000)
     me = bridge_dir.name
-    for sibling in root.iterdir():
-        if sibling.name == me or not sibling.is_dir():
-            continue
-        other = _read_state(sibling)
-        if other.store_path != target:
-            continue
-        if now_ms - other.heartbeat_ms > _CLAIM_FRESH_MS:
-            continue  # stale claim — the owning session is gone; ignore it
+    for name, other in _live_sibling_claims(bridge_dir, store_path):
         if other.launch_epoch_ms < my_launch_ms:
             return True
-        if other.launch_epoch_ms == my_launch_ms and sibling.name < me:
+        if other.launch_epoch_ms == my_launch_ms and name < me:
             return True
     return False
+
+
+def _chat_claimed_by_any(bridge_dir: Path, store_path: Path) -> bool:
+    """Whether any live sibling owns this rotation candidate.
+
+    Unlike initial discovery, rotation cannot take an existing chat from a
+    sibling, regardless of which session launched first."""
+    return bool(_live_sibling_claims(bridge_dir, store_path))
 
 
 def _fd_exhaustion_errno(exc: BaseException) -> int | None:
@@ -439,6 +459,23 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
             if store.is_file() and _chat_created_ms(chat_dir) >= floor_ms:
                 matches.append(store)
     return matches[0] if len(matches) == 1 else None
+
+
+def _discover_rotated_store(store_path: Path, launch_epoch_ms: int) -> Path | None:
+    """Find the newest sibling chat created after the current chat and this launch.
+
+    The launch floor (with clock skew) prevents cold resume from selecting an
+    unrelated existing chat. The old store remains on disk after /clear.
+
+    :param store_path: Currently bound chat store.
+    :param launch_epoch_ms: Terminal launch time in wall-clock milliseconds.
+    :returns: Qualifying sibling store, or None."""
+    floor_ms = max(
+        launch_epoch_ms - _DISCOVERY_SKEW_MS,
+        _chat_created_ms(store_path.parent) + 1,
+    )
+    best, _created = _scan_hash_dir(store_path.parent.parent, floor_ms, None, -1)
+    return best
 
 
 def _scan_hash_dir(
@@ -756,6 +793,39 @@ async def _patch_external_session_id(
         )
 
 
+async def _post_external_session_rotated(
+    client: httpx.AsyncClient, *, session_id: str, chat_id: str
+) -> bool:
+    """Update the cold-resume target after a TUI rotation; plain PATCH is write-once.
+
+    Return False for transport failures that should retry next poll. Return
+    True for acknowledgements or HTTP rejections, including old servers that
+    reject this event and retain the previous target."""
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_session_rotated",
+                "data": {"external_session_id": chat_id},
+            },
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Transient error posting external_session_rotated; session=%s — retrying next poll",
+            session_id,
+        )
+        return False
+    if resp.status_code >= 400:
+        _logger.error(
+            "AP rejected external_session_rotated (%s); cold resume will keep "
+            "targeting the previous chat; session=%s chat_id=%s",
+            resp.status_code,
+            session_id,
+            chat_id,
+        )
+    return True
+
+
 async def _post_external_session_status(
     client: httpx.AsyncClient, *, session_id: str, status: str
 ) -> None:
@@ -914,6 +984,13 @@ async def forward_cursor_store_to_session(
     re-posting; if discovery resolves a *different* store than the persisted one
     (a cold resume relaunched a fresh chat), the cursor resets to that store.
 
+    When the TUI itself starts a new chat mid-session (``/clear`` and its
+    aliases), the newer sibling store is detected and the mirror rotates onto
+    it — fresh rowid cursor, fresh model dedupe, and a cold-resume target
+    re-pointed via the ``external_session_rotated`` event — so a TUI-side new
+    chat never strands the web session on the cleared-away chat (see
+    :func:`_discover_rotated_store`).
+
     A failed item POST never silently re-posts forever: a server *rejection* (a
     4xx, or a 5xx such as a failed DB insert) is retried for up to
     ``_MAX_ITEM_POST_ATTEMPTS`` polls and then skipped so one poison item can't
@@ -942,9 +1019,8 @@ async def forward_cursor_store_to_session(
     # has seen. Reset whenever the cursor advances past an item.
     failed_rowid = 0
     failed_attempts = 0
-    # Track whether the cursor chat id has been persisted as external_session_id
-    # so the cold-resume path can pass ``--resume <chatId>`` to cursor-agent.
-    chat_id_patched = False
+    # Last persisted cold-resume target; retry only when the bound chat changes.
+    patched_chat_id: str | None = None
     model_state = _ModelMirrorState()
     # fd-exhaustion window tracking: when the poll fails with EMFILE/ENFILE the
     # loop pauses mirroring (structured, rate-limited WARNING) instead of
@@ -982,12 +1058,12 @@ async def forward_cursor_store_to_session(
                             ),
                         )
                         persisted = _ForwardState()  # consumed
-                        if not chat_id_patched:
-                            chat_id_val = store_path.parent.name
+                        chat_id_val = store_path.parent.name
+                        if chat_id_val != patched_chat_id:
                             await _patch_external_session_id(
                                 client, session_id=session_id, chat_id=chat_id_val
                             )
-                            chat_id_patched = True
+                            patched_chat_id = chat_id_val
                     else:
                         resolved = await asyncio.to_thread(
                             _discover_store, workspace, launch_epoch_ms
@@ -1017,12 +1093,12 @@ async def forward_cursor_store_to_session(
                             # Persist the cursor chat id as external_session_id so
                             # a later cold resume can pass ``--resume <chatId>``
                             # to the cursor-agent TUI.
-                            if not chat_id_patched:
-                                chat_id_val = store_path.parent.name
+                            chat_id_val = store_path.parent.name
+                            if chat_id_val != patched_chat_id:
                                 await _patch_external_session_id(
                                     client, session_id=session_id, chat_id=chat_id_val
                                 )
-                                chat_id_patched = True
+                                patched_chat_id = chat_id_val
                 if store_path is not None and store_path.exists():
                     # cursor keeps ONE chat per working dir, so two cursor-native
                     # sessions launched in the same cwd discover the same store.
@@ -1040,6 +1116,17 @@ async def forward_cursor_store_to_session(
                         )
                         store_path = None
                     else:
+                        # A /clear rotation re-points the cold-resume target via
+                        # the rotation event (posted at rotation time below);
+                        # retried here only while a transport failure left it
+                        # unacknowledged.
+                        chat_id_val = store_path.parent.name
+                        if patched_chat_id is not None and patched_chat_id != chat_id_val:
+                            settled = await _post_external_session_rotated(
+                                client, session_id=session_id, chat_id=chat_id_val
+                            )
+                            if settled:
+                                patched_chat_id = chat_id_val
                         items = await asyncio.to_thread(
                             _read_new_items, store_path, last_rowid, agent_name
                         )
@@ -1196,6 +1283,46 @@ async def forward_cursor_store_to_session(
                             state=model_state,
                             model=observed_model,
                         )
+                        # Rotate only after draining the backlog, with a fresh cursor/model
+                        # state and cold-resume target. Never take a live sibling's chat.
+                        if not retrying_items:
+                            rotated = await asyncio.to_thread(
+                                _discover_rotated_store, store_path, launch_epoch_ms
+                            )
+                            if rotated is not None and not await asyncio.to_thread(
+                                _chat_claimed_by_any, bridge_dir, rotated
+                            ):
+                                _logger.info(
+                                    "cursor TUI started a new chat; rotating mirror: "
+                                    "session=%s old=%s new=%s",
+                                    session_id,
+                                    store_path,
+                                    rotated,
+                                )
+                                store_path = rotated
+                                last_rowid = 0
+                                failed_rowid = failed_attempts = 0
+                                model_state = _ModelMirrorState()
+                                _write_state(
+                                    bridge_dir,
+                                    _ForwardState(
+                                        store_path=str(store_path),
+                                        last_rowid=0,
+                                        launch_epoch_ms=launch_epoch_ms,
+                                    ),
+                                )
+                                # Re-point the cold-resume target at the new
+                                # chat. The PATCH contract is write-once, so
+                                # this rides the explicit rotation event; a
+                                # transport failure retries at the top of the
+                                # bound branch next poll.
+                                chat_id_val = store_path.parent.name
+                                if chat_id_val != patched_chat_id:
+                                    settled = await _post_external_session_rotated(
+                                        client, session_id=session_id, chat_id=chat_id_val
+                                    )
+                                    if settled:
+                                        patched_chat_id = chat_id_val
                 # Turn over the cursor ``stop`` hook's turn-completion markers to
                 # an ``external_session_status: idle`` edge — the signal that wakes
                 # a parent orchestrator (the PTY watcher's spinner status never
