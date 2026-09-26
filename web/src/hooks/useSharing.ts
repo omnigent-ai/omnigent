@@ -43,8 +43,8 @@ async function fetchSharing(): Promise<SharingState> {
 }
 
 /** Fetch the current server-wide sharing settings (admin only). */
-export function useSharing() {
-  return useQuery({ queryKey: QUERY_KEY, queryFn: fetchSharing, staleTime: 5_000 });
+export function useSharing({ enabled = true }: { enabled?: boolean } = {}) {
+  return useQuery({ queryKey: QUERY_KEY, queryFn: fetchSharing, staleTime: 5_000, enabled });
 }
 
 /** PUT /v1/sharing — update the mode and/or public-access setting (admin). */
