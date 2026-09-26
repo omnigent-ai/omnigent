@@ -19,9 +19,7 @@ from typing import TypeAlias
 
 from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeNativeServer,
-    build_opencode_attach_args,
     client_for_state,
-    opencode_terminal_env,
 )
 from omnigent.harnesses.opencode_native.bridge import read_bridge_state
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
@@ -269,19 +267,3 @@ class OpenCodeHttpTransport:
             )
         finally:
             await client.aclose()
-
-    def build_tui_attach_command(
-        self, launch: NativeLaunchConfig, session_id: str
-    ) -> tuple[list[str], Mapping[str, str]]:
-        """Build the ``opencode attach`` argv + env for a TUI takeover."""
-        server_url = launch.server_url or (self._server.base_url if self._server else "")
-        argv = build_opencode_attach_args(
-            server_url=server_url,
-            workspace=launch.workspace,
-            session_id=session_id,
-            opencode_args=launch.terminal_launch_args,
-        )
-        env: Mapping[str, str] = (
-            opencode_terminal_env(self._server) if self._server is not None else {}
-        )
-        return argv, env

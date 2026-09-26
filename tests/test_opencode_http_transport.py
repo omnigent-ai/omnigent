@@ -191,19 +191,6 @@ async def test_reply_permission_maps_decision() -> None:
     assert ("reply_permission", ("per_1", {"reply": "always", "message": "ok"})) in client.calls
 
 
-def test_build_tui_attach_command_uses_launch_server_url() -> None:
-    transport = OpenCodeHttpTransport(client_factory=lambda: _FakeClient())
-    argv, env = transport.build_tui_attach_command(
-        _launch(server_url="http://127.0.0.1:1234", terminal_launch_args=("--foo",)),
-        "ses_1",
-    )
-    assert argv[0] == "attach"
-    assert "http://127.0.0.1:1234" in argv
-    assert "ses_1" in argv
-    assert "--foo" in argv
-    assert env == {}  # no server handle → empty terminal env
-
-
 async def test_no_connection_coordinates_raises() -> None:
     # No factory / server / bridge_dir → the client builder fails loud.
     with pytest.raises(RuntimeError):

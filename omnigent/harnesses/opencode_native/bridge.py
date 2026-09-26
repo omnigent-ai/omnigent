@@ -11,7 +11,7 @@ Layout (per bridge id):
 
     ~/.omnigent/opencode-native/<sha256(bridge_id)[:32]>/
         state.json          # runtime state (mutates each turn)
-        auth.secret         # OPENCODE_SERVER_PASSWORD for this server
+        auth.secret         # OPENCODE_PASSWORD for this server
         xdg-data/           # XDG_DATA_HOME for the per-session opencode
         xdg-config/         # XDG_CONFIG_HOME for the per-session opencode
 
@@ -43,10 +43,11 @@ OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_OPENCODE_NATIVE_REQUEST_SE
 # codex-native ``omnigent.codex_native.bridge_id`` label.
 OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.opencode_native.bridge_id"
 
-# OpenCode server basic-auth env vars (see opencode ``attach``/``serve``).
+# OpenCode server password env. v2 reads OPENCODE_PASSWORD and still honors
+# the legacy OPENCODE_SERVER_PASSWORD; both carry the per-session secret.
+OPENCODE_PASSWORD_ENV_VAR = "OPENCODE_PASSWORD"
 OPENCODE_SERVER_PASSWORD_ENV_VAR = "OPENCODE_SERVER_PASSWORD"
-OPENCODE_SERVER_USERNAME_ENV_VAR = "OPENCODE_SERVER_USERNAME"
-# Default basic-auth username opencode falls back to when unset.
+# The v2 server's fixed basic-auth username.
 OPENCODE_DEFAULT_USERNAME = "opencode"
 
 _STATE_FILE = "state.json"

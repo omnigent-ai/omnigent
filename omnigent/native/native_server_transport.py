@@ -120,7 +120,7 @@ class NativeServerTransport(Protocol):
 
     Implementations encapsulate all wire details (process launch, session
     lifecycle, prompt injection, abort, event stream, fork, permission
-    replies, TUI attach). The shared
+    replies). The shared
     :class:`~omnigent.native.native_server_harness.NativeServerHarness` calls only
     these methods.
     """
@@ -161,10 +161,4 @@ class NativeServerTransport(Protocol):
 
     async def reply_permission(self, decision: NativePermissionDecision) -> None:
         """Relay a permission decision to the native server."""
-        raise NotImplementedError
-
-    def build_tui_attach_command(
-        self, launch: NativeLaunchConfig, session_id: str
-    ) -> tuple[list[str], Mapping[str, str]]:
-        """Build the ``(argv, env)`` for a terminal TUI takeover."""
         raise NotImplementedError

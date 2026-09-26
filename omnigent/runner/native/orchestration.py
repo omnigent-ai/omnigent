@@ -1425,10 +1425,10 @@ async def _auto_create_opencode_terminal(
     Auto-create an OpenCode terminal for an opencode-native session.
 
     Mirrors :func:`_auto_create_codex_terminal`, substituting ``opencode
-    serve`` / ``opencode attach`` for Codex's app-server/remote transport:
+    serve`` / ``opencode --server`` for Codex's app-server/remote transport:
     boots a per-session ``opencode serve`` process, resumes-or-creates the
     OpenCode session, persists bridge state + ``external_session_id``,
-    starts the SSE forwarder, then registers the ``opencode attach`` TUI as
+    starts the SSE forwarder, then registers the ``opencode --server`` TUI as
     a streamable terminal resource attached to that server.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
@@ -1444,7 +1444,7 @@ async def _auto_create_opencode_terminal(
     """
     from omnigent.harnesses.opencode_native.app_server import (
         OpenCodeNativeServer,
-        build_opencode_attach_args,
+        build_tui_command,
         opencode_terminal_env,
     )
     from omnigent.harnesses.opencode_native.bridge import (
@@ -1767,6 +1767,13 @@ async def _auto_create_opencode_terminal(
         )
         _register_auto_forwarder_task(session_id, forwarder_task)
 
+    tui_argv = build_tui_command(
+        server.opencode_path,
+        base_url=server.base_url,
+        session_id=opencode_session_id,
+        workspace=workspace,
+        extra_args=tuple(launch_config.terminal_launch_args or ()),
+    )
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     try:
         terminal_view = await resource_registry.launch_auxiliary_terminal(
@@ -1781,14 +1788,13 @@ async def _auto_create_opencode_terminal(
                     cwd=workspace,
                     sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
                 ),
-                command=server.opencode_path,
-                args=build_opencode_attach_args(
-                    server_url=server.base_url,
-                    workspace=workspace,
-                    session_id=opencode_session_id,
-                    opencode_args=tuple(launch_config.terminal_launch_args or ()),
+                command=tui_argv[0],
+                args=tui_argv[1:],
+                env=opencode_terminal_env(
+                    server.auth_secret,
+                    xdg_data_home=server.xdg_data_home,
+                    xdg_config_home=server.xdg_config_home,
                 ),
-                env=opencode_terminal_env(server),
                 scrollback=100_000,
                 tmux_allow_passthrough=True,
                 tmux_start_on_attach=False,

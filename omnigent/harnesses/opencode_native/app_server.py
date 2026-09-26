@@ -10,12 +10,12 @@ Responsibilities:
 - Resolve and version-check the ``opencode`` CLI.
 - Allocate a loopback port and per-session XDG data/config roots.
 - Launch ``opencode serve --hostname 127.0.0.1 --port <port>`` with a
-  random ``OPENCODE_SERVER_PASSWORD`` and the per-session XDG dirs.
+  random ``OPENCODE_PASSWORD`` and the per-session XDG dirs.
 - Poll the HTTP API for readiness.
 - Expose ``base_url``, ``auth_headers``, ``xdg_data_home`` /
   ``xdg_config_home``, and a process handle.
-- Build the ``opencode attach`` argv + env for the terminal takeover (the
-  Codex ``--remote`` analog).
+- Build the ``opencode --server <url> --session <id>`` argv + env for the
+  terminal TUI (the Codex ``--remote`` analog).
 - Terminate the process on session close / runner shutdown.
 
 Security posture: bind to ``127.0.0.1`` only, random per-session password,
@@ -40,9 +40,8 @@ import httpx
 from packaging.version import InvalidVersion, Version
 
 from omnigent.harnesses.opencode_native.bridge import (
-    OPENCODE_DEFAULT_USERNAME,
+    OPENCODE_PASSWORD_ENV_VAR,
     OPENCODE_SERVER_PASSWORD_ENV_VAR,
-    OPENCODE_SERVER_USERNAME_ENV_VAR,
     auth_headers_for_secret,
     ensure_auth_secret,
     xdg_config_home_for_bridge_dir,
@@ -296,32 +295,38 @@ def build_opencode_serve_args(
     return ["serve", "--hostname", hostname, "--port", str(port), *opencode_args]
 
 
-def build_opencode_attach_args(
+def build_tui_command(
+    opencode_path: str,
     *,
-    server_url: str,
+    base_url: str,
+    session_id: str,
     workspace: str,
-    session_id: str | None,
-    opencode_args: Sequence[str] = (),
+    extra_args: Sequence[str] = (),
 ) -> list[str]:
     """
-    Build the ``opencode attach`` argv for a terminal takeover.
+    Build the full argv for the OpenCode TUI bound to this session's server.
 
-    Mirrors codex's ``--remote`` attach: the TUI attaches to the
-    already-running server so the terminal, forwarder, and web-UI bridge
-    all drive the same OpenCode session.
+    The TUI connects to the runner-owned ``opencode serve`` (``--server``) and
+    opens the Omnigent-owned session, so the terminal, forwarder, and web UI
+    drive one OpenCode session. The password travels in the environment (see
+    :func:`opencode_terminal_env`), never on argv.
 
-    :param server_url: The server URL, e.g. ``"http://127.0.0.1:49231"``.
-    :param workspace: Directory the TUI runs in (``--dir``).
-    :param session_id: OpenCode session id to attach (``--session``), or
-        ``None`` to let the TUI choose.
-    :param opencode_args: Extra pass-through args appended last.
-    :returns: Argv tail after the executable.
+    :param opencode_path: Path to the ``opencode`` binary.
+    :param base_url: Server URL, e.g. ``"http://127.0.0.1:49231"``.
+    :param session_id: OpenCode session id, e.g. ``"ses_abc123"``.
+    :param workspace: Directory the TUI starts in (positional argument).
+    :param extra_args: User pass-through args appended last.
+    :returns: ``[opencode, "--server", url, "--session", id, workspace, *extra]``.
     """
-    args = ["attach", server_url, "--dir", workspace]
-    if session_id:
-        args.extend(["--session", session_id])
-    args.extend(opencode_args)
-    return args
+    return [
+        opencode_path,
+        "--server",
+        base_url,
+        "--session",
+        session_id,
+        workspace,
+        *extra_args,
+    ]
 
 
 def filtered_server_env(
@@ -334,9 +339,9 @@ def filtered_server_env(
     Build the launch environment for ``opencode serve``.
 
     Per-session XDG dirs isolate OpenCode's state from the user's global
-    config; ``OPENCODE_SERVER_PASSWORD`` secures the loopback server. Only
-    provider/proxy env and operator-declared runner passthrough vars from the
-    parent are passed through.
+    config; ``OPENCODE_PASSWORD`` (plus the legacy ``OPENCODE_SERVER_PASSWORD``)
+    secures the loopback server. Only provider/proxy env and operator-declared
+    runner passthrough vars from the parent are passed through.
 
     :param bridge_dir: Native OpenCode bridge directory.
     :param auth_secret: Server password for basic auth.
@@ -363,27 +368,37 @@ def filtered_server_env(
     env.update(extra_env or {})
     env["XDG_DATA_HOME"] = str(xdg_data_home_for_bridge_dir(bridge_dir))
     env["XDG_CONFIG_HOME"] = str(xdg_config_home_for_bridge_dir(bridge_dir))
+    env[OPENCODE_PASSWORD_ENV_VAR] = auth_secret
     env[OPENCODE_SERVER_PASSWORD_ENV_VAR] = auth_secret
-    env[OPENCODE_SERVER_USERNAME_ENV_VAR] = OPENCODE_DEFAULT_USERNAME
     return env
 
 
-def opencode_terminal_env(server: OpenCodeNativeServer) -> dict[str, str]:
+def opencode_terminal_env(
+    secret: str,
+    *,
+    xdg_data_home: Path | None = None,
+    xdg_config_home: Path | None = None,
+) -> dict[str, str]:
     """
-    Build terminal-process env for the native OpenCode TUI (``attach``).
+    Build the environment for the OpenCode TUI terminal process.
 
-    Keeping the password in the environment avoids leaking it on argv
-    (``--password`` defaults to ``OPENCODE_SERVER_PASSWORD``).
-
-    :param server: The running server wrapper.
-    :returns: Environment variables for the attach terminal process.
+    :param secret: The per-session server password.
+    :param xdg_data_home: Per-session ``XDG_DATA_HOME`` so TUI-local state stays
+        out of the user's global OpenCode data dir; ``None`` leaves it unset.
+    :param xdg_config_home: Per-session ``XDG_CONFIG_HOME``; ``None`` leaves it
+        unset.
+    :returns: Env carrying the password as ``OPENCODE_PASSWORD`` and the legacy
+        ``OPENCODE_SERVER_PASSWORD``.
     """
-    return {
-        OPENCODE_SERVER_PASSWORD_ENV_VAR: server.auth_secret,
-        OPENCODE_SERVER_USERNAME_ENV_VAR: OPENCODE_DEFAULT_USERNAME,
-        "XDG_DATA_HOME": str(server.xdg_data_home),
-        "XDG_CONFIG_HOME": str(server.xdg_config_home),
+    env = {
+        OPENCODE_PASSWORD_ENV_VAR: secret,
+        OPENCODE_SERVER_PASSWORD_ENV_VAR: secret,
     }
+    if xdg_data_home is not None:
+        env["XDG_DATA_HOME"] = str(xdg_data_home)
+    if xdg_config_home is not None:
+        env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    return env
 
 
 class OpenCodeNativeServer:

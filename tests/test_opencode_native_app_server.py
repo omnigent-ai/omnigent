@@ -12,8 +12,8 @@ from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
     OpenCodeNativeServer,
     OpenCodeVersionError,
-    build_opencode_attach_args,
     build_opencode_serve_args,
+    build_tui_command,
     check_opencode_version,
     filtered_server_env,
     find_opencode_cli,
@@ -62,31 +62,23 @@ def test_build_serve_args_has_explicit_host_port() -> None:
     assert args == ["serve", "--hostname", "127.0.0.1", "--port", "49231"]
 
 
-def test_build_attach_args() -> None:
-    args = build_opencode_attach_args(
-        server_url="http://127.0.0.1:49231",
-        workspace="/repo",
+def test_build_tui_command() -> None:
+    assert build_tui_command(
+        "/usr/bin/opencode",
+        base_url="http://127.0.0.1:49231",
         session_id="ses_1",
-    )
-    assert args == [
-        "attach",
+        workspace="/repo",
+        extra_args=("--log-level", "debug"),
+    ) == [
+        "/usr/bin/opencode",
+        "--server",
         "http://127.0.0.1:49231",
-        "--dir",
-        "/repo",
         "--session",
         "ses_1",
+        "/repo",
+        "--log-level",
+        "debug",
     ]
-
-
-def test_build_attach_args_without_session() -> None:
-    args = build_opencode_attach_args(
-        server_url="http://127.0.0.1:49231",
-        workspace="/repo",
-        session_id=None,
-        opencode_args=("--extra",),
-    )
-    assert "--session" not in args
-    assert args[-1] == "--extra"
 
 
 def test_filtered_server_env_sets_xdg_and_password(
@@ -97,8 +89,9 @@ def test_filtered_server_env_sets_xdg_and_password(
     env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
     assert env["XDG_DATA_HOME"] == str(tmp_path / "xdg-data")
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
+    assert env["OPENCODE_PASSWORD"] == "pw"
     assert env["OPENCODE_SERVER_PASSWORD"] == "pw"
-    assert env["OPENCODE_SERVER_USERNAME"] == "opencode"
+    assert "OPENCODE_SERVER_USERNAME" not in env
     assert env["ANTHROPIC_API_KEY"] == "secret-key"  # provider env passes through
     assert "RANDOM_UNRELATED" not in env  # unrelated env filtered out
 
@@ -169,11 +162,23 @@ def test_base_url_and_auth_headers(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert server.auth_headers["Authorization"].startswith("Basic ")
 
 
-def test_terminal_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    server = _server(monkeypatch, tmp_path)
-    env = opencode_terminal_env(server)
-    assert env["OPENCODE_SERVER_PASSWORD"] == server.auth_secret
-    assert env["XDG_DATA_HOME"] == str(server.xdg_data_home)
+def test_terminal_env_carries_password_under_both_names(tmp_path: Path) -> None:
+    env = opencode_terminal_env(
+        "pw", xdg_data_home=tmp_path / "data", xdg_config_home=tmp_path / "config"
+    )
+    assert env == {
+        "OPENCODE_PASSWORD": "pw",
+        "OPENCODE_SERVER_PASSWORD": "pw",
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+    }
+
+
+def test_terminal_env_without_xdg_dirs() -> None:
+    assert opencode_terminal_env("pw") == {
+        "OPENCODE_PASSWORD": "pw",
+        "OPENCODE_SERVER_PASSWORD": "pw",
+    }
 
 
 async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
