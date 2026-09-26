@@ -1768,3 +1768,102 @@ async def test_child_permission_replies_to_the_child_session() -> None:
     await fwd.handle_event(_asked("per_c", sessionID="ses_child"))
     await _drain(fwd)
     assert opencode.permission_replies == [("ses_child", "per_c", "reject")]
+
+
+# --- history seeding --------------------------------------------------------
+
+
+def _assistant_message(
+    message_id: str, *content: dict[str, Any], completed: bool = True, **extra: Any
+) -> dict[str, Any]:
+    time_info: dict[str, Any] = {"created": 1}
+    if completed:
+        time_info["completed"] = 2
+    return {
+        "id": message_id,
+        "type": "assistant",
+        "agent": "build",
+        "model": {"id": "claude-sonnet-4-5", "providerID": "anthropic"},
+        "content": list(content),
+        "time": time_info,
+        **extra,
+    }
+
+
+def _tool_content(call_id: str, status: str, **state: Any) -> dict[str, Any]:
+    state.setdefault("input", {"command": "ls"})
+    return {
+        "type": "tool",
+        "id": call_id,
+        "name": "shell",
+        "state": {"status": status, **state},
+        "time": {"created": 1},
+    }
+
+
+async def test_seed_marks_v2_history_keys() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.messages = [
+        {"id": "msg_u", "type": "user", "text": "hi", "time": {"created": 1}},
+        _assistant_message(
+            "msg_1",
+            {"type": "reasoning", "text": "think"},
+            {"type": "text", "text": "answer"},
+            _tool_content("call_1", "completed", content=[{"type": "text", "text": "ok"}]),
+            _tool_content("call_2", "running", metadata={}),
+        ),
+        "not-a-mapping",
+    ]
+    fwd = _forwarder(server, opencode)
+    await fwd.seed_dedupe_from_history()
+    assert fwd.state.mark(fwd._key("user", "msg_u")) is False
+    assert fwd.state.mark(fwd._key("text-final", "msg_1", "0")) is False
+    assert fwd.state.mark(fwd._key("tool-call", "call_1")) is False
+    assert fwd.state.mark(fwd._key("tool-out", "call_1")) is False
+    # A still-running tool's output must still post live.
+    assert fwd.state.mark(fwd._key("tool-out", "call_2")) is True
+
+
+async def test_seed_swallows_history_errors() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+
+    async def _boom(_sid: str, *, after_id: str | None = None) -> list[dict[str, Any]]:
+        raise RuntimeError("history unavailable")
+
+    opencode.list_messages = _boom  # type: ignore[assignment]
+    fwd = _forwarder(server, opencode)
+    await fwd.seed_dedupe_from_history()
+    assert server.posts == []
+
+
+async def test_seed_rebuilds_usage_and_model() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    tokens_1 = {"input": 1000, "output": 50, "reasoning": 0, "cache": {"read": 200, "write": 0}}
+    tokens_2 = {"input": 2000, "output": 100, "reasoning": 0, "cache": {"read": 300, "write": 0}}
+    opencode.messages = [
+        _assistant_message("msg_1", cost=0.01, tokens=tokens_1),
+        _assistant_message("msg_2", cost=0.02, tokens=tokens_2),
+    ]
+    fwd = _forwarder(server, opencode)
+    await fwd.seed_dedupe_from_history()
+    usage = _datas(server.posts, "external_session_usage")[-1]
+    assert usage["cumulative_cost_usd"] == 0.03
+    assert usage["cumulative_input_tokens"] == 3000
+    assert usage["cumulative_output_tokens"] == 150
+    assert usage["cumulative_cache_read_input_tokens"] == 500
+    # The next step on the same model is not reported as a switch.
+    await fwd.handle_event(_step_started("msg_3"))
+    assert "external_model_change" not in _types(server.posts)
+
+
+async def test_seed_cursor_stops_at_first_unsettled_message() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.messages = [
+        {"id": "msg_u", "type": "user", "text": "hi", "time": {"created": 1}},
+        _assistant_message("msg_1"),
+        _assistant_message("msg_2", completed=False),
+        {"id": "msg_u2", "type": "user", "text": "more", "time": {"created": 3}},
+    ]
+    fwd = _forwarder(server, opencode)
+    await fwd.seed_dedupe_from_history()
+    assert fwd._last_seen_message_id == "msg_1"

@@ -457,6 +457,19 @@ def _child_session_id(response: httpx.Response | None) -> str | None:
     return child if isinstance(child, str) and child else None
 
 
+def _history_message_settled(message: Mapping[str, Any]) -> bool:
+    """Return whether a v2 ``Session.Message.Info`` can no longer change."""
+    kind = message.get("type")
+    if kind == "assistant":
+        time_info = message.get("time")
+        return isinstance(time_info, Mapping) and isinstance(
+            time_info.get("completed"), (int, float)
+        )
+    if kind == "compaction":
+        return message.get("status") != "running"
+    return True
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's v2 event stream into Omnigent events.
@@ -518,10 +531,15 @@ class OpenCodeNativeForwarder:
         self._inbox_items: dict[str, _JsonObject] = {}
         # Child session id -> subagent start details until its conversation exists.
         self._pending_children: dict[str, _PendingChild] = {}
+        # Newest history message known settled; the reconnect catch-up cursor.
+        self._last_seen_message_id: str | None = None
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
-        Run the SSE consume loop with reconnect/backoff.
+        Run the SSE consume loop with reconnect/backoff and gap-fill.
+
+        The first connection pre-marks persisted history so a restart never
+        re-posts it.
 
         :param max_reconnects: Reconnect cap (``None`` = unbounded); used by
             tests to bound the loop.
@@ -530,6 +548,8 @@ class OpenCodeNativeForwarder:
         backoff = 0.5
         try:
             while True:
+                if attempt == 0:
+                    await self.seed_dedupe_from_history()
                 try:
                     await self._consume_once()
                 except asyncio.CancelledError:
@@ -1628,6 +1648,68 @@ class OpenCodeNativeForwarder:
             return
         self._pending_children.pop(child_id, None)
         turn.conversation_id = child_conversation
+
+    async def seed_dedupe_from_history(self) -> None:
+        """
+        Pre-mark persisted history so a restart never re-posts it.
+
+        Best effort: a history failure leaves the dedupe set empty. Rebuilds
+        cumulative usage and the last mirrored model from assistant messages.
+        """
+        try:
+            messages = await self._opencode.list_messages(self._opencode_session_id)
+        except Exception:  # noqa: BLE001 - seeding is best effort.
+            _logger.debug("OpenCode forwarder could not seed dedupe from history", exc_info=True)
+            return
+        settled_prefix = True
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            self._mark_history_message(message)
+            message_id = _str_field(message, "id")
+            if settled_prefix and message_id is not None and _history_message_settled(message):
+                self._last_seen_message_id = message_id
+            else:
+                settled_prefix = False
+        try:
+            await self._post_session_usage()
+        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+            _logger.debug(
+                "OpenCode forwarder could not re-post usage after seeding", exc_info=True
+            )
+
+    def _mark_history_message(self, message: Mapping[str, Any]) -> None:
+        """Pre-mark one history message's dedupe keys and record its usage."""
+        message_id = _str_field(message, "id")
+        if message_id is None:
+            return
+        kind = message.get("type")
+        if kind == "user":
+            self.state.mark(self._key("user", message_id))
+            return
+        if kind != "assistant":
+            return
+        model = _model_ref(message.get("model"))
+        self._record_step_usage(message_id, message, model)
+        if model is not None:
+            self._last_model = model
+        content = message.get("content")
+        text_ordinal = 0
+        for item in content if isinstance(content, list) else []:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("type") == "text":
+                self.state.mark(self._key("text-final", message_id, str(text_ordinal)))
+                text_ordinal += 1
+            elif item.get("type") == "tool":
+                call_id = _str_field(item, "id")
+                state = item.get("state")
+                status = state.get("status") if isinstance(state, Mapping) else None
+                if call_id is None or status == "streaming":
+                    continue
+                self.state.mark(self._key("tool-call", call_id))
+                if status in ("completed", "error"):
+                    self.state.mark(self._key("tool-out", call_id))
 
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:

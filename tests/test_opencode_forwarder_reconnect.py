@@ -157,3 +157,12 @@ async def test_handle_event_no_longer_calls_update_last_event_id() -> None:
 
     source = inspect.getsource(fwd_mod)
     assert "update_last_event_id" not in source
+
+
+async def test_run_seeds_on_initial_connect() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.messages = [_assistant("msg_old", _text("old answer"))]
+    fwd = _forwarder(server, opencode)
+    await _run(fwd, max_reconnects=0)
+    assert fwd.state.mark(fwd._key("text-final", "msg_old", "0")) is False
+    assert opencode.after_ids == [None]
