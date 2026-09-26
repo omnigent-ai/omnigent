@@ -912,6 +912,124 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
 
 
 @pytest.mark.asyncio
+async def test_codex_native_title_routes_non_openai_model_through_compat_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A non-OpenAI title exec must not send parallel_tool_calls to the gateway.
+
+    The gateway rejects any Responses request carrying the field, so the title
+    exec routes through the compat proxy like a session launch. The fake codex
+    posts a field-carrying request at the config.toml base_url and the upstream
+    must receive it stripped.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import tomllib
+
+    upstream_bodies: list[dict[str, Any]] = []
+
+    class UpstreamHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            upstream_bodies.append(json.loads(self.rfile.read(length)))
+            payload = b'{"object": "response", "status": "completed"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+    upstream.daemon_threads = True
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    upstream_url = f"http://127.0.0.1:{upstream.server_address[1]}/v1"
+    proxied_url: dict[str, str] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            args = captured["args"]
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
+            config = tomllib.loads((codex_home / "config.toml").read_text())
+            base_url = config["model_providers"]["omnigent_provider"]["base_url"]
+            proxied_url["base_url"] = base_url
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{base_url}/responses",
+                    json={
+                        "model": "system.ai.qwen35-122b-a10b",
+                        "input": "title",
+                        "parallel_tool_calls": False,
+                    },
+                )
+            assert response.status_code == 200
+            output_path.write_text("Debug authentication timeout\n")
+            return b"", b""
+
+    captured: dict[str, Any] = {}
+
+    async def create_subprocess_exec(command: str, *args: str, **kwargs: Any) -> FakeProcess:
+        captured.update(command=command, args=list(args), kwargs=kwargs)
+        return FakeProcess()
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text("")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    provider_overrides = _provider_codex_config_overrides(
+        model="system.ai.qwen35-122b-a10b",
+        base_url=upstream_url,
+        auth_command="printf test-token",
+        wire_api="responses",
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.resolve_native_codex_launch",
+        lambda *, model, spec=None: NativeCodexLaunch(provider_overrides, model, None),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: "codex",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: source_home,
+    )
+
+    try:
+        title = await codex_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="please investigate the authentication timeout",
+                harness="codex-native",
+                spawn_env={},
+                process_manager=None,
+                model_override="system.ai.qwen35-122b-a10b",
+            )
+        )
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+
+    assert title == "Debug authentication timeout"
+    # The exec's provider config points at the loopback proxy, not the gateway.
+    assert proxied_url["base_url"].startswith("http://127.0.0.1:")
+    assert proxied_url["base_url"] != upstream_url
+    [body] = upstream_bodies
+    assert "parallel_tool_calls" not in body
+    assert body["input"] == "title"
+    # The per-exec proxy is torn down with the exec.
+    with pytest.raises(httpx.ConnectError):
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(f"{proxied_url['base_url']}/responses", json={})
+
+
+@pytest.mark.asyncio
 async def test_codex_native_title_prefers_title_model_over_session_sources(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

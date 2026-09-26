@@ -21,9 +21,11 @@ _logger = logging.getLogger("omnigent.runner.background_titles.codex_native")
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with an isolated native Codex exec process."""
     from omnigent.harnesses.codex_native.app_server import (
+        _rewrite_provider_override_base_url,
         build_codex_native_server,
         resolve_native_codex_launch,
     )
+    from omnigent.harnesses.codex_native.gateway_compat import CodexResponsesCompatProxy
     from omnigent.inner import _proc
     from omnigent.inner.codex_executor import (
         _codex_home_config_source_from_env,
@@ -63,6 +65,18 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             bridge_dir=temp_root / "bridge",
             extra_config_overrides=launch.config_overrides,
         )
+        # Same gate as a session launch: non-OpenAI gateway models reject
+        # Responses fields codex always sends, so the title exec must route
+        # through the compat proxy too or every title turn 400s.
+        compat_proxy: CodexResponsesCompatProxy | None = None
+        if native_server.gateway_compat_upstream:
+            compat_proxy = CodexResponsesCompatProxy(native_server.gateway_compat_upstream)
+            await compat_proxy.start()
+            native_server.config_overrides = _rewrite_provider_override_base_url(
+                native_server.config_overrides,
+                upstream=native_server.gateway_compat_upstream,
+                proxy_base_url=compat_proxy.base_url,
+            )
         native_server.config_overrides = materialize_codex_provider_config(
             codex_home,
             native_server.config_overrides,
@@ -102,36 +116,40 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         args.append(
             f"{instructions} Do not use tools.\n<user_message>\n{context.prompt}\n</user_message>"
         )
-        env = {**native_server.env, "CODEX_HOME": str(codex_home)}
-        process = await asyncio.create_subprocess_exec(
-            native_server.codex_path,
-            *args,
-            cwd=str(title_workdir),
-            env=env,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **_proc.spawn_kwargs(),
-        )
         try:
-            async with asyncio.timeout(BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS):
-                _stdout, stderr = await process.communicate()
-        except (TimeoutError, asyncio.CancelledError):
-            if process.returncode is None:
-                _proc.kill_tree(process)
-            with contextlib.suppress(Exception):
-                await process.wait()
-            raise
-
-        if process.returncode != 0:
-            detail = stderr.decode(errors="replace").strip()
-            _logger.warning(
-                "background native Codex title failed returncode=%s detail=%s",
-                process.returncode,
-                detail[-1000:],
-                extra={"session_id": runner_primary_session_id()},
+            env = {**native_server.env, "CODEX_HOME": str(codex_home)}
+            process = await asyncio.create_subprocess_exec(
+                native_server.codex_path,
+                *args,
+                cwd=str(title_workdir),
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **_proc.spawn_kwargs(),
             )
-            return None
-        if not output_path.is_file():
-            return None
-        return output_path.read_text(errors="replace").strip()
+            try:
+                async with asyncio.timeout(BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS):
+                    _stdout, stderr = await process.communicate()
+            except (TimeoutError, asyncio.CancelledError):
+                if process.returncode is None:
+                    _proc.kill_tree(process)
+                with contextlib.suppress(Exception):
+                    await process.wait()
+                raise
+
+            if process.returncode != 0:
+                detail = stderr.decode(errors="replace").strip()
+                _logger.warning(
+                    "background native Codex title failed returncode=%s detail=%s",
+                    process.returncode,
+                    detail[-1000:],
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                return None
+            if not output_path.is_file():
+                return None
+            return output_path.read_text(errors="replace").strip()
+        finally:
+            if compat_proxy is not None:
+                await compat_proxy.aclose()

@@ -12,6 +12,7 @@ from omnigent.models.codex_model_vocabulary import (
     codex_reachable_model_slug,
     codex_spawn_model,
     comparable_model_id,
+    is_openai_codex_model,
 )
 from omnigent.util.reasoning_effort import clamp_effort_for_model
 
@@ -160,3 +161,57 @@ def test_catalog_prefixes_match_the_routing_defaults() -> None:
     from omnigent.server.smart_routing import MODEL_ID_PREFIXES
 
     assert _CATALOG_PREFIXES == MODEL_ID_PREFIXES
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "databricks-gpt-5-4-mini",
+        "system.ai.gpt-6-nova",
+        "codex-5",
+        "Databricks-GPT-5-6-Sol[1M]",
+        "gpt-5.6-codex-max",
+        "gpt-4o",
+        "o3",
+        "o4-mini",
+    ],
+)
+def test_is_openai_codex_model_accepts_openai_served_ids(model: str) -> None:
+    assert is_openai_codex_model(model) is True
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "system.ai.qwen35-122b-a10b",
+        "system.ai.llama-4-maverick",
+        "system.ai.gemma-3-12b",
+        "system.ai.grok-4-6",
+        "databricks-glm-5-2",
+        "kimi-k2-6",
+        "databricks-claude-sonnet-5",
+        "olmo-3",
+        "",
+        "   ",
+    ],
+)
+def test_is_openai_codex_model_rejects_other_vendors(model: str) -> None:
+    assert is_openai_codex_model(model) is False
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["system.ai.gpt-oss-20b", "system.ai.gpt-oss-120b", "gpt-oss-20b", "databricks-gpt-oss-120b"],
+)
+def test_is_openai_codex_model_rejects_gpt_oss(model: str) -> None:
+    # gpt-oss keeps OpenAI's gpt- spelling but is open-weights and always
+    # hosted elsewhere; treating it as OpenAI-served would skip the
+    # gateway-compat gating exactly where the resolved launch default needs it.
+    assert is_openai_codex_model(model) is False
+
+
+def test_is_openai_codex_model_rejects_none() -> None:
+    # An unresolved launch model (codex's own default) is not a vendor match.
+    assert is_openai_codex_model(None) is False

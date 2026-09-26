@@ -14,7 +14,7 @@ import socket
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
+from omnigent.harnesses.codex_native.gateway_compat import CodexResponsesCompatProxy
 from omnigent.harnesses.codex_native.launch_args import (
     _write_private_config,
     absolute_codex_path,
@@ -83,7 +84,11 @@ from omnigent.inner.databricks_executor import (
     _databricks_gateway_host,
     _read_databrickscfg_host,
 )
-from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
+from omnigent.models.codex_model_vocabulary import (
+    codex_reachable_model_slug,
+    codex_spawn_model,
+    is_openai_codex_model,
+)
 from omnigent.process_logging import (
     harness_stderr_capture_enabled,
     log_info_once,
@@ -1786,6 +1791,10 @@ class CodexNativeAppServer:
     :param model_catalog_rows: Fresh rows from the shared, launch-shaped
         ``model/list`` catalog. When present, startup derives migration
         acknowledgements locally instead of spawning ``codex debug models``.
+    :param gateway_compat_upstream: Provider base URL to front with the
+        Responses compat proxy (set for a non-OpenAI resolved launch model;
+        see :mod:`omnigent.harnesses.codex_native.gateway_compat`), or
+        ``None`` for a direct connection.
     :param trust_project: Whether to trust :attr:`cwd` in the private
         session config before startup. Runner-owned headless sessions set
         this because nobody can answer Codex's project-trust TUI prompt.
@@ -1830,6 +1839,7 @@ class CodexNativeAppServer:
     pinned_model: str | None = None
     pinned_effort: str | None = None
     model_catalog_rows: list[_JsonObject] | None = None
+    gateway_compat_upstream: str | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
@@ -1841,6 +1851,7 @@ class CodexNativeAppServer:
     session_id: str | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
+    _gateway_compat_proxy: CodexResponsesCompatProxy | None = field(default=None, init=False)
 
     async def start(self) -> None:
         """
@@ -1946,6 +1957,17 @@ class CodexNativeAppServer:
             self.developer_instructions,
             use_current_base=compose_profile_instructions,
         )
+        if self.gateway_compat_upstream:
+            proxy = self._gateway_compat_proxy or CodexResponsesCompatProxy(
+                self.gateway_compat_upstream
+            )
+            await proxy.start()
+            self._gateway_compat_proxy = proxy
+            self.config_overrides = _rewrite_provider_override_base_url(
+                self.config_overrides,
+                upstream=self.gateway_compat_upstream,
+                proxy_base_url=proxy.base_url,
+            )
         self.config_overrides = materialize_codex_provider_config(
             self.codex_home,
             self.config_overrides,
@@ -2014,6 +2036,7 @@ class CodexNativeAppServer:
             if self.process_owner_lock is not None:
                 self.process_owner_lock.close()
                 self.process_owner_lock = None
+            await self._close_gateway_compat_proxy()
             raise
         if self.process_owner_lock is not None:
             register_codex_native_process(
@@ -2199,6 +2222,11 @@ class CodexNativeAppServer:
         else:
             _logger.info(message, self.policy_hook_disabled_reason)
 
+    async def _close_gateway_compat_proxy(self) -> None:
+        proxy, self._gateway_compat_proxy = self._gateway_compat_proxy, None
+        if proxy is not None:
+            await proxy.aclose()
+
     async def close(self) -> None:
         """
         Stop the app-server subprocess.
@@ -2237,6 +2265,7 @@ class CodexNativeAppServer:
                     diagnostics.finish()
                     with contextlib.suppress(Exception):
                         await asyncio.to_thread(diagnostics.close)
+        await self._close_gateway_compat_proxy()
 
     async def _wait_until_ready(self) -> CodexAppServerClient:
         """
@@ -3054,6 +3083,12 @@ def build_codex_native_server(
     """
     Build a configured native Codex app-server process wrapper.
 
+    When the resolved launch model is a non-OpenAI id, the launch routes
+    through a loopback proxy that strips Responses request fields those
+    gateway models reject (``parallel_tool_calls``); see
+    :mod:`omnigent.harnesses.codex_native.gateway_compat`. An unresolved
+    model (Codex's own default) keeps a direct connection.
+
     :param socket_path: Unix socket path for the app-server.
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param cwd: Working directory for Codex, e.g. the user's repo.
@@ -3157,6 +3192,11 @@ def build_codex_native_server(
         override.split("=", 1)[0] == "model" for override in config_overrides
     ):
         config_overrides.append(f"model={json.dumps(pinned_model)}")
+    gateway_compat_upstream: str | None = None
+    if pinned_model and not is_openai_codex_model(pinned_model):
+        # Non-OpenAI gateway models reject Responses fields codex always
+        # sends; front their provider base_url with the compat proxy.
+        gateway_compat_upstream = _provider_override_base_url(config_overrides)
     return CodexNativeAppServer(
         codex_path=resolved_codex,
         socket_path=socket_path,
@@ -3174,6 +3214,7 @@ def build_codex_native_server(
         pinned_model=pinned_model,
         pinned_effort=reasoning_effort,
         model_catalog_rows=model_catalog_rows,
+        gateway_compat_upstream=gateway_compat_upstream,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
         reconcile_process_registry=reconcile_process_registry,
@@ -3265,6 +3306,62 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     return "openai"
 
 
+def _provider_override_base_url(config_overrides: Iterable[str]) -> str | None:
+    """The ``base_url`` inside a generated ``model_providers.…`` override.
+
+    :param config_overrides: Codex ``-c`` override strings, e.g. the ones
+        :func:`_provider_codex_config_overrides` generates.
+    :returns: The provider table's ``base_url``, or ``None`` when no
+        override carries one.
+    """
+    for override in config_overrides:
+        _, sep, table = override.partition("=")
+        if not sep or not override.startswith("model_providers."):
+            continue
+        marker = "base_url="
+        index = table.find(marker)
+        if index < 0:
+            continue
+        decoder = json.JSONDecoder()
+        try:
+            base_url, _ = decoder.raw_decode(table[index + len(marker) :])
+        except ValueError:
+            continue
+        if isinstance(base_url, str):
+            return base_url
+    return None
+
+
+def _rewrite_provider_override_base_url(
+    config_overrides: Iterable[str], *, upstream: str, proxy_base_url: str
+) -> list[str]:
+    """Point generated provider overrides carrying *upstream* at the proxy.
+
+    :param config_overrides: Codex ``-c`` override strings.
+    :param upstream: The provider ``base_url`` being replaced.
+    :param proxy_base_url: The loopback proxy URL codex should call instead.
+    :returns: The overrides with matching ``base_url`` values rewritten.
+    """
+    rewritten: list[str] = []
+    for override in config_overrides:
+        key, sep, table = override.partition("=")
+        if sep and key.startswith("model_providers."):
+            marker = "base_url="
+            index = table.find(marker)
+            if index >= 0:
+                start = index + len(marker)
+                decoder = json.JSONDecoder()
+                try:
+                    base_url, consumed = decoder.raw_decode(table[start:])
+                except ValueError:
+                    base_url, consumed = None, 0
+                if base_url == upstream:
+                    table = table[:start] + json.dumps(proxy_base_url) + table[start + consumed :]
+                    override = f"{key}={table}"
+        rewritten.append(override)
+    return rewritten
+
+
 def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
     """Inference base URL a resolved launch pins, or None when it defers to Codex's own login.
 
@@ -3285,21 +3382,9 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
         if not host:
             return None
         return _databricks_codex_base_url(host.rstrip("/"))
-    for override in launch.config_overrides:
-        _, sep, table = override.partition("=")
-        if not sep or not override.startswith("model_providers."):
-            continue
-        marker = "base_url="
-        index = table.find(marker)
-        if index < 0:
-            continue
-        decoder = json.JSONDecoder()
-        try:
-            base_url, _ = decoder.raw_decode(table[index + len(marker) :])
-        except ValueError:
-            continue
-        if isinstance(base_url, str):
-            return base_url
+    override_base_url = _provider_override_base_url(launch.config_overrides)
+    if override_base_url is not None:
+        return override_base_url
     # A cli-config entry pins only a provider *name*; its table (with the
     # base_url) lives in the user's shared ~/.codex/config.toml. Read that
     # file to resolve the base URL a cli-config launch actually routes through.

@@ -63,6 +63,10 @@ _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", _MODEL_ROUTE_PREFIX)
 #: version only when there is a minor, and keeps the tier hyphenated, so an
 #: arm whose tier hangs off a major alone carries no dot at all.
 _GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)(?:-(\d+))?(?:-([a-z0-9]+))?$")
+# Ids OpenAI's own API serves: gpt-*, codex-*, and the o-series reasoning
+# models. The open-weights gpt-oss family shares the prefix but is always
+# hosted by someone else, so it is excluded before this pattern applies.
+_OPENAI_MODEL_ID_RE = re.compile(r"^(?:gpt-|codex-|o\d)")
 
 #: Models the gateway serves that codex's bundled catalog does not carry, so
 #: omnigent adds them to the session's own catalog (``model_catalog_json``)
@@ -131,6 +135,32 @@ def codex_spawn_model(model: str) -> str | None:
     family, major, minor, tier = match.groups()
     slug = f"{family}-{major}.{minor}" if minor else f"{family}-{major}"
     return f"{slug}-{tier}" if tier else slug
+
+
+def is_openai_codex_model(model: str | None) -> bool:
+    """Report whether *model* is served by OpenAI's own Responses API.
+
+    Some request features codex emits only exist there — gateway-hosted
+    vendors reject them (``web_search``, ``parallel_tool_calls``), so callers
+    gate those features on this answer. Matches by id prefix (``gpt-``,
+    ``codex-``, ``o<digit>``) rather than :data:`_GPT_ID_RE`, so
+    multi-segment tiers such as ``gpt-5.6-codex-max`` still count. The
+    open-weights ``gpt-oss`` family keeps the ``gpt-`` spelling but is always
+    hosted off OpenAI (Databricks serves it as ``system.ai.gpt-oss-20b``), so
+    it answers ``False``.
+
+    :param model: Any model id, catalog or codex spelling, e.g.
+        ``"databricks-gpt-5-6-luna"`` or ``"system.ai.qwen35-122b-a10b"``;
+        ``None`` or empty when the launch model is not known.
+    :returns: ``True`` only for a recognized OpenAI-served id; ``False`` for
+        every other vendor, including ``None`` and empty strings.
+    """
+    if not model:
+        return False
+    bare = comparable_model_id(model)
+    if bare.startswith("gpt-oss"):
+        return False
+    return _OPENAI_MODEL_ID_RE.match(bare) is not None
 
 
 def clamp_spawn_effort(effort: str | None, model: str | None) -> str | None:
