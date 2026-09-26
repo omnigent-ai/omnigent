@@ -422,6 +422,10 @@ def write_policy_hook_config(
                 "--bridge-dir",
                 str(bridge_dir),
             ],
+            # Hermes points TMPDIR at its own scratch dir for everything it launches;
+            # serve-mcp derives its trusted bridge roots from the temp dir, so it must
+            # see the runner's (where the bridge dir lives) or it refuses to start.
+            "env": {name: tempfile.gettempdir() for name in ("TMPDIR", "TMP", "TEMP")},
         },
     }
 

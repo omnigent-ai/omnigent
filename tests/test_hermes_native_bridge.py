@@ -586,3 +586,12 @@ def test_user_hermes_root_of_a_profile_home_is_its_root(tmp_path, monkeypatch) -
 def test_session_home_is_a_profile_of_the_user_root(tmp_path, _hermes_root) -> None:
     home = b.hermes_home_for_bridge_dir(tmp_path / "abc123")
     assert home == _hermes_root / "profiles" / "omnigent-abc123"
+
+
+def test_mcp_server_keeps_the_runner_temp_dir(tmp_path) -> None:
+    """Hermes redirects TMPDIR for its children; serve-mcp needs the runner's to trust its bridge dir."""
+    import tempfile
+
+    home = b.write_policy_hook_config(tmp_path / "bridge", "http://localhost:6767", "s-tmp")
+    env = json.loads((home / "config.yaml").read_text())["mcp_servers"]["omnigent"]["env"]
+    assert env == {name: tempfile.gettempdir() for name in ("TMPDIR", "TMP", "TEMP")}
