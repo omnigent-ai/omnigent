@@ -824,11 +824,14 @@ async def test_bound_opencode_switch_qualifies_the_literal_gateway_id(
 @pytest.mark.asyncio
 async def test_opencode_model_switch_sets_model_on_live_session(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
     from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
     from omnigent.runner.app import _AUTO_OPENCODE_SERVERS
 
     conv_id = "c6d1e2f3a4b54c6d8e9f0a1b2c3d4e5f"
+    monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", tmp_path)
     update = Mock(return_value=True)
     monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge.update_model_override", update)
     monkeypatch.setattr(

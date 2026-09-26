@@ -6971,7 +6971,9 @@ def create_runner_app(
         updated = await asyncio.to_thread(update_model_override, bridge_dir, model)
         model_ref = _opencode_model_ref(model)
         server = _AUTO_OPENCODE_SERVERS.get(conv_id)
-        state = read_bridge_state(bridge_dir) if server is not None else None
+        state = (
+            await asyncio.to_thread(read_bridge_state, bridge_dir) if server is not None else None
+        )
         if model_ref is not None and server is not None and state is not None:
             # The TUI and the next turn pick the model up from the session.
             client = server.client()
