@@ -241,6 +241,192 @@ def _user_file_block(file: Mapping[str, Any]) -> _JsonObject:
     return {"type": "input_text", "text": f"[attachment: {label}]"}
 
 
+@dataclass(frozen=True)
+class FormQuestion:
+    """
+    One v2 form field rendered as a web ``ask_user_question`` entry.
+
+    :param key: Form field key; also the web question id.
+    :param kind: v2 field type, e.g. ``"string"`` or ``"multiselect"``.
+    :param question: The web question payload.
+    :param values_by_label: Option label -> option value.
+    """
+
+    key: str
+    kind: str
+    question: _JsonObject
+    values_by_label: dict[str, str]
+
+
+def form_questions(fields: object) -> list[FormQuestion] | None:
+    """
+    Map v2 ``Form.Field`` entries onto web ``ask_user_question`` questions.
+
+    ``string`` with options -> single select; ``multiselect`` -> multi select;
+    ``boolean`` -> Yes/No; ``number``/``integer`` and option-less ``string`` ->
+    free text (the web form always offers a custom text row); ``external`` ->
+    a Done acknowledgement naming the URL. Hidden fields keep their default.
+
+    :param fields: ``form.fields`` from ``form.created``.
+    :returns: The questions, or ``None`` when a visible field cannot be rendered.
+    """
+    if not isinstance(fields, list) or not fields:
+        return None
+    questions: list[FormQuestion] = []
+    for raw_field in fields:
+        if not isinstance(raw_field, Mapping):
+            return None
+        key = _str_field(raw_field, "key")
+        kind = _str_field(raw_field, "type")
+        if key is None or kind is None:
+            return None
+        if raw_field.get("hidden") is True:
+            continue
+        title = _str_field(raw_field, "title")
+        prompt = _str_field(raw_field, "description") or title or key
+        options: list[_JsonObject] = []
+        values: dict[str, str] = {}
+        multi = False
+        if kind in ("string", "multiselect"):
+            raw_options = raw_field.get("options")
+            if raw_options is not None and not isinstance(raw_options, list):
+                return None
+            for option in raw_options or []:
+                if not isinstance(option, Mapping):
+                    return None
+                label = _str_field(option, "label")
+                value = option.get("value")
+                if label is None or not isinstance(value, str):
+                    return None
+                entry: _JsonObject = {"label": label}
+                description = _str_field(option, "description")
+                if description is not None:
+                    entry["description"] = description
+                options.append(entry)
+                values[label] = value
+            if kind == "multiselect":
+                if not options:
+                    return None
+                multi = True
+        elif kind == "boolean":
+            options = [{"label": "Yes"}, {"label": "No"}]
+        elif kind == "external":
+            url = _str_field(raw_field, "url")
+            if url is None:
+                return None
+            prompt = f"{prompt}\n\nOpen {url} and choose Done when finished."
+            options = [{"label": "Done"}]
+        elif kind not in ("number", "integer"):
+            return None
+        question: _JsonObject = {
+            "question": prompt,
+            "options": options,
+            "multiSelect": multi,
+            "id": key,
+        }
+        if title is not None:
+            question["header"] = title
+        questions.append(
+            FormQuestion(key=key, kind=kind, question=question, values_by_label=values)
+        )
+    return questions
+
+
+def _parse_boolean(raw: str) -> bool | None:
+    """Parse a Yes/No answer (or typed true/false) into a bool."""
+    token = raw.strip().lower()
+    if token in ("yes", "y", "true"):
+        return True
+    if token in ("no", "n", "false"):
+        return False
+    return None
+
+
+def _parse_number(raw: str, *, integer: bool) -> int | float | None:
+    """Parse a typed number; ``None`` when it is not a valid number."""
+    try:
+        number = float(raw.strip())
+    except ValueError:
+        return None
+    if integer:
+        return int(number) if number.is_integer() else None
+    return number
+
+
+def _field_active(field: Mapping[str, Any], answer: Mapping[str, Any]) -> bool:
+    """Evaluate a field's ``when`` conditions (all must hold) against *answer*."""
+    conditions = field.get("when")
+    if not isinstance(conditions, list):
+        return True
+    for condition in conditions:
+        if not isinstance(condition, Mapping):
+            return False
+        key = condition.get("key")
+        if not isinstance(key, str) or key not in answer:
+            return False
+        value = answer[key]
+        target = condition.get("value")
+        hit = target in value if isinstance(value, list) else value == target
+        if (condition.get("op") == "eq") != hit:
+            return False
+    return True
+
+
+def form_answer(
+    questions: list[FormQuestion],
+    fields: list[Any],
+    content: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """
+    Convert the web form result into a v2 ``Form.Answer``.
+
+    :param questions: The questions built by :func:`form_questions`.
+    :param fields: The original ``form.fields`` (for ``when`` conditions).
+    :param content: ``ElicitationResult.content`` keyed by question id.
+    :returns: ``{field key: value}``, or ``None`` when an answer is invalid
+        (the caller cancels the form).
+    """
+    answer: dict[str, Any] = {}
+    for question in questions:
+        raw = content.get(question.key)
+        if question.kind == "external":
+            answer[question.key] = True
+            continue
+        if raw is None:
+            continue
+        if question.kind == "multiselect":
+            items = [raw] if isinstance(raw, str) else raw
+            if not isinstance(items, list):
+                return None
+            answer[question.key] = [
+                question.values_by_label.get(item, item) for item in items if isinstance(item, str)
+            ]
+            continue
+        if not isinstance(raw, str):
+            return None
+        if question.kind == "string":
+            answer[question.key] = question.values_by_label.get(raw, raw)
+        elif question.kind == "boolean":
+            parsed_bool = _parse_boolean(raw)
+            if parsed_bool is None:
+                return None
+            answer[question.key] = parsed_bool
+        else:
+            parsed_number = _parse_number(raw, integer=question.kind == "integer")
+            if parsed_number is None:
+                return None
+            answer[question.key] = parsed_number
+    by_key = {
+        f["key"]: f for f in fields if isinstance(f, Mapping) and isinstance(f.get("key"), str)
+    }
+    return {
+        key: value
+        for key, value in answer.items()
+        if by_key.get(key, {}).get("type") == "external"
+        or _field_active(by_key.get(key, {}), answer)
+    }
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's v2 event stream into Omnigent events.

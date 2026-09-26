@@ -1299,3 +1299,109 @@ async def test_fixture_permission_replied_without_pending_task_clears_card() -> 
     assert _datas(server.posts, "external_elicitation_resolved") == [
         {"elicitation_id": replied.data["requestID"]}
     ]
+
+
+# --- form field mapping -----------------------------------------------------
+
+
+def test_form_string_with_options_is_single_select() -> None:
+    fields = [
+        {
+            "key": "q0",
+            "type": "string",
+            "title": "Formatting",
+            "description": "Indent style?",
+            "options": [
+                {"value": "tab", "label": "Tabs", "description": "hard tabs"},
+                {"value": "space", "label": "Spaces"},
+            ],
+        }
+    ]
+    questions = fwd_mod.form_questions(fields)
+    assert questions is not None
+    assert questions[0].question == {
+        "question": "Indent style?",
+        "options": [{"label": "Tabs", "description": "hard tabs"}, {"label": "Spaces"}],
+        "multiSelect": False,
+        "id": "q0",
+        "header": "Formatting",
+    }
+    assert fwd_mod.form_answer(questions, fields, {"q0": "Tabs"}) == {"q0": "tab"}
+    # A custom typed answer passes through unchanged.
+    assert fwd_mod.form_answer(questions, fields, {"q0": "two spaces"}) == {"q0": "two spaces"}
+
+
+def test_form_multiselect_maps_labels_to_values() -> None:
+    fields = [
+        {
+            "key": "tools",
+            "type": "multiselect",
+            "options": [{"value": "t", "label": "Tests"}, {"value": "l", "label": "Lint"}],
+        }
+    ]
+    questions = fwd_mod.form_questions(fields)
+    assert questions is not None and questions[0].question["multiSelect"] is True
+    assert fwd_mod.form_answer(questions, fields, {"tools": ["Tests", "Lint"]}) == {
+        "tools": ["t", "l"]
+    }
+
+
+def test_form_boolean_number_and_integer_fields() -> None:
+    fields = [
+        {"key": "ok", "type": "boolean", "title": "Proceed?"},
+        {"key": "ratio", "type": "number"},
+        {"key": "count", "type": "integer"},
+    ]
+    questions = fwd_mod.form_questions(fields)
+    assert questions is not None
+    assert questions[0].question["options"] == [{"label": "Yes"}, {"label": "No"}]
+    assert questions[1].question["options"] == []
+    content = {"ok": "No", "ratio": "0.5", "count": "3"}
+    assert fwd_mod.form_answer(questions, fields, content) == {
+        "ok": False,
+        "ratio": 0.5,
+        "count": 3,
+    }
+    assert fwd_mod.form_answer(questions, fields, {"count": "3.5"}) is None
+    assert fwd_mod.form_answer(questions, fields, {"ratio": "abc"}) is None
+
+
+def test_form_external_field_is_acknowledged() -> None:
+    fields = [
+        {
+            "key": "login",
+            "type": "external",
+            "url": "https://example.test/auth",
+            "title": "Sign in",
+        }
+    ]
+    questions = fwd_mod.form_questions(fields)
+    assert questions is not None
+    assert "https://example.test/auth" in questions[0].question["question"]
+    assert questions[0].question["options"] == [{"label": "Done"}]
+    assert fwd_mod.form_answer(questions, fields, {"login": "Done"}) == {"login": True}
+
+
+def test_form_hidden_fields_are_skipped_and_unknown_types_reject() -> None:
+    hidden = [{"key": "token", "type": "string", "hidden": True}]
+    assert fwd_mod.form_questions(hidden) == []
+    assert fwd_mod.form_questions([{"key": "x", "type": "date"}]) is None
+    assert fwd_mod.form_questions([{"key": "m", "type": "multiselect", "options": []}]) is None
+
+
+def test_form_answer_drops_inactive_conditional_fields() -> None:
+    fields = [
+        {
+            "key": "mode",
+            "type": "string",
+            "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}],
+        },
+        {"key": "detail", "type": "string", "when": [{"key": "mode", "op": "eq", "value": "b"}]},
+    ]
+    questions = fwd_mod.form_questions(fields)
+    assert questions is not None
+    assert fwd_mod.form_answer(questions, fields, {"mode": "A", "detail": "x"}) == {"mode": "a"}
+    assert fwd_mod.form_answer(questions, fields, {"mode": "B", "detail": "x"}) == {
+        "mode": "b",
+        "detail": "x",
+    }
