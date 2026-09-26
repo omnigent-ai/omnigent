@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
-from omnigent.harnesses.opencode_native.client import OpenCodeEvent
+from omnigent.harnesses.opencode_native.client import OpenCodeClientError, OpenCodeEvent
 from tests.opencode_v2_fixtures import events_of_type
 
 _SESSION = "ses_1"
@@ -1130,3 +1130,133 @@ async def test_cancelled_inbox_prompt_is_never_posted() -> None:
     await fwd.handle_event(_event("session.inbox.cancelled", inboxID="msg_u"))
     await fwd.handle_event(_event("session.inbox.delivered", inboxID="msg_u"))
     assert _items(server.posts) == []
+
+
+# --- permissions ------------------------------------------------------------
+
+
+def _asked(request_id: str, action: str = "shell", **data: Any) -> OpenCodeEvent:
+    data.setdefault("resources", ["ls"])
+    data.setdefault("metadata", {"command": "ls"})
+    return _event("permission.asked", id=request_id, action=action, **data)
+
+
+async def test_fixture_permission_rejects_when_no_policy_wired() -> None:
+    """No evaluator fails closed: the captured request is rejected."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    asked = _fixture("permission.asked")
+    await fwd.handle_event(asked)
+    await _drain(fwd)
+    assert opencode.permission_replies == [(_FIX_SESSION, asked.data["id"], "reject")]
+
+
+async def test_permission_asked_rejects_when_policy_denies() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+
+    async def deny(_normalized: Any) -> dict[str, Any]:
+        return {"decision": "deny"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=deny)
+    await fwd.handle_event(_asked("per_2"))
+    await _drain(fwd)
+    assert opencode.permission_replies == [(_SESSION, "per_2", "reject")]
+
+
+async def test_permission_asked_allows_only_on_explicit_policy_allow() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+
+    async def allow(_normalized: Any) -> dict[str, Any]:
+        return {"decision": "allow"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=allow)
+    await fwd.handle_event(_asked("per_a"))
+    await _drain(fwd)
+    assert opencode.permission_replies == [(_SESSION, "per_a", "once")]
+
+
+async def test_permission_asked_allow_always_still_replies_once() -> None:
+    """Replying ``always`` would make OpenCode stop asking and bypass live policy."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+
+    async def allow_always(_normalized: Any) -> dict[str, Any]:
+        return {"decision": "allow_always"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=allow_always)
+    await fwd.handle_event(_asked("per_aa"))
+    await _drain(fwd)
+    assert opencode.permission_replies == [(_SESSION, "per_aa", "once")]
+
+
+async def test_permission_asked_rejects_when_policy_returns_ask() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+
+    async def ask(_normalized: Any) -> dict[str, Any]:
+        return {"decision": "ask"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=ask)
+    await fwd.handle_event(_asked("per_ask"))
+    await _drain(fwd)
+    assert opencode.permission_replies == [(_SESSION, "per_ask", "reject")]
+
+
+async def test_permission_asked_passes_normalized_input_to_evaluator() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    seen: list[Any] = []
+
+    async def capture(normalized: Any) -> dict[str, Any]:
+        seen.append(normalized)
+        return {"decision": "deny"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=capture, workspace="/work/repo")
+    await fwd.handle_event(_asked("per_n"))
+    await _drain(fwd)
+    assert len(seen) == 1
+    assert seen[0]["harness"] == "opencode-native"
+    assert seen[0]["action"] == "shell"
+    assert seen[0]["omnigent_session_id"] == "conv_1"
+
+
+async def test_permission_asked_dedupes() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    event = _asked("per_3")
+    await fwd.handle_event(event)
+    await fwd.handle_event(event)
+    await _drain(fwd)
+    assert len(opencode.permission_replies) == 1
+
+
+async def test_permission_reply_failure_is_surfaced() -> None:
+    """OpenCode blocks the turn until answered, so a failed reply must be visible."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+
+    async def failing_reply(*_args: Any, **_kwargs: Any) -> bool:
+        raise OpenCodeClientError("reply failed: 500")
+
+    opencode.reply_permission = failing_reply  # type: ignore[method-assign]
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_asked("per_err"))
+    await _drain(fwd)
+    statuses = _datas(server.posts, "external_session_status")
+    assert statuses[-1]["status"] == "running"
+    assert statuses[-1]["blocked_on"] == "permission reply failed for per_err"
+
+
+async def test_permission_evaluation_does_not_block_the_event_loop() -> None:
+    """A parked approval must not stall later events for the session."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    release = asyncio.Event()
+
+    async def parked(_normalized: Any) -> dict[str, Any]:
+        await release.wait()
+        return {"decision": "allow"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=parked)
+    await fwd.handle_event(_asked("per_p"))
+    await fwd.handle_event(_event("session.compaction.started", reason="auto", recent=""))
+    assert _datas(server.posts, "external_compaction_status") == [{"status": "in_progress"}]
+    release.set()
+    await _drain(fwd)
+    assert opencode.permission_replies == [(_SESSION, "per_p", "once")]

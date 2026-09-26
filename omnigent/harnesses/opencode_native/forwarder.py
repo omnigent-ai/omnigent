@@ -31,7 +31,14 @@ from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeEvent,
 )
-from omnigent.harnesses.opencode_native.permissions import PolicyDecision
+from omnigent.harnesses.opencode_native.permissions import (
+    OpenCodePermissionRequest,
+    PolicyDecision,
+    decision_to_reply,
+    map_verdict_to_decision,
+    normalize_for_policy,
+    parse_permission_request,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -1107,6 +1114,79 @@ class OpenCodeNativeForwarder:
         if inbox_id is not None:
             self._inbox_items.pop(inbox_id, None)
 
+    async def _on_permission_asked(self, event: OpenCodeEvent) -> None:
+        """Handle ``permission.asked`` — evaluate policy in a background task.
+
+        The evaluator can park on a human approval card, so it never runs
+        inline: that would stall this session's event loop, including the
+        ``permission.replied`` that withdraws the card when the TUI answers.
+        """
+        request = parse_permission_request(event.data)
+        if request is None:
+            return
+        if not self.state.mark(self._key("perm", request.request_id)):
+            return
+        task = asyncio.create_task(self._handle_permission(request))
+        self._permission_tasks[request.request_id] = task
+        task.add_done_callback(
+            lambda _t, rid=request.request_id: self._permission_tasks.pop(rid, None)
+        )
+
+    async def _handle_permission(self, request: OpenCodePermissionRequest) -> None:
+        """Resolve one permission and reply ``once`` or ``reject`` (never ``always``)."""
+        decision = await self._resolve_permission(request_dict=request)
+        # ``ask`` means no human resolution was obtained upstream: fail closed.
+        reply = decision_to_reply(decision) or "reject"
+        # Marked before replying so our own ``permission.replied`` echo is ignored.
+        self.state.mark(self._key("perm-replied", request.request_id))
+        try:
+            # No reply message: in v2 a reject message tells the model to continue.
+            await self._opencode.reply_permission(
+                request.session_id or self._opencode_session_id, request.request_id, reply
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - surface it: OpenCode stays blocked on the request.
+            _logger.warning(
+                "OpenCode permission reply failed for request=%s",
+                request.request_id,
+                exc_info=True,
+            )
+            turn = self._turns.get(request.session_id or self._opencode_session_id)
+            if turn is not None:
+                await self._post_status(
+                    turn,
+                    _STATUS_RUNNING,
+                    extra={"blocked_on": f"permission reply failed for {request.request_id}"},
+                )
+
+    async def _resolve_permission(
+        self, *, request_dict: OpenCodePermissionRequest
+    ) -> PolicyDecision:
+        """
+        Resolve a permission request to a normalized decision.
+
+        :param request_dict: The parsed permission request.
+        :returns: The normalized policy decision.
+        """
+        if self._policy_evaluator is None:
+            return self._default_decision
+        normalized = normalize_for_policy(
+            request_dict,
+            omnigent_session_id=self._session_id,
+            workspace=self._workspace,
+        )
+        try:
+            verdict = await self._policy_evaluator(normalized)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - policy errors fail closed.
+            _logger.warning("OpenCode policy evaluation failed", exc_info=True)
+            return "ask"
+        if verdict is None:
+            return self._default_decision
+        return map_verdict_to_decision(verdict)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -1159,4 +1239,5 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.inbox.enqueued": OpenCodeNativeForwarder._on_inbox_enqueued,
     "session.inbox.delivered": OpenCodeNativeForwarder._on_inbox_delivered,
     "session.inbox.cancelled": OpenCodeNativeForwarder._on_inbox_cancelled,
+    "permission.asked": OpenCodeNativeForwarder._on_permission_asked,
 }
