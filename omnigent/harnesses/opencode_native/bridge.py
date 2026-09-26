@@ -32,6 +32,7 @@ import os
 import secrets
 import sqlite3
 import tempfile
+import urllib.parse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -512,7 +513,9 @@ def snapshot_opencode_database(source: Path, dest_bridge_dir: Path) -> bool:
             # Read-only: a sole read-write connection would checkpoint and delete
             # the source's WAL on close.
             contextlib.closing(
-                sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10.0)
+                sqlite3.connect(
+                    f"file:{urllib.parse.quote(str(source))}?mode=ro", uri=True, timeout=10.0
+                )
             ) as src,
             contextlib.closing(sqlite3.connect(dest)) as dst,
         ):

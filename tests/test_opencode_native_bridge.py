@@ -786,3 +786,17 @@ def test_snapshot_opencode_database_copies_any_source_path(tmp_path: Path) -> No
         claim = conn.execute("SELECT time_suspended FROM session_v2").fetchone()[0]
     conn.close()
     assert claim is not None, "the user's live store must never be modified"
+
+
+def test_snapshot_opencode_database_source_path_with_uri_special_chars(tmp_path: Path) -> None:
+    """A source path containing '#', '%' must not break the sqlite URI."""
+    user_db = tmp_path / "weird #dir% here" / "custom.db"
+    _make_opencode_db(user_db, claimed=True)
+    dest_dir = tmp_path / "import-bridge"
+
+    assert snapshot_opencode_database(user_db, dest_dir) is True
+
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(dest_dir)) as conn:
+        rows = conn.execute("SELECT id, time_suspended FROM session_v2").fetchall()
+    conn.close()
+    assert rows == [("ses_src", None)]
