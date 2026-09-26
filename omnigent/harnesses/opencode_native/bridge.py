@@ -26,13 +26,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import tempfile
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from omnigent.native import native_bridge_common
+
+_logger = logging.getLogger(__name__)
 
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
@@ -550,6 +555,49 @@ def seeded_provider_ids(bridge_dir: Path) -> frozenset[str]:
     except (OSError, ValueError):
         return frozenset()
     return frozenset(str(k) for k in data) if isinstance(data, dict) else frozenset()
+
+
+class _ProviderKeyClient(Protocol):
+    async def connect_provider_key(self, provider_id: str, api_key: str) -> bool: ...
+
+
+async def connect_env_provider_keys(
+    client: _ProviderKeyClient,
+    *,
+    stored: Iterable[str] = (),
+    environ: Mapping[str, str] | None = None,
+) -> list[str]:
+    """
+    Store provider API keys from the environment in the per-session credential DB.
+
+    Fallback for providers with no seeded credential: each provider whose API-key
+    env var is set is connected with ``POST /api/integration/{id}/connect/key``.
+
+    :param client: The per-session OpenCode client.
+    :param stored: Provider ids that already have a credential.
+    :param environ: Environment to read; ``None`` uses ``os.environ``.
+    :returns: Provider ids connected.
+    """
+    from omnigent.onboarding.opencode_auth import _ENV_PROVIDER_VARS
+
+    env = os.environ if environ is None else environ
+    skip = set(stored)
+    connected: list[str] = []
+    for provider_id, _label, var in _ENV_PROVIDER_VARS:
+        if provider_id in skip:
+            continue
+        key = env.get(var, "").strip()
+        if not key:
+            continue
+        skip.add(provider_id)
+        try:
+            ok = await client.connect_provider_key(provider_id, key)
+        except Exception:  # noqa: BLE001 - best effort; opencode can still read the env itself.
+            _logger.info("opencode env key connect failed for %s", provider_id, exc_info=True)
+            continue
+        if ok:
+            connected.append(provider_id)
+    return connected
 
 
 def auth_secret_path(bridge_dir: Path) -> Path:

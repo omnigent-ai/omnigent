@@ -605,3 +605,39 @@ def test_update_last_applied_model(bridge_dir: Path) -> None:
     assert loaded is not None
     assert loaded.last_applied_model == "acme/model-a"
     assert loaded.model_override == "acme/model-a"
+
+
+class _KeyClient:
+    def __init__(self, *, fail: str | None = None) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._fail = fail
+
+    async def connect_provider_key(self, provider_id: str, api_key: str) -> bool:
+        self.calls.append((provider_id, api_key))
+        if provider_id == self._fail:
+            raise RuntimeError("boom")
+        return True
+
+
+async def test_connect_env_provider_keys_skips_stored_and_failures() -> None:
+    client = _KeyClient(fail="groq")
+    connected = await bridge.connect_env_provider_keys(
+        client,
+        stored={"anthropic"},
+        environ={
+            "ANTHROPIC_API_KEY": "a",
+            "OPENAI_API_KEY": " o ",
+            "GEMINI_API_KEY": "g1",
+            "GOOGLE_GENERATIVE_AI_API_KEY": "g2",
+            "GROQ_API_KEY": "q",
+        },
+    )
+    assert connected == ["openai", "google"]
+    # google connects once (first matching var); groq failed and is skipped.
+    assert client.calls == [("openai", "o"), ("google", "g1"), ("groq", "q")]
+
+
+async def test_connect_env_provider_keys_noop_without_env() -> None:
+    client = _KeyClient()
+    assert await bridge.connect_env_provider_keys(client, environ={}) == []
+    assert client.calls == []
