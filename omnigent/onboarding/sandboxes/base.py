@@ -58,14 +58,16 @@ _logger = logging.getLogger(__name__)
 MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
 """Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
 
-# Global default keepalive cadence, used by every managed provider except
-# agent_sandbox. Providers whose keep_alive is idempotent ("configure once")
-# don't need a fast cadence, so the default stays cheap.
+# Global default keepalive cadence, used by every managed provider except the
+# short-window ones below. Providers whose keep_alive is idempotent ("configure
+# once") don't need a fast cadence, so the default stays cheap.
 _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
-# agent_sandbox pushes an absolute shutdownTime forward and runs a SHORT window,
-# so it must refresh fast (its window floor is twice this). Scoped to the
-# provider so lowering it does not multiply every other provider's write load.
-_AGENT_SANDBOX_KEEPALIVE_INTERVAL_S: float = 60.0
+# agent_sandbox and e2b push an absolute deadline forward under a SHORT window,
+# so they must refresh fast (agent_sandbox's window floor is twice this, e2b's
+# pause window five times). Scoped to those providers so lowering it does not
+# multiply every other provider's write load.
+_SHORT_WINDOW_KEEPALIVE_INTERVAL_S: float = 60.0
+_SHORT_WINDOW_PROVIDERS: frozenset[str] = frozenset({"agent_sandbox", "e2b"})
 _MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
 # Ceiling so a finite-but-huge override (e.g. 1e308) cannot overflow the
 # window-floor math (ceil(2 * interval)); an hour is already far past useful.
@@ -76,17 +78,17 @@ def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
     """
     How often the server refreshes a live managed sandbox's liveness, in seconds.
 
-    Provider-scoped default: ``agent_sandbox`` refreshes fast (60s) because it
-    pushes an absolute deadline forward under a short window; every other
-    provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
+    Provider-scoped default: ``agent_sandbox`` and ``e2b`` refresh fast (60s)
+    because they push an absolute deadline forward under a short window; every
+    other provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
     overrides both when set (advanced/experimental — the operator-facing knob is
     ``keep_warm_s``), floored at a small minimum so a typo cannot spin the loop.
     Resolved live from the env on each call (no snapshot), so the server loop
     cadence and the ``agent_sandbox`` window floor cannot disagree.
     """
     default = (
-        _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S
-        if provider == "agent_sandbox"
+        _SHORT_WINDOW_KEEPALIVE_INTERVAL_S
+        if provider in _SHORT_WINDOW_PROVIDERS
         else _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
     )
     raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()
@@ -740,7 +742,7 @@ def supervise_host_command(command: str) -> str:
     not just the host — otherwise the loop faithfully restarts it. Both in-sandbox
     stop paths already do: ``foreground_kill_command`` signals the process the
     pidfile recorded (the supervisor, which is what ``exec``s under it), and
-    islo's preserved-daemon stop matches ``"omnigent host"`` against full argv,
+    the preserved-daemon stop matches ``"omnigent host"`` against full argv,
     which the supervisor's own ``sh -c <script>`` argv contains.
 
     The attempt counter in the restart log makes a persistently-crashing host
@@ -962,6 +964,57 @@ class SandboxHostLauncher(SandboxLifecycle):
         """
 
 
+_STOP_PRESERVED_HOST_DAEMON_SCRIPT = """\
+import os, signal, subprocess, time
+
+self_pids = {os.getpid(), os.getppid()}
+try:
+    output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
+except Exception as exc:
+    print(f"could not inspect process table: {exc}")
+    raise SystemExit(0)
+
+targets = []
+for line in output.splitlines():
+    parts = line.strip().split(None, 1)
+    if len(parts) != 2:
+        continue
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        continue
+    args = parts[1]
+    if pid in self_pids:
+        continue
+    if "omnigent host" in args:
+        targets.append(pid)
+
+for pid in targets:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        print(f"could not terminate preserved omnigent host pid {pid}: {exc}")
+
+time.sleep(0.5)
+for pid in targets:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        continue
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+if targets:
+    print(f"stopped preserved omnigent host daemon(s): {', '.join(map(str, targets))}")
+"""
+
+
 class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
     """
     Default exec-model host launcher for providers that exec into a running
@@ -1060,6 +1113,23 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
         )
         return workspace
+
+    def _stop_preserved_host_daemon(self, sandbox_id: str) -> None:
+        """
+        Best-effort cleanup for providers whose pause/resume preserves memory.
+
+        A paused VM can resume with the old ``omnigent host`` process still
+        alive and carrying a stale launch token. Stop it before the shared
+        startup path launches a fresh daemon.
+        """
+        try:
+            self.run(
+                sandbox_id,
+                f"python3 -c {shlex.quote(_STOP_PRESERVED_HOST_DAEMON_SCRIPT)}",
+                check=False,
+            )
+        except click.ClickException as exc:
+            click.echo(f"  → warning: could not stop preserved omnigent host: {exc}", err=True)
 
     def materialize_workspace(
         self,

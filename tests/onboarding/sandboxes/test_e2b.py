@@ -5,12 +5,19 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import click
+import httpx
 import pytest
 
-from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
+from omnigent.onboarding.sandboxes.base import (
+    MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+    SandboxCapabilityError,
+    SandboxGoneError,
+    resolve_managed_keepalive_interval_s,
+)
 from omnigent.onboarding.sandboxes.e2b import (
     _HOBBY_FALLBACK_LIFETIME_S,
     DEFAULT_E2B_TEMPLATE,
@@ -19,8 +26,10 @@ from omnigent.onboarding.sandboxes.e2b import (
     E2BSandboxLauncher,
     _is_missing_template_error,
     _lifetime_cap_from_error,
+    pause_window_s,
     resolve_max_lifetime_s,
 )
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
 
 # ── Fake e2b SDK ────────────────────────────────────────────
 #
@@ -83,6 +92,14 @@ class _State:
     running: bool = True
     connect_missing: bool = False
     connect_calls: list[str] = field(default_factory=list)
+    connect_timeouts: list[int | None] = field(default_factory=list)
+    connect_raises: BaseException | None = None
+    # By-id calls (Sandbox.set_timeout(id, t)), distinct from handle calls.
+    set_timeouts_by_id: list[tuple[str, int]] = field(default_factory=list)
+    info_state: str = "running"
+    info_missing: bool = False
+    info_raises: BaseException | None = None
+    get_info_calls: list[str] = field(default_factory=list)
     kill_missing: bool = False
     kill_raises: bool = False
     set_timeout_raises: bool = False
@@ -146,6 +163,31 @@ class _FakeFiles:
         return object()  # WriteInfo stand-in
 
 
+class _ClassOrInstance:
+    """Dispatch like the SDK's ``class_method_variant``: by id on the class."""
+
+    def __init__(self, on_instance, on_class) -> None:
+        self._on_instance = on_instance
+        self._on_class = on_class
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return partial(self._on_class, objtype)
+        return partial(self._on_instance, obj)
+
+
+def _set_timeout_on_handle(self, timeout: int, **kwargs) -> None:
+    if self._state.set_timeout_raises:
+        raise _SandboxException("rejected")
+    self._state.set_timeouts.append(timeout)
+
+
+def _set_timeout_by_id(cls, sandbox_id: str, timeout: int, **kwargs) -> None:
+    if cls._state.set_timeout_raises:
+        raise _SandboxException("rejected")
+    cls._state.set_timeouts_by_id.append((sandbox_id, timeout))
+
+
 class _FakeSandbox:
     _state: _State
 
@@ -171,11 +213,23 @@ class _FakeSandbox:
         return cls()
 
     @classmethod
-    def connect(cls, sandbox_id: str, **kwargs) -> _FakeSandbox:
+    def connect(cls, sandbox_id: str, timeout: int | None = None, **kwargs) -> _FakeSandbox:
         cls._state.connect_calls.append(sandbox_id)
+        cls._state.connect_timeouts.append(timeout)
         if cls._state.connect_missing:
             raise _NotFoundException(sandbox_id)
+        if cls._state.connect_raises is not None:
+            raise cls._state.connect_raises
         return cls(sandbox_id)
+
+    @classmethod
+    def get_info(cls, sandbox_id: str, **kwargs) -> types.SimpleNamespace:
+        cls._state.get_info_calls.append(sandbox_id)
+        if cls._state.info_missing:
+            raise _NotFoundException(sandbox_id)
+        if cls._state.info_raises is not None:
+            raise cls._state.info_raises
+        return types.SimpleNamespace(sandbox_id=sandbox_id, state=cls._state.info_state)
 
     @staticmethod
     def kill(sandbox_id: str, **kwargs) -> bool:
@@ -187,10 +241,7 @@ class _FakeSandbox:
     def is_running(self, request_timeout=None) -> bool:
         return self._state.running
 
-    def set_timeout(self, timeout: int, **kwargs) -> None:
-        if self._state.set_timeout_raises:
-            raise _SandboxException("rejected")
-        self._state.set_timeouts.append(timeout)
+    set_timeout = _ClassOrInstance(_set_timeout_on_handle, _set_timeout_by_id)
 
 
 @pytest.fixture()
@@ -214,6 +265,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _State:
     monkeypatch.setenv("E2B_API_KEY", "e2b-test-key")
     monkeypatch.delenv(TEMPLATE_ENV_VAR, raising=False)
     monkeypatch.delenv(SANDBOX_ENV_PASSTHROUGH_ENV_VAR, raising=False)
+    monkeypatch.delenv(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, raising=False)
     return state
 
 
@@ -596,3 +648,190 @@ def test_capability_surface() -> None:
     assert launcher.supports_local_port_forward is False
     with pytest.raises(SandboxCapabilityError, match="cannot forward a local port"):
         launcher.forward_local_port("sb-e2b-1", 8022)
+
+
+# ── pause mode ──────────────────────────────────────────────
+
+
+def test_kill_mode_create_passes_no_lifecycle(sdk: _State) -> None:
+    E2BSandboxLauncher().provision("x")
+    assert sdk.create_kwargs["lifecycle"] is None  # the SDK default: kill on timeout
+
+
+@pytest.mark.parametrize(("interval", "initial_window"), [("60", 1200), ("300", 1500)])
+def test_pause_mode_creates_pause_lifecycle_with_boot_grace(
+    sdk: _State, monkeypatch: pytest.MonkeyPatch, interval: str, initial_window: int
+) -> None:
+    monkeypatch.setenv(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, interval)
+    E2BSandboxLauncher(on_timeout="pause").provision("x")
+    assert sdk.create_kwargs["lifecycle"] == {"on_timeout": "pause", "auto_resume": False}
+    assert sdk.create_kwargs["timeout"] == initial_window
+
+
+def test_e2b_uses_the_short_window_keepalive_cadence(sdk: _State) -> None:
+    assert resolve_managed_keepalive_interval_s("e2b") == 60.0
+
+
+@pytest.mark.parametrize(("interval", "window"), [("30", 300), ("60", 300), ("200", 1000)])
+def test_pause_window_is_five_keepalive_intervals_with_floor(
+    sdk: _State, monkeypatch: pytest.MonkeyPatch, interval: str, window: int
+) -> None:
+    monkeypatch.setenv(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, interval)
+    assert pause_window_s() == window
+
+
+def test_pause_keep_alive_extends_by_id_without_connecting(sdk: _State) -> None:
+    # Connecting would resume a sandbox that paused between refreshes.
+    assert E2BSandboxLauncher(on_timeout="pause").keep_alive("sb-e2b-1") is True
+    assert sdk.set_timeouts_by_id == [("sb-e2b-1", pause_window_s())]
+    assert sdk.connect_calls == []
+
+
+def test_pause_keep_alive_soft_fails(sdk: _State) -> None:
+    sdk.set_timeout_raises = True
+    assert E2BSandboxLauncher(on_timeout="pause").keep_alive("sb-e2b-1") is False
+
+
+def test_pause_keep_alive_soft_fails_on_network_error(
+    sdk: _State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _timeout(*args, **kwargs):
+        raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(_FakeSandbox, "set_timeout", _ClassOrInstance(_timeout, _timeout))
+    assert E2BSandboxLauncher(on_timeout="pause").keep_alive("sb-e2b-1") is False
+
+
+def test_kill_mode_is_running_is_unknown(sdk: _State) -> None:
+    assert E2BSandboxLauncher().is_running("sb-e2b-1") is None
+    assert sdk.get_info_calls == []
+
+
+@pytest.mark.parametrize(
+    ("state", "missing", "raises", "expected"),
+    [
+        ("running", False, None, True),
+        ("paused", False, None, False),
+        ("running", True, None, False),
+        ("running", False, _SandboxException("503"), None),
+        ("running", False, httpx.ReadTimeout("timed out"), None),
+        ("running", False, httpx.ConnectError("refused"), None),
+    ],
+)
+def test_pause_is_running_reads_state_without_waking(
+    sdk: _State,
+    state: str,
+    missing: bool,
+    raises: BaseException | None,
+    expected: bool | None,
+) -> None:
+    sdk.info_state = state
+    sdk.info_missing = missing
+    sdk.info_raises = raises
+    assert E2BSandboxLauncher(on_timeout="pause").is_running("sb-e2b-1") is expected
+    assert sdk.connect_calls == []
+
+
+@pytest.mark.parametrize(
+    ("interval", "initial_window", "steady_window"), [("60", 1200, 300), ("300", 1500, 1500)]
+)
+def test_pause_resume_grants_boot_grace_then_keepalive_uses_steady_window(
+    sdk: _State,
+    monkeypatch: pytest.MonkeyPatch,
+    interval: str,
+    initial_window: int,
+    steady_window: int,
+) -> None:
+    monkeypatch.setenv(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, interval)
+    launcher = E2BSandboxLauncher(on_timeout="pause")
+    launcher.resume("sb-e2b-1")
+    launcher.run("sb-e2b-1", "echo hi")
+    assert sdk.connect_calls == ["sb-e2b-1"]
+    assert sdk.connect_timeouts == [initial_window]
+    assert launcher.keep_alive("sb-e2b-1") is True
+    assert sdk.set_timeouts_by_id == [("sb-e2b-1", steady_window)]
+    assert sdk.connect_calls == ["sb-e2b-1"]
+
+
+def test_pause_resume_missing_sandbox_is_gone(sdk: _State) -> None:
+    sdk.connect_missing = True
+    with pytest.raises(SandboxGoneError):
+        E2BSandboxLauncher(on_timeout="pause").resume("sb-e2b-1")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_SandboxException("resume in progress"), httpx.ConnectError("resume in progress")],
+)
+def test_pause_resume_failure_keeps_the_sandbox(sdk: _State, error: BaseException) -> None:
+    # A refused resume must not read as "gone", which would provision a new sandbox.
+    sdk.connect_raises = error
+    with pytest.raises(click.ClickException, match="resume in progress") as caught:
+        E2BSandboxLauncher(on_timeout="pause").resume("sb-e2b-1")
+    assert not isinstance(caught.value, SandboxGoneError)
+
+
+def test_kill_mode_resume_is_unsupported(sdk: _State) -> None:
+    with pytest.raises(SandboxCapabilityError):
+        E2BSandboxLauncher().resume("sb-e2b-1")
+
+
+def _start_host(launcher: E2BSandboxLauncher) -> None:
+    launcher.start_host(
+        "sb-e2b-1",
+        token="tok-new",
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="https://omnigent.example.com",
+    )
+
+
+def test_pause_start_host_stops_restored_host_before_launch(sdk: _State) -> None:
+    sdk.exec_result = _FakeCommandResult(stdout="/home/user")
+    _start_host(E2BSandboxLauncher(on_timeout="pause"))
+    commands = [call["cmd"] for call in sdk.run_calls]
+    stop = next(i for i, cmd in enumerate(commands) if "preserved omnigent host" in cmd)
+    launch = next(i for i, cmd in enumerate(commands) if "OMNIGENT_HOST_TOKEN" in cmd)
+    assert stop < launch
+    assert "tok-new" in commands[launch]
+
+
+def test_pause_start_host_applies_git_clone_options(sdk: _State) -> None:
+    sdk.exec_result = _FakeCommandResult(stdout="/home/user")
+    E2BSandboxLauncher(on_timeout="pause").start_host(
+        "sb-e2b-1",
+        token="tok-new",
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="https://omnigent.example.com",
+        repos=[
+            RepoWorkspace(
+                url="https://github.com/org/repo.git",
+                branch=None,
+                repo_name="repo",
+                git_clone=GitCloneOptions(depth=1),
+            )
+        ],
+    )
+    clones = [call["cmd"] for call in sdk.run_calls if "git clone" in call["cmd"]]
+    assert len(clones) == 1
+    assert "--depth 1" in clones[0]
+
+
+def test_kill_mode_start_host_skips_restored_host_stop(sdk: _State) -> None:
+    sdk.exec_result = _FakeCommandResult(stdout="/home/user")
+    _start_host(E2BSandboxLauncher())
+    assert not any("preserved omnigent host" in call["cmd"] for call in sdk.run_calls)
+
+
+def test_capabilities_by_timeout_action() -> None:
+    kill = E2BSandboxLauncher().capabilities
+    pause = E2BSandboxLauncher(on_timeout="pause").capabilities
+    for caps in (kill, pause):
+        assert caps.managed_launch and caps.programmatic_terminate and caps.file_copy
+        assert caps.streaming_exec and caps.foreground_exec
+        # start_host is overridden but still defers to the shared clone path.
+        assert caps.git_clone_options
+        assert not caps.local_port_forward
+    assert (kill.resume_stopped, kill.snapshot_restore) == (False, False)
+    assert (pause.resume_stopped, pause.snapshot_restore) == (True, True)
