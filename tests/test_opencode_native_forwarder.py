@@ -1,17 +1,20 @@
-"""Tests for the OpenCode SSE -> Omnigent event forwarder translation."""
+"""Tests for the OpenCode v2 event -> Omnigent event forwarder translation."""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
 from omnigent.harnesses.opencode_native.client import OpenCodeEvent
+from tests.opencode_v2_fixtures import events_of_type
 
 _SESSION = "ses_1"
+# The captured turn's own OpenCode session id.
+_FIX_SESSION: str = events_of_type("session.execution.started")[0]["data"]["sessionID"]
 
 
 class _RecordingServerClient:
@@ -20,883 +23,106 @@ class _RecordingServerClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.hook_response: dict[str, Any] | None = None
+        self.child_conversation_id = "conv_child_1"
 
     async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
         self.posts.append((url, json))
         request = httpx.Request("POST", url)
         if url.endswith("/hooks/native-permission-request") and self.hook_response is not None:
             return httpx.Response(200, json=self.hook_response, request=request)
+        if json.get("type") == "external_subagent_start":
+            body = {"queued": False, "child_session_id": self.child_conversation_id}
+            return httpx.Response(200, json=body, request=request)
         return httpx.Response(200, request=request)
 
 
 class _FakeOpenCodeClient:
-    """Fake OpenCode client recording permission and question replies + history."""
+    """Fake v2 OpenCode client recording replies and serving history."""
 
     def __init__(self) -> None:
-        self.replies: list[tuple[str, dict[str, Any]]] = []
         self.messages: list[dict[str, Any]] = []
-        self.question_replies: list[tuple[str, list[Any]]] = []
-        self.question_rejects: list[str] = []
+        self.after_ids: list[str | None] = []
+        self.permission_replies: list[tuple[str, str, str]] = []
+        self.form_replies: list[tuple[str, str, dict[str, Any]]] = []
+        self.form_cancels: list[tuple[str, str]] = []
+        self.stream: list[OpenCodeEvent] = []
 
-    async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
+    async def list_messages(
+        self, session_id: str, *, after_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        self.after_ids.append(after_id)
         return self.messages
 
-    async def reply_permission(self, request_id: str, reply: dict[str, Any]) -> bool:
-        self.replies.append((request_id, reply))
+    async def reply_permission(
+        self, session_id: str, request_id: str, decision: str, message: str | None = None
+    ) -> bool:
+        self.permission_replies.append((session_id, request_id, decision))
         return True
 
-    async def reply_question(self, request_id: str, answers: list[Any]) -> bool:
-        self.question_replies.append((request_id, answers))
+    async def reply_form(self, session_id: str, form_id: str, answer: dict[str, Any]) -> bool:
+        self.form_replies.append((session_id, form_id, answer))
         return True
 
-    async def reject_question(self, request_id: str) -> bool:
-        self.question_rejects.append(request_id)
+    async def cancel_form(self, session_id: str, form_id: str) -> bool:
+        self.form_cancels.append((session_id, form_id))
         return True
+
+    async def stream_events(self) -> AsyncIterator[OpenCodeEvent]:
+        for event in self.stream:
+            yield event
 
 
 def _forwarder(
     server: _RecordingServerClient,
     opencode: _FakeOpenCodeClient,
+    *,
+    opencode_session_id: str = _SESSION,
     **kwargs: Any,
 ) -> fwd_mod.OpenCodeNativeForwarder:
     return fwd_mod.OpenCodeNativeForwarder(
         session_id="conv_1",
-        opencode_session_id=_SESSION,
+        opencode_session_id=opencode_session_id,
         opencode_client=opencode,  # type: ignore[arg-type]
         server_client=server,  # type: ignore[arg-type]
         **kwargs,
     )
 
 
-def _event(event_type: str, **props: Any) -> OpenCodeEvent:
-    props.setdefault("sessionID", _SESSION)
-    return OpenCodeEvent(id=None, type=event_type, properties=props, raw={})
+def _event(event_type: str, **data: Any) -> OpenCodeEvent:
+    """Hand-build a v2 ``/api/event`` frame for this test's session."""
+    data.setdefault("sessionID", _SESSION)
+    return OpenCodeEvent(id=None, type=event_type, data=data, location=None)
+
+
+def _to_event(raw: dict[str, Any]) -> OpenCodeEvent:
+    """Convert a captured ``/api/event`` frame into an ``OpenCodeEvent``."""
+    return OpenCodeEvent(
+        id=raw.get("id"),
+        type=raw["type"],
+        data=dict(raw.get("data") or {}),
+        location=raw.get("location"),
+    )
+
+
+def _fixture(event_type: str, index: int = 0) -> OpenCodeEvent:
+    """The *index*-th captured event of *event_type* (for ``_FIX_SESSION``)."""
+    return _to_event(events_of_type(event_type)[index])
 
 
 def _types(posts: list[tuple[str, dict[str, Any]]]) -> list[str]:
     return [body["type"] for _url, body in posts]
 
 
-async def test_part_delta_is_not_forwarded() -> None:
-    """Live token deltas are intentionally dropped (see the _HANDLERS note).
-
-    The web chat view reconciles live ``text_delta`` previews with the
-    committed item via a finalize/retire handshake; emitting deltas without it
-    duplicated/garbled the chat. The forwarder posts only the durable item.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "message.part.delta", field="text", partID="prt_1", messageID="msg_1", delta="hello"
-        )
-    )
-    assert "external_output_text_delta" not in _types(server.posts)
-
-
-async def test_assistant_text_part_finalized_on_idle_and_dedupes() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    # The role lives on the message; the text on a text part of that message.
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "full answer"},
-        )
-    )
-    await fwd.handle_event(_event("session.idle"))
-    await fwd.handle_event(_event("session.idle"))  # duplicate flush must not re-post
-    items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
-    assert len(items) == 1
-    assert items[0]["data"]["item_type"] == "message"
-    assert items[0]["data"]["item_data"]["role"] == "assistant"
-    assert items[0]["data"]["item_data"]["content"][0]["text"] == "full answer"
-    # The item groups under its assistant messageID (per-turn response), NOT a
-    # constant session id — that constant id was what clustered every turn's
-    # assistant items together and broke chat ordering.
-    assert items[0]["data"]["response_id"] == "msg_1"
-
-
-async def test_each_assistant_message_gets_its_own_response_id() -> None:
-    """Distinct assistant messages map to distinct per-turn response groups."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    for msg in ("msg_a", "msg_b"):
-        await fwd.handle_event(_event("message.updated", info={"id": msg, "role": "assistant"}))
-        await fwd.handle_event(
-            _event(
-                "message.part.updated",
-                part={"id": f"prt_{msg}", "messageID": msg, "type": "text", "text": f"t-{msg}"},
-            )
-        )
-        await fwd.handle_event(_event("session.idle"))
-    items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
-    response_ids = [it["data"]["response_id"] for it in items]
-    assert response_ids == ["msg_a", "msg_b"], "each turn must get its own response_id"
-
-
-async def test_user_text_part_is_mirrored_before_the_assistant() -> None:
-    """The forwarder is the transcript source: it posts the user message too.
-
-    For native-server harnesses omnigent persists no separate user item, so the
-    forwarder must mirror the user message (role=user) — posted eagerly so it
-    precedes its assistant reply (correct chat ordering). Deduped by part id.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_u", "role": "user"}))
-    user_part = _event(
-        "message.part.updated",
-        part={"id": "prt_u", "messageID": "msg_u", "type": "text", "text": "my prompt"},
-    )
-    await fwd.handle_event(user_part)
-    await fwd.handle_event(user_part)  # snapshot repeat must not double-post
-    # Then the assistant reply for the same turn.
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_a", "role": "assistant"}))
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={"id": "prt_a", "messageID": "msg_a", "type": "text", "text": "hello"},
-        )
-    )
-    await fwd.handle_event(_event("session.idle"))
-
-    items = [b["data"] for _u, b in server.posts if b["type"] == "external_conversation_item"]
-    roles = [it["item_data"]["role"] for it in items if it["item_type"] == "message"]
-    assert roles == ["user", "assistant"], f"expected user before assistant, got {roles}"
-    user_item = next(it for it in items if it["item_data"]["role"] == "user")
-    assert user_item["item_data"]["content"][0]["text"] == "my prompt"
-    assert user_item["response_id"] == "msg_u"
-
-
-async def test_tool_part_posts_function_call_and_output() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={
-                "id": "prt_t",
-                "messageID": "msg_1",
-                "type": "tool",
-                "callID": "call_1",
-                "tool": "bash",
-                "state": {
-                    "status": "completed",
-                    "input": {"command": "ls"},
-                    "output": "file1\nfile2",
-                },
-            },
-        )
-    )
-    call = next(b for _u, b in server.posts if b["data"].get("item_type") == "function_call")
-    assert call["data"]["item_data"]["name"] == "bash"
-    assert call["data"]["item_data"]["call_id"] == "call_1"
-    assert '"command": "ls"' in call["data"]["item_data"]["arguments"]
-    assert call["data"]["response_id"] == "msg_1"
-    out = next(b for _u, b in server.posts if b["data"].get("item_type") == "function_call_output")
-    assert out["data"]["item_data"]["call_id"] == "call_1"
-    assert out["data"]["item_data"]["output"] == "file1\nfile2"
-    assert out["data"]["response_id"] == "msg_1"
-
-
-async def test_tool_part_dedupes_call_and_output_across_snapshots() -> None:
-    """The same tool part as running then completed posts the call/output once each."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    base = {"id": "prt_t", "messageID": "msg_1", "type": "tool", "callID": "c1", "tool": "bash"}
-    running = {"status": "running", "input": {"command": "ls"}}
-    completed = {"status": "completed", "input": {"command": "ls"}, "output": "ok"}
-    await fwd.handle_event(_event("message.part.updated", part={**base, "state": running}))
-    await fwd.handle_event(_event("message.part.updated", part={**base, "state": completed}))
-    calls = [b for _u, b in server.posts if b["data"].get("item_type") == "function_call"]
-    outs = [b for _u, b in server.posts if b["data"].get("item_type") == "function_call_output"]
-    assert len(calls) == 1
-    assert len(outs) == 1
-
-
-async def test_tool_part_error_posts_error_output() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={
-                "id": "prt_e",
-                "messageID": "msg_1",
-                "type": "tool",
-                "callID": "call_2",
-                "tool": "bash",
-                "state": {"status": "error", "input": {"command": "x"}, "error": "boom"},
-            },
-        )
-    )
-    item = next(
-        b for _u, b in server.posts if b["data"].get("item_type") == "function_call_output"
-    )
-    assert "boom" in item["data"]["item_data"]["output"]
-
-
-async def test_lifecycle_emits_running_then_idle() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    await fwd.handle_event(_event("session.idle"))
-    statuses = [
-        b["data"]["status"] for _u, b in server.posts if b["type"] == "external_session_status"
-    ]
-    assert statuses == ["running", "idle"]
-
-
-async def test_session_error_auth_posts_failed_with_reauth() -> None:
-    """A ProviderAuthError surfaces a `failed` edge flagged for re-auth.
-
-    opencode reports an expired/invalid provider key as `session.error` with a
-    `ProviderAuthError`; the forwarder must post `external_session_status:
-    failed` carrying both the error message and the re-auth hint plus
-    `reauth_required` so the web UI prompts a re-login instead of rendering a
-    silent idle.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "session.error",
-            error={
-                "name": "ProviderAuthError",
-                "data": {"providerID": "anthropic", "message": "invalid api key"},
-            },
-        )
-    )
-    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
-    assert status["status"] == "failed"
-    assert status["reauth_required"] is True
-    assert "invalid api key" in status["output"]
-    assert fwd_mod._OPENCODE_REAUTH_HINT in status["output"]
-
-
-async def test_session_error_generic_posts_failed_without_reauth() -> None:
-    """A non-auth error surfaces a `failed` edge with the message, no re-auth."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "session.error",
-            error={"name": "APIError", "data": {"statusCode": 500, "message": "upstream boom"}},
-        )
-    )
-    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
-    assert status["status"] == "failed"
-    assert status["output"] == "upstream boom"
-    assert "reauth_required" not in status
-
-
-async def test_session_error_message_aborted_takes_idle_path() -> None:
-    """A MessageAbortedError is a user interrupt → the normal idle path."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event("session.error", error={"name": "MessageAbortedError", "data": {}})
-    )
-    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
-    assert status["status"] == "idle"
-    assert "reauth_required" not in status
-    assert "output" not in status
+def _datas(posts: list[tuple[str, dict[str, Any]]], event_type: str) -> list[dict[str, Any]]:
+    return [body["data"] for _url, body in posts if body["type"] == event_type]
 
 
 def _status_edges(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-    return [b["data"] for _u, b in posts if b["type"] == "external_session_status"]
+    return _datas(posts, "external_session_status")
 
 
-async def test_running_and_idle_carry_assistant_response_id() -> None:
-    """running/idle edges carry the turn's assistant messageID as ``response_id``.
-
-    The web chat renders in-flight tool calls live only when the ``running`` edge
-    and the mirrored ``function_call`` items share the SAME ``response_id``. Here
-    the tool call and both status edges must all group under ``msg_1``.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={
-                "id": "prt_t",
-                "messageID": "msg_1",
-                "type": "tool",
-                "callID": "call_1",
-                "tool": "bash",
-                "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
-            },
-        )
-    )
-    await fwd.handle_event(_event("session.idle"))
-
-    edges = _status_edges(server.posts)
-    assert [(e["status"], e["response_id"]) for e in edges] == [
-        ("running", "msg_1"),
-        ("idle", "msg_1"),
-    ]
-    call = next(b for _u, b in server.posts if b["data"].get("item_type") == "function_call")
-    # The live-card contract: same id on the running edge and the tool call.
-    assert call["data"]["response_id"] == edges[0]["response_id"]
-
-
-async def test_running_edge_fires_once_per_turn() -> None:
-    """A turn's many parts still produce exactly one ``running`` edge."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    for part in (
-        {"id": "s", "messageID": "msg_1", "type": "step-start"},
-        {"id": "prt_x", "messageID": "msg_1", "type": "text", "text": "hi"},
-        {
-            "id": "prt_t",
-            "messageID": "msg_1",
-            "type": "tool",
-            "callID": "c1",
-            "tool": "bash",
-            "state": {"status": "running", "input": {"command": "ls"}},
-        },
-    ):
-        await fwd.handle_event(_event("message.part.updated", part=part))
-    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
-    assert len(running) == 1
-    assert running[0]["response_id"] == "msg_1"
-
-
-async def test_running_edge_deferred_until_message_id_known() -> None:
-    """A bare ``session.status`` busy before ``message.updated`` still yields the id.
-
-    opencode can open a turn with ``session.status`` busy (no messageID) before
-    the assistant ``message.updated`` arrives. The ``running`` edge must defer
-    until the id is known and carry ``msg_1`` — not an id-less/session-id edge
-    that would never match the tool-call items — and still fire exactly once.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
-    # No running edge yet: the id is unknown.
-    assert _status_edges(server.posts) == []
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
-    assert len(running) == 1
-    assert running[0]["response_id"] == "msg_1"
-
-
-async def test_second_turn_gets_its_own_running_response_id() -> None:
-    """Each turn's running/idle edges carry that turn's own assistant id."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    for msg in ("msg_a", "msg_b"):
-        await fwd.handle_event(_event("message.updated", info={"id": msg, "role": "assistant"}))
-        await fwd.handle_event(_event("session.idle"))
-    edges = _status_edges(server.posts)
-    assert [(e["status"], e["response_id"]) for e in edges] == [
-        ("running", "msg_a"),
-        ("idle", "msg_a"),
-        ("running", "msg_b"),
-        ("idle", "msg_b"),
-    ]
-
-
-async def test_multi_assistant_message_turn_retires_with_the_live_id() -> None:
-    """Two assistant messages in ONE turn: idle carries the id that went live.
-
-    If opencode emits more than one assistant ``message.updated`` before
-    ``session.idle`` (no idle between them), the ``running`` edge locks to the
-    first id (``msg_1``) while ``_active_message_id`` advances to ``msg_2``. The
-    terminal ``idle`` edge must still carry ``msg_1`` — the id the running edge
-    used — so the web retires the tool cards that were actually rendered live.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_2", "role": "assistant"}))
-    await fwd.handle_event(_event("session.idle"))
-    edges = _status_edges(server.posts)
-    assert [(e["status"], e["response_id"]) for e in edges] == [
-        ("running", "msg_1"),
-        ("idle", "msg_1"),
-    ]
-
-
-async def test_turn_without_assistant_message_idles_with_session_fallback() -> None:
-    """A turn that opens (busy) and idles with no assistant ``message.updated``.
-
-    No ``running`` edge fires (there was never an id to carry) and the terminal
-    ``idle`` edge falls back to the session id. Benign — there are no live tool
-    cards to retire — but the fallback id is deliberate, not a mismatch bug.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
-    await fwd.handle_event(_event("session.idle"))
-    edges = _status_edges(server.posts)
-    assert [e["status"] for e in edges] == ["idle"]
-    assert edges[0]["response_id"] == _SESSION
-
-
-async def test_permission_asked_rejects_when_no_policy_wired() -> None:
-    """Absent a policy evaluator the forwarder FAILS CLOSED (no auto-approve).
-
-    The security contract: a headless OpenCode turn must never silently
-    auto-approve a sensitive op just because no policy gate is wired. The
-    previous ``allow_once`` default did exactly that.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)  # no policy_evaluator → fail closed
-    await fwd.handle_event(
-        _event("permission.v2.asked", id="per_1", action="bash", resources=[{"command": "ls"}])
-    )
-    assert opencode.replies == [("per_1", {"reply": "reject", "message": "omnigent-policy"})]
-
-
-async def test_permission_asked_rejects_when_policy_denies() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-
-    async def deny(_normalized: Any) -> dict[str, Any]:
-        return {"decision": "deny"}
-
-    fwd = _forwarder(server, opencode, policy_evaluator=deny)
-    await fwd.handle_event(_event("permission.v2.asked", id="per_2", action="bash"))
-    assert opencode.replies[0][1]["reply"] == "reject"
-
-
-async def test_permission_asked_allows_only_on_explicit_policy_allow() -> None:
-    """An explicit policy ``allow`` is the only path to ``once``."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-
-    async def allow(_normalized: Any) -> dict[str, Any]:
-        return {"decision": "allow"}
-
-    fwd = _forwarder(server, opencode, policy_evaluator=allow)
-    await fwd.handle_event(_event("permission.v2.asked", id="per_a", action="bash"))
-    assert opencode.replies[0][1]["reply"] == "once"
-
-
-async def test_permission_asked_allow_always_still_replies_once() -> None:
-    """An allow_always verdict must reply "once", never "always".
-
-    Replying "always" makes opencode persist the grant and stop emitting
-    permission.asked, which bypasses the server policy engine and breaks live
-    policy toggles (e.g. enabling "Require Approval" mid-session). The forwarder
-    always replies "once" so opencode re-asks every call; "always allow"
-    persistence is the server engine's job.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-
-    async def allow_always(_normalized: Any) -> dict[str, Any]:
-        return {"decision": "allow_always"}
-
-    fwd = _forwarder(server, opencode, policy_evaluator=allow_always)
-    await fwd.handle_event(_event("permission.v2.asked", id="per_aa", action="bash"))
-    assert opencode.replies[0][1]["reply"] == "once"
-
-
-async def test_permission_asked_rejects_when_policy_returns_ask() -> None:
-    """An unresolved ``ask`` reaching the forwarder FAILS CLOSED, not auto-approve.
-
-    The genuine human approval for an ``ask`` is resolved UPSTREAM by the
-    policy evaluator (the server parks an approval card on
-    ``/policies/evaluate`` and returns a hard allow/deny). An ``ask`` that
-    still reaches the forwarder means no human resolution was obtained, so
-    it must DENY — never silently approve.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-
-    async def ask(_normalized: Any) -> dict[str, Any]:
-        return {"decision": "ask"}
-
-    fwd = _forwarder(server, opencode, policy_evaluator=ask)
-    await fwd.handle_event(_event("permission.v2.asked", id="per_ask", action="bash"))
-    assert opencode.replies[0][1]["reply"] == "reject"
-
-
-async def test_permission_asked_passes_normalized_input_to_evaluator() -> None:
-    """The forwarder routes through the policy gate with a normalized input.
-
-    Proves the request is genuinely evaluated (harness + action + the
-    concrete command), not decided by a hardcoded default.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    seen: list[Any] = []
-
-    async def capture(normalized: Any) -> dict[str, Any]:
-        seen.append(normalized)
-        return {"decision": "deny"}
-
-    fwd = _forwarder(server, opencode, policy_evaluator=capture, workspace="/work/repo")
-    await fwd.handle_event(
-        _event("permission.v2.asked", id="per_n", action="bash", resources=[{"command": "ls"}])
-    )
-    assert len(seen) == 1
-    assert seen[0]["harness"] == "opencode-native"
-    assert seen[0]["action"] == "bash"
-    assert seen[0]["command"] == "ls"
-    assert seen[0]["working_directory"] == "/work/repo"
-    assert seen[0]["omnigent_session_id"] == "conv_1"
-
-
-async def test_permission_asked_dedupes() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    ev = _event("permission.v2.asked", id="per_3", action="bash")
-    await fwd.handle_event(ev)
-    await fwd.handle_event(ev)
-    assert len(opencode.replies) == 1
-
-
-async def test_event_for_other_session_ignored() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        OpenCodeEvent(
-            id=None,
-            type="message.part.updated",
-            properties={
-                "sessionID": "ses_OTHER",
-                "part": {"id": "p", "messageID": "m", "type": "text", "text": "x"},
-            },
-            raw={},
-        )
-    )
-    assert server.posts == []
-
-
-async def test_unknown_event_is_ignored() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("some.unknown.event", foo="bar"))
-    assert server.posts == []
-
-
-async def test_run_reconnects_until_cap() -> None:
-    """run() retries the SSE consume loop and stops at the reconnect cap."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    calls = {"n": 0}
-
-    async def failing_consume() -> None:
-        calls["n"] += 1
-        raise httpx.ReadError("dropped", request=httpx.Request("GET", "http://x/event"))
-
-    fwd._consume_once = failing_consume  # type: ignore[method-assign]
-
-    # Patch sleep so the backoff doesn't slow the test.
-    async def _no_sleep(_seconds: float) -> None:
-        return None
-
-    orig_sleep = fwd_mod.asyncio.sleep
-    fwd_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
-    try:
-        await fwd.run(max_reconnects=3)
-    finally:
-        fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
-    assert calls["n"] == 4  # initial + 3 reconnects
-
-
-async def test_seed_dedupe_from_history_marks_parts_and_roles() -> None:
-    """Resume seeding records message roles and pre-marks text/tool part keys."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    opencode.messages = [
-        {
-            "info": {"id": "msg_1", "role": "assistant"},
-            "parts": [
-                {"id": "prt_text", "type": "text"},
-                {"id": "prt_tool", "type": "tool", "callID": "call_1"},
-                "not-a-mapping",
-            ],
-        },
-        {"info": {"id": "msg_2", "role": "user"}, "parts": []},
-        "not-a-mapping-message",
-    ]
-    fwd = _forwarder(server, opencode)
-    await fwd.seed_dedupe_from_history()
-    assert fwd._msg_role == {"msg_1": "assistant", "msg_2": "user"}
-    # Seeded keys are pre-marked, so re-marking returns False (would be deduped).
-    assert fwd.state.mark(fwd._key("text-final", "prt_text")) is False
-    assert fwd.state.mark(fwd._key("tool-call", "call_1")) is False
-
-
-async def test_seed_dedupe_from_history_swallows_errors() -> None:
-    """A history-fetch failure leaves the dedupe empty rather than raising."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-
-    async def _boom(_sid: str) -> list[dict[str, Any]]:
-        raise RuntimeError("history unavailable")
-
-    opencode.list_messages = _boom  # type: ignore[assignment]
-    fwd = _forwarder(server, opencode)
-    await fwd.seed_dedupe_from_history()  # best-effort → no raise
-    assert fwd._msg_role == {}
-
-
-async def test_seed_dedupe_from_history_seeds_usage() -> None:
-    """Resume seeding rebuilds cumulative usage and re-posts it immediately."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    opencode.messages = [
-        {
-            "info": {
-                "id": "msg_1",
-                "role": "assistant",
-                "modelID": "claude-sonnet-4-5",
-                "providerID": "anthropic",
-                "cost": 0.01,
-                "tokens": {"input": 1000, "output": 50, "cache": {"read": 200, "write": 0}},
-            },
-            "parts": [],
-        },
-        {
-            "info": {
-                "id": "msg_2",
-                "role": "assistant",
-                "modelID": "claude-sonnet-4-5",
-                "providerID": "anthropic",
-                "cost": 0.02,
-                "tokens": {"input": 2000, "output": 100, "cache": {"read": 300, "write": 0}},
-            },
-            "parts": [],
-        },
-        {"info": {"id": "msg_u", "role": "user"}, "parts": []},
-    ]
-    fwd = _forwarder(server, opencode)
-    await fwd.seed_dedupe_from_history()
-    # Usage is rebuilt per assistant message id (user messages contribute none).
-    assert set(fwd._usage_by_message) == {"msg_1", "msg_2"}
-    usage = next(b for _u, b in server.posts if b["type"] == "external_session_usage")["data"]
-    assert usage["cumulative_cost_usd"] == 0.03  # 0.01 + 0.02
-    assert usage["cumulative_input_tokens"] == 3000  # 1000 + 2000
-    assert usage["cumulative_output_tokens"] == 150  # 50 + 100
-    assert usage["cumulative_cache_read_input_tokens"] == 500  # 200 + 300
-
-
-async def test_compaction_started_posts_in_progress() -> None:
-    """`session.next.compaction.started` → external_compaction_status in_progress."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event("session.next.compaction.started", messageID="msg_1", reason="auto")
-    )
-    body = next(b for _u, b in server.posts if b["type"] == "external_compaction_status")
-    assert body["data"]["status"] == "in_progress"
-
-
-async def test_compaction_ended_posts_completed() -> None:
-    """`session.next.compaction.ended` → external_compaction_status completed."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "session.next.compaction.ended",
-            messageID="msg_1",
-            reason="manual",
-            text="summary",
-            recent="tail",
-        )
-    )
-    body = next(b for _u, b in server.posts if b["type"] == "external_compaction_status")
-    assert body["data"]["status"] == "completed"
-
-
-async def test_session_compacted_posts_completed() -> None:
-    """Explicit /summarize emits `session.compacted` → external_compaction_status completed."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("session.compacted"))
-    body = next(b for _u, b in server.posts if b["type"] == "external_compaction_status")
-    assert body["data"]["status"] == "completed"
-
-
-async def test_assistant_usage_posts_external_session_usage() -> None:
-    """message.updated assistant cost/tokens → external_session_usage (cumulative)."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "message.updated",
-            info={
-                "id": "msg_a",
-                "role": "assistant",
-                "modelID": "claude-sonnet-4-5",
-                "providerID": "anthropic",
-                "cost": 0.012,
-                "tokens": {"input": 1000, "output": 50, "cache": {"read": 200, "write": 0}},
-            },
-        )
-    )
-    usage = next(b for _u, b in server.posts if b["type"] == "external_session_usage")["data"]
-    assert usage["cumulative_cost_usd"] == 0.012
-    assert usage["cumulative_input_tokens"] == 1000
-    assert usage["cumulative_output_tokens"] == 50
-    assert usage["cumulative_cache_read_input_tokens"] == 200
-    assert usage["context_tokens"] == 1200  # input + cache.read + cache.write
-    assert usage["model"] == "anthropic/claude-sonnet-4-5"
-    assert usage["context_window"] > 0
-
-
-async def test_usage_sums_across_messages_and_dedupes() -> None:
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-
-    def msg(mid: str, cost: float, inp: int) -> dict[str, object]:
-        return {
-            "id": mid,
-            "role": "assistant",
-            "modelID": "m",
-            "providerID": "p",
-            "cost": cost,
-            "tokens": {"input": inp, "output": 1},
-        }
-
-    await fwd.handle_event(_event("message.updated", info=msg("m1", 0.01, 100)))
-    await fwd.handle_event(_event("message.updated", info=msg("m2", 0.02, 200)))
-    usages = [b["data"] for _u, b in server.posts if b["type"] == "external_session_usage"]
-    assert usages[-1]["cumulative_cost_usd"] == 0.03  # 0.01 + 0.02
-    assert usages[-1]["cumulative_input_tokens"] == 300
-    # Re-posting the same final message must dedupe (no new identical post).
-    before = len(usages)
-    await fwd.handle_event(_event("message.updated", info=msg("m2", 0.02, 200)))
-    after = len([b for _u, b in server.posts if b["type"] == "external_session_usage"])
-    assert after == before
-
-
-async def test_model_switched_mirrors_to_omnigent_and_dedupes() -> None:
-    """TUI model switch → external_model_change (deduped)."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "session.next.model.switched", model={"providerID": "anthropic", "id": "claude-opus-4"}
-        )
-    )
-    changes = [b["data"] for _u, b in server.posts if b["type"] == "external_model_change"]
-    assert changes[-1]["model"] == "anthropic/claude-opus-4"
-    # Same model again → no duplicate post.
-    before = len(changes)
-    await fwd.handle_event(
-        _event(
-            "session.next.model.switched", model={"providerID": "anthropic", "id": "claude-opus-4"}
-        )
-    )
-    after = len([b for _u, b in server.posts if b["type"] == "external_model_change"])
-    assert after == before
-
-
-async def test_reasoning_part_streams_suffix_deltas() -> None:
-    """opencode reasoning parts → transient reasoning deltas (suffix-only)."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": "Let me"},
-        )
-    )
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={
-                "id": "prt_r",
-                "messageID": "msg_1",
-                "type": "reasoning",
-                "text": "Let me think",
-            },
-        )
-    )
-    deltas = [
-        b["data"] for _u, b in server.posts if b["type"] == "external_output_reasoning_delta"
-    ]
-    # First snapshot opens the block (started); second posts only the new suffix.
-    assert deltas[0] == {"delta": "Let me", "started": True}
-    assert deltas[1] == {"delta": " think", "started": False}
-
-
-async def test_reasoning_part_no_repost_when_unchanged() -> None:
-    """A repeated identical reasoning snapshot posts no new delta."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
-    part = {"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": "stable"}
-    await fwd.handle_event(_event("message.part.updated", part=part))
-    await fwd.handle_event(_event("message.part.updated", part=dict(part)))
-    deltas = [b for _u, b in server.posts if b["type"] == "external_output_reasoning_delta"]
-    assert len(deltas) == 1
-
-
-async def test_image_file_part_posts_image_block() -> None:
-    """An image ``file`` part → an input/output_image content block."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_u", "role": "user"}))
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={
-                "id": "prt_f",
-                "messageID": "msg_u",
-                "type": "file",
-                "mime": "image/png",
-                "url": "data:image/png;base64,AAAA",
-            },
-        )
-    )
-    items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
-    content = items[-1]["data"]["item_data"]["content"][0]
-    assert content == {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
-    assert items[-1]["data"]["item_data"]["role"] == "user"
-
-
-async def test_non_image_file_part_text_flattened() -> None:
-    """A non-image ``file`` part → a short text reference (text-flattened)."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_a", "role": "assistant"}))
-    await fwd.handle_event(
-        _event(
-            "message.part.updated",
-            part={
-                "id": "prt_f2",
-                "messageID": "msg_a",
-                "type": "file",
-                "mime": "application/pdf",
-                "url": "file:///tmp/report.pdf",
-                "filename": "report.pdf",
-            },
-        )
-    )
-    items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
-    block = items[-1]["data"]["item_data"]["content"][0]
-    assert block["type"] == "output_text"
-    assert "report.pdf" in block["text"]
-    assert items[-1]["data"]["item_data"]["agent"] == "opencode"
-
-
-async def test_file_part_dedupes_across_snapshots() -> None:
-    """A file part posts once even when the part updates repeatedly."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("message.updated", info={"id": "msg_u", "role": "user"}))
-    part = {
-        "id": "prt_f",
-        "messageID": "msg_u",
-        "type": "file",
-        "mime": "image/jpeg",
-        "url": "data:image/jpeg;base64,ZZZZ",
-    }
-    await fwd.handle_event(_event("message.part.updated", part=part))
-    await fwd.handle_event(_event("message.part.updated", part=dict(part)))
-    items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
-    assert len(items) == 1
-
-
-# --- question tool (blocking ``question`` → web elicitation) --------------
+def _items(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    return _datas(posts, "external_conversation_item")
 
 
 def _hook_post(server: _RecordingServerClient) -> dict[str, Any] | None:
@@ -907,245 +133,107 @@ def _hook_post(server: _RecordingServerClient) -> dict[str, Any] | None:
     return None
 
 
-async def test_question_asked_accept_single_select_replies() -> None:
-    """A single-select web verdict → reply_question with the chosen label list.
+async def _drain(fwd: fwd_mod.OpenCodeNativeForwarder) -> None:
+    """Await every background permission / form task the forwarder spawned."""
+    tasks = [*fwd._permission_tasks.values(), *fwd._form_tasks.values()]
+    await asyncio.gather(*tasks)
 
-    The asked event carries the request id under ``id``; the question is parked
-    on the native-permission-request hook (NOT inline — a background task), and
-    the accept verdict's per-question content is keyed by the ORIGINAL index.
-    """
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    server.hook_response = {"action": "accept", "content": {"0": "Tabs"}}
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "question.asked",
-            id="que_1",
-            tool="question",
-            questions=[
-                {
-                    "question": "Indent style?",
-                    "header": "Formatting",
-                    "options": [{"label": "Tabs"}, {"label": "Spaces"}],
-                }
-            ],
-        )
+
+def _step_started(message_id: str, **data: Any) -> OpenCodeEvent:
+    data.setdefault("agent", "build")
+    data.setdefault("model", {"id": "claude-sonnet-4-5", "providerID": "anthropic"})
+    data.setdefault("started", 1)
+    return _event("session.step.started", assistantMessageID=message_id, **data)
+
+
+def _step_ended(message_id: str, **data: Any) -> OpenCodeEvent:
+    data.setdefault("finish", "stop")
+    data.setdefault("cost", 0.0)
+    data.setdefault(
+        "tokens", {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
     )
-    # The handler spawns a task and returns immediately (never blocks the loop);
-    # capture it before awaiting (the done-callback evicts it on completion).
-    task = fwd._question_tasks["que_1"]
-    await task
-    assert opencode.question_replies == [("que_1", [["Tabs"]])]
-    assert opencode.question_rejects == []
-    hook = _hook_post(server)
-    assert hook is not None
-    assert hook["operation_type"] == "question"
-    assert hook["agent"] == "OpenCode"
-    assert hook["policy_name"] == "opencode_native_question"
-    # Header drives the card message; the structured payload is authoritative.
-    assert hook["message"] == "Formatting"
-    assert hook["content_preview"] == "Indent style?"
-    web_questions = hook["ask_user_question"]["questions"]
-    assert web_questions[0]["id"] == "0"
-    assert web_questions[0]["multiSelect"] is False
-    assert web_questions[0]["options"] == [{"label": "Tabs"}, {"label": "Spaces"}]
+    return _event("session.step.ended", assistantMessageID=message_id, **data)
 
 
-async def test_question_asked_accept_multi_question_multi_select_replies() -> None:
-    """Two questions (one multi-select) → one answer list per question, in order."""
+# --- filtering / dispatch ---------------------------------------------------
+
+
+async def test_unknown_event_is_ignored() -> None:
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    server.hook_response = {"action": "accept", "content": {"0": ["A", "B"], "1": "X"}}
     fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "question.asked",
-            id="que_1",
-            questions=[
-                {
-                    "question": "Pick letters",
-                    "multiple": True,
-                    "options": [{"label": "A"}, {"label": "B"}, {"label": "C"}],
-                },
-                {"question": "Pick one", "options": [{"label": "X"}, {"label": "Y"}]},
-            ],
-        )
+    await fwd.handle_event(_event("some.unknown.event", foo="bar"))
+    assert server.posts == []
+
+
+async def test_event_for_other_session_ignored() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    event = _event("session.execution.started", sessionID="ses_OTHER")
+    assert fwd._event_targets_session(event) is False
+    await fwd.handle_event(event)
+    assert server.posts == []
+
+
+async def test_event_without_session_id_passes_filter() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    connected = OpenCodeEvent(id="evt_1", type="server.connected", data={}, location=None)
+    assert fwd._event_targets_session(connected) is True
+
+
+async def test_form_created_filters_on_nested_session_id() -> None:
+    """``form.created`` carries the session id under ``data.form``."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    ours = OpenCodeEvent(
+        id=None,
+        type="form.created",
+        data={"form": {"id": "frm_1", "sessionID": _SESSION}},
+        location=None,
     )
-    task = fwd._question_tasks["que_1"]
-    await task
-    assert opencode.question_replies == [("que_1", [["A", "B"], ["X"]])]
-    assert opencode.question_rejects == []
-    web_questions = _hook_post(server)["ask_user_question"]["questions"]
-    assert web_questions[0]["multiSelect"] is True
-    assert [q["id"] for q in web_questions] == ["0", "1"]
-
-
-async def test_question_asked_decline_rejects_without_reply() -> None:
-    """A ``decline`` web verdict → reject_question, never reply_question."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    server.hook_response = {"action": "decline"}
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "question.asked",
-            id="que_1",
-            questions=[{"question": "Q?", "options": [{"label": "A"}]}],
-        )
+    theirs = OpenCodeEvent(
+        id=None,
+        type="form.created",
+        data={"form": {"id": "frm_2", "sessionID": "ses_X"}},
+        location=None,
     )
-    task = fwd._question_tasks["que_1"]
-    await task
-    assert opencode.question_rejects == ["que_1"]
-    assert opencode.question_replies == []
+    assert fwd._event_targets_session(ours) is True
+    assert fwd._event_targets_session(theirs) is False
 
 
-async def test_question_asked_empty_verdict_rejects() -> None:
-    """An empty 200 (TUI answered / timeout, no scripted verdict) → reject_question."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    # hook_response stays None → the hook returns an empty 200 body.
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "question.asked",
-            id="que_1",
-            questions=[{"question": "Q?", "options": [{"label": "A"}]}],
-        )
-    )
-    task = fwd._question_tasks["que_1"]
-    await task
-    assert opencode.question_rejects == ["que_1"]
-    assert opencode.question_replies == []
-    # The card WAS parked (the hook was POSTed); it just resolved with no verdict.
-    assert _hook_post(server) is not None
-
-
-async def test_question_replied_cancels_pending_task_and_clears_card() -> None:
-    """``question.replied`` (TUI answered) cancels the park and withdraws the card.
-
-    ``replied`` keys the id as ``requestID`` (not ``id``). It must cancel the
-    still-parked POST (so the forwarder doesn't also reply) and post
-    ``external_elicitation_resolved`` so the web card disappears.
-    """
+async def test_consume_once_dispatches_stream_events() -> None:
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
+    seen: list[str] = []
 
-    async def _never() -> None:
-        await asyncio.sleep(3600)
+    async def _record(event: OpenCodeEvent) -> None:
+        seen.append(event.type)
 
-    pending: asyncio.Task[None] = asyncio.create_task(_never())
-    fwd._question_tasks["que_1"] = pending
-    await fwd.handle_event(_event("question.replied", requestID="que_1", answers=[["A"]]))
-    # The parked task was cancelled and removed from the registry.
-    assert "que_1" not in fwd._question_tasks
-    with contextlib.suppress(asyncio.CancelledError):
-        await pending
-    assert pending.cancelled()
-    resolved = next(
-        b["data"] for _u, b in server.posts if b["type"] == "external_elicitation_resolved"
-    )
-    assert resolved == {"elicitation_id": "que_1"}
-    # No reply/reject was sent for a TUI-resolved question.
-    assert opencode.question_replies == []
-    assert opencode.question_rejects == []
+    fwd.handle_event = _record  # type: ignore[method-assign]
+    opencode.stream = [_event("session.status", status={"type": "busy"})]
+    await fwd._consume_once()
+    assert seen == ["session.status"]
 
 
-async def test_question_rejected_clears_card() -> None:
-    """``question.rejected`` (TUI declined) withdraws the web card."""
+async def test_run_reconnects_until_cap() -> None:
+    """run() retries the SSE consume loop and stops at the reconnect cap."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("question.rejected", requestID="que_9"))
-    resolved = next(
-        b["data"] for _u, b in server.posts if b["type"] == "external_elicitation_resolved"
-    )
-    assert resolved == {"elicitation_id": "que_9"}
+    calls = {"n": 0}
 
+    async def failing_consume() -> None:
+        calls["n"] += 1
+        raise httpx.ReadError("dropped", request=httpx.Request("GET", "http://x/api/event"))
 
-async def test_run_awaits_cancelled_question_tasks() -> None:
-    """Forwarder shutdown waits for question-task cancellation cleanup."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    cleanup_finished = asyncio.Event()
+    fwd._consume_once = failing_consume  # type: ignore[method-assign]
 
-    async def _pending_question() -> None:
-        try:
-            await asyncio.Future()
-        finally:
-            await asyncio.sleep(0)
-            cleanup_finished.set()
+    async def _no_sleep(_seconds: float) -> None:
+        return None
 
-    pending = asyncio.create_task(_pending_question())
-    fwd._question_tasks["que_1"] = pending
-    await asyncio.sleep(0)
-    await fwd.run(max_reconnects=0)
-
-    assert cleanup_finished.is_set()
-    assert pending.cancelled()
-    assert fwd._question_tasks == {}
-
-
-async def test_question_asked_no_valid_options_rejects_without_hook() -> None:
-    """A question with no renderable options → reject_question, no card parked."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "question.asked",
-            id="que_1",
-            # Options present but none carry a usable string label.
-            questions=[{"question": "Q?", "options": [{}, {"label": ""}]}],
-        )
-    )
-    task = fwd._question_tasks["que_1"]
-    await task
-    assert opencode.question_rejects == ["que_1"]
-    assert opencode.question_replies == []
-    assert _hook_post(server) is None
-
-
-async def test_question_asked_empty_questions_rejects_without_hook() -> None:
-    """An empty questions list → reject_question, no card parked."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(_event("question.asked", id="que_1", questions=[]))
-    task = fwd._question_tasks["que_1"]
-    await task
-    assert opencode.question_rejects == ["que_1"]
-    assert _hook_post(server) is None
-
-
-async def test_question_asked_mixed_valid_and_malformed_rejects_whole_request() -> None:
-    """One malformed question rejects the request instead of sending empty answers."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    fwd = _forwarder(server, opencode)
-    await fwd.handle_event(
-        _event(
-            "question.asked",
-            id="que_1",
-            questions=[
-                {"question": "Valid?", "options": [{"label": "Yes"}]},
-                {"question": "Malformed", "options": [{"label": ""}]},
-            ],
-        )
-    )
-    task = fwd._question_tasks["que_1"]
-    await task
-    assert opencode.question_rejects == ["que_1"]
-    assert opencode.question_replies == []
-    assert _hook_post(server) is None
-
-
-async def test_question_asked_dedupes_concurrent_same_request() -> None:
-    """A duplicate ``question.asked`` for the same id spawns only one park task."""
-    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    server.hook_response = {"action": "accept", "content": {"0": "A"}}
-    fwd = _forwarder(server, opencode)
-    ev = _event(
-        "question.asked",
-        id="que_1",
-        questions=[{"question": "Q?", "options": [{"label": "A"}]}],
-    )
-    await fwd.handle_event(ev)
-    task = fwd._question_tasks["que_1"]
-    # A second asked event before the first resolves must NOT spawn a 2nd task.
-    await fwd.handle_event(ev)
-    assert fwd._question_tasks["que_1"] is task
-    await task
-    assert opencode.question_replies == [("que_1", [["A"]])]
+    orig_sleep = fwd_mod.asyncio.sleep
+    fwd_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
+    try:
+        await fwd.run(max_reconnects=3)
+    finally:
+        fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
+    assert calls["n"] == 4  # initial + 3 reconnects
