@@ -452,6 +452,21 @@ Pick the injection that matches the reported trigger, drive the turn through it,
 and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — that
 observed error state is the reproduction, and the same test films it in Step 4.
 
+**The reported harness is part of the environment — seeding its wire events is
+a stand-in.** When the ticket attributes the failure to a native harness's
+turns (codex-native, claude-native, …), the reproduction must run that harness.
+A driver that posts the events the native forwarder would send —
+`external_session_status`, `external_assistant_message` — to the server's
+events endpoint demonstrates the server-side handling, but not that the
+reported harness drives it: the component the ticket blames never ran, so the
+environment is not `real` even though the server and SPA are. If seeded wire
+events are the only way you can reach the failing state, that facet's verdict
+is **`likely_repro`** with the seeding named in `environment_fidelity` and in
+`journey`/`evidence` — never `reproduced` with `environment_fidelity: real`.
+(The mock-LLM and Playwright `route` fault lanes above script a *backend
+dependency* while the real product path still runs; replacing the harness
+itself with scripted events is not the same.)
+
 Judge **each sub-symptom** honestly and independently:
 
 **Global `needs_more_info` rule:** use it only for information absent from the
@@ -465,8 +480,10 @@ retryable rather than becoming a product verdict.
   Capture the evidence (snapshot, response, log excerpt).
 - Failure reproduces, but only against a **stand-in** for the reported
   environment you could not drive (for example the CI egress proxy standing in
-  for a Databricks-network host) → **`likely_repro`**. Name the stand-in in
-  `environment_fidelity` (see below). It still dispatches the fix workflow.
+  for a Databricks-network host, or seeded harness wire events standing in for
+  the native harness the ticket blames) → **`likely_repro`**. Name the
+  stand-in in `environment_fidelity` (see below). It still dispatches the fix
+  workflow.
 - The failure depends on **native behaviour this environment cannot exercise**
   (the iOS soft keyboard, WebKit-only rendering, a native-chrome layout) and the
   stand-in you can drive — desktop Chromium at a phone viewport — cannot exhibit
@@ -675,7 +692,9 @@ Field meanings:
   reproduced here). When you reproduced the failure only against a **stand-in**
   for the reported environment — the verdict is then `likely_repro` — set
   `stand-in: <what you drove> — could not drive <the reported surface>`, e.g.
-  `stand-in: CI egress proxy — could not drive the Databricks-network host`, and
+  `stand-in: CI egress proxy — could not drive the Databricks-network host` or
+  `stand-in: scripted external_session_status/external_assistant_message
+  events — could not run the codex-native harness`, and
   say the same in `journey` and `evidence`. (When the stand-in *cannot exhibit*
   the reported failure at all — a native-chrome bug on the web SPA — you do not
   get a verdict from it: that is `needs_manual_review`, and you name the
