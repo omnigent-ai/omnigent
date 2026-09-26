@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.opencode_native.bridge import write_opencode_policy_plugin
 from omnigent.harnesses.opencode_native.provider import (
     ASK_ALL_PERMISSIONS,
     OPENAI_COMPATIBLE_PACKAGE,
@@ -18,6 +19,7 @@ from omnigent.harnesses.opencode_native.provider import (
     _strip_jsonc_comments,
     _strip_trailing_commas,
     build_opencode_config,
+    build_opencode_mcp_block,
     build_opencode_omnigent_mcp_server,
     build_opencode_provider_block,
     managed_connect_opencode_config,
@@ -913,3 +915,52 @@ def test_write_opencode_instructions_removes_stale_file(
     assert write_opencode_instructions(session_xdg, "x") is not None
     assert write_opencode_instructions(session_xdg, "   ") is None
     assert not (session_xdg / "opencode" / "AGENTS.md").exists()
+
+
+def test_runner_assembly_shape_matches_v2_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Mirror of the runner's opencode.json assembly (orchestration.py)."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-user-config"))
+    bridge_dir = tmp_path / "bridge"
+    xdg = bridge_dir / "xdg-config"
+    mcp_servers = build_opencode_mcp_block([])
+    mcp_servers.update(build_opencode_omnigent_mcp_server(bridge_dir))
+    plugin_paths = [str(write_opencode_policy_plugin(bridge_dir))]
+    instructions = write_opencode_instructions(xdg, "Agent rules.")
+    config = maybe_merge_user_provider_config(
+        build_opencode_config(
+            model="anthropic/claude-sonnet-4-5",
+            gateway=None,
+            mcp_servers=mcp_servers,
+            plugin_paths=plugin_paths,
+            instructions=str(instructions),
+        )
+    )
+    path = write_opencode_provider_config(xdg, config)
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["permissions"] == [{"action": "*", "resource": "*", "effect": "ask"}]
+    assert written["mcp"]["servers"]["omnigent"]["codemode"] is False
+    assert written["plugins"] == [str(bridge_dir / "omnigent-policy")]
+    assert written["instructions"] == [str(xdg / "opencode" / "AGENTS.md")]
+    assert written["model"] == "anthropic/claude-sonnet-4-5"
+    assert not {"provider", "permission", "plugin"} & set(written)
+
+
+def test_runner_imports_v2_builders() -> None:
+    import omnigent.harnesses.opencode_native.provider as prov
+
+    for name in (
+        "build_opencode_config",
+        "build_opencode_mcp_block",
+        "build_opencode_omnigent_mcp_server",
+        "managed_connect_opencode_config",
+        "maybe_merge_user_provider_config",
+        "resolve_bound_opencode_gateway",
+        "resolve_databricks_gateway",
+        "write_opencode_instructions",
+        "write_opencode_provider_config",
+    ):
+        assert hasattr(prov, name), name
+    for removed in ("build_opencode_provider_config", "build_opencode_model_default_config"):
+        assert not hasattr(prov, removed), removed

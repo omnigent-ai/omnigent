@@ -1490,30 +1490,26 @@ async def _auto_create_opencode_terminal(
     # provider config the ambient env/global config already gives it.
     from omnigent.harnesses.opencode_native.bridge import xdg_config_home_for_bridge_dir
     from omnigent.harnesses.opencode_native.provider import (
+        build_opencode_config,
         build_opencode_mcp_block,
-        build_opencode_model_default_config,
         build_opencode_omnigent_mcp_server,
-        build_opencode_provider_config,
         managed_connect_opencode_config,
         maybe_merge_user_provider_config,
         resolve_bound_opencode_gateway,
         resolve_databricks_gateway,
+        write_opencode_instructions,
         write_opencode_provider_config,
     )
 
-    # Accumulate the synthesized opencode.json: provider/model (Databricks
-    # gateway or a pinned default) + the agent's MCP servers + force-ask.
-    config: dict[str, object] = {}
+    # Synthesize the per-session v2 opencode.json: providers/model, MCP servers,
+    # plugins, instructions, and an ask-all permission ruleset so every tool call
+    # raises permission.asked for the forwarder's policy gate.
     xdg_config_home = xdg_config_home_for_bridge_dir(bridge_dir)
     managed_opencode_broker_cmd: str | None = None
-    # A spec/CLI-selected Databricks gateway wins first (an explicit ``--model``
-    # that names a gateway endpoint, or a spec profile), exactly as claude/codex/pi
-    # resolve the spec provider before their broker fallback.
-    # ``resolve_databricks_gateway`` returns None when no profile is selected (the
-    # bare managed-connect host); the ucode-config path below is then the last
-    # resort. On that bare host it adopts ucode's pinned served model — replacing an
-    # unrecognized explicit ``--model`` (logged below), since the workspace gateway
-    # is the only working provider there.
+    extra_providers: dict[str, dict[str, object]] = {}
+    plugin_paths: list[str] = []
+    # A spec/CLI-selected gateway wins first, exactly as claude/codex/pi resolve the
+    # spec provider before their broker fallback; the ucode config is the last resort.
     opencode_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     gateway = await asyncio.to_thread(
         resolve_bound_opencode_gateway,
@@ -1525,27 +1521,15 @@ async def _auto_create_opencode_terminal(
             _opencode_native_profile_from_spec(agent_spec), model_id=model_override
         )
     if gateway is not None:
-        # Pin the per-prompt model to the synthesized provider/endpoint id, and
-        # write it as opencode's default model too so the TUI launches on it.
         model_override = gateway.qualified_model
-        config = dict(build_opencode_provider_config(gateway))
-        config["model"] = model_override
     else:
-        # Managed connect host (last resort): reuse ucode's generated opencode
-        # config (provider block + served model + refreshing auth plugin), the
-        # same artifact lakebox and ucode itself use. The plugin mints per request
-        # via ``ucode auth-token`` → the broker command forwarded into the opencode
-        # env below, so no static omnigent-minted token. Offloaded to a thread: on
-        # the first launch (before the host-boot configure has written opencode's
-        # config) it may run a ``ucode configure`` subprocess, which must not block
-        # the runner's event loop. None off a managed connect host.
-        managed_config = await asyncio.to_thread(managed_connect_opencode_config, xdg_config_home)
+        # Managed connect host: reuse ucode's providers with an Omnigent-owned v2
+        # auth plugin that mints per request via the broker command. Offloaded to a
+        # thread because it may run ``ucode configure`` on first launch.
+        managed_config = await asyncio.to_thread(
+            managed_connect_opencode_config, xdg_config_home, bridge_dir
+        )
         if managed_config:
-            # The auth plugin needs the broker command to mint per request; derive
-            # it from the SAME sidecar the config gated on (not a separate profile
-            # read), so the two can't disagree. Only adopt the managed config when
-            # the command resolves — a provider block with no mint command can't
-            # authenticate, so without it leave opencode on its own login instead.
             from omnigent.host.databricks_credential import (
                 _read_sidecar,
                 _sidecar_path,
@@ -1557,8 +1541,13 @@ async def _auto_create_opencode_terminal(
                 broker_token_command(_oc_sidecar["workspace_host"]) if _oc_sidecar else None
             )
             if managed_opencode_broker_cmd:
-                config = managed_config
-                pinned = config.get("model")
+                providers = managed_config.get("providers")
+                if isinstance(providers, dict):
+                    extra_providers = providers
+                managed_plugins = managed_config.get("plugins")
+                if isinstance(managed_plugins, list):
+                    plugin_paths.extend(p for p in managed_plugins if isinstance(p, str))
+                pinned = managed_config.get("model")
                 if isinstance(pinned, str):
                     if model_override and model_override != pinned:
                         _logger.info(
@@ -1574,61 +1563,29 @@ async def _auto_create_opencode_terminal(
                     "opencode managed connect: ucode config resolved but no broker command "
                     "(sidecar missing/mismatched); leaving opencode on its own login."
                 )
-        if not config and model_override:
-            # No custom provider, but a model is pinned (``omni opencode --model``
-            # or the ``omni setup`` OpenCode default): write opencode's default
-            # model so the native TUI and first turn use it instead of
-            # ``opencode/big-pickle``. OpenCode resolves the provider from the
-            # model-id prefix against its own auth.json, so no provider block is
-            # needed.
-            config = dict(build_opencode_model_default_config(model_override))
 
-    # Build opencode's ``mcp`` block: the Omnigent builtin-tool relay (so the
-    # model can call sys_*/load_skill/web_fetch — the real "connects to Omnigent
-    # MCP") PLUS the agent's own declared MCP servers (translated into opencode's
-    # config). The relay is added only when we'll actually start it below
-    # (``ensure_comment_relay`` present), else serve-mcp would launch with no
-    # tool_relay.json to read. Force every tool call to prompt so it routes
-    # through Omnigent's policy engine via the forwarder's permission gate —
-    # opencode's enforcement is reactive (no pre-tool hook), so "ask" is what
-    # makes the policy verdicts apply to MCP (and other) tools.
-    mcp_block = build_opencode_mcp_block(_opencode_native_mcp_servers_from_spec(agent_spec))
+    # MCP: the Omnigent builtin-tool relay (only when it will be started below, so
+    # serve-mcp finds tool_relay.json) plus the agent's own declared servers.
+    mcp_servers = build_opencode_mcp_block(_opencode_native_mcp_servers_from_spec(agent_spec))
     if server_client is not None and ensure_comment_relay is not None:
-        mcp_block.update(build_opencode_omnigent_mcp_server(bridge_dir))
-    if mcp_block:
-        config.setdefault("$schema", "https://opencode.ai/config.json")
-        config["mcp"] = mcp_block
-        config["permission"] = "ask"
+        mcp_servers.update(build_opencode_omnigent_mcp_server(bridge_dir))
 
-    # Load the Omnigent policy-bridge plugin so opencode's lifecycle hooks reach
-    # the policy engine at phases the reactive permission.asked path can't:
-    # REQUEST (gate TUI-typed prompts at submit) and TOOL_RESULT (gate/redact
-    # tool output). The plugin POSTs PHASE_REQUEST / PHASE_TOOL_RESULT to
-    # ``/policies/evaluate`` (same contract as claude's UserPromptSubmit /
-    # PostToolUse hooks); coordinates come from the OMNIGENT_* env stamped on
-    # the server below. Only wired when there's a server to evaluate against.
+    # The policy plugin gates REQUEST (TUI-typed prompts) and TOOL_RESULT phases the
+    # permission.asked path cannot reach; coordinates come from the OMNIGENT_* env.
     policy_env: dict[str, str] = {}
     if managed_opencode_broker_cmd:
-        # ucode's auth plugin runs ``ucode auth-token`` → get_databricks_token,
-        # which mints from this broker command (databricks/ucode#531).
+        # The ucode auth plugin runs ``ucode auth-token``, which mints from this command.
         policy_env["DATABRICKS_BEARER_COMMAND"] = managed_opencode_broker_cmd
     runner_server_url = os.environ.get("RUNNER_SERVER_URL")
     if server_client is not None and runner_server_url:
-        plugin_path = write_opencode_policy_plugin(bridge_dir)
-        config.setdefault("$schema", "https://opencode.ai/config.json")
-        existing_plugins = config.get("plugin")
-        config["plugin"] = ([*existing_plugins] if isinstance(existing_plugins, list) else []) + [
-            str(plugin_path)
-        ]
+        plugin_paths.append(str(write_opencode_policy_plugin(bridge_dir)))
         policy_env["OMNIGENT_POLICY_URL"] = runner_server_url
         policy_env["OMNIGENT_SESSION_ID"] = session_id
-        # Point the plugin at tool_relay.json so it can pick up relay
-        # credentials as soon as the relay starts (written later by
-        # ensure_comment_relay). The plugin re-reads on every call.
+        # The plugin re-reads tool_relay.json per call, picking up the relay once it starts.
         from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
 
         policy_env["OMNIGENT_RELAY_FILE"] = str(bridge_dir / _TOOL_RELAY_FILE)
-        # Bake fallback headers for the first calls before relay starts.
+        # Fallback routing headers for calls made before the relay starts.
         from omnigent.runner._entry import _make_auth_token_factory
 
         _policy_factory = _make_auth_token_factory()
@@ -1640,20 +1597,25 @@ async def _auto_create_opencode_terminal(
                 databricks_request_headers(runner_server_url, bearer_token=_policy_token)
             )
 
-    # Merge the user's global provider definitions (e.g. OpenAI-compatible
-    # endpoints with custom base URLs) into the synthesized config so the
-    # spawned server sees both. The per-session XDG_CONFIG_HOME override
-    # hides the user's ~/.config/opencode/opencode.jsonc, so without this
-    # merge, custom providers with non-default base URLs are invisible.
+    # opencode 2.0 ignores config ``instructions``; the per-session global AGENTS.md is read.
+    instructions_path = write_opencode_instructions(
+        xdg_config_home, _native_startup_raw_instructions_from_spec(agent_spec)
+    )
+    config = build_opencode_config(
+        model=model_override,
+        gateway=gateway,
+        mcp_servers=mcp_servers,
+        plugin_paths=plugin_paths,
+        instructions=str(instructions_path) if instructions_path is not None else None,
+        extra_providers=extra_providers,
+    )
+    # The per-session XDG_CONFIG_HOME hides the user's global config; carry over
+    # their providers, default model, plugins and MCP servers (v1 or v2 spelling).
     config = maybe_merge_user_provider_config(config)
+    write_opencode_provider_config(xdg_config_home, config)
 
-    if config:
-        write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
-
-    # The server runs with a per-session XDG_DATA_HOME, so copy the user's
-    # `opencode auth login` credentials in — otherwise it can't authenticate
-    # their providers and falls back to the no-auth default model. No-op on a
-    # remote runner (no local auth.json) / Databricks-gateway path.
+    # The per-session DB imports $XDG_DATA_HOME/opencode/auth.json once when it is
+    # created; seed it with the user's auth.json and v2 SQLite credentials.
     seed_opencode_auth(bridge_dir)
 
     # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
