@@ -21,6 +21,7 @@ from omnigent.errors import (
     impact_for_code,
     is_before_harness_start,
     is_cancelled_rpc_error,
+    is_permission_denied_rpc_error,
     phase_for_code,
     restart_on_stale_cursor,
 )
@@ -82,6 +83,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
         (ErrorCode.UPSTREAM_CANCELLED, 499),
+        (ErrorCode.UPSTREAM_PERMISSION_DENIED, 403),
         (ErrorCode.STALE_CURSOR, 400),
     ],
 )
@@ -126,6 +128,7 @@ def test_every_error_code_has_a_concrete_category() -> None:
         (ErrorCode.UNAUTHORIZED, ErrorCategory.USER),
         (ErrorCode.WORKSPACE_MISSING, ErrorCategory.USER),
         (ErrorCode.UPSTREAM_CANCELLED, ErrorCategory.UPSTREAM),
+        (ErrorCode.UPSTREAM_PERMISSION_DENIED, ErrorCategory.UPSTREAM),
         (ErrorCode.STALE_CURSOR, ErrorCategory.USER),
     ],
 )
@@ -201,6 +204,7 @@ def test_every_error_code_has_an_impact() -> None:
         (ErrorCode.NOT_FOUND, ErrorImpact.BENIGN),
         (ErrorCode.INVALID_INPUT, ErrorImpact.BENIGN),
         (ErrorCode.FORBIDDEN, ErrorImpact.BENIGN),
+        (ErrorCode.UPSTREAM_PERMISSION_DENIED, ErrorImpact.BENIGN),
         (ErrorCode.STALE_CURSOR, ErrorImpact.BENIGN),
     ],
 )
@@ -335,6 +339,38 @@ def test_is_cancelled_rpc_error_tolerates_broken_status_readers() -> None:
     assert is_cancelled_rpc_error(broken) is False
 
 
+def test_is_permission_denied_rpc_error_matches_by_shape_not_identity() -> None:
+    """A permission-denied RpcError matches regardless of which module defines it.
+
+    The deployed build vendors grpc, so an isinstance check against pypi
+    grpcio would never fire there; the match must be structural.
+    """
+    assert is_permission_denied_rpc_error(_make_rpc_error("PERMISSION_DENIED")) is True
+
+
+def test_is_permission_denied_rpc_error_ignores_other_statuses() -> None:
+    """Only PERMISSION_DENIED is the expected upstream denial; the rest keep
+    their existing treatment, and the two detectors never overlap."""
+    assert is_permission_denied_rpc_error(_make_rpc_error("UNAVAILABLE")) is False
+    assert is_permission_denied_rpc_error(_make_rpc_error("CANCELLED")) is False
+    assert is_permission_denied_rpc_error(_make_rpc_error(None)) is False
+    assert is_cancelled_rpc_error(_make_rpc_error("PERMISSION_DENIED")) is False
+
+
+def test_is_permission_denied_rpc_error_requires_rpc_error_ancestry() -> None:
+    """A non-RpcError exception never matches, even with a denied code()."""
+
+    class NotAnRpcFailure(Exception):
+        def code(self) -> object:
+            class _Status:
+                name = "PERMISSION_DENIED"
+
+            return _Status()
+
+    assert is_permission_denied_rpc_error(NotAnRpcFailure("nope")) is False
+    assert is_permission_denied_rpc_error(ValueError("nope")) is False
+
+
 def test_classify_exception_cancelled_rpc_is_transient_upstream() -> None:
     """A peer-cancelled RPC buckets as a transient upstream blip, and its wire
     code stays pinned (clients dispatch on the string)."""
@@ -347,6 +383,17 @@ def test_classify_exception_cancelled_rpc_is_transient_upstream() -> None:
     assert classify_exception(_make_rpc_error("UNAVAILABLE")) == (
         ErrorCategory.UNKNOWN,
         ErrorImpact.UNKNOWN,
+    )
+
+
+def test_classify_exception_permission_denied_rpc_is_benign_upstream() -> None:
+    """A permission-denied RPC buckets as a benign upstream denial — the
+    dependency refused one call, and a bare retry does not self-heal it — and
+    its wire code stays pinned (clients dispatch on the string)."""
+    assert ErrorCode.UPSTREAM_PERMISSION_DENIED == "upstream_permission_denied"
+    assert classify_exception(_make_rpc_error("PERMISSION_DENIED")) == (
+        ErrorCategory.UPSTREAM,
+        ErrorImpact.BENIGN,
     )
 
 
@@ -373,6 +420,7 @@ def test_every_error_code_has_a_phase() -> None:
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, ErrorPhase.TURN, False),
         (ErrorCode.INTERNAL_ERROR, ErrorPhase.UNKNOWN, False),
         (ErrorCode.UPSTREAM_CANCELLED, ErrorPhase.UNKNOWN, False),
+        (ErrorCode.UPSTREAM_PERMISSION_DENIED, ErrorPhase.UNKNOWN, False),
     ],
 )
 def test_code_phase_and_harness_boundary(
