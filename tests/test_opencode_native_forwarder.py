@@ -1029,3 +1029,27 @@ async def test_next_step_after_retry_clears_blocked_on() -> None:
     )
     await fwd.handle_event(_step_started("msg_2"))
     assert _status_edges(server.posts)[-1] == {"status": "running", "response_id": "msg_1"}
+
+
+async def test_retry_before_first_step_posts_running_with_session_fallback_id() -> None:
+    """A retry can arrive before any ``session.step.started`` (real Z.AI ordering)."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.execution.started"))
+    await fwd.handle_event(
+        _event(
+            "session.retry.scheduled",
+            assistantMessageID=None,
+            attempt=1,
+            at=1,
+            error={"type": "provider.rate-limit", "message": "busy"},
+        )
+    )
+    edge = _status_edges(server.posts)[-1]
+    assert edge == {
+        "status": "running",
+        "response_id": _SESSION,
+        "blocked_on": "Retrying (attempt 1): busy",
+    }
+    await fwd.handle_event(_step_started("msg_1"))
+    assert _status_edges(server.posts)[-1] == {"status": "running", "response_id": "msg_1"}
