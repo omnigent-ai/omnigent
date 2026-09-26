@@ -58,7 +58,7 @@ import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
-import { buildBubbles } from "@/lib/renderItems";
+import { buildBubbles, hasUnresolvedTrailingToolCall } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
@@ -6486,15 +6486,30 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
+      // Skip id-keyed side effects when the status patch drops a false idle.
+      let ignoredFalseIdle = false;
       // The status patch is conversation-scoped; the cache/query side effects
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).
       applyToNamedConversation(event.conversationId, (s) => {
+        // A quiet, unresolved tool can trigger a bare PTY idle mid-turn.
+        // Keep Working lit; id-bearing and blocked-on edges remain authoritative.
+        if (
+          event.status === "idle" &&
+          event.responseId === undefined &&
+          event.blockedOn == null &&
+          (s.sessionStatus === "running" || s.activeResponse?.state === "streaming") &&
+          hasUnresolvedTrailingToolCall(s.blocks)
+        ) {
+          ignoredFalseIdle = true;
+          return {};
+        }
         // `sessionStatus` tracks the server's session-level status 1:1 — a
         // server `idle` means the session is idle, full stop, and the
         // "Working…" indicator (which reads only `sessionStatus`) turns off.
         // There is exactly one idle heuristic and it lives server-side (the
-        // runner's PTY-activity watcher); the client must not second-guess it.
+        // runner's PTY-activity watcher); the client second-guesses it only
+        // for the single false-idle shape dropped above (a bare idle mid-tool).
         // The bubble lifecycle below (`status`/`activeResponse`) still defers
         // to response_end, but that is separate from the session-level status.
         const patch: Partial<ChatState> = {
@@ -6673,6 +6688,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
         return patch;
       });
+      // A dropped false idle must vanish entirely: no sidebar-cache status
+      // flip and no turn-end invalidations for an edge the store ignored.
+      if (ignoredFalseIdle) return;
       // Refetch the snapshot at turn START too: the runner persists
       // turn-scoped labels (e.g. the cost advisor's `cost_control.plan`
       // verdict) before the harness runs, so the verdict can render

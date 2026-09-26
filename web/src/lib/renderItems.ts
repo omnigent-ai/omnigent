@@ -1653,6 +1653,24 @@ function buildAssistantItems(
   return items;
 }
 
+/** Whether a trailing tool call has no inline output or matching result. */
+export function hasUnresolvedTrailingToolCall(blocks: AnyBlock[]): boolean {
+  const resolved = new Set<string>();
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const b = blocks[i]!;
+    if (b.type === "tool_result") {
+      resolved.add(b.callId);
+      continue;
+    }
+    if (b.type === "native_tool") continue;
+    if (b.type !== "tool_group") break;
+    for (const ex of b.executions) {
+      if (ex.output === null && !resolved.has(ex.callId)) return true;
+    }
+  }
+  return false;
+}
+
 function trailingLiveToolCallIds(
   blocks: AnyBlock[],
   lifecycle: ActiveResponse["state"],
