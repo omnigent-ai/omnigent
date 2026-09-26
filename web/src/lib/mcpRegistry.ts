@@ -1,5 +1,6 @@
 import { authenticatedFetch } from "./identity";
 import { withBasePath } from "./basePath";
+import { databricksConnectUrl } from "./databricksIntegration";
 
 export interface RegistryService {
   id: string;
@@ -20,11 +21,21 @@ export async function registryRequest<T>(path = "", init?: RequestInit): Promise
   return response.json() as Promise<T>;
 }
 
-export function authorizeRegistryService(service: RegistryService, signal: AbortSignal) {
+export function authorizeRegistryService(
+  service: RegistryService,
+  signal: AbortSignal,
+  workspace?: string,
+) {
+  if (service.auth === "databricks" && !workspace?.trim()) {
+    return Promise.reject(new Error("Enter your Databricks workspace URL."));
+  }
   const returnTo = withBasePath("/settings/mcp");
-  const url = withBasePath(
-    `/v1/connections/${encodeURIComponent(service.connect_provider)}/connect?return_to=${encodeURIComponent(returnTo)}`,
-  );
+  const url =
+    service.auth === "databricks"
+      ? databricksConnectUrl(workspace!.trim(), returnTo)
+      : withBasePath(
+          `/v1/connections/${encodeURIComponent(service.connect_provider)}/connect?return_to=${encodeURIComponent(returnTo)}`,
+        );
   const popup = window.open("about:blank", "_blank", "popup,width=600,height=720");
   if (!popup) return Promise.reject(new Error("Allow pop-ups to connect this account."));
   // The provider page must not be able to navigate the session window.

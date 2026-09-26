@@ -333,3 +333,89 @@ async def test_connection_test_preserves_safe_upstream_diagnosis(registry, monke
         response = await client.post("/v1/mcp-registry/services/tracker/test")
     assert response.status_code == 502
     assert "HTTP 403" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", ["a" * 4080, "é" * 1000])
+async def test_kms_rejects_oversized_serialized_bearer_before_encrypt(db_uri, token):
+    from unittest.mock import Mock
+
+    from omnigent.stores.credential_store.secret_cipher import KmsSecretCipher
+
+    kms = Mock()
+    store = CredentialStore(db_uri, KmsSecretCipher("test-key", client=kms))
+    registry = McpRegistry(McpRegistryConfig(services=[service()]), store)
+    app = FastAPI()
+    app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.put(
+            "/v1/mcp-registry/services/tracker/connection",
+            headers={"x-test-user": "alice"},
+            json={"token": token},
+        )
+    assert response.status_code == 400, response.text
+    assert "4096 serialized bytes" in response.text and "Vault" in response.text
+    assert token not in response.text
+    kms.encrypt.assert_not_called()
+    assert store.get("alice", "mcp:tracker") is None
+
+
+@pytest.mark.asyncio
+async def test_kms_oauth_size_error_is_a_connection_error(db_uri, monkeypatch):
+    from unittest.mock import Mock
+
+    from omnigent.server.mcp_registry import McpOAuthHooks
+    from omnigent.stores.credential_store.secret_cipher import KmsSecretCipher
+
+    kms = Mock()
+    kms.encrypt.return_value = {"CiphertextBlob": b"test-cipher"}
+    kms.decrypt.return_value = {"Plaintext": b'{"nonce": "nonce", "verifier": "verifier"}'}
+    store = CredentialStore(db_uri, KmsSecretCipher("test-key", client=kms))
+    store.upsert(
+        "alice",
+        "mcp-pending:tracker",
+        secret={"nonce": "nonce", "verifier": "verifier"},
+        metadata={},
+    )
+    kms.encrypt.reset_mock()
+    entry = service(
+        auth="oauth",
+        oauth={
+            "authorize_url": "https://auth.example.test/authorize",
+            "token_url": "https://auth.example.test/token",
+            "client_id": "demo",
+        },
+    )
+    monkeypatch.setenv("OMNIGENT_MCP_OAUTH_STATE_SECRET", "test-signing-key-32-characters-long")
+    registry = McpRegistry(
+        McpRegistryConfig(public_url="http://localhost", services=[entry]), store
+    )
+    monkeypatch.setattr(
+        registry,
+        "exchange",
+        AsyncMock(return_value={"access_token": "short", "refresh_token": "x" * 4096}),
+    )
+    with pytest.raises(ConnectionError, match="4096 serialized bytes"):
+        await McpOAuthHooks(registry, entry).complete(
+            "alice", "code", {"nonce": "nonce", "service": "tracker"}
+        )
+    kms.encrypt.assert_not_called()
+    assert store.get("alice", "mcp:tracker") is None
+
+
+def test_kms_size_boundary_counts_utf8_bytes():
+    from unittest.mock import Mock
+
+    from omnigent.stores.credential_store.secret_cipher import KmsSecretCipher, SecretTooLargeError
+
+    kms = Mock()
+    kms.encrypt.return_value = {"CiphertextBlob": b"cipher"}
+    cipher = KmsSecretCipher("test-key", client=kms)
+    cipher.encrypt("é" * 2048, context={"user_id": "alice"})
+    assert len(kms.encrypt.call_args.kwargs["Plaintext"]) == 4096
+    kms.encrypt.reset_mock()
+    with pytest.raises(SecretTooLargeError):
+        cipher.encrypt("é" * 2049, context={"user_id": "alice"})
+    kms.encrypt.assert_not_called()

@@ -15,6 +15,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import Context
 
+REDIRECT_URI = "http://localhost:18780/v1/connections/mcp-tracker/callback"
+
 mcp = FastMCP("Demo work tracker", stateless_http=True, json_response=True)
 codes: dict[str, dict] = {}
 refresh_tokens: dict[str, dict] = {}
@@ -92,16 +94,14 @@ def authorize(request: Request):
 async def approve(request: Request):
     fields = dict(await request.form())
     redirect = str(fields.get("redirect_uri", ""))
-    from urllib.parse import urlsplit
-
-    if urlsplit(redirect).hostname not in {"localhost", "127.0.0.1"}:
-        raise HTTPException(400, "The demo only accepts localhost callbacks")
+    if redirect != REDIRECT_URI:
+        raise HTTPException(400, "Callback does not match the registered demo redirect URI")
     if fields.get("code_challenge_method") != "S256":
         raise HTTPException(400, "PKCE is required")
     code = secrets.token_urlsafe(24)
     codes[code] = {**fields, "expires_at": time.time() + 120}
     return RedirectResponse(
-        redirect + "?" + urlencode({"code": code, "state": fields["state"]}), status_code=303
+        REDIRECT_URI + "?" + urlencode({"code": code, "state": fields["state"]}), status_code=303
     )
 
 
@@ -152,5 +152,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18782)
+    parser.add_argument("--redirect-uri", default=REDIRECT_URI)
     args = parser.parse_args()
+    REDIRECT_URI = args.redirect_uri
     uvicorn.run(app, host="0.0.0.0", port=args.port)

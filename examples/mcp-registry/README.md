@@ -260,8 +260,20 @@ PKCE S256 is used. Confidential clients send the secret named by
 `client_secret_env` in the token request body. Configure a stable random
 `OMNIGENT_MCP_OAUTH_STATE_SECRET` of at least 32 characters.
 
+The local demo accepts only its registered callback URL, defaulting to
+`http://localhost:18780/v1/connections/mcp-tracker/callback`. If the Omnigent
+port or base path changes, start the provider with `--redirect-uri <callback>`.
+Disconnected Databricks services ask for a workspace URL in the launch picker
+before opening the existing Databricks OAuth flow.
+
 Personal bearer/OAuth connections require the existing KMS or Vault cipher;
 there is no plaintext fallback. Connections are scoped to workspace and user.
+
+KMS-backed connections must fit within 4096 bytes after JSON serialization and
+UTF-8 encoding, including both access and refresh tokens. Oversized credentials
+are rejected before encryption with an operator-facing message; use the existing
+Vault Transit backend for larger grants. OAuth connection failures return to the
+UI as sign-in errors, with the storage-limit diagnosis in the server log.
 The new `mcp:<id>` records do not register a credential-vending provider.
 For an already-supported credential provider, reuse its configured connection:
 
@@ -304,7 +316,7 @@ sequenceDiagram
   H->>G: POST /v1/mcp/tracker: read_ticket + authenticated session context
   G->>P: Existing tool-call policy / approval
   P-->>G: Allow
-  G->>G: Resolve trusted actor and check service and tool allowlists
+  G->>G: Authenticate caller and check service and tool allowlists
   G->>C: Load this workspace/user/service connection
   opt Token expires soon
     G->>O: Refresh token exchange
@@ -394,5 +406,5 @@ exercises real Vault encryption, UI OAuth redirects, the Docker host, and a harn
 Browser launch tests cover local-host and sandbox selections on desktop and mobile;
 the local-host integration also discovers and calls tools through `ProxyMcpManager`.
 Gateway tests exercise both the default backend and an injected backend, including
-request denial, approval, argument transforms, result filtering, trusted actor
+request denial, approval, argument transforms, result filtering, authenticated caller
 selection, session permissions and transport failures without replay.

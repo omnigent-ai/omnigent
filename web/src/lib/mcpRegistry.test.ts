@@ -73,3 +73,23 @@ it("closes the popup and cancels polling when the picker unmounts", async () => 
   expect(popup.close).toHaveBeenCalledOnce();
   expect(vi.getTimerCount()).toBe(0);
 });
+
+it("requires a Databricks workspace and includes it in the existing provider flow", async () => {
+  const databricks = { ...service, auth: "databricks" as const, connect_provider: "databricks" };
+  const controller = new AbortController();
+  await expect(authorizeRegistryService(databricks, controller.signal)).rejects.toThrow(
+    "workspace URL",
+  );
+  expect(window.open).not.toHaveBeenCalled();
+  const result = authorizeRegistryService(
+    databricks,
+    controller.signal,
+    "https://workspace.example.test",
+  );
+  const url = new URL(popup.location.href, window.location.origin);
+  expect(url.pathname).toBe("/v1/connections/databricks/connect");
+  expect(url.searchParams.get("workspace")).toBe("https://workspace.example.test");
+  const assertion = expect(result).rejects.toThrow("cancelled");
+  controller.abort();
+  await assertion;
+});

@@ -14,7 +14,6 @@ from omnigent.server.mcp_gateway import gateway_backend
 from omnigent.server.mcp_registry import McpRegistry, McpService
 from omnigent.server.registry_gateway import execute_registry_tool, registry_user
 from omnigent.server.routes._auth_helpers import require_access, require_user
-from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
 from omnigent.server.routes._sessions.helpers import _build_actor, _load_agent_spec_for_session
 from omnigent.server.routes._sessions.orchestration import _handle_mcp_tools_call
 from omnigent.server.routes.connections_base import ConnectionError
@@ -75,7 +74,7 @@ class McpPolicyAdapter:
         if registry is None:
             raise HTTPException(404, "MCP gateway is not configured")
         try:
-            user = registry_user(_build_actor(conv.labels.get(_TURN_ACTOR_LABEL) or caller))
+            user = registry_user(_build_actor(caller))
             service = registry.service(service_id, user)
         except ConnectionError as exc:
             raise HTTPException(403, str(exc)) from None

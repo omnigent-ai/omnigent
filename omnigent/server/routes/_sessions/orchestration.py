@@ -10771,6 +10771,7 @@ async def _create_session_from_existing_agent(
             source_bundle,
             body.mcp_registry_services,
             user_id,
+            trusted_template=agent.session_id is None,
         )
 
     # Validate the host workspace before creating a session or worktree.
@@ -10987,6 +10988,8 @@ async def _create_session_from_existing_agent(
             agent_for_user, agent_store, artifact_store, agent, user_id
         )
 
+
+    session_persisted = False
     try:
         # Include spec-seeded defaults before create; overflow must not leave a session.
         encode_session_overrides(
@@ -11017,11 +11020,19 @@ async def _create_session_from_existing_agent(
                         reasoning_effort=reasoning_effort,
                     ),
                     registry_bundle,
+                    spec=validate_agent_bundle(
+                        registry_bundle,
+                        enforce_handler_allowlist=not (
+                            agent.session_id is None or local_single_user_enabled()
+                        ),
+                    ),
+                    derive_launch_args=False,
                     runner_id=inherited_runner_id,
                     inference_snapshot=inference_snapshot,
                     inference_model=model_override,
                     created_by=user_id,
                 )
+                session_persisted = True
                 conv = await asyncio.to_thread(
                     conversation_store.get_conversation, created.session_id
                 )
@@ -11074,7 +11085,8 @@ async def _create_session_from_existing_agent(
                 )
     except NameAlreadyExistsError as exc:
         if (
-            created_worktree_path is not None
+            not session_persisted
+            and created_worktree_path is not None
             and body.host_id is not None
             and git_branch is not None
         ):
@@ -11091,6 +11103,8 @@ async def _create_session_from_existing_agent(
             )
         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
     except Exception:
+        # After persistence, the workspace belongs to the session even if a
+        # follow-up metadata write fails. Before that, roll back our worktree.
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
         # cleanup before the error propagates. We re-raise unchanged
@@ -11099,7 +11113,8 @@ async def _create_session_from_existing_agent(
         # force-removed. An existing worktree bound via workspace_branch
         # also sets git_branch but is the user's — never destroy it.
         if (
-            created_worktree_path is not None
+            not session_persisted
+            and created_worktree_path is not None
             and body.host_id is not None
             and git_branch is not None
         ):
@@ -11330,6 +11345,9 @@ def _create_session_from_bundle(
     inference_model: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
+
+    *,
+    derive_launch_args: bool = True,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -11350,6 +11368,8 @@ def _create_session_from_bundle(
         parent session (caller-resolved, ownership-checked),
         e.g. ``"runner_abc123"``. ``None`` leaves the session
         unbound.
+    :param derive_launch_args: False for an internal template copy whose caller
+        already validated the launch arguments, including interactive children.
     :param spec: Optional pre-validated spec for *bundle_bytes*. The
         multipart route validates the bundle once up front (it needs
         ``os_env.cwd`` for workspace validation before any row
@@ -11391,7 +11411,7 @@ def _create_session_from_bundle(
         )
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
-    if metadata.parent_session_id is not None:
+    if derive_launch_args and metadata.parent_session_id is not None:
         try:
             terminal_launch_args = _derive_terminal_launch_args_from_spec(spec)
         except ValueError as exc:
@@ -11400,7 +11420,7 @@ def _create_session_from_bundle(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
-    elif metadata.terminal_launch_args is None:
+    elif derive_launch_args and metadata.terminal_launch_args is None:
         # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the
         # spec's explicit bypass opt-ins (e.g. codex-native ``yolo: true``);
         # an interactive session never inherits the headless default bypass.

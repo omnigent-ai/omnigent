@@ -33,6 +33,8 @@ def demo_mcp(tmp_path):
                 str(root / "examples/mcp-registry/demo_service.py"),
                 "--port",
                 str(port),
+                "--redirect-uri",
+                "http://localhost/v1/connections/mcp-tracker/callback",
             ],
             stdout=log,
             stderr=log,
@@ -44,6 +46,7 @@ def demo_mcp(tmp_path):
                     if httpx.get(url + "/health", timeout=0.2).status_code == 200:
                         break
                 except httpx.HTTPError:
+                    # Connection/read failures are expected while the server starts.
                     pass
                 if process.poll() is not None:
                     log.seek(0)
@@ -126,3 +129,17 @@ async def test_connect_refresh_reuse_and_disconnect(db_uri, demo_mcp, monkeypatc
         assert (await browser.get("/v1/mcp-registry/services")).json()["data"][0][
             "connected"
         ] is False
+
+
+def test_demo_authorization_requires_registered_callback(demo_mcp):
+    response = httpx.post(
+        demo_mcp + "/authorize",
+        data={
+            "redirect_uri": "http://localhost/unregistered-callback",
+            "state": "test-state",
+            "code_challenge_method": "S256",
+            "code_challenge": "test-challenge",
+        },
+    )
+    assert response.status_code == 400
+    assert "location" not in response.headers

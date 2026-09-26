@@ -157,7 +157,9 @@ prove that a write did not execute.
 
 `POST /v1/mcp/{service_id}` has a session-independent URL. Its Omnigent adapter
 requires `X-Omnigent-Session-Id` and authenticates the caller before checking edit
-access, session selection, the trusted turn actor and service/tool allowlists.
+access, session selection, and the authenticated caller's service/tool allowlists.
+The same caller owns the upstream credential, including on the legacy route.
+Session sharing and historical turn labels do not delegate account access.
 The header is a context reference, not a credential. Sessionless calls are not
 supported by this adapter. No separate policy service needs to be deployed.
 
@@ -282,6 +284,12 @@ grant. Resolution fails while no grant exists; an already-authorized call may
 finish. A refresh cannot recreate a connection deleted while it was in progress.
 An OAuth callback already exchanging its code can still save a connection after
 disconnect; cancellation of that in-flight exchange remains a prototype limit.
+
+KMS-backed connections must fit within 4096 bytes after JSON serialization and
+UTF-8 encoding, including both access and refresh tokens. Oversized credentials
+are rejected before encryption with an operator-facing message; use the existing
+Vault Transit backend for larger grants. OAuth connection failures return to the
+UI as sign-in errors, with the storage-limit diagnosis in the server log.
 
 ## Gateway versus credential broker
 
