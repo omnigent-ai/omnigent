@@ -4,14 +4,16 @@ The runner-orchestration sibling of ``test_opencode_native_wire_contract_e2e.py`
 (which drives ``OpenCodeNativeServer`` directly). This exercises the WHOLE
 product path: list built-in agents -> find ``opencode-native-ui`` -> connect a
 host daemon -> create a host-bound session -> the runner auto-creates the
-``opencode serve`` + SSE forwarder + ``opencode attach`` terminal resource ->
-send a user message -> poll session items until the assistant echoes a marker.
+``opencode serve --stdio`` + SSE forwarder + ``opencode --server`` TUI terminal
+resource -> send a user message -> poll session items until the assistant echoes a marker.
 
-Opt-in (needs a pinned ``opencode`` binary + LLM credentials)::
+Opt-in and run manually before merging opencode-native changes (needs
+``@opencode/cli`` 2.0.x on PATH and LLM credentials)::
 
+    npm install -g @opencode/cli@~2.0.18
     OMNIGENT_E2E_OPENCODE_NATIVE=1 \
     HOME=/tmp/omni-isolated DATABRICKS_CONFIG_FILE=$REAL_HOME/.databrickscfg \
-    .venv/bin/python -m pytest tests/e2e/test_host_opencode_native_e2e.py \
+    uv run pytest tests/e2e/test_host_opencode_native_e2e.py \
         --profile ai-devtools-prod \
         --llm-api-key "$(databricks auth token -p ai-devtools-prod \
             | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')" \
@@ -41,7 +43,7 @@ from tests.e2e.helpers import POLL_INTERVAL_S
 pytestmark = pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_OPENCODE_NATIVE") != "1" or shutil.which("opencode") is None,
     reason=(
-        "opencode-native host e2e needs a pinned `opencode` binary + LLM creds; "
+        "opencode-native host e2e needs `opencode` 2.x (npm @opencode/cli@~2.0.18) + LLM creds; "
         "set OMNIGENT_E2E_OPENCODE_NATIVE=1 (and pass --profile/--llm-api-key) to run"
     ),
 )
@@ -226,7 +228,7 @@ def test_opencode_native_host_session_auto_creates_terminal(
     Exercises the runner-orchestration path end-to-end: an online host daemon
     runs the session, and the runner's session-creation dispatch must call
     :func:`_auto_create_opencode_terminal` (boot ``opencode serve`` + SSE
-    forwarder + ``opencode attach``) and register ``terminal_opencode_main`` as
+    forwarder + ``opencode --server`` TUI) and register ``terminal_opencode_main`` as
     a streamable resource — so the Web UI has a terminal+chat view to embed,
     exactly as it does for claude/codex/pi/cursor.
 
@@ -256,9 +258,8 @@ def test_opencode_native_host_session_auto_creates_terminal(
         create.raise_for_status()
         session_id = create.json()["id"]
 
-        # The runner's _auto_create_opencode_terminal must register the TUI on
-        # session creation (the dispatch branch this PR adds alongside the other
-        # natives) — otherwise the Web UI would have no terminal to attach to.
+        # The runner registers the TUI on session creation; without it the
+        # Web UI has no terminal to attach to.
         terminal_id = terminal_resource_id("opencode", "main")
         _poll_for_terminal(
             http_client,
