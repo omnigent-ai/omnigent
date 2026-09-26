@@ -12,6 +12,7 @@ import {
   layoutTree,
   type TreeNode,
 } from "./subagentGraphLayout";
+import type { SubagentIconSource } from "./subagentIcons";
 import { activityDotClassName, childStatus, sessionStatus } from "./subagentStatus";
 import { SubagentsPanel } from "./SubagentsPanel";
 
@@ -120,6 +121,13 @@ function renderPanel(opts: { conversationId?: string; rootSessionId?: string } =
   );
 }
 
+const ROOT_IDENTITY = {
+  kind: "root",
+  wrapper: null,
+  harness: null,
+  agentName: null,
+} as const satisfies SubagentIconSource;
+
 function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
   return {
     id,
@@ -127,9 +135,14 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
     activity: "idle",
     statusLabel: "Idle",
     preview: null,
+    identity: { kind: "child", wrapper: null, tool: null },
     children: [],
     ...overrides,
   };
+}
+
+function treeRoot(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
+  return leaf(id, { identity: ROOT_IDENTITY, ...overrides });
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +341,7 @@ describe("computeSubtreeWidths", () => {
 
   it("computes width as sum of children + gaps for a parent", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [leaf("c1"), leaf("c2"), leaf("c3")],
     };
     const widths = computeSubtreeWidths(root);
@@ -338,14 +351,14 @@ describe("computeSubtreeWidths", () => {
   });
 
   it("uses the larger of NODE_WIDTH and total children width", () => {
-    const root: TreeNode = { ...leaf("root"), children: [leaf("c1")] };
+    const root: TreeNode = { ...treeRoot("root"), children: [leaf("c1")] };
     const widths = computeSubtreeWidths(root);
     expect(widths.get("root")).toBe(180);
   });
 
   it("handles nested trees", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [{ ...leaf("a"), children: [leaf("a1"), leaf("a2")] }, leaf("b")],
     };
     const widths = computeSubtreeWidths(root);
@@ -362,7 +375,7 @@ describe("computeSubtreeWidths", () => {
 
 describe("layoutTree", () => {
   it("places a single root node at the origin", () => {
-    const { nodes, edges } = layoutTree(leaf("root"), "root");
+    const { nodes, edges } = layoutTree(treeRoot("root"), "root");
     expect(nodes).toHaveLength(1);
     expect(edges).toHaveLength(0);
     expect(nodes[0].id).toBe("root");
@@ -371,19 +384,21 @@ describe("layoutTree", () => {
 
   it("creates edges from parent to each child", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [leaf("c1"), leaf("c2")],
     };
     const { nodes, edges } = layoutTree(root, "none");
     expect(nodes).toHaveLength(3);
     expect(edges).toHaveLength(2);
+    expect(nodes.find((node) => node.id === "root")!.data.identity.kind).toBe("root");
+    expect(nodes.find((node) => node.id === "c1")!.data.identity.kind).toBe("child");
     expect(edges[0]).toMatchObject({ source: "root", target: "c1" });
     expect(edges[1]).toMatchObject({ source: "root", target: "c2" });
   });
 
   it("marks active node correctly", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [leaf("c1"), leaf("c2")],
     };
     const { nodes } = layoutTree(root, "c2");
@@ -393,7 +408,7 @@ describe("layoutTree", () => {
   });
 
   it("positions children below the parent", () => {
-    const root: TreeNode = { ...leaf("root"), children: [leaf("c1")] };
+    const root: TreeNode = { ...treeRoot("root"), children: [leaf("c1")] };
     const { nodes } = layoutTree(root, "none");
     const rootNode = nodes.find((n) => n.id === "root")!;
     const childNode = nodes.find((n) => n.id === "c1")!;
@@ -402,7 +417,7 @@ describe("layoutTree", () => {
 
   it("spaces siblings horizontally", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [leaf("c1"), leaf("c2"), leaf("c3")],
     };
     const { nodes } = layoutTree(root, "none");
@@ -413,7 +428,7 @@ describe("layoutTree", () => {
 
   it("centers parent above its children", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [leaf("c1"), leaf("c2")],
     };
     const { nodes } = layoutTree(root, "none");
@@ -427,7 +442,7 @@ describe("layoutTree", () => {
 
   it("animates edges to working children", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [leaf("c_work", { activity: "working" }), leaf("c_idle")],
     };
     const { edges } = layoutTree(root, "none");
@@ -439,7 +454,7 @@ describe("layoutTree", () => {
 
   it("uses higher opacity on edges to working children", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [leaf("c_work", { activity: "working" }), leaf("c_idle")],
     };
     const { edges } = layoutTree(root, "none");
@@ -450,7 +465,7 @@ describe("layoutTree", () => {
 
   it("lays out a 3-level tree without overlapping nodes", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: [
         { ...leaf("a"), children: [leaf("a1"), leaf("a2")] },
         { ...leaf("b"), children: [leaf("b1"), leaf("b2"), leaf("b3")] },
@@ -475,7 +490,7 @@ describe("layoutTree", () => {
 
   it("handles a wide flat tree (many siblings)", () => {
     const root: TreeNode = {
-      ...leaf("root"),
+      ...treeRoot("root"),
       children: Array.from({ length: 10 }, (_, i) => leaf(`c${i}`)),
     };
     const { nodes, edges } = layoutTree(root, "none");
@@ -493,15 +508,61 @@ describe("layoutTree", () => {
 
 describe("buildTree", () => {
   it("creates a leaf when no children exist in the map", () => {
-    const tree = buildTree("root", "main", "idle", "Idle", null, new Map(), 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, new Map(), 0, ROOT_IDENTITY);
     expect(tree).toEqual({
       id: "root",
       label: "main",
       activity: "idle",
       statusLabel: "Idle",
       preview: null,
+      identity: ROOT_IDENTITY,
       children: [],
     });
+  });
+
+  it("carries root and child identity through layout without changing geometry", () => {
+    const map = new Map<string, ChildSessionInfo[]>();
+    map.set("root", [
+      childInfo({
+        id: "child",
+        tool: "Explore",
+        labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+      }),
+    ]);
+
+    const tree = buildTree("root", "Codex", "idle", "Idle", null, map, 0, {
+      kind: "root",
+      wrapper: "codex-native-ui",
+      harness: "codex-native",
+      agentName: "codex-native-ui",
+    });
+    const { nodes } = layoutTree(tree, "root");
+
+    expect(nodes.map(({ id, position, data }) => ({ id, position, data }))).toMatchObject([
+      {
+        id: "root",
+        position: { x: -90, y: 0 },
+        data: {
+          identity: {
+            kind: "root",
+            wrapper: "codex-native-ui",
+            harness: "codex-native",
+            agentName: "codex-native-ui",
+          },
+        },
+      },
+      {
+        id: "child",
+        position: { x: -90, y: 90 },
+        data: {
+          identity: {
+            kind: "child",
+            wrapper: "codex-native-ui-subagent",
+            tool: "Explore",
+          },
+        },
+      },
+    ]);
   });
 
   it("builds nested tree from children map", () => {
@@ -517,7 +578,7 @@ describe("buildTree", () => {
     ]);
     map.set("c1", [childInfo({ id: "c1a", session_name: "search", tool: "Explore" })]);
 
-    const tree = buildTree("root", "main", "working", "Working", null, map, 0);
+    const tree = buildTree("root", "main", "working", "Working", null, map, 0, ROOT_IDENTITY);
 
     expect(tree.children).toHaveLength(2);
     expect(tree.children[0].id).toBe("c1");
@@ -537,7 +598,7 @@ describe("buildTree", () => {
     map.set("c2", [childInfo({ id: "c3", tool: "c" })]);
     map.set("c3", [childInfo({ id: "c4", tool: "d" })]);
 
-    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0, ROOT_IDENTITY);
 
     expect(tree.children).toHaveLength(1);
     expect(tree.children[0].children).toHaveLength(1);
@@ -554,7 +615,7 @@ describe("buildTree", () => {
       childInfo({ id: "c4" }),
     ]);
 
-    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0, ROOT_IDENTITY);
 
     expect(tree.children[0].label).toBe("named");
     expect(tree.children[1].label).toBe("titled");
@@ -600,7 +661,7 @@ describe("buildTree", () => {
       }),
     ]);
 
-    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0, ROOT_IDENTITY);
 
     expect(tree.children[0].label).toBe("Investigate flaky auth test");
     expect(tree.children[1].label).toBe("general-purpose:b7c2e9f4a1d3c5e60");
@@ -614,7 +675,7 @@ describe("buildTree", () => {
       childInfo({ id: "c1", tool: "a", last_message_preview: "Searching for auth..." }),
     ]);
 
-    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0, ROOT_IDENTITY);
 
     expect(tree.children[0].preview).toBe("Searching for auth...");
   });
