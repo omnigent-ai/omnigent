@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import re
 import sqlite3
 import subprocess
-from collections.abc import Sequence
+import tempfile
+from collections.abc import AsyncIterator, Coroutine, Sequence
 from hashlib import sha256
 from pathlib import Path
-from typing import get_args
+from typing import Any, TypeVar, get_args
 
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.harnesses.claude_native.bridge import (
@@ -29,8 +32,12 @@ from omnigent.harnesses.kiro_native.session_forwarder import (
 )
 from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
+    OpenCodeNativeServer,
+    client_for_state,
     find_opencode_cli,
 )
+from omnigent.harnesses.opencode_native.bridge import user_xdg_data_home
+from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeClientError
 from omnigent.harnesses.opencode_native.forwarder import opencode_tool_output_text
 from omnigent.session_import.models import (
     ImportSource,
@@ -43,6 +50,8 @@ _OPENCODE_IMPORT_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]+")
 _MAX_EXTERNAL_SESSION_ID_LENGTH = 128
 _MAX_RESPONSE_ID_LENGTH = 64
 _OPENCODE_COMMAND_TIMEOUT_SECONDS = 120
+_OPENCODE_IMPORT_START_TIMEOUT_SECONDS = 120.0
+_T = TypeVar("_T")
 
 # Transcript byte size past which an import is trimmed to the last compaction
 # boundary instead of the full history. Below it the whole transcript imports
@@ -186,6 +195,65 @@ def _run_opencode_json(
         raise SessionImportNotFoundError("OpenCode returned invalid JSON") from exc
 
 
+def _opencode_user_store_exists() -> bool:
+    """Whether the user has a local OpenCode database to import from."""
+    store = user_xdg_data_home() / "opencode"
+    return any(store.glob("opencode*.db"))
+
+
+@contextlib.asynccontextmanager
+async def _opencode_import_client() -> AsyncIterator[OpenCodeClient]:
+    """Start a short-lived ``opencode serve`` on the user's store and yield a client.
+
+    The server gets a throwaway config home, so the user's plugins and MCP
+    servers never start; it is stopped when the block exits.
+    """
+    try:
+        opencode_path = find_opencode_cli(None)
+    except OpenCodeCliNotFoundError as exc:
+        raise SessionImportNotFoundError(str(exc)) from exc
+    with tempfile.TemporaryDirectory(prefix="omnigent-opencode-import-") as scratch:
+        server = OpenCodeNativeServer(
+            bridge_dir=Path(scratch),
+            workspace=Path.home(),
+            opencode_path=opencode_path,
+            user_data_store=True,
+        )
+        try:
+            await asyncio.wait_for(server.start(), timeout=_OPENCODE_IMPORT_START_TIMEOUT_SECONDS)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            raise SessionImportNotFoundError(f"OpenCode server could not start: {exc}") from exc
+        client = client_for_state(base_url=server.base_url, auth_secret=server.auth_secret)
+        try:
+            yield client
+        finally:
+            await client.aclose()
+            await server.close()
+
+
+def _run_opencode_import(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Run one import coroutine from synchronous import code (CLI or worker thread)."""
+    return asyncio.run(coro)
+
+
+async def _list_opencode_root_sessions(limit: int) -> list[tuple[str, float]]:
+    """Return ``(session_id, updated_ms)`` for the user's newest top-level sessions."""
+    async with _opencode_import_client() as client:
+        try:
+            sessions = await client.list_root_sessions(limit=limit)
+        except OpenCodeClientError as exc:
+            raise SessionImportNotFoundError(f"OpenCode session list failed: {exc}") from exc
+    recent: list[tuple[str, float]] = []
+    for session in sessions:
+        if session.parent_id or not _is_safe_opencode_import_session_id(session.id):
+            continue
+        time_info = session.raw.get("time")
+        updated = time_info.get("updated") if isinstance(time_info, dict) else None
+        recent.append((session.id, float(updated) if isinstance(updated, (int, float)) else 0.0))
+    recent.sort(key=lambda entry: (entry[1], entry[0]), reverse=True)
+    return recent[:limit]
+
+
 def _qwen_session_locator(path: Path) -> str:
     """Qualify a Qwen id by project while staying within API limits."""
     project = path.parent.parent.name
@@ -279,34 +347,9 @@ def _recent_local_sessions_with_recency(
         return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "opencode":
-        payload = _run_opencode_json(
-            "session",
-            "list",
-            "--format",
-            "json",
-            "--pure",
-            empty_ok=True,
-        )
-        if not isinstance(payload, list):
-            raise SessionImportNotFoundError("OpenCode returned an invalid session list")
-        updated_by_id: dict[str, int | float] = {}
-        for entry in payload:
-            if not isinstance(entry, dict) or isinstance(entry.get("parentID"), str):
-                continue
-            session_id = entry.get("id")
-            updated = entry.get("updated")
-            if not isinstance(session_id, str) or not _is_safe_opencode_import_session_id(
-                session_id
-            ):
-                continue
-            timestamp = updated if isinstance(updated, (int, float)) else 0
-            updated_by_id[session_id] = max(updated_by_id.get(session_id, 0), timestamp)
-        ordered = sorted(
-            updated_by_id,
-            key=lambda session_id: (updated_by_id[session_id], session_id),
-            reverse=True,
-        )
-        return [(session_id, float(updated_by_id[session_id])) for session_id in ordered[:limit]]
+        if not _opencode_user_store_exists():
+            return []
+        return _run_opencode_import(_list_opencode_root_sessions(limit))
 
     if source == "pi":
         configured_home = os.environ.get("PI_CODING_AGENT_DIR")

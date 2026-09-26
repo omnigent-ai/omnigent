@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,6 +17,8 @@ from omnigent.harnesses.kiro_native.session_forwarder import (
     KiroConversationMessage,
     parse_kiro_jsonl_line,
 )
+from omnigent.harnesses.opencode_native.app_server import OpenCodeCliNotFoundError
+from omnigent.harnesses.opencode_native.client import OpenCodeSession
 from omnigent.session_import import local as local_import
 from omnigent.session_import.local import (
     list_recent_local_session_ids,
@@ -171,53 +176,105 @@ def test_long_source_ids_get_distinct_bounded_response_ids(
     assert all(len(response_id) <= 64 for response_id in response_ids)
 
 
-def test_list_recent_opencode_sessions_uses_public_cli(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """OpenCode batch discovery uses its supported JSON listing command."""
-    calls: list[tuple[str, ...]] = []
+class _FakeImportClient:
+    """Stand-in for the import server's OpenCode client."""
 
-    def fake_run(
-        *arguments: str, opencode_path: str | None = None, empty_ok: bool = False
-    ) -> object:
-        assert opencode_path is None
-        calls.append(arguments)
-        return [
-            {"id": "ses_old", "updated": 10, "directory": "/old"},
-            {"id": "ses_child", "updated": 30, "parentID": "ses_parent"},
-            {"id": "ses_new", "updated": 20, "directory": "/new"},
-        ]
+    def __init__(
+        self,
+        *,
+        sessions: list[OpenCodeSession] | None = None,
+        session: OpenCodeSession | None = None,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self._sessions = sessions or []
+        self._session = session
+        self._messages = messages or []
+        self.list_limits: list[int] = []
 
-    monkeypatch.setattr(local_import, "_run_opencode_json", fake_run)
+    async def list_root_sessions(self, *, limit: int = 100) -> list[OpenCodeSession]:
+        self.list_limits.append(limit)
+        return self._sessions
 
-    assert list_recent_local_session_ids("opencode", limit=2) == ("ses_new", "ses_old")
-    assert calls == [("session", "list", "--format", "json", "--pure")]
+    async def get_session(self, session_id: str) -> OpenCodeSession | None:
+        return self._session if self._session and self._session.id == session_id else None
 
-
-def test_list_recent_opencode_sessions_rejects_schema_drift(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A changed public listing schema reports a contract error."""
-    monkeypatch.setattr(local_import, "_run_opencode_json", lambda *arguments, **kwargs: {})
-
-    with pytest.raises(SessionImportNotFoundError, match="invalid session list"):
-        list_recent_local_session_ids("opencode", limit=1)
+    async def list_messages(
+        self, session_id: str, *, after_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._messages
 
 
-def test_list_recent_opencode_sessions_treats_empty_output_as_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With no sessions OpenCode prints nothing (exit 0) — not an error."""
-    from types import SimpleNamespace
+def _use_import_client(monkeypatch: pytest.MonkeyPatch, fake: _FakeImportClient) -> None:
+    @contextlib.asynccontextmanager
+    async def _fake_cm() -> AsyncIterator[_FakeImportClient]:
+        yield fake
 
-    monkeypatch.setattr(local_import, "find_opencode_cli", lambda path: "/fake/opencode")
-    monkeypatch.setattr(
-        local_import.subprocess,
-        "run",
-        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    monkeypatch.setattr(local_import, "_opencode_import_client", _fake_cm)
+    monkeypatch.setattr(local_import, "_opencode_user_store_exists", lambda: True)
+
+
+def _session(session_id: str, *, updated: int, parent: str | None = None) -> OpenCodeSession:
+    return OpenCodeSession(
+        id=session_id,
+        parent_id=parent,
+        raw={"id": session_id, "time": {"created": 1, "updated": updated}},
     )
 
+
+def test_list_recent_opencode_sessions_uses_server_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batch discovery lists top-level sessions across projects, newest first."""
+    fake = _FakeImportClient(
+        sessions=[
+            _session("ses_old", updated=10),
+            _session("ses_child", updated=30, parent="ses_parent"),
+            _session("ses_new", updated=20),
+            _session("--help", updated=40),
+        ]
+    )
+    _use_import_client(monkeypatch, fake)
+
+    assert list_recent_local_session_ids("opencode", limit=2) == ("ses_new", "ses_old")
+    assert fake.list_limits == [2]
+
+
+def test_list_recent_opencode_sessions_without_store_skips_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No local OpenCode DB means no sessions, without starting a server."""
+
+    @contextlib.asynccontextmanager
+    async def _fail_cm() -> AsyncIterator[_FakeImportClient]:
+        raise AssertionError("the import server must not start without a store")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(local_import, "_opencode_import_client", _fail_cm)
+    monkeypatch.setattr(local_import, "_opencode_user_store_exists", lambda: False)
+
     assert list_recent_local_session_ids("opencode", limit=5) == ()
+
+
+def test_opencode_user_store_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    assert local_import._opencode_user_store_exists() is False
+    (tmp_path / "opencode").mkdir()
+    (tmp_path / "opencode" / "opencode.db").write_bytes(b"")
+    assert local_import._opencode_user_store_exists() is True
+
+
+def test_opencode_import_client_reports_missing_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _missing(_path: str | None = None) -> str:
+        raise OpenCodeCliNotFoundError("opencode CLI not found on PATH")
+
+    monkeypatch.setattr(local_import, "find_opencode_cli", _missing)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    with pytest.raises(SessionImportNotFoundError, match="not found"):
+        local_import._run_opencode_import(_open())
 
 
 def test_load_opencode_session_preserves_messages_files_and_tools(
