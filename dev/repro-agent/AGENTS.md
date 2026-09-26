@@ -420,8 +420,9 @@ independently, because a compound bug can be partly fixed:
 `file://` URL to inspect CI artifacts: it targets the desktop browser, not the
 CI filesystem. Use an available image-capable tool to view the saved screenshot.
 If none is available, preserve the image for review, use Playwright DOM/layout
-assertions for what they can establish, and state that visual inspection was
-unavailable. Image dimensions, file metadata, and successful screenshot capture
+assertions for what they can establish, state that visual inspection was
+unavailable, and claim in the caption and journey only what those assertions
+established. Image dimensions, file metadata, and successful screenshot capture
 alone do not establish that the UI looks correct.
 
 Reach for the real trigger, not the internal function it flows into. If the
@@ -566,6 +567,14 @@ Follow these rules for each clip:
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
+- Caption only verified states. Every UI state the caption or the steps to
+  reproduce names — present or absent — must be asserted by the recorded test
+  on that element or confirmed in the final frame viewed as an image. Never
+  write an unverified negative such as "the switcher never appears" from the
+  expected failure model: a locator that accepts several outcomes (the toggle
+  or an error pill) establishes none of them, and a screenshot you could not
+  view confirms nothing. Leave an unverified state out of the caption and the
+  journey; the fix step reads those claims as its acceptance criteria.
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the result in `evidence`.
 - If recording is blocked by missing tools or an environment that cannot run
@@ -689,8 +698,11 @@ Field meanings:
   breaks as `\n` escapes in valid JSON; do not compact the steps into an
   arrow-separated summary or change this field to an array. Include labeled
   recipes for separate facets and distinguish verified results from reported
-  or unverified outcomes. Keep the internal mechanism (function calls, uncleared
-  state, leaked subscriptions, timeouts) in `facets`/`evidence`.
+  or unverified outcomes. Write each `Observed:` line from what the page or
+  output showed, under the Step 4 verification rule; do not restate the
+  expected failure model as an observation. Keep the internal mechanism
+  (function calls, uncleared state, leaked subscriptions, timeouts) in
+  `facets`/`evidence`.
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
@@ -704,7 +716,9 @@ Field meanings:
   what the clip shows — e.g. `"start a session → open the model picker → select
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
-  behavior (the journey completing). This is per-recording (each clip drives its
+  behavior (the journey completing). Name only states the test asserted or the
+  final frame confirmed (Step 4); an unverified negative such as "X never
+  appears" does not belong here. This is per-recording (each clip drives its
   own steps), distinct from the bug-level `journey` field. `capture_mode` is one
   of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
   authored-but-unrendered VHS tape in the artifact, but do not declare it as a
