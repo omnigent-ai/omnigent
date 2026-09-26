@@ -16,6 +16,7 @@ import {
   type AgentNodeData,
 } from "./subagentGraphLayout";
 import { activityDotClassName, sessionStatus } from "./subagentStatus";
+import { resolveSubagentIcon } from "./subagentIcons";
 
 import "@xyflow/react/dist/style.css";
 
@@ -50,8 +51,12 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
 }
 
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
-  const { label, activity, statusLabel, isActive, preview } = data;
+  const { label, activity, statusLabel, isActive, preview, identity } = data;
   const tint = ACTIVITY_TINT[activity];
+  const Icon = resolveSubagentIcon(identity);
+  const accessibleIdentity =
+    nativeCodingAgentForWrapper(identity.wrapper)?.displayName ??
+    (identity.kind === "root" ? identity.agentName : identity.tool);
 
   return (
     <>
@@ -70,6 +75,14 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         style={{ width: NODE_WIDTH }}
       >
         <div className="flex items-center gap-1.5">
+          {accessibleIdentity && (
+            <span className="sr-only">Agent identity: {accessibleIdentity}</span>
+          )}
+          <Icon
+            aria-hidden="true"
+            data-testid="agent-node-icon"
+            className="size-3.5 shrink-0 text-muted-foreground"
+          />
           <span className="truncate text-sm font-medium leading-tight">{label}</span>
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
@@ -189,6 +202,8 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const rootLabel = nativeAgent?.displayName ?? session?.agentName ?? "main";
+  const rootHarness = session?.harness ?? null;
+  const rootAgentName = session?.agentName ?? null;
   // Mirror the list view's ``sessionStatus`` so the root node honors
   // launching / disconnected (not just running / failed / idle).
   const rootStatus = sessionStatus(session?.status, session?.lastTaskError);
@@ -205,8 +220,24 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
         null,
         childrenMap,
         conversationId,
+        {
+          kind: "root",
+          wrapper: wrapper ?? null,
+          harness: rootHarness,
+          agentName: rootAgentName,
+        },
       ),
-    [rootSessionId, rootLabel, rootActivity, rootStatusLabel, childrenMap, conversationId],
+    [
+      rootSessionId,
+      rootLabel,
+      rootActivity,
+      rootStatusLabel,
+      childrenMap,
+      conversationId,
+      wrapper,
+      rootHarness,
+      rootAgentName,
+    ],
   );
 
   const navigate = useNavigate();

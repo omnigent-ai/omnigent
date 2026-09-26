@@ -5,6 +5,7 @@ import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { DevinIcon } from "@/components/icons/DevinIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
+import { GrokIcon } from "@/components/icons/GrokIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
 import { KiroIcon } from "@/components/icons/KiroIcon";
@@ -14,6 +15,7 @@ import { PiIcon } from "@/components/icons/PiIcon";
 import type { ComponentType, SVGProps } from "react";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
+import { AgentIcon, resolveAgentIcon } from "@/lib/agentIcon";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentHoverCard } from "@/components/AgentHoverCard";
 
@@ -58,6 +60,7 @@ export function iconForAgent(
   if (agent.harness?.includes("devin")) return DevinIcon;
   // Both the SDK "kimi"/"kimi-code" harness and "kimi-native" get the Kimi glyph.
   if (agent.harness?.includes("kimi")) return KimiIcon;
+  if (agent.harness?.includes("grok")) return GrokIcon;
   // qwen falls back to generic BotIcon for now; see docs/QWEN_FOLLOWUPS.md
   // Exact match — a substring check would false-match e.g. "openapi".
   if (agent.harness === "pi") return PiIcon;
@@ -101,7 +104,10 @@ export function AgentCard({
   compact?: boolean;
   hover?: boolean;
 }) {
-  const Icon = iconForAgent(agent);
+  // Declared spec icon first (emoji grapheme or path served via the icon
+  // endpoint), then the harness/iconKind glyph. The precedence lives in
+  // resolveAgentIcon so this card and the Agents-rail row stay in lockstep.
+  const iconResolution = resolveAgentIcon(agent, () => iconForAgent(agent));
   const card = (
     <button
       type="button"
@@ -111,7 +117,7 @@ export function AgentCard({
         selected ? "border-primary bg-primary/5" : "border-border hover:border-muted-foreground/30"
       } cursor-pointer`}
     >
-      <Icon className="size-4 shrink-0 text-muted-foreground" />
+      <AgentIcon resolution={iconResolution} className="size-4 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
         <span className="text-sm font-semibold">{agent.display_name}</span>
         {!compact && agent.description && (
