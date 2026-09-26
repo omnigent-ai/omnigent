@@ -568,6 +568,15 @@ Follow these rules for each clip:
   expired login and capture the error it prints.
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the result in `evidence`.
+- Quote only text the final frame shows. A caption that quotes a message
+  ("Codex is not signed in … configure a provider") claims the viewer can read
+  it, so the clip must show it: expand a collapsed error pill or folded card in
+  the driver and assert the expanded body is visible before stopping (see the
+  `web` lane in `dev/recording-lanes.md`). A DOM or transcript match such as
+  `"signed in" in combined` is satisfied by the collapsed body and proves
+  nothing about the screen. If you did not see the text in the final frame,
+  caption only what is visible ("generic error cards; detail text asserted from
+  the DOM") and keep the quoted text in `evidence`.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
   `recording_unavailable_reason`. Do not block the verdict because footage is
@@ -705,7 +714,9 @@ Field meanings:
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). This is per-recording (each clip drives its
-  own steps), distinct from the bug-level `journey` field. `capture_mode` is one
+  own steps), distinct from the bug-level `journey` field. Text the caption
+  quotes must be legible in the clip's final frame (Step 4); a message still
+  folded inside a collapsed error pill is not. `capture_mode` is one
   of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
   authored-but-unrendered VHS tape in the artifact, but do not declare it as a
   recording. Empty list when nothing valid was recorded.
