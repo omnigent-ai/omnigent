@@ -64,7 +64,9 @@ the docs at `https://opencode.ai/v2/docs/build/{sdk,client,plugins}`, and npm.
   `opencode v2.0.18`. `OMNIGENT_OPENCODE_SKIP_VERSION_CHECK` stays.
 - Install spec (`onboarding/harness_install.py`, `deploy/docker/
   install-harness-cli.sh`): `@opencode/cli@~2.0.18`, binary `opencode`, login
-  step `opencode auth login`.
+  step `opencode auth login`. Both packages link the same global `opencode`
+  bin and npm refuses to overwrite a foreign bin, so the install runs
+  `npm rm -g opencode-ai` first.
 - `app_server.py` launches
   `opencode serve --hostname 127.0.0.1 --port <port> --stdio` with
   `OPENCODE_PASSWORD` (and legacy `OPENCODE_SERVER_PASSWORD`) set to the
@@ -100,17 +102,19 @@ surface the forwarder tests fake. Every response is unwrapped from `data`.
 | `interrupt()` | `POST /api/session/{id}/interrupt` |
 | `compact()` | `POST /api/session/{id}/compact` |
 | `fork(before_message_id?)` | `POST /api/session/{id}/fork {before}` |
-| `reply_permission(rid, decision)` | `POST …/permission/{rid}/reply {decision: once\|reject, message}` |
+| `reply_permission(rid, decision)` | `POST …/permission/{rid}/reply {decision: once\|reject}`; no `message` on reject (v2 feeds a reject message to the model as a correction and it continues) |
 | `reply_form(fid, answer)`, `cancel_form(fid)` | `POST …/form/{fid}/reply {answer}`, `DELETE …/form/{fid}` |
 | `list_models()`, `list_providers()` | `GET /api/model`, `GET /api/provider` |
 | `stream_events()` | `GET /api/event`; parse `data:` frames, skip `: heartbeat`, yield `{id, type, data, location}` |
 
 - `http_transport.build_prompt_payload`: text goes to `text`; image
   attachments become `files:[{uri:"data:<mime>;base64,…", name}]`; non-image
-  files are text-flattened as today. There is no `system` field: the composed
-  system prompt is delivered through the config `instructions` key (preferred)
-  or, if the recon spike shows `instructions` is not applied per session, as one
-  `synthetic` message per session.
+  files are text-flattened as today. There is no `system` field, and v2.0.18
+  parses but never reads the config `instructions` key (an array of paths), so
+  the composed system prompt is written once per session to
+  `<XDG_CONFIG_HOME>/opencode/AGENTS.md`, which OpenCode does read. Instruction
+  delivery therefore becomes a launch-time snapshot (`instruction_delivery`
+  capability moves from `COMPOSED_PER_TURN` to `COMPOSED_SESSION_SNAPSHOT`).
 - Model override: the executor calls `set_model` before `prompt` when the
   `state.json` override differs from the last applied model, which is recorded
   in `state.json`.
@@ -134,7 +138,7 @@ running cost/tokens, last seen model.
 | `session.text.ended {ordinal, text}` | buffer; flushed as an `external_conversation_item` assistant message at step end |
 | `session.reasoning.delta` / `.ended` | `external_output_reasoning_delta {delta, started}` |
 | `session.tool.called {id, name, input}` | `function_call` (names `shell`, `edit`, `subagent`, MCP names as-is) |
-| `session.tool.progress {metadata}` | `external_tool_output_delta` when metadata carries incremental output (verified in recon; otherwise dropped) |
+| `session.tool.progress {metadata}` | `external_tool_output_delta` when `metadata.output` is a string extending the last seen value. No built-in 2.0.18 tool sends incremental output (shell sends `{shellID}` only), so shell output lands with `session.tool.success`; the delta path is ready for tools that do |
 | `session.tool.success {content, metadata}` / `.failed {error}` | `function_call_output` |
 | `session.step.ended {cost, tokens, files}`, `session.usage.updated` | accumulate; `external_session_usage` |
 | `session.execution.succeeded`, `session.status {idle}` | flush, usage, `idle` status |
@@ -148,6 +152,7 @@ running cost/tokens, last seen model.
 | `form.created {form}` | web question card via `/hooks/native-permission-request`; fields mapped by type (`string`+options → single select, `multiselect`, `boolean`, `number`/`integer`, `external` → text-flattened URL) |
 | `form.replied` / `form.cancelled` | `external_elicitation_resolved` |
 | `session.created {parentID}` | `external_subagent_start` for OpenCode-native child sessions |
+| `session.inbox.enqueued` / `.delivered` / `.cancelled` | user prompt mirrored as a user `external_conversation_item` on delivery (v2 has no user-message event; the inbox id is the message id) |
 
 - Filtering: `data.sessionID` equals ours, or the session's `parentID` chain
   leads to ours (subagent mirroring). Events without a session id pass through.
@@ -160,17 +165,26 @@ running cost/tokens, last seen model.
 ### 4. Config, plugin, policies, credentials
 
 - `provider.py` emits v2 `opencode.json`:
-  - `providers.<id>` for the Omnigent or Databricks gateway (same
-    `@ai-sdk/openai-compatible` payload); `model` as `provider/model`.
+  - `providers.<id>` for the Omnigent or Databricks gateway using v2's native
+    `@opencode/ai/providers/openai-compatible` package with
+    `settings.{baseURL, apiKey, provider}`; `model` as `provider/model`.
   - `permissions: [{action:"*", resource:"*", effect:"ask"}]` always, so every
-    tool call raises `permission.asked`. `--auto`/yolo flags are never passed to
-    the TUI.
+    tool call raises `permission.asked`. Because a workspace `opencode.json`
+    loads after ours and the last matching rule wins, the same rules are also
+    passed as `Session.permissions` on `POST /api/session`, which merge last.
+    `--auto`, `--standalone`, `--continue`, `--server` and `--session` are
+    stripped from TUI pass-through args.
   - `mcp.servers.omnigent` for the relay (`type:"local"`, same `serve-mcp`
     argv, `codemode:false` so relay tools keep their names and are individually
     gated), plus `spec.mcp_servers` entries (`local`/`remote`, Databricks bearer
     header where applicable).
-  - `plugins: ["<bridge>/omnigent-policy.js"]`.
-  - `instructions` carries the composed system prompt (see section 2).
+  - `plugins: ["<bridge>/omnigent-policy"]`: v2 silently drops a plugin
+    given as a file path, so each plugin is a directory with `package.json`
+    (`"type": "module"`) and `server.js`. A bare-path plugin cannot import
+    `@opencode/plugin`; it exports a plain `{id, setup}` default, which is
+    what `Plugin.define` returns anyway.
+  - The composed system prompt goes to the per-session `AGENTS.md` (section 2),
+    prepended to the user's own global `AGENTS.md`.
   - Merge of the user's global config keeps `providers`/`plugins`/`model`,
     reading both v1 and v2 key names.
 - Policy plugin (`bridge.py` generator) rewritten to
@@ -184,27 +198,39 @@ running cost/tokens, last seen model.
   resources, source, metadata}`. `safety.py` action set updated to `shell`,
   `edit`, `subagent`, `read`, `grep`, `glob`, `webfetch`, `skill` (confirmed in
   recon).
-- Credentials (`bridge.py`): copy the user's `auth.json` into the per-session
-  data dir so v2's one-time import populates the per-session SQLite. If only v2
-  credentials exist (SQLite, no `auth.json`), connect provider env keys via
-  `POST /api/integration/{provider}/connect/key`; otherwise readiness surfaces
-  the `opencode auth login` hint. `opencode_auth.py` detects the v2 credential
-  DB.
+- Credentials (`bridge.py`): seed the per-session `auth.json` from the user's
+  `auth.json` merged with rows read (read-only) from the `credential` table of
+  the user's v2 SQLite DB, in the legacy shape, so v2's one-time import
+  populates the per-session store. Provider env keys are already detected by
+  v2 from the process environment; `connect_provider_key` remains as a
+  fallback. Readiness (`opencode_auth.py`) counts both `auth.json` and v2 DB
+  credentials, and reads `needs-auth` with the `opencode auth login` hint when
+  neither has any.
 
 ### 5. Session commands, import, docs, testing, rollout
 
 - Resume: same-host via `GET /api/session/{id}` against the per-session DB.
   Lost session: create fresh and seed the Omnigent transcript with
   `prompt {resume:false}`.
-- Fork: same-harness fork uses native `POST /fork {before}` when the source
-  bridge dir is reachable; otherwise the text-preamble path. The capability row
-  stays `fork_history=PREAMBLE` until native fork is verified live.
-- Clear relaunches as today; model switch uses `set_model`; `/compact` calls
-  `POST /compact` with no model.
-- Session import (`session_import/local.py`): `opencode session list` remains;
-  `opencode export` is gone. Import starts a short-lived
-  `opencode serve --stdio` against the user's real data dir and reads
-  `GET /api/session/{id}/message`, parsing the v2 `content[]` model.
+- Fork: same-harness, same-workspace fork copies the source `opencode.db`
+  into the new bridge dir with SQLite's online backup, clears
+  `session_v2.time_suspended` on the copy (otherwise the new server resumes the
+  source's in-flight turn), then calls native `POST /fork`; any other case uses
+  the text-preamble path. The capability row stays `fork_history=PREAMBLE`
+  until native fork is verified live.
+- Clear relaunches with a fresh session; model switch uses `set_model` on
+  the live session; `/compact` calls `POST /compact` with no model; interrupt
+  and stop get a native handler calling `POST /interrupt` (today they fall
+  through to an in-process cancel that never reaches OpenCode). The model
+  picker fallback reads `GET /api/model` only; the `opencode models` CLI path
+  is removed (in v2 it is a wrapper over the same endpoint and needs the
+  background service).
+- Session import (`session_import/local.py`): `opencode export` is gone and
+  `opencode session list` is scoped to one project. Import starts a short-lived
+  `opencode serve --stdio` against the user's real data dir (throwaway config
+  home so user plugins and MCP servers never start), lists with
+  `GET /api/session?parentID=null`, and reads `GET /api/session/{id}/message`,
+  parsing the v2 `content[]` model.
 - Docs: OpenCode section in `docs/` and the omnigent.ai configuration page
   (supported 2.0.x, `@opencode/cli`, `opencode auth login`, YAML example);
   fix the stale e2e docstring citing a vendored 1.17.7 OpenAPI; `CHANGELOG.md`
@@ -231,13 +257,15 @@ running cost/tokens, last seen model.
   4. session commands, import;
   5. docs.
 
-## Open items resolved by the recon spike (stage 0)
+## Open items for the recon spike (stage 0)
 
-1. Whether config `instructions` applies the system prompt per session, or a
-   `synthetic` message is needed.
-2. Whether `prompt {resume:false}` records without running (else `/synthetic`).
-3. Whether `session.tool.progress.metadata` carries incremental output.
-4. Whether Code Mode MCP calls raise `permission.asked`, and that
-   `codemode:false` is honored for the relay.
-5. The exact v2 action-name set for `safety.py`.
-6. Whether `opencode session list --format json` still exists for import.
+Source reading of the `v2.0.18` tag settled items 1, 3, 5 and 6 (`instructions`
+is parsed but unread, so `AGENTS.md` carries the prompt; no built-in tool sends
+incremental progress output; actions are `shell`, `edit`, `read`, `grep`,
+`glob`, `webfetch`, `skill`, `subagent`, plus MCP tool names; `session list`
+exists but is project-scoped). The live spike confirms them and resolves:
+
+1. Whether `prompt {resume:false}` records without running (else `/synthetic`).
+2. Whether the relay's MCP calls raise `permission.asked` with `codemode:false`,
+   and what `resources`/`metadata` they carry.
+3. Whether the per-session `AGENTS.md` reaches the model as system context.
