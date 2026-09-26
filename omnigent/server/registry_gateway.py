@@ -65,7 +65,7 @@ async def execute_registry_tool(
     config: MCPServerConfig,
     name: str,
     arguments: dict[str, Any],
-    actor: dict[str, str] | None,
+    credential_user: str | None,
 ) -> dict[str, Any]:
     try:
         registry = getattr(request.app.state, "mcp_registry", None) if request else None
@@ -74,7 +74,7 @@ async def execute_registry_tool(
         tool = name[len(config.name) + 2 :]
         if config.tools is not None and tool not in config.tools:
             raise ConnectionError("Tool is not enabled for this session")
-        user = registry_user(actor)
+        user = registry_user({"run_as": credential_user} if credential_user else None)
         service = registry.service(config.name, user)
         if tool not in service.tools:
             raise ConnectionError("Tool is not allowed by the MCP registry")

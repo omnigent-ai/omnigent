@@ -191,3 +191,18 @@ it("asks for a Databricks workspace before connecting and selecting it", async (
     "https://workspace.example.test",
   );
 });
+
+it("follows catalog cursors before showing the complete selection", async () => {
+  vi.mocked(registryRequest)
+    .mockResolvedValueOnce({ data: [service], next_cursor: "tracker" })
+    .mockResolvedValueOnce({
+      data: [{ ...service, id: "wiki", title: "Wiki", connected: true }],
+      next_cursor: null,
+    });
+  const toggle = vi.fn();
+  render(<McpRegistryPicker attached={[]} onToggle={toggle} busy={false} />);
+  fireEvent.click(await screen.findByRole("checkbox", { name: "Wiki" }));
+  expect(toggle).toHaveBeenCalledWith("wiki", true);
+  expect(registryRequest).toHaveBeenNthCalledWith(2, "?after=tracker");
+  expect(screen.getByRole("checkbox", { name: "Work tracker" })).toBeInTheDocument();
+});

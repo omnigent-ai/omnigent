@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_right
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -34,13 +35,20 @@ def create_mcp_registry_router(
             raise HTTPException(404, str(exc)) from exc
 
     @router.get("/mcp-registry/services")
-    async def catalog(request: Request, response: Response) -> dict[str, Any]:
+    async def catalog(
+        request: Request,
+        response: Response,
+        limit: int = Query(default=50, ge=1, le=100),
+        after: str = Query(default="", max_length=64),
+    ) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-store"
         user_id = user(request)
         data = []
-        for entry in registry.services.values():
-            if not entry.permits(user_id):
-                continue
+        ids = sorted(entry.id for entry in registry.services.values() if entry.permits(user_id))
+        start = bisect_right(ids, after)
+        page = ids[start : start + limit]
+        for service_id in page:
+            entry = registry.services[service_id]
             connected = entry.auth == "none"
             if entry.auth in {"github", "databricks"}:
                 store = getattr(request.app.state, f"{entry.auth}_store", None)
@@ -63,7 +71,10 @@ def create_mcp_registry_router(
                     "connect_provider": f"mcp-{entry.id}" if entry.oauth else entry.auth,
                 }
             )
-        return {"data": data}
+        return {
+            "data": data,
+            "next_cursor": page[-1] if start + len(page) < len(ids) else None,
+        }
 
     @router.put("/mcp-registry/services/{service_id}/connection")
     async def connect_token(

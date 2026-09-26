@@ -74,7 +74,9 @@ capability.
 Both JSON `POST /v1/sessions` and multipart creation metadata accept the optional
 field `mcp_registry_services`, for example `["tracker"]`. These IDs **add to**
 the agent's authored tools. A JSON create with selections gets a session-scoped
-copy of the agent bundle; other sessions and the template are unchanged. Existing
+copy of the agent bundle; other sessions and the template are unchanged. Trusted
+template environment fields are resolved at launch, including nested agents;
+user uploads never expand against the server environment. Existing
 registry tool restrictions are preserved, custom-name collisions are rejected,
 and unknown or disallowed services fail before session persistence. Named
 sub-agent creates use their authored MCP configuration rather than this picker.
@@ -376,7 +378,7 @@ configuration is outside this gateway path.
 - Streamable HTTP tools only; no OAuth discovery/dynamic registration, legacy SSE,
   resource/prompt proxying, or interactive upstream elicitation.
 - One server worker. Refreshes coordinate per workspace/user/service in that
-  process; distributed refresh locking is future work.
+  process; idle locks are released. Distributed refresh locking is future work.
 - A fresh upstream connection per request; no discovery cache. Disconnected or
   unavailable services are omitted from discovery; Settings provides a test/error.
 - Text output follows existing result policies. Non-text blocks are serialized
@@ -384,8 +386,12 @@ configuration is outside this gateway path.
 - No automatic retries of tool calls. Disconnect deletes the local connection,
   not the provider's grant. An already-authorized request may complete; an OAuth
   callback already exchanging its code may save a connection after disconnect.
-- Existing session authentication, actor selection, access rules and approval
-  behavior apply. This is a prototype for authenticated deployments or explicit
+- Direct calls use the authenticated caller for policy and credential identity.
+  Verified runner calls use the recorded turn actor for policies and the runner's
+  authenticated account (normally the owner) for credentials. Shared editor turns
+  can therefore use the owner's connection, subject to their tool policies.
+  Queued multi-editor turn attribution retains the existing label limitation.
+- Existing session authentication, access rules and approval behavior apply. This is a prototype for authenticated deployments or explicit
   local single-user mode, not a replacement for sandbox isolation.
 
 ```bash
