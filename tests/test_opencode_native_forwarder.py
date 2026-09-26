@@ -12,7 +12,7 @@ import httpx
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
 from omnigent.harnesses.opencode_native.client import OpenCodeClientError, OpenCodeEvent
-from tests.opencode_v2_fixtures import events_of_type
+from tests.opencode_v2_fixtures import events_of_type, load_events, load_messages
 
 _SESSION = "ses_1"
 # The captured turn's own OpenCode session id.
@@ -1867,3 +1867,23 @@ async def test_seed_cursor_stops_at_first_unsettled_message() -> None:
     fwd = _forwarder(server, opencode)
     await fwd.seed_dedupe_from_history()
     assert fwd._last_seen_message_id == "msg_1"
+
+
+async def test_seed_from_captured_history_suppresses_replay() -> None:
+    """Seeding from the real fixture history must dedupe its own captured events."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    # messages.json is captured newest-first; seeding needs ascending (oldest-first) order.
+    opencode.messages = list(reversed(load_messages()["data"]))
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    await fwd.seed_dedupe_from_history()
+    for raw in load_events():
+        # Both spawn background tasks that need a live counterpart to resolve; the
+        # seeded history already covers what they would have produced.
+        if raw["type"] in ("permission.asked", "form.created"):
+            continue
+        await fwd.handle_event(_to_event(raw))
+    await _drain(fwd)
+    for item in _items(server.posts):
+        assert item["item_type"] not in ("function_call", "function_call_output")
+        if item["item_type"] == "message":
+            assert item["item_data"].get("role") not in ("assistant", "user")
