@@ -1753,7 +1753,7 @@ async def _auto_create_opencode_terminal(
 
     # opencode 2.0 ignores config ``instructions``; the per-session global AGENTS.md is read.
     instructions_path = write_opencode_instructions(
-        xdg_config_home, _native_startup_raw_instructions_from_spec(agent_spec)
+        xdg_config_home, _opencode_session_instructions_from_spec(agent_spec)
     )
     config = build_opencode_config(
         model=model_override,
@@ -6879,6 +6879,28 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     if not isinstance(model, str) or not model:
         return None
     return model
+
+
+def _opencode_session_instructions_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
+    """Compose the session-snapshot instructions written to OpenCode's AGENTS.md.
+
+    Author instructions plus the spec-level framework instructions from
+    ``omnigent.runtime.prompt``. No per-request text or turn-bound framework
+    text is included: AGENTS.md is written once per launch and read for every
+    later turn. Tool schemas are empty, matching the runner's own composition.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: The composed text, or ``None`` when there is no spec.
+    """
+    from omnigent.runtime.prompt import build_instructions_nullable
+
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    return build_instructions_nullable(spec, None, [])
 
 
 def _native_startup_raw_instructions_from_spec(

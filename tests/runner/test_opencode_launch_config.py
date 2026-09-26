@@ -13,6 +13,7 @@ import omnigent.harnesses.opencode_native.bridge as bridge
 import omnigent.harnesses.opencode_native.provider as provider
 import omnigent.runner._entry as runner_entry
 import omnigent.runner.native.orchestration as orchestration
+from omnigent.spec import AgentSpec
 
 
 class _StopBeforeBoot(Exception):
@@ -70,9 +71,6 @@ def launch_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any
     monkeypatch.setattr(provider, "managed_connect_opencode_config", lambda *a: None)
     monkeypatch.setattr(runner_entry, "_make_auth_token_factory", lambda *a, **k: None)
     monkeypatch.setattr(app_server, "OpenCodeNativeServer", _FakeServer)
-    monkeypatch.setattr(
-        orchestration, "_native_startup_raw_instructions_from_spec", lambda spec: "Agent rules."
-    )
 
     async def _launch_config(**kwargs: Any) -> Any:
         return orchestration._OpenCodeNativeLaunchConfig(
@@ -103,7 +101,9 @@ async def test_launch_writes_v2_config_with_ask_all_permissions(
         return None
 
     bridge_dir = await _launch_until_boot(
-        server_client=object(), ensure_comment_relay=_ensure_relay
+        server_client=object(),
+        ensure_comment_relay=_ensure_relay,
+        agent_spec=AgentSpec(spec_version=1, name="rules", instructions="Agent rules."),
     )
     xdg = bridge_dir / "xdg-config"
     written = json.loads((xdg / "opencode" / "opencode.json").read_text(encoding="utf-8"))
@@ -111,7 +111,10 @@ async def test_launch_writes_v2_config_with_ask_all_permissions(
     assert written["mcp"]["servers"]["omnigent"]["codemode"] is False
     assert written["plugins"] == [str(bridge_dir / "omnigent-policy")]
     assert written["instructions"] == [str(xdg / "opencode" / "AGENTS.md")]
-    assert (xdg / "opencode" / "AGENTS.md").read_text(encoding="utf-8").strip() == "Agent rules."
+    agents_md = (xdg / "opencode" / "AGENTS.md").read_text(encoding="utf-8")
+    # Author text first, then the framework-owned instructions.
+    assert agents_md.startswith("Agent rules.")
+    assert "Embedded browser: the browser_navigate" in agents_md
     assert written["model"] == "anthropic/claude-sonnet-4-5"
     assert not {"provider", "permission", "plugin"} & set(written)
     assert launch_env["seeded"] == [bridge_dir]

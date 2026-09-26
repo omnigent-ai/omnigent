@@ -516,7 +516,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.PREAMBLE,
         # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
         # shell_tool_* stay None.
-        # The composed prompt rides the launch config's `instructions` key.
+        # The composed prompt is written once per launch to the per-session AGENTS.md.
         instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
     ),
     # devin-native wraps the resident `devin` TUI. Every axis below was
