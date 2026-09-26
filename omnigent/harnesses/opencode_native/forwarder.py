@@ -1515,6 +1515,22 @@ class OpenCodeNativeForwarder:
             return None
         return result if isinstance(result, dict) else None
 
+    async def _on_form_resolved(self, event: OpenCodeEvent) -> None:
+        """Handle ``form.replied`` / ``form.cancelled`` — withdraw the web card.
+
+        Our own reply/cancel is marked before it is sent, so its echo is
+        ignored. Otherwise the TUI answered first: cancel the still-parked
+        task and clear the web card.
+        """
+        form_id = _str_field(event.data, "id")
+        if form_id is None or not self.state.mark(self._key("form-replied", form_id)):
+            return
+        task = self._form_tasks.pop(form_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._post_event(_EXTERNAL_ELICITATION_RESOLVED, {"elicitation_id": form_id})
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -1570,4 +1586,6 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "permission.asked": OpenCodeNativeForwarder._on_permission_asked,
     "permission.replied": OpenCodeNativeForwarder._on_permission_replied,
     "form.created": OpenCodeNativeForwarder._on_form_created,
+    "form.replied": OpenCodeNativeForwarder._on_form_resolved,
+    "form.cancelled": OpenCodeNativeForwarder._on_form_resolved,
 }

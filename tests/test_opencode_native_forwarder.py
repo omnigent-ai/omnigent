@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -1559,3 +1560,79 @@ async def test_form_hook_transport_failure_cancels_form() -> None:
     await _drain(fwd)
     assert opencode.form_cancels == [(_SESSION, "frm_1")]
     assert opencode.form_replies == []
+
+
+# --- form resolution --------------------------------------------------------
+
+
+async def test_form_replied_cancels_pending_task_and_clears_card() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+
+    async def _never() -> None:
+        await asyncio.sleep(3600)
+
+    pending: asyncio.Task[None] = asyncio.create_task(_never())
+    fwd._form_tasks["frm_1"] = pending
+    await fwd.handle_event(_event("form.replied", id="frm_1", answer={"q0": "Tabs"}))
+    assert "frm_1" not in fwd._form_tasks
+    with contextlib.suppress(asyncio.CancelledError):
+        await pending
+    assert pending.cancelled()
+    assert _datas(server.posts, "external_elicitation_resolved") == [{"elicitation_id": "frm_1"}]
+    assert opencode.form_replies == []
+    assert opencode.form_cancels == []
+
+
+async def test_fixture_form_replied_clears_card() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    replied = _fixture("form.replied")
+    await fwd.handle_event(replied)
+    assert _datas(server.posts, "external_elicitation_resolved") == [
+        {"elicitation_id": replied.data["id"]}
+    ]
+
+
+async def test_form_cancelled_clears_card() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("form.cancelled", id="frm_9"))
+    assert _datas(server.posts, "external_elicitation_resolved") == [{"elicitation_id": "frm_9"}]
+
+
+async def test_form_replied_echo_of_our_own_reply_is_ignored() -> None:
+    """Our own reply's echo must not cancel the parked task or post twice."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"q0": "Tabs"}}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_form_event("frm_1", _SINGLE))
+    await _drain(fwd)
+    assert opencode.form_replies == [(_SESSION, "frm_1", {"q0": "Tabs"})]
+    assert "frm_1" not in fwd._form_tasks
+
+    await fwd.handle_event(_event("form.replied", id="frm_1", answer={"q0": "Tabs"}))
+
+    assert _datas(server.posts, "external_elicitation_resolved") == []
+
+
+async def test_run_awaits_cancelled_background_tasks() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    cleanup_finished = asyncio.Event()
+
+    async def _pending() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            await asyncio.sleep(0)
+            cleanup_finished.set()
+
+    pending = asyncio.create_task(_pending())
+    fwd._form_tasks["frm_1"] = pending
+    await asyncio.sleep(0)
+    await fwd.run(max_reconnects=0)
+    assert cleanup_finished.is_set()
+    assert pending.cancelled()
+    assert fwd._form_tasks == {}
+    assert fwd._permission_tasks == {}
