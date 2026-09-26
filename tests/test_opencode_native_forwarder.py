@@ -1053,3 +1053,30 @@ async def test_retry_before_first_step_posts_running_with_session_fallback_id() 
     }
     await fwd.handle_event(_step_started("msg_1"))
     assert _status_edges(server.posts)[-1] == {"status": "running", "response_id": "msg_1"}
+
+
+# --- compaction -------------------------------------------------------------
+
+
+async def test_fixture_compaction_cycle_brackets_status() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    await fwd.handle_event(_fixture("session.compaction.started"))
+    await fwd.handle_event(_fixture("session.compaction.ended"))
+    assert _datas(server.posts, "external_compaction_status") == [
+        {"status": "in_progress"},
+        {"status": "completed"},
+    ]
+
+
+async def test_compaction_failed_posts_failed() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.compaction.failed",
+            reason="auto",
+            error={"type": "provider.transport", "message": "reset"},
+        )
+    )
+    assert _datas(server.posts, "external_compaction_status") == [{"status": "failed"}]

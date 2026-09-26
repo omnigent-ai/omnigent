@@ -1000,6 +1000,36 @@ class OpenCodeNativeForwarder:
             message if isinstance(message, str) else None,
         )
 
+    async def _on_compaction_started(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.compaction.started`` (auto or manual)."""
+        turn = await self._active_turn(event)
+        if turn is not None:
+            await self._post_event(
+                _EXTERNAL_COMPACTION_STATUS,
+                {"status": "in_progress"},
+                conversation_id=turn.conversation_id,
+            )
+
+    async def _on_compaction_ended(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.compaction.ended``."""
+        turn = await self._active_turn(event)
+        if turn is not None:
+            await self._post_event(
+                _EXTERNAL_COMPACTION_STATUS,
+                {"status": "completed"},
+                conversation_id=turn.conversation_id,
+            )
+
+    async def _on_compaction_failed(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.compaction.failed``."""
+        turn = await self._active_turn(event)
+        if turn is not None:
+            await self._post_event(
+                _EXTERNAL_COMPACTION_STATUS,
+                {"status": "failed"},
+                conversation_id=turn.conversation_id,
+            )
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -1046,4 +1076,7 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.execution.failed": OpenCodeNativeForwarder._on_execution_failed,
     "session.execution.interrupted": OpenCodeNativeForwarder._on_execution_interrupted,
     "session.retry.scheduled": OpenCodeNativeForwarder._on_retry_scheduled,
+    "session.compaction.started": OpenCodeNativeForwarder._on_compaction_started,
+    "session.compaction.ended": OpenCodeNativeForwarder._on_compaction_ended,
+    "session.compaction.failed": OpenCodeNativeForwarder._on_compaction_failed,
 }
