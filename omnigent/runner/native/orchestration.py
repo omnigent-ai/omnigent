@@ -21,7 +21,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -1539,6 +1539,35 @@ async def _resolve_opencode_session(
             server_client=server_client,
         )
     return created.id
+
+
+# Root ``opencode`` flags the runner owns: auto-approval would bypass policy,
+# and server/session selection would detach the TUI from the per-session server.
+_OPENCODE_TUI_DROPPED_FLAGS = frozenset({"--auto", "--standalone", "--continue", "-c"})
+_OPENCODE_TUI_DROPPED_VALUE_FLAGS = frozenset({"--server", "--session", "-s"})
+
+
+def _sanitize_opencode_tui_args(args: Sequence[str]) -> list[str]:
+    """
+    Drop user pass-through TUI flags that conflict with the runner-owned server.
+
+    :param args: User ``terminal_launch_args``, e.g. ``["--auto", "--prompt", "hi"]``.
+    :returns: The args with conflicting flags (and their values) removed.
+    """
+    kept: list[str] = []
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+            continue
+        name, has_value, _ = arg.partition("=")
+        if name in _OPENCODE_TUI_DROPPED_FLAGS:
+            continue
+        if name in _OPENCODE_TUI_DROPPED_VALUE_FLAGS:
+            skip_value = not has_value
+            continue
+        kept.append(arg)
+    return kept
 
 
 async def _auto_create_opencode_terminal(

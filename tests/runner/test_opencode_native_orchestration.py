@@ -17,6 +17,7 @@ from omnigent.harnesses.opencode_native.bridge import (
 from omnigent.runner.native.orchestration import (
     _OpenCodeNativeLaunchConfig,
     _prepare_opencode_native_fork,
+    _sanitize_opencode_tui_args,
 )
 
 
@@ -165,3 +166,18 @@ def test_prepare_native_fork_skips_unreachable_source(bridge_root: Path) -> None
         _prepare_opencode_native_fork(_fork_config(), bridge_dir=clone_dir, workspace="/repo")
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (["--auto"], []),
+        (["--standalone", "--continue", "-c"], []),
+        (["--server", "http://x", "--session", "ses_1", "-s", "ses_2"], []),
+        (["--server=http://x", "--session=ses_1"], []),
+        (["--prompt", "hi", "--log-level", "debug"], ["--prompt", "hi", "--log-level", "debug"]),
+        (["--auto", "--prompt", "hi"], ["--prompt", "hi"]),
+    ],
+)
+def test_sanitize_opencode_tui_args(args: list[str], expected: list[str]) -> None:
+    assert _sanitize_opencode_tui_args(args) == expected
