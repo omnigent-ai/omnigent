@@ -75,6 +75,27 @@ if _hindsight_available():
     )
 
 
+def _cognee_available() -> bool:
+    """Return True when the optional ``cognee`` package is usable."""
+    import importlib.util
+    import os
+
+    if os.environ.get("OMNIGENT_DISABLE_COGNEE", "").strip().lower() in ("true", "1", "yes"):
+        return False
+    return importlib.util.find_spec("cognee") is not None
+
+
+# Cognee memory tools (optional ``cognee`` extra). Advertised only when the
+# package is installed and not kill-switched.
+if _cognee_available():
+    _TOOL_CLASSES.update(
+        {
+            "cognee_search": ("omnigent.tools.builtins.cognee", "CogneeSearchTool"),
+            "cognee_remember": ("omnigent.tools.builtins.cognee", "CogneeRememberTool"),
+        }
+    )
+
+
 @tool
 def list_builtin_tools() -> str:
     """

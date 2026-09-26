@@ -367,6 +367,29 @@ def test_embedded_browser_guidance_names_registered_tools() -> None:
         assert name in EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 
 
+def test_cognee_memory_instruction_rides_the_spec_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec that enables a cognee builtin gets the memory announcement.
+
+    The gating lives in ``omnigent.runtime.memory`` (builtin declared AND the
+    availability gate open); composition only has to route the hook. Force the
+    gate open so the test doesn't depend on the optional extra being installed.
+    """
+    import omnigent.runtime.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "cognee_available", lambda: True)
+    with_memory = _spec("Agent prompt", builtins=("cognee_search",))
+    result = build_instructions(with_memory, None, [])
+    # The unconditional browser guidance rides the same hook; the memory
+    # announcement lands after it, and only when a cognee builtin is enabled.
+    assert result.startswith("Agent prompt\n\n")
+    assert result.endswith(f"\n\n{memory_mod.COGNEE_MEMORY_INSTRUCTION}")
+
+    without_memory = _spec("Agent prompt")
+    assert memory_mod.COGNEE_MEMORY_INSTRUCTION not in build_instructions(without_memory, None, [])
+
+
 def test_subagent_wake_notice_shape_matches_runner_notice() -> None:
     """
     The announced shape must track the notice the runner actually posts.

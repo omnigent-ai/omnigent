@@ -70,14 +70,21 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     mirroring the unconditional ``browser_*`` registration
     (``ToolManager._register_browser_tools``).
 
+    The cognee memory announcement rides the same hook: it applies only when
+    the spec enables a cognee builtin and the memory gate is open, and the
+    gating itself lives in the owning module (:mod:`omnigent.runtime.memory`).
+
     :param spec: The parsed AgentSpec.
     :returns: The applicable spec-level framework instructions, never empty.
     """
+    from omnigent.runtime.memory import cognee_framework_instructions
+
     instructions: list[str] = []
     dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
     if spec.tools.agents or spec.spawn or dispatches_web_researcher:
         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
     instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
+    instructions.extend(cognee_framework_instructions(spec))
     return instructions
 
 
