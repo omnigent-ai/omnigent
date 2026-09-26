@@ -115,7 +115,7 @@ def _types(posts: list[tuple[str, dict[str, Any]]]) -> list[str]:
 
 
 def _datas(posts: list[tuple[str, dict[str, Any]]], event_type: str) -> list[dict[str, Any]]:
-    return [body["data"] for _url, body in posts if body["type"] == event_type]
+    return [body["data"] for _url, body in posts if body.get("type") == event_type]
 
 
 def _status_edges(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -1526,3 +1526,36 @@ async def test_form_created_dedupes() -> None:
     assert fwd._form_tasks["frm_1"] is task
     await _drain(fwd)
     assert opencode.form_replies == [(_SESSION, "frm_1", {"q0": "Tabs"})]
+
+
+async def test_form_reply_failure_cancels_and_logs() -> None:
+    """A failed reply must still cancel the form and surface a blocked status."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"q0": "Tabs"}}
+
+    async def failing_reply(*_args: Any, **_kwargs: Any) -> bool:
+        raise OpenCodeClientError("reply failed: 500")
+
+    opencode.reply_form = failing_reply  # type: ignore[method-assign]
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_form_event("frm_1", _SINGLE))
+    await _drain(fwd)
+    assert opencode.form_cancels == [(_SESSION, "frm_1")]
+    statuses = _datas(server.posts, "external_session_status")
+    assert statuses[-1]["status"] == "running"
+    assert statuses[-1]["blocked_on"] == "form reply failed for frm_1"
+
+
+async def test_form_hook_transport_failure_cancels_form() -> None:
+    """A hook POST transport failure must cancel the form, not hang it."""
+
+    class _FailingServerClient:
+        async def post(self, _url: str, *, json: dict[str, Any]) -> httpx.Response:
+            raise httpx.ConnectError("boom", request=httpx.Request("POST", "http://x"))
+
+    opencode = _FakeOpenCodeClient()
+    fwd = _forwarder(_FailingServerClient(), opencode)  # type: ignore[arg-type]
+    await fwd.handle_event(_form_event("frm_1", _SINGLE))
+    await _drain(fwd)
+    assert opencode.form_cancels == [(_SESSION, "frm_1")]
+    assert opencode.form_replies == []

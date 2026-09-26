@@ -1419,6 +1419,8 @@ class OpenCodeNativeForwarder:
             return
         try:
             if not questions:
+                # Marked before replying so our own form.replied echo is ignored.
+                self.state.mark(self._key("form-replied", form_id))
                 await self._opencode.reply_form(session_id, form_id, {})
                 return
             title = _str_field(form, "title")
@@ -1437,15 +1439,26 @@ class OpenCodeNativeForwarder:
             if answer is None:
                 await self._cancel_form_quietly(session_id, form_id)
                 return
+            # Marked before replying so our own form.replied echo is ignored.
+            self.state.mark(self._key("form-replied", form_id))
             await self._opencode.reply_form(session_id, form_id, answer)
         except asyncio.CancelledError:
             raise
         except (httpx.HTTPError, OpenCodeClientError) as exc:
-            _logger.warning("OpenCode form handling failed for form=%s: %s", form_id, exc)
+            _logger.warning("OpenCode form reply failed for form=%s: %s", form_id, exc)
             await self._cancel_form_quietly(session_id, form_id)
+            turn = self._turns.get(session_id)
+            if turn is not None:
+                await self._post_status(
+                    turn,
+                    _STATUS_RUNNING,
+                    extra={"blocked_on": f"form reply failed for {form_id}"},
+                )
 
     async def _cancel_form_quietly(self, session_id: str, form_id: str) -> None:
         """Best-effort cancel a form; a TUI answer commonly makes this 404."""
+        # Marked before cancelling so our own form.cancelled echo is ignored.
+        self.state.mark(self._key("form-replied", form_id))
         try:
             await self._opencode.cancel_form(session_id, form_id)
         except (httpx.HTTPError, OpenCodeClientError):
