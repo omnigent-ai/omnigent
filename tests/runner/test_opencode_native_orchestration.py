@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+import pytest
+
 import omnigent.runner.native.orchestration as orchestration
+from omnigent.harnesses.opencode_native import bridge as opencode_bridge
+from omnigent.harnesses.opencode_native.bridge import (
+    OpenCodeNativeBridgeState,
+    opencode_db_path_for_bridge_dir,
+    write_bridge_state,
+)
+from omnigent.runner.native.orchestration import (
+    _OpenCodeNativeLaunchConfig,
+    _prepare_opencode_native_fork,
+)
 
 
 class _Resp:
@@ -56,3 +69,99 @@ async def test_launch_config_without_fork_labels(monkeypatch: Any) -> None:
     assert cfg.fork_source_id is None
     assert cfg.fork_source_external_id is None
     assert cfg.fork_carry_history is False
+
+
+def _fork_config(**overrides: Any) -> _OpenCodeNativeLaunchConfig:
+    values: dict[str, Any] = {
+        "workspace": Path("/repo"),
+        "policy_server_url": "http://127.0.0.1:8123",
+        "terminal_launch_args": None,
+        "model_override": None,
+        "external_session_id": None,
+        "fork_carry_history": True,
+        "fork_source_id": "conv_source",
+        "fork_source_external_id": "ses_src",
+    }
+    values.update(overrides)
+    return _OpenCodeNativeLaunchConfig(**values)
+
+
+@pytest.fixture
+def bridge_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(opencode_bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
+    return tmp_path / "opencode-native"
+
+
+def _seed_source(workspace: str) -> None:
+    import sqlite3
+
+    source_dir = opencode_bridge.prepare_bridge_dir("conv_source")
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(source_dir)) as conn:
+        conn.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_suspended INTEGER)")
+        conn.execute("INSERT INTO session_v2 VALUES ('ses_src', NULL)")
+    conn.close()
+    write_bridge_state(
+        source_dir,
+        OpenCodeNativeBridgeState(
+            session_id="conv_source",
+            server_base_url="http://127.0.0.1:1",
+            opencode_session_id="ses_src",
+            workspace=workspace,
+        ),
+    )
+
+
+def test_prepare_native_fork_copies_source_db(bridge_root: Path) -> None:
+    _seed_source("/repo")
+    clone_dir = opencode_bridge.prepare_bridge_dir("conv_clone")
+
+    source_session = _prepare_opencode_native_fork(
+        _fork_config(), bridge_dir=clone_dir, workspace="/repo"
+    )
+
+    assert source_session == "ses_src"
+    assert opencode_db_path_for_bridge_dir(clone_dir).is_file()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"external_session_id": "ses_own"},
+        {"fork_carry_history": False},
+        {"fork_source_id": None},
+        {"fork_source_external_id": None},
+        {"fork_source_external_id": "0b8f-claude-uuid"},
+    ],
+)
+def test_prepare_native_fork_skips_without_directive(
+    bridge_root: Path, overrides: dict[str, Any]
+) -> None:
+    _seed_source("/repo")
+    clone_dir = opencode_bridge.prepare_bridge_dir("conv_clone")
+
+    assert (
+        _prepare_opencode_native_fork(
+            _fork_config(**overrides), bridge_dir=clone_dir, workspace="/repo"
+        )
+        is None
+    )
+    assert not opencode_db_path_for_bridge_dir(clone_dir).exists()
+
+
+def test_prepare_native_fork_skips_other_workspace(bridge_root: Path) -> None:
+    _seed_source("/elsewhere")
+    clone_dir = opencode_bridge.prepare_bridge_dir("conv_clone")
+
+    assert (
+        _prepare_opencode_native_fork(_fork_config(), bridge_dir=clone_dir, workspace="/repo")
+        is None
+    )
+    assert not opencode_db_path_for_bridge_dir(clone_dir).exists()
+
+
+def test_prepare_native_fork_skips_unreachable_source(bridge_root: Path) -> None:
+    clone_dir = opencode_bridge.prepare_bridge_dir("conv_clone")
+    assert (
+        _prepare_opencode_native_fork(_fork_config(), bridge_dir=clone_dir, workspace="/repo")
+        is None
+    )

@@ -1430,6 +1430,51 @@ async def _opencode_native_launch_config(
     )
 
 
+def _prepare_opencode_native_fork(
+    launch_config: _OpenCodeNativeLaunchConfig,
+    *,
+    bridge_dir: Path,
+    workspace: str,
+) -> str | None:
+    """
+    Stage a same-harness native fork before the clone's server starts.
+
+    Copies the source conversation's OpenCode DB into *bridge_dir* so the
+    clone's ``opencode serve`` can fork the source session. Only an unbound
+    clone whose source ran opencode in the same workspace qualifies; every
+    other case returns ``None`` and the launch falls back to the preamble.
+
+    :param launch_config: The clone's launch config.
+    :param bridge_dir: The clone's bridge directory.
+    :param workspace: The clone's workspace path.
+    :returns: The source OpenCode session id to fork, or ``None``.
+    """
+    from omnigent.harnesses.opencode_native.bridge import (
+        bridge_dir_for_bridge_id,
+        copy_opencode_database_for_fork,
+        read_bridge_state,
+    )
+
+    source_conversation = launch_config.fork_source_id
+    source_session = launch_config.fork_source_external_id
+    if (
+        launch_config.external_session_id is not None
+        or not launch_config.fork_carry_history
+        or not source_conversation
+        or not source_session
+        or not source_session.startswith("ses_")
+    ):
+        return None
+    source_bridge_dir = bridge_dir_for_bridge_id(source_conversation)
+    source_state = read_bridge_state(source_bridge_dir)
+    # A forked session inherits the parent's directory, so only fork in place.
+    if source_state is not None and source_state.workspace not in (None, workspace):
+        return None
+    if not copy_opencode_database_for_fork(source_bridge_dir, bridge_dir):
+        return None
+    return source_session
+
+
 async def _auto_create_opencode_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
