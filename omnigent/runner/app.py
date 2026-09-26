@@ -1658,6 +1658,9 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# child_session_id -> work id of the drained dispatch, so a turn Claude Code
+# resumes on its own is delivered under the id stamped on the child session.
+_drained_subagent_work_ids: dict[str, str] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
 # scans that both pass the registry check and queue one result twice.
@@ -1778,6 +1781,7 @@ def register_subagent_work(
         created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
+    _drained_subagent_work_ids.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
     return entry
@@ -1812,6 +1816,25 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     return entry
 
 
+def forget_drained_subagent_delivery(child_session_id: str) -> bool:
+    """
+    Stop treating *child_session_id*'s next terminal edge as already delivered.
+
+    ``sys_read_inbox`` remembers a drained child so the PTY watcher's trailing
+    ``idle`` after the delivered ``Stop`` is not pushed to the parent twice.
+    That memory must end when the child does new work — a self-resumed turn
+    (Claude Code continuing after a background task or subagent hand-back)
+    ends with a real result the parent has never seen.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: ``True`` when the child was remembered as drained.
+    """
+    if child_session_id in _drained_delivered_subagent_children:
+        _drained_delivered_subagent_children.discard(child_session_id)
+        return True
+    return False
+
+
 def unregister_subagent_work(
     child_session_id: str,
     *,
@@ -1840,6 +1863,7 @@ def unregister_subagent_work(
         return
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
+        _drained_subagent_work_ids[child_session_id] = entry.work_id
     _subagent_work_by_child.pop(child_session_id, None)
     _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
@@ -1864,10 +1888,12 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     """
     unregister_subagent_work(session_id)
     _drained_delivered_subagent_children.discard(session_id)
+    _drained_subagent_work_ids.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
+        _drained_subagent_work_ids.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
@@ -3343,6 +3369,11 @@ def create_runner_app(
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if status in ("running", "waiting"):
+            # The poller and pane watcher publish a claude-native child's
+            # ``running`` here, never on ``/events``. A drained child working
+            # again was resumed by Claude Code: its next terminal edge is new.
+            forget_drained_subagent_delivery(session_id)
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -5526,6 +5557,28 @@ def create_runner_app(
             return existing
         if conv_id in _drained_delivered_subagent_children:
             return None
+        # A child re-armed after a drain keeps its stamped dispatch id, so the
+        # receipt written when this result is drained matches the child's label.
+        work_id = _drained_subagent_work_ids.get(conv_id)
+        # The runner's own child registration is authoritative when the
+        # parent's inbox lives here (that is what the parent's dispatch
+        # recorded); the server snapshot is the fallback for a child adopted
+        # after a restart. A parent with no inbox on this runner keeps the
+        # snapshot path so a mirrored child is not turned into a delivery.
+        local_meta = _child_session_parents.get(conv_id)
+        if (
+            local_meta is not None
+            and local_meta.parent_id
+            and local_meta.parent_id != conv_id
+            and local_meta.parent_id in _session_inboxes_ref
+        ):
+            return register_subagent_work(
+                parent_session_id=local_meta.parent_id,
+                child_session_id=conv_id,
+                agent=local_meta.tool or "sub-agent",
+                title=local_meta.session_name or "",
+                work_id=work_id,
+            )
         try:
             snapshot = await _session_snapshot(conv_id)
         except Exception:  # noqa: BLE001 — best-effort recovery
@@ -5539,6 +5592,7 @@ def create_runner_app(
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            work_id=work_id,
         )
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
@@ -10167,6 +10221,14 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+            if status in ("running", "waiting"):
+                # A child whose delivered result the parent already drained is
+                # remembered so its trailing idle is not re-delivered. New
+                # activity means new work (Claude Code resumes a session on
+                # its own when a background task or subagent finishes), so
+                # forget the drain: the next terminal edge is a fresh result
+                # the parent has not seen, not a duplicate.
+                forget_drained_subagent_delivery(conversation_id)
             if status in ("idle", "failed"):
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
             if status == "idle":

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -707,6 +709,151 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
     del callbacks
+
+
+_CLAUDE_PANE_PID = 4242
+_CLAUDE_SESSION_UUID = "7d2f0c4e-status-file-session"
+
+
+def _write_claude_status_file(config_dir: Path, *, status: str) -> Path:
+    """Write Claude's ``sessions/<pid>.json`` for the observed pane with *status*."""
+    directory = config_dir / "sessions"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{_CLAUDE_PANE_PID}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "pid": _CLAUDE_PANE_PID,
+                "sessionId": _CLAUDE_SESSION_UUID,
+                "cwd": "/repo",
+                "kind": "interactive",
+                "status": status,
+                "statusUpdatedAt": 1785480000000,
+                "updatedAt": 1785480000000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+async def _observe_native_with_real_poller(
+    tmp_path: Path, session_id: str, *, config_dir: Path
+) -> tuple[dict[str, object], list[str], SessionResourceRegistry]:
+    """Observe a claude-native terminal whose poller reads a real status file.
+
+    :returns: ``(callbacks, statuses, registry)`` — the wired watcher callbacks
+        (``on_tick`` drives the poller), the statuses the publisher recorded,
+        and the registry (so the test can post the forwarder's external edges).
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
+    statuses: list[str] = []
+    registry.set_session_status_publisher(
+        lambda _sid, status, _reason=None: statuses.append(status)
+    )
+
+    def _build(
+        *, session_id: str, instance: object, on_status: Callable[[str, str | None], None]
+    ) -> SessionStatusPoller:
+        del instance
+        return SessionStatusPoller(
+            on_status=on_status,
+            pane_pid_getter=lambda: _CLAUDE_PANE_PID,
+            session_id_getter=lambda: _CLAUDE_SESSION_UUID,
+            config_dir=config_dir,
+            omnigent_session_id=session_id,
+        )
+
+    registry._build_claude_native_status_poller = _build  # type: ignore[method-assign]
+
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del idle_threshold_s, poll_interval_s, replace
+        callbacks["on_idle"] = on_idle
+        callbacks["on_activity"] = on_activity
+        callbacks["on_exit"] = on_exit
+        callbacks["on_tick"] = on_tick
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
+    await registry.observe_required_terminal(
+        session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    return callbacks, statuses, registry
+
+
+@pytest.mark.asyncio
+async def test_hook_idle_rearms_a_poller_whose_file_still_says_busy(tmp_path: Path) -> None:
+    """A hook-derived turn end must not silence a Claude that is still working.
+
+    Claude's status file stays ``busy`` across a ``Stop`` while a delegate keeps
+    working, and when Claude then resumes the session on its own. The
+    forwarder's ``idle`` moves the shared baseline to idle, but the poller's own
+    edge baseline still says ``running`` and the file is written only on change
+    — so without a re-arm the session reads idle for the whole self-resumed
+    turn: no spinner on the worker, and no ``running`` edge to mark the parent
+    waiting or to re-arm a drained child's result delivery.
+    """
+    config_dir = tmp_path / "claude"
+    _write_claude_status_file(config_dir, status="busy")
+    callbacks, statuses, registry = await _observe_native_with_real_poller(
+        tmp_path, "conv_busy_after_stop", config_dir=config_dir
+    )
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"], "an unchanged file must stay silent"
+
+    # Stop hook: the forwarder posts idle to the server; the runner learns it on
+    # /events and adopts it as the baseline.
+    registry.note_external_session_status("conv_busy_after_stop", "idle")
+    assert not registry.session_turn_is_active("conv_busy_after_stop")
+
+    # Claude's file still says busy: the next tick must re-assert running.
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+    assert registry.session_turn_is_active("conv_busy_after_stop")
+
+
+@pytest.mark.asyncio
+async def test_hook_idle_re_read_is_silent_when_the_file_agrees(tmp_path: Path) -> None:
+    """Re-reading the file after the hook's idle adds no flicker when it reads idle too."""
+    config_dir = tmp_path / "claude"
+    path = _write_claude_status_file(config_dir, status="busy")
+    callbacks, statuses, registry = await _observe_native_with_real_poller(
+        tmp_path, "conv_idle_after_stop", config_dir=config_dir
+    )
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # The turn ends: Claude rewrites the file as idle, then its Stop hook lands.
+    _write_claude_status_file(config_dir, status="idle")
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    registry.note_external_session_status("conv_idle_after_stop", "idle")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"], "the file's idle lands on the hook's baseline"
 
 
 @pytest.mark.asyncio

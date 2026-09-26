@@ -11843,3 +11843,21 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+def test_augment_claude_args_disables_prompt_suggestions_unless_requested(tmp_path: Path) -> None:
+    """
+    Claude Code's predicted-next-prompt suggestion renders dimmed in the input
+    box; the bridge scrapes that box as text, so a suggestion reads as an
+    unsent draft. Launch without suggestions, but respect an explicit choice.
+    """
+    args = augment_claude_args(
+        ("--resume", "abc"), bridge_dir=tmp_path, python_executable="/venv/bin/python"
+    )
+    assert args[args.index("--prompt-suggestions") + 1] == "false"
+
+    explicit = augment_claude_args(
+        ("--prompt-suggestions", "true"), bridge_dir=tmp_path, python_executable="/venv/bin/python"
+    )
+    assert explicit.count("--prompt-suggestions") == 1
+    assert explicit[explicit.index("--prompt-suggestions") + 1] == "true"

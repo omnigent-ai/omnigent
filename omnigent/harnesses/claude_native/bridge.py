@@ -2579,6 +2579,13 @@ def augment_claude_args(
             str(settings_path),
         ]
     )
+    # Claude Code (2.1.282+) renders a predicted next prompt dimmed inside the
+    # input box after each turn. The bridge reads that box as text, so the
+    # suggestion looks like an unsent draft to every composer check and a
+    # bare Enter would submit it. Nothing here consumes suggestions, so turn
+    # them off unless the caller asked for them explicitly.
+    if "--prompt-suggestions" not in args:
+        args.extend(["--prompt-suggestions", "false"])
     if append_system_prompt:
         args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.

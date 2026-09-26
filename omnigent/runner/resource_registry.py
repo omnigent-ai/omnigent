@@ -618,7 +618,11 @@ class SessionResourceRegistry:
         publishes these edges directly to the server, so without this the
         watcher would still believe its own last edge is live and swallow the
         next turn's ``running`` as a duplicate — leaving the session stuck on
-        the hook's ``idle`` with no working indicator for the whole turn.
+        the hook's ``idle`` with no working indicator for the whole turn. A
+        terminal edge also re-arms the session's status-file poller: Claude's
+        file is written only on change, so a file still reading ``busy`` after
+        the hook's turn end (a delegate keeps working, or Claude resumes the
+        session on its own) would otherwise never re-publish ``running``.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
@@ -628,6 +632,11 @@ class SessionResourceRegistry:
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
         self._sync_status_edge(session_id, status)
+        if status in {"idle", "failed"}:
+            with self._lock:
+                poller = self._status_pollers.get(session_id)
+            if poller is not None:
+                poller.resync()
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:

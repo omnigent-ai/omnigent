@@ -369,3 +369,73 @@ def test_launch_timeout_resolver_rejects_non_finite(
     assert runner_app.resolve_subagent_launch_timeout_s() == 45.5
     monkeypatch.delenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S")
     assert runner_app.resolve_subagent_launch_timeout_s() == default
+
+
+@pytest.mark.asyncio
+async def test_self_resumed_child_completion_is_delivered_after_a_drain() -> None:
+    """
+    New activity from a drained child reopens delivery of its next result.
+
+    User journey: a worker reports a result, the parent drains it with
+    ``sys_read_inbox``; later Claude Code resumes the worker on its own (a
+    background task or internal subagent hands back) and the worker ends that
+    turn with a question for the parent. Its ``running`` edge shows the new
+    work; its ``idle`` edge must then reach the parent's inbox as a fresh
+    completion — not be dropped as "already delivered" for the old dispatch.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    runner_app.register_child_session(
+        child_id,
+        parent_session_id=parent_id,
+        title="claude:impl",
+        tool="claude",
+        session_name="impl",
+    )
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude-native", title="impl"
+    )
+    try:
+        async with _runner_client(app) as client:
+
+            async def edge(data: dict[str, Any]) -> None:
+                resp = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={"type": "external_session_status", "data": data},
+                )
+                assert resp.status_code == 204, resp.text
+
+            await edge({"status": "running"})
+            await edge({"status": "idle", "output": "Round one done."})
+            assert session_inbox.get_nowait()["output"] == "Round one done."
+            # The parent drains the result: sys_read_inbox forgets the entry
+            # but remembers the child so a trailing watcher idle is a no-op.
+            runner_app.unregister_subagent_work(child_id, remember_drained_delivery=True)
+            await edge({"status": "idle"})  # trailing quiescence idle
+            assert session_inbox.empty(), "a trailing idle after the drain must not re-deliver"
+
+            # Claude Code resumes the worker by itself; it works, then asks.
+            await edge({"status": "running"})
+            await edge({"status": "idle", "output": "Want me to open the PR, or one more round?"})
+        payload = session_inbox.get_nowait()
+        assert payload["status"] == "completed"
+        assert "open the PR" in str(payload["output"]), (
+            "a self-resumed worker's next result must reach the parent; it was "
+            "dropped as already delivered for the drained dispatch"
+        )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app.unregister_child_session(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(child_id, None)
+        runner_app.forget_drained_subagent_delivery(child_id)
