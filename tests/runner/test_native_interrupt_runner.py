@@ -99,7 +99,7 @@ def test_native_cancel_capability_follows_stop_registry() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["antigravity-native", "claude-sdk", None])
 async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
     """Harnesses without an interrupt/stop handler return None (caller falls through)."""
     runner, _ = _make_runner()
@@ -337,3 +337,80 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     assert isinstance(resp, Response) and resp.status_code == 204
     assert injected == [("dir/bid-conv_cl", 1.0)]
     assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+
+
+def _patch_opencode(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    state: Any,
+    error: Exception | None = None,
+) -> list[str]:
+    import omnigent.harnesses.opencode_native.app_server as oc_app_server
+    import omnigent.harnesses.opencode_native.bridge as oc_bridge
+
+    interrupted: list[str] = []
+
+    class _Client:
+        async def interrupt(self, session_id: str) -> bool:
+            if error is not None:
+                raise error
+            interrupted.append(session_id)
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(oc_bridge, "read_bridge_state", lambda _dir: state)
+    monkeypatch.setattr(oc_app_server, "client_for_state", lambda **_kw: _Client())
+    return interrupted
+
+
+def _opencode_state() -> Any:
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
+
+    return OpenCodeNativeBridgeState(
+        session_id="conv_o",
+        server_base_url="http://127.0.0.1:1",
+        opencode_session_id="ses_o",
+        auth_secret="pw",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["interrupt", "stop"])
+async def test_opencode_interrupt_calls_server_and_wakes_parent(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    interrupted = _patch_opencode(monkeypatch, state=_opencode_state())
+    runner, captured = _make_runner()
+
+    resp = await getattr(runner, method)("opencode-native", "conv_o")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert interrupted == ["ses_o"]
+    assert captured["wakes"] == [("conv_o", "cancelled", "[System: sub-agent interrupted]")]
+
+
+@pytest.mark.asyncio
+async def test_opencode_interrupt_without_state_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_opencode(monkeypatch, state=None)
+    runner, _ = _make_runner()
+    assert await runner.interrupt("opencode-native", "conv_o") is None
+
+
+@pytest.mark.asyncio
+async def test_opencode_interrupt_failure_is_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.harnesses.opencode_native.client import OpenCodeClientError
+
+    _patch_opencode(
+        monkeypatch, state=_opencode_state(), error=OpenCodeClientError("interrupt failed: 500")
+    )
+    runner, captured = _make_runner()
+
+    resp = await runner.interrupt("opencode-native", "conv_o")
+
+    assert resp is not None and resp.status_code == 503
+    assert b"opencode_native_interrupt_failed" in resp.body
+    assert captured["wakes"] == []
