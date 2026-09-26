@@ -157,6 +157,42 @@ async def test_run_turn_switches_model_before_prompt(
     assert state.last_applied_model == "anthropic/claude-opus-4"
 
 
+async def test_run_turn_switches_model_with_variant(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``#variant`` suffix reaches ``/model`` as a separate ``variant`` field."""
+    _seed_state(tmp_path, model_override="anthropic/claude-opus-4#high")
+    executor = _executor(tmp_path, monkeypatch)
+    await _run(executor, "hello")
+    assert fake_server.requests[0][2] == {
+        "model": {"id": "claude-opus-4", "providerID": "anthropic", "variant": "high"}
+    }
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.last_applied_model == "anthropic/claude-opus-4#high"
+
+
+async def test_run_turn_switches_model_with_multi_slash_provider_ref(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provider splits at the FIRST slash; the model id keeps the rest."""
+    _seed_state(tmp_path, model_override="openrouter/acme/model-x")
+    executor = _executor(tmp_path, monkeypatch)
+    await _run(executor, "hello")
+    assert fake_server.requests[0][2] == {
+        "model": {"id": "acme/model-x", "providerID": "openrouter"}
+    }
+
+
+async def test_run_turn_switches_model_without_variant_sends_no_variant_key(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_state(tmp_path, model_override="anthropic/claude-opus-4")
+    executor = _executor(tmp_path, monkeypatch)
+    await _run(executor, "hello")
+    assert "variant" not in fake_server.requests[0][2]["model"]
+
+
 async def test_run_turn_skips_model_switch_when_already_applied(
     fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

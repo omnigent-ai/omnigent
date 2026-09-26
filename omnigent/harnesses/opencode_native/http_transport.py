@@ -108,18 +108,25 @@ def _attachment_to_file(attachment: Mapping[str, object]) -> dict[str, str] | No
     return entry
 
 
-def _split_model_id(model: str) -> tuple[str, str] | None:
+def _split_model_id(model: str) -> tuple[str, str, str | None] | None:
     """
-    Split a qualified model id at its first slash.
+    Split a qualified model ref into provider, model id, and optional variant.
 
-    :param model: e.g. ``"openrouter/acme/model-x"``.
-    :returns: ``("openrouter", "acme/model-x")``, or ``None`` when *model* has
-        no provider prefix.
+    The provider splits off at the first ``/`` (so a provider whose own model
+    id contains slashes, e.g. ``"openrouter/acme/model-x"``, keeps them); the
+    remainder then splits at the LAST ``#`` for an optional variant suffix.
+
+    :param model: e.g. ``"openrouter/acme/model-x#high"``.
+    :returns: ``("openrouter", "acme/model-x", "high")``, or ``None`` when
+        *model* has no provider prefix.
     """
-    provider, sep, model_id = model.partition("/")
-    if sep and provider and model_id:
-        return provider, model_id
-    return None
+    provider, sep, rest = model.partition("/")
+    if not sep or not provider or not rest:
+        return None
+    model_id, hash_sep, variant = rest.rpartition("#")
+    if not hash_sep:
+        return provider, rest, None
+    return provider, model_id, variant or None
 
 
 class OpenCodeHttpTransport:
@@ -147,7 +154,8 @@ class OpenCodeHttpTransport:
         self._server = server
         self._client_factory = client_factory
         self._directory = directory
-        # Last model pushed via POST /model when no bridge state records it.
+        # Fallback for when self._bridge_dir is None (e.g. tests using
+        # client_factory): the last model pushed via POST /model.
         self._last_applied_model: str | None = None
 
     def _client(self) -> OpenCodeClient:
@@ -245,8 +253,10 @@ class OpenCodeHttpTransport:
         last_applied = state.last_applied_model if state is not None else self._last_applied_model
         if last_applied == model:
             return
-        provider_id, model_id = split
-        await client.set_model(session_id, provider_id=provider_id, model_id=model_id)
+        provider_id, model_id, variant = split
+        await client.set_model(
+            session_id, provider_id=provider_id, model_id=model_id, variant=variant
+        )
         self._last_applied_model = model
         if self._bridge_dir is not None:
             update_last_applied_model(self._bridge_dir, model)
