@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import threading
 from collections import Counter
@@ -422,8 +423,7 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
-        # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
-        # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
+        # Generic ACP is config-gated; the empty fixture has no slug keys.
         "acp",
         # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
         # row never needs to touch this list.
@@ -553,15 +553,88 @@ def test_configured_harness_map_all_true_with_clis(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
-    # The generic ACP harness is config-gated (≥1 registered agent), not
-    # CLI-gated — satisfy it so it isn't the lone unconfigured entry here.
-    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
+    # Supply a real entry so generic and per-slug ACP readiness are true.
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda config=None: [AcpAgentEntry(slug="traex", name="TraeX", command="traex acp serve")],
+    )
     # antigravity (SDK) needs a visible Gemini credential (not the openai
     # family the other SDK harnesses share).
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     result = configured_harness_map()
     not_ready = {k: v for k, v in result.items() if v is not True}
     assert not not_ready, f"expected every spelling ready, got {not_ready}"
+
+
+def test_configured_harness_map_enumerates_configured_acp_slugs(
+    tmp_path: Path,
+) -> None:
+    """Expose every configured ACP slug, including collision suffixes."""
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "TraeX", "command": "traex acp serve"},
+                        {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
+                        {"name": "gemini cli", "command": "gemini2 --experimental-acp"},
+                    ]
+                }
+            }
+        )
+    )
+    result = configured_harness_map()
+    assert result["acp"] is True
+    assert result["acp:traex"] is True
+    assert result["acp:gemini-cli"] is True
+    assert result["acp:gemini-cli-2"] is True
+
+
+def test_configured_harness_map_omits_acp_slugs_without_configured_agents(
+    tmp_path: Path,
+) -> None:
+    """Omit slug keys for empty or malformed ACP configuration."""
+    result = configured_harness_map()
+    assert not [key for key in result if key.startswith("acp:")]
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"acp": {"agents": [{"name": "X", "command": "y", "omnigent_mcp": "nope"}]}}
+        )
+    )
+    result = configured_harness_map()
+    assert not [key for key in result if key.startswith("acp:")]
+    assert result["acp"] is False
+
+
+def test_malformed_acp_config_does_not_log_secret_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Malformed passthrough entries must not expose their values in readiness logs."""
+    secret = "TOKEN=readiness-secret-sentinel"
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "TraeX",
+                            "command": "traex acp serve",
+                            "env_passthrough": [secret],
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    with caplog.at_level(logging.DEBUG, logger="omnigent.onboarding.harness_readiness"):
+        result = configured_harness_map()
+    assert result["acp"] is False
+    assert "acp:traex" not in result
+    assert "ValueError" in caplog.text
+    assert secret not in caplog.text
 
 
 def test_configured_harness_map_probes_codex_readiness_once(

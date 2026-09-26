@@ -237,6 +237,21 @@ async def _seed_recent_workspace(page: Any, host_id: str, workspace: str) -> Non
     )
 
 
+def _managed_claude_credential_visible() -> bool:
+    if sys.platform != "darwin":
+        return False
+    from omnigent.onboarding.ambient import claude_managed_gateway
+
+    return claude_managed_gateway()[1]
+
+
+_skip_managed_claude = pytest.mark.skipif(
+    _managed_claude_credential_visible(),
+    reason="machine-wide Claude managed credentials survive isolated HOME",
+)
+
+
+@_skip_managed_claude
 def test_sdk_harness_readiness_reflects_missing_credentials(
     live_server: str,
     credentialless_host: dict[str, Any],
@@ -250,6 +265,51 @@ def test_sdk_harness_readiness_reflects_missing_credentials(
     the picker) reflects that no credential is resolvable for the SDK harness.
     """
     _run_in_fresh_loop(_drive_sdk_readiness(live_server, credentialless_host))
+
+
+@_skip_managed_claude
+def test_sdk_needs_auth_reaches_picker_without_launch(
+    live_server: str,
+    credentialless_host: dict[str, Any],
+) -> None:
+    """Carry the daemon's advisory SDK verdict to the browser before launch."""
+    availability = (credentialless_host.get("configured_harnesses") or {}).get("claude-sdk")
+    assert availability == "needs-auth", f"unexpected host SDK readiness: {availability!r}"
+    _run_in_fresh_loop(_drive_sdk_warning_without_launch(live_server, credentialless_host))
+
+
+async def _drive_sdk_warning_without_launch(base_url: str, host: dict[str, Any]) -> None:
+    agent_name = f"credless-sdk-warning-{uuid.uuid4().hex[:6]}"
+    agent_id = _register_harness_agent(base_url, agent_name, "claude-sdk", "claude-sonnet-4-5")
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            await _seed_recent_workspace(page, host["host_id"], host["workspace"])
+            host_id_json = json.dumps(host["host_id"])
+            await page.add_init_script(
+                f'window.localStorage.setItem("omnigent:last-host-choice", {host_id_json});'
+            )
+            await _seed_last_agent(page, agent_id)
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(picker).to_have_attribute(
+                "aria-label", re.compile(re.escape(agent_name), re.IGNORECASE)
+            )
+            await picker.click()
+            await expect(picker).to_have_attribute(
+                "aria-label", re.compile(r"SDK Claude SDK"), timeout=15_000
+            )
+            await page.keyboard.press("Escape")
+            warning = page.get_by_test_id("new-chat-landing-harness-warning")
+            await expect(warning).to_be_visible(timeout=15_000)
+            await expect(warning).to_contain_text(host["name"])
+        finally:
+            await page.close()
+            await browser.close()
 
 
 async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
