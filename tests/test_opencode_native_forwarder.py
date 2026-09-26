@@ -1080,3 +1080,53 @@ async def test_compaction_failed_posts_failed() -> None:
         )
     )
     assert _datas(server.posts, "external_compaction_status") == [{"status": "failed"}]
+
+
+# --- user prompts -----------------------------------------------------------
+
+
+def _enqueued(inbox_id: str, text: str, **payload: Any) -> OpenCodeEvent:
+    return _event(
+        "session.inbox.enqueued",
+        inboxID=inbox_id,
+        item={"type": "user", "payload": {"text": text, **payload}, "delivery": "steer"},
+    )
+
+
+async def test_user_prompt_posts_on_delivery_before_assistant() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_enqueued("msg_u", "my prompt"))
+    assert _items(server.posts) == []
+    await fwd.handle_event(_event("session.inbox.delivered", inboxID="msg_u"))
+    await fwd.handle_event(_step_started("msg_a"))
+    await fwd.handle_event(
+        _event("session.text.ended", assistantMessageID="msg_a", ordinal=0, text="hello")
+    )
+    await fwd.handle_event(_step_ended("msg_a"))
+    items = _items(server.posts)
+    assert [i["item_data"]["role"] for i in items] == ["user", "assistant"]
+    assert items[0]["item_data"]["content"] == [{"type": "input_text", "text": "my prompt"}]
+    assert items[0]["response_id"] == "msg_u"
+
+
+async def test_user_prompt_image_attachment_becomes_input_image() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    image = {"data": "AAAA", "mime": "image/png", "source": {"type": "inline"}, "name": "a.png"}
+    await fwd.handle_event(_enqueued("msg_u", "see image", files=[image]))
+    await fwd.handle_event(_event("session.inbox.delivered", inboxID="msg_u"))
+    content = _items(server.posts)[0]["item_data"]["content"]
+    assert content == [
+        {"type": "input_text", "text": "see image"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+    ]
+
+
+async def test_cancelled_inbox_prompt_is_never_posted() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_enqueued("msg_u", "never mind"))
+    await fwd.handle_event(_event("session.inbox.cancelled", inboxID="msg_u"))
+    await fwd.handle_event(_event("session.inbox.delivered", inboxID="msg_u"))
+    assert _items(server.posts) == []

@@ -223,6 +223,17 @@ def _int_or_zero(value: object) -> int:
     return 0
 
 
+def _user_file_block(file: Mapping[str, Any]) -> _JsonObject:
+    """Render a v2 ``Prompt.FileAttachment`` as a user content block."""
+    mime = file.get("mime")
+    data = file.get("data")
+    if isinstance(mime, str) and mime.startswith("image/") and isinstance(data, str) and data:
+        return {"type": "input_image", "image_url": f"data:{mime};base64,{data}"}
+    name = file.get("name")
+    label = name if isinstance(name, str) and name else (mime or "attachment")
+    return {"type": "input_text", "text": f"[attachment: {label}]"}
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's v2 event stream into Omnigent events.
@@ -280,6 +291,8 @@ class OpenCodeNativeForwarder:
         self._last_usage_signature: tuple[tuple[str, object], ...] | None = None
         # Last model mirrored to Omnigent (``provider/id``), to dedupe switches.
         self._last_model: str | None = None
+        # inboxID -> user prompt payload, posted when the prompt is delivered.
+        self._inbox_items: dict[str, _JsonObject] = {}
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -1030,6 +1043,70 @@ class OpenCodeNativeForwarder:
                 conversation_id=turn.conversation_id,
             )
 
+    async def _post_message_content(
+        self,
+        turn: _SessionTurn,
+        role: str,
+        content: list[_JsonObject],
+        *,
+        response_id: str,
+    ) -> None:
+        """Persist a message item with arbitrary content blocks."""
+        item_data: _JsonObject = {"role": role, "content": content}
+        if role == "assistant":
+            item_data["agent"] = _AGENT_NAME
+        await self._post_event(
+            _EXTERNAL_ITEM,
+            {"item_type": "message", "item_data": item_data, "response_id": response_id},
+            conversation_id=turn.conversation_id,
+        )
+
+    async def _post_user_payload(
+        self, turn: _SessionTurn, message_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        """Post a user prompt (text + attachments) once per message id."""
+        content: list[_JsonObject] = []
+        text = payload.get("text")
+        if isinstance(text, str) and text:
+            content.append({"type": "input_text", "text": text})
+        files = payload.get("files")
+        for file in files if isinstance(files, list) else []:
+            if isinstance(file, Mapping):
+                content.append(_user_file_block(file))
+        if not content or not self.state.mark(self._key("user", message_id)):
+            return
+        await self._post_message_content(turn, "user", content, response_id=message_id)
+
+    async def _on_inbox_enqueued(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.inbox.enqueued`` — hold a user prompt until delivered."""
+        inbox_id = _str_field(event.data, "inboxID")
+        item = event.data.get("item")
+        if inbox_id is None or not isinstance(item, Mapping) or item.get("type") != "user":
+            return
+        payload = item.get("payload")
+        if isinstance(payload, Mapping):
+            self._inbox_items[inbox_id] = dict(payload)
+
+    async def _on_inbox_delivered(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.inbox.delivered`` — the prompt joined the transcript.
+
+        The delivered inbox id is the user message id, so the prompt posts in
+        transcript order (a queued prompt appears when it runs, not when sent).
+        """
+        turn = await self._active_turn(event)
+        inbox_id = _str_field(event.data, "inboxID")
+        if turn is None or inbox_id is None:
+            return
+        payload = self._inbox_items.pop(inbox_id, None)
+        if payload is not None:
+            await self._post_user_payload(turn, inbox_id, payload)
+
+    async def _on_inbox_cancelled(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.inbox.cancelled`` — drop a queued prompt."""
+        inbox_id = _str_field(event.data, "inboxID")
+        if inbox_id is not None:
+            self._inbox_items.pop(inbox_id, None)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -1079,4 +1156,7 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.compaction.started": OpenCodeNativeForwarder._on_compaction_started,
     "session.compaction.ended": OpenCodeNativeForwarder._on_compaction_ended,
     "session.compaction.failed": OpenCodeNativeForwarder._on_compaction_failed,
+    "session.inbox.enqueued": OpenCodeNativeForwarder._on_inbox_enqueued,
+    "session.inbox.delivered": OpenCodeNativeForwarder._on_inbox_delivered,
+    "session.inbox.cancelled": OpenCodeNativeForwarder._on_inbox_cancelled,
 }
