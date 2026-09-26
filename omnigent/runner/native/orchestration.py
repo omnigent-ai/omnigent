@@ -36,7 +36,7 @@ if TYPE_CHECKING:
         CodexNativeAppServer,
     )
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
-    from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeClient
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.terminal import TerminalInstance
@@ -2084,63 +2084,6 @@ def _opencode_native_model_from_spec(
         return _resolve_spec_model(spec)
     except Exception:  # noqa: BLE001 - model resolution is best effort.
         return None
-
-
-def _resolve_opencode_compact_model(
-    session: OpenCodeSession | None,
-    messages: list[_JsonObject],
-    model_override: str | None,
-) -> tuple[str | None, str | None]:
-    """
-    Resolve the ``(provider_id, model_id)`` for an opencode ``/summarize``.
-
-    opencode's ``/summarize`` requires an explicit model, but Omnigent
-    creates the session WITHOUT one (the model is pinned per prompt), so
-    ``session.raw["model"]`` is usually absent. Resolve it from a
-    most-authoritative-first fallback chain:
-
-    1. The most-recent assistant message carries the live model on its
-       ``info`` as ``providerID`` + ``modelID`` (the MESSAGE keys). Iterate
-       in reverse for the last ``info.role == "assistant"`` with both set.
-    2. Else the session ``model`` field (covers create-with-model / TUI
-       switchModel) — on the SESSION object the keys are ``providerID`` +
-       ``id`` (NOT ``modelID``).
-    3. Else ``model_override`` from bridge state, a qualified
-       ``"provider/model"`` string split on the FIRST ``/``.
-
-    :param session: The :class:`OpenCodeSession` (``.raw`` is the payload),
-        or ``None``.
-    :param messages: The session's messages, each ``{"info": ..., "parts": ...}``.
-    :param model_override: Bridge-state ``model_override`` (qualified
-        ``provider/model``), or ``None``.
-    :returns: ``(provider_id, model_id)``; both ``None`` when unresolved.
-    """
-    # 1. The latest assistant message's live model (message keys:
-    #    ``providerID`` + ``modelID``).
-    for message in reversed(messages):
-        info = message.get("info") if isinstance(message, dict) else None
-        if not isinstance(info, dict) or info.get("role") != "assistant":
-            continue
-        provider_id = info.get("providerID")
-        model_id = info.get("modelID")
-        if isinstance(provider_id, str) and provider_id and isinstance(model_id, str) and model_id:
-            return provider_id, model_id
-
-    # 2. The session ``model`` field (session keys: ``providerID`` + ``id``).
-    model = session.raw.get("model") if session is not None else None
-    if isinstance(model, dict):
-        provider_id = model.get("providerID")
-        model_id = model.get("id")
-        if isinstance(provider_id, str) and provider_id and isinstance(model_id, str) and model_id:
-            return provider_id, model_id
-
-    # 3. Bridge-state ``model_override`` (``provider/model``, split on first ``/``).
-    if isinstance(model_override, str) and "/" in model_override:
-        provider_id, _, model_id = model_override.partition("/")
-        if provider_id and model_id:
-            return provider_id, model_id
-
-    return None, None
 
 
 def _opencode_native_profile_from_spec(

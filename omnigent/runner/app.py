@@ -145,7 +145,6 @@ from omnigent.runner.native import (
     _publish_tmux_target_for_bridge,
     _required_runner_env,
     _resolve_native_spawn_env,
-    _resolve_opencode_compact_model,
     _resolved_spec_workdir,
     _resolved_workdir_for_spec,
     _rewrap_like,
@@ -6914,22 +6913,7 @@ def create_runner_app(
             )
         client = server.client()
         try:
-            session = await client.get_session(state.opencode_session_id)
-            messages = await client.list_messages(state.opencode_session_id)
-            provider_id, model_id = _resolve_opencode_compact_model(
-                session, messages, state.model_override
-            )
-            if not provider_id or not model_id:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "opencode_native_compact_failed",
-                        "detail": "Could not resolve a compaction model; try switching the model.",
-                    },
-                )
-            await client.summarize(
-                state.opencode_session_id, provider_id=provider_id, model_id=model_id
-            )
+            await client.compact(state.opencode_session_id)
         except (httpx.HTTPError, OpenCodeClientError, RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
