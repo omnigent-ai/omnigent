@@ -1292,15 +1292,33 @@ async def _capture_codex_discovery_stderr_tail(
     return redact_log_text(text.splitlines()[-1].strip())[:_MODEL_DISCOVERY_STDERR_LINE_CHARS]
 
 
-async def _stop_codex_model_discovery_process(discovery: _CodexModelDiscoveryProcess) -> None:
-    """Terminate a discovery process and finish draining its stderr pipe."""
-    process = discovery.process
+async def _shutdown_process_session(process: asyncio.subprocess.Process) -> None:
+    """
+    Stop an app-server process and everything it left in its session.
+
+    ``SIGTERM`` the tree, wait up to five seconds for the process, escalate to
+    ``SIGKILL`` on timeout, then ``SIGKILL`` whatever still shares its session.
+    Codex starts each stdio MCP server in its own process group and can exit
+    before they do, so a wrapper that outlives the app-server or ignores
+    ``SIGTERM`` is an orphan by the time the process is gone.
+
+    :param process: The running app-server subprocess.
+    :returns: None.
+    """
+    pid = process.pid
     _proc.terminate_tree(process)
     try:
         await asyncio.wait_for(process.wait(), timeout=5.0)
     except TimeoutError:
         _proc.kill_tree(process)
         await process.wait()
+    if pid is not None:
+        _proc.kill_session(pid)
+
+
+async def _stop_codex_model_discovery_process(discovery: _CodexModelDiscoveryProcess) -> None:
+    """Terminate a discovery process and finish draining its stderr pipe."""
+    await _shutdown_process_session(discovery.process)
     await discovery.stderr_tail
 
 
@@ -2206,12 +2224,7 @@ class CodexNativeAppServer:
         :returns: None.
         """
         if self.proc is not None and self.proc.returncode is None:
-            _terminate_process_tree(self.proc)
-            try:
-                await asyncio.wait_for(self.proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                _kill_process_tree(self.proc)
-                await self.proc.wait()
+            await _shutdown_process_session(self.proc)
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -4484,16 +4497,6 @@ def build_codex_remote_args(
     return [*resume_args, "resume", "--remote", remote_url, thread_id]
 
 
-def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
-    """
-    Send SIGTERM to a subprocess process group when possible.
-
-    :param process: Subprocess handle to terminate.
-    :returns: None.
-    """
-    _proc.terminate_tree(process)
-
-
 def _process_group_id(process: asyncio.subprocess.Process) -> int:
     """
     Return the child process group id used for crash-safe reaping.
@@ -4505,13 +4508,3 @@ def _process_group_id(process: asyncio.subprocess.Process) -> int:
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             return os.getpgid(process.pid)
     return process.pid
-
-
-def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
-    """
-    Send SIGKILL to a subprocess process group when possible.
-
-    :param process: Subprocess handle to kill.
-    :returns: None.
-    """
-    _proc.kill_tree(process)

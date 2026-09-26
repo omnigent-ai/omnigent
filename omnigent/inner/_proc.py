@@ -11,7 +11,12 @@ equivalents:
   parent and the whole tree can be torn down).
 * :func:`terminate_tree` / :func:`kill_tree` — recursively stop a process and
   all of its descendants, using the process-group fast path on POSIX and
-  :mod:`psutil` walking on every platform.
+  :mod:`psutil` walking on every platform. On POSIX both also signal every
+  member of the child's session, which reaches descendants that moved to a
+  process group of their own.
+* :func:`terminate_session` / :func:`kill_session` — signal whatever is left
+  in the POSIX session a child led, including orphans re-parented to init
+  after the child exited, which no walk from the child can find any more.
 * :func:`process_alive` — liveness check that doesn't rely on ``os.kill(pid, 0)``.
 
 :mod:`psutil` is already a core dependency, so the descendant walk needs no new
@@ -80,6 +85,7 @@ def malloc_tuning_env() -> dict[str, str]:
 # process groups and SIGKILL do not exist. None on non-POSIX hosts.
 _killpg_fn = getattr(os, "killpg", None)
 _getpgid_fn = getattr(os, "getpgid", None)
+_getsid_fn = getattr(os, "getsid", None)
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 _CREATE_NEW_PROCESS_GROUP = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
 
@@ -175,6 +181,84 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def _session_member_pids(leader_pid: int) -> list[int]:
+    """
+    Pids of the live processes in the POSIX session *leader_pid* leads.
+
+    A child spawned with :func:`spawn_kwargs` leads its own session, and every
+    descendant keeps that session id even after it moves to a new process
+    group (Codex does this for each stdio MCP server it launches) or is
+    re-parented to init when the leader dies. The session id is therefore the
+    one handle that still finds the whole tree once ``killpg`` on the leader's
+    group and a :mod:`psutil` walk from the leader cannot. Never includes this
+    process or its own session, and matches nothing for a pid that never led
+    a session (no session bears its number) or for pid <= 1.
+
+    :param leader_pid: Pid of a child spawned with :func:`spawn_kwargs`,
+        e.g. ``44759``.
+    :returns: Member pids, e.g. ``[44761, 44968]``; ``[]`` off POSIX.
+    """
+    if not IS_POSIX or _getsid_fn is None or leader_pid <= 1:
+        return []
+    try:
+        own_sid = _getsid_fn(0)
+    except OSError:
+        return []
+    if leader_pid == own_sid:
+        return []
+    own_pid = os.getpid()
+    members: list[int] = []
+    for pid in psutil.pids():
+        if pid == own_pid:
+            continue
+        with suppress(OSError):
+            if _getsid_fn(pid) == leader_pid:
+                members.append(pid)
+    return members
+
+
+def _signal_session(leader_pid: int, sig: int) -> int:
+    """
+    Send *sig* to every live member of the session *leader_pid* leads.
+
+    :param leader_pid: Pid of a child spawned with :func:`spawn_kwargs`.
+    :param sig: Signal number, e.g. ``signal.SIGTERM``.
+    :returns: How many processes were signaled.
+    """
+    signaled = 0
+    for pid in _session_member_pids(leader_pid):
+        with suppress(OSError):
+            os.kill(pid, sig)
+            signaled += 1
+    return signaled
+
+
+def terminate_session(leader_pid: int) -> int:
+    """
+    ``SIGTERM`` whatever is left in the session *leader_pid* led.
+
+    Safe after the leader has exited: orphans re-parented to init keep the
+    session id. No-op off POSIX.
+
+    :param leader_pid: Pid of a child spawned with :func:`spawn_kwargs`.
+    :returns: How many processes were signaled.
+    """
+    return _signal_session(leader_pid, signal.SIGTERM)
+
+
+def kill_session(leader_pid: int) -> int:
+    """
+    ``SIGKILL`` whatever is left in the session *leader_pid* led.
+
+    Safe after the leader has exited: orphans re-parented to init keep the
+    session id. No-op off POSIX.
+
+    :param leader_pid: Pid of a child spawned with :func:`spawn_kwargs`.
+    :returns: How many processes were signaled.
+    """
+    return _signal_session(leader_pid, _SIGKILL)
+
+
 def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     """
     Gracefully stop ``process`` and all of its descendants.
@@ -197,6 +281,7 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
         return
 
     if _killpg(pid, signal.SIGTERM):
+        _signal_session(pid, signal.SIGTERM)
         if grace:
             _wait_gone(pid, grace)
         return
@@ -208,6 +293,7 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     if not procs:
         with suppress(Exception):
             process.terminate()
+    _signal_session(pid, signal.SIGTERM)
     if grace:
         _wait_gone(pid, grace)
 
@@ -229,6 +315,7 @@ def kill_tree(process: _ProcessLike | None) -> None:
         return
 
     if _killpg(pid, _SIGKILL):
+        _signal_session(pid, _SIGKILL)
         return
 
     procs = _walk_descendants(pid)
@@ -238,6 +325,7 @@ def kill_tree(process: _ProcessLike | None) -> None:
     if not procs:
         with suppress(Exception):
             process.kill()
+    _signal_session(pid, _SIGKILL)
 
 
 def _wait_gone(pid: int, timeout: float) -> None:

@@ -605,3 +605,116 @@ def test_malloc_tuning_env_honors_overrides(monkeypatch: pytest.MonkeyPatch) -> 
         "MALLOC_ARENA_MAX": "1",
         "MALLOC_TRIM_THRESHOLD_": "65536",
     }
+
+
+def _spawn_session_with_detached_group_child(
+    tmp_path: Path, *, child_ignores_sigterm: bool, leader_exits: bool
+) -> tuple[subprocess.Popen[bytes], int]:
+    """
+    Start a session leader whose child moves to its own process group.
+
+    Mirrors a Codex app server launching a stdio MCP server: the leader is
+    spawned with :func:`_proc.spawn_kwargs` (own session and group) and the
+    child starts a new process group, so ``killpg`` on the leader's group
+    cannot reach it while it keeps the leader's session id. The child writes
+    its pid only once its signal disposition is in place. With
+    ``leader_exits`` the leader quits right after the spawn, leaving the child
+    an orphan.
+    """
+    import sys
+
+    pid_file = tmp_path / "detached_child.pid"
+    child_code = (
+        "import os, pathlib, signal, time\n"
+        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if child_ignores_sigterm else "")
+        + f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        + "time.sleep(60)\n"
+    )
+    leader_code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}], process_group=0)\n"
+        + ("" if leader_exits else "time.sleep(60)\n")
+    )
+    leader = subprocess.Popen([sys.executable, "-c", leader_code], **_proc.spawn_kwargs())
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if pid_file.exists() and pid_file.read_text().strip():
+            return leader, int(pid_file.read_text().strip())
+        time.sleep(0.05)
+    _proc.kill_tree(leader)
+    raise AssertionError("detached child never started")
+
+
+def _assert_reaped(pid: int, what: str) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if not _proc.process_alive(pid):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{what} (pid {pid}) survived")
+
+
+def _kill_quietly(pid: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.posix_only
+def test_terminate_tree_reaches_a_child_in_its_own_process_group(tmp_path: Path) -> None:
+    """
+    A descendant that left the leader's process group still dies with the tree.
+
+    This is the shape of a Codex app server and its stdio MCP servers: a new
+    process group each, but the same session.
+    """
+    leader, child_pid = _spawn_session_with_detached_group_child(
+        tmp_path, child_ignores_sigterm=False, leader_exits=False
+    )
+    try:
+        assert os.getpgid(child_pid) != os.getpgid(leader.pid)
+        assert os.getsid(child_pid) == leader.pid
+        _proc.terminate_tree(leader, grace=5)
+        leader.wait(timeout=5)
+        _assert_reaped(child_pid, "detached-group child")
+    finally:
+        _kill_quietly(child_pid)
+        _proc.kill_tree(leader)
+
+
+@pytest.mark.posix_only
+def test_kill_session_reaps_a_sigterm_immune_orphan_after_its_leader_exited(
+    tmp_path: Path,
+) -> None:
+    """
+    The session sweep still finds a survivor once the leader is gone.
+
+    With the leader dead the tree cannot be walked and the tree functions are
+    no-ops by contract, yet the orphan keeps the leader's session id. It
+    ignores ``SIGTERM`` by design here, so only the ``SIGKILL`` sweep removes it.
+    """
+    leader, child_pid = _spawn_session_with_detached_group_child(
+        tmp_path, child_ignores_sigterm=True, leader_exits=True
+    )
+    try:
+        leader.wait(timeout=10)
+        assert os.getsid(child_pid) == leader.pid
+        _proc.terminate_tree(leader)
+        _proc.kill_tree(leader)
+        assert _proc.terminate_session(leader.pid) >= 1
+        time.sleep(0.5)
+        assert _proc.process_alive(child_pid)
+        assert _proc.kill_session(leader.pid) >= 1
+        _assert_reaped(child_pid, "SIGTERM-immune orphan")
+    finally:
+        _kill_quietly(child_pid)
+
+
+def test_session_member_pids_never_targets_our_own_session() -> None:
+    """
+    The sweep refuses pid <= 1 and our own session and never lists this process.
+    """
+    assert _proc._session_member_pids(0) == []
+    assert _proc._session_member_pids(1) == []
+    if _platform.IS_POSIX:
+        assert _proc._session_member_pids(os.getsid(0)) == []
+        assert os.getpid() not in _proc._session_member_pids(os.getpid())
