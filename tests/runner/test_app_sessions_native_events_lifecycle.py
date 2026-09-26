@@ -3734,6 +3734,145 @@ async def test_auxiliary_codex_tui_exit_preserves_app_server(
     assert not [event for event in events if event.get("type") == "session.status"]
 
 
+# Mirrors the runner's exit-driven recreate cap for the embedded REPL terminal.
+_REPL_RECREATE_LIMIT = 3
+
+
+async def _await_repl_terminal_recover(conv_id: str) -> None:
+    """Await the runner's named REPL-recover task for ``conv_id``, if any."""
+    for _ in range(10):
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"repl-terminal-recover:{conv_id}" and not task.done()
+        ]
+        if not pending:
+            return
+        await asyncio.gather(*pending)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_repl_exit_recreates_embedded_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected ``tui:main`` death rebuilds the embedded REPL terminal.
+
+    The REPL terminal is a live SDK session's main terminal. Deleting the
+    resource and returning (the generic auxiliary-exit path) silently loses
+    it: the inventory drops ``tui:main`` and the web view claims the harness
+    is not running while the session is still alive. The runner must instead
+    announce the rebuild via ``session.terminal_pending`` before the deletion
+    lands and recreate the terminal.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+
+    conv_id = uuid.uuid4().hex
+    recreated: list[str] = []
+
+    async def _fake_auto_create_repl_terminal(session_id: str, *args: Any, **kwargs: Any) -> None:
+        recreated.append(session_id)
+
+    monkeypatch.setattr(runner_app, "_auto_create_repl_terminal", _fake_auto_create_repl_terminal)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal_tui_main",
+                terminal_name="tui",
+                session_key="main",
+                lifecycle=TerminalLifecycle.AUXILIARY,
+            )
+        )
+        await _await_repl_terminal_recover(conv_id)
+        events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    assert recreated == [conv_id]
+    # The rebuild is announced before the stale resource is deleted, so the web
+    # view moves straight to "terminal coming up" instead of the misleading
+    # "harness is not running" fallback, and is released once the rebuild ends.
+    lifecycle_events = [
+        (event["type"], event.get("pending"), event.get("resource_id"))
+        for event in events
+        if event.get("type") in {"session.resource.deleted", "session.terminal_pending"}
+    ]
+    assert lifecycle_events == [
+        ("session.terminal_pending", True, None),
+        ("session.resource.deleted", None, "terminal_tui_main"),
+        ("session.terminal_pending", False, None),
+    ]
+    # A live SDK session losing its embedded pane is not a session failure.
+    assert not [event for event in events if event.get("type") == "session.status"]
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_repl_exit_recreate_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash-looping REPL terminal stops being auto-recreated at the cap.
+
+    When something keeps killing the recreated tmux server, the exit→recreate
+    loop must stop after the cap instead of spinning forever; a fresh terminal
+    attach still recreates the pane on demand.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+
+    conv_id = uuid.uuid4().hex
+    recreated: list[str] = []
+
+    async def _fake_auto_create_repl_terminal(session_id: str, *args: Any, **kwargs: Any) -> None:
+        recreated.append(session_id)
+
+    monkeypatch.setattr(runner_app, "_auto_create_repl_terminal", _fake_auto_create_repl_terminal)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        for _ in range(_REPL_RECREATE_LIMIT + 1):
+            publish_exit(
+                TerminalExitEvent(
+                    session_id=conv_id,
+                    terminal_id="terminal_tui_main",
+                    terminal_name="tui",
+                    session_key="main",
+                    lifecycle=TerminalLifecycle.AUXILIARY,
+                )
+            )
+            await _await_repl_terminal_recover(conv_id)
+        events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    # Only the capped number of rebuilds ran; the over-cap exit still deletes
+    # its resource but is dropped without another pending toggle.
+    assert recreated == [conv_id] * _REPL_RECREATE_LIMIT
+    assert [
+        event["pending"] for event in events if event.get("type") == "session.terminal_pending"
+    ] == [True, False] * _REPL_RECREATE_LIMIT
+    assert (
+        len([event for event in events if event.get("type") == "session.resource.deleted"])
+        == _REPL_RECREATE_LIMIT + 1
+    )
+
+
 @pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])
 @pytest.mark.asyncio
 async def test_required_terminal_clean_quit_publishes_idle_not_failed(
