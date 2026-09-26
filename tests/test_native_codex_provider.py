@@ -900,6 +900,70 @@ def test_default_provider_without_credential_logged_out_marks_login_required(
     assert launch.login_required is True
 
 
+# ── ambient built-in provider: config.toml routes without any login ─────────
+
+
+def _write_ambient_codex_config(home: Path, content: str) -> None:
+    """Write ``~/.codex/config.toml`` under the isolated HOME (no auth.json)."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize("provider_id", ["amazon-bedrock", "ollama"])
+def test_ambient_builtin_provider_routes_without_login(_isolated: Path, provider_id: str) -> None:
+    """A config.toml selecting a self-sufficient built-in provider routes the launch.
+
+    Codex authenticates its built-in non-OpenAI providers itself (Bedrock via
+    the AWS credential chain), so with no Omnigent provider and no Codex login
+    the launch must route through that config — exactly like a plain ``codex``
+    run — instead of a doomed ``login_required`` sign-in screen.
+    """
+    _write_ambient_codex_config(
+        _isolated,
+        f'model = "openai.gpt-5.6-terra"\nmodel_provider = "{provider_id}"\n\n'
+        f'[model_providers.{provider_id}.aws]\nregion = "us-east-1"\n',
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == [f'model_provider="{provider_id}"']
+    assert launch.profile is None
+    assert launch.login_required is False
+    assert provider_id in launch.summary
+    assert "no provider configured" not in launch.summary
+
+
+def test_ambient_openai_selection_still_marks_login_required(_isolated: Path) -> None:
+    """An explicit built-in ``openai`` selection is Codex's own login — still doomed."""
+    _write_ambient_codex_config(_isolated, 'model_provider = "openai"\nmodel = "gpt-5.4"\n')
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "no provider configured" in launch.summary
+    assert launch.login_required is True
+
+
+def test_configured_provider_wins_over_ambient_builtin(_isolated: Path) -> None:
+    """An Omnigent provider default still routes ahead of the ambient built-in."""
+    _write_ambient_codex_config(_isolated, 'model_provider = "amazon-bedrock"\n')
+    _seed(
+        _isolated,
+        {
+            "vendor": {
+                "kind": "key",
+                "default": True,
+                "openai": {"base_url": "https://vendor.example.com/v1", "api_key": "test-key"},
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "vendor" in launch.summary
+    assert launch.login_required is False
+
+
 def test_global_api_key_routes_without_model_or_cli_login(
     _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

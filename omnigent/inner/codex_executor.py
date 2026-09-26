@@ -1086,6 +1086,12 @@ def materialize_codex_provider_config(
     commands. Persist them in the session-owned ``config.toml`` instead so
     process arguments contain only non-secret routing and behavior overrides.
 
+    Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) are
+    left untouched: Codex allows only limited overrides on them (Bedrock:
+    ``aws.profile`` / ``aws.region``) and reacts to any other field by
+    discarding the **whole** config ("Invalid configuration; using defaults"),
+    which would strand the session on the sign-in screen.
+
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
@@ -1131,9 +1137,13 @@ def materialize_codex_provider_config(
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
 
+    from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
         if not isinstance(provider_config, MutableMapping):
+            continue
+        if provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
         if isinstance(provider_config, tomlkit.items.InlineTable):
             inline_provider = tomlkit.inline_table()

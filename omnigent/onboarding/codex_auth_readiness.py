@@ -75,6 +75,27 @@ def effective_custom_provider_table(
     return provider_id, table
 
 
+def effective_self_sufficient_builtin_provider(config: dict[str, object]) -> str | None:
+    """Return the selected built-in provider id when Codex needs no login for it.
+
+    Mirrors the built-in branch of :func:`codex_config_effective_auth`: every
+    built-in provider except ``openai`` (Bedrock, Ollama, LM Studio)
+    authenticates itself — Bedrock through the AWS credential chain, the local
+    servers not at all — so a config selecting one routes Codex without a
+    ChatGPT login. Configured ``[model_providers]`` entries cannot replace
+    these built-ins (Bedrock accepts only limited endpoint/auth overrides that
+    never reintroduce a login), so the selection alone decides.
+
+    :param config: A parsed Codex ``config.toml`` (:func:`load_codex_config`).
+    :returns: The built-in provider id, e.g. ``"amazon-bedrock"``, or ``None``
+        when the effective provider is unset, custom, or ``openai``.
+    """
+    provider_id = effective_codex_model_provider(config)
+    if provider_id in CODEX_BUILTIN_PROVIDERS and provider_id != "openai":
+        return provider_id
+    return None
+
+
 def provider_table_has_self_contained_auth(table: dict[str, object]) -> bool:
     """Return whether a custom provider table carries adoption-safe auth.
 

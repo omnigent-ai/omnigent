@@ -3543,6 +3543,29 @@ def _codex_login_usable() -> bool:
     return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
 
 
+def _ambient_builtin_codex_provider() -> str | None:
+    """The bridged config.toml's self-sufficient built-in provider, if selected.
+
+    Reads the same ``config.toml`` the launched Codex process will use (the
+    bridged ``CODEX_HOME`` source). When it selects a built-in non-OpenAI
+    provider (e.g. ``amazon-bedrock``), Codex authenticates that provider
+    itself — a plain ``codex`` run works with no ChatGPT login — so the launch
+    can route through it instead of falling to a doomed login screen.
+
+    :returns: The built-in provider id, e.g. ``"amazon-bedrock"``, or ``None``.
+    """
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.onboarding.codex_auth_readiness import (
+        effective_self_sufficient_builtin_provider,
+        load_codex_config,
+    )
+
+    config = load_codex_config(_codex_home_config_source_from_env() / "config.toml")
+    if config is None:
+        return None
+    return effective_self_sufficient_builtin_provider(config)
+
+
 def _resolve_subscription_launch(
     entry: ProviderEntry, model: str | None, explicit: dict[str, object]
 ) -> NativeCodexLaunch:
@@ -3634,7 +3657,9 @@ def resolve_native_codex_launch(
     2. else a global ``auth:`` block → ucode for Databricks, or provider
        overrides for an inline API key;
     3. else an ambient-detected provider (first run without configure);
-    4. else the codex CLI's own login.
+    4. else a self-sufficient built-in provider the bridged ``config.toml``
+       selects (e.g. ``amazon-bedrock`` — Codex authenticates it itself);
+    5. else the codex CLI's own login.
 
     Without a *spec* (or when the spec carries no spec-level credential),
     credentials are controlled by ``omnigent setup`` provider config (or the
@@ -3828,6 +3853,23 @@ def resolve_native_codex_launch(
             )
 
     if entry is None:
+        ambient_builtin = _ambient_builtin_codex_provider()
+        if ambient_builtin is not None:
+            log_info_once(
+                _logger,
+                "native-codex routing: config.toml built-in provider %r (Codex-native "
+                "ambient config; Codex authenticates it itself)",
+                ambient_builtin,
+            )
+            return NativeCodexLaunch(
+                config_overrides=[f"model_provider={json.dumps(ambient_builtin)}"],
+                model=model,
+                profile=None,
+                summary=(
+                    f"Codex config.toml built-in provider {ambient_builtin!r} "
+                    "(Codex-native ambient config; Codex authenticates it itself)"
+                ),
+            )
         log_info_once(
             _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "

@@ -3896,6 +3896,38 @@ def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path:
     assert provider["stream_idle_timeout_ms"] == 300_000
 
 
+def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouched(
+    tmp_path: Path,
+) -> None:
+    """Built-in provider tables stay codex-valid: no retry stamping.
+
+    Codex allows only ``aws.profile`` / ``aws.region`` overrides on its
+    built-in ``amazon-bedrock`` table and reacts to any other field by
+    discarding the whole config ("Invalid configuration; using defaults"),
+    which would strand the session on the sign-in screen. Custom tables in
+    the same config still receive the retry budget.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model_provider = "amazon-bedrock"\n\n'
+        '[model_providers.amazon-bedrock.aws]\nregion = "us-east-1"\n\n'
+        '[model_providers.gateway]\nname = "Gateway"\nbase_url = "https://example.test"\n'
+    )
+
+    materialize_codex_provider_config(codex_home, [])
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model_providers"]["amazon-bedrock"] == {"aws": {"region": "us-east-1"}}
+    gateway = config["model_providers"]["gateway"]
+    assert gateway["request_max_retries"] == RetryPolicy().max_retries
+
+
 # ---------------------------------------------------------------------------
 # _clean_codex_env tests
 # ---------------------------------------------------------------------------
