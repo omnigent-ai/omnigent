@@ -11,10 +11,12 @@ import subprocess
 import time
 import uuid
 from collections.abc import Generator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 from omnigent.harnesses.codex_native.state import _codex_native_state_root
+from omnigent.inner import _proc
 
 try:
     import fcntl
@@ -25,24 +27,13 @@ _logger = logging.getLogger(__name__)
 _REGISTRY_FILE = "process-registry.json"
 _OWNER_LOCK_DIR = "process-owners"
 _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
+# Delay escalation long enough for Codex to flush rollout state.
+_SIGKILL_GRACE_S = 10.0
 
 
 @dataclass(frozen=True)
 class CodexNativeProcessEntry:
-    """
-    One crash-reapable native Codex subprocess registry entry.
-
-    :param pid: Child process id.
-    :param pgid: Child process group id.
-    :param tmux_session_name: Optional tmux session name owned by the child.
-    :param session_tag: Unique tag also embedded in the child command line.
-    :param process_start_identity: Kernel-backed process birth identity used
-        to distinguish the registered child from a later process reusing its
-        PID. ``None`` is accepted for entries written by older versions.
-    :param owner_lock_path: Lock file held by the parent while it owns
-        the child. If the lock is still held during reconciliation, the
-        child is a live sibling and must not be reaped.
-    """
+    """One crash-reapable native Codex subprocess registry entry."""
 
     pid: int
     pgid: int
@@ -50,6 +41,9 @@ class CodexNativeProcessEntry:
     session_tag: str
     process_start_identity: str | None = None
     owner_lock_path: str | None = None
+    sigterm_at: float | None = None
+    members: tuple[tuple[int, str], ...] | None = None
+    leader_identity: str | None = None
 
 
 @dataclass
@@ -161,6 +155,7 @@ def register_codex_native_process(
         session_tag=session_tag,
         process_start_identity=_process_start_identity(pid),
         owner_lock_path=str(owner_lock_path) if owner_lock_path is not None else None,
+        leader_identity=_proc.process_start_identity(pid),
     )
     path = registry_path or codex_native_process_registry_path()
     with _registry_lock(path):
@@ -191,35 +186,159 @@ def unregister_codex_native_process(
         _write_registry(path, entries)
 
 
-def reconcile_codex_native_process_registry(*, registry_path: Path | None = None) -> None:
-    """
-    Reap crash-leftover native Codex children recorded by prior runs.
-
-    PID reuse is guarded by comparing the process birth identity recorded at
-    spawn. Older entries without that identity retain the command-line tag
-    fallback.
-
-    :param registry_path: Test override for the registry file path.
-    :returns: None.
-    """
+def reconcile_codex_native_process_registry(*, registry_path: Path | None = None) -> int:
+    """Reap crash-leftover native Codex children recorded by prior runs."""
     path = registry_path or codex_native_process_registry_path()
+    signaled = 0
     with _registry_lock(path):
+        now = time.time()
         survivors: list[CodexNativeProcessEntry] = []
+        pending_terms: list[CodexNativeProcessEntry] = []
         for entry in _read_registry(path):
             if _owner_lock_held(entry.owner_lock_path):
                 survivors.append(entry)
                 continue
-            matches_entry = _process_matches_entry(entry)
-            if matches_entry is None:
+            if entry.leader_identity is None and entry.process_start_identity is not None:
+                matches_entry = _process_matches_entry(entry)
+                if matches_entry is None:
+                    survivors.append(entry)
+                    continue
+                if not matches_entry:
+                    continue
+                if not _terminate_process_group(entry):
+                    survivors.append(entry)
+                    continue
+                _reap_tmux_session(entry.tmux_session_name)
+                signaled += 1
+                continue
+            if entry.sigterm_at is not None:
+                if now - entry.sigterm_at < _SIGKILL_GRACE_S:
+                    survivors.append(entry)
+                    continue
+                outcome, entry = _escalate_sigkill(entry)
+                if outcome == "killed":
+                    signaled += 1
+                if outcome in ("killed", "retry"):
+                    # Keep the entry: absence is re-verified on a later
+                    # pass before its metadata is dropped.
+                    survivors.append(entry)
+                    continue
+                _reap_tmux_session(entry.tmux_session_name)
+                continue
+            leader = _entry_leader_state(entry)
+            if leader == "unverifiable":
+                # Retain a possibly matching process whose identity is temporarily unreadable.
                 survivors.append(entry)
                 continue
-            if not matches_entry:
+            if leader == "gone":
+                # Drop an unsignaled entry once its leader identity is gone.
+                _reap_tmux_session(entry.tmux_session_name)
                 continue
-            if not _terminate_process_group(entry):
+            members = _group_member_identities(entry.pgid)
+            if members is None:
+                # Defer signaling until escalation targets can be recorded.
+                _logger.warning(
+                    "cannot snapshot members of codex-native group %d; "
+                    "deferring its reap to a later pass",
+                    entry.pgid,
+                )
                 survivors.append(entry)
                 continue
-            _reap_tmux_session(entry.tmux_session_name)
-        _write_registry(path, survivors)
+            entry = replace(entry, sigterm_at=now, members=members)
+            survivors.append(entry)
+            pending_terms.append(entry)
+        # Persist member identities before delivering the first signal.
+        if not _write_registry(path, survivors):
+            return signaled
+        for entry in pending_terms:
+            # Recheck each member identity after persisting the snapshot.
+            delivered = [
+                pid
+                for pid, start in entry.members or ()
+                if _signal_member_verified(pid, start, signal.SIGTERM)
+            ]
+            if delivered:
+                _logger.info(
+                    "SIGTERMed ownerless codex-native member(s) %s of group %d",
+                    delivered,
+                    entry.pgid,
+                )
+                signaled += 1
+    return signaled
+
+
+_EscalationOutcome = Literal["killed", "retry", "gone", "unverifiable"]
+
+
+def _escalate_sigkill(
+    entry: CodexNativeProcessEntry,
+) -> tuple[_EscalationOutcome, CodexNativeProcessEntry]:
+    """SIGKILL the identity-verified recorded members of a SIGTERMed entry."""
+    kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+    if entry.members is None:
+        # Legacy entries can safely target only their tag-verified leader.
+        if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
+            try:
+                os.kill(entry.pid, kill_sig)
+            except OSError:
+                return "retry", entry
+            _logger.warning(
+                "ownerless codex-native leader %d survived SIGTERM; SIGKILLed",
+                entry.pid,
+            )
+            return "killed", entry
+        _logger.info(
+            "dropping codex-native entry for group %d: tagged leader gone and no "
+            "member snapshot to verify survivors",
+            entry.pgid,
+        )
+        return "unverifiable", entry
+    states = [(pid, start, _member_identity_state(pid, start)) for pid, start in entry.members]
+    delivered = [
+        pid
+        for pid, start, state in states
+        if state == "match" and _kill_member_verified(pid, start)
+    ]
+    if delivered:
+        _logger.warning(
+            "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
+            entry.pgid,
+            delivered,
+        )
+        return "killed", entry
+    if any(state == "match" for _pid, _start, state in states):
+        return "retry", entry
+    if any(state == "unverifiable" for _pid, _start, state in states):
+        # A member that exists but cannot be identified might still be
+        # ours; keep the entry rather than declaring the group gone.
+        return "retry", entry
+    if _proc.group_kernel_present(entry.pgid) is not False:
+        # Keep evidence until the kernel reports the recorded group absent.
+        _logger.warning(
+            "codex-native group %d has unverifiable occupant(s) after all "
+            "recorded members exited; retaining its entry",
+            entry.pgid,
+        )
+        return "retry", entry
+    return "gone", entry
+
+
+def ownerless_entry_matches_leader(pid: int, identity: str | None) -> bool:
+    """Whether an adopted zombie leader corresponds to an ownerless entry."""
+    if identity is None:
+        return False
+    try:
+        entries = _read_registry(codex_native_process_registry_path())
+    except Exception:  # noqa: BLE001 — attribution is best-effort
+        return False
+    for entry in entries:
+        if entry.pid != pid or identity not in (
+            entry.leader_identity,
+            entry.process_start_identity,
+        ):
+            continue
+        return not _owner_lock_held(entry.owner_lock_path)
+    return False
 
 
 @contextlib.contextmanager
@@ -284,7 +403,7 @@ def _read_registry(path: Path) -> list[CodexNativeProcessEntry]:
     return entries
 
 
-def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> None:
+def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> bool:
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         payload = []
@@ -298,6 +417,8 @@ def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> None:
         os.replace(tmp, path)
     except OSError:
         _logger.warning("codex-native process registry write failed", exc_info=True)
+        return False
+    return True
 
 
 def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
@@ -309,6 +430,11 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
     process_start_identity = item.get("process_start_identity")
     tmux_session_name = item.get("tmux_session_name")
     owner_lock_path = item.get("owner_lock_path")
+    sigterm_at = item.get("sigterm_at")
+    members = _members_from_json(item.get("members"))
+    leader_identity = item.get("leader_identity")
+    if not isinstance(leader_identity, str) or not leader_identity:
+        leader_identity = None
     if not isinstance(pid, int) or pid <= 0:
         return None
     if not isinstance(pgid, int) or pgid <= 0:
@@ -321,6 +447,8 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         tmux_session_name = None
     if owner_lock_path is not None and not isinstance(owner_lock_path, str):
         owner_lock_path = None
+    if not isinstance(sigterm_at, (int, float)) or isinstance(sigterm_at, bool):
+        sigterm_at = None
     return CodexNativeProcessEntry(
         pid=pid,
         pgid=pgid,
@@ -328,7 +456,26 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         session_tag=session_tag,
         process_start_identity=process_start_identity,
         owner_lock_path=owner_lock_path,
+        sigterm_at=float(sigterm_at) if sigterm_at is not None else None,
+        members=members,
+        leader_identity=leader_identity,
     )
+
+
+def _members_from_json(raw: object) -> tuple[tuple[int, str], ...] | None:
+    if not isinstance(raw, list):
+        return None
+    members: list[tuple[int, str]] = []
+    for item in raw:
+        if not isinstance(item, list) or len(item) != 2:
+            return None
+        pid, start = item
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return None
+        if not isinstance(start, str) or not start:
+            return None
+        members.append((pid, start))
+    return tuple(members) if members else None
 
 
 def _owner_lock_held(owner_lock_path: str | None) -> bool:
@@ -367,6 +514,15 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _entry_leader_state(entry: CodexNativeProcessEntry) -> str:
+    """Classify an entry's recorded leader: ``match``/``gone``/``unverifiable``."""
+    if entry.leader_identity is not None:
+        return _member_identity_state(entry.pid, entry.leader_identity)
+    if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
+        return "match"
+    return "gone"
 
 
 def _process_matches_entry(entry: CodexNativeProcessEntry) -> bool | None:
@@ -432,6 +588,29 @@ def _process_cmdline(pid: int) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _group_member_identities(pgid: int) -> tuple[tuple[int, str], ...] | None:
+    """Snapshot ``(pid, identity)`` for every member of *pgid*."""
+    members = _proc.group_member_identities(pgid)
+    if not members:
+        return None
+    return tuple(sorted(members.items()))
+
+
+def _member_identity_state(pid: int, identity: str) -> str:
+    """Classify a recorded member against its live incarnation."""
+    return _proc.process_identity_state(pid, identity)
+
+
+def _signal_member_verified(pid: int, identity: str, sig: signal.Signals) -> bool:
+    """Deliver *sig* to *pid* only if it is still the recorded incarnation."""
+    return _proc.kill_verified(pid, identity, sig)
+
+
+def _kill_member_verified(pid: int, identity: str) -> bool:
+    """SIGKILL *pid* only if it is still the recorded incarnation."""
+    return _signal_member_verified(pid, identity, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _terminate_process_group(entry: CodexNativeProcessEntry) -> bool:

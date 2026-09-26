@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -88,6 +89,11 @@ _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 # a still-running Omnigent (leave alone) or a crashed one (kill its
 # children, remove the dir).
 _AP_PID_FILE = "AP_PID"
+# Sibling of AP_PID carrying the manager's kernel start identity, so the
+# dead-sibling gate survives pid recycling.
+_AP_IDENT_FILE = "AP_IDENT"
+# Record harness identities so a subreaper can attribute adopted leaders.
+_HARNESS_PIDS_FILE = "HARNESS_PIDS"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
 # socket. Filesystem permissions + the per-AP-uuid scope are the v1
@@ -189,6 +195,24 @@ _SPAWN_POLL_INTERVAL_S = 0.05
 # normal lifecycle — if SIGTERM doesn't land in 3 s, SIGKILL is
 # the only recourse.
 _ORPHAN_SIGTERM_GRACE_S = 3.0
+
+# Keep the instance dir when a killed process has not disappeared yet.
+_ORPHAN_KILL_VERIFY_TIMEOUT_S = 2.0
+
+# Whether the missing-lsof warning has fired; the periodic sweep would
+# otherwise repeat it every pass on hosts without lsof.
+_lsof_missing_warned = False
+
+
+def _warn_lsof_missing_once() -> None:
+    global _lsof_missing_warned
+    if _lsof_missing_warned:
+        return
+    _lsof_missing_warned = True
+    _logger.warning(
+        "lsof not found; orphaned harness instance dirs cannot be verified "
+        "and will be kept — install lsof to enable orphan cleanup"
+    )
 
 
 class NoLiveHarnessError(RuntimeError):
@@ -666,6 +690,19 @@ class HarnessProcessManager:
         """
         return _socket_path(self._instance_dir, conversation_id)
 
+    def _record_harness_spawn(self, pid: int | None) -> None:
+        """Append the spawned harness's identity to the instance dir."""
+        if pid is None:
+            return
+        identity = _proc.process_start_identity(pid)
+        if identity is None:
+            return
+        try:
+            with (self._instance_dir / _HARNESS_PIDS_FILE).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"pid": pid, "identity": identity}) + "\n")
+        except OSError:
+            _logger.debug("could not record harness spawn identity", exc_info=True)
+
     async def start(self, *, sweep_orphans: bool = True) -> None:
         """
         Initialize the per-instance dir and start the idle reaper.
@@ -693,6 +730,13 @@ class HarnessProcessManager:
         # uuid collided with a still-running instance — fail loud.
         sentinel = self._instance_dir / _AP_PID_FILE
         sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        own_identity = _proc.process_start_identity(os.getpid())
+        if own_identity is not None:
+            # Atomic replace: a torn identity read would look like a
+            # recycled (dead) owner and could sweep a live instance dir.
+            ident_tmp = self._instance_dir / (_AP_IDENT_FILE + ".tmp")
+            ident_tmp.write_text(own_identity, encoding="utf-8")
+            os.replace(ident_tmp, self._instance_dir / _AP_IDENT_FILE)
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1283,6 +1327,7 @@ class HarnessProcessManager:
         ]
         spawn_started_at = time.monotonic()
         process = await self._spawn_harness_process(runner_argv, effective_env)
+        self._record_harness_spawn(process.pid)
         try:
             await _wait_for_bind(process, endpoint, harness, conversation_id)
             # The harness process has bound its socket and is ready to serve —
@@ -1391,6 +1436,7 @@ class HarnessProcessManager:
                     "Harness zygote unavailable (%s); falling back to direct exec", exc
                 )
                 self._harness_zygote_disabled = True
+        # Detach each harness into the process group used for tree cleanup.
         return await asyncio.create_subprocess_exec(
             sys.executable,
             # -P keeps the inherited workspace cwd off sys.path so it can't
@@ -1402,6 +1448,7 @@ class HarnessProcessManager:
             stdout=None,
             stderr=None,
             env=effective_env,
+            **_proc.spawn_kwargs(),
         )
 
     async def _close_entry(self, entry: _SubprocessEntry) -> None:
@@ -1538,44 +1585,41 @@ class HarnessProcessManager:
                         conv_id,
                     )
 
+    async def _sweep_orphans(self) -> None:
+        """Sweep dead sibling instance dirs under ``_tmp_parent``."""
+        await sweep_orphaned_instance_dirs(self._tmp_parent)
 
-async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) -> None:
-    """Clean harness processes left behind by crashed prior instances.
 
-    Host-spawned runners delegate this machine-global work to the host. The
-    standalone server keeps calling it from :meth:`HarnessProcessManager.start`.
-
-    :param tmp_parent: Harness socket root to scan. Defaults to the configured
-        machine-global root.
-    :returns: None.
-    """
-    root = tmp_parent if tmp_parent is not None else _default_tmp_parent()
+async def sweep_orphaned_instance_dirs(tmp_parent: Path | None = None) -> int:
+    """Reap dead instance dirs while retaining unverifiable trees for retry."""
+    parent = tmp_parent if tmp_parent is not None else _default_tmp_parent()
     try:
-        if not root.exists():
-            return
+        if not parent.exists():
+            return 0
     except OSError as exc:
         _logger.warning(
             "cannot access %s for the orphan sweep: %s; skipping sweep",
-            root,
+            parent,
             exc,
         )
-        return
+        return 0
     try:
-        children = list(root.iterdir())
+        children = list(parent.iterdir())
     except OSError as exc:
         _logger.warning(
             "cannot enumerate %s for the orphan sweep: %s; skipping sweep",
-            root,
+            parent,
             exc,
         )
-        return
+        return 0
+    swept = 0
     for child in children:
+        if not child.name.startswith("ap-"):
+            continue
+        sentinel = child / _AP_PID_FILE
         try:
-            if not child.is_dir() or not child.name.startswith("ap-"):
-                continue
-            sentinel = child / _AP_PID_FILE
-            if not sentinel.exists():
-                # No sentinel: directory either pre-dates the
+            if not child.is_dir() or not sentinel.exists():
+                # No sentinel — directory either pre-dates the
                 # convention or is mid-creation. Leave alone.
                 continue
         except OSError as exc:
@@ -1585,54 +1629,253 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
                 exc,
             )
             continue
-        try:
-            pid = int(sentinel.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError) as exc:
+        if _ap_owner_is_dead(child) is not True:
+            # Sibling Omnigent still running, or unverifiable — leave it.
+            continue
+        _logger.info("sweeping orphaned Omnigent instance dir %s", child)
+        if await _kill_orphan_runners(child):
+            shutil.rmtree(child, ignore_errors=True)
+            swept += 1
+        else:
+            # The dir is the only record pointing at these processes; keep
+            # it so a later sweep retries instead of leaking them untracked.
             _logger.warning(
-                "could not read AP_PID sentinel at %s: %s; skipping",
-                sentinel,
-                exc,
+                "kept orphaned instance dir %s: termination not yet verified",
+                child,
             )
-            continue
-        if _pid_alive(pid):
-            continue
-        _logger.info(
-            "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
-            child,
-            pid,
+    return swept
+
+
+async def _kill_orphan_runners(instance_dir: Path) -> bool:
+    """Send SIGTERM to runner process trees whose socket lives under"""
+    groups = _load_reap_state(instance_dir)
+    if groups is None:
+        _logger.warning(
+            "unreadable reap state under %s; keeping the dir untouched",
+            instance_dir,
         )
-        await _kill_orphan_runners(child)
-        shutil.rmtree(child, ignore_errors=True)
-
-
-async def _kill_orphan_runners(instance_dir: Path) -> None:
-    """Terminate runner processes whose sockets live under *instance_dir*."""
-    all_pids: set[int] = set()
+        return False
+    pending_signals: list[tuple[int, str]] = []
+    lookup_failed = False
     for socket_file in instance_dir.glob("conv-*.sock"):
-        for pid in await _pids_holding_socket(socket_file):
-            try:
-                os.kill(pid, signal.SIGTERM)
-                all_pids.add(pid)
-            except ProcessLookupError:
+        pids = await _pids_holding_socket(socket_file)
+        if pids is None:
+            lookup_failed = True
+            continue
+        for pid in pids:
+            snapshot = _holder_group_snapshot(pid)
+            if snapshot is None:
+                # Keep the dir when the holder tree cannot be snapshotted safely.
+                lookup_failed = True
                 continue
-            except PermissionError:
+            pgid, members = snapshot
+            if not members:
+                continue  # holder already gone
+            groups.setdefault(pgid, {}).update(members)
+            pending_signals.extend(members.items())
+
+    if pending_signals:
+        # Write-ahead: identities must be durable before the first signal,
+        # or a crash mid-reap would strand survivors with no record.
+        if not _save_reap_state(instance_dir, groups):
+            _logger.warning(
+                "could not persist reap state under %s; deferring signals",
+                instance_dir,
+            )
+            return False
+        # Recheck each recorded identity before signaling it.
+        for member, identity in pending_signals:
+            _proc.kill_verified(member, identity, signal.SIGTERM)
+
+    tracked_any = any(members for members in groups.values())
+    if tracked_any:
+        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
+        # Escalate only identity-verified members recorded before SIGTERM.
+        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for members in groups.values():
+            for pid, identity in members.items():
+                if _proc.process_identity_state(pid, identity) != "match":
+                    continue
                 _logger.warning(
-                    "cannot signal orphan runner pid %d (permission denied)",
+                    "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
                     pid,
                 )
+                _proc.kill_verified(pid, identity, kill_sig)
+        deadline = time.monotonic() + _ORPHAN_KILL_VERIFY_TIMEOUT_S
+        while not _reap_state_settled(groups):
+            if time.monotonic() >= deadline:
+                _save_reap_state(instance_dir, groups)
+                return False
+            await asyncio.sleep(0.1)
 
-    if not all_pids:
-        return
-    await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
-    for pid in all_pids:
-        if not _pid_alive(pid):
+    if lookup_failed:
+        if tracked_any:
+            _save_reap_state(instance_dir, groups)
+        return False
+    for pgid in groups:
+        if pgid <= 0:
             continue
-        _logger.warning(
-            "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
-            pid,
-        )
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        # Keep evidence until the kernel reports the recorded group absent.
+        present = _proc.group_kernel_present(pgid)
+        if present is not False:
+            _logger.warning(
+                "group %d under %s still present after all recorded members "
+                "exited; keeping instance dir",
+                pgid,
+                instance_dir,
+            )
+            _save_reap_state(instance_dir, groups)
+            return False
+    # A listening conversation socket vetoes instance-dir removal.
+    for socket_file in instance_dir.glob("conv-*.sock"):
+        if await _can_connect_uds(socket_file):
+            _logger.warning(
+                "socket %s still accepts connections; keeping instance dir",
+                socket_file,
+            )
+            return False
+    return True
+
+
+def _holder_group_snapshot(pid: int) -> tuple[int, dict[int, str]] | None:
+    """Snapshot the socket holder's group and its member identities."""
+    if pid <= 0:
+        return (0, {})
+    if hasattr(os, "getpgid"):
+        try:
+            pgid = os.getpgid(pid)
+            own_group = pgid == os.getpgid(0)
+        except ProcessLookupError:
+            return (0, {})
+        except OSError:
+            return None
+        if not own_group:
+            members = _proc.group_member_identities(pgid)
+            if members is None:
+                return None
+            return (pgid, members)
+    identity = _proc.process_start_identity(pid)
+    if identity is None:
+        # Gone or unreadable: lsof re-resolves a gone holder to nothing on
+        # the next pass, and an unreadable one must not be signaled blind.
+        return None
+    return (0, {pid: identity})
+
+
+def harness_spawn_record_matches(pid: int, identity: str | None) -> bool:
+    """Whether ``(pid, identity)`` was spawned by a now-dead AP instance."""
+    if identity is None:
+        return False
+    parent = _default_tmp_parent()
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return False
+    for child in children:
+        if not child.name.startswith("ap-"):
+            continue
+        try:
+            if _ap_owner_is_dead(child) is not True:
+                continue
+            lines = (child / _HARNESS_PIDS_FILE).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("pid") == pid and record.get("identity") == identity:
+                return True
+    return False
+
+
+def _ap_owner_is_dead(instance_dir: Path) -> bool | None:
+    """Whether the instance dir's recorded AP owner is provably dead."""
+    try:
+        pid = int((instance_dir / _AP_PID_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    identity: str | None
+    try:
+        identity = (instance_dir / _AP_IDENT_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        identity = None
+    if identity:
+        state = _proc.process_identity_state(pid, identity)
+        if state == "match":
+            return False
+        if state == "gone":
+            return True
+        return None
+    return not _pid_alive(pid)
+
+
+_REAP_STATE_FILE = "REAP_STATE"
+
+
+def _load_reap_state(instance_dir: Path) -> dict[int, dict[int, str]] | None:
+    """Load the persisted ``pgid -> {pid: identity}`` reap bookkeeping."""
+    try:
+        payload = json.loads((instance_dir / _REAP_STATE_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    groups: dict[int, dict[int, str]] = {}
+    for pgid_str, members in payload.items():
+        try:
+            pgid = int(pgid_str)
+        except ValueError:
+            return None  # a corrupt row may hide a recorded member
+        if not isinstance(members, dict):
+            return None
+        parsed: dict[int, str] = {}
+        for pid_str, identity in members.items():
+            try:
+                member = int(pid_str)
+            except ValueError:
+                return None
+            if not isinstance(identity, str) or not identity:
+                return None
+            parsed[member] = identity
+        if parsed:
+            groups[pgid] = parsed
+    return groups
+
+
+def _save_reap_state(instance_dir: Path, groups: dict[int, dict[int, str]]) -> bool:
+    """Persist the reap bookkeeping into the instance dir."""
+    payload = {
+        str(pgid): {str(pid): identity for pid, identity in members.items()}
+        for pgid, members in groups.items()
+        if members
+    }
+    try:
+        tmp = instance_dir / (_REAP_STATE_FILE + ".tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, instance_dir / _REAP_STATE_FILE)
+    except OSError:
+        _logger.warning("could not persist reap state under %s", instance_dir, exc_info=True)
+        return False
+    return True
+
+
+def _reap_state_settled(groups: dict[int, dict[int, str]]) -> bool:
+    """Whether every recorded member is definitively dead."""
+    for members in groups.values():
+        for pid, identity in members.items():
+            state = _proc.process_identity_state(pid, identity)
+            if state != "gone" and not _proc.process_is_zombie(pid):
+                return False
+    return True
+
+
+async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) -> int:
+    """Clean harness processes left behind by crashed prior instances."""
+    return await sweep_orphaned_instance_dirs(tmp_parent)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1668,22 +1911,8 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-async def _pids_holding_socket(socket_path: Path) -> list[int]:
-    """
-    Return the OS PIDs that have ``socket_path`` open.
-
-    Used by the orphan sweep to find the runner subprocess
-    holding an abandoned socket. Shells out to ``lsof`` for
-    portability across Linux + macOS without a third-party dep
-    (``psutil`` would also work but adds an install).
-
-    Returns an empty list on any subprocess error so the caller
-    can keep going — orphan cleanup is best-effort.
-
-    :param socket_path: The socket file to look up holders for.
-    :returns: List of holding PIDs (often a single one — the
-        bound runner).
-    """
+async def _pids_holding_socket(socket_path: Path) -> list[int] | None:
+    """Return the OS PIDs that have ``socket_path`` open."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "lsof",
@@ -1692,11 +1921,24 @@ async def _pids_holding_socket(socket_path: Path) -> list[int]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
+    except FileNotFoundError:
+        _warn_lsof_missing_once()
+        return None
     except OSError:
-        return []
-    stdout, _ = await proc.communicate()
-    if proc.returncode != 0:
-        return []
+        return None
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        # Cancellation (sweep timeout, shutdown) must not leave the lsof
+        # helper running past the caller's subprocess-op guard.
+        with contextlib.suppress(OSError, ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        raise
+    # Treat lsof exit 1 with empty output as the normal no-holder result.
+    if proc.returncode is not None and proc.returncode > 1:
+        return None
     pids: list[int] = []
     for line in stdout.decode("utf-8", errors="replace").splitlines():
         line = line.strip()

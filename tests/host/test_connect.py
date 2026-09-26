@@ -7,6 +7,8 @@ import contextlib
 import errno
 import json
 import logging
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -83,6 +85,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+from tests._helpers import procs as test_procs
 
 pytestmark = pytest.mark.asyncio
 
@@ -3329,6 +3332,737 @@ def test_install_child_subreaper_is_safe_to_call() -> None:
         assert result is False
 
 
+async def test_sweep_ownerless_trees_once_runs_all_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One sweep pass runs every family; a failing family blocks nothing."""
+    import omnigent.harnesses.codex_native.process_registry as registry_mod
+    import omnigent.inner.terminal as terminal_mod
+    import omnigent.runtime.harnesses.process_manager as pm_mod
+
+    host = _make_host_process()
+    calls: list[str] = []
+    ops_during: list[int] = []
+
+    def fake_reconcile() -> int:
+        ops_during.append(host._owned_subprocess_ops)
+        calls.append("codex")
+        raise RuntimeError("family sweep blew up")
+
+    def fake_reap_terminals() -> int:
+        calls.append("terminals")
+        return 2
+
+    async def fake_sweep_instance_dirs(tmp_parent: Path | None = None) -> int:
+        calls.append("instance-dirs")
+        return 1
+
+    monkeypatch.setattr(registry_mod, "reconcile_codex_native_process_registry", fake_reconcile)
+    monkeypatch.setattr(terminal_mod, "reap_orphaned_terminals", fake_reap_terminals)
+    monkeypatch.setattr(pm_mod, "sweep_orphaned_instance_dirs", fake_sweep_instance_dirs)
+
+    await host._sweep_ownerless_trees_once()
+
+    assert calls == ["codex", "terminals", "instance-dirs"]
+    assert ops_during == [1], "sweep must run under the host-subprocess-op guard"
+    assert host._owned_subprocess_ops == 0
+
+
+async def test_sweep_bounds_a_wedged_codex_registry_reconcile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconcile stuck on its registry flock stalls only its own pass."""
+    import omnigent.harnesses.codex_native.process_registry as registry_mod
+    import omnigent.inner.terminal as terminal_mod
+    import omnigent.runtime.harnesses.process_manager as pm_mod
+    from omnigent.host import connect as connect_mod
+
+    host = _make_host_process()
+    calls: list[str] = []
+    release = threading.Event()
+
+    def wedged_reconcile() -> int:
+        calls.append("codex")
+        release.wait(8.0)
+        return 0
+
+    def fake_reap_terminals() -> int:
+        calls.append("terminals")
+        return 0
+
+    async def fake_sweep_instance_dirs(tmp_parent: Path | None = None) -> int:
+        calls.append("instance-dirs")
+        return 0
+
+    monkeypatch.setattr(connect_mod, "_OWNERLESS_SWEEP_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(connect_mod, "_OWNERLESS_SWEEP_JOIN_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(registry_mod, "reconcile_codex_native_process_registry", wedged_reconcile)
+    monkeypatch.setattr(terminal_mod, "reap_orphaned_terminals", fake_reap_terminals)
+    monkeypatch.setattr(pm_mod, "sweep_orphaned_instance_dirs", fake_sweep_instance_dirs)
+
+    try:
+        await asyncio.wait_for(host._sweep_ownerless_trees_once(), timeout=5.0)
+    finally:
+        release.set()
+
+    assert calls == ["codex", "terminals", "instance-dirs"]
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and host._owned_subprocess_ops:
+        await asyncio.sleep(0.05)
+    assert host._owned_subprocess_ops == 0
+
+
+def _classify_live_child_with_argv(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> bool:
+    """Classify one live adopted child whose /proc argv reads *argv*."""
+    from omnigent.host import connect as connect_mod
+
+    host = _make_host_process()
+    monkeypatch.setattr(
+        connect_mod.psutil,
+        "Process",
+        lambda _pid: SimpleNamespace(cmdline=lambda: list(argv)),
+    )
+    pin = connect_mod._AdoptedPin(identity="x", is_leader=True)
+    return host._classify_adopted_pin(4242, pin)
+
+
+def test_tmux_owner_gate_survives_whitespace_in_socket_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tmux server with spaces in its socket path still hits the owner gate."""
+    gate_calls: list[Path] = []
+
+    def owner_alive(instance_dir: Path) -> bool | None:
+        gate_calls.append(instance_dir)
+        return False
+
+    monkeypatch.setattr("omnigent.inner.terminal.terminal_owner_is_dead", owner_alive)
+    condemned = _classify_live_child_with_argv(
+        monkeypatch,
+        [
+            "tmux",
+            "-S",
+            "/tmp/dir with spaces/omnigent-terminal-abc/tmux.sock",
+            "new-session",
+            "-d",
+            "tmux wait-for omnigent-start-on-attach; exec bash",
+        ],
+    )
+    assert condemned is False, "a live-owner tmux server must never be condemned"
+    assert gate_calls == [Path("/tmp/dir with spaces/omnigent-terminal-abc")]
+
+
+def test_condemn_signatures_key_on_argv_elements_not_joined_substrings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Family matching follows real spawn shapes, not free substrings."""
+    # Real spawn shapes: condemned.
+    assert _classify_live_child_with_argv(
+        monkeypatch,
+        [sys.executable, "-P", "-m", "omnigent.runtime.harnesses._runner", "--x"],
+    )
+    assert _classify_live_child_with_argv(
+        monkeypatch,
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            "/tmp/b",
+        ],
+    ), "the relocated serve-mcp relay module must be condemnable"
+    assert _classify_live_child_with_argv(
+        monkeypatch,
+        [sys.executable, "-m", "omnigent.claude_native_bridge", "serve-mcp"],
+    ), "a relay spawned by a pre-relocation install must stay condemnable"
+    assert _classify_live_child_with_argv(
+        monkeypatch, ["codex", "app-server", "omnigent_crash_teardown_tag=abc123"]
+    )
+    assert _classify_live_child_with_argv(
+        monkeypatch,
+        ["sh", "-c", "tmux wait-for omnigent-start-on-attach; exec bash"],
+    )
+
+    # Stranger processes naming a module in an argument: spared.
+    assert not _classify_live_child_with_argv(
+        monkeypatch,
+        ["tail", "-f", "/var/log/omnigent.runtime.harnesses._runner.log"],
+    )
+    assert not _classify_live_child_with_argv(
+        monkeypatch,
+        ["grep", "-r", "omnigent.harnesses.claude_native.bridge", "/workspace"],
+    )
+
+
+def test_live_adopted_leader_condemned_via_codex_ownership_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live adopted codex leader is attributed by its registry record."""
+    calls: list[tuple[int, str | None]] = []
+    argv = ["node", "/opt/codex/bin/codex.js", "app-server"]
+
+    def record_matches(pid: int, identity: str | None) -> bool:
+        calls.append((pid, identity))
+        return True
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.ownerless_entry_matches_leader",
+        record_matches,
+    )
+    assert _classify_live_child_with_argv(monkeypatch, argv) is True
+    assert calls == [(4242, "x")]
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.ownerless_entry_matches_leader",
+        lambda _pid, _identity: False,
+    )
+    assert _classify_live_child_with_argv(monkeypatch, argv) is False
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="zombie pgid inspection (and subreaper adoption) are Linux-only",
+)
+async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kernel-pin path end to end, with a SIGTERM-handler late fork."""
+    import subprocess
+    import sys
+
+    from omnigent.host import connect as connect_mod
+
+    host = _make_host_process()
+    host._is_subreaper = True  # direct-child logic needs no reparenting here
+    monkeypatch.setattr(connect_mod, "_ADOPTED_SIGTERM_GRACE_S", 0.0)
+
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, signal, subprocess, sys, time\n"
+                "def on_term(_sig, _frame):\n"
+                "    subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); time.sleep(120)', "
+                "'omnigent-start-on-attach'])\n"
+                "    time.sleep(0.2)\n"
+                "    os._exit(0)\n"
+                "signal.signal(signal.SIGTERM, on_term)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(120)\n"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    child_ident: str | None = None
+    try:
+        assert leader.stdout is not None
+        assert leader.stdout.readline().strip() == "ready"
+        os.kill(leader.pid, signal.SIGTERM)
+        child_pid = int(leader.stdout.readline().strip())
+        child_ident = test_procs.capture_identity(child_pid)
+
+        # Let the leader become a zombie WITHOUT reaping it ourselves.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not connect_mod._live_group_member_pids(leader.pid, exclude=child_pid):
+                break
+            await asyncio.sleep(0.05)
+
+        host._adoption_active = True  # deferral requires a releaser
+        host._reap_orphans_once()
+        assert leader.pid in host._adopted_pins
+        assert host._adopted_pins[leader.pid].deferred_zombie
+        import psutil as psutil_mod
+
+        assert psutil_mod.Process(leader.pid).status() == psutil_mod.STATUS_ZOMBIE
+        assert leader.returncode is None, "Popen must never have observed the exit"
+
+        host._reap_adopted_orphans_once()
+        host._reap_adopted_orphans_once()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and test_procs.alive(child_pid, child_ident):
+            host._reap_adopted_orphans_once()
+            await asyncio.sleep(0.05)
+        assert not test_procs.alive(child_pid, child_ident), (
+            "late-forked child survived the pinned drain"
+        )
+
+        # Drained group: the pin is released and the zombie reaped.
+        host._reap_adopted_orphans_once()
+        assert leader.pid not in host._adopted_pins
+    finally:
+        host._adoption_active = False
+        if child_pid is not None and child_ident is not None:
+            test_procs.safe_kill(child_pid, child_ident)
+        if leader.poll() is None:
+            leader.kill()
+        with contextlib.suppress(Exception):
+            leader.wait(timeout=10)
+
+
+def _pid_alive_probe(pid: int) -> bool:
+    """Liveness probe treating zombies as dead (group-drain semantics)."""
+    import psutil as psutil_mod
+
+    try:
+        return psutil_mod.Process(pid).status() != psutil_mod.STATUS_ZOMBIE
+    except psutil_mod.Error:
+        return False
+
+
+async def test_adopted_sweep_kills_condemned_live_leader_and_its_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live adopted leader with a family signature is drained as a group."""
+    import subprocess
+    import sys
+
+    from omnigent.host import connect as connect_mod
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    monkeypatch.setattr(connect_mod, "_ADOPTED_SIGTERM_GRACE_S", 0.0)
+
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); time.sleep(120)'])\n"
+                "time.sleep(120)\n"
+            ),
+            "omnigent-start-on-attach",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    child_ident: str | None = None
+    try:
+        assert leader.stdout is not None
+        child_pid = int(leader.stdout.readline().strip())
+        child_ident = test_procs.capture_identity(child_pid)
+
+        host._reap_adopted_orphans_once()  # TERM pass (leader dies)
+        await asyncio.to_thread(leader.wait, 10)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and test_procs.alive(child_pid, child_ident):
+            host._reap_adopted_orphans_once()  # KILL passes drain the group
+            await asyncio.sleep(0.05)
+        assert not test_procs.alive(child_pid, child_ident), "group member survived the drain"
+    finally:
+        if child_pid is not None and child_ident is not None:
+            test_procs.safe_kill(child_pid, child_ident)
+        if leader.poll() is None:
+            leader.kill()
+        with contextlib.suppress(Exception):
+            leader.wait(timeout=10)
+
+
+def test_defer_dead_leader_pins_unconditionally_no_occupancy_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zombie group leader is pinned without any occupancy scan."""
+    from omnigent.host import connect as connect_mod
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    # Leader looks like a group leader (pgid == pid == sid).
+    monkeypatch.setattr(connect_mod, "_pid_stat_ids", lambda _pid: (4242, 4242))
+    monkeypatch.setattr(connect_mod._proc, "process_start_identity", lambda _pid: "leader-id")
+
+    def _scan_must_not_run(*_a: object, **_k: object) -> object:
+        raise AssertionError("the defer decision must not consult an occupancy scan")
+
+    monkeypatch.setattr(connect_mod._proc, "group_has_live_members", _scan_must_not_run)
+
+    assert host._defer_dead_leader(4242) is True
+    pin = host._adopted_pins[4242]
+    assert pin.deferred_zombie and pin.is_leader
+
+    # A non-leader zombie (pgid != pid) pins nothing.
+    monkeypatch.setattr(connect_mod, "_pid_stat_ids", lambda _pid: (999, 999))
+    assert host._defer_dead_leader(5555) is False
+    assert 5555 not in host._adopted_pins
+
+
+def test_drive_condemned_pin_retains_when_final_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed whole-group SIGKILL retains the pin, never releases it."""
+    from omnigent.host import connect as connect_mod
+    from omnigent.host.connect import _AdoptedPin
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    pin = _AdoptedPin(identity="leader-id", is_leader=True, deferred_zombie=True)
+    host._adopted_pins[7000] = pin
+
+    pin.termed_at = 1.0
+    monkeypatch.setattr(connect_mod._proc, "process_identity_state", lambda _p, _i: "gone")
+    monkeypatch.setattr(connect_mod, "_pid_is_zombie", lambda _p: False)
+    monkeypatch.setattr(connect_mod, "_live_group_member_pids", lambda _p, exclude=None: [])
+    monkeypatch.setattr(connect_mod._proc, "group_has_live_members", lambda _p: False)
+
+    released: list[int] = []
+    monkeypatch.setattr(host, "_release_pin", lambda pid: released.append(pid))
+    monkeypatch.setattr(connect_mod.os, "killpg", _raise_eperm)
+
+    driving = host._drive_condemned_pin(7000, pin, now=100.0, grace_s=0.0)
+
+    assert driving is True, "a failed kill must keep driving even if the scan says empty"
+    assert released == [], "a failed kill must never be released over a raceable empty scan"
+
+    # Once the kill lands, the same drained group releases.
+    monkeypatch.setattr(connect_mod.os, "killpg", lambda _pg, _s: None)
+    driving = host._drive_condemned_pin(7000, pin, now=100.0, grace_s=0.0)
+    assert driving is False
+    assert released == [7000]
+
+
+def _raise_eperm(*_a: object, **_k: object) -> None:
+    """killpg stub that fails as if the caller lacked permission."""
+    raise PermissionError(1, "Operation not permitted")
+
+
+async def test_adopted_sweep_leaves_unknown_children_untouched() -> None:
+    """An adopted child matching no family signature is never signaled."""
+    import subprocess
+    import sys
+
+    host = _make_host_process()
+    host._is_subreaper = True
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        start_new_session=True,
+    )
+    try:
+        host._reap_adopted_orphans_once()
+        assert child.pid not in host._adopted_pins
+        assert child.poll() is None, "unknown adopted child must survive the sweep"
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+async def test_adopted_sweep_excludes_recorded_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The --local Omnigent server is host-owned, never an adopted orphan."""
+    import subprocess
+    import sys
+
+    host = _make_host_process()
+    host._is_subreaper = True
+
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            "omnigent-start-on-attach",
+        ],
+        start_new_session=True,
+    )
+    try:
+        host._local_server_incarnation = None
+        host2 = HostProcess(host._identity, "http://localhost:8000", local_server_pid=child.pid)
+        host2._is_subreaper = True
+        host2._reap_adopted_orphans_once()
+        assert child.pid not in host2._adopted_pins
+        assert child.poll() is None, "recorded local server must survive the sweep"
+
+        host2._local_server_incarnation = (child.pid, "stranger-start")
+        assert host2._local_server_pids() == set()
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+async def test_local_server_zombie_is_reaped_without_adopted_pin() -> None:
+    """A stopped local server must not wait for the orphan-tree sweep."""
+    from omnigent.host import connect as connect_mod
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        start_new_session=True,
+    )
+    host = HostProcess(
+        _make_host_process()._identity, "http://localhost:8000", local_server_pid=child.pid
+    )
+    host._is_subreaper = True
+    host._adoption_active = True
+    try:
+        assert host._local_server_pids() == {child.pid}
+        child.kill()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if connect_mod.psutil.Process(child.pid).status() == connect_mod.psutil.STATUS_ZOMBIE:
+                break
+            await asyncio.sleep(0.01)
+        assert connect_mod.psutil.Process(child.pid).status() == connect_mod.psutil.STATUS_ZOMBIE
+        assert host._local_server_pids() == {child.pid}
+        assert host._reap_orphans_targeted([child.pid]) == 1
+        assert child.pid not in host._adopted_pins
+    finally:
+        host._adopted_pins.clear()
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+
+
+async def test_dead_leader_attribution_uses_registry_and_spawn_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred dead leader is condemned via recorded attribution."""
+    from omnigent.host.connect import _AdoptedPin
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    pin = _AdoptedPin(identity="id-x", is_leader=True, deferred_zombie=True)
+
+    monkeypatch.setattr(
+        "omnigent.host.connect._live_group_member_pids", lambda _pgid, exclude=None: []
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.ownerless_entry_matches_leader",
+        lambda _pid, _ident: True,
+    )
+    assert host._dead_leader_group_is_ours(4242, pin) is True
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.ownerless_entry_matches_leader",
+        lambda _pid, _ident: False,
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.harness_spawn_record_matches",
+        lambda _pid, _ident: True,
+    )
+    assert host._dead_leader_group_is_ours(4242, pin) is True
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.harness_spawn_record_matches",
+        lambda _pid, _ident: False,
+    )
+    assert host._dead_leader_group_is_ours(4242, pin) is False
+
+
+async def test_kill_switch_covers_periodic_sweep_and_shutdown_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One switch disables ALL active ownerless killing in the host."""
+    from omnigent.host import connect as connect_mod
+
+    async def _run_with_switch(value: str) -> tuple[bool, bool]:
+        monkeypatch.setenv(connect_mod._OWNERLESS_SWEEP_ENV_VAR, value)
+        host = _make_host_process()
+        swept: list[bool] = []
+        drained: list[bool] = []
+
+        async def _spy_sweep() -> None:
+            swept.append(True)
+
+        async def _spy_drain(budget_s: float = 3.0) -> None:
+            drained.append(True)
+
+        async def _interrupt() -> None:
+            await asyncio.sleep(0)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(host, "_ownerless_sweep_loop", _spy_sweep)
+        monkeypatch.setattr(host, "_final_adoption_drain", _spy_drain)
+        monkeypatch.setattr(host, "_connect_and_serve", _interrupt)
+        monkeypatch.setattr(connect_mod, "_install_child_subreaper", lambda: True)
+        await host.run()
+        return bool(swept), bool(drained)
+
+    assert await _run_with_switch("0") == (False, False)
+    assert await _run_with_switch("1") == (True, True)
+
+
+async def test_final_adoption_drain_reaps_condemned_trees_at_shutdown() -> None:
+    """Shutdown's bounded drain condemns and kills freshly adopted trees."""
+    import subprocess
+    import sys
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    host._adoption_active = True
+
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            "omnigent-start-on-attach",
+        ],
+        start_new_session=True,
+    )
+    try:
+        child_ident = test_procs.capture_identity(child.pid)
+        await host._final_adoption_drain(budget_s=0.5)
+
+        # The drain killed the condemned tree.
+        assert test_procs.wait_gone(child.pid, child_ident), "shutdown drain left the tree alive"
+
+        deadline = time.monotonic() + 10.0
+        while child.pid in host._adopted_pins and time.monotonic() < deadline:
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(child.pid, os.WNOHANG)
+            host._reap_adopted_orphans_once(grace_s=0.0)
+            await asyncio.sleep(0.05)
+        assert child.pid not in host._adopted_pins, "pin not released after tree drained"
+    finally:
+        test_procs.safe_kill(child.pid, child_ident)
+        with contextlib.suppress(Exception):
+            child.wait(timeout=10)
+
+
+async def test_zombie_drain_skips_pinned_and_reaps_the_rest() -> None:
+    """Pinned zombies survive the drain; unpinned orphan zombies do not."""
+    import errno as errno_mod
+
+    host = _make_host_process()
+
+    pinned = os.fork()
+    if pinned == 0:  # pragma: no cover — child leg
+        os._exit(0)
+    victim = os.fork()
+    if victim == 0:  # pragma: no cover — child leg
+        os._exit(0)
+    from omnigent.host.connect import _AdoptedPin
+
+    host._adopted_pins[pinned] = _AdoptedPin(identity=None, is_leader=False)
+
+    host._is_subreaper = True  # route through the pin-aware targeted drain
+    deadline = time.monotonic() + 5.0
+    reaped = 0
+    while time.monotonic() < deadline and reaped == 0:
+        reaped = host._reap_orphans_targeted()
+        time.sleep(0.05)
+
+    # The unpinned zombie was consumed; the pinned one still awaits us.
+    with pytest.raises(OSError) as exc_info:
+        os.waitpid(victim, os.WNOHANG)
+    assert exc_info.value.errno == errno_mod.ECHILD
+    assert os.waitpid(pinned, os.WNOHANG)[0] in (0, pinned)
+    host._adopted_pins.clear()
+    with contextlib.suppress(OSError):
+        os.waitpid(pinned, 0)
+
+
+def test_ownerless_sweep_env_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sweep defaults on; only explicit off values disable it."""
+    from omnigent.host.connect import _OWNERLESS_SWEEP_ENV_VAR, _ownerless_sweep_enabled
+
+    monkeypatch.delenv(_OWNERLESS_SWEEP_ENV_VAR, raising=False)
+    assert _ownerless_sweep_enabled()
+    for off in ("0", "false", "OFF", " no "):
+        monkeypatch.setenv(_OWNERLESS_SWEEP_ENV_VAR, off)
+        assert not _ownerless_sweep_enabled()
+    monkeypatch.setenv(_OWNERLESS_SWEEP_ENV_VAR, "1")
+    assert _ownerless_sweep_enabled()
+
+
+async def test_sweep_ownerless_trees_once_reaps_real_families(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One real pass cleans every family and spares everything live-owned."""
+    import os
+    import sys
+
+    import omnigent.harnesses.codex_native.process_registry as registry_mod
+    import omnigent.inner.terminal as terminal_mod
+    from omnigent.native import owner_claim
+    from omnigent.runtime.harnesses.process_manager import (
+        _AP_PID_FILE,
+        _TMP_PARENT_ENV_VAR,
+    )
+
+    host = _make_host_process()
+
+    terminals_root = tmp_path / "terminals"
+    terminals_root.mkdir()
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: terminals_root)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    probe = subprocess.Popen([sys.executable, "-c", "pass"])
+    probe.wait()
+    dead_owner_dir = terminals_root / "omnigent-terminal-deadhost"
+    dead_owner_dir.mkdir()
+    owner_claim.write_owner_claim(dead_owner_dir)
+    dead_claim_path = dead_owner_dir / "owner.pid"
+    dead_claim_lines = dead_claim_path.read_text(encoding="utf-8").splitlines()
+    dead_claim_lines[0] = str(probe.pid)
+    dead_claim_path.write_text("\n".join(dead_claim_lines) + "\n", encoding="utf-8")
+    live_owner_dir = terminals_root / "omnigent-terminal-livehost"
+    live_owner_dir.mkdir()
+    owner_claim.write_owner_claim(live_owner_dir)
+    legacy_owner_dir = terminals_root / "omnigent-terminal-legacyhost"
+    legacy_owner_dir.mkdir()
+    (legacy_owner_dir / "owner.pid").write_text(str(probe.pid), encoding="utf-8")
+
+    # Instance-dir family: dead-AP dir plus a live-AP sibling.
+    ap_parent = tmp_path / "ap-parent"
+    ap_parent.mkdir()
+    monkeypatch.setenv(_TMP_PARENT_ENV_VAR, str(ap_parent))
+    dead_ap = ap_parent / "ap-dead"
+    dead_ap.mkdir()
+    (dead_ap / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    live_ap = ap_parent / "ap-live"
+    live_ap.mkdir()
+    (live_ap / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+
+    # Codex family: a real ownerless tagged process (no owner lock held).
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "codex-state"))
+    tag = "tag-host-e2e"
+    orphan = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            registry_mod.codex_native_session_tag_cmdline_arg(tag),
+        ],
+        start_new_session=True,
+    )
+    try:
+        registry_mod.register_codex_native_process(
+            pid=orphan.pid,
+            pgid=orphan.pid,
+            session_tag=tag,
+            owner_lock_path=None,
+        )
+
+        await host._sweep_ownerless_trees_once()
+
+        assert not dead_owner_dir.exists()
+        assert live_owner_dir.exists()
+        assert legacy_owner_dir.exists()
+        assert not dead_ap.exists()
+        assert live_ap.exists()
+        # The sweep SIGTERMed the ownerless group; the process dies.
+        assert orphan.wait(timeout=10) is not None
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=10)
+
+
 def test_host_spawned_runner_has_parent_pid_env(
     tmp_path: Path,
 ) -> None:
@@ -3606,6 +4340,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
         "OMNIGENT_LOG_TTY_FD": "9",
+        "OMNIGENT_CODEX_NATIVE_STATE_DIR": "/srv/omnigent/codex-state",
     }
 
     env = _build_runner_env(
@@ -3649,6 +4384,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # must reach the runner without also forcing
     # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    assert env["OMNIGENT_CODEX_NATIVE_STATE_DIR"] == "/srv/omnigent/codex-state"
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"

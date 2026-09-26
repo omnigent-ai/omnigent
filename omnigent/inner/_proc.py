@@ -410,6 +410,140 @@ def _wait_gone(pid: int, timeout: float) -> None:
         psutil.Process(pid).wait(timeout=timeout)
 
 
+def process_start_identity(pid: int) -> str | None:
+    """Stable identity for ``pid``'s current incarnation, or ``None`` if gone."""
+    if pid <= 0:
+        return None
+    try:
+        return repr(psutil.Process(pid).create_time())
+    except (psutil.Error, OSError):
+        return None
+
+
+def process_identity_state(pid: int, identity: str | None) -> str:
+    """Classify *pid* against a recorded :func:`process_start_identity`."""
+    if pid <= 0 or identity is None:
+        return "gone"
+    try:
+        current = repr(psutil.Process(pid).create_time())
+    except psutil.NoSuchProcess:
+        # Includes psutil.ZombieProcess on platforms that hide zombie
+        # metadata — a zombie holds no resources worth waiting for.
+        return "gone"
+    except (psutil.Error, OSError):
+        return "unverifiable"
+    return "match" if current == identity else "gone"
+
+
+def group_member_identities(pgid: int) -> dict[int, str] | None:
+    """Snapshot ``pid -> identity`` for every member of process group *pgid*."""
+    if pgid <= 0 or _getpgid_fn is None:
+        return None
+    try:
+        pids = psutil.pids()
+    except (psutil.Error, OSError):
+        return None
+    members: dict[int, str] = {}
+    for pid in pids:
+        # Recheck group membership after reading each process identity.
+        try:
+            if _getpgid_fn(pid) != pgid:
+                continue
+        except OSError:
+            continue  # gone or not ours to inspect — not a member of ours
+        try:
+            identity = repr(psutil.Process(pid).create_time())
+        except psutil.NoSuchProcess:
+            continue  # exited between the group check and the identity read
+        except (psutil.Error, OSError):
+            return None  # a confirmed member is unreadable — fail closed
+        try:
+            if _getpgid_fn(pid) != pgid:
+                continue
+        except OSError:
+            continue
+        members[pid] = identity
+    return members or None
+
+
+def process_is_zombie(pid: int) -> bool:
+    """Whether *pid* is an unreaped zombie — dead for reaping purposes."""
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except (psutil.Error, OSError):
+        return False
+
+
+def group_has_live_members(pgid: int) -> bool | None:
+    """Whether process group *pgid* has any live (non-zombie) members."""
+    if pgid <= 0 or _getpgid_fn is None:
+        return None
+    try:
+        pids = psutil.pids()
+    except (psutil.Error, OSError):
+        return None
+    for pid in pids:
+        try:
+            if _getpgid_fn(pid) != pgid:
+                continue
+        except ProcessLookupError:
+            continue  # exited mid-scan — definitively not a member anymore
+        except OSError:
+            return None  # membership unknowable — scan incomplete
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                continue
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError):
+            return None  # a confirmed member is unreadable — inconclusive
+        return True
+    return False
+
+
+def group_kernel_present(pgid: int) -> bool | None:
+    """Whether the kernel reports process group *pgid* as having any members."""
+    if pgid <= 0 or _killpg_fn is None:
+        return None
+    try:
+        _killpg_fn(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def kill_verified(pid: int, identity: str, sig: int) -> bool:
+    """Deliver *sig* to *pid* only if it is still the recorded incarnation."""
+    if process_identity_state(pid, identity) != "match":
+        return False
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is not None and pidfd_send is not None:
+        try:
+            fd = pidfd_open(pid)
+        except OSError:
+            return False
+        try:
+            if process_identity_state(pid, identity) != "match":
+                return False
+            pidfd_send(fd, sig)
+            return True
+        except OSError:
+            return False
+        finally:
+            with suppress(OSError):
+                os.close(fd)
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
 def process_alive(pid: int) -> bool:
     """
     Whether ``pid`` names a live, non-zombie process.

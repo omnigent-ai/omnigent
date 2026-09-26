@@ -16,12 +16,13 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypeVar, cast
@@ -284,6 +285,131 @@ def _connect_marker_path(log_path: Path) -> Path:
 # exit-status collection uses nonblocking waits.
 _ORPHAN_REAP_INTERVAL_S = 2.0
 
+# Ownerless trees accrue slowly, so sweep less often than zombie cleanup.
+_OWNERLESS_SWEEP_INTERVAL_S = 60.0
+
+# Bound for one harness instance-dir sweep pass. Its lsof probes carry no
+# timeout of their own, and a wedged filesystem must not stall the loop.
+_OWNERLESS_SWEEP_TIMEOUT_S = 120.0
+
+# Bound shutdown joins without releasing the subprocess guard early.
+_OWNERLESS_SWEEP_JOIN_TIMEOUT_S = 15.0
+
+# This switch disables periodic and shutdown ownerless-tree killing.
+_OWNERLESS_SWEEP_ENV_VAR = "OMNIGENT_HOST_OWNERLESS_SWEEP"
+
+
+def _ownerless_sweep_enabled() -> bool:
+    """Whether the periodic ownerless-tree sweep should run."""
+    value = os.environ.get(_OWNERLESS_SWEEP_ENV_VAR)
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+# Grace between condemning an adopted orphan (SIGTERM) and escalating to
+# SIGKILL. With the 60s sweep cadence the escalation lands on the next pass.
+_ADOPTED_SIGTERM_GRACE_S = 10.0
+
+# Match only framework-owned argv shapes; tmux uses its owner marker gate.
+_ADOPTED_CONDEMN_MODULE_ARGS: frozenset[str] = frozenset(
+    {
+        # Harness runner subprocesses (process_manager spawn).
+        "omnigent.runtime.harnesses._runner",
+        # Accept the current and pre-relocation bridge module paths.
+        "omnigent.harnesses.claude_native.bridge",
+        "omnigent.claude_native_bridge",
+    }
+)
+_ADOPTED_CONDEMN_ARG_PREFIX = "omnigent_crash_teardown_tag="
+_ADOPTED_CONDEMN_ARG_SUBSTRING = "omnigent-start-on-attach"
+_TMUX_INSTANCE_DIR_MARKER = "omnigent-terminal-"
+
+
+def _argv_condemn_match(argv: Sequence[str]) -> bool:
+    """Whether an adopted child's argv names a condemnable family."""
+    for i, arg in enumerate(argv):
+        if arg in _ADOPTED_CONDEMN_MODULE_ARGS and i > 0 and argv[i - 1] == "-m":
+            return True
+        if arg.startswith(_ADOPTED_CONDEMN_ARG_PREFIX):
+            return True
+        if _ADOPTED_CONDEMN_ARG_SUBSTRING in arg:
+            return True
+    return False
+
+
+@dataclass
+class _AdoptedPin:
+    """Bookkeeping for one pinned direct child of the host."""
+
+    identity: str | None
+    is_leader: bool
+    condemned: bool = False
+    deferred_zombie: bool = False
+    termed_at: float | None = None
+
+
+def _pid_stat_ids(pid: int) -> tuple[int, int] | None:
+    """Read ``(pgid, sid)`` for *pid*, valid even for an unreaped zombie."""
+    try:
+        pgid = os.getpgid(pid)
+        sid = os.getsid(pid)
+    except OSError:
+        return None
+    return pgid, sid
+
+
+def _live_group_member_pids(pgid: int, *, exclude: int | None = None) -> list[int] | None:
+    """Pids of live (non-zombie) members of *pgid*."""
+    live: list[int] = []
+    try:
+        pids = psutil.pids()
+    except (psutil.Error, OSError):
+        return None
+    for pid in pids:
+        if pid == exclude:
+            continue
+        try:
+            if os.getpgid(pid) != pgid:
+                continue
+        except OSError:
+            continue  # gone, or not ours to inspect — not a member of ours
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                continue
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError):
+            return None  # a confirmed member is unreadable — inconclusive
+        live.append(pid)
+    return live
+
+
+def _group_provably_empty(members: list[int] | None) -> bool:
+    """Whether a member scan PROVES the group has no live members."""
+    return members is not None and not members
+
+
+def _pid_is_zombie(pid: int) -> bool:
+    """Whether *pid* is an unreaped zombie (dead for drain purposes)."""
+    return _proc.process_is_zombie(pid)
+
+
+def _adopted_child_argv(pid: int) -> list[str]:
+    """Intact argv of a live direct child, ``[]`` if unreadable."""
+    try:
+        return psutil.Process(pid).cmdline()
+    except (psutil.Error, OSError):
+        return []
+
+
+def _tmux_instance_dir_from_argv(argv: Sequence[str]) -> Path | None:
+    """Extract the per-session terminal instance dir from a tmux argv."""
+    for arg in argv:
+        if _TMUX_INSTANCE_DIR_MARKER in arg and arg.endswith("tmux.sock"):
+            return Path(arg).parent
+    return None
+
 
 def _install_child_subreaper() -> bool:
     """Make this process reap orphaned descendants (Linux only).
@@ -543,6 +669,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # Share the Codex teardown ledger with runners that use a custom state root.
+        "OMNIGENT_CODEX_NATIVE_STATE_DIR",
         # Auth provider selection. The env-unset default was flipped
         # to "accounts", so the whole CLI → daemon → local-server chain has
         # to agree on the mode. Without this, the daemon strips
@@ -1079,19 +1207,12 @@ class HostProcess:
         self,
         identity: HostIdentity,
         server_url: str,
+        *,
+        local_server_pid: int | None = None,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
     ) -> None:
-        """Initialize the host process.
-
-        :param identity: Host identity from ``config.yaml``.
-        :param server_url: Server URL to connect to.
-        :param lifecycle_lock: Optional guard binding this daemon's lifetime
-            to its registry record. When present, the daemon holds the lock
-            and self-terminates once the record is deleted or reassigned.
-        :param interactive_shells: Optional shell inventory override for tests.
-            By default the host discovers its installed shells once at startup.
-        """
+        """Initialize the host process."""
         self._identity = identity
         self._server_url = server_url.rstrip("/")
         # One reader per workspace, so its registry keeps state between
@@ -1187,6 +1308,21 @@ class HostProcess:
         self._runner_stop_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
+        # Strong ref to the active ownerless-tree sweep task
+        # (see :meth:`_ownerless_sweep_loop`).
+        self._ownerless_sweep_task: asyncio.Task[None] | None = None
+        # Subreapers receive orphaned descendants as direct children.
+        self._is_subreaper = False
+        # Defer zombie leaders only while an adopted-tree sweep can release them.
+        self._adoption_active = False
+        # Exclude the health-verified local server incarnation from adoption.
+        self._local_server_incarnation: tuple[int, str] | None = None
+        if local_server_pid is not None:
+            identity_str = _proc.process_start_identity(local_server_pid)
+            if identity_str is not None:
+                self._local_server_incarnation = (local_server_pid, identity_str)
+        # Pins preserve adopted leaders until their process groups are drained.
+        self._adopted_pins: dict[int, _AdoptedPin] = {}
         # Host-owned machine-global cleanup. Runner exits trigger background
         # passes; runner startup never waits for them.
         self._maintenance_janitor: HostMaintenanceJanitor | None = None
@@ -1320,20 +1456,10 @@ class HostProcess:
             return 0
         if child_pids is None:
             child_pids = self._orphan_child_pids()
-        tracked = self._tracked_runner_pids()
-        reaped = 0
-        for pid in child_pids:
-            if pid in tracked:
-                continue
-            try:
-                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
-            except OSError:
-                # A watcher may have consumed this exit after the snapshot.
-                continue
-            reaped += waited_pid > 0
-        if reaped:
-            _logger.debug("orphan reaper reaped %d process(es)", reaped)
-        return reaped
+        child_pids = list(child_pids)
+        if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
+            return self._reap_orphans_waitid(child_pids)
+        return self._reap_orphans_targeted(child_pids)
 
     @contextlib.contextmanager
     def _host_subprocess_op(self) -> Iterator[None]:
@@ -1347,6 +1473,79 @@ class HostProcess:
             yield
         finally:
             self._owned_subprocess_ops -= 1
+
+    def _reap_orphans_waitid(self, child_pids: Iterable[int]) -> int:
+        """Use a non-consuming readiness probe before targeted zombie waits."""
+        try:
+            info = os.waitid(  # type: ignore[attr-defined]
+                os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+        except (ChildProcessError, OSError):
+            return 0
+        if info is None:
+            return 0
+        return self._reap_orphans_targeted(child_pids)
+
+    def _reap_orphans_targeted(self, child_pids: Iterable[int] | None = None) -> int:
+        """Reap zombie direct children through per-PID, nonblocking waits."""
+        if child_pids is None:
+            child_pids = self._orphan_child_pids()
+        reaped = 0
+        tracked = self._tracked_runner_pids()
+        local_server_pids = self._local_server_pids()
+        for pid in child_pids:
+            if pid in tracked or pid in self._adopted_pins:
+                continue
+            try:
+                if psutil.Process(pid).status() != psutil.STATUS_ZOMBIE:
+                    continue
+            except (psutil.Error, OSError):
+                continue
+            if (
+                self._is_subreaper
+                and self._adoption_active
+                and pid not in local_server_pids
+                and self._defer_dead_leader(pid)
+            ):
+                continue
+            if self._consume_child_zombie(pid):
+                reaped += 1
+        if reaped:
+            _logger.debug("orphan reaper reaped %d process(es)", reaped)
+        return reaped
+
+    def _direct_children(self) -> list[psutil.Process]:
+        """Return this process's direct children, including zombies."""
+        try:
+            return psutil.Process().children()
+        except (psutil.Error, OSError):
+            return []
+
+    def _defer_dead_leader(self, pid: int) -> bool:
+        """Pin a zombie group leader until the adopted-tree sweep classifies it."""
+        ids = _pid_stat_ids(pid)
+        if ids is None or ids[0] != pid:
+            return False
+        identity = _proc.process_start_identity(pid)
+        self._adopted_pins[pid] = _AdoptedPin(
+            identity=identity, is_leader=True, deferred_zombie=True
+        )
+        _logger.info(
+            "holding dead group leader %d unreaped (kernel pin) until its "
+            "orphaned group is classified — expect a transient <defunct> child",
+            pid,
+        )
+        return True
+
+    def _consume_child_zombie(self, pid: int) -> bool:
+        """Consume one zombie direct child's exit status."""
+        try:
+            if hasattr(os, "waitid"):
+                return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG) is not None
+            reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return False
+        return reaped_pid == pid
 
     async def _run_host_subprocess_in_thread(self, operation: Callable[[], _T]) -> _T:
         """Run a subprocess-owning operation off-loop without losing its exit status.
@@ -1368,6 +1567,287 @@ class HostProcess:
 
         task.add_done_callback(_release)
         return await asyncio.shield(task)
+
+    async def _ownerless_sweep_loop(self) -> None:
+        """Periodically kill live process trees whose owner is provably gone."""
+        while True:
+            await asyncio.sleep(_OWNERLESS_SWEEP_INTERVAL_S)
+            try:
+                await self._sweep_ownerless_trees_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — the sweep must never die on a stray error
+                _logger.debug("ownerless-tree sweep failed", exc_info=True)
+
+    async def _sweep_ownerless_trees_once(self) -> None:
+        """Run one pass of every per-family ownerless-tree sweep."""
+        from omnigent.harnesses.codex_native.process_registry import (
+            reconcile_codex_native_process_registry,
+        )
+        from omnigent.inner.terminal import reap_orphaned_terminals
+        from omnigent.runtime.harnesses.process_manager import (
+            sweep_orphaned_instance_dirs,
+        )
+
+        if self._is_subreaper:
+            try:
+                # Keep pinning and signaling atomic with respect to zombie cleanup.
+                condemned = self._reap_adopted_orphans_once()
+                if condemned:
+                    _logger.info(
+                        "ownerless sweep: driving %d adopted orphan tree(s)",
+                        condemned,
+                    )
+            except Exception:  # noqa: BLE001 — best-effort per family
+                _logger.warning("adopted-orphan sweep failed", exc_info=True)
+        try:
+            # Bound each registry pass while its worker retains the subprocess guard.
+            signaled = await asyncio.wait_for(
+                self._run_family_in_thread(reconcile_codex_native_process_registry),
+                timeout=_OWNERLESS_SWEEP_TIMEOUT_S,
+            )
+            if signaled:
+                _logger.info(
+                    "ownerless sweep: signaled %d codex-native process group(s)",
+                    signaled,
+                )
+        except Exception:  # noqa: BLE001 — best-effort per family
+            _logger.warning("codex-native ownerless sweep failed", exc_info=True)
+        try:
+            reaped = await asyncio.wait_for(
+                self._run_family_in_thread(reap_orphaned_terminals),
+                timeout=_OWNERLESS_SWEEP_TIMEOUT_S,
+            )
+            if reaped:
+                _logger.info(
+                    "ownerless sweep: reaped %d orphaned terminal tmux server(s)",
+                    reaped,
+                )
+        except Exception:  # noqa: BLE001 — best-effort per family
+            _logger.warning("terminal ownerless sweep failed", exc_info=True)
+        try:
+            # A timed-out pass may cancel mid-kill, leaving a runner
+            # SIGTERMed but not yet SIGKILLed; the next pass finishes it.
+            swept = await self._run_family_task(
+                asyncio.wait_for(
+                    sweep_orphaned_instance_dirs(),
+                    timeout=_OWNERLESS_SWEEP_TIMEOUT_S,
+                )
+            )
+            if swept:
+                _logger.info(
+                    "ownerless sweep: cleaned %d orphaned harness instance dir(s)",
+                    swept,
+                )
+        except Exception:  # noqa: BLE001 — best-effort per family
+            _logger.warning("harness instance-dir ownerless sweep failed", exc_info=True)
+
+    def _reap_adopted_orphans_once(self, grace_s: float | None = None) -> int:
+        """Classify and drive every adopted direct child (subreaper hosts)."""
+        if self._owned_subprocess_ops > 0:
+            # Avoid classifying host-owned subprocesses while their owner is waiting.
+            return 0
+        tracked = self._tracked_runner_pids()
+        excluded = tracked | self._local_server_pids()
+        for child in self._direct_children():
+            pid = child.pid
+            if pid in excluded or pid in self._adopted_pins:
+                continue
+            try:
+                is_zombie = child.status() == psutil.STATUS_ZOMBIE
+                identity = None if is_zombie else repr(child.create_time())
+            except (psutil.Error, OSError):
+                continue
+            if is_zombie:
+                continue  # the drain owns zombies (and defers dead leaders)
+            ids = _pid_stat_ids(pid)
+            self._adopted_pins[pid] = _AdoptedPin(
+                identity=identity,
+                is_leader=ids is not None and ids[0] == pid,
+            )
+
+        condemned = 0
+        now = time.monotonic()
+        for pid, pin in list(self._adopted_pins.items()):
+            if not pin.condemned and not self._classify_adopted_pin(pid, pin):
+                self._release_pin(pid)
+                continue
+            pin.condemned = True
+            if self._drive_condemned_pin(pid, pin, now, grace_s=grace_s):
+                condemned += 1
+        return condemned
+
+    async def _final_adoption_drain(self, budget_s: float = 3.0) -> None:
+        """Bounded condemn/drain cycle for shutdown."""
+        deadline = time.monotonic() + budget_s
+        while time.monotonic() < deadline:
+            try:
+                driving = self._reap_adopted_orphans_once(grace_s=0.0)
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                _logger.debug("final adoption drain failed", exc_info=True)
+                return
+            self._reap_orphans_once()
+            if not driving and not self._adopted_pins:
+                return
+            await asyncio.sleep(0.1)
+        if self._adopted_pins:
+            _logger.warning(
+                "exiting with %d undrained adopted orphan tree(s); their "
+                "processes reparent above this host",
+                len(self._adopted_pins),
+            )
+
+    def _local_server_pids(self) -> set[int]:
+        """Pid of the local Omnigent server incarnation this host owns."""
+        cached = self._local_server_incarnation
+        if cached is None:
+            return set()
+        if _proc.process_identity_state(cached[0], cached[1]) == "match":
+            return {cached[0]}
+        return set()
+
+    def _classify_adopted_pin(self, pid: int, pin: _AdoptedPin) -> bool:
+        """Decide whether a pinned adopted child is ownerless."""
+        if pin.deferred_zombie:
+            return self._dead_leader_group_is_ours(pid, pin)
+        argv = _adopted_child_argv(pid)
+        if not argv:
+            return False
+        # Check tmux ownership before matching commands embedded in its argv.
+        instance_dir = _tmux_instance_dir_from_argv(argv)
+        if instance_dir is not None:
+            from omnigent.inner.terminal import terminal_owner_is_dead
+
+            return terminal_owner_is_dead(instance_dir) is True
+        if _argv_condemn_match(argv):
+            return True
+        # Attribute Codex leaders by their registry identity when argv loses its tag.
+        if not pin.is_leader:
+            return False
+        from omnigent.harnesses.codex_native.process_registry import (
+            ownerless_entry_matches_leader,
+        )
+
+        return ownerless_entry_matches_leader(pid, pin.identity)
+
+    def _dead_leader_group_is_ours(self, pid: int, pin: _AdoptedPin) -> bool:
+        """Attribute a deferred dead leader's group to a known family."""
+        for member in _live_group_member_pids(pid, exclude=pid) or []:
+            if _argv_condemn_match(_adopted_child_argv(member)):
+                return True
+        from omnigent.harnesses.codex_native.process_registry import (
+            ownerless_entry_matches_leader,
+        )
+        from omnigent.runtime.harnesses.process_manager import (
+            harness_spawn_record_matches,
+        )
+
+        if ownerless_entry_matches_leader(pid, pin.identity):
+            return True
+        return harness_spawn_record_matches(pid, pin.identity)
+
+    def _drive_condemned_pin(
+        self, pid: int, pin: _AdoptedPin, now: float, *, grace_s: float | None = None
+    ) -> bool:
+        """Advance one condemned tree: TERM, then KILL, then reap when empty."""
+        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        grace = _ADOPTED_SIGTERM_GRACE_S if grace_s is None else grace_s
+        # A matching identity may be a zombie; release gates require live members.
+        present = _proc.process_identity_state(pid, pin.identity) == "match"
+        running = present and not _pid_is_zombie(pid)
+        if pin.termed_at is None:
+            group_live = pin.is_leader and not _group_provably_empty(
+                _live_group_member_pids(pid, exclude=pid)
+            )
+            sig = signal.SIGTERM if (running or group_live) else kill_sig
+            self._signal_pinned(pid, pin, sig)
+            pin.termed_at = now
+            return True
+        if pin.is_leader:
+            if not _group_provably_empty(_live_group_member_pids(pid, exclude=pid)) or running:
+                if now - pin.termed_at >= grace:
+                    self._signal_pinned(pid, pin, kill_sig)
+                return True
+            # After SIGKILL, a member scan cannot race a new fork from the group.
+            if not self._signal_pinned(pid, pin, kill_sig):
+                # The whole-group SIGKILL did not reach a live member, so
+                # the scan below cannot prove the group drained — retain.
+                return True
+            # A successful SIGKILL makes the following live-member scan conclusive.
+            if _proc.group_has_live_members(pid) is not False:
+                return True
+            self._release_pin(pid)
+            return False
+        if running:
+            if now - pin.termed_at >= grace:
+                self._signal_pinned(pid, pin, kill_sig)
+            return True
+        self._release_pin(pid)
+        return False
+
+    def _signal_pinned(self, pid: int, pin: _AdoptedPin, sig: int) -> bool:
+        """Deliver *sig* to a pinned pid (whole group for leaders)."""
+        try:
+            if pin.is_leader and hasattr(os, "killpg"):
+                os.killpg(pid, sig)
+            else:
+                os.kill(pid, sig)
+        except ProcessLookupError:
+            return True  # already gone — the kill's goal is met (ESRCH)
+        except OSError:
+            # Retain the pin whenever group signaling fails.
+            _logger.warning(
+                "adopted-orphan reaper could not signal %s %d",
+                "group" if pin.is_leader else "pid",
+                pid,
+                exc_info=True,
+            )
+            return False
+        _logger.info(
+            "adopted-orphan reaper sent signal %d to %s %d",
+            sig,
+            "group" if pin.is_leader else "pid",
+            pid,
+        )
+        return True
+
+    def _release_pin(self, pid: int) -> None:
+        """Reap (if a zombie remains) and forget one pin."""
+        self._adopted_pins.pop(pid, None)
+        self._consume_child_zombie(pid)
+
+    def _release_subprocess_op(self) -> None:
+        """Drop one subprocess-op ref (family-sweep done-callback target)."""
+        self._owned_subprocess_ops -= 1
+
+    async def _run_family_in_thread(self, fn: Callable[[], int]) -> int:
+        """Run one blocking family sweep in a worker thread, guard-safe."""
+        # Increment BEFORE submission — the worker can start on its thread
+        # before this coroutine runs another line.
+        self._owned_subprocess_ops += 1
+        future = asyncio.get_running_loop().run_in_executor(None, fn)
+        future.add_done_callback(lambda _f: self._release_subprocess_op())
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(future), timeout=_OWNERLESS_SWEEP_JOIN_TIMEOUT_S
+                )
+            raise
+
+    async def _run_family_task(self, coro: Awaitable[int]) -> int:
+        """Run one async family sweep as a task, join-safe on cancellation."""
+        self._owned_subprocess_ops += 1
+        task = asyncio.ensure_future(coro)
+        task.add_done_callback(lambda _f: self._release_subprocess_op())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(task, timeout=_OWNERLESS_SWEEP_JOIN_TIMEOUT_S)
+            raise
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -3804,15 +4284,14 @@ class HostProcess:
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
         # OOM the box on a long-blocked run (#1782).
-        if _install_child_subreaper():
-            _logger.debug("installed PR_SET_CHILD_SUBREAPER; host will reap orphans")
+        self._is_subreaper = _install_child_subreaper() or os.getpid() == 1
+        if self._is_subreaper:
+            _logger.debug("host is a subreaper; orphaned descendants reparent here")
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
         # Bind this daemon's lifetime to its registry record before starting
-        # host-owned cleanup. The previous daemon holds this lock until its
-        # runners have been terminated, so the delayed startup pass cannot
-        # classify a still-shutting-down runner as live and miss it forever.
+        # host-owned cleanup.
         if self._lifecycle_lock is not None:
             self._lifecycle_lock.acquire()
             self._lifecycle_task = asyncio.create_task(
@@ -3826,6 +4305,15 @@ class HostProcess:
         except Exception:
             self._maintenance_janitor = None
             _logger.exception("Failed to start host maintenance janitor")
+
+        # Owner markers also support the periodic sweep on non-subreaper hosts.
+        if _ownerless_sweep_enabled():
+            self._adoption_active = True
+            self._ownerless_sweep_task = asyncio.create_task(
+                self._ownerless_sweep_loop(), name="host-ownerless-sweep"
+            )
+        else:
+            _logger.info("ownerless-tree sweep disabled via %s", _OWNERLESS_SWEEP_ENV_VAR)
         # Detect wake from system suspend (laptop sleep) and force-drop the
         # then-dead tunnel so the reconnect loop reattaches within seconds
         # instead of waiting out the ~90s keepalive ping timeout.
@@ -4040,6 +4528,16 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._reaper_task
                 self._reaper_task = None
+            if self._ownerless_sweep_task is not None:
+                self._ownerless_sweep_task.cancel()
+                # Join (bounded) so no sweep helper survives into the
+                # final drain below with a stealable exit status.
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(
+                        self._ownerless_sweep_task,
+                        timeout=_OWNERLESS_SWEEP_JOIN_TIMEOUT_S,
+                    )
+                self._ownerless_sweep_task = None
             if self._suspend_task is not None:
                 self._suspend_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4066,6 +4564,10 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watcher
             self._cleanup_runners()
+            # Drain descendants orphaned after the periodic sweep stopped.
+            if self._is_subreaper and _ownerless_sweep_enabled():
+                await self._final_adoption_drain()
+            self._adoption_active = False
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
             # grandchildren are now reapable and no tracked pid can be stolen.
@@ -4767,33 +5269,12 @@ def run_host_process(
     server_url: str,
     config_path: Path | None = None,
     *,
+    local_server_pid: int | None = None,
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
 ) -> None:
-    """Entry point for ``omnigent host``.
-
-    Loads (or creates) the host identity from the ``host`` section
-    of ``~/.omnigent/config.yaml``, then runs the host process.
-
-    :param server_url: Server URL to connect to, e.g.
-        ``"https://omnigent-app.databricksapps.com"``.
-    :param config_path: Optional path to ``config.yaml``.
-        Defaults to ``~/.omnigent/config.yaml``.
-    :param daemon_target: Normalized registry target this process owns, e.g.
-        ``"local"`` or a server URL. When given, the daemon binds its lifetime
-        to that record (flock + self-terminate on delete/reassign). ``None``
-        (the historical default) runs without the lifecycle guard.
-    :param lifecycle_lock: A lock already acquired by an auto-launched daemon
-        before it claimed the registry record. When provided, it is retained
-        for the host process lifetime instead of acquiring another handle.
-    :param interactive_shells: Optional shell inventory override for tests.
-        By default the host discovers its installed shells once at startup.
-    :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
-        fails permanently (auth / authorization / outdated server, or a
-        loopback server that is gone). The actionable cause is printed
-        to stderr first.
-    """
+    """Entry point for ``omnigent host``."""
     host_log_path = configure_process_logging(
         "host",
         log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
@@ -4875,6 +5356,7 @@ def run_host_process(
     host = HostProcess(
         identity,
         server_url,
+        local_server_pid=local_server_pid,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
     )

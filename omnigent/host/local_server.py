@@ -559,29 +559,12 @@ def local_server_status() -> LocalServerInfo:
 
 @dataclass(frozen=True)
 class LocalServerStartup:
-    """Outcome of :func:`ensure_local_omnigent_server`.
-
-    :param url: Base URL of the running server, e.g.
-        ``"http://127.0.0.1:8123"``.
-    :param spawned: ``True`` when this call started a NEW detached server
-        process; ``False`` when it reused an already-running healthy server
-        (one started earlier by ``omnigent server`` or by a prior
-        ``connect`` / ``run`` daemon). Callers that own teardown — notably
-        the connect Ctrl-C stop-server prompt — gate on this so they only
-        offer to stop a server they actually brought up, never one the user
-        started independently.
-    :param log_path: Absolute path of the background server's captured log
-        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``
-        — surfaced so callers (``server --background``) can point the user at the
-        exact log. For a spawned server this is the freshly created log; for
-        a reused one it is read back from the log-path sidecar, and may be
-        ``None`` when the running server is a foreground ``omnigent server``
-        (logs stream to its terminal) or a legacy record without the sidecar.
-    """
+    """Outcome of :func:`ensure_local_omnigent_server`."""
 
     url: str
     spawned: bool
     log_path: Path | None = None
+    pid: int | None = None
 
 
 def ensure_local_omnigent_server() -> LocalServerStartup:
@@ -612,8 +595,12 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
     reused = local_server_url_if_healthy()
     if reused is not None:
         if _read_local_server_sig() == desired_sig:
+            recorded = _read_local_server_pid_file()
             return LocalServerStartup(
-                url=reused, spawned=False, log_path=_read_local_server_log_path()
+                url=reused,
+                spawned=False,
+                log_path=_read_local_server_log_path(),
+                pid=recorded[0] if recorded else None,
             )
         # Config drift: the running server was spawned under a different
         # auth source and cannot be reconfigured in place (auth
@@ -652,7 +639,10 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
                 log_path=spawned.log_path,
             )
             return LocalServerStartup(
-                url=spawned.base_url, spawned=True, log_path=spawned.log_path
+                url=spawned.base_url,
+                spawned=True,
+                log_path=spawned.log_path,
+                pid=spawned.proc.pid,
             )
         # A DIFFERENT process owns the port. The stable-port preference
         # means two concurrent spawners (another HOME on this box, a

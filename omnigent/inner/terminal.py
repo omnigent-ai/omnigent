@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import tempfile
@@ -805,6 +806,14 @@ def _terminals_tmp_root() -> Path:
     return Path(tempfile.gettempdir())
 
 
+def terminal_owner_is_dead(instance_dir: Path) -> bool | None:
+    """Whether the instance dir's recorded owner is provably dead."""
+    claim = owner_claim.read_owner_claim(instance_dir)
+    if claim is None:
+        return None
+    return owner_claim.owner_is_gone(claim, process_alive=_process_alive)
+
+
 def reap_orphaned_terminals() -> int:
     """
     Kill terminal tmux servers whose owning process is gone.
@@ -824,13 +833,21 @@ def reap_orphaned_terminals() -> int:
     """
     if not _tmux_available():
         return 0
+    try:
+        entries = list(_terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"))
+    except OSError:
+        return 0
     reaped = 0
-    for entry in _terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"):
+    for entry in entries:
         claim = owner_claim.read_owner_claim(entry)
         if claim is None or not owner_claim.owner_is_gone(claim, process_alive=_process_alive):
             continue
         socket_path = entry / "tmux.sock"
-        had_socket = socket_path.exists()
+        try:
+            had_socket = socket_path.exists()
+        except OSError:
+            # Foreign-owned dir on a shared host — not ours to reap.
+            continue
         if had_socket:
             try:
                 result = subprocess.run(
@@ -844,10 +861,17 @@ def reap_orphaned_terminals() -> int:
                     "Could not reap terminal %s; preserving its socket for retry", entry
                 )
                 continue
-            if result.returncode != 0 and socket_path.exists():
-                detail = result.stderr.decode(errors="replace").strip()
-                if not _tmux_reports_target_gone(detail):
-                    # Keep the control socket until cleanup is confirmed.
+            if result.returncode != 0:
+                detail = getattr(result, "stderr", b"").decode(errors="replace").strip()
+                try:
+                    unresolved_control_path = (
+                        socket_path.exists()
+                        and not socket_path.is_socket()
+                        and not _tmux_reports_target_gone(detail)
+                    )
+                except OSError:
+                    continue
+                if unresolved_control_path:
                     logger.warning(
                         "tmux orphan cleanup failed (rc=%s) for %s; preserving its "
                         "socket for retry",
@@ -855,6 +879,11 @@ def reap_orphaned_terminals() -> int:
                         entry,
                     )
                     continue
+            if _tmux_server_alive(socket_path):
+                logger.warning(
+                    "tmux server still listens on %s; preserving its socket", socket_path
+                )
+                continue
         shutil.rmtree(entry, ignore_errors=True)
         # Record what the sweep destroyed. The socket path is the join key
         # against the owning session's "no server running on <socket>" exit,
@@ -871,6 +900,28 @@ def reap_orphaned_terminals() -> int:
         )
         reaped += 1
     return reaped
+
+
+def _tmux_server_alive(socket_path: Path) -> bool:
+    """Positively probe whether a tmux server still listens on *socket_path*."""
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(2.0)
+        probe.connect(str(socket_path))
+    except TimeoutError:
+        return True
+    except OSError as exc:
+        if exc.errno is None:
+            return False
+        return exc.errno not in (
+            errno.ENOENT,
+            errno.ECONNREFUSED,
+            errno.ENOTSOCK,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            probe.close()
+    return True
 
 
 def build_terminal_os_env_spec(

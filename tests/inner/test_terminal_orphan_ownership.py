@@ -6,6 +6,7 @@ import errno
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -119,7 +120,13 @@ def test_sweep_only_kills_real_tmux_with_proven_dead_owner(
     monkeypatch.setattr(owner_claim, "current_pid_namespace", lambda: "local-ns")
     monkeypatch.setattr(owner_claim, "current_boot_id", lambda: "local-boot")
     try:
-        assert terminal_mod.reap_orphaned_terminals() == (1 if ownership == "dead_local" else 0)
+        reaped = terminal_mod.reap_orphaned_terminals()
+        if ownership == "dead_local":
+            deadline = time.monotonic() + 2.0
+            while reaped == 0 and time.monotonic() < deadline:
+                time.sleep(0.05)
+                reaped = terminal_mod.reap_orphaned_terminals()
+        assert reaped == (1 if ownership == "dead_local" else 0)
         result = subprocess.run(
             [*base, "has-session", "-t", "main"],
             check=False,

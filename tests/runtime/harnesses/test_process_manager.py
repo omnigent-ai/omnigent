@@ -28,6 +28,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -37,6 +38,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 from omnigent.runtime.harnesses.process_manager import (
@@ -45,13 +47,13 @@ from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
     NoLiveHarnessError,
     _default_tmp_parent,
-    _kill_orphan_runners,
     _model_env_key,
     _pid_alive,
     _pids_holding_socket,
     _SubprocessEntry,
     sweep_orphaned_harness_processes,
 )
+from tests._helpers import procs as test_procs
 
 _TEST_HARNESS_NAME = "test"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_harness"
@@ -1263,11 +1265,11 @@ async def test_pids_holding_socket_returns_empty_for_missing(
     assert pids == []
 
 
-async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
+async def test_pids_holding_socket_reports_failure_when_lsof_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     short_tmp_parent: Path,
 ) -> None:
-    """Missing ``lsof`` is best-effort cleanup noise, not a boot failure."""
+    """Missing ``lsof`` reads as lookup failure, never as "no holders"."""
 
     async def missing_lsof(*_args: object, **_kwargs: object) -> object:
         raise FileNotFoundError(2, "No such file or directory", "lsof")
@@ -1275,7 +1277,7 @@ async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", missing_lsof)
 
     pids = await _pids_holding_socket(short_tmp_parent / "conv-stale.sock")
-    assert pids == []
+    assert pids is None
 
 
 # ── Per-spawn env override ─────────────────────────────────────
@@ -1426,7 +1428,11 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
             await mgr.start()
             client = await mgr.get_client('conv_parent_death', {_TEST_HARNESS_NAME!r})
             pid = (await client.get('/pid')).json()['pid']
+            from omnigent.inner import _proc
+            identity = _proc.process_start_identity(pid)
+            assert identity is not None, 'runner identity must be readable'
             print(pid, flush=True)
+            print(identity, flush=True)
             os._exit(0)
 
         asyncio.run(main())
@@ -1440,18 +1446,22 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
         timeout=30,
         env={**os.environ, "PYTHONPATH": os.getcwd()},
     )
-    runner_pid = int(proc.stdout.strip().splitlines()[-1])
+    runner_pid_line, runner_identity = proc.stdout.strip().splitlines()[-2:]
+    runner_pid = int(runner_pid_line)
+    assert runner_identity and runner_identity != "None", "identity handoff failed"
+
+    def _runner_exited() -> bool:
+        """Identity-based death probe: load-proof and pid-reuse-proof."""
+        state = _proc.process_identity_state(runner_pid, runner_identity)
+        return state == "gone" or _proc.process_is_zombie(runner_pid)
 
     try:
-        for _ in range(60):
-            if not _pid_alive(runner_pid):
-                break
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not _runner_exited():
             await asyncio.sleep(0.1)
-        assert not _pid_alive(runner_pid)
+        assert _runner_exited(), "runner outlived its spawning parent"
     finally:
-        if _pid_alive(runner_pid):
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(runner_pid, signal.SIGKILL)
+        _proc.kill_verified(runner_pid, runner_identity, signal.SIGKILL)
 
 
 async def test_runner_subprocess_hard_exits_when_sigterm_shutdown_wedges(
@@ -1491,39 +1501,415 @@ async def test_orphan_sweep_escalates_to_sigkill(
     register_test_harness: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Orphan sweep SIGKILLs runners that survive SIGTERM."""
+    """Sweep SIGKILLs surviving identity-verified members, and reports"""
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
-    killed: list[tuple[int, signal.Signals]] = []
-    calls = 0
+    killed_member: list[tuple[int, signal.Signals]] = []
 
     async def fake_pids_holding_socket(socket_path: Path) -> list[int]:
         assert socket_path.name == "conv-stale.sock"
         return [12345]
 
-    def fake_pid_alive(pid: int) -> bool:
-        assert pid == 12345
+    def fake_kill_verified(pid: int, identity: str, sig: signal.Signals) -> bool:
+        assert identity == "id-a"
+        killed_member.append((pid, sig))
         return True
 
-    def fake_kill(pid: int, sig: signal.Signals) -> None:
-        nonlocal calls
-        calls += 1
-        assert pid == 12345
-        killed.append((pid, sig))
-
     monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0)
+    monkeypatch.setattr(pm_mod, "_ORPHAN_KILL_VERIFY_TIMEOUT_S", 0.0)
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", fake_pids_holding_socket)
-    monkeypatch.setattr(pm_mod, "_pid_alive", fake_pid_alive)
-    monkeypatch.setattr(pm_mod.os, "kill", fake_kill)
+    monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: (54321, {12345: "id-a"}))
+    monkeypatch.setattr(pm_mod._proc, "process_identity_state", lambda _pid, _ident: "match")
+    monkeypatch.setattr(pm_mod._proc, "kill_verified", fake_kill_verified)
 
     instance_dir = short_tmp_parent / "ap-dead"
     instance_dir.mkdir()
     (instance_dir / "conv-stale.sock").touch()
 
-    await _kill_orphan_runners(instance_dir)
+    confirmed = await pm_mod._kill_orphan_runners(instance_dir)
 
-    assert calls == 2
-    assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+    assert killed_member == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+    assert confirmed is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions/lsof")
+@pytest.mark.skipif(shutil.which("lsof") is None, reason="lsof required")
+async def test_orphan_sweep_kills_whole_detached_harness_tree(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production topology: the sweep reaps the holder AND its children."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.2)
+
+    instance_dir = short_tmp_parent / "ap-dead"
+    instance_dir.mkdir(mode=0o700)
+    (instance_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    sock = instance_dir / "conv-x.sock"
+
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time\n"
+                f"fd = open({str(sock)!r}, 'w')\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); "
+                "time.sleep(120)'])\n"
+                "time.sleep(120)\n"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    child_ident: str | None = None
+    try:
+        assert leader.stdout is not None
+        child_pid = int(leader.stdout.readline().strip())
+        child_ident = test_procs.capture_identity(child_pid)
+
+        sweep_task = asyncio.create_task(pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent))
+        await asyncio.to_thread(leader.wait, 10)
+        await sweep_task
+
+        # The kill landed: the child is dead or a not-yet-collected zombie.
+        assert test_procs.wait_gone(child_pid, child_ident), "harness child survived the sweep"
+
+        deadline = time.monotonic() + 10.0
+        while instance_dir.exists() and time.monotonic() < deadline:
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(child_pid, os.WNOHANG)
+            await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+            await asyncio.sleep(0.05)
+        assert not instance_dir.exists(), "dir not released after the group went absent"
+    finally:
+        if child_pid is not None and child_ident is not None:
+            test_procs.safe_kill(child_pid, child_ident)
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions")
+async def test_orphan_sweep_kills_from_persisted_state_after_holder_exit(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persisted reap state kills the member and releases its directory."""
+    import json as json_mod
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.1)
+
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)",
+        ],
+        start_new_session=True,
+    )
+    try:
+        identity = pm_mod._proc.process_start_identity(child.pid)
+        assert identity is not None
+        instance_dir = short_tmp_parent / "ap-dead"
+        instance_dir.mkdir(mode=0o700)
+        (instance_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+        (instance_dir / pm_mod._REAP_STATE_FILE).write_text(
+            json_mod.dumps({str(child.pid): {str(child.pid): identity}}),
+            encoding="utf-8",
+        )
+
+        sweep_task = asyncio.create_task(pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent))
+        await asyncio.to_thread(child.wait, 10)
+        swept = await sweep_task
+        deadline = time.monotonic() + 10.0
+        while swept == 0 and instance_dir.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+        assert swept == 1
+        assert not instance_dir.exists()
+        assert child.poll() is not None, "recorded member must be killed from state"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+async def test_harness_subprocess_is_spawned_as_session_leader(
+    manager: HarnessProcessManager,
+    register_test_harness: None,
+) -> None:
+    """The real spawn detaches the harness into its own session."""
+    if sys.platform == "win32":
+        pytest.skip("POSIX process groups")
+    await manager.start()
+    try:
+        await manager.get_client("conv_leader", _TEST_HARNESS_NAME)
+        entry = manager._entries["conv_leader"]
+        pid = entry.process.pid
+        assert pid is not None
+        assert os.getpgid(pid) == pid
+        assert os.getpgid(pid) != os.getpgid(0)
+    finally:
+        await manager.shutdown()
+
+
+async def test_orphan_sweep_keeps_dir_while_socket_still_listens(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-accepting conv socket vetoes dir removal even if lsof lied."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    async def lying_lookup(_socket_path: Path) -> list[int]:
+        return []
+
+    monkeypatch.setattr(pm_mod, "_pids_holding_socket", lying_lookup)
+
+    instance_dir = short_tmp_parent / "ap-dead"
+    instance_dir.mkdir(mode=0o700)
+    (instance_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    sock_path = instance_dir / "conv-x.sock"
+
+    import socket as socket_mod
+
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    try:
+        server.bind(str(sock_path))
+        server.listen(1)
+
+        swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+        assert swept == 0
+        assert instance_dir.exists(), "listening socket must veto dir removal"
+    finally:
+        server.close()
+
+
+async def test_orphan_sweep_keeps_dir_when_group_snapshot_fails(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsnapshottable holder tree is neither signaled nor deleted."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    async def lookup(_socket_path: Path) -> list[int]:
+        return [12345]
+
+    def must_not_signal(_pid: int, _ident: str, _sig: signal.Signals) -> bool:
+        raise AssertionError("an unverifiable tree must not be signaled")
+
+    monkeypatch.setattr(pm_mod, "_pids_holding_socket", lookup)
+    monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: None)
+    monkeypatch.setattr(pm_mod._proc, "kill_verified", must_not_signal)
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / "conv-stale.sock").touch()
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists(), "dir with an unverifiable tree must be kept for retry"
+
+
+async def test_orphan_sweep_defers_signals_when_state_write_fails(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No durable identities, no signals: write-ahead is a precondition."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    async def lookup(_socket_path: Path) -> list[int]:
+        return [12345]
+
+    def must_not_signal(_pid: int, _ident: str, _sig: signal.Signals) -> bool:
+        raise AssertionError("must not signal before the reap state is durable")
+
+    monkeypatch.setattr(pm_mod, "_pids_holding_socket", lookup)
+    monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: (54321, {12345: "id-a"}))
+    monkeypatch.setattr(pm_mod, "_save_reap_state", lambda _d, _g: False)
+    monkeypatch.setattr(pm_mod._proc, "kill_verified", must_not_signal)
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / "conv-stale.sock").touch()
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists()
+
+
+def test_ap_owner_gate_is_identity_anchored(short_tmp_parent: Path) -> None:
+    """A recycled AP pid reads as dead once the identity sibling exists."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    d = short_tmp_parent / "ap-x"
+    d.mkdir(mode=0o700)
+    (d / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    # Legacy (no identity): live pid reads alive.
+    assert pm_mod._ap_owner_is_dead(d) is False
+    # Identity mismatch = a recycled pid: provably dead despite liveness.
+    (d / pm_mod._AP_IDENT_FILE).write_text("not-our-identity", encoding="utf-8")
+    assert pm_mod._ap_owner_is_dead(d) is True
+    # Matching identity: alive.
+    identity = pm_mod._proc.process_start_identity(os.getpid())
+    assert identity is not None
+    (d / pm_mod._AP_IDENT_FILE).write_text(identity, encoding="utf-8")
+    assert pm_mod._ap_owner_is_dead(d) is False
+
+
+def test_harness_spawn_record_matches_only_dead_ap_and_identity(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopted-leader attribution needs a dead AP and an identity match."""
+    import json as json_mod
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setenv(_TMP_PARENT_ENV_VAR, str(short_tmp_parent))
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / pm_mod._HARNESS_PIDS_FILE).write_text(
+        json_mod.dumps({"pid": 4242, "identity": "id-a"}) + "\n", encoding="utf-8"
+    )
+    live = short_tmp_parent / "ap-live"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    (live / pm_mod._HARNESS_PIDS_FILE).write_text(
+        json_mod.dumps({"pid": 5353, "identity": "id-b"}) + "\n", encoding="utf-8"
+    )
+
+    assert pm_mod.harness_spawn_record_matches(4242, "id-a") is True
+    assert pm_mod.harness_spawn_record_matches(4242, "id-x") is False
+    assert pm_mod.harness_spawn_record_matches(4242, None) is False
+    # Recorded by a LIVE AP: never attributed as ownerless.
+    assert pm_mod.harness_spawn_record_matches(5353, "id-b") is False
+
+
+async def test_orphan_sweep_retains_dir_while_recorded_group_still_occupied(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recorded members gone but the group occupied: retain, log, never chase."""
+    import json as json_mod
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.0)
+    present = {"value": True}
+    monkeypatch.setattr(pm_mod._proc, "group_kernel_present", lambda _pgid: present["value"])
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / pm_mod._REAP_STATE_FILE).write_text(
+        json_mod.dumps({"54321": {"99999998": "gone-identity"}}), encoding="utf-8"
+    )
+
+    # Group still present (a fork the tier cannot attribute): retain+log.
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+    assert swept == 0
+    assert dead.exists(), "present group must keep its evidence"
+    assert (dead / pm_mod._REAP_STATE_FILE).exists()
+
+    # Group provably absent (ESRCH): the evidence is finally released.
+    present["value"] = False
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+    assert swept == 1
+    assert not dead.exists()
+
+
+async def test_orphan_sweep_treats_malformed_state_as_indeterminate(
+    short_tmp_parent: Path,
+) -> None:
+    """A corrupt REAP_STATE must block cleanup, not read as empty."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / pm_mod._REAP_STATE_FILE).write_text("{not json", encoding="utf-8")
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists(), "indeterminate state must keep the dir"
+
+
+async def test_orphan_sweep_keeps_dir_when_socket_lookup_fails(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed lsof lookup must not cost the dir — the only retry record."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    async def failing_lookup(_socket_path: Path) -> None:
+        return None
+
+    monkeypatch.setattr(pm_mod, "_pids_holding_socket", failing_lookup)
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / "conv-stale.sock").touch()
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists(), "dir with unverified processes must be kept for retry"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: -1)() == 0, reason="root bypasses permission checks"
+)
+async def test_orphan_sweep_skips_unreadable_foreign_entries(
+    short_tmp_parent: Path,
+) -> None:
+    """Foreign-owned entries never abort the sweep of readable orphans."""
+    from omnigent.runtime.harnesses.process_manager import sweep_orphaned_instance_dirs
+
+    foreign = short_tmp_parent / "ap-foreign"
+    foreign.mkdir(mode=0o700)
+    (foreign / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    live = short_tmp_parent / "ap-live"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    foreign.chmod(0o000)
+    try:
+        swept = await sweep_orphaned_instance_dirs(short_tmp_parent)
+    finally:
+        foreign.chmod(0o700)
+
+    assert swept == 1
+    assert not dead.exists()
+    assert foreign.exists()
+    assert live.exists()
+
+
+async def test_orphan_sweep_survives_unlistable_parent(tmp_path: Path) -> None:
+    """A missing or unlistable parent is a no-op, never a raise."""
+    from omnigent.runtime.harnesses.process_manager import sweep_orphaned_instance_dirs
+
+    assert await sweep_orphaned_instance_dirs(tmp_path / "nonexistent") == 0
 
 
 # ── Mid-spawn cancellation ──────────────────────────────────────

@@ -326,6 +326,9 @@ def _run_harness_child(request: dict[str, Any]) -> None:
         flags, incl. ``--parent-pid <runner_pid>``) + ``env``.
     """
     _apply_child_env(request)
+    # Give each harness a process group that cleanup can terminate as a tree.
+    with contextlib.suppress(OSError):
+        os.setsid()
     # The harness's OS parent is the zygote, not the runner, so its watchdog
     # must probe the runner pid explicitly rather than trust os.getppid().
     os.environ[ZYGOTE_HARNESS_FORKED_ENV_VAR] = "1"
