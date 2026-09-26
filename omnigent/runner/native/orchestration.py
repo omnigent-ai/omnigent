@@ -1879,7 +1879,7 @@ def _build_opencode_policy_evaluator(
     Build the policy evaluator the OpenCode permission forwarder consults.
 
     Mirrors codex-native's policy hook exactly: every OpenCode
-    ``permission.v2.asked`` request is POSTed to this session's
+    ``permission.asked`` request is POSTed to this session's
     ``/v1/sessions/{id}/policies/evaluate`` endpoint as a
     ``PHASE_TOOL_CALL`` event. The server evaluates configured policies and
     — for an ``ASK`` verdict — parks a human approval card and blocks until
@@ -1902,11 +1902,15 @@ def _build_opencode_policy_evaluator(
     url = f"/v1/sessions/{session_component}/policies/evaluate"
 
     async def _evaluate(normalized: Mapping[str, object]) -> Mapping[str, object] | None:
-        arguments: _JsonObject = {
-            key: normalized[key]
-            for key in ("command", "path", "url")
-            if normalized.get(key) is not None
-        }
+        provided = normalized.get("arguments")
+        if isinstance(provided, Mapping):
+            arguments: _JsonObject = {str(key): value for key, value in provided.items()}
+        else:
+            arguments = {
+                key: normalized[key]
+                for key in ("command", "path", "url")
+                if normalized.get(key) is not None
+            }
         metadata = normalized.get("metadata")
         if isinstance(metadata, Mapping) and metadata:
             arguments.setdefault("metadata", dict(metadata))

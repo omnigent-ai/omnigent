@@ -1,7 +1,7 @@
 """Unit tests for the OpenCode permission policy evaluator wiring.
 
 The runner wires this evaluator into the OpenCode permission forwarder so
-every ``permission.v2.asked`` request is decided by the SAME server-side
+every ``permission.asked`` request is decided by the SAME server-side
 policy/approval gate codex-native uses (``POST /policies/evaluate``), not
 silently auto-approved. These tests pin the request shape, the verdict
 mapping, and — critically — that every failure mode fails CLOSED.
@@ -100,3 +100,37 @@ async def test_evaluator_fails_closed_on_non_200_or_empty_body() -> None:
             conversation_id="c",
         )
         assert (await evaluate({"action": "bash"})) == {"decision": "deny"}
+
+
+async def test_evaluator_posts_normalized_arguments() -> None:
+    """v2 action arguments (e.g. a grep ``pattern``) reach the policy engine."""
+    client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="conv_1",
+    )
+    await evaluate(
+        {
+            "action": "grep",
+            "arguments": {"pattern": "secret", "path": "src"},
+            "command": None,
+            "path": "src",
+            "url": None,
+            "metadata": {},
+        }
+    )
+    _url, body, _timeout = client.calls[0]
+    assert body["event"]["data"] == {
+        "name": "grep",
+        "arguments": {"pattern": "secret", "path": "src"},
+    }
+
+
+async def test_evaluator_names_v2_shell_action() -> None:
+    client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    await evaluate({"action": "shell", "arguments": {"command": "ls"}, "metadata": {}})
+    assert client.calls[0][1]["event"]["data"] == {"name": "shell", "arguments": {"command": "ls"}}
