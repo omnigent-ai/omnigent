@@ -36,6 +36,7 @@ import json
 import os
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
@@ -215,10 +216,14 @@ def pi_session_records_from_session_items(
     items map as:
 
     - user ``message`` -> Pi ``message`` with ``role: "user"``.
-    - assistant ``message`` -> Pi ``message`` with ``role: "assistant"`` and a
-      text content block.
-    - ``function_call`` -> Pi ``message`` with ``role: "assistant"`` whose
-      content carries a ``toolCall`` block.
+    - assistant ``message`` / ``function_call`` -> ONE Pi assistant ``message``
+      per model response: consecutive items sharing a ``response_id`` merge
+      their text and ``toolCall`` blocks, the shape Pi itself persists for a
+      response with (parallel) tool calls. Keeping sibling calls and the
+      response text in a single assistant message keeps every ``toolResult``
+      adjacent to the message holding its call, which the Anthropic
+      tool_use/tool_result pairing contract requires when Pi replays the
+      rebuilt history.
     - ``function_call_output`` -> Pi ``message`` with ``role: "toolResult"``.
 
     Interrupted assistant turns (and the rest of their response group) are
@@ -248,51 +253,139 @@ def pi_session_records_from_session_items(
     records: list[_JsonObject] = [header]
     parent_id: str | None = None
     skip_response_ids = _interrupted_response_ids(items)
+    group: _AssistantResponseGroup | None = None
+
+    def append_entry(entry: _JsonObject) -> None:
+        nonlocal parent_id
+        entry["parentId"] = parent_id
+        records.append(entry)
+        parent_id = cast(str, entry["id"])
+
+    def flush_group() -> None:
+        nonlocal group
+        if group is None:
+            return
+        append_entry(
+            {
+                "type": "message",
+                "id": group.entry_id,
+                "timestamp": timestamp,
+                "message": _pi_assistant_message(
+                    group.blocks, provider=provider, model=group.model or model
+                ),
+            }
+        )
+        group = None
 
     for index, item in enumerate(items):
         response_id = item.get("response_id")
         if isinstance(response_id, str) and response_id in skip_response_ids:
             continue
-        entries = _pi_entries_from_session_item(
-            item,
-            session_id=session_id,
-            external_session_id=external_session_id,
-            index=index,
-            timestamp=timestamp,
-            provider=provider,
-            model=model,
-        )
-        for entry in entries:
-            entry["parentId"] = parent_id
-            records.append(entry)
-            parent_id = cast(str, entry["id"])
+        blocks = _pi_assistant_blocks_from_item(item)
+        if blocks is None:
+            # Not part of an assistant response, so any open response ended.
+            flush_group()
+            entry = _pi_non_assistant_entry(
+                item,
+                session_id=session_id,
+                external_session_id=external_session_id,
+                index=index,
+                timestamp=timestamp,
+            )
+            if entry is not None:
+                append_entry(entry)
+            continue
+        rid = response_id if isinstance(response_id, str) and response_id else None
+        item_model = item.get("model")
+        eff_model = item_model if isinstance(item_model, str) else ""
+        if group is not None and rid is not None and group.response_id == rid:
+            group.blocks.extend(blocks)
+            group.model = group.model or eff_model
+            continue
+        flush_group()
+        if blocks:
+            group = _AssistantResponseGroup(
+                response_id=rid,
+                blocks=blocks,
+                entry_id=_synthetic_pi_entry_id(
+                    session_id=session_id,
+                    external_session_id=external_session_id,
+                    item=item,
+                    index=index,
+                ),
+                model=eff_model,
+            )
+    flush_group()
     return records
 
 
-def _pi_entries_from_session_item(
+@dataclass
+class _AssistantResponseGroup:
+    """One model response's assistant message, merged from flat Omnigent items.
+
+    Omnigent stores each ``function_call`` and the response's text as separate
+    items; Pi persists them as one assistant message. Merging restores Pi's
+    shape so every tool result stays adjacent to its call on replay.
+    """
+
+    response_id: str | None
+    blocks: list[_JsonObject]
+    entry_id: str
+    model: str
+
+
+def _pi_assistant_blocks_from_item(item: _JsonObject) -> list[_JsonObject] | None:
+    """Return Pi assistant content blocks for an assistant-response item.
+
+    :param item: Flat Omnigent item dict.
+    :returns: Text blocks for an assistant ``message``, a single ``toolCall``
+        block for a ``function_call`` (empty when malformed or blank), or
+        ``None`` when the item is not part of an assistant response.
+    """
+    item_type = item.get("type")
+    if item_type == "message":
+        if item.get("role") != "assistant":
+            return None
+        return _pi_text_blocks_from_api_content(item.get("content"), api_type="output_text")
+    if item_type != "function_call":
+        return None
+    name = item.get("name")
+    call_id = item.get("call_id")
+    if not isinstance(name, str) or not name:
+        return []
+    if not isinstance(call_id, str) or not call_id:
+        return []
+    return [
+        {
+            "type": "toolCall",
+            "id": call_id,
+            "name": name,
+            "arguments": _pi_tool_arguments(item.get("arguments")),
+        }
+    ]
+
+
+def _pi_non_assistant_entry(
     item: _JsonObject,
     *,
     session_id: str,
     external_session_id: str,
     index: int,
     timestamp: str,
-    provider: str,
-    model: str,
-) -> list[_JsonObject]:
-    """Convert one Omnigent item into zero or more Pi session entries.
+) -> _JsonObject | None:
+    """Convert a user message or tool output item into a Pi session entry.
+
+    Assistant-response items (assistant ``message`` / ``function_call``) are
+    merged per response by the caller and never reach this helper.
 
     :param item: Flat Omnigent item dict.
     :param session_id: Omnigent conversation id (for synthetic ids).
     :param external_session_id: Pi session id (for synthetic ids).
     :param index: Zero-based index of *item* in the source list.
-    :param timestamp: ISO timestamp to stamp on each entry.
-    :param provider: Provider id for assistant messages.
-    :param model: Default model id for assistant messages.
-    :returns: Pi entry dicts (without ``parentId``, which the caller links).
+    :param timestamp: ISO timestamp to stamp on the entry.
+    :returns: Pi entry dict (without ``parentId``, which the caller links), or
+        ``None`` for items with no Pi representation.
     """
-    item_type = item.get("type")
-    item_model = item.get("model")
-    eff_model = item_model if isinstance(item_model, str) and item_model else model
 
     def entry_id(suffix: str = "") -> str:
         return _synthetic_pi_entry_id(
@@ -303,86 +396,45 @@ def _pi_entries_from_session_item(
             suffix=suffix,
         )
 
-    if item_type == "message":
-        role = item.get("role")
-        if role == "user":
-            blocks = _pi_text_blocks_from_api_content(item.get("content"), api_type="input_text")
-            if not blocks:
-                return []
-            return [
-                {
-                    "type": "message",
-                    "id": entry_id(),
-                    "timestamp": timestamp,
-                    "message": {
-                        "role": "user",
-                        "content": blocks,
-                        "timestamp": 0,
-                    },
-                }
-            ]
-        if role == "assistant":
-            blocks = _pi_text_blocks_from_api_content(item.get("content"), api_type="output_text")
-            if not blocks:
-                return []
-            return [
-                {
-                    "type": "message",
-                    "id": entry_id(),
-                    "timestamp": timestamp,
-                    "message": _pi_assistant_message(blocks, provider=provider, model=eff_model),
-                }
-            ]
-        return []
+    item_type = item.get("type")
 
-    if item_type == "function_call":
-        name = item.get("name")
-        call_id = item.get("call_id")
-        if not isinstance(name, str) or not name:
-            return []
-        if not isinstance(call_id, str) or not call_id:
-            return []
-        tool_call_block: _JsonObject = {
-            "type": "toolCall",
-            "id": call_id,
-            "name": name,
-            "arguments": _pi_tool_arguments(item.get("arguments")),
+    if item_type == "message" and item.get("role") == "user":
+        blocks = _pi_text_blocks_from_api_content(item.get("content"), api_type="input_text")
+        if not blocks:
+            return None
+        return {
+            "type": "message",
+            "id": entry_id(),
+            "timestamp": timestamp,
+            "message": {
+                "role": "user",
+                "content": blocks,
+                "timestamp": 0,
+            },
         }
-        return [
-            {
-                "type": "message",
-                "id": entry_id(),
-                "timestamp": timestamp,
-                "message": _pi_assistant_message(
-                    [tool_call_block], provider=provider, model=eff_model
-                ),
-            }
-        ]
 
     if item_type == "function_call_output":
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id:
-            return []
+            return None
         output = item.get("output")
         if not isinstance(output, str):
             output = "" if output is None else json.dumps(output, separators=(",", ":"))
-        return [
-            {
-                "type": "message",
-                "id": entry_id(),
-                "timestamp": timestamp,
-                "message": {
-                    "role": "toolResult",
-                    "toolCallId": call_id,
-                    "toolName": "",
-                    "content": [{"type": "text", "text": output}],
-                    "isError": False,
-                    "timestamp": 0,
-                },
-            }
-        ]
+        return {
+            "type": "message",
+            "id": entry_id(),
+            "timestamp": timestamp,
+            "message": {
+                "role": "toolResult",
+                "toolCallId": call_id,
+                "toolName": "",
+                "content": [{"type": "text", "text": output}],
+                "isError": False,
+                "timestamp": 0,
+            },
+        }
 
-    return []
+    return None
 
 
 def _pi_assistant_message(
