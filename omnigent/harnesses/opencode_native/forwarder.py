@@ -172,6 +172,36 @@ def _model_ref(value: object) -> str | None:
     return None
 
 
+def opencode_tool_content_text(content: object, *, error: object = None) -> str:
+    """
+    Flatten a v2 tool result into ``function_call_output`` text.
+
+    :param content: ``Tool.Content[]`` (``{type:"text", text}`` /
+        ``{type:"file", uri, mime, name?}``) from ``session.tool.success`` /
+        ``.failed`` or a completed tool state.
+    :param error: ``Session.StructuredError`` ``{type, message}`` for a failed
+        tool, else ``None``.
+    :returns: The output text; failures are prefixed with ``[error]``.
+    """
+    parts: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif item.get("type") == "file":
+                name = item.get("name") or item.get("uri") or item.get("mime") or "file"
+                parts.append(f"[file: {name}]")
+    text = "\n".join(part for part in parts if part)
+    if isinstance(error, Mapping):
+        message = error.get("message")
+        detail = message if isinstance(message, str) and message else error.get("type")
+        prefix = f"[error] {detail}" if detail else "[error]"
+        return f"{prefix}\n{text}" if text else prefix
+    return text
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's v2 event stream into Omnigent events.
@@ -568,6 +598,117 @@ class OpenCodeNativeForwarder:
             conversation_id=turn.conversation_id,
         )
 
+    async def _post_tool_call(
+        self,
+        turn: _SessionTurn,
+        call_id: str,
+        tool: str,
+        arguments: _JsonObject,
+        *,
+        message_id: str | None,
+    ) -> None:
+        """Mirror a tool invocation as a function_call item."""
+        await self._post_event(
+            _EXTERNAL_ITEM,
+            {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": _AGENT_NAME,
+                    "name": tool,
+                    "arguments": json.dumps(arguments, ensure_ascii=True),
+                    "call_id": call_id,
+                },
+                "response_id": self._response_id(turn, message_id),
+            },
+            conversation_id=turn.conversation_id,
+        )
+
+    async def _post_tool_output(
+        self, turn: _SessionTurn, call_id: str, output: str, *, message_id: str | None
+    ) -> None:
+        """Mirror a tool result as a function_call_output item."""
+        await self._post_event(
+            _EXTERNAL_ITEM,
+            {
+                "item_type": "function_call_output",
+                "item_data": {"call_id": call_id, "output": output},
+                "response_id": self._response_id(turn, message_id),
+            },
+            conversation_id=turn.conversation_id,
+        )
+
+    async def _on_tool_input_started(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.tool.input.started`` — remember the tool's name."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        call_id = _str_field(event.data, "id")
+        name = _str_field(event.data, "name")
+        if call_id is not None and name is not None:
+            turn.tool_names[call_id] = name
+
+    async def _on_tool_called(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.tool.called`` — mirror the call as ``function_call``."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        call_id = _str_field(event.data, "id")
+        if call_id is None or not self.state.mark(self._key("tool-call", call_id)):
+            return
+        raw_input = event.data.get("input")
+        arguments = dict(raw_input) if isinstance(raw_input, Mapping) else {}
+        await self._begin_turn_if_needed(turn)
+        # Text the model wrote before the call lands above it in the chat.
+        await self._flush_pending_text(turn)
+        await self._post_tool_call(
+            turn,
+            call_id,
+            turn.tool_names.get(call_id, "tool"),
+            arguments,
+            message_id=_str_field(event.data, "assistantMessageID"),
+        )
+
+    async def _on_tool_success(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.tool.success`` — mirror the result as ``function_call_output``."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        call_id = _str_field(event.data, "id")
+        if call_id is None or not self.state.mark(self._key("tool-out", call_id)):
+            return
+        turn.tool_output.pop(call_id, None)
+        await self._post_tool_output(
+            turn,
+            call_id,
+            opencode_tool_content_text(event.data.get("content")),
+            message_id=_str_field(event.data, "assistantMessageID"),
+        )
+
+    async def _on_tool_failed(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.tool.failed`` — post an ``[error]`` output.
+
+        A malformed-input failure arrives without ``session.tool.called``, so
+        the call half is posted first to keep the output paired.
+        """
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        call_id = _str_field(event.data, "id")
+        if call_id is None:
+            return
+        message_id = _str_field(event.data, "assistantMessageID")
+        if self.state.mark(self._key("tool-call", call_id)):
+            await self._post_tool_call(
+                turn, call_id, turn.tool_names.get(call_id, "tool"), {}, message_id=message_id
+            )
+        if not self.state.mark(self._key("tool-out", call_id)):
+            return
+        turn.tool_output.pop(call_id, None)
+        output = opencode_tool_content_text(
+            event.data.get("content"), error=event.data.get("error")
+        )
+        await self._post_tool_output(turn, call_id, output, message_id=message_id)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -603,4 +744,8 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.step.ended": OpenCodeNativeForwarder._on_step_ended,
     "session.reasoning.delta": OpenCodeNativeForwarder._on_reasoning_delta,
     "session.reasoning.ended": OpenCodeNativeForwarder._on_reasoning_ended,
+    "session.tool.input.started": OpenCodeNativeForwarder._on_tool_input_started,
+    "session.tool.called": OpenCodeNativeForwarder._on_tool_called,
+    "session.tool.success": OpenCodeNativeForwarder._on_tool_success,
+    "session.tool.failed": OpenCodeNativeForwarder._on_tool_failed,
 }

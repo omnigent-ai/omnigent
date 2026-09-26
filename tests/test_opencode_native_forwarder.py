@@ -511,3 +511,180 @@ async def test_fixture_reasoning_streams_as_one_block() -> None:
     assert deltas[0]["started"] is True
     assert all(d["started"] is False for d in deltas[1:])
     assert "".join(d["delta"] for d in deltas) == ended["text"]
+
+
+# --- tools ------------------------------------------------------------------
+
+
+def test_tool_content_text_joins_text_and_names_files() -> None:
+    content = [
+        {"type": "text", "text": "line 1"},
+        {"type": "file", "uri": "file:///tmp/a.png", "mime": "image/png", "name": "a.png"},
+    ]
+    assert fwd_mod.opencode_tool_content_text(content) == "line 1\n[file: a.png]"
+
+
+def test_tool_content_text_prefixes_errors() -> None:
+    error = {"type": "tool.execution", "message": "boom"}
+    assert fwd_mod.opencode_tool_content_text(None, error=error) == "[error] boom"
+    partial = [{"type": "text", "text": "partial"}]
+    assert fwd_mod.opencode_tool_content_text(partial, error=error) == "[error] boom\npartial"
+
+
+async def test_fixture_shell_call_and_output() -> None:
+    """The captured ``shell`` call posts under its v2 name with its input + output."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    started = next(
+        raw
+        for raw in events_of_type("session.tool.input.started")
+        if raw["data"]["name"] == "shell"
+    )
+    call_id = started["data"]["id"]
+    called = next(
+        raw for raw in events_of_type("session.tool.called") if raw["data"]["id"] == call_id
+    )
+    success = next(
+        raw for raw in events_of_type("session.tool.success") if raw["data"]["id"] == call_id
+    )
+    await fwd.handle_event(_fixture("session.step.started"))
+    for raw in (started, called, success):
+        await fwd.handle_event(_to_event(raw))
+    items = _items(server.posts)
+    call = next(i for i in items if i["item_type"] == "function_call")
+    assert call["item_data"]["name"] == "shell"
+    assert call["item_data"]["call_id"] == call_id
+    assert fwd_mod.json.loads(call["item_data"]["arguments"]) == called["data"]["input"]
+    out = next(i for i in items if i["item_type"] == "function_call_output")
+    assert out["item_data"]["output"] == fwd_mod.opencode_tool_content_text(
+        success["data"]["content"]
+    )
+
+
+async def test_tool_names_pass_through_unchanged() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    for call_id, name in (("c1", "edit"), ("c2", "subagent"), ("c3", "omnigent_sys_session_list")):
+        await fwd.handle_event(
+            _event("session.tool.input.started", assistantMessageID="msg_1", id=call_id, name=name)
+        )
+        await fwd.handle_event(
+            _event(
+                "session.tool.called",
+                assistantMessageID="msg_1",
+                id=call_id,
+                input={},
+                executed=True,
+            )
+        )
+    names = [
+        i["item_data"]["name"] for i in _items(server.posts) if i["item_type"] == "function_call"
+    ]
+    assert names == ["edit", "subagent", "omnigent_sys_session_list"]
+
+
+async def test_tool_items_share_the_running_response_id() -> None:
+    """Tool items in a later step still group under the turn's live id."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.execution.started"))
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_step_started("msg_2"))
+    await fwd.handle_event(
+        _event("session.tool.input.started", assistantMessageID="msg_2", id="c1", name="shell")
+    )
+    await fwd.handle_event(
+        _event(
+            "session.tool.called",
+            assistantMessageID="msg_2",
+            id="c1",
+            input={"command": "ls"},
+            executed=True,
+        )
+    )
+    call = next(i for i in _items(server.posts) if i["item_type"] == "function_call")
+    assert call["response_id"] == "msg_1"
+
+
+async def test_tool_failed_posts_error_output() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event("session.tool.input.started", assistantMessageID="msg_1", id="c1", name="shell")
+    )
+    await fwd.handle_event(
+        _event(
+            "session.tool.called",
+            assistantMessageID="msg_1",
+            id="c1",
+            input={"command": "x"},
+            executed=True,
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "session.tool.failed",
+            assistantMessageID="msg_1",
+            id="c1",
+            error={"type": "tool.execution", "message": "boom"},
+            executed=True,
+        )
+    )
+    out = next(i for i in _items(server.posts) if i["item_type"] == "function_call_output")
+    assert out["item_data"] == {"call_id": "c1", "output": "[error] boom"}
+
+
+async def test_tool_failed_without_call_posts_call_first() -> None:
+    """Malformed tool input fails without ``session.tool.called``; keep the pair."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event("session.tool.input.started", assistantMessageID="msg_1", id="c1", name="edit")
+    )
+    await fwd.handle_event(
+        _event(
+            "session.tool.failed",
+            assistantMessageID="msg_1",
+            id="c1",
+            error={"type": "tool.input-json", "message": "bad json"},
+            executed=False,
+        )
+    )
+    kinds = [(i["item_type"], i["item_data"].get("name")) for i in _items(server.posts)]
+    assert kinds == [("function_call", "edit"), ("function_call_output", None)]
+
+
+async def test_tool_call_and_output_dedupe() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    called = _event(
+        "session.tool.called", assistantMessageID="msg_1", id="c1", input={}, executed=True
+    )
+    success = _event(
+        "session.tool.success",
+        assistantMessageID="msg_1",
+        id="c1",
+        content=[{"type": "text", "text": "ok"}],
+        executed=True,
+    )
+    for event in (called, called, success, success):
+        await fwd.handle_event(event)
+    kinds = [i["item_type"] for i in _items(server.posts)]
+    assert kinds == ["function_call", "function_call_output"]
+
+
+async def test_text_before_tool_call_lands_first() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event("session.text.ended", assistantMessageID="msg_1", ordinal=0, text="Running ls.")
+    )
+    await fwd.handle_event(
+        _event("session.tool.called", assistantMessageID="msg_1", id="c1", input={}, executed=True)
+    )
+    assert [i["item_type"] for i in _items(server.posts)] == ["message", "function_call"]
