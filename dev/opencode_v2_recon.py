@@ -40,6 +40,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import itertools
 import json
 import os
 import secrets
@@ -336,56 +337,6 @@ async def _stream_events(
                 buffer = []
 
 
-async def _auto_answer_prompts(
-    client: httpx.AsyncClient,
-    session_id: str,
-    events: list[dict[str, Any]],
-    findings: dict[str, str],
-) -> None:
-    """Poll captured events and auto-answer the first permission ask and form."""
-    answered_permission = False
-    answered_form = False
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + 120.0
-    while loop.time() < deadline and not (answered_permission and answered_form):
-        await asyncio.sleep(0.5)
-        for event in list(events):
-            if event.get("type") == "permission.asked" and not answered_permission:
-                request_id = event["data"]["id"]
-                reply = await client.post(
-                    f"/api/session/{session_id}/permission/{request_id}/reply",
-                    json={"decision": "once"},
-                )
-                findings["permission_reply_status"] = str(reply.status_code)
-                if reply.status_code < 300:
-                    answered_permission = True
-                else:
-                    print(
-                        f"permission reply failed: {reply.status_code} {reply.text}",
-                        file=sys.stderr,
-                    )
-            if event.get("type") == "form.created" and not answered_form:
-                form = event["data"]["form"]
-                answer = {
-                    field["key"]: (
-                        field.get("options", ["A"])[0] if field.get("type") == "string" else "A"
-                    )
-                    for field in form.get("fields", [])
-                }
-                reply = await client.post(
-                    f"/api/session/{session_id}/form/{form['id']}/reply",
-                    json={"answer": answer},
-                )
-                findings["form_reply_status"] = str(reply.status_code)
-                if reply.status_code < 300:
-                    answered_form = True
-                else:
-                    print(
-                        f"form reply failed: {reply.status_code} {reply.text}",
-                        file=sys.stderr,
-                    )
-
-
 _TERMINAL_EXECUTION_EVENT_TYPES = frozenset(
     {
         "session.execution.succeeded",
@@ -427,17 +378,87 @@ def is_terminal_session_event(event: dict[str, Any], session_id: str) -> bool:
     return False
 
 
-async def _wait_for_session_terminal(
-    events: list[dict[str, Any]], session_id: str, timeout: float
+_DRIVE_PROMPTS_TIMEOUT_SECONDS = 180.0  # 120s auto-answer + 60s terminal-wait budgets, combined
+
+
+async def _drive_prompts_until_terminal(
+    client: httpx.AsyncClient,
+    session_id: str,
+    events: list[dict[str, Any]],
+    findings: dict[str, str],
+    timeout: float = _DRIVE_PROMPTS_TIMEOUT_SECONDS,
 ) -> dict[str, Any] | None:
-    """Poll captured events until one signals *session_id* has left the running state."""
+    """
+    Answer every permission/form prompt as it appears, until *session_id* goes terminal.
+
+    A single combined loop (rather than answer-the-first-of-each, then
+    separately wait for idle) is required because a model can raise more
+    than one permission ask or form in one turn: the earlier two-phase
+    version stopped answering after the first of each, so a second
+    ``permission.asked`` for the same turn was never replied to and the
+    session never left "running".
+
+    :param timeout: Overall budget for both answering prompts and reaching
+        a terminal event.
+    :returns: The terminal event that ended the session, or ``None`` if
+        *timeout* elapses first.
+    """
+    answered_permission_ids: set[str] = set()
+    answered_form_ids: set[str] = set()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
+        for event in list(events):
+            if event.get("type") == "permission.asked":
+                request_id = event["data"]["id"]
+                if request_id in answered_permission_ids:
+                    continue
+                reply = await client.post(
+                    f"/api/session/{session_id}/permission/{request_id}/reply",
+                    json={"decision": "once"},
+                )
+                findings["permission_reply_status"] = str(reply.status_code)
+                if reply.status_code < 300:
+                    answered_permission_ids.add(request_id)
+                else:
+                    print(
+                        f"permission reply failed: {reply.status_code} {reply.text}",
+                        file=sys.stderr,
+                    )
+            if event.get("type") == "form.created":
+                form = event["data"]["form"]
+                form_id = form["id"]
+                if form_id in answered_form_ids:
+                    continue
+                answer = {
+                    field["key"]: (
+                        field.get("options", ["A"])[0] if field.get("type") == "string" else "A"
+                    )
+                    for field in form.get("fields", [])
+                }
+                reply = await client.post(
+                    f"/api/session/{session_id}/form/{form_id}/reply",
+                    json={"answer": answer},
+                )
+                findings["form_reply_status"] = str(reply.status_code)
+                if reply.status_code < 300:
+                    answered_form_ids.add(form_id)
+                else:
+                    print(
+                        f"form reply failed: {reply.status_code} {reply.text}",
+                        file=sys.stderr,
+                    )
+
         for event in events:
             if is_terminal_session_event(event, session_id):
+                findings["permissions_answered"] = str(len(answered_permission_ids))
+                findings["forms_answered"] = str(len(answered_form_ids))
                 return event
+
         await asyncio.sleep(0.5)
+
+    findings["permissions_answered"] = str(len(answered_permission_ids))
+    findings["forms_answered"] = str(len(answered_form_ids))
     return None
 
 
@@ -466,6 +487,50 @@ async def _wait_for_integration_loaded(
     return False
 
 
+def progress_has_incremental_output(events: list[dict[str, Any]]) -> tuple[bool, list[str]]:
+    """
+    Detect whether ``session.tool.progress`` metadata grows incrementally per tool call.
+
+    Per v2's schema (``session-event.ts``'s ``Tool.Progress``), each
+    progress event carries ``{..., id (the tool call id), metadata:
+    Record<string, Json>}`` and is a live replacement of the previous
+    metadata for that same tool call as it runs. "Incremental" means some
+    string-valued metadata field is a growing prefix across consecutive
+    progress events for the same tool call id — the streaming-output
+    pattern a UI would render live, as opposed to metadata that's static or
+    replaced wholesale each time.
+
+    :param events: Captured ``/api/event`` frames (any type; non-progress
+        events are ignored).
+    :returns: ``(has_incremental_output, metadata_keys_seen)`` — whether any
+        field grew this way, and the sorted distinct metadata key names
+        observed across every progress event.
+    """
+    by_tool_call: dict[str, list[dict[str, Any]]] = {}
+    keys_seen: set[str] = set()
+    for event in events:
+        if event.get("type") != "session.tool.progress":
+            continue
+        data = event.get("data", {})
+        metadata = data.get("metadata") or {}
+        keys_seen.update(metadata.keys())
+        tool_call_id = data.get("id")
+        if tool_call_id is None:
+            continue
+        by_tool_call.setdefault(tool_call_id, []).append(metadata)
+
+    has_incremental = any(
+        isinstance(previous_value, str)
+        and isinstance(current.get(key), str)
+        and current[key] != previous_value
+        and current[key].startswith(previous_value)
+        for metadata_sequence in by_tool_call.values()
+        for previous, current in itertools.pairwise(metadata_sequence)
+        for key, previous_value in previous.items()
+    )
+    return has_incremental, sorted(keys_seen)
+
+
 def _fill_recon_findings(
     events: list[dict[str, Any]], messages: dict[str, Any], findings: dict[str, str]
 ) -> None:
@@ -476,11 +541,16 @@ def _fill_recon_findings(
     findings["1_instructions_applies_system_prompt"] = "yes" if instructions_seen else "no"
 
     progress_events = [e for e in events if e.get("type") == "session.tool.progress"]
-    findings["3_tool_progress_has_incremental_output"] = (
-        "no data captured (no session.tool.progress events seen)"
-        if not progress_events
-        else ("yes" if any(e.get("data", {}).get("metadata") for e in progress_events) else "no")
-    )
+    if not progress_events:
+        findings["3_tool_progress_has_incremental_output"] = (
+            "no data captured (no session.tool.progress events seen)"
+        )
+    else:
+        has_incremental, metadata_keys = progress_has_incremental_output(events)
+        keys_text = ", ".join(metadata_keys) if metadata_keys else "(none)"
+        findings["3_tool_progress_has_incremental_output"] = (
+            f"{'yes' if has_incremental else 'no'} (metadata keys seen: {keys_text})"
+        )
 
     mcp_calls = [
         e
@@ -533,7 +603,6 @@ def _write_fixtures(
     (out_dir / "recon-findings.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-_IDLE_TIMEOUT_SECONDS = 60.0
 _TURN_TIMEOUT_SECONDS = 600.0
 
 
@@ -714,15 +783,13 @@ async def run_recon(args: argparse.Namespace) -> int:
             )
             prompt_resp.raise_for_status()
 
-            await _auto_answer_prompts(client, session_id, events, findings)
-
-            terminal_event = await _wait_for_session_terminal(
-                events, session_id, _IDLE_TIMEOUT_SECONDS
+            terminal_event = await _drive_prompts_until_terminal(
+                client, session_id, events, findings
             )
             if terminal_event is None:
                 print(
                     f"session {session_id} did not reach a terminal state within "
-                    f"{_IDLE_TIMEOUT_SECONDS}s of the auto-answer window; aborting without "
+                    f"{_DRIVE_PROMPTS_TIMEOUT_SECONDS}s of answering prompts; aborting without "
                     "writing fixtures",
                     file=sys.stderr,
                 )

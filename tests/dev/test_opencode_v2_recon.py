@@ -12,6 +12,7 @@ from dev.opencode_v2_recon import (
     build_recon_opencode_config,
     credential_values_from_env,
     is_terminal_session_event,
+    progress_has_incremental_output,
     read_stored_key,
     redact_secrets,
 )
@@ -243,3 +244,65 @@ def test_read_stored_key_skips_oauth_credential(tmp_path: Path, capsys: object) 
     assert read_stored_key(db_path, "github") is None
     captured = capsys.readouterr()  # type: ignore[attr-defined]
     assert "oauth" in captured.err
+
+
+def _progress_event(tool_call_id: str, metadata: dict[str, object]) -> dict[str, object]:
+    return {"type": "session.tool.progress", "data": {"id": tool_call_id, "metadata": metadata}}
+
+
+def test_progress_has_incremental_output_detects_growing_string_field() -> None:
+    events = [
+        _progress_event("call_1", {"output": "Hel"}),
+        _progress_event("call_1", {"output": "Hello"}),
+        _progress_event("call_1", {"output": "Hello, world"}),
+    ]
+    has_incremental, keys = progress_has_incremental_output(events)
+    assert has_incremental is True
+    assert keys == ["output"]
+
+
+def test_progress_has_incremental_output_false_for_static_metadata() -> None:
+    events = [
+        _progress_event("call_1", {"status": "running"}),
+        _progress_event("call_1", {"status": "running"}),
+    ]
+    has_incremental, keys = progress_has_incremental_output(events)
+    assert has_incremental is False
+    assert keys == ["status"]
+
+
+def test_progress_has_incremental_output_false_for_replaced_not_grown_value() -> None:
+    events = [
+        _progress_event("call_1", {"output": "abc"}),
+        _progress_event("call_1", {"output": "xyz"}),
+    ]
+    has_incremental, keys = progress_has_incremental_output(events)
+    assert has_incremental is False
+    assert keys == ["output"]
+
+
+def test_progress_has_incremental_output_does_not_mix_different_tool_calls() -> None:
+    events = [
+        _progress_event("call_1", {"output": "Hello"}),
+        _progress_event("call_2", {"output": "H"}),
+    ]
+    has_incremental, keys = progress_has_incremental_output(events)
+    assert has_incremental is False
+    assert keys == ["output"]
+
+
+def test_progress_has_incremental_output_empty_for_no_progress_events() -> None:
+    events = [{"type": "session.status", "data": {"sessionID": "ses_1"}}]
+    has_incremental, keys = progress_has_incremental_output(events)
+    assert has_incremental is False
+    assert keys == []
+
+
+def test_progress_has_incremental_output_collects_all_metadata_keys() -> None:
+    events = [
+        _progress_event("call_1", {"output": "a", "phase": "start"}),
+        _progress_event("call_1", {"output": "ab", "phase": "start"}),
+    ]
+    has_incremental, keys = progress_has_incremental_output(events)
+    assert has_incremental is True
+    assert keys == ["output", "phase"]
