@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 
 import pytest
 
+import omnigent.runner.transports.ws_tunnel.registry as registry_mod
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     ResponseHeadFrame,
@@ -381,3 +383,219 @@ async def test_wait_for_runner_zero_timeout_just_checks() -> None:
     assert await reg.wait_for_runner("r1", timeout_s=0) is None
     session = reg.register("r1", _NoopWS(), _hello())
     assert await reg.wait_for_runner("r1", timeout_s=-1) is session
+
+
+def _fill_outbound(session: registry_mod.RunnerSession) -> None:
+    for _ in range(registry_mod._OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+
+@pytest.mark.asyncio
+async def test_registered_outbound_queue_is_bounded() -> None:
+    """Each runner generation has a fixed frame budget."""
+    session = TunnelRegistry().register("r1", _NoopWS(), _hello())
+    assert session.outbound_queue.maxsize == registry_mod._OUTBOUND_QUEUE_MAX_FRAMES
+    _fill_outbound(session)
+    with pytest.raises(asyncio.QueueFull):
+        session.outbound_queue.put_nowait("overflow")
+
+
+@pytest.mark.asyncio
+async def test_send_text_waits_for_a_full_queue_to_drain() -> None:
+    """A temporary burst waits for room without dropping its tail frame."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    _fill_outbound(session)
+
+    send = asyncio.create_task(reg.send_text(session, "tail-frame"))
+    await asyncio.sleep(0.01)
+    assert not send.done()
+    session.outbound_queue.get_nowait()
+    await asyncio.wait_for(send, timeout=2.0)
+
+    drained = [session.outbound_queue.get_nowait() for _ in range(session.outbound_queue.qsize())]
+    assert drained[-1] == "tail-frame"
+
+
+@pytest.mark.asyncio
+async def test_send_text_fails_when_a_full_queue_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender that frees no room surfaces a bounded ConnectionError."""
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 0.05)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    _fill_outbound(session)
+
+    with pytest.raises(ConnectionError, match="stalled"):
+        await reg.send_text(session, "blocked-frame")
+
+
+@pytest.mark.asyncio
+async def test_replacement_releases_waiter_without_enqueueing_on_retired_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generation replacement wins atomically over a waiting enqueue."""
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    _fill_outbound(old)
+    send = asyncio.create_task(reg.send_text(old, "sneaky-frame"))
+    await asyncio.sleep(0.05)
+    assert not send.done()
+
+    reg.register("r1", _NoopWS(), _hello())
+    await asyncio.sleep(0)
+    old.outbound_queue.get_nowait()
+    with pytest.raises(ConnectionError, match="replaced"):
+        await asyncio.wait_for(send, timeout=2.0)
+
+    drained = [old.outbound_queue.get_nowait() for _ in range(old.outbound_queue.qsize())]
+    assert "sneaky-frame" not in drained
+
+
+@pytest.mark.parametrize("cancel_before_start", [False, True])
+@pytest.mark.asyncio
+async def test_cancelled_enqueue_task_resolves_waiting_sender(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_before_start: bool,
+) -> None:
+    """Owner-loop cancellation cannot orphan the cross-loop acknowledgement."""
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    _fill_outbound(session)
+
+    before = asyncio.all_tasks()
+    send = asyncio.create_task(reg.send_text(session, "parked-frame"))
+    await asyncio.sleep(0 if cancel_before_start else 0.01)
+    enqueue_tasks = asyncio.all_tasks() - before - {send}
+    assert enqueue_tasks
+    for task in enqueue_tasks:
+        task.cancel()
+
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_send_text_never_enqueues_after_room_frees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller cancellation prevents a parked owner-loop enqueue from landing."""
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_POLL_S", 0.01)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    _fill_outbound(session)
+
+    send = asyncio.create_task(reg.send_text(session, "cancelled-frame"))
+    await asyncio.sleep(0)
+    send.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await send
+
+    session.outbound_queue.get_nowait()
+    await asyncio.sleep(0.05)
+    drained = [session.outbound_queue.get_nowait() for _ in range(session.outbound_queue.qsize())]
+    assert "cancelled-frame" not in drained
+
+
+@pytest.mark.asyncio
+async def test_send_text_cancellation_is_atomic_across_event_loop_threads() -> None:
+    """Cancellation cannot be reported after the owner loop commits the frame."""
+    entered_put = threading.Event()
+    release_put = threading.Event()
+    inserted = threading.Event()
+
+    class _PausingQueue(asyncio.Queue[str | None]):
+        def put_nowait(self, item: str | None) -> None:
+            if item == "cancelled-frame":
+                entered_put.set()
+                release_put.wait(timeout=2.0)
+            super().put_nowait(item)
+            if item == "cancelled-frame":
+                inserted.set()
+
+    owner_loop = asyncio.new_event_loop()
+    owner_thread = threading.Thread(target=owner_loop.run_forever, daemon=True)
+    owner_thread.start()
+    timer: threading.Timer | None = None
+    try:
+        reg = TunnelRegistry()
+
+        async def _register() -> registry_mod.RunnerSession:
+            session = reg.register("r1", _NoopWS(), _hello())
+            session.outbound_queue = _PausingQueue(maxsize=registry_mod._OUTBOUND_QUEUE_MAX_FRAMES)
+            return session
+
+        session = await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(_register(), owner_loop)
+        )
+        send = asyncio.create_task(reg.send_text(session, "cancelled-frame"))
+        assert await asyncio.wait_for(asyncio.to_thread(entered_put.wait, 2.0), timeout=3.0)
+
+        # The owner loop has passed the cancellation guard but is paused inside
+        # put_nowait. Let cancellation run on this separate caller loop before
+        # releasing the insertion window.
+        timer = threading.Timer(0.1, release_put.set)
+        timer.start()
+        send.cancel()
+        await send
+
+        assert await asyncio.wait_for(asyncio.to_thread(inserted.wait, 2.0), timeout=3.0)
+
+        async def _drain() -> list[str | None]:
+            return [
+                session.outbound_queue.get_nowait() for _ in range(session.outbound_queue.qsize())
+            ]
+
+        drained = await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_drain(), owner_loop))
+        assert drained == ["cancelled-frame"]
+    finally:
+        release_put.set()
+        if timer is not None:
+            timer.join(timeout=2.0)
+        owner_loop.call_soon_threadsafe(owner_loop.stop)
+        owner_thread.join(timeout=5.0)
+        owner_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_send_text_fails_when_owner_loop_is_stopped() -> None:
+    """A stopped owner loop fails the send instead of awaiting forever."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        reg = TunnelRegistry()
+
+        async def _register() -> registry_mod.RunnerSession:
+            return reg.register("r1", _NoopWS(), _hello())
+
+        session = asyncio.run_coroutine_threadsafe(_register(), loop).result(timeout=5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        assert not loop.is_running()
+        with pytest.raises(ConnectionError, match="not running"):
+            await asyncio.wait_for(reg.send_text(session, "frame"), timeout=2.0)
+    finally:
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_retire_places_stop_sentinel_in_a_full_queue() -> None:
+    """Retiring a saturated generation still wakes and stops its writer."""
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    _fill_outbound(old)
+
+    reg.register("r1", _NoopWS(), _hello())
+    await asyncio.sleep(0)
+
+    assert old.outbound_queue.qsize() == registry_mod._OUTBOUND_QUEUE_MAX_FRAMES
+    drained = [old.outbound_queue.get_nowait() for _ in range(old.outbound_queue.qsize())]
+    assert drained[-1] is None

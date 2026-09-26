@@ -270,6 +270,8 @@ def create_terminal_attach_router(
                 socket_path=str(entry.instance.socket_path),
                 tmux_target=entry.instance.tmux_target,
                 read_only=read_only,
+                session_id=session_id,
+                terminal_id=terminal_id,
             )
 
     return router
