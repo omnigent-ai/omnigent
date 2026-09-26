@@ -35,6 +35,10 @@ the `cli` section below for setup steps.
 
 - Show the actual product behavior. Tests may drive the interaction and verify
   the result, but the clip must show the product itself.
+- Any text the caption quotes must be legible in the final frame. Detail that
+  lives inside a collapsed disclosure — an error pill's message body, a folded
+  tool card — is in the DOM but not on screen until it is expanded. Expand it
+  during the journey before the clip ends, or leave the quote out of the caption.
 - Do not substitute a video of pytest output, assertions, test source, debug
   logs, or a slide describing what happened. Do not invent a different journey
   just to produce a video.
@@ -145,6 +149,20 @@ the leftover raw dir, so the same footage isn't collected twice. If that dir has
 **no** `.webm` after the run, the recording genuinely didn't happen (the test
 errored before opening a page, or the fixture never came online) — capture the
 reason per the empty-recordings rule; never report a clip you didn't produce.
+
+**Expand collapsed detail before the clip ends.** Omnigent's error pill
+(`data-testid="error-pill"`) shows only its headline — "Codex ran into an error
+during this turn", "Something went wrong" — until the user clicks it; the message
+(`error-message-content`) sits inside the collapsed body. A DOM or transcript
+match on that message (`"signed in" in combined`, `to_contain_text` on the pill,
+an `inner_text` probe) is satisfied by the hidden body and says nothing about
+what the viewer sees. To show the message, have the driver click the pill,
+assert the expanded body with
+`expect(pill.get_by_test_id("error-message-content")).to_have_text(...)` (or
+`to_be_visible()`), and hold it before stopping. If the message never renders on
+screen, or you cannot view the final frame to confirm it did, caption only the
+collapsed cards ("three collapsed error cards; the sign-in detail was asserted
+from the DOM, not shown") — never the quoted message.
 
 ## `mobile` facets
 
@@ -262,6 +280,13 @@ state, bad output, error) for a `before` recording, or the correct end state for
 `fixed`/`after` one. Convert to `.mp4` with `ffmpeg` when available; `.webm`/`.gif`
 are fine otherwise. Recordings are workspace artifacts exactly like the test —
 leave them uncommitted; in CI the artifact bundle collects them.
+
+Every phrase the caption quotes must be readable in the final frame. Text a DOM
+or transcript assertion found inside a collapsed element is not visible, and a
+screenshot you never opened confirms nothing: when you cannot confirm the final
+frame shows the quoted text, do not quote it. Caption the visible state instead
+and say the detail was established from the DOM, so a reader is not told the
+footage proves something it never shows.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in

@@ -130,6 +130,11 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.
+- Quote in an after-clip caption only text the final frame shows. A message
+  folded inside a collapsed error pill or card is in the DOM, not on screen:
+  expand it in the driver and assert the expanded body is visible before
+  stopping, or caption only the visible cards and keep the quoted text in the
+  evidence.
 - Record your fix on the author path, or the reviewed PR head on the review
   path. Save the clip as `recordings/<slug>/after-<facet>.<ext>` with
   `kind: "after"`, and include it in the PR Demo section and handoff.
