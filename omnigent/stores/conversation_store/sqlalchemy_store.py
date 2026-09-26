@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from typing import Any, Protocol, cast
 
@@ -60,6 +60,14 @@ from omnigent.db.enum_codecs import (
     encode_session_live_status,
 )
 from omnigent.db.query_context import query_name_scope
+from omnigent.db.sqlite_trigram import (
+    initialize_trigram_search,
+    load_trigram_candidates,
+    trigram_earliest_like_match_position,
+    trigram_literal_match_positions,
+    trigram_match_expression,
+    trigram_search_ready,
+)
 from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
@@ -630,6 +638,7 @@ def _fetch_search_snippets(
     session: Session,
     conversation_ids: list[str],
     query: str,
+    earliest_match_positions: Mapping[str, int] | None = None,
 ) -> dict[str, str]:
     """
     Build a per-conversation preview excerpt of matching chat content.
@@ -650,14 +659,31 @@ def _fetch_search_snippets(
     :param conversation_ids: Conversation IDs to build snippets for,
         e.g. ``["conv_a", "conv_b"]``.
     :param query: The user's search string.
+    :param earliest_match_positions: Each conversation's earliest matching item
+        position when already known, so only those items are read.
     :returns: Mapping ``{conversation_id: snippet}``. Conversations whose
         only match was the title (no item body match) are absent — the
         caller leaves their ``search_snippet`` as ``None``.
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
     workspace_id = current_workspace_id()
+    if earliest_match_positions is not None:
+        if not earliest_match_positions:
+            return {}
+        located_rows = session.execute(
+            select(
+                SqlConversationItem.conversation_id,
+                SqlConversationItem.search_text,
+            ).where(
+                SqlConversationItem.workspace_id == workspace_id,
+                tuple_(SqlConversationItem.conversation_id, SqlConversationItem.position).in_(
+                    list(earliest_match_positions.items())
+                ),
+            )
+        ).tuples()
+        return _build_search_snippets(located_rows, query)
+    pattern = f"%{query.lower()}%"
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
     # can't use that index and falls back to a full table scan of every item.
@@ -695,7 +721,15 @@ def _fetch_search_snippets(
                 SqlConversationItem.position == earliest.c.pos,
             ),
         )
-    ).all()
+    ).tuples()
+    return _build_search_snippets(rows, query)
+
+
+def _build_search_snippets(
+    rows: Iterable[tuple[str, str | None]],
+    query: str,
+) -> dict[str, str]:
+    """Build ``{conversation_id: snippet}`` from ``(conversation_id, search_text)`` rows."""
     out: dict[str, str] = {}
     for conv_id, search_text in rows:
         if not search_text:
@@ -902,6 +936,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             else cast(ColumnElement[Any], SqlConversation.id)
         )
         ensure_fts_table(self._conv_engine)
+        initialize_trigram_search(self._conv_engine)
 
     def _get_meta(self, conversation_id: str) -> SqlConversationMetadata | None:
         """
@@ -2686,9 +2721,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             otherwise matches conversations where
             ``LOWER(title) LIKE %query%`` or any
             ``conversation_items.search_text`` contains the
-            query. Implemented with the SQL ``LIKE`` operator
-            (no FTS) so it works against both SQLite and
-            Postgres without extra extensions.
+            query. Local SQLite uses a trigram FTS index when its
+            runtime provides one. Other databases and short
+            queries use a correlated SQL ``LIKE`` predicate.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2815,6 +2850,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             stmt = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id()
             )
+            earliest_match_position: ColumnElement[int] | None = None
 
             if qualifying_ids is not None:
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
@@ -2932,6 +2968,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .exists()
                 )
+                match_expression = trigram_match_expression(search_query)
+                if match_expression is not None and trigram_search_ready(session):
+                    if "_" in search_query or "%" in search_query:
+                        load_trigram_candidates(session, match_expression)
+                        earliest_match_position = trigram_earliest_like_match_position(pattern)
+                    else:
+                        matches = trigram_literal_match_positions(match_expression, pattern)
+                        stmt = stmt.outerjoin(
+                            matches, matches.c.conversation_id == SqlConversation.id
+                        )
+                        earliest_match_position = matches.c.position
+                    content_match = earliest_match_position.is_not(None)
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
@@ -3049,7 +3097,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 sort_fn(sort_col),
                 sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
             ).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
+            earliest_match_positions: dict[str, int] | None = None
+            if earliest_match_position is None:
+                rows = list(session.execute(stmt).scalars().all())
+            else:
+                matched = session.execute(stmt.add_columns(earliest_match_position)).all()
+                rows = [conversation for conversation, _ in matched]
+                earliest_match_positions = {
+                    conversation.id: position
+                    for conversation, position in matched
+                    if position is not None
+                }
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
@@ -3064,7 +3122,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(session, row_ids, search_query, earliest_match_positions)
+                if search_query
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
