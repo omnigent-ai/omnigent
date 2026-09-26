@@ -1339,6 +1339,9 @@ class _OpenCodeNativeLaunchConfig:
         transcript should be seeded as a text preamble
         (``omnigent.fork.carry_history``); opencode has no native session to
         clone, so the runner rehydrates from the copied Omnigent transcript.
+    :param fork_source_id: Source Omnigent conversation id of a forked clone.
+    :param fork_source_external_id: Source OpenCode session id, stamped only
+        for untruncated same-harness forks.
     """
 
     workspace: Path
@@ -1347,6 +1350,8 @@ class _OpenCodeNativeLaunchConfig:
     model_override: str | None
     external_session_id: str | None
     fork_carry_history: bool = False
+    fork_source_id: str | None = None
+    fork_source_external_id: str | None = None
 
 
 async def _opencode_native_launch_config(
@@ -1393,15 +1398,26 @@ async def _opencode_native_launch_config(
         not isinstance(session_workspace, str) or not session_workspace
     ):
         raise RuntimeError(f"Invalid workspace for OpenCode session {session_id!r}.")
-    # On a forked clone, the server stamps carry-history (opencode has no native
-    # session to clone, so the runner rehydrates the copied transcript as a
-    # noReply preamble — same path as a lost-session resume).
-    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+    # Fork directives are only consulted while the clone has no OpenCode
+    # session of its own (see _prepare_opencode_native_fork).
+    from omnigent.stores.conversation_store import (
+        FORK_CARRY_HISTORY_LABEL_KEY,
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
+    )
 
     labels = snapshot.get("labels")
-    fork_carry_history = (
-        isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
-    )
+    fork_carry_history = False
+    fork_source_id: str | None = None
+    fork_source_external_id: str | None = None
+    if isinstance(labels, dict):
+        fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+        source_id = labels.get(FORK_SOURCE_LABEL_KEY)
+        if isinstance(source_id, str) and source_id:
+            fork_source_id = source_id
+        source_external = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+        if isinstance(source_external, str) and source_external:
+            fork_source_external_id = source_external
     return _OpenCodeNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -1409,6 +1425,8 @@ async def _opencode_native_launch_config(
         model_override=model_override,
         external_session_id=external_session_id,
         fork_carry_history=fork_carry_history,
+        fork_source_id=fork_source_id,
+        fork_source_external_id=fork_source_external_id,
     )
 
 
