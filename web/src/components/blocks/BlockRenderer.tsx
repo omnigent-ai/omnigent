@@ -24,7 +24,7 @@
 //    with no trailing answer (interrupted / failed / tool-only step
 //    bubbles) keeps its trace expanded.
 
-import type { ReactNode } from "react";
+import type { AnimationEvent, ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
@@ -70,6 +70,10 @@ const FOLD_RECENT_MOUNT_DEBOUNCE_MS = 3_000;
 // index.css) with slack — anchoring would otherwise pin the answer
 // below the fold and glide the growing trace off the top.
 const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
+
+// Backstop when a collapse animation's `animationend` never arrives.
+// The `forwards` fill keeps content collapsed during the extra 200ms.
+const FOLD_COLLAPSE_HIDE_FALLBACK_MS = 400;
 
 interface BlockRendererProps {
   items: RenderItem[];
@@ -567,6 +571,22 @@ function TurnWorkedFold({
     return () => cancelAnimationFrame(frame);
   }, [animateCollapse, defaultOpen]);
 
+  // Keep the settled trace mounted so expansion reuses rendered markdown.
+  // Hide it after collapse so it cannot receive focus or affect layout.
+  const [closedSettled, setClosedSettled] = useState(!animateCollapse);
+  useEffect(() => {
+    if (open || closedSettled) return undefined;
+    const timer = window.setTimeout(() => setClosedSettled(true), FOLD_COLLAPSE_HIDE_FALLBACK_MS);
+    return () => window.clearTimeout(timer);
+  }, [open, closedSettled]);
+  const handleContentAnimationEnd = (event: AnimationEvent<HTMLDivElement>) => {
+    // Child animations bubble too; only this element's own collapse
+    // animation (see index.css) marks the fold as settled closed.
+    if (event.target !== event.currentTarget) return;
+    if (event.animationName !== "turn-fold-collapse") return;
+    setClosedSettled(true);
+  };
+
   // A USER-initiated expand (never the animateCollapse mount-close)
   // opens INSTANTLY — no height animation — and snaps the fold row to
   // the top of the scroller so the trace reads from its beginning. The
@@ -587,6 +607,8 @@ function TurnWorkedFold({
     scrollOnOpenRef.current = next;
     setUserOpened(next);
     setOpen(next);
+    // Reveal the rendered trace in the first open frame.
+    if (next) setClosedSettled(false);
   };
   useLayoutEffect(() => {
     if (!open || !scrollOnOpenRef.current) return;
@@ -641,6 +663,9 @@ function TurnWorkedFold({
           height animation. */}
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
+        forceMount
+        hidden={!open && closedSettled}
+        onAnimationEnd={handleContentAnimationEnd}
       >
         <div className="relative flex flex-col gap-1 pt-2 pl-4">
           <span

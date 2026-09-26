@@ -3,6 +3,7 @@ import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 import { lazyCodePlugin } from "./lazyCodePlugin";
+import { ChatMermaidBlock } from "./mermaid-block";
 
 type StreamdownRehypePlugins = NonNullable<StreamdownProps["rehypePlugins"]>;
 type StreamdownRehypePlugin = StreamdownRehypePlugins[number];
@@ -29,6 +30,9 @@ export const STREAMDOWN_PLUGINS = {
   // rewritten to `$$…$$` by `normalizeExplicitMathDelimiters`.
   math: createMathPlugin({ singleDollarTextMath: false }),
   mermaid,
+  // The app renderer pre-renders hidden diagrams and reuses them when a
+  // settled trace expands; custom renderers override the built-in block.
+  renderers: [{ component: ChatMermaidBlock, language: "mermaid" }],
 };
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
 export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(true);

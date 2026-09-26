@@ -442,7 +442,7 @@ describe("BlockRenderer dispatch", () => {
   it("does not add adjacent-text spacing across tool items", () => {
     // Rendered as a live turn ("running") so the whole trace stays
     // expanded — a settled turn would fold "Before tool." behind the
-    // Worked row and unmount it.
+    // Worked row and hide it.
     const items: RenderItem[] = [
       { kind: "text", itemId: "t1", text: "Before tool.", final: true },
       {
@@ -559,11 +559,10 @@ describe("BlockRenderer dispatch", () => {
       );
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
       expect(screen.getByText("Worked")).toBeDefined();
-      // The answer stays visible; the trace (narration + run labels)
-      // is unmounted until expanded.
+      // The answer stays visible while the mounted trace stays hidden.
       expect(screen.getByText("All done here.")).toBeDefined();
-      expect(screen.queryByText("Planning the run.")).toBeNull();
-      expect(screen.queryByText(/Ran 2 shell commands/)).toBeNull();
+      expect(screen.getByText("Planning the run.")).not.toBeVisible();
+      expect(screen.getByText(/Ran 2 shell commands/)).not.toBeVisible();
 
       fireEvent.click(screen.getByText("Worked"));
       expect(screen.getByText("Planning the run.")).toBeDefined();
@@ -579,6 +578,47 @@ describe("BlockRenderer dispatch", () => {
       expect(individualToolTrigger).not.toHaveClass("text-sm");
       // The answer remains visible after expansion too.
       expect(screen.getByText("All done here.")).toBeDefined();
+    });
+
+    it("keeps the settled trace mounted while folded and reveals the same nodes on expand", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Planning the run.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "All done here.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      const narration = screen.getByText("Planning the run.");
+      expect(narration).not.toBeVisible();
+
+      fireEvent.click(screen.getByText("Worked"));
+      const revealed = screen.getByText("Planning the run.");
+      expect(revealed).toBe(narration);
+      expect(revealed).toBeVisible();
+    });
+
+    it("re-hides the kept trace after a user collapse settles", async () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Planning the run.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "All done here.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      const trigger = screen.getByText("Worked");
+      fireEvent.click(trigger);
+      const narration = screen.getByText("Planning the run.");
+      expect(narration).toBeVisible();
+
+      fireEvent.click(trigger);
+      await waitFor(() => expect(screen.getByText("Planning the run.")).not.toBeVisible());
+      expect(screen.getByText("Planning the run.")).toBe(narration);
     });
 
     it("starts a response containing a user interjection expanded", () => {
@@ -599,7 +639,7 @@ describe("BlockRenderer dispatch", () => {
 
       fireEvent.click(fold);
       expect(fold).toHaveAttribute("aria-expanded", "false");
-      expect(screen.queryByText("No conflict.")).toBeNull();
+      expect(screen.getByText("No conflict.")).not.toBeVisible();
       expect(screen.getByText("Merged.")).toBeDefined();
     });
 
@@ -633,7 +673,7 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Worked for 1m 46s")).toBeDefined();
     });
 
-    it("uses a compact accessible trigger and pins expanded work to a vertical line", () => {
+    it("uses a compact accessible trigger and pins expanded work to a vertical line", async () => {
       const items: RenderItem[] = [
         tool(1),
         { kind: "text", itemId: "m1", text: "Done.", final: true },
@@ -665,7 +705,10 @@ describe("BlockRenderer dispatch", () => {
 
       fireEvent.click(trigger);
       expect(trigger).toHaveAttribute("aria-expanded", "false");
-      expect(screen.queryByTestId("turn-worked-fold-pin-line")).toBeNull();
+      // jsdom uses the timeout backstop because it has no animationend.
+      await waitFor(() =>
+        expect(screen.getByTestId("turn-worked-fold-pin-line")).not.toBeVisible(),
+      );
     });
 
     it("preserves an expanded Worked section when its duration updates", () => {
@@ -787,7 +830,7 @@ describe("BlockRenderer dispatch", () => {
           </FileViewerContext.Provider>,
         );
         await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
-        await waitFor(() => expect(screen.queryByText("Called 1 tool")).toBeNull());
+        await waitFor(() => expect(screen.getByText("Called 1 tool")).not.toBeVisible());
         expect(scrollSpy).not.toHaveBeenCalled();
       });
     });
@@ -817,8 +860,8 @@ describe("BlockRenderer dispatch", () => {
         </FileViewerContext.Provider>,
       );
       await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
-      // The trace collapses a frame later (it mounts open to animate away).
-      await waitFor(() => expect(screen.queryByText("Looking around.")).toBeNull());
+      // The trace mounts open, collapses a frame later, and remains mounted.
+      await waitFor(() => expect(screen.getByText("Looking around.")).not.toBeVisible());
       expect(screen.getByText("Answer text.")).toBeDefined();
     });
 
@@ -853,8 +896,8 @@ describe("BlockRenderer dispatch", () => {
       );
       // The dispatch card renders outside the fold; the plain tool and
       // the narration stay hidden inside it.
-      expect(screen.getByText(/sys_session_send/)).toBeDefined();
-      expect(screen.queryByText("Dispatching.")).toBeNull();
+      expect(screen.getByText(/sys_session_send/)).toBeVisible();
+      expect(screen.getByText("Dispatching.")).not.toBeVisible();
       expect(screen.queryByText(/tool_1/)).toBeNull();
       expect(screen.getByText("Relayed.")).toBeDefined();
     });
@@ -891,7 +934,7 @@ describe("BlockRenderer dispatch", () => {
         </FileViewerContext.Provider>,
       );
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
-      expect(screen.queryByTestId("approval-card")).toBeNull();
+      expect(screen.getByTestId("approval-card")).not.toBeVisible();
       expect(screen.getByText("All done.")).toBeDefined();
 
       fireEvent.click(screen.getByText("Worked"));
@@ -916,8 +959,10 @@ describe("BlockRenderer dispatch", () => {
         </FileViewerContext.Provider>,
       );
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
-      expect(screen.getByTestId("approval-card").getAttribute("data-state")).toBe("pending");
-      expect(screen.queryByText("Requesting approval.")).toBeNull();
+      const pendingCard = screen.getByTestId("approval-card");
+      expect(pendingCard.getAttribute("data-state")).toBe("pending");
+      expect(pendingCard).toBeVisible();
+      expect(screen.getByText("Requesting approval.")).not.toBeVisible();
     });
 
     it("does not fold a turn with no trailing answer", () => {
@@ -972,7 +1017,7 @@ describe("BlockRenderer dispatch", () => {
       );
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
       expect(screen.getByText("Edit landed.")).toBeDefined();
-      expect(screen.queryByText("Editing the file.")).toBeNull();
+      expect(screen.getByText("Editing the file.")).not.toBeVisible();
       expect(screen.queryByText(/turn_diff/)).toBeNull();
 
       // Expanding the Worked row reveals the trace; the diff sits in
@@ -1000,10 +1045,10 @@ describe("BlockRenderer dispatch", () => {
         </FileViewerContext.Provider>,
       );
       expect(screen.getByText("Worked for 42s")).toBeDefined();
-      expect(screen.queryByText("Dispatching two sub-agents.")).toBeNull();
+      expect(screen.getByText("Dispatching two sub-agents.")).not.toBeVisible();
 
       fireEvent.click(screen.getByText("Worked for 42s"));
-      expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
+      expect(screen.getByText("Dispatching two sub-agents.")).toBeVisible();
     });
 
     it("never folds the last assistant bubble while the session is running", async () => {
@@ -1035,7 +1080,7 @@ describe("BlockRenderer dispatch", () => {
       // settle debounce).
       rerender(view("idle"));
       await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
-      await waitFor(() => expect(screen.queryByText("Checking the CLI.")).toBeNull());
+      await waitFor(() => expect(screen.getByText("Checking the CLI.")).not.toBeVisible());
     });
 
     it("keeps a shown fold through a scheduled wake's running edge", async () => {
@@ -1068,7 +1113,7 @@ describe("BlockRenderer dispatch", () => {
       // Structural, not timing: the fold stays across further renders.
       rerender(view("running"));
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
-      expect(screen.queryByText("Polling CI.")).toBeNull();
+      await waitFor(() => expect(screen.getByText("Polling CI.")).not.toBeVisible());
     });
 
     it("a revive clears the latch and restores live-turn suppression", async () => {
@@ -1192,7 +1237,7 @@ describe("BlockRenderer dispatch", () => {
         </FileViewerContext.Provider>,
       );
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
-      expect(screen.queryByText("Narration.")).toBeNull();
+      expect(screen.getByText("Narration.")).not.toBeVisible();
     });
 
     it("never folds the last bubble while an elicitation is parked, even if all else reads settled", async () => {
@@ -1267,7 +1312,7 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
       // The answer stays out; the narration folds away with the trace.
       expect(screen.getByText("Server started on 8838.")).toBeDefined();
-      expect(screen.queryByText("Checking the CLI.")).toBeNull();
+      expect(screen.getByText("Checking the CLI.")).not.toBeVisible();
     });
 
     it("never folds a bubble made only of streaming artifacts", () => {
@@ -1346,7 +1391,7 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
       expect(screen.getByText("Looking around.")).toBeDefined();
       await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
-      await waitFor(() => expect(screen.queryByText("Looking around.")).toBeNull());
+      await waitFor(() => expect(screen.getByText("Looking around.")).not.toBeVisible());
       expect(screen.getByText("All done.")).toBeDefined();
     });
 
@@ -1362,7 +1407,7 @@ describe("BlockRenderer dispatch", () => {
         </FileViewerContext.Provider>,
       );
       expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
-      expect(screen.queryByText("Looking around.")).toBeNull();
+      expect(screen.getByText("Looking around.")).not.toBeVisible();
     });
 
     it("does not fold an all-text turn", () => {

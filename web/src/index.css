@@ -2224,13 +2224,18 @@ aside[aria-label="Workspace"][data-maximized] {
 .turn-fold-content-instant[data-state="open"] {
   animation: none;
 }
+/* Hold the collapsed height until the mounted trace receives `hidden`. */
 .turn-fold-content[data-state="closed"] {
-  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 @media (prefers-reduced-motion: reduce) {
   .turn-fold-content[data-state="open"],
   .turn-fold-content[data-state="closed"] {
     animation: none;
+  }
+  /* With no animationend, hide the mounted trace immediately. */
+  .turn-fold-content[data-state="closed"] {
+    display: none;
   }
 }
 /* The summary row grows in over the same beat as the trace shrinks.
