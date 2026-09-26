@@ -129,6 +129,16 @@ def workspace_bar_needs_collapse(bar: Locator) -> bool:
     )
 
 
+def set_session_title(base_url: str, session_id: str, title: str) -> None:
+    """Give a seeded session a unique, visible sidebar label."""
+    response = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"title": title},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+
+
 def open_right_rail(page: Page) -> None:
     """Expand the right "Workspace" rail if it is collapsed.
 

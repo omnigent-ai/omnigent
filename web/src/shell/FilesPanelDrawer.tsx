@@ -81,42 +81,44 @@ export function FilesPanelDrawer({
   }, [open]);
 
   return (
-    <aside
-      ref={ref}
-      data-testid="files-panel-drawer"
-      data-state={open ? "open" : "closed"}
-      style={{ width: panelWidth }}
-      className={cn(
-        "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
-        "fixed inset-0 z-50 shadow-lg",
-        open ? "translate-x-0" : "translate-x-full",
-        "md:relative md:inset-auto md:z-auto md:shadow-none md:translate-x-0 md:shrink-0",
-        open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
-      )}
-      aria-hidden={!open}
-      data-collapsed={!open || undefined}
-    >
-      {isDesktop && (
+    <>
+      {isDesktop && open && (
         <div
           {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          className="relative z-10 w-1 shrink-0 self-stretch cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
         />
       )}
-      {/* FilesPanel switches to its full-screen layout when `onClose`
+      <aside
+        ref={ref}
+        data-testid="files-panel-drawer"
+        data-state={open ? "open" : "closed"}
+        style={{ width: panelWidth }}
+        className={cn(
+          "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
+          "fixed inset-0 z-50 shadow-lg",
+          open ? "translate-x-0" : "translate-x-full",
+          "md:relative md:inset-auto md:z-auto md:shadow-none md:translate-x-0 md:shrink-0",
+          open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
+        )}
+        aria-hidden={!open}
+        data-collapsed={!open || undefined}
+      >
+        {/* FilesPanel switches to its full-screen layout when `onClose`
           is set: it owns the header (title + X close button) and
           fills the parent's height. Mount it only while open so the
           folder tree initializes from the latest inline-panel state. */}
-      {open && (
-        <FilesPanel
-          onFileSelect={onFileSelect}
-          flatView={flatView}
-          showHidden={showHidden}
-          onShowHiddenChange={onShowHiddenChange}
-          sort={sort}
-          onSortChange={onSortChange}
-          onClose={onClose}
-        />
-      )}
-    </aside>
+        {open && (
+          <FilesPanel
+            onFileSelect={onFileSelect}
+            flatView={flatView}
+            showHidden={showHidden}
+            onShowHiddenChange={onShowHiddenChange}
+            sort={sort}
+            onSortChange={onSortChange}
+            onClose={onClose}
+          />
+        )}
+      </aside>
+    </>
   );
 }
