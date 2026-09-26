@@ -56,6 +56,43 @@ from omnigent.harnesses.opencode_native.client import (
 
 _logger = logging.getLogger(__name__)
 
+
+def list_opencode_cli_model_options_isolated(
+    **kwargs: object,
+) -> list[dict[str, object]]:
+    """``list_opencode_cli_model_options`` under a scratch HOME.
+
+    User plugins and global config hooks run inside ``opencode`` and can
+    swallow the CLI's stdout, silently blanking the launch picker. The probe
+    therefore runs under a scratch HOME that copies only the user's OpenCode
+    credentials (``auth.json``). PATH is preserved (that is where the binary
+    lives); ``OPENCODE_CONFIG`` / ``OPENCODE_CONFIG_CONTENT`` are cleared so
+    ambient config cannot leak in. The scratch directory is removed in a
+    ``finally`` once the listing finishes.
+    """
+    import contextlib as _contextlib
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    real_home = Path(_os.environ.get("HOME", str(Path.home())))
+    scratch = Path(_tempfile.mkdtemp(prefix="omnigent-oc-probe-"))
+    try:
+        auth_src = real_home / ".local" / "share" / "opencode" / "auth.json"
+        if auth_src.is_file():
+            data_dir = scratch / ".local" / "share" / "opencode"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            _shutil.copyfile(auth_src, data_dir / "auth.json")
+        env = dict(_os.environ)
+        env["HOME"] = str(scratch)
+        env.pop("OPENCODE_CONFIG", None)
+        env.pop("OPENCODE_CONFIG_CONTENT", None)
+        return list_opencode_cli_model_options(env=env, **kwargs)  # type: ignore[arg-type]
+    finally:
+        with _contextlib.suppress(OSError):
+            _shutil.rmtree(scratch)
+
+
 # Env vars the OpenCode server inherits from the parent that are safe and
 # useful (provider creds + proxy). Everything else is filtered out so the
 # server runs against a clean, per-session environment.
