@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import httpx
@@ -12,7 +15,8 @@ import respx
 from click.testing import CliRunner
 
 from omnigent.cli import _CLICK_SUBCOMMANDS, cli
-from omnigent.session_import.models import SessionImportNotFoundError
+from omnigent.harnesses.opencode_native.app_server import OpenCodeCliNotFoundError
+from omnigent.harnesses.opencode_native.client import OpenCodeSession
 
 _BASE = "http://localhost:6767"
 
@@ -225,27 +229,33 @@ def test_import_command_accepts_qwen_session(tmp_path: Path) -> None:
 
 
 @respx.mock
-def test_import_command_accepts_opencode_export() -> None:
-    """The CLI accepts OpenCode and uploads its public export representation."""
+def test_import_command_accepts_opencode_session() -> None:
+    """The CLI accepts OpenCode and uploads the session read from its v2 server."""
     route = respx.post(f"{_BASE}/v1/imports").mock(
         return_value=httpx.Response(
             201,
             json={"session_id": "conv_opencode", "status": "imported", "item_count": 1},
         )
     )
-    export = {
-        "info": {"id": "ses_cli", "directory": "/repo"},
-        "messages": [
-            {
-                "info": {"id": "msg_user", "role": "user"},
-                "parts": [{"type": "text", "text": "hello"}],
-            }
-        ],
-    }
+    session = OpenCodeSession(id="ses_cli", directory="/repo", raw={"id": "ses_cli"})
+    messages: list[dict[str, Any]] = [
+        {"id": "msg_user", "type": "user", "text": "hello", "time": {"created": 1}}
+    ]
+
+    class _Client:
+        async def get_session(self, session_id: str) -> OpenCodeSession | None:
+            return session if session_id == session.id else None
+
+        async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
+            return messages
+
+    @contextlib.asynccontextmanager
+    async def _import_client() -> AsyncIterator[_Client]:
+        yield _Client()
 
     with (
         patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
-        patch("omnigent.session_import.local._run_opencode_json", return_value=export),
+        patch("omnigent.session_import.local._opencode_import_client", _import_client),
     ):
         result = CliRunner().invoke(
             cli,
@@ -262,9 +272,12 @@ def test_import_command_accepts_opencode_export() -> None:
 
 def test_import_command_reports_opencode_discovery_failure() -> None:
     """Batch discovery surfaces a missing or broken OpenCode CLI cleanly."""
-    with patch(
-        "omnigent.session_import.local._run_opencode_json",
-        side_effect=SessionImportNotFoundError("opencode CLI not found on PATH"),
+    with (
+        patch("omnigent.session_import.local._opencode_user_store_exists", return_value=True),
+        patch(
+            "omnigent.session_import.local.find_opencode_cli",
+            side_effect=OpenCodeCliNotFoundError("opencode CLI not found on PATH"),
+        ),
     ):
         result = CliRunner().invoke(
             cli,
