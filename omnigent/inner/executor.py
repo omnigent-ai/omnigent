@@ -327,6 +327,22 @@ class TurnCancelled(ExecutorEvent):
 
 
 @dataclass
+class TurnNotice(ExecutorEvent):
+    """Guidance that answers the turn without failing it.
+
+    Yielded before :class:`TurnComplete` when the executor cannot do the work
+    but knows what the user should do instead (e.g. ``/login`` on a native
+    harness). The adapter emits it as an ``error`` item with ``level: "info"``.
+
+    :param message: Guidance text shown to the user.
+    :param code: Stable classifier, e.g. ``"claude_native_auth_command"``.
+    """
+
+    message: str
+    code: str = "notice"
+
+
+@dataclass
 class ExecutorError(ExecutorEvent):
     """Something went wrong.
 

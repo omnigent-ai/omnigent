@@ -40,6 +40,7 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     TurnCancelled,
     TurnComplete,
+    TurnNotice,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.policies.types import FAIL_CLOSED_PHASES
@@ -875,6 +876,22 @@ class ExecutorAdapter(HarnessApp):
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
+        elif isinstance(event, TurnNotice):
+            # Persist guidance as an info notice without failing the turn.
+            ctx.emit(
+                OutputItemDoneEvent(
+                    type="response.output_item.done",
+                    item={
+                        "id": f"err_{uuid.uuid4().hex[:12]}",
+                        "type": "error",
+                        "source": "harness",
+                        "code": event.code,
+                        "message": event.message,
+                        "level": "info",
+                        "agent": ctx.response_id,
+                    },
+                )
+            )
         elif isinstance(event, CompactionStarted):
             from omnigent.server.schemas import CompactionInProgressEvent
 

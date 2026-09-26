@@ -242,6 +242,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "codex_thread_reset": (
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
+    "claude_native_auth_command": "Sign in or out of Claude Code with omni setup on the host.",
     "codex_turn_error": "Codex ran into an error during this turn.",
     "native_turn_error": "The agent ran into an error during this turn.",
     "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",

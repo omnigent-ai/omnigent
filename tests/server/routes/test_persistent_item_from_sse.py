@@ -74,3 +74,59 @@ def test_function_call_output_is_persisted() -> None:
     )
     assert result is not None
     assert result.type == "function_call_output"
+
+
+def test_info_level_error_item_is_persisted() -> None:
+    """A harness notice (``error`` item with ``level: "info"``) is durable.
+
+    Dropping it would leave a completed turn with no visible answer after reload.
+    """
+    result = _extract_persistent_item_from_sse(
+        _output_item_done(
+            {
+                "id": "err_1",
+                "type": "error",
+                "source": "harness",
+                "code": "claude_native_auth_command",
+                "message": "Run omni setup on the host to sign in again.",
+                "level": "info",
+                "agent": "resp_1",
+            }
+        )
+    )
+    assert result is not None
+    assert result.type == "error"
+    assert getattr(result.data, "level", None) == "info"
+    assert getattr(result.data, "code", None) == "claude_native_auth_command"
+
+
+def test_destructive_error_item_is_not_persisted() -> None:
+    """Only notices persist as output items; failures ride ``response.failed``."""
+    result = _extract_persistent_item_from_sse(
+        _output_item_done(
+            {
+                "id": "err_3",
+                "type": "error",
+                "source": "harness",
+                "code": "native_turn_error",
+                "message": "the turn blew up",
+            }
+        )
+    )
+    assert result is None
+
+
+def test_malformed_error_item_is_dropped() -> None:
+    """An error item without required text fails parse and is not persisted."""
+    result = _extract_persistent_item_from_sse(
+        _output_item_done(
+            {
+                "id": "err_2",
+                "type": "error",
+                "source": "harness",
+                "code": "claude_native_auth_command",
+                # message missing: ErrorData requires non-empty text.
+            }
+        )
+    )
+    assert result is None
