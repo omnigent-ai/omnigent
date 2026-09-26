@@ -27,6 +27,9 @@ Record the user action and the product's response:
   interface shows the result. Set `recordings: []`, describe what you observed,
   and explain how you checked it.
 
+Record an error appearing mid-turn; it is a visible response, not static text
+asserting the bug.
+
 For example, if `omnigent host` prints the wrong error after login expires,
 record running that command with an expired login and showing its output. See
 the `cli` section below for setup steps.
@@ -49,6 +52,8 @@ Recording is **best-effort**:
   to show, set `recordings: []` for that facet. Name the specific blocker in
   `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
   that cannot start.
+- If the reproduction runs its own live server, attempt the recorder attach
+  described below before citing the stock fixture as a blocker.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
@@ -72,6 +77,42 @@ typically auth-gated (a Databricks Apps deployment bounces an unauthenticated
 Playwright to SSO), so the recorder can't drive it. Let the `tests/e2e_ui/`
 fixtures **spawn their own local server + runner** (the default when no
 `--ui-base-url` is passed).
+
+## A live server your reproduction built is a recording target
+
+The fixture spawn is the default lane, not the only one. Whenever your
+reproduction already stood up its own live server — for *any* reason the stock
+`tests/e2e_ui/` fixtures don't cover — that running server is itself a
+recording target. Do **not** declare the web lane unfilmable by citing the
+stock fixture's limits — attach the recorder to the server you already have
+running. Build the SPA first (next section): an
+`omnigent server` serves it from `omnigent/server/static/web-ui/`, so once the
+bundle exists the SPA is live on your stack's own URL. Then run the recorder
+against that URL:
+
+```bash
+OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
+OMNIGENT_E2E_RECORD_DIR="$PWD/recordings/<slug>/raw" \
+  pytest <test_path> --ui-base-url http://127.0.0.1:<port> \
+  --video on --screenshot on --output recordings/<slug>
+```
+
+`--ui-base-url` skips the SPA build and server spawn. Use an isolated loopback
+server on a random port. The safety check rejects loopback, local/private
+addresses and known development ports (6767, 8000, 5173). The command opts in
+with `OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1` for this reproduction-owned server. Runner-bound fixtures start a runner against
+the supplied server.
+
+Tests that depend on the fixture-owned database cannot use an external server.
+For those journeys, drive the reproduction's server with a separate Playwright
+context and pass `record_video_dir` explicitly. Within `tests/e2e_ui/`,
+`OMNIGENT_E2E_RECORD_DIR` enables direct async contexts; `--video on` covers the
+pytest-playwright page fixture. Direct synchronous contexts need an explicit
+`record_video_dir`. Close the context to finish the WebM.
+
+If the attach fails, include the command and error in
+`recording_unavailable_reason`. A stock fixture limitation alone does not
+establish that the running server cannot be recorded.
 
 ## Build the SPA up front — before you run the recorder, not during it
 
