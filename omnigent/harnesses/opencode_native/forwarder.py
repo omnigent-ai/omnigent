@@ -1187,6 +1187,22 @@ class OpenCodeNativeForwarder:
             return self._default_decision
         return map_verdict_to_decision(verdict)
 
+    async def _on_permission_replied(self, event: OpenCodeEvent) -> None:
+        """Handle ``permission.replied`` — first answer wins.
+
+        Our own reply is marked before it is sent, so its echo is ignored.
+        Otherwise the TUI answered first: cancel the still-parked evaluation
+        and clear the web card.
+        """
+        request_id = _str_field(event.data, "requestID")
+        if request_id is None or not self.state.mark(self._key("perm-replied", request_id)):
+            return
+        task = self._permission_tasks.pop(request_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._post_event(_EXTERNAL_ELICITATION_RESOLVED, {"elicitation_id": request_id})
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -1240,4 +1256,5 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.inbox.delivered": OpenCodeNativeForwarder._on_inbox_delivered,
     "session.inbox.cancelled": OpenCodeNativeForwarder._on_inbox_cancelled,
     "permission.asked": OpenCodeNativeForwarder._on_permission_asked,
+    "permission.replied": OpenCodeNativeForwarder._on_permission_replied,
 }

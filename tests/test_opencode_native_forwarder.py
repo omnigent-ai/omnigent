@@ -1260,3 +1260,42 @@ async def test_permission_evaluation_does_not_block_the_event_loop() -> None:
     release.set()
     await _drain(fwd)
     assert opencode.permission_replies == [(_SESSION, "per_p", "once")]
+
+
+# --- permission replied -----------------------------------------------------
+
+
+async def test_own_permission_reply_echo_is_ignored() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_asked("per_1"))
+    await _drain(fwd)
+    await fwd.handle_event(_event("permission.replied", requestID="per_1", reply="reject"))
+    assert "external_elicitation_resolved" not in _types(server.posts)
+
+
+async def test_tui_permission_reply_cancels_parked_evaluation_and_clears_card() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+
+    async def parked(_normalized: Any) -> dict[str, Any]:
+        await asyncio.Event().wait()
+        return {"decision": "allow"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=parked)
+    await fwd.handle_event(_asked("per_t"))
+    task = fwd._permission_tasks["per_t"]
+    await asyncio.sleep(0)
+    await fwd.handle_event(_event("permission.replied", requestID="per_t", reply="once"))
+    assert task.cancelled()
+    assert opencode.permission_replies == []
+    assert _datas(server.posts, "external_elicitation_resolved") == [{"elicitation_id": "per_t"}]
+
+
+async def test_fixture_permission_replied_without_pending_task_clears_card() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    replied = _fixture("permission.replied")
+    await fwd.handle_event(replied)
+    assert _datas(server.posts, "external_elicitation_resolved") == [
+        {"elicitation_id": replied.data["requestID"]}
+    ]
