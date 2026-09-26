@@ -46,7 +46,10 @@ both ends.
   give-up row.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
   (`intentional_stop`, `server_shutdown`, `idle_no_failure` or
-  `failed_mid_turn`), `grace_s`, `outage_s`, `retries`.
+  `failed_mid_turn`), `grace_s`, `outage_s`, `retries`. `outage_s` is the
+  time since the current grace window opened; a reconnect that dropped again
+  within the window does not reset it, so it includes that brief connected
+  stretch and is not cumulative disconnected time.
 - `runner_session_init_started`: `resume_interrupted_turn`,
   `suppress_recovery_turn`, `recovery_id`. Neither flag set is the tunnel
   reconnect hook; resume set is a sub-agent restore; suppress set is a
