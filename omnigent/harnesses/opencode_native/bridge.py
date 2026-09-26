@@ -24,11 +24,13 @@ OpenCode's persisted session history.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import secrets
+import sqlite3
 import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -55,7 +57,7 @@ OPENCODE_SERVER_PASSWORD_ENV_VAR = "OPENCODE_SERVER_PASSWORD"
 OPENCODE_DEFAULT_USERNAME = "opencode"
 # Per-session SQLite store ``opencode serve`` keeps sessions and credentials in.
 OPENCODE_DB_ENV_VAR = "OPENCODE_DB"
-_OPENCODE_DB_FILE = "opencode.db"
+OPENCODE_DB_FILENAME = "opencode.db"
 
 _STATE_FILE = "state.json"
 _AUTH_SECRET_FILE = "auth.secret"
@@ -474,7 +476,49 @@ def opencode_db_path_for_bridge_dir(bridge_dir: Path) -> Path:
     :returns: Absolute ``opencode.db`` path, passed to the server as
         ``OPENCODE_DB``.
     """
-    return bridge_dir / _OPENCODE_DB_FILE
+    return bridge_dir / OPENCODE_DB_FILENAME
+
+
+def _remove_database_files(database: Path) -> None:
+    """Delete a SQLite database and its WAL/SHM side files, if present."""
+    for suffix in ("", "-wal", "-shm"):
+        with contextlib.suppress(FileNotFoundError):
+            database.with_name(database.name + suffix).unlink()
+
+
+def copy_opencode_database_for_fork(source_bridge_dir: Path, dest_bridge_dir: Path) -> bool:
+    """
+    Snapshot a source conversation's OpenCode DB into a fork's bridge dir.
+
+    The fork's own ``opencode serve`` must see the source session to run
+    ``POST /api/session/{id}/fork``. The copy releases execution claims
+    (``session_v2.time_suspended``) so the fork's server does not resume the
+    source's unfinished turn on boot.
+
+    :param source_bridge_dir: Bridge dir of the conversation being forked.
+    :param dest_bridge_dir: Bridge dir of the new (forked) conversation.
+    :returns: ``True`` when the copy is in place; ``False`` (and no copy left
+        behind) when the source DB is missing or its schema is unrecognized.
+    """
+    source = opencode_db_path_for_bridge_dir(source_bridge_dir)
+    if not source.is_file():
+        return False
+    dest = opencode_db_path_for_bridge_dir(dest_bridge_dir)
+    dest_bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _remove_database_files(dest)
+    try:
+        with (
+            contextlib.closing(sqlite3.connect(source, timeout=10.0)) as src,
+            contextlib.closing(sqlite3.connect(dest)) as dst,
+        ):
+            src.backup(dst)
+            dst.execute("UPDATE session_v2 SET time_suspended = NULL")
+            dst.commit()
+    except sqlite3.Error:
+        _remove_database_files(dest)
+        return False
+    os.chmod(dest, 0o600)
+    return True
 
 
 def user_opencode_config_path() -> Path | None:

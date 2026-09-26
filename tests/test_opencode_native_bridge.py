@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -16,7 +17,9 @@ from omnigent.harnesses.opencode_native.bridge import (
     bridge_dir_for_bridge_id,
     build_opencode_native_spawn_env,
     clear_bridge_state,
+    copy_opencode_database_for_fork,
     ensure_auth_secret,
+    opencode_db_path_for_bridge_dir,
     prepare_bridge_dir,
     read_bridge_state,
     update_active_message_id,
@@ -650,3 +653,55 @@ async def test_connect_env_provider_keys_noop_without_env() -> None:
     client = _KeyClient()
     assert await bridge.connect_env_provider_keys(client, environ={}) == []
     assert client.calls == []
+
+
+def _make_opencode_db(path: Path, *, claimed: bool) -> None:
+    """Create a minimal v2-shaped OpenCode DB with one session row."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_suspended INTEGER)")
+        conn.execute(
+            "INSERT INTO session_v2 (id, time_suspended) VALUES (?, ?)",
+            ("ses_src", 1_700_000_000_000 if claimed else None),
+        )
+    conn.close()
+
+
+def test_copy_opencode_database_for_fork_releases_claims(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    _make_opencode_db(opencode_db_path_for_bridge_dir(source_dir), claimed=True)
+
+    assert copy_opencode_database_for_fork(source_dir, dest_dir) is True
+
+    dest = opencode_db_path_for_bridge_dir(dest_dir)
+    with sqlite3.connect(dest) as conn:
+        rows = conn.execute("SELECT id, time_suspended FROM session_v2").fetchall()
+    conn.close()
+    assert rows == [("ses_src", None)], "a copied in-flight claim would re-run the source turn"
+    assert (dest.stat().st_mode & 0o777) == 0o600
+    # The source keeps its own claim; only the copy is released.
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(source_dir)) as conn:
+        assert conn.execute("SELECT time_suspended FROM session_v2").fetchone()[0] is not None
+    conn.close()
+
+
+def test_copy_opencode_database_for_fork_missing_source(tmp_path: Path) -> None:
+    (tmp_path / "dest").mkdir()
+    assert copy_opencode_database_for_fork(tmp_path / "source", tmp_path / "dest") is False
+    assert not opencode_db_path_for_bridge_dir(tmp_path / "dest").exists()
+
+
+def test_copy_opencode_database_for_fork_unknown_schema_leaves_no_copy(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(source_dir)) as conn:
+        conn.execute("CREATE TABLE unrelated (id TEXT)")
+    conn.close()
+
+    assert copy_opencode_database_for_fork(source_dir, dest_dir) is False
+    assert not opencode_db_path_for_bridge_dir(dest_dir).exists()
