@@ -35,7 +35,7 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     def _stub_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
             if argv[0].endswith("opencode"):
-                version = "1.17.7\n"
+                version = "opencode v2.0.18\n"
             elif argv[0].endswith("cursor-agent") or argv[0].endswith("hermes"):
                 version = "2026.07.01\n"
             else:

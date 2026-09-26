@@ -106,11 +106,11 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     # tripped up by an unexpected subprocess probe.
     def _stub_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's declared range is [1.17.7, 1.18.0); Cursor uses calendar
+            # OpenCode's declared range is [2.0.0, 3.0.0); Cursor uses calendar
             # versions and needs a build after 2026-06-01; everything else is
             # fine with a generous semver placeholder.
             if argv[0].endswith("opencode"):
-                version = "1.17.7\n"
+                version = "opencode v2.0.18\n"
             elif argv[0].endswith("cursor-agent") or argv[0].endswith("hermes"):
                 version = "2026.07.01\n"
             else:

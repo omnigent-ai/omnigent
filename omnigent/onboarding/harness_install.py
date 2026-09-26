@@ -901,7 +901,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     resolvable **and**, when the harness declares ``min_version`` /
     ``max_version_exclusive`` in its install spec, the binary's
     ``--version`` output satisfies that range. This prevents an outdated
-    native CLI (e.g. an OpenCode release outside the supported 1.17.x band)
+    native CLI (e.g. an OpenCode release outside the supported 2.x band)
     from being treated as ready during setup.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``) or

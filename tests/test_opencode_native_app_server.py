@@ -23,20 +23,19 @@ from omnigent.harnesses.opencode_native.app_server import (
 
 
 def test_parse_opencode_version() -> None:
-    assert parse_opencode_version("opencode 1.17.7") == "1.17.7"
-    assert parse_opencode_version("1.17.7") == "1.17.7"
-    assert parse_opencode_version("v1.17.7-beta.1") == "1.17.7-beta.1"
+    assert parse_opencode_version("opencode v2.0.18") == "2.0.18"
+    assert parse_opencode_version("2.0.18") == "2.0.18"
+    assert parse_opencode_version("v2.1.0-beta.1") == "2.1.0-beta.1"
     assert parse_opencode_version("no version here") is None
 
 
 def test_check_version_in_range() -> None:
-    check_opencode_version("1.17.7")
-    check_opencode_version("1.17.99")
-    check_opencode_version("1.18.0")
-    check_opencode_version("1.18.16")
+    check_opencode_version("2.0.0")
+    check_opencode_version("2.0.18")
+    check_opencode_version("2.9.99")
 
 
-@pytest.mark.parametrize("version", ["1.16.0", "1.19.0", "2.0.0"])
+@pytest.mark.parametrize("version", ["1.17.7", "1.18.16", "1.99.0", "3.0.0"])
 def test_check_version_out_of_range_raises(version: str) -> None:
     with pytest.raises(OpenCodeVersionError):
         check_opencode_version(version)
@@ -291,7 +290,7 @@ async def test_start_raises_on_unsupported_version_without_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.16")
     monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
@@ -319,7 +318,7 @@ async def test_start_skips_version_gate_when_env_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.16")
     monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", "1")
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
@@ -340,7 +339,7 @@ async def test_start_skips_version_gate_when_env_set(
     monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
     monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
     await server.start()
-    assert server.version == "1.19.0"
+    assert server.version == "1.18.16"
     assert server.process is not None
 
 
@@ -357,9 +356,9 @@ def test_resolve_opencode_version_parses(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(
         appsrv.subprocess,
         "run",
-        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="opencode 1.17.7\n", stderr=""),
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="opencode v2.0.18\n", stderr=""),
     )
-    assert appsrv.resolve_opencode_version("/x/opencode") == "1.17.7"
+    assert appsrv.resolve_opencode_version("/x/opencode") == "2.0.18"
 
 
 def test_resolve_opencode_version_run_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
