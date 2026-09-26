@@ -2552,6 +2552,31 @@ class HostProcess:
                 return [], str(exc)
             return [(source, sid) for sid in ids], None
 
+        def _log_skip(source: str, session_id: str, exc: Exception) -> None:
+            # A per-session skip is recovered (counted on the done frame, the
+            # batch continues), so it logs below ERROR with the traceback at DEBUG.
+            _logger.warning(
+                "import_local: skipping session source=%r id=%r (%s: %s)",
+                source,
+                session_id,
+                type(exc).__name__,
+                exc,
+                extra=debug_event(
+                    "import_local_session_skipped",
+                    source=source,
+                    error_category=ErrorCategory.UNKNOWN.value,
+                    error_impact=ErrorImpact.BENIGN.value,
+                ),
+                stacklevel=2,
+            )
+            _logger.debug(
+                "import_local: skip traceback source=%r id=%r",
+                source,
+                session_id,
+                exc_info=exc,
+                stacklevel=2,
+            )
+
         def _load(
             source: str, session_id: str
         ) -> tuple[HostImportedLocalSession | None, str | None]:
@@ -2564,10 +2589,8 @@ class HostProcess:
                 # Designed to be surfaced (e.g. "…has no importable history"),
                 # so pass it through as the per-session failure reason.
                 return None, str(exc)
-            except (OSError, ValueError, TypeError):
-                _logger.exception(
-                    "import_local: could not read session source=%r id=%r", source, session_id
-                )
+            except (OSError, ValueError, TypeError) as exc:
+                _log_skip(source, session_id, exc)
                 return None, "This session's transcript could not be read."
             return (
                 HostImportedLocalSession(
@@ -2629,13 +2652,11 @@ class HostProcess:
                     # Dead tunnel: abort the batch (recovery is owned upstream),
                     # never a per-session skip — nothing more can be sent.
                     raise
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 — recovered skip, counted below
                     # Any other failure reading, normalizing, encoding, or sending
                     # one session must not drop the rest of the batch: count it and
                     # move on so the remaining sessions still upload.
-                    _logger.exception(
-                        "import_local: skipping session source=%r id=%r", source, session_id
-                    )
+                    _log_skip(source, session_id, exc)
                     failures.append(
                         {
                             "external_session_id": session_id,
