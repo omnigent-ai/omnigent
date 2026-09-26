@@ -5378,7 +5378,11 @@ describe("chatStore — stop", () => {
     useChatStore.getState().stop();
 
     const state = useChatStore.getState();
-    expect(state.pendingUserMessages).toEqual([]);
+    // The still-pending prompt survives the stop: only `session.input.consumed`
+    // (promote) or a terminal `session.status` edge (dangling cleanup) may
+    // settle it — never the local stop itself.
+    expect(state.pendingUserMessages).toHaveLength(1);
+    expect(state.pendingUserMessages[0]?.tempId).toBe("pend_1");
     expect(state.status).toBe("idle");
     expect(state.sessionStatus).toBe("idle");
     expect(state.activeResponse).toEqual({
@@ -5387,6 +5391,40 @@ describe("chatStore — stop", () => {
       error: null,
     });
     expect(readConversationRows()[0]?.status).toBe("idle");
+  });
+
+  it("keeps the just-sent prompt bubble when stop interrupts before input.consumed", () => {
+    // A POSTed-but-not-yet-consumed prompt is still optimistic; stop() (the
+    // Stop button and the composer's Escape shortcut both route through it)
+    // must leave it in the transcript until the server reconciles it.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      pendingUserMessages: [
+        {
+          tempId: "pend_keep",
+          content: [{ type: "input_text", text: "keep me visible after Esc" }],
+          posted: true,
+        },
+      ],
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
+      status: "streaming",
+      sessionStatus: "running",
+    });
+    seedConversationsCache([conv("conv_abc", "running")]);
+
+    useChatStore.getState().stop();
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([
+      {
+        tempId: "pend_keep",
+        content: [{ type: "input_text", text: "keep me visible after Esc" }],
+        posted: true,
+      },
+    ]);
+    // The stop itself still settles the local working state.
+    expect(state.status).toBe("idle");
+    expect(state.activeResponse?.state).toBe("cancelled");
   });
 
   it("leaves a non-streaming activeResponse untouched on stop", () => {
@@ -5407,7 +5445,7 @@ describe("chatStore — stop", () => {
     useChatStore.getState().stop();
 
     const state = useChatStore.getState();
-    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.pendingUserMessages).toHaveLength(1);
     expect(state.status).toBe("idle");
     expect(state.sessionStatus).toBe("idle");
     // Untouched — the guard skipped the cancelled overwrite.
