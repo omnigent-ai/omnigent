@@ -103,6 +103,57 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
+# A shell's not-found line names the token it could not resolve, either after
+# the phrase (zsh: ``zsh:2: command not found: --model``) or before it (bash,
+# dash, env, exec: ``bash: line 1: claude: command not found``,
+# ``sh: 1: claude: not found``, ``env: 'claude': No such file or directory``).
+_BLAMED_AFTER_PHRASE = re.compile(r"(?:command not found|no such file or directory):\s*(\S+)")
+_BLAMED_BEFORE_PHRASE = re.compile(
+    r"(\S+):\s*(?:command not found|no such file or directory|not found\b"
+    r"|executable file not found)"
+)
+_BLAMED_NOT_RECOGNIZED = re.compile(r"(\S+) is not recognized as an internal or external command")
+_REPORTER = re.compile(r"^-?([a-z0-9_.+-]+?)(?::\d+)?:")
+_BLAME_QUOTES = "'\"`‘’,;"
+# Launchers whose own not-found line blames the program they failed to exec.
+# claude-native runs ``env -u … claude …``, so an ``env:`` error means the CLI.
+_EXEC_WRAPPERS = frozenset({"env"})
+
+
+def _not_found_blame(line: str) -> tuple[str, str] | None:
+    """Return ``(reporter, blamed token)`` for a shell not-found *line*, else ``None``."""
+    match = (
+        _BLAMED_AFTER_PHRASE.search(line)
+        or _BLAMED_BEFORE_PHRASE.search(line)
+        or _BLAMED_NOT_RECOGNIZED.search(line)
+    )
+    if match is None:
+        return None
+    reporter = _REPORTER.match(line.lstrip())
+    return (reporter.group(1) if reporter else "", match.group(1).strip(_BLAME_QUOTES))
+
+
+def _missing_binary(s: _Signal) -> bool:
+    """Missing install: a not-found line blames the launched command, or a silent 127.
+
+    Exit 127 alone is ambiguous: a present CLI that crashes and leaves a stray
+    token for the shell exits 127 too. With a known command, only a not-found
+    line about that command (or from its exec wrapper) proves a missing install.
+    """
+    if not s.command:
+        # Nothing to cross-check against; keep the historical broad rule.
+        return s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS)
+    for line in s.output.splitlines():
+        blame = _not_found_blame(line)
+        if blame is None:
+            continue
+        reporter, token = blame
+        if token == s.command or token.rsplit("/", 1)[-1] == s.command:
+            return True
+        if reporter == s.command and reporter in _EXEC_WRAPPERS:
+            return True
+    return s.exit_code == 127 and not s.output.strip()
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
@@ -121,7 +172,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     ),
     _TerminalMatcher(
         "missing_binary",
-        lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),
+        _missing_binary,
         FailureDiagnosis(
             title="Agent command not found",
             cause=(
