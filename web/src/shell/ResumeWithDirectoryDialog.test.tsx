@@ -217,6 +217,52 @@ describe("ResumeWithDirectoryDialog", () => {
     expect(launchRunnerMock).not.toHaveBeenCalled();
   });
 
+  it("offers the caller's own machine when the source host isn't in their list", async () => {
+    // The hosts list is owner-scoped, so a cross-user fork's source host is
+    // never in it. The dialog must not read that absence as "offline" and
+    // dead-end the caller on reconnect guidance for a machine they can't
+    // touch — it should open the picker on their own online machine.
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_mine", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(
+      sourceSession({ hostId: "host_theirs", workspace: "/Users/alice/repo" }),
+    );
+
+    renderDialog();
+
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    expect(screen.queryByTestId("resume-dir-cli-fallback")).toBeNull();
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(bindBtn);
+
+    // Launches on the caller's machine; the source directory still prefills
+    // (the mismatch warning covers its foreign-path caveat).
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_mine",
+        "conv_clone",
+        "/Users/alice/repo",
+        undefined,
+      ),
+    );
+  });
+
+  it("guides a foreign-source fork to start a host when the caller has none online", async () => {
+    useHostsMock.mockReturnValue({ data: [] } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(
+      sourceSession({ hostId: "host_theirs", workspace: "/Users/alice/repo" }),
+    );
+
+    renderDialog();
+
+    // "Start one with `omnigent host`" — the caller's compute, not a
+    // reconnect command for the source owner's machine.
+    expect(await screen.findByTestId("resume-dir-no-hosts")).toBeTruthy();
+    expect(screen.queryByTestId("resume-dir-cli-fallback")).toBeNull();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+  });
+
   it("warns when the chosen directory differs from the source's", async () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_src", name: "laptop", owner: "me", status: "online" }],
