@@ -219,35 +219,36 @@ describe("isPdfFile", () => {
 });
 
 // ---------------------------------------------------------------------------
-// isModelFile — 3D model preview detection (STL / 3MF / OBJ)
+// isModelFile — 3D model preview detection
 // ---------------------------------------------------------------------------
 
 describe("isModelFile", () => {
-  it.each(["part.stl", "assembly.3mf", "mesh.obj", "dir/nested/widget.STL", "MODEL.OBJ"])(
-    "classifies %s as a model by extension",
-    (path) => {
-      expect(isModelFile(path)).toBe(true);
-    },
-  );
-
   it.each([
-    "app.py",
-    "logo.png",
+    "part.stl",
+    "assembly.3mf",
+    "mesh.obj",
     "scene.gltf",
     "model.glb",
-    "part.step",
-    "part.stp",
-    "notes.txt",
-    "data.json",
-  ])("classifies %s as non-model (out of scope or unrelated)", (path) => {
-    expect(isModelFile(path)).toBe(false);
+    "dir/nested/widget.STL",
+    "MODEL.GLB",
+  ])("classifies %s as a model by extension", (path) => {
+    expect(isModelFile(path)).toBe(true);
   });
+
+  it.each(["app.py", "logo.png", "part.step", "part.stp", "notes.txt", "data.json"])(
+    "classifies %s as non-model (out of scope or unrelated)",
+    (path) => {
+      expect(isModelFile(path)).toBe(false);
+    },
+  );
 
   it("treats a recognized model content type as authoritative on an unknown extension", () => {
     expect(isModelFile("blob", "model/stl")).toBe(true);
     expect(isModelFile("download", "application/vnd.ms-pki.stl")).toBe(true);
     expect(isModelFile("blob", "model/3mf")).toBe(true);
     expect(isModelFile("blob", "model/obj")).toBe(true);
+    expect(isModelFile("blob", "model/gltf+json")).toBe(true);
+    expect(isModelFile("blob", "model/gltf-binary")).toBe(true);
   });
 
   it("ignores charset parameters on the content type", () => {
@@ -260,6 +261,8 @@ describe("isModelFile", () => {
     // raw-text paths.
     expect(isModelFile("part.stl", "application/octet-stream")).toBe(true);
     expect(isModelFile("mesh.obj", "text/plain")).toBe(true);
+    expect(isModelFile("scene.glb", "application/octet-stream")).toBe(true);
+    expect(isModelFile("scene.gltf", "text/plain")).toBe(true);
   });
 
   it("does not treat plain text (no model extension) as a model", () => {
@@ -280,6 +283,8 @@ describe("getModelFormat", () => {
     ["part.stl", "stl"],
     ["assembly.3mf", "3mf"],
     ["mesh.obj", "obj"],
+    ["scene.gltf", "gltf"],
+    ["model.glb", "gltf"],
     ["dir/WIDGET.STL", "stl"],
   ])("resolves %s to %s by extension", (path, format) => {
     expect(getModelFormat(path)).toBe(format);
@@ -292,6 +297,8 @@ describe("getModelFormat", () => {
     expect(getModelFormat("download.bin", "application/vnd.ms-pki.stl")).toBe("stl");
     expect(getModelFormat("blob", "model/3mf")).toBe("3mf");
     expect(getModelFormat("blob", "model/obj")).toBe("obj");
+    expect(getModelFormat("blob", "model/gltf+json")).toBe("gltf");
+    expect(getModelFormat("blob", "model/gltf-binary")).toBe("gltf");
   });
 
   it("prefers the MIME format over the extension when both are model types", () => {
@@ -302,6 +309,8 @@ describe("getModelFormat", () => {
   it("falls back to the extension for generic content types", () => {
     expect(getModelFormat("part.stl", "application/octet-stream")).toBe("stl");
     expect(getModelFormat("mesh.obj", "text/plain")).toBe("obj");
+    expect(getModelFormat("scene.glb", "application/octet-stream")).toBe("gltf");
+    expect(getModelFormat("scene.gltf", "text/plain")).toBe("gltf");
   });
 
   it("ignores charset parameters on the content type", () => {
@@ -310,7 +319,7 @@ describe("getModelFormat", () => {
 
   it("returns null for non-model files", () => {
     expect(getModelFormat("app.py")).toBeNull();
-    expect(getModelFormat("scene.gltf")).toBeNull();
+    expect(getModelFormat("scene.step")).toBeNull();
     expect(getModelFormat("readme.txt", "text/plain")).toBeNull();
     expect(getModelFormat("Dockerfile")).toBeNull();
   });
