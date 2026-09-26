@@ -75,6 +75,7 @@ from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
+_RECORD_DIR_ENV = "OMNIGENT_E2E_RECORD_DIR"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
 
@@ -452,8 +453,15 @@ def browser_context_args(
     pytest-playwright already creates a fresh context for its function-scoped
     ``context`` and ``page`` fixtures. Keeping this wrapper function-scoped
     makes that contract explicit and prevents accidental mutable option reuse.
+    When ``OMNIGENT_E2E_RECORD_DIR`` is set, those fixtures record their video
+    there unless ``--video`` already chose a directory.
     """
-    return {**browser_context_args}
+    context_args = {**browser_context_args}
+    record_dir = os.environ.get(_RECORD_DIR_ENV)
+    if record_dir:
+        Path(record_dir).mkdir(parents=True, exist_ok=True)
+        context_args.setdefault("record_video_dir", record_dir)
+    return context_args
 
 
 def _validate_ui_base_url(base_url: str) -> None:
@@ -2370,12 +2378,13 @@ def _record_video(
     them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
     methods to inject ``record_video_dir`` into every page/context they open, so
     the rendered journey lands as a ``.webm`` regardless of how the test opened
-    the browser. A caller that already passes ``record_video_dir`` is left alone.
-    Playwright writes the file (a random hash name) when the context closes;
-    callers/harnesses pick it up from the directory. No-op when the env var is
-    unset, so ordinary runs are unaffected.
+    the browser (``browser_context_args`` covers the sync fixtures). A caller
+    that already passes ``record_video_dir`` is left alone. Playwright writes
+    the file (a random hash name) when the context closes; callers/harnesses
+    pick it up from the directory. No-op when the env var is unset, so ordinary
+    runs are unaffected.
     """
-    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+    record_dir = os.environ.get(_RECORD_DIR_ENV)
     if not record_dir:
         yield
         return
@@ -2397,6 +2406,36 @@ def _record_video(
     monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
     monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
     yield
+
+
+def _recording_requested(config: pytest.Config) -> bool:
+    """True when this run films the journey, via the env var or ``--video``."""
+    if os.environ.get(_RECORD_DIR_ENV):
+        return True
+    return config.getoption("--video", default="off") not in (None, "off")
+
+
+def _stop_recorded_context(item: pytest.Item) -> None:
+    """Close the pytest-playwright context so its video ends on the test's final state."""
+    context = getattr(item, "funcargs", {}).get("context")
+    # No open page means the test closed it and the video is already finalized.
+    if context is None or not context.pages:
+        return
+    # pytest-playwright's close wrapper still takes its screenshots and traces.
+    with contextlib.suppress(Error):
+        context.close()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, None, None]:
+    """Stop the recording when the test body ends, before later fixtures tear down.
+
+    The ``context`` behind ``page`` otherwise outlives the session fixtures' teardown."""
+    yield
+    if call.when == "call" and _recording_requested(item.config):
+        _stop_recorded_context(item)
 
 
 @pytest.fixture
