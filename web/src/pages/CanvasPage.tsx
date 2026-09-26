@@ -295,11 +295,26 @@ function CanvasSurface() {
     }
   }, [networkConfirmed, persist, projects, projectsQuery.data, sessions, viewerId]);
 
+  // Selection lives on the node objects, and the session list publishes a
+  // fresh array on every poll, focus refresh, and streamed update — so every
+  // rebuild must carry the clicked card's selection over or it flickers away.
+  const rebuildNodes = useCallback(
+    (items: readonly Conversation[], positions: CanvasPositions, requests: CanvasPullRequests) => {
+      setNodes((current) => {
+        const selectedIds = new Set(current.filter((node) => node.selected).map((node) => node.id));
+        return nodesFor(items, positions, requests).map((node) =>
+          selectedIds.has(node.id) ? { ...node, selected: true } : node,
+        );
+      });
+    },
+    [nodesFor],
+  );
+
   // Cards follow the active canvas; drags update the node state directly and
   // land in positionsRef on drop, so rebuilding here never loses a move.
   useEffect(() => {
-    setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
-  }, [nodesFor, visibleSessions, pullRequests]);
+    rebuildNodes(visibleSessions, positionsRef.current, pullRequests);
+  }, [rebuildNodes, visibleSessions, pullRequests]);
 
   // Keep every card in view until the user pans or zooms by hand: first paint,
   // tab switches, cards arriving while loading, and Reset layout. Keyed on the
@@ -447,9 +462,9 @@ function CanvasSurface() {
     ) as CanvasPositions;
     positionsRef.current = { ...kept, ...mergeSessionPositions(visibleSessions, {}) };
     scheduleFit();
-    setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
+    rebuildNodes(visibleSessions, positionsRef.current, pullRequests);
     persist(withPositions(layoutRef.current, positionsRef.current));
-  }, [nodesFor, persist, pullRequests, scheduleFit, trackClick, visibleSessions]);
+  }, [persist, pullRequests, rebuildNodes, scheduleFit, trackClick, visibleSessions]);
 
   const newSession = () => {
     trackClick("canvas.new-session");
