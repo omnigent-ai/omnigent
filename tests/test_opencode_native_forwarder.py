@@ -871,3 +871,63 @@ async def test_model_selected_mirrors_and_dedupes() -> None:
     await fwd.handle_event(selected)
     await fwd.handle_event(selected)
     assert _datas(server.posts, "external_model_change") == [{"model": "anthropic/claude-opus-4"}]
+
+
+# --- execution failure ------------------------------------------------------
+
+
+async def test_execution_failed_auth_posts_failed_with_reauth() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.execution.failed",
+            error={"type": "provider.auth", "message": "invalid api key", "status": 401},
+        )
+    )
+    status = _status_edges(server.posts)[-1]
+    assert status["status"] == "failed"
+    assert status["reauth_required"] is True
+    assert "invalid api key" in status["output"]
+    assert fwd_mod._OPENCODE_REAUTH_HINT in status["output"]
+
+
+async def test_execution_failed_http_403_is_auth_shaped() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.execution.failed",
+            error={"type": "provider.invalid-request", "message": "forbidden", "status": 403},
+        )
+    )
+    assert _status_edges(server.posts)[-1]["reauth_required"] is True
+
+
+async def test_execution_failed_generic_posts_failed_without_reauth() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.execution.failed",
+            error={"type": "provider.internal", "message": "upstream boom", "status": 500},
+        )
+    )
+    status = _status_edges(server.posts)[-1]
+    assert status["status"] == "failed"
+    assert status["output"] == "upstream boom"
+    assert "reauth_required" not in status
+
+
+async def test_execution_failed_aborted_takes_idle_path() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.execution.failed",
+            error={"type": "aborted", "message": "Session interrupted by user"},
+        )
+    )
+    status = _status_edges(server.posts)[-1]
+    assert status["status"] == "idle"
+    assert "output" not in status

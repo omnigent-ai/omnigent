@@ -891,6 +891,35 @@ class OpenCodeNativeForwarder:
             return
         await self._observe_model(_model_ref(event.data.get("model")), explicit=True)
 
+    async def _on_execution_failed(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.execution.failed`` — failed (or re-auth) status edge.
+
+        ``error`` is a ``Session.StructuredError`` ``{type, message, status?}``.
+        ``aborted`` is a user interrupt and takes the idle path; ``provider.auth``
+        or an HTTP 401/403 status carries the re-auth hint.
+        """
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        error = event.data.get("error")
+        _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
+        error_map: Mapping[str, Any] = error if isinstance(error, Mapping) else {}
+        error_type = error_map.get("type")
+        if error_type == _ABORTED_ERROR_TYPE:
+            await self._end_turn(turn)
+            return
+        message = error_map.get("message")
+        if not isinstance(message, str) or not message.strip():
+            message = "OpenCode session ended with an error."
+        is_auth = error_type == _AUTH_ERROR_TYPE or error_map.get("status") in _AUTH_STATUS_CODES
+        extra: _JsonObject = {"output": message.strip()}
+        if is_auth:
+            extra["output"] = f"{message.strip()}\n\n{_OPENCODE_REAUTH_HINT}"
+            extra["reauth_required"] = True
+        if self._is_root(turn):
+            await self._post_session_usage()
+        await self._end_turn(turn, status=_STATUS_FAILED, extra=extra)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -934,4 +963,5 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.tool.progress": OpenCodeNativeForwarder._on_tool_progress,
     "session.usage.updated": OpenCodeNativeForwarder._on_usage_updated,
     "session.step.failed": OpenCodeNativeForwarder._on_step_ended,
+    "session.execution.failed": OpenCodeNativeForwarder._on_execution_failed,
 }
