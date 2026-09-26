@@ -21,7 +21,10 @@ from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeNativeServer,
     client_for_state,
 )
-from omnigent.harnesses.opencode_native.bridge import read_bridge_state
+from omnigent.harnesses.opencode_native.bridge import (
+    read_bridge_state,
+    update_last_applied_model,
+)
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
 from omnigent.native.native_server_transport import (
     NativeEvent,
@@ -105,6 +108,20 @@ def _attachment_to_file(attachment: Mapping[str, object]) -> dict[str, str] | No
     return entry
 
 
+def _split_model_id(model: str) -> tuple[str, str] | None:
+    """
+    Split a qualified model id at its first slash.
+
+    :param model: e.g. ``"openrouter/acme/model-x"``.
+    :returns: ``("openrouter", "acme/model-x")``, or ``None`` when *model* has
+        no provider prefix.
+    """
+    provider, sep, model_id = model.partition("/")
+    if sep and provider and model_id:
+        return provider, model_id
+    return None
+
+
 class OpenCodeHttpTransport:
     """
     HTTP + SSE transport for opencode-native.
@@ -130,6 +147,8 @@ class OpenCodeHttpTransport:
         self._server = server
         self._client_factory = client_factory
         self._directory = directory
+        # Last model pushed via POST /model when no bridge state records it.
+        self._last_applied_model: str | None = None
 
     def _client(self) -> OpenCodeClient:
         """
@@ -190,11 +209,13 @@ class OpenCodeHttpTransport:
             await client.aclose()
 
     async def send_prompt(self, session_id: str, prompt: NativePrompt) -> _JsonMapping:
-        """Inject a prompt via ``POST /api/session/{id}/prompt``."""
+        """Switch the model if needed, then inject via ``POST /api/session/{id}/prompt``."""
         delivery = "queue" if prompt.metadata.get("delivery") == "queue" else "steer"
         payload = build_prompt_payload(prompt.text, prompt.attachments, delivery=delivery)
         client = self._client()
         try:
+            if prompt.model:
+                await self._apply_model(client, session_id, prompt.model)
             return await client.prompt(
                 session_id,
                 text=payload["text"],
@@ -203,6 +224,32 @@ class OpenCodeHttpTransport:
             )
         finally:
             await client.aclose()
+
+    async def _apply_model(self, client: OpenCodeClient, session_id: str, model: str) -> None:
+        """
+        Switch the OpenCode session to *model* when it differs from the last one applied.
+
+        The last applied model lives in bridge state so a respawned harness
+        process does not resend an unchanged switch every turn.
+
+        :param client: Open client for the session's server.
+        :param session_id: OpenCode session id.
+        :param model: Qualified ``provider/model`` id, e.g. ``"opencode/big-pickle"``.
+        :raises OpenCodeClientError: When OpenCode rejects the switch.
+        """
+        split = _split_model_id(model)
+        if split is None:
+            _logger.warning("opencode-native: ignoring unqualified model id %r", model)
+            return
+        state = read_bridge_state(self._bridge_dir) if self._bridge_dir is not None else None
+        last_applied = state.last_applied_model if state is not None else self._last_applied_model
+        if last_applied == model:
+            return
+        provider_id, model_id = split
+        await client.set_model(session_id, provider_id=provider_id, model_id=model_id)
+        self._last_applied_model = model
+        if self._bridge_dir is not None:
+            update_last_applied_model(self._bridge_dir, model)
 
     async def abort(self, session_id: str) -> bool:
         """Interrupt active work via ``POST /api/session/{id}/interrupt``."""

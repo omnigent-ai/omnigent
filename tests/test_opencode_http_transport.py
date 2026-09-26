@@ -95,6 +95,16 @@ class _FakeClient:
         self.calls.append(("reply_permission", (request_id, reply)))
         return True
 
+    async def set_model(
+        self,
+        session_id: str,
+        *,
+        provider_id: str,
+        model_id: str,
+        variant: str | None = None,
+    ) -> None:
+        self.calls.append(("set_model", (session_id, provider_id, model_id)))
+
     async def events(self) -> Any:
         self.calls.append(("events", None))
         yield SimpleNamespace(
@@ -162,6 +172,23 @@ async def test_send_prompt_drops_system_prompt() -> None:
         "ses_1", NativePrompt(text="hi", system_prompt="be brief")
     )
     assert "system" not in client.calls[-1][1][1]
+
+
+async def test_send_prompt_switches_model_once_without_bridge_state() -> None:
+    client = _FakeClient()
+    transport = _transport(client)
+    await transport.send_prompt("ses_1", NativePrompt(text="a", model="acme/model-x"))
+    await transport.send_prompt("ses_1", NativePrompt(text="b", model="acme/model-x"))
+    assert [c for c in client.calls if c[0] == "set_model"] == [
+        ("set_model", ("ses_1", "acme", "model-x"))
+    ]
+    assert [c[0] for c in client.calls] == ["set_model", "prompt", "prompt"]
+
+
+async def test_send_prompt_ignores_unqualified_model() -> None:
+    client = _FakeClient()
+    await _transport(client).send_prompt("ses_1", NativePrompt(text="a", model="just-a-name"))
+    assert [c[0] for c in client.calls] == ["prompt"]
 
 
 async def test_abort_interrupts() -> None:

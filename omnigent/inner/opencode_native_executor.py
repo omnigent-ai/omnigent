@@ -55,18 +55,14 @@ class OpenCodeNativeExecutor(NativeServerHarness):
 
     def _build_prompt_with_model_override(self, content: object) -> NativePrompt | None:
         """
-        Build a prompt, pinning the resolved model so it governs from turn one.
+        Build a prompt carrying the session's model override.
 
-        OpenCode's ``POST /session`` create body does NOT accept a model
-        (verified against the OpenCode SDK ``SessionCreateData``); the model
-        is a per-prompt field (``{"providerID", "modelID"}``). So the
-        session's ``model_override`` is applied to EVERY injected prompt
-        here. Because OpenCode persists the last-used model as the session
-        default, pinning the first injected turn also governs subsequent
-        TUI-typed turns — the override controls the run from the start, not
-        just a later web turn. A per-turn ``config.model`` (if any) still
-        wins: the base ``run_turn`` only fills the model when the prompt
-        leaves it unset, so it skips a prompt this method already pinned.
+        The transport switches the OpenCode session to ``prompt.model`` via
+        ``POST /api/session/{id}/model`` before admitting the prompt, but only
+        when it differs from ``last_applied_model`` in bridge state, so the
+        override governs the run from the first injected turn. A per-turn
+        ``config.model`` still wins: the base ``run_turn`` only fills the model
+        when the prompt leaves it unset.
 
         :param content: Executor message content (string or content blocks).
         :returns: The prompt with the resolved model applied, or ``None``

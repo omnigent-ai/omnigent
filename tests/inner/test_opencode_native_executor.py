@@ -13,6 +13,8 @@ from omnigent.harnesses.opencode_native import http_transport as transport_mod
 from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     OpenCodeNativeBridgeState,
+    read_bridge_state,
+    update_model_override,
     write_bridge_state,
 )
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
@@ -72,6 +74,7 @@ def _seed_state(
     session_id: str = "conv_1",
     opencode_session_id: str = "ses_1",
     model_override: str | None = None,
+    last_applied_model: str | None = None,
 ) -> None:
     write_bridge_state(
         bridge_dir,
@@ -81,6 +84,7 @@ def _seed_state(
             opencode_session_id=opencode_session_id,
             auth_secret="pw",
             model_override=model_override,
+            last_applied_model=last_applied_model,
         ),
     )
 
@@ -130,6 +134,95 @@ async def test_run_turn_with_blocks(
     assert body["files"] == [{"uri": _PNG_DATA_URI}]
     # No inline base64 in the text.
     assert _PNG_B64 not in body["text"]
+
+
+async def test_run_turn_switches_model_before_prompt(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The override reaches OpenCode via POST /model before the first prompt."""
+    _seed_state(tmp_path, model_override="anthropic/claude-opus-4")
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run(executor, "hello")
+    assert [type(e) for e in events] == [TurnComplete]
+    assert [path for _, path, _ in fake_server.requests] == [
+        "/api/session/ses_1/model",
+        "/api/session/ses_1/prompt",
+    ]
+    assert fake_server.requests[0][2] == {
+        "model": {"id": "claude-opus-4", "providerID": "anthropic"}
+    }
+    assert "model" not in _prompts(fake_server)[0]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.last_applied_model == "anthropic/claude-opus-4"
+
+
+async def test_run_turn_skips_model_switch_when_already_applied(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_state(
+        tmp_path,
+        model_override="anthropic/claude-opus-4",
+        last_applied_model="anthropic/claude-opus-4",
+    )
+    executor = _executor(tmp_path, monkeypatch)
+    await _run(executor, "hello")
+    assert [path for _, path, _ in fake_server.requests] == ["/api/session/ses_1/prompt"]
+
+
+async def test_run_turn_switches_again_after_override_changes(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_state(tmp_path, model_override="acme/one")
+    executor = _executor(tmp_path, monkeypatch)
+    await _run(executor, "first")
+    await _run(executor, "again")
+    assert update_model_override(tmp_path, "acme/two") is True
+    await _run(executor, "second")
+    model_bodies = [body for _, path, body in fake_server.requests if path.endswith("/model")]
+    assert model_bodies == [
+        {"model": {"id": "one", "providerID": "acme"}},
+        {"model": {"id": "two", "providerID": "acme"}},
+    ]
+
+
+async def test_run_turn_without_override_never_switches_model(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_state(tmp_path)
+    executor = _executor(tmp_path, monkeypatch)
+    await _run(executor, "hello")
+    assert [path for _, path, _ in fake_server.requests] == ["/api/session/ses_1/prompt"]
+
+
+async def test_run_turn_model_switch_failure_errors_without_prompting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _FakeServer()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model"):
+            server.requests.append(("POST", request.url.path, {}))
+            return httpx.Response(400, json={"_tag": "InvalidRequestError", "message": "bad"})
+        return server.handler(request)
+
+    def fake_client_for_state(
+        *, base_url: str, auth_secret: str | None, directory: str | None = None
+    ) -> OpenCodeClient:
+        mock = httpx.AsyncClient(
+            base_url="http://opencode.test", transport=httpx.MockTransport(handler)
+        )
+        return OpenCodeClient("http://opencode.test", client=mock)
+
+    monkeypatch.setattr(transport_mod, "client_for_state", fake_client_for_state)
+    _seed_state(tmp_path, model_override="acme/missing")
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run(executor, "hello")
+    assert [type(e) for e in events] == [ExecutorError]
+    assert _prompts(server) == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.last_applied_model is None
 
 
 async def test_run_turn_no_user_content_errors(
