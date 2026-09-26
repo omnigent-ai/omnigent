@@ -207,6 +207,18 @@ def test_kimi_is_exempt_from_pane_reaping() -> None:
     assert "claude" in NATIVE_PANE_TERMINAL_NAMES
 
 
+def test_every_native_harness_pane_is_reaper_covered() -> None:
+    # The name filter is hand-kept, so a native harness missing from it (as
+    # devin once was) leaks every finished session's pane. Only kimi may be
+    # absent — see test_kimi_is_exempt_from_pane_reaping.
+    from omnigent.harness_aliases import NATIVE_HARNESSES, native_terminal_name
+    from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
+
+    pane_names = {native_terminal_name(harness) for harness in NATIVE_HARNESSES}
+    uncovered = pane_names - NATIVE_PANE_TERMINAL_NAMES
+    assert uncovered <= {"kimi"}, f"native panes invisible to the reaper: {sorted(uncovered)}"
+
+
 async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
