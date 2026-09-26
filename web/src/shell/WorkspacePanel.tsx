@@ -598,6 +598,10 @@ interface WorkspacePanelProps {
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
   inert?: boolean;
+  /** Visual presence state; false runs the exit transition while the rail shrinks. */
+  open?: boolean;
+  /** Suppress panel motion while the resize handle is actively dragging. */
+  resizing?: boolean;
   /**
    * Props for the left-edge resize handle (onMouseDown/onKeyDown + ARIA),
    * from ``useResizableInlinePanel().handleProps``.
@@ -713,6 +717,8 @@ function WorkspacePanelImpl({
   width,
   handleProps,
   inert,
+  open = true,
+  resizing = false,
   rightRailTab,
   onRightRailTabChange,
   showFilesPanel,
@@ -1000,6 +1006,7 @@ function WorkspacePanelImpl({
   return (
     <aside
       aria-label="Workspace"
+      aria-hidden={!open}
       inert={inert}
       // The resize hook can starve the rail to width 0 while it stays mounted;
       // marking it collapsed keeps index.css's safe-area padding off it so a
@@ -1020,8 +1027,10 @@ function WorkspacePanelImpl({
       // handle is suppressed in that state — there's no neighbor to resize
       // against.
       data-maximized={maximized || undefined}
+      data-state={open ? "open" : "closed"}
+      data-resizing={resizing || undefined}
       className={cn(
-        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
+        "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
@@ -1030,7 +1039,10 @@ function WorkspacePanelImpl({
       style={
         maximized
           ? undefined
-          : ({ width, "--omnigent-reserved-width": `${width}px` } as CSSProperties)
+          : ({
+              width: open ? width : 0,
+              "--omnigent-reserved-width": `${width}px`,
+            } as CSSProperties)
       }
     >
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
@@ -1256,7 +1268,7 @@ function WorkspacePanelImpl({
             onClick={onToggleMaximized}
             disabled={pending}
             size="icon-xs"
-            className="flex size-6"
+            className="flex size-6 text-muted-foreground hover:text-foreground"
           >
             {maximized ? <MinimizeIcon className="size-4" /> : <MaximizeIcon className="size-4" />}
           </Button>
