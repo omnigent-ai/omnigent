@@ -23,6 +23,7 @@ from omnigent.harnesses.opencode_native.provider import (
     managed_connect_opencode_config,
     maybe_merge_user_provider_config,
     resolve_databricks_gateway,
+    write_opencode_instructions,
     write_opencode_provider_config,
 )
 
@@ -812,3 +813,37 @@ def test_build_opencode_config_extra_providers_and_bad_model() -> None:
     )
     assert cfg["providers"] == {"databricks-oss": {"package": "aisdk:@ai-sdk/openai"}}
     assert "model" not in cfg  # not provider/model
+
+
+def test_write_opencode_instructions_writes_global_agents_md(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-cfg"))
+    session_xdg = tmp_path / "session-xdg"
+    path = write_opencode_instructions(session_xdg, "  Be terse.\n")
+    assert path is not None
+    assert path == session_xdg / "opencode" / "AGENTS.md"
+    assert path.read_text(encoding="utf-8") == "Be terse.\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_write_opencode_instructions_keeps_user_agents_md(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    user_dir = tmp_path / "user-cfg" / "opencode"
+    user_dir.mkdir(parents=True)
+    (user_dir / "AGENTS.md").write_text("User rules.\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-cfg"))
+    path = write_opencode_instructions(tmp_path / "s", "Agent rules.")
+    assert path is not None
+    assert path.read_text(encoding="utf-8") == "User rules.\n\nAgent rules.\n"
+
+
+def test_write_opencode_instructions_removes_stale_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "nothing"))
+    session_xdg = tmp_path / "s"
+    assert write_opencode_instructions(session_xdg, "x") is not None
+    assert write_opencode_instructions(session_xdg, "   ") is None
+    assert not (session_xdg / "opencode" / "AGENTS.md").exists()

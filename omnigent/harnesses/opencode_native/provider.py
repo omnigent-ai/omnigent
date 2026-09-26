@@ -235,6 +235,51 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     return path
 
 
+_INSTRUCTIONS_FILE = "AGENTS.md"
+
+
+def _user_agents_md() -> str | None:
+    """The user's global ``~/.config/opencode/AGENTS.md`` text, if any."""
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    try:
+        text = (base / "opencode" / _INSTRUCTIONS_FILE).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text.strip() or None
+
+
+def write_opencode_instructions(xdg_config_home: Path, instructions: str | None) -> Path | None:
+    """
+    Write the per-session global ``AGENTS.md`` opencode loads as ambient instructions.
+
+    opencode 2.0 parses the config ``instructions`` key but does not apply it; the
+    global ``AGENTS.md`` under its config dir is always read. The user's own
+    global ``AGENTS.md`` comes first so the per-session config dir does not hide it.
+
+    :param xdg_config_home: The per-session ``XDG_CONFIG_HOME``.
+    :param instructions: Raw author instructions, or ``None``.
+    :returns: The written path, or ``None`` (and any stale file removed) when empty.
+    """
+    cfg_dir = xdg_config_home / "opencode"
+    path = cfg_dir / _INSTRUCTIONS_FILE
+    parts = [part for part in (_user_agents_md(), (instructions or "").strip()) if part]
+    if not parts:
+        path.unlink(missing_ok=True)
+        return None
+    cfg_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_INSTRUCTIONS_FILE}.", dir=str(cfg_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n\n".join(parts) + "\n")
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return path
+
+
 def _mcp_timeout(seconds: object) -> dict[str, int] | None:
     """Convert an ``MCPServerConfig.timeout`` in seconds to v2 ``{catalog, execution}`` ms."""
     if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
