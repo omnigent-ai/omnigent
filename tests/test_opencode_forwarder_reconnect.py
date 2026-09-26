@@ -14,6 +14,7 @@ import httpx
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
 from omnigent.harnesses.opencode_native.client import OpenCodeEvent
+from tests.opencode_v2_fixtures import load_messages
 
 _SESSION = "ses_reconnect"
 
@@ -166,3 +167,141 @@ async def test_run_seeds_on_initial_connect() -> None:
     await _run(fwd, max_reconnects=0)
     assert fwd.state.mark(fwd._key("text-final", "msg_old", "0")) is False
     assert opencode.after_ids == [None]
+
+
+async def test_run_catches_up_on_reconnect_posts_gap_content() -> None:
+    """msg_1 arrives live; msg_2 lands during the drop and is replayed exactly once."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    msg_1 = _assistant("msg_1", _text("hello"))
+    msg_2 = _assistant("msg_2", _text("from gap"))
+    opencode.message_snapshots = [[], [msg_1, msg_2]]
+    opencode._event_batches = [
+        _live_text_turn("msg_1", "hello"),
+        _live_text_turn("msg_2", "from gap"),
+    ]
+    await _run(fwd, max_reconnects=1)
+    assert _assistant_texts(server) == ["hello", "from gap"]
+
+
+async def test_catch_up_passes_cursor_as_after_id() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.messages = [
+        {"id": "msg_u", "type": "user", "text": "hi", "time": {"created": 1}},
+        _assistant("msg_1", _text("answer")),
+    ]
+    fwd = _forwarder(server, opencode)
+    await _run(fwd, max_reconnects=1)
+    assert opencode.after_ids == [None, "msg_1"]
+
+
+async def test_catch_up_called_on_reconnect_not_initial_connect() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    seed_calls: list[int] = []
+    catch_up_calls: list[int] = []
+
+    async def _counting_seed() -> None:
+        seed_calls.append(1)
+
+    async def _counting_catch_up() -> None:
+        catch_up_calls.append(1)
+
+    fwd.seed_dedupe_from_history = _counting_seed  # type: ignore[method-assign]
+    fwd.catch_up_from_history = _counting_catch_up  # type: ignore[method-assign]
+
+    async def _failing_consume() -> None:
+        raise httpx.ReadError("dropped", request=httpx.Request("GET", "http://x/api/event"))
+
+    fwd._consume_once = _failing_consume  # type: ignore[method-assign]
+    await _run(fwd, max_reconnects=2)
+    assert len(seed_calls) == 1
+    assert len(catch_up_calls) == 2
+
+
+async def test_reconnect_catches_up_user_text_and_tool_items() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    opencode.message_snapshots = [
+        [],
+        [
+            {"id": "msg_u", "type": "user", "text": "run the command", "time": {"created": 1}},
+            _assistant(
+                "msg_a",
+                {
+                    "type": "tool",
+                    "id": "call_1",
+                    "name": "shell",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "pwd"},
+                        "content": [{"type": "text", "text": "/workspace"}],
+                    },
+                    "time": {"created": 1, "completed": 2},
+                },
+                _text("done"),
+            ),
+        ],
+    ]
+    opencode._event_batches = [[], []]
+    await _run(fwd, max_reconnects=1)
+    items = [b["data"] for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    assert [i["item_type"] for i in items] == [
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert items[0]["item_data"]["role"] == "user"
+    assert items[0]["item_data"]["content"][0]["text"] == "run the command"
+    assert items[1]["item_data"]["name"] == "shell"
+    assert items[2]["item_data"]["output"] == "/workspace"
+    assert items[3]["item_data"]["content"][0]["text"] == "done"
+    assert items[3]["message_id"] == "opencode:msg_a:text:0"
+
+
+async def test_catch_up_keeps_cursor_before_incomplete_message() -> None:
+    """An in-flight assistant message is re-read on the next catch-up."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    opencode.message_snapshots = [
+        [],
+        [
+            _assistant("msg_done", _text("first")),
+            _assistant("msg_live", _text("partial"), completed=False),
+        ],
+    ]
+    opencode._event_batches = [[], []]
+    await _run(fwd, max_reconnects=1)
+    assert fwd._last_seen_message_id == "msg_done"
+
+
+async def test_reconnect_does_not_repost_already_seeded_content() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.messages = [_assistant("msg_pre", _text("before disconnect"))]
+    fwd = _forwarder(server, opencode)
+    opencode._event_batches = [
+        _live_text_turn("msg_pre", "before disconnect"),
+        _live_text_turn("msg_pre", "before disconnect"),
+    ]
+    await _run(fwd, max_reconnects=1)
+    assert _assistant_texts(server) == []
+
+
+async def test_fixture_messages_replay_on_catch_up() -> None:
+    """The captured ``GET /api/session/{id}/message`` body replays every text once."""
+    body = load_messages()
+    messages = body["data"]
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.message_snapshots = [[], messages]
+    opencode._event_batches = [[], []]
+    fwd = _forwarder(server, opencode)
+    await _run(fwd, max_reconnects=1)
+    expected = [
+        item["text"]
+        for message in messages
+        if message.get("type") == "assistant"
+        for item in message.get("content", [])
+        if item.get("type") == "text" and item.get("text")
+    ]
+    assert _assistant_texts(server) == expected

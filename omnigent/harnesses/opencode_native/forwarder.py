@@ -538,8 +538,8 @@ class OpenCodeNativeForwarder:
         """
         Run the SSE consume loop with reconnect/backoff and gap-fill.
 
-        The first connection pre-marks persisted history so a restart never
-        re-posts it.
+        The first connection pre-marks persisted history; every reconnect
+        replays history persisted after the last settled message.
 
         :param max_reconnects: Reconnect cap (``None`` = unbounded); used by
             tests to bound the loop.
@@ -550,6 +550,8 @@ class OpenCodeNativeForwarder:
             while True:
                 if attempt == 0:
                     await self.seed_dedupe_from_history()
+                else:
+                    await self.catch_up_from_history()
                 try:
                     await self._consume_once()
                 except asyncio.CancelledError:
@@ -1710,6 +1712,97 @@ class OpenCodeNativeForwarder:
                 self.state.mark(self._key("tool-call", call_id))
                 if status in ("completed", "error"):
                     self.state.mark(self._key("tool-out", call_id))
+
+    async def catch_up_from_history(self) -> None:
+        """
+        Replay history persisted after the last settled message.
+
+        The live stream never replays missed events, so after a reconnect the
+        forwarder re-reads ``GET /api/session/{id}/message`` past the cursor
+        and feeds unseen content through the normal post paths; dedupe keys
+        suppress anything already posted.
+        """
+        try:
+            messages = await self._opencode.list_messages(
+                self._opencode_session_id, after_id=self._last_seen_message_id
+            )
+        except Exception:  # noqa: BLE001 - catch-up is best effort.
+            _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
+            return
+        turn = self._turns[self._opencode_session_id]
+        settled_prefix = True
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            await self._replay_history_message(turn, message)
+            message_id = _str_field(message, "id")
+            if settled_prefix and message_id is not None and _history_message_settled(message):
+                self._last_seen_message_id = message_id
+            else:
+                settled_prefix = False
+        try:
+            await self._post_session_usage()
+        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+            _logger.debug(
+                "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
+            )
+
+    async def _replay_history_message(
+        self, turn: _SessionTurn, message: Mapping[str, Any]
+    ) -> None:
+        """Post one history message's unseen user text, assistant text, and tools."""
+        message_id = _str_field(message, "id")
+        if message_id is None:
+            return
+        kind = message.get("type")
+        if kind == "user":
+            await self._post_user_payload(turn, message_id, message)
+            return
+        if kind != "assistant":
+            return
+        self._record_step_usage(message_id, message, _model_ref(message.get("model")))
+        content = message.get("content")
+        text_ordinal = 0
+        for item in content if isinstance(content, list) else []:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("type") == "text":
+                text = item.get("text")
+                key = self._key("text-final", message_id, str(text_ordinal))
+                if isinstance(text, str) and text and self.state.mark(key):
+                    await self._post_assistant_text(
+                        turn,
+                        text,
+                        message_id=message_id,
+                        stream_id=self._stream_id(message_id, "text", text_ordinal),
+                    )
+                text_ordinal += 1
+            elif item.get("type") == "tool":
+                await self._replay_tool(turn, message_id, item)
+
+    async def _replay_tool(
+        self, turn: _SessionTurn, message_id: str, item: Mapping[str, Any]
+    ) -> None:
+        """Post a history tool's call and (when settled) its output."""
+        call_id = _str_field(item, "id")
+        state = item.get("state")
+        if call_id is None or not isinstance(state, Mapping):
+            return
+        status = state.get("status")
+        if status == "streaming":
+            return
+        name = _str_field(item, "name") or "tool"
+        turn.tool_names[call_id] = name
+        raw_input = state.get("input")
+        arguments = dict(raw_input) if isinstance(raw_input, Mapping) else {}
+        if self.state.mark(self._key("tool-call", call_id)):
+            await self._post_tool_call(turn, call_id, name, arguments, message_id=message_id)
+        if status == "completed" and self.state.mark(self._key("tool-out", call_id)):
+            output = opencode_tool_content_text(state.get("content"))
+            await self._post_tool_output(turn, call_id, output, message_id=message_id)
+        elif status == "error" and self.state.mark(self._key("tool-out", call_id)):
+            output = opencode_tool_content_text(state.get("content"), error=state.get("error"))
+            await self._post_tool_output(turn, call_id, output, message_id=message_id)
 
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
