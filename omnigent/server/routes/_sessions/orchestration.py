@@ -11042,6 +11042,7 @@ async def _create_session_from_existing_agent(
                         subagent_routing_override=subagent_routing_override,
                         harness_override=harness_override,
                     )
+                    assert conv is not None
                 if git_branch is not None:
                     assert body.host_id is not None
                     conv = await asyncio.to_thread(

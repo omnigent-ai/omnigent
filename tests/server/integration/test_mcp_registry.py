@@ -320,3 +320,33 @@ async def test_gateway_reports_upstream_permission_failure(
     assert "not retried" in called.json()["error"]["message"]
     execute.assert_awaited_once()
     assert f"session={session_id} failure=http http_status=403" in caplog.text
+
+
+async def test_launch_selection_preserves_initial_metadata(client, launch_registry):
+    source = await create_test_session(client, name="registry-metadata")
+    metadata = {
+        "agent_id": source["agent_id"],
+        "mcp_registry_services": ["tracker"],
+        "labels": {"review_context": "prototype"},
+        "reasoning_effort": "low",
+        "model_override": "gpt-4o-mini",
+        "cost_control_mode_override": "off",
+        "subagent_routing_override": "off",
+        "harness_override": "openai-agents",
+    }
+    response = await client.post("/v1/sessions", json=metadata)
+    assert response.status_code == 201, response.text
+    session = response.json()
+    from omnigent.runtime import get_conversation_store
+
+    stored = get_conversation_store().get_conversation(session["id"])
+    assert stored is not None
+    assert stored.labels["review_context"] == "prototype"
+    for field in (
+        "reasoning_effort",
+        "model_override",
+        "cost_control_mode_override",
+        "subagent_routing_override",
+        "harness_override",
+    ):
+        assert getattr(stored, field) == metadata[field]
