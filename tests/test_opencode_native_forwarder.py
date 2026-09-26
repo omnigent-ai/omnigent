@@ -970,3 +970,62 @@ async def test_interrupt_persists_partial_streamed_text() -> None:
     item = _items(server.posts)[-1]
     assert item["item_data"]["content"][0]["text"] == "Half an"
     assert item["message_id"] == "opencode:msg_1:text:0"
+
+
+# --- retry ------------------------------------------------------------------
+
+
+async def test_retry_scheduled_posts_running_with_blocked_on() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event(
+            "session.retry.scheduled",
+            assistantMessageID="msg_1",
+            attempt=2,
+            at=1700000000000,
+            error={"type": "provider.rate-limit", "message": "429 slow down"},
+        )
+    )
+    edge = _status_edges(server.posts)[-1]
+    assert edge == {
+        "status": "running",
+        "response_id": "msg_1",
+        "blocked_on": "Retrying (attempt 2): 429 slow down",
+    }
+
+
+async def test_status_retry_dedupes_with_retry_scheduled() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event(
+            "session.retry.scheduled",
+            assistantMessageID="msg_1",
+            attempt=1,
+            at=1,
+            error={"type": "provider.rate-limit", "message": "busy"},
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "session.status", status={"type": "retry", "attempt": 1, "message": "busy", "next": 1}
+        )
+    )
+    blocked = [e for e in _status_edges(server.posts) if "blocked_on" in e]
+    assert len(blocked) == 1
+
+
+async def test_next_step_after_retry_clears_blocked_on() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event(
+            "session.status", status={"type": "retry", "attempt": 1, "message": "busy", "next": 1}
+        )
+    )
+    await fwd.handle_event(_step_started("msg_2"))
+    assert _status_edges(server.posts)[-1] == {"status": "running", "response_id": "msg_1"}

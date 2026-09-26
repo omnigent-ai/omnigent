@@ -472,7 +472,7 @@ class OpenCodeNativeForwarder:
             await self._finish_turn(turn)
 
     async def _on_session_status(self, event: OpenCodeEvent) -> None:
-        """Handle ``session.status {busy|idle}``."""
+        """Handle ``session.status {busy|idle|retry}``."""
         turn = await self._active_turn(event)
         if turn is None:
             return
@@ -484,6 +484,13 @@ class OpenCodeNativeForwarder:
             await self._begin_turn_if_needed(turn)
         elif status_type == "idle":
             await self._finish_turn(turn)
+        elif status_type == "retry":
+            message = status.get("message")
+            await self._post_retry_status(
+                turn,
+                _int_field(status, "attempt"),
+                message if isinstance(message, str) else None,
+            )
 
     async def _on_step_started(self, event: OpenCodeEvent) -> None:
         """Handle ``session.step.started`` — record the assistant id and model."""
@@ -500,6 +507,11 @@ class OpenCodeNativeForwarder:
                 update_active_message_id(self._bridge_dir, message_id, status="busy")
             await self._observe_model(turn.step_model, explicit=False)
         await self._begin_turn_if_needed(turn)
+        if turn.retry_label is not None:
+            turn.retry_label = None
+            await self._post_status(
+                turn, _STATUS_RUNNING, extra={"response_id": self._response_id(turn, message_id)}
+            )
 
     @staticmethod
     def _stream_id(message_id: str, kind: str, ordinal: int) -> str:
@@ -954,6 +966,40 @@ class OpenCodeNativeForwarder:
             )
         await self._end_turn(turn)
 
+    async def _post_retry_status(
+        self, turn: _SessionTurn, attempt: int | None, message: str | None
+    ) -> None:
+        """Show a provider retry on the running edge (``blocked_on``), deduped."""
+        label = f"Retrying (attempt {attempt})" if attempt else "Retrying"
+        if message:
+            label = f"{label}: {message}"
+        label = label[:_MAX_BLOCKED_ON_CHARS]
+        if label == turn.retry_label:
+            return
+        turn.retry_label = label
+        await self._begin_turn_if_needed(turn)
+        await self._post_status(
+            turn,
+            _STATUS_RUNNING,
+            extra={
+                "response_id": self._response_id(turn, turn.assistant_message_id),
+                "blocked_on": label,
+            },
+        )
+
+    async def _on_retry_scheduled(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.retry.scheduled {attempt, at, error}``."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        error = event.data.get("error")
+        message = error.get("message") if isinstance(error, Mapping) else None
+        await self._post_retry_status(
+            turn,
+            _int_field(event.data, "attempt"),
+            message if isinstance(message, str) else None,
+        )
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -999,4 +1045,5 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.step.failed": OpenCodeNativeForwarder._on_step_ended,
     "session.execution.failed": OpenCodeNativeForwarder._on_execution_failed,
     "session.execution.interrupted": OpenCodeNativeForwarder._on_execution_interrupted,
+    "session.retry.scheduled": OpenCodeNativeForwarder._on_retry_scheduled,
 }
