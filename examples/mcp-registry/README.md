@@ -355,7 +355,9 @@ For policy checks, attach a request policy that denies `tracker__read_ticket` an
 confirm no upstream call runs. Change it to ASK, approve in the existing approval
 UI, and inspect the returned tool result. A result policy can replace or suppress
 that output. Result-review ASK withholds it; interactive result review is not
-implemented. A separate ambient MCP configuration is outside this gateway path.
+implemented. The [result-review design](../../designs/MCP_REGISTRY_GATEWAY.md#adding-interactive-result-review)
+explains the retained-result continuation needed to add it. A separate ambient MCP
+configuration is outside this gateway path.
 
 ## Prototype boundaries and tests
 
