@@ -146,6 +146,18 @@ the leftover raw dir, so the same footage isn't collected twice. If that dir has
 errored before opening a page, or the fixture never came online) — capture the
 reason per the empty-recordings rule; never report a clip you didn't produce.
 
+**Stop on a visible assertion of the end state, then hold it.** The driver's
+final wait decides where the clip ends, so it must assert the on-screen state
+the clip is supposed to show: locate the exact element whose rendered text or
+state changes, require it to be visible, and match its rendered text
+(`to_have_text` on the visible label, or `to_be_visible()` on the changed
+control). A DOM text-content probe such as `to_contain_text` on a container is
+satisfied by hidden or pending-state markup before the label paints, so the
+recording stops before the on-screen change and the clip never shows it. After
+the visible assertion passes, hold the settled state for at least 3 seconds
+before closing the page/context so the outcome is legible in the footage; a
+fixed sleep is that hold, never the stop condition itself.
+
 ## `mobile` facets
 
 The iOS/Android apps are thin native shells that load the *same* server-served SPA
@@ -268,3 +280,8 @@ For each recording, write a short **`caption`** in its handoff entry describing
 what the clip shows: e.g. `"start a session → open the model picker → select the
 catalog → picker shows raw IDs"`. This is what a reader sees under the video on
 the ticket, so make it read like a journey, not a restatement of the bug title.
+
+A caption must not claim a visible end state the driver never visibly asserted.
+If the final wait was a DOM text-content probe rather than an assertion on the
+rendered, on-screen element, caption only what the footage demonstrably shows,
+or re-record the journey with a visible stop assertion.

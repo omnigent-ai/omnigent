@@ -127,6 +127,13 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
   assertions, debug logs, or test source.
+- End the after clip on the corrected state visibly on screen: the driver's
+  final wait must assert the rendered element itself (`to_have_text` on the
+  visible label, `to_be_visible` on the changed control), never a DOM
+  text-content probe like `to_contain_text` that hidden or pending-state markup
+  satisfies before the label paints. Hold the settled state for at least
+  3 seconds before stopping, and caption only an end state the driver visibly
+  asserted.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.
