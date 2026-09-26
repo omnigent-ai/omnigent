@@ -170,6 +170,35 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "AgentPinRequest": {
+        "description": "Body for `PUT /hosts/{host_id}/agents/{name}/pin`.\n\nAt least one field must be set; `None` leaves that selection\nunchanged.",
+        "properties": {
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          }
+        },
+        "title": "AgentPinRequest",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Proposed title for a framework or agent-initiated rename.",
@@ -3865,6 +3894,21 @@
           "ordered_project_ids"
         ],
         "title": "ProjectOrderResponse",
+        "type": "object"
+      },
+      "ProviderUpsertRequest": {
+        "description": "Body for `PUT /hosts/{host_id}/providers/{name}` \u2014 the full entry.",
+        "properties": {
+          "entry": {
+            "additionalProperties": true,
+            "title": "Entry",
+            "type": "object"
+          }
+        },
+        "required": [
+          "entry"
+        ],
+        "title": "ProviderUpsertRequest",
         "type": "object"
       },
       "QueuedEvent": {
@@ -9402,6 +9446,167 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/agent-specs": {
+      "get": {
+        "description": "List the host-local agent specs with their current pins.\n\nThese are the specs under the host's `~/.omnigent/agents/` \u2014\nthe ones `omnigent run <agent>` resolves there \u2014 as opposed to\nthe server-side registered-agent store the sessions API serves.",
+        "operationId": "list_host_agent_specs_v1_hosts__host_id__agent_specs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Host Agent Specs V1 Hosts  Host Id  Agent Specs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Host Agent Specs",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/agent-specs/{agent_name}/pin": {
+      "delete": {
+        "description": "Remove an agent spec's provider and model pins.",
+        "operationId": "clear_host_agent_pin_v1_hosts__host_id__agent_specs__agent_name__pin_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agent_name",
+            "required": true,
+            "schema": {
+              "title": "Agent Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clear Host Agent Pin V1 Hosts  Host Id  Agent Specs  Agent Name  Pin Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear Host Agent Pin",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "put": {
+        "description": "Pin an agent spec's provider and/or model on the host.\n\nWrites `executor.auth: {type: provider, name: ...}` and/or\n`executor.model` \u2014 the runtime's strongest per-agent selector;\nresolution then prefers the pin over every ambient default.",
+        "operationId": "pin_host_agent_v1_hosts__host_id__agent_specs__agent_name__pin_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agent_name",
+            "required": true,
+            "schema": {
+              "title": "Agent Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentPinRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Pin Host Agent V1 Hosts  Host Id  Agent Specs  Agent Name  Pin Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pin Host Agent",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/credentials/detected": {
       "get": {
         "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline, 502/504 on host failure/timeout.",
@@ -9939,6 +10144,221 @@
           }
         },
         "summary": "Get Host Model Options",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/providers": {
+      "get": {
+        "description": "List a host's providers (secrets redacted to source descriptors).",
+        "operationId": "list_host_providers_v1_hosts__host_id__providers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Host Providers V1 Hosts  Host Id  Providers Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Host Providers",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/providers/{name}": {
+      "delete": {
+        "description": "Delete one provider entry from the host's config.",
+        "operationId": "delete_host_provider_v1_hosts__host_id__providers__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Host Provider V1 Hosts  Host Id  Providers  Name  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Host Provider",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "put": {
+        "description": "Create or replace one provider entry on the host.\n\nThe entry is validated by the host with the same parser every\nturn runs, so a shape the runtime would reject never lands in\n`config.yaml`.",
+        "operationId": "upsert_host_provider_v1_hosts__host_id__providers__name__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderUpsertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Upsert Host Provider V1 Hosts  Host Id  Providers  Name  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upsert Host Provider",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/providers/{name}/test": {
+      "post": {
+        "description": "Probe a provider's endpoint from the host with its own credential.\n\nThe credential is resolved host-side and sent only to the\nprovider's own `base_url`; the response carries status,\nlatency, and a bounded model-id sample \u2014 never the secret.",
+        "operationId": "test_host_provider_v1_hosts__host_id__providers__name__test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Test Host Provider V1 Hosts  Host Id  Providers  Name  Test Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Host Provider",
         "tags": [
           "hosts"
         ]

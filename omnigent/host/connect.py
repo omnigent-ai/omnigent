@@ -46,7 +46,7 @@ from omnigent.debug_logging import (
     debug_event,
     runner_log_scope,
 )
-from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -84,6 +84,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostProviderOpFrame,
+    HostProviderOpResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -109,6 +111,7 @@ from omnigent.host.git_worktree import (
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
+from omnigent.host.provider_ops import run_provider_op
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
@@ -863,7 +866,6 @@ def _build_runner_env(
     # ``api_key_ref: env:MY_TOKEN``) would need to manually add it to
     # OMNIGENT_RUNNER_ENV_PASSTHROUGH — their credential resolves fine in
     # the CLI/daemon but silently drops before reaching the runner subprocess.
-    from omnigent.errors import OmnigentError as _OmnigentError
     from omnigent.onboarding.provider_config import (
         load_config,
         provider_credential_env_vars,
@@ -871,7 +873,7 @@ def _build_runner_env(
 
     try:
         config_env_vars = provider_credential_env_vars(load_config())
-    except (OSError, _OmnigentError):
+    except (OSError, OmnigentError):
         config_env_vars = frozenset()
     if inference_config is not None:
         config_env_vars |= provider_credential_env_vars(
@@ -3441,6 +3443,43 @@ class HostProcess:
             return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
+    def _handle_provider_op(self, frame: HostProviderOpFrame) -> HostProviderOpResultFrame:
+        """Run one provider / agent-pin operation on THIS machine.
+
+        The config-control-plane workhorse behind the server's
+        ``/v1/hosts/{id}/providers*`` and ``/v1/hosts/{id}/agents/{name}/pin``
+        routes: validates and mutates this host's ``~/.omnigent/config.yaml``
+        and ``~/.omnigent/agents/`` specs through the shared, non-interactive
+        core in :mod:`omnigent.host.provider_ops` — the same parser the CLI
+        and runtime use, so a file this writes is one every turn accepts.
+        Secrets never appear in the result payload; errors map to the frame's
+        ``error_status``/``error_code`` fields for the panel to render.
+        File I/O runs off the event loop (caller wraps in ``to_thread``).
+
+        :param frame: The op request — ``frame.op`` selects the operation,
+            ``frame.params`` carries its arguments.
+        :returns: Result with ``status`` ``"ok"`` plus the op payload, or
+            ``"failed"`` with a non-secret error description.
+        """
+        try:
+            payload = run_provider_op(frame.op, frame.params)
+        except OmnigentError as exc:
+            return HostProviderOpResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=str(exc),
+                error_code=getattr(exc, "code", None),
+                error_status=exc.http_status if hasattr(exc, "http_status") else None,
+            )
+        except (OSError, ValueError) as exc:
+            return HostProviderOpResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+                error_status=500,
+            )
+        return HostProviderOpResultFrame(request_id=frame.request_id, status="ok", payload=payload)
+
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
         """Serve a workspace-mutating op from the host (runner-offline fallback).
 
@@ -4688,6 +4727,11 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await ws.send(encode_host_frame(options_result))
+        elif isinstance(frame, HostProviderOpFrame):
+            # Config writes touch config.yaml / agent specs on disk, so run
+            # the op off the event loop and reply when it completes.
+            provider_result = await asyncio.to_thread(self._handle_provider_op, frame)
+            await ws.send(encode_host_frame(provider_result))
         elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.
