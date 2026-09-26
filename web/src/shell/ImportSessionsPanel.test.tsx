@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
@@ -170,6 +170,47 @@ describe("ImportSessionsPanel", () => {
         25,
         expect.any(Function),
         "session-exact",
+      ),
+    );
+  });
+
+  it("offers Hermes as an import source and submits it as the harness", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "Gateway session" });
+      return {
+        imported: 1,
+        alreadyImported: 0,
+        failed: 0,
+        sessions: [{ id: "c1", title: "Gateway session" }],
+        failures: [],
+      };
+    });
+
+    renderPanel();
+    // The harness list offers a Hermes row (the native select mock renders
+    // every SOURCES entry as an <option>).
+    const harnessSelect = screen.getAllByRole("combobox")[2];
+    expect(within(harnessSelect).getByRole("option", { name: "Hermes" })).toBeInTheDocument();
+
+    fireEvent.change(harnessSelect, { target: { value: "hermes" } });
+    fireEvent.change(screen.getAllByRole("combobox")[1], {
+      target: { value: "session" },
+    });
+    fireEvent.change(screen.getByTestId("import-session-id"), {
+      target: { value: "discord-42" },
+    });
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    await waitFor(() =>
+      expect(importLocalSessionsMock).toHaveBeenCalledWith(
+        "host_1",
+        "hermes",
+        25,
+        expect.any(Function),
+        "discord-42",
       ),
     );
   });

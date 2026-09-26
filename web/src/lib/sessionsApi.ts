@@ -527,7 +527,8 @@ export async function createSession(
 }
 
 /** Local coding harnesses whose transcripts can be imported. */
-export type ImportSource = "claude" | "codex" | "kimi" | "kiro" | "opencode" | "pi" | "qwen";
+export type ImportSource =
+  "claude" | "codex" | "hermes" | "kimi" | "kiro" | "opencode" | "pi" | "qwen";
 
 /** A specific harness, or "all" to import from every supported harness at once. */
 export type ImportSourceSelector = ImportSource | "all";
