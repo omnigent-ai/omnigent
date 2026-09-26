@@ -1382,6 +1382,8 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param connect_generation: Per-connect token for guarded pre-registry
+        cleanup; ``NULL`` on legacy rows. Registered disconnects are unguarded.
     """
 
     __tablename__ = "hosts"
@@ -1414,6 +1416,8 @@ class SqlHost(OmnigentBase):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Epoch-µs connect token; BigInteger because epoch-µs exceeds int32.
+    connect_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         CheckConstraint(

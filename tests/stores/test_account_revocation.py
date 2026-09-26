@@ -394,8 +394,10 @@ def test_host_identity_changes_preserve_account_generation(db_uri: str) -> None:
     with account_authority_scope("alice", account.account_generation):
         claimed = hosts.upsert_on_connect(original_id, "laptop", "alice", allow_host_id_reown=True)
         assert claimed.account_generation == account.account_generation
+        assert isinstance(claimed.connect_generation, int)
         rotated = hosts.upsert_on_connect(rotated_id, "laptop", "alice")
     assert rotated.account_generation == account.account_generation
+    assert isinstance(rotated.connect_generation, int)
     assert hosts.get_host(rotated_id).account_generation == account.account_generation
 
 
