@@ -335,6 +335,34 @@ async def test_catch_up_posts_call_for_running_tool_and_live_success_completes_i
     assert items[1]["item_data"]["output"] == "/workspace"
 
 
+async def test_handler_exception_does_not_reconnect_and_continues_batch() -> None:
+    """A raising handler is isolated: no reconnect, later events in the batch still post."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    original = fwd_mod._HANDLERS["session.text.ended"]
+
+    async def _boom(self: fwd_mod.OpenCodeNativeForwarder, event: OpenCodeEvent) -> None:
+        raise RuntimeError("handler exploded")
+
+    fwd_mod._HANDLERS["session.text.ended"] = _boom
+    try:
+        opencode._event_batches = [_live_text_turn("msg_1", "hello")]
+        await _run(fwd, max_reconnects=0)
+    finally:
+        fwd_mod._HANDLERS["session.text.ended"] = original
+
+    # The raising handler drops the text, but later events in the same batch
+    # (step.ended, execution.succeeded) still land and no reconnect happens.
+    assert _assistant_texts(server) == []
+    statuses = [
+        body["data"]["status"]
+        for _u, body in server.posts
+        if body["type"] == "external_session_status"
+    ]
+    assert "idle" in statuses
+    assert opencode.after_ids == [None]
+
+
 async def test_catch_up_skips_streaming_tool() -> None:
     """A tool still ``streaming`` at catch-up posts nothing; the live call lands once."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()

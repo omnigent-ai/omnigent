@@ -583,7 +583,17 @@ class OpenCodeNativeForwarder:
     async def _consume_once(self) -> None:
         """Consume the event stream once, dispatching each event."""
         async for event in self._opencode.stream_events():
-            await self.handle_event(event)
+            try:
+                await self.handle_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a bad event must not tear down the stream.
+                _logger.error(
+                    "OpenCode forwarder handler failed for event type=%s session=%s",
+                    event.type,
+                    self._session_id,
+                    exc_info=True,
+                )
 
     async def handle_event(self, event: OpenCodeEvent) -> None:
         """

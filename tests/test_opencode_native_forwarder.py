@@ -1941,3 +1941,56 @@ async def test_full_fixture_turn_replays_consistently() -> None:
         if i["item_type"] == "message" and i["item_data"]["role"] == "assistant"
     }
     assert stream_ids <= retired, "every live preview is retired by a final item"
+
+
+# --- handler table ----------------------------------------------------------
+
+
+def test_handler_table_covers_v2_events_and_drops_v1_names() -> None:
+    """Every spec'd v2 event has a handler and no v1 event name survives."""
+    required = {
+        "session.status",
+        "session.execution.started",
+        "session.execution.succeeded",
+        "session.execution.failed",
+        "session.execution.interrupted",
+        "session.step.started",
+        "session.step.ended",
+        "session.text.delta",
+        "session.text.ended",
+        "session.reasoning.delta",
+        "session.reasoning.ended",
+        "session.tool.called",
+        "session.tool.progress",
+        "session.tool.success",
+        "session.tool.failed",
+        "session.usage.updated",
+        "session.retry.scheduled",
+        "session.compaction.started",
+        "session.compaction.ended",
+        "session.compaction.failed",
+        "session.model.selected",
+        "session.created",
+        "permission.asked",
+        "permission.replied",
+        "form.created",
+        "form.replied",
+        "form.cancelled",
+    }
+    v1_names = {
+        "message.updated",
+        "message.part.updated",
+        "message.part.delta",
+        "session.idle",
+        "session.error",
+        "session.compacted",
+        "session.next.compaction.started",
+        "session.next.compaction.ended",
+        "session.next.model.switched",
+        "permission.v2.asked",
+        "question.asked",
+        "question.replied",
+        "question.rejected",
+    }
+    assert required <= set(fwd_mod._HANDLERS)
+    assert not v1_names & set(fwd_mod._HANDLERS)
