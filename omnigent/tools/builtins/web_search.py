@@ -335,6 +335,26 @@ def _run_keenable(query: str, config: dict[str, str]) -> str:
     return _search_keenable(query, config)
 
 
+def _run_serply(query: str, config: dict[str, str]) -> str:
+    """
+    Run a Serply web search query using spec config credentials.
+
+    :param query: The search query.
+    :param config: Must contain ``api_key``; may contain ``search_type``
+        (``web`` default, ``news``, or ``scholar``) and ``max_results``.
+    :returns: Formatted results or an error message.
+    """
+    from omnigent.tools.builtins.web_search_serply import (
+        _search_serply,
+    )
+
+    api_key = config.get("api_key")
+    if not api_key:
+        return "Serply web search requires api_key in the web_search config."
+
+    return _search_serply(query, config)
+
+
 # Single source of truth for the selectable backends. To add an engine, write
 # its ``_run_*`` above and add one row here — the dispatch in ``_search`` and
 # the error hint below both derive from this map, so nothing else needs editing.
@@ -346,6 +366,7 @@ _BACKENDS: dict[str, _Backend] = {
     "perplexity": _Backend(_run_perplexity, keyless=False),
     "nimble": _Backend(_run_nimble, keyless=False),
     "tavily": _Backend(_run_tavily, keyless=False),
+    "serply": _Backend(_run_serply, keyless=False),
 }
 
 
