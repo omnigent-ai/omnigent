@@ -122,6 +122,7 @@ from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
+    _agent_forks_opencode_native_session,
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
@@ -3284,6 +3285,9 @@ def register_core_routes(
         # _agent_carries_cursor_fork_history). The single FORK_CARRY_HISTORY
         # label drives both; the runner branches on harness.
         target_is_cursor = await asyncio.to_thread(_agent_carries_cursor_fork_history, base_agent)
+        target_forks_opencode = await asyncio.to_thread(
+            _agent_forks_opencode_native_session, base_agent
+        )
         carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history, base_agent
         )
@@ -3293,13 +3297,14 @@ def register_core_routes(
         # runner takes the rebuild path instead of a doomed clone attempt
         # (a failed clone launches fresh, losing history). cursor never clones a
         # native session (server-backed; it carries history via the preamble),
-        # so it always skips the source directive too. A managed fork gets its
-        # OWN fresh sandbox, whose filesystem has no copy of the source's local
-        # native rollout, so the clone is likewise doomed — skip the directive
-        # so the runner rebuilds from the copied Omnigent items instead.
+        # so it skips the source directive; opencode keeps it to fork the
+        # source session natively. A managed fork gets its OWN fresh sandbox,
+        # whose filesystem has no copy of the source's local native rollout,
+        # so the clone is likewise doomed — skip the directive so the runner
+        # rebuilds from the copied Omnigent items instead.
         resume_source_native_session = (
             (not switching_agent or copy_model_settings)
-            and not target_is_cursor
+            and (not target_is_cursor or target_forks_opencode)
             and body.host_type != "managed"
         )
 

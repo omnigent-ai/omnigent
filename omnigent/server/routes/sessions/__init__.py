@@ -353,6 +353,7 @@ from omnigent.server.routes._sessions.helpers import (
     _add_model_usage_delta as _add_model_usage_delta,
     _agent_carries_cursor_fork_history as _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history_impl as _agent_carries_native_fork_history_impl,
+    _agent_forks_opencode_native_session as _agent_forks_opencode_native_session,
     _agent_is_native_impl as _agent_is_native_impl,
     _agent_provider_family as _agent_provider_family,
     _allow_all_edits_eligible as _allow_all_edits_eligible,
