@@ -447,12 +447,57 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+# Authoritative verdicts for a dispatched child that has gone silent past the
+# stall budget, from reading the child's server-side session summary. The
+# stall sweep only synthesizes a failure for ``stuck``; the rest defer.
+_SILENT_CHILD_APPROVAL = "approval"  # parked on a human approval; silence is expected
+_SILENT_CHILD_TERMINAL = "terminal"  # server already holds a real terminal result
+_SILENT_CHILD_STUCK = "stuck"  # genuinely wedged; warn the parent provisionally
+_SILENT_CHILD_UNKNOWN = "unknown"  # server unreadable; do not fail on a guess
+# Cap on authoritative child reads per stall sweep. Silent candidates past this
+# many (oldest silence first) wait for the next sweep, so a burst of stale
+# entries never issues an unbounded batch of snapshot reads in one tick.
+_SUBAGENT_STALL_ADJUDICATIONS_PER_SWEEP = 25
 # Bound how long a sub-agent dispatch can wait for a start acknowledgment.
 # A timeout reports uncertain launch status, not proof that the process is dead.
 _SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
 _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
 # Interval for the background sweep in the runner entrypoint.
 SUBAGENT_LAUNCH_REAP_INTERVAL_S = 30.0
+# Liveness budget for a sub-agent dispatch that DID start: a child that has
+# produced no runner-visible activity at all (no status edge, no published
+# event) for this long is wedged. Without this backstop every harness-drift
+# bug presents as a silent infinite hang with the parent's inbox empty.
+_SUBAGENT_STALL_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_STALL_TIMEOUT_S"
+_DEFAULT_SUBAGENT_STALL_TIMEOUT_S = 900.0
+
+
+def _resolve_timeout_env_s(env_var: str, default_s: float) -> float:
+    """
+    Resolve a seconds-valued liveness budget from the environment.
+
+    Values ``<= 0`` disable the corresponding reaper. A non-numeric or
+    non-finite override is rejected with a warning and falls back to
+    *default_s*.
+
+    :param env_var: Environment variable name, e.g.
+        ``"OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"``.
+    :param default_s: Fallback budget in seconds, e.g. ``180.0``.
+    :returns: The budget in seconds, e.g. ``180.0``.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return default_s
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    # Non-finite values (nan/inf) would silently disable reaping without the
+    # explicit ``<= 0`` "disabled" intent — reject them like non-numeric input.
+    if value is None or not math.isfinite(value):
+        _logger.warning("Invalid %s=%r; using default %ss", env_var, raw, default_s)
+        return default_s
+    return value
 
 
 def resolve_subagent_launch_timeout_s() -> float:
@@ -464,24 +509,21 @@ def resolve_subagent_launch_timeout_s() -> float:
 
     :returns: The budget in seconds, e.g. ``180.0``.
     """
-    raw = os.environ.get(_SUBAGENT_LAUNCH_TIMEOUT_S_ENV, "").strip()
-    if not raw:
-        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
-    try:
-        value = float(raw)
-    except ValueError:
-        value = None
-    # Non-finite values (nan/inf) would silently disable reaping without the
-    # explicit ``<= 0`` "disabled" intent — reject them like non-numeric input.
-    if value is None or not math.isfinite(value):
-        _logger.warning(
-            "Invalid %s=%r; using default %ss",
-            _SUBAGENT_LAUNCH_TIMEOUT_S_ENV,
-            raw,
-            _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S,
-        )
-        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
-    return value
+    return _resolve_timeout_env_s(
+        _SUBAGENT_LAUNCH_TIMEOUT_S_ENV, _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    )
+
+
+def resolve_subagent_stall_timeout_s() -> float:
+    """
+    Resolve the liveness budget for a started-but-silent sub-agent dispatch.
+
+    Values ``<= 0`` disable the stall sweep. A non-numeric override is
+    rejected with a warning and falls back to the default.
+
+    :returns: The budget in seconds, e.g. ``900.0``.
+    """
+    return _resolve_timeout_env_s(_SUBAGENT_STALL_TIMEOUT_S_ENV, _DEFAULT_SUBAGENT_STALL_TIMEOUT_S)
 
 
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
@@ -1617,6 +1659,13 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param last_activity_at: Unix timestamp of the most recent
+        runner-visible edge for this child (status edge or published
+        event). Seeds to the dispatch time; drives the stall sweep.
+    :param stalled: Whether the recorded terminal is a watchdog-synthesized
+        stall failure rather than a real child edge. A later genuine
+        terminal edge supersedes it, so the parent acts on the real result
+        instead of the backstop's placeholder.
     """
 
     parent_session_id: str
@@ -1631,6 +1680,8 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    last_activity_at: float = dataclasses.field(default_factory=time.time)
+    stalled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1791,6 +1842,35 @@ def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
     :returns: The work entry, or ``None`` if the child is not tracked.
     """
     return _subagent_work_by_child.get(child_session_id)
+
+
+def note_subagent_activity(child_session_id: str) -> None:
+    """
+    Record that a dispatched sub-agent produced a runner-visible edge.
+
+    Keeps the stall sweep keyed on silence rather than on wall-clock since
+    dispatch, so a healthy long-running child is never reaped.
+
+    Activity also refreshes every tracked ancestor of the emitting session.
+    A parent that dispatched a child and is now parked awaiting its result
+    emits no edges of its own; without this, a nested orchestrator (P → C → G)
+    whose grandchild G is productively working would see C's timestamp expire
+    and be falsely reaped. Walking the ``parent_session_id`` chain keeps the
+    whole waiting spine alive as long as any descendant is active.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: None.
+    """
+    now = time.time()
+    seen: set[str] = set()
+    session_id: str | None = child_session_id
+    while session_id is not None and session_id not in seen:
+        seen.add(session_id)
+        entry = _subagent_work_by_child.get(session_id)
+        if entry is None:
+            break
+        entry.last_activity_at = now
+        session_id = entry.parent_session_id
 
 
 def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | None:
@@ -2136,6 +2216,21 @@ def mark_subagent_work_terminal(
             reason=_SUBAGENT_DELIVERY_UNTRACKED,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+        if entry.stalled:
+            # The recorded terminal is a watchdog-synthesized stall failure — a
+            # guess that the child's real edge would never arrive. A later
+            # genuine terminal edge (a forwarded completion, or a reconciled
+            # remote result) disproves that guess, so it supersedes the stall
+            # and is re-delivered; the parent must act on the real result, not
+            # the backstop's placeholder. Only the stall sweep sets ``stalled``,
+            # and it never touches an already-terminal entry, so any terminal
+            # report reaching here is the genuine edge.
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            entry.stalled = False
+            return _deliver_subagent_completion(entry)
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
@@ -2282,14 +2377,207 @@ def reap_stalled_subagent_launches(
     return reaped
 
 
+def _classify_silent_child_from_snapshot(snapshot: _JsonObject | None) -> str:
+    """Map a child's own session snapshot to a silent-child verdict.
+
+    Read from a single, bounded ``GET /v1/sessions/{child_id}`` — the child's
+    tracked id — rather than scanning the parent's whole child list.
+
+    :param snapshot: The child's ``SessionResponse`` dict, or ``None`` when the
+        read failed.
+    :returns: One of the ``_SILENT_CHILD_*`` verdicts.
+    """
+    if snapshot is None:
+        return _SILENT_CHILD_UNKNOWN
+    pending = snapshot.get("pending_elicitations")
+    if isinstance(pending, list) and pending:
+        # Parked on a native permission prompt replayed on the snapshot.
+        return _SILENT_CHILD_APPROVAL
+    status = snapshot.get("status")
+    if status in ("running", "waiting"):
+        # The server also sees an in-flight turn: genuinely wedged.
+        return _SILENT_CHILD_STUCK
+    if status in ("idle", "failed"):
+        # The dispatched turn already ended server-side; the runner merely
+        # missed the terminal edge. Let reconciliation deliver the real result.
+        return _SILENT_CHILD_TERMINAL
+    return _SILENT_CHILD_UNKNOWN
+
+
+async def reap_stalled_subagent_dispatches(
+    *,
+    now: float | None = None,
+    timeout_s: float | None = None,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
+    read_child: Callable[[str], Awaitable[_JsonObject | None]] | None = None,
+    interrupt: Callable[[_SubagentWorkEntry], Awaitable[None]] | None = None,
+) -> list[_SubagentWorkEntry]:
+    """
+    Warn the parent about sub-agent dispatches that started and went silent.
+
+    Complements :func:`reap_stalled_subagent_launches`, which only covers a
+    child wedged before its first edge. Once a child reaches ``running``
+    nothing else bounds its lifetime, so any harness drift that loses the
+    child's terminal edge presents as a silent infinite hang with the
+    parent's inbox empty. This sweep is keyed on the absence of edges, not on
+    wall-clock since dispatch: a child still emitting activity keeps
+    refreshing ``last_activity_at`` and is never reaped.
+
+    Silence alone is not proof of a hang, so a candidate silent past the
+    budget is adjudicated against the child's own authoritative session
+    snapshot (``read_child`` — a single, bounded ``GET`` of the tracked child
+    id, never a scan of the parent's whole child list) before anything is
+    delivered:
+
+    * a pending elicitation (native permission prompt, invisible to the
+      runner's local ``pending_approvals``) — left alone; the ASK has its own
+      day-long budget.
+    * the server sees the session ``idle``/``failed`` — the dispatched turn
+      already ended and the runner merely missed the terminal edge; the entry
+      is demoted to ``waiting`` so the reconcile pass delivers the real result,
+      never a synthesized failure.
+    * unreadable / unexpected — no proof of a hang, so it is retried next sweep.
+    * the server also sees an in-flight turn (``running``/``waiting``) —
+      genuinely wedged. The still-live child is interrupted (best effort) and
+      the parent gets a PROVISIONAL failure: the entry is marked ``stalled`` so
+      it stays trackable and cancellable, and any genuine terminal edge that
+      still arrives supersedes it (see :func:`mark_subagent_work_terminal`).
+
+    Because each verdict and interrupt is an ``await``, the child can finish,
+    be cancelled, or be replaced by a new dispatch mid-decision. The entry's
+    identity and ``running`` status are therefore re-checked after every
+    await, and the provisional failure is only ever recorded while the entry
+    is still the same live ``running`` dispatch — so a real terminal result
+    (or a newer dispatch) is never overwritten.
+
+    Each sweep adjudicates at most
+    :data:`_SUBAGENT_STALL_ADJUDICATIONS_PER_SWEEP` candidates (oldest silence
+    first), each with a single metadata-only child read, so the periodic
+    workload stays bounded no matter how many entries have gone stale; the rest
+    are picked up on later ticks. An approval-parked candidate has its activity
+    refreshed so it is not re-read every sweep.
+
+    A ``launching`` entry belongs to the launch sweep; a ``waiting`` entry is
+    a restart-recovered dispatch the reconcile loop owns (its registry state,
+    not its server status — a recovered child stays ``waiting`` here until
+    reconciliation sees it turn terminal); terminal entries are done. A
+    quiet-but-healthy child with no execution heartbeat can still be classified
+    ``stuck`` once past the (default 900s) budget; the interrupt is best effort
+    and the failure provisional, so a genuine late result still supersedes it.
+
+    :param now: Clock override for tests, e.g. ``time.time()``.
+    :param timeout_s: Budget override for tests; defaults to
+        :func:`resolve_subagent_stall_timeout_s`.
+    :param mark_terminal: Terminal-delivery callback. Production passes the
+        app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
+        also schedules the parent wake POST. Defaults to the inbox-only
+        :func:`mark_subagent_work_terminal`.
+    :param read_child: Async callback returning a child's own session snapshot
+        (or ``None`` on a failed read). ``None`` treats every silent candidate
+        as ``stuck`` (unit tests that only exercise the timing gate).
+    :param interrupt: Async best-effort interrupt for a genuinely-stuck child,
+        so a still-live turn is stopped rather than left duplicating work.
+    :returns: The entries that were given a provisional stall failure.
+    """
+    budget = resolve_subagent_stall_timeout_s() if timeout_s is None else timeout_s
+    if budget <= 0:
+        return []
+    deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
+    current = time.time() if now is None else now
+
+    def _still_silent_running(entry: _SubagentWorkEntry) -> bool:
+        # Re-read the registry: only act while this exact entry is still the
+        # registered dispatch, still running, still un-warned, and still
+        # silent. Anything else means a real edge or a new dispatch landed
+        # during an await and now owns the child id.
+        return (
+            _subagent_work_by_child.get(entry.child_session_id) is entry
+            and entry.status == "running"
+            and not entry.stalled
+            and current - entry.last_activity_at >= budget
+        )
+
+    candidates = [
+        entry
+        for entry in list(_subagent_work_by_child.values())
+        if entry.status == "running"
+        and not pending_approvals.has_pending(entry.child_session_id)
+        and current - entry.last_activity_at >= budget
+    ]
+    # Oldest silence first, and only a bounded batch per sweep: a burst of stale
+    # entries is worked off over several ticks, never one unbounded read storm.
+    candidates.sort(key=lambda entry: entry.last_activity_at)
+    candidates = candidates[:_SUBAGENT_STALL_ADJUDICATIONS_PER_SWEEP]
+    reaped: list[_SubagentWorkEntry] = []
+    for entry in candidates:
+        if read_child is None:
+            verdict = _SILENT_CHILD_STUCK
+        else:
+            # One bounded read of the tracked child id, not a sibling scan.
+            snapshot = await read_child(entry.child_session_id)
+            # Re-check after the await before acting on a now-possibly-stale
+            # verdict.
+            if not _still_silent_running(entry):
+                continue
+            verdict = _classify_silent_child_from_snapshot(snapshot)
+        if verdict == _SILENT_CHILD_APPROVAL:
+            # An approval wait is expected silence with its own long budget.
+            # Refresh activity so it is not re-read on every single sweep —
+            # it is re-adjudicated once a whole budget later instead.
+            entry.last_activity_at = current
+            continue
+        if verdict == _SILENT_CHILD_UNKNOWN:
+            # The server was unreadable; retry on the next sweep.
+            continue
+        if verdict == _SILENT_CHILD_TERMINAL:
+            # The server has the real result; hand it to the reconcile pass.
+            # No await between the re-check and here, so the transition is safe.
+            entry.status = "waiting"
+            continue
+        _logger.warning(
+            "Sub-agent dispatch wedged (silent, server in-progress); provisionally "
+            "failing it: parent=%s child=%s",
+            entry.parent_session_id,
+            entry.child_session_id,
+        )
+        if interrupt is not None:
+            await interrupt(entry)
+            # The interrupt may have synchronously terminalized the child (a
+            # real ``cancelled`` edge). Re-check before recording anything, so
+            # the provisional failure never overwrites that authoritative result.
+            if not _still_silent_running(entry):
+                continue
+        # Atomic with the re-check above (no await until delivery returns):
+        # keep the entry trackable so a genuine terminal edge still supersedes
+        # and re-delivers the real result.
+        entry.stalled = True
+        deliver(
+            entry.child_session_id,
+            status="failed",
+            output=(
+                f"Error: sub-agent {entry.agent!r} title {entry.title!r} produced no "
+                f"activity for {budget:.0f}s and appears wedged; an interrupt was "
+                "requested. This status is provisional — if the child is still alive "
+                "its real result will supersede it. Re-dispatch only if it does not."
+            ),
+        )
+        reaped.append(entry)
+    return reaped
+
+
 async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
+    read_child: Callable[[str], Awaitable[_JsonObject | None]] | None = None,
+    interrupt_silent: Callable[[_SubagentWorkEntry], Awaitable[None]] | None = None,
 ) -> None:
     """
-    Periodically sweep for sub-agent dispatches wedged in ``launching``.
+    Periodically sweep for wedged sub-agent dispatches.
+
+    Covers both children stuck in ``launching`` (never started) and started
+    children that have gone silent past the stall budget.
 
     Runs until cancelled; started by the runner entrypoint alongside the
     process manager. Sweep errors are logged and never end the loop.
@@ -2299,12 +2587,20 @@ async def run_subagent_launch_reaper(
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
     :param reconcile_pending: Refresh recovered work awaiting remote completion.
+    :param read_child: Single-child snapshot reader, forwarded to
+        :func:`reap_stalled_subagent_dispatches` for authoritative adjudication.
+    :param interrupt_silent: Best-effort interrupt for a genuinely-stuck child.
     :returns: None.
     """
     while True:
         await asyncio.sleep(interval_s)
         try:
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+            await reap_stalled_subagent_dispatches(
+                mark_terminal=mark_terminal,
+                read_child=read_child,
+                interrupt=interrupt_silent,
+            )
             if reconcile_pending is not None:
                 await reconcile_pending()
         except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
@@ -3295,6 +3591,11 @@ def create_runner_app(
         latest_assistant_text: str | None = None,
         allow_history_preview_fallback: bool = True,
     ) -> None:
+        # Every runner-visible edge for a session funnels through here (via
+        # ``_publish_event`` and the ``external_session_status`` ingest
+        # branch). Stamp dispatched children here so the stall sweep keys on
+        # real silence, before the non-child early return.
+        note_subagent_activity(session_id)
         meta = _child_session_parents.get(session_id)
         if meta is None:
             return
@@ -5684,6 +5985,75 @@ def create_runner_app(
             await _recover_undrained_subagent_results(parent_id)
 
     app.state.reconcile_pending_subagent_results = _reconcile_pending_subagent_results
+
+    async def _read_child_session_snapshot(child_id: str) -> _JsonObject | None:
+        """Read one child's own session snapshot for stall adjudication.
+
+        A single, bounded ``GET /v1/sessions/{child_id}`` of the already-tracked
+        child id — the authoritative source for the session ``status`` and any
+        replayed ``pending_elicitations`` (native permission prompts live only
+        server-side, not in the runner's local ``pending_approvals``). Never
+        scans the parent's whole child list. Returns ``None`` on any read
+        failure so the sweep waits rather than failing a child on a guess.
+
+        :param child_id: The dispatched child session to read.
+        :returns: The child's ``SessionResponse`` dict, or ``None`` on failure.
+        """
+        try:
+            # Metadata only: skip the transcript read (the snapshot's most
+            # expensive step) and the runner/host liveness lookup. The verdict
+            # only needs ``status`` and any replayed ``pending_elicitations``.
+            resp = await server_client.get(
+                f"/v1/sessions/{child_id}",
+                params={"include_items": "false", "include_liveness": "false"},
+                timeout=30.0,
+            )
+        except httpx.HTTPError:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+
+    app.state.read_child_session_snapshot = _read_child_session_snapshot
+
+    async def _interrupt_silent_subagent_dispatch(entry: _SubagentWorkEntry) -> None:
+        """Best-effort stop of a wedged-but-live child before failing it.
+
+        Routes the same cancel event ``sys_cancel_task`` uses — ``stop_session``
+        for a hard-stop-capable native, ``interrupt`` otherwise — so a still-live
+        turn is freed rather than left duplicating the parent's re-dispatch.
+        Best effort: a failure is logged and never blocks the provisional
+        failure delivery.
+
+        :param entry: The genuinely-stuck child's work entry.
+        :returns: None.
+        """
+        from omnigent.runner.native.interrupt import native_cancel_capability
+
+        event_type = (
+            "stop_session"
+            if native_cancel_capability(entry.wrapper_label) == "stop"
+            else "interrupt"
+        )
+        try:
+            await server_client.post(
+                f"/v1/sessions/{entry.child_session_id}/events",
+                json={"type": event_type, "data": {}},
+                timeout=30.0,
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "Best-effort interrupt of wedged sub-agent failed: parent=%s child=%s",
+                entry.parent_session_id,
+                entry.child_session_id,
+                exc_info=True,
+            )
+
+    app.state.interrupt_silent_subagent_dispatch = _interrupt_silent_subagent_dispatch
 
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
