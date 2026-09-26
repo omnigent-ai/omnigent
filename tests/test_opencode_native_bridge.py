@@ -20,6 +20,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     prepare_bridge_dir,
     read_bridge_state,
     update_active_message_id,
+    update_last_applied_model,
     update_last_event_id,
     update_model_override,
     user_opencode_config_path,
@@ -417,3 +418,33 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_last_applied_model_round_trips(bridge_dir: Path) -> None:
+    write_bridge_state(bridge_dir, _state(bridge_dir, last_applied_model="acme/model-a"))
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model == "acme/model-a"
+    raw = json.loads((bridge_dir / "state.json").read_text(encoding="utf-8"))
+    assert raw["last_applied_model"] == "acme/model-a"
+
+
+def test_last_applied_model_absent_in_older_state_reads_none(bridge_dir: Path) -> None:
+    write_bridge_state(bridge_dir, _state(bridge_dir))
+    path = bridge_dir / "state.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw.pop("last_applied_model")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model is None
+
+
+def test_update_last_applied_model(bridge_dir: Path) -> None:
+    assert update_last_applied_model(bridge_dir, "acme/model-a") is False  # no state yet
+    write_bridge_state(bridge_dir, _state(bridge_dir, model_override="acme/model-a"))
+    assert update_last_applied_model(bridge_dir, "acme/model-a") is True
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model == "acme/model-a"
+    assert loaded.model_override == "acme/model-a"

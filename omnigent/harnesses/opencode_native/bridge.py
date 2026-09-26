@@ -253,6 +253,9 @@ class OpenCodeNativeBridgeState:
         ``"anthropic/claude-opus-4"``, or ``None``.
     :param workspace: Workspace cwd the session runs in.
     :param last_event_id: Last SSE event id seen, for resume/debug.
+    :param last_applied_model: Model most recently pushed to the OpenCode
+        session via ``POST /api/session/{id}/model``, e.g.
+        ``"opencode/big-pickle"``; ``None`` until the first switch.
     """
 
     session_id: str
@@ -266,6 +269,7 @@ class OpenCodeNativeBridgeState:
     model_override: str | None = None
     workspace: str | None = None
     last_event_id: str | None = None
+    last_applied_model: str | None = None
 
     def auth_headers(self) -> dict[str, str]:
         """
@@ -592,6 +596,7 @@ def write_bridge_state(bridge_dir: Path, state: OpenCodeNativeBridgeState) -> No
                     "model_override": state.model_override,
                     "workspace": state.workspace,
                     "last_event_id": state.last_event_id,
+                    "last_applied_model": state.last_applied_model,
                 },
                 handle,
                 sort_keys=True,
@@ -668,6 +673,7 @@ def read_bridge_state(bridge_dir: Path) -> OpenCodeNativeBridgeState | None:
         model_override=_opt_str("model_override"),
         workspace=_opt_str("workspace"),
         last_event_id=_opt_str("last_event_id"),
+        last_applied_model=_opt_str("last_applied_model"),
     )
 
 
@@ -721,12 +727,11 @@ def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
     """
     Persist a new per-session model override (Omnigent→opencode model switch).
 
-    opencode has no session-level model setting — the model is a per-prompt
-    field — so the executor reads ``model_override`` from this bridge state on
-    every web-injected prompt (see
-    ``OpenCodeNativeExecutor._build_prompt_with_model_override``). Updating it
-    here makes the NEXT injected turn use the new model. A blank/whitespace
-    value clears the override (fall back to opencode's own default).
+    Before each web-injected prompt the transport compares ``model_override``
+    with ``last_applied_model`` and calls ``POST /api/session/{id}/model`` when
+    they differ, so updating it here switches the model on the NEXT injected
+    turn. A blank/whitespace value clears the override (OpenCode keeps the
+    model it last had).
 
     :param bridge_dir: Native OpenCode bridge directory.
     :param model_override: New qualified model id (``provider/model``), or
@@ -741,4 +746,23 @@ def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
 
     normalized = model_override.strip() if isinstance(model_override, str) else None
     write_bridge_state(bridge_dir, dataclasses.replace(state, model_override=normalized or None))
+    return True
+
+
+def update_last_applied_model(bridge_dir: Path, model: str) -> bool:
+    """
+    Record the model most recently applied to the OpenCode session.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param model: Qualified model id that ``POST /api/session/{id}/model``
+        accepted, e.g. ``"opencode/big-pickle"``.
+    :returns: ``True`` when the state existed and was updated, ``False`` when
+        no bridge state is present.
+    """
+    state = read_bridge_state(bridge_dir)
+    if state is None:
+        return False
+    import dataclasses
+
+    write_bridge_state(bridge_dir, dataclasses.replace(state, last_applied_model=model))
     return True
