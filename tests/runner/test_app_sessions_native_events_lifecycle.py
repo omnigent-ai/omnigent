@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -681,7 +680,7 @@ async def test_cursor_native_model_options_failure_is_retryable(
 
 
 @pytest.mark.asyncio
-async def test_opencode_native_model_options_uses_cli_catalog(
+async def test_opencode_native_model_options_reads_server_catalog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -699,19 +698,36 @@ async def test_opencode_native_model_options_uses_cli_catalog(
             session_id=conv_id,
             server_base_url="http://127.0.0.1:49231",
             opencode_session_id="ses_1",
+            auth_secret="pw",
+            workspace="/repo",
         ),
     )
-    captured_envs: list[Mapping[str, str] | None] = []
 
-    def _fake_list_options(*, env: Mapping[str, str] | None = None) -> list[dict[str, object]]:
-        captured_envs.append(env)
-        return [{"id": "opencode-go/glm-5.2", "displayName": "opencode-go/glm-5.2"}]
+    class _Client:
+        closed = False
 
-    monkeypatch.setattr(
-        opencode_native_app_server,
-        "list_opencode_cli_model_options",
-        _fake_list_options,
-    )
+        async def list_models(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "id": "glm-5.2",
+                    "modelID": "glm-5.2",
+                    "providerID": "opencode-go",
+                    "name": "GLM 5.2",
+                    "status": "active",
+                    "enabled": True,
+                }
+            ]
+
+        async def aclose(self) -> None:
+            _Client.closed = True
+
+    built: list[dict[str, object]] = []
+
+    def _fake_client_for_state(**kwargs: object) -> _Client:
+        built.append(kwargs)
+        return _Client()
+
+    monkeypatch.setattr(opencode_native_app_server, "client_for_state", _fake_client_for_state)
     spec = AgentSpec(
         spec_version=1,
         name="t",
@@ -737,14 +753,21 @@ async def test_opencode_native_model_options_uses_cli_catalog(
 
     assert response.status_code == 200
     assert response.json() == {
-        "models": [{"id": "opencode-go/glm-5.2", "displayName": "opencode-go/glm-5.2"}]
+        "models": [
+            {
+                "id": "opencode-go/glm-5.2",
+                "model": "glm-5.2",
+                "providerID": "opencode-go",
+                "displayName": "opencode-go/glm-5.2",
+                "name": "GLM 5.2",
+                "isDefault": False,
+            }
+        ]
     }
-    assert len(captured_envs) == 1
-    cli_env = captured_envs[0]
-    assert cli_env is not None
-    bridge_dir = opencode_native_bridge.bridge_dir_for_bridge_id(conv_id)
-    assert cli_env["XDG_DATA_HOME"] == str(bridge_dir / "xdg-data")
-    assert cli_env["XDG_CONFIG_HOME"] == str(bridge_dir / "xdg-config")
+    assert built == [
+        {"base_url": "http://127.0.0.1:49231", "auth_secret": "pw", "directory": "/repo"}
+    ]
+    assert _Client.closed
 
 
 @pytest.mark.asyncio

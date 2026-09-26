@@ -16,6 +16,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     write_bridge_state,
 )
 from omnigent.runner.native.orchestration import (
+    _opencode_model_options_from_catalog,
     _opencode_model_ref,
     _OpenCodeNativeLaunchConfig,
     _prepare_opencode_native_fork,
@@ -214,3 +215,51 @@ def test_auto_create_opencode_terminal_has_no_v1_session_calls() -> None:
 )
 def test_opencode_model_ref(model: str | None, expected: dict[str, str] | None) -> None:
     assert _opencode_model_ref(model) == expected
+
+
+def test_model_options_from_v2_catalog() -> None:
+    catalog = [
+        {
+            "id": "glm-5.2",
+            "modelID": "glm-5.2",
+            "providerID": "opencode-go",
+            "name": "GLM 5.2",
+            "status": "active",
+            "enabled": True,
+        },
+        {
+            "id": "old",
+            "modelID": "old",
+            "providerID": "openai",
+            "name": "Old",
+            "status": "deprecated",
+            "enabled": True,
+        },
+        {
+            "id": "off",
+            "modelID": "off",
+            "providerID": "openai",
+            "name": "Off",
+            "status": "active",
+            "enabled": False,
+        },
+        {
+            "id": "glm-5.2",
+            "modelID": "glm-5.2",
+            "providerID": "opencode-go",
+            "name": "dup",
+            "status": "active",
+            "enabled": True,
+        },
+        {"providerID": "broken"},
+    ]
+    assert _opencode_model_options_from_catalog(catalog) == [
+        {
+            "id": "opencode-go/glm-5.2",
+            "model": "glm-5.2",
+            "providerID": "opencode-go",
+            "displayName": "opencode-go/glm-5.2",
+            "name": "GLM 5.2",
+            "isDefault": False,
+        }
+    ]

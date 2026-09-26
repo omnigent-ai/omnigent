@@ -2108,6 +2108,46 @@ def _opencode_model_ref(model: str | None) -> dict[str, str] | None:
     return ref
 
 
+def _opencode_model_options_from_catalog(models: list[_JsonObject]) -> list[_JsonObject]:
+    """
+    Map OpenCode v2 ``Model.Info`` entries onto web model-picker options.
+
+    Disabled and deprecated models are hidden; duplicates keep the first
+    (the catalog is ordered by release date).
+
+    :param models: ``GET /api/model`` data, e.g.
+        ``[{"id": "gpt-5", "providerID": "openai", "name": "GPT-5", ...}]``.
+    :returns: Options keyed by the qualified ``provider/model`` id.
+    """
+    options: list[_JsonObject] = []
+    seen: set[str] = set()
+    for model in models:
+        provider_id = model.get("providerID")
+        model_id = model.get("id")
+        if not isinstance(provider_id, str) or not provider_id:
+            continue
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        if model.get("enabled") is False or model.get("status") == "deprecated":
+            continue
+        qualified = f"{provider_id}/{model_id}"
+        if qualified in seen:
+            continue
+        seen.add(qualified)
+        name = model.get("name")
+        options.append(
+            {
+                "id": qualified,
+                "model": model_id,
+                "providerID": provider_id,
+                "displayName": qualified,
+                "name": name if isinstance(name, str) and name else model_id,
+                "isDefault": False,
+            }
+        )
+    return options
+
+
 def _opencode_native_profile_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
 ) -> str | None:

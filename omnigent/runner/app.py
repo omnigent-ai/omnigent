@@ -141,6 +141,7 @@ from omnigent.runner.native import (
     _is_spec_local_native_python_tool,
     _launch_native_terminal,
     _log_terminal_lookup_miss,
+    _opencode_model_options_from_catalog,
     _opencode_model_ref,
     _publish_terminal_pending,
     _publish_tmux_target_for_bridge,
@@ -6928,43 +6929,25 @@ def create_runner_app(
         return Response(status_code=200)
 
     async def _opencode_native_model_options(conv_id: str) -> list[_JsonObject]:
-        from omnigent.harnesses.opencode_native.app_server import (
-            filtered_server_env,
-            list_opencode_cli_model_options,
-        )
+        from omnigent.harnesses.opencode_native import app_server as opencode_app_server
         from omnigent.harnesses.opencode_native.bridge import (
             bridge_dir_for_bridge_id,
             read_bridge_state,
         )
-        from omnigent.harnesses.opencode_native.client import OpenCodeClient
 
-        bridge_dir = bridge_dir_for_bridge_id(conv_id)
-        state = read_bridge_state(bridge_dir)
+        state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
         if state is None or not state.server_base_url:
             raise _CodexNativeModelOptionsNotReady("OpenCode-native app-server is not ready yet.")
-
-        cli_env = filtered_server_env(
-            bridge_dir=bridge_dir,
-            auth_secret=state.auth_secret or "",
-        )
-        try:
-            return await asyncio.to_thread(list_opencode_cli_model_options, env=cli_env)
-        except Exception as exc:  # noqa: BLE001 - fall back to the server catalog.
-            _logger.debug(
-                "OpenCode CLI model list failed for %s: %r",
-                conv_id,
-                exc,
-                extra={"session_id": conv_id},
-            )
-
-        client = OpenCodeClient(
+        client = opencode_app_server.client_for_state(
             base_url=state.server_base_url,
-            headers=state.auth_headers(),
+            auth_secret=state.auth_secret,
+            directory=state.workspace,
         )
         try:
-            return await client.list_models()
+            models = await client.list_models()
         finally:
             await client.aclose()
+        return _opencode_model_options_from_catalog(models)
 
     async def _handle_opencode_native_model_change(conv_id: str, model: str | None) -> Response:
         from omnigent.harnesses.opencode_native.bridge import (
