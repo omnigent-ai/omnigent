@@ -499,6 +499,38 @@ def test_merge_mcp_v1_flat_and_v2_servers(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert servers["modern"] == {"type": "remote", "url": "https://m"}
 
 
+def test_merge_lifts_flat_synthesized_mcp_into_servers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pre-Task-63 callers may hand a flat ``mcp`` map; the merge nests it."""
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        '{"mcp": {"servers": {"gh": {"type": "remote", "url": "https://gh"}}}}',
+    )
+    config: dict[str, object] = {"mcp": {"omnigent": {"type": "local", "command": ["r"]}}}
+    result = maybe_merge_user_provider_config(config)
+    assert result["mcp"] == {
+        "servers": {
+            "omnigent": {"type": "local", "command": ["r"]},
+            "gh": {"type": "remote", "url": "https://gh"},
+        }
+    }
+
+
+def test_merge_warns_and_continues_on_malformed_user_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _user_config(monkeypatch, tmp_path, "{not json")
+    config = {"model": "anthropic/claude-sonnet-4-5"}
+    with caplog.at_level("WARNING"):
+        result = maybe_merge_user_provider_config(config)
+    assert result == config
+    assert any(
+        "Failed to parse user OpenCode config" in record.message for record in caplog.records
+    )
+
+
 def test_merge_user_provider_config_handles_jsonc_comments(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

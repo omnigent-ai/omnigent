@@ -820,9 +820,16 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     user_servers = _user_mcp_servers(user)
     if user_servers:
         mcp = result.get("mcp")
-        mcp_block = dict(mcp) if isinstance(mcp, Mapping) else {}
-        current = mcp_block.get("servers")
-        servers = dict(current) if isinstance(current, Mapping) else {}
+        if isinstance(mcp, Mapping) and "servers" not in mcp:
+            # Pre-Task-63 callers may still hand us a flat ``mcp`` map (server
+            # entries at the top level, not yet nested under ``servers``).
+            # Lift it so the written config always uses the v2 shape.
+            mcp_block: dict[str, object] = {}
+            servers = dict(mcp)
+        else:
+            mcp_block = dict(mcp) if isinstance(mcp, Mapping) else {}
+            current = mcp_block.get("servers")
+            servers = dict(current) if isinstance(current, Mapping) else {}
         for name, entry in user_servers.items():
             servers.setdefault(name, entry)
         mcp_block["servers"] = servers
