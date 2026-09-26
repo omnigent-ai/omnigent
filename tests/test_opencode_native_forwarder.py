@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
 from omnigent.harnesses.opencode_native.client import OpenCodeClientError, OpenCodeEvent
@@ -1545,6 +1547,27 @@ async def test_form_reply_failure_cancels_and_logs() -> None:
     statuses = _datas(server.posts, "external_session_status")
     assert statuses[-1]["status"] == "running"
     assert statuses[-1]["blocked_on"] == "form reply failed for frm_1"
+
+
+async def test_form_unexpected_error_cancels_and_surfaces(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-transport error must not leave OpenCode waiting on the form forever."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"q0": "Tabs"}}
+
+    async def broken_reply(*_args: Any, **_kwargs: Any) -> bool:
+        raise TypeError("unexpected answer shape")
+
+    opencode.reply_form = broken_reply  # type: ignore[method-assign]
+    fwd = _forwarder(server, opencode)
+    with caplog.at_level(logging.WARNING, logger=fwd_mod.__name__):
+        await fwd.handle_event(_form_event("frm_1", _SINGLE))
+        await _drain(fwd)
+    assert opencode.form_cancels == [(_SESSION, "frm_1")]
+    statuses = _datas(server.posts, "external_session_status")
+    assert statuses[-1]["blocked_on"] == "form reply failed for frm_1"
+    assert any("conv_1" in r.getMessage() and "frm_1" in r.getMessage() for r in caplog.records)
 
 
 async def test_form_hook_transport_failure_cancels_form() -> None:

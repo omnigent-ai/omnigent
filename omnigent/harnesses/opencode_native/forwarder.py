@@ -29,7 +29,6 @@ import httpx
 from omnigent.harnesses.opencode_native.bridge import update_active_message_id
 from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
-    OpenCodeClientError,
     OpenCodeEvent,
 )
 from omnigent.harnesses.opencode_native.permissions import (
@@ -1490,12 +1489,12 @@ class OpenCodeNativeForwarder:
         OpenCode turn is never wedged. ``CancelledError`` propagates: it means
         the TUI answered first (see :meth:`_on_permission_replied`-style flow).
         """
-        fields = form.get("fields")
-        questions = form_questions(fields)
-        if questions is None or not isinstance(fields, list):
-            await self._cancel_form_quietly(session_id, form_id)
-            return
         try:
+            fields = form.get("fields")
+            questions = form_questions(fields)
+            if questions is None or not isinstance(fields, list):
+                await self._cancel_form_quietly(session_id, form_id)
+                return
             if not questions:
                 # Marked before replying so our own form.replied echo is ignored.
                 self.state.mark(self._key("form-replied", form_id))
@@ -1522,8 +1521,13 @@ class OpenCodeNativeForwarder:
             await self._opencode.reply_form(session_id, form_id, answer)
         except asyncio.CancelledError:
             raise
-        except (httpx.HTTPError, OpenCodeClientError) as exc:
-            _logger.warning("OpenCode form reply failed for form=%s: %s", form_id, exc)
+        except Exception:  # noqa: BLE001 - any failure must still release the form.
+            _logger.warning(
+                "OpenCode form handling failed for session=%s form=%s",
+                self._session_id,
+                form_id,
+                exc_info=True,
+            )
             await self._cancel_form_quietly(session_id, form_id)
             turn = self._turns.get(session_id)
             if turn is not None:
@@ -1539,7 +1543,9 @@ class OpenCodeNativeForwarder:
         self.state.mark(self._key("form-replied", form_id))
         try:
             await self._opencode.cancel_form(session_id, form_id)
-        except (httpx.HTTPError, OpenCodeClientError):
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - best effort; the TUI may have answered already.
             _logger.debug("OpenCode form cancel for form=%s failed", form_id, exc_info=True)
 
     async def _park_elicitation(
