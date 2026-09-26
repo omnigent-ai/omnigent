@@ -3972,53 +3972,25 @@ function ConversationRowImpl({
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const rowLinkRef = useRef<HTMLAnchorElement>(null);
   const touchContextMenuRef = useRef(false);
-  const primingContextMenuRef = useRef(false);
-  const pendingMenuOpenFrame = useRef<number | null>(null);
-  const cancelPendingMenuOpen = useCallback(() => {
-    if (pendingMenuOpenFrame.current === null) return;
-    cancelAnimationFrame(pendingMenuOpenFrame.current);
-    pendingMenuOpenFrame.current = null;
-  }, []);
-  useEffect(() => cancelPendingMenuOpen, [cancelPendingMenuOpen]);
   const handleContextMenuOpenChange = useCallback((open: boolean) => {
-    // A priming dispatch only moves Radix's anchor to the finger.
-    if (open && primingContextMenuRef.current) return;
     setContextMenuOpen(open);
     if (!open) {
       if (!touchContextMenuRef.current) rowLinkRef.current?.focus({ preventScroll: true });
       touchContextMenuRef.current = false;
     }
   }, []);
-  const openContextMenuAt = useCallback(
-    (point: { clientX: number; clientY: number }) => {
-      touchContextMenuRef.current = true;
-      const dispatchContextMenu = () => {
-        const event = new MouseEvent("contextmenu", {
-          bubbles: true,
-          cancelable: true,
-          button: 2,
-          clientX: point.clientX,
-          clientY: point.clientY,
-        });
-        Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
-        rowLinkRef.current?.dispatchEvent(event);
-      };
-      // Radix publishes a new anchor point in a passive effect, so opening in
-      // the same render paints the menu at (0,0) first. Move it, then open.
-      primingContextMenuRef.current = true;
-      try {
-        dispatchContextMenu();
-      } finally {
-        primingContextMenuRef.current = false;
-      }
-      cancelPendingMenuOpen();
-      pendingMenuOpenFrame.current = requestAnimationFrame(() => {
-        pendingMenuOpenFrame.current = null;
-        dispatchContextMenu();
-      });
-    },
-    [cancelPendingMenuOpen],
-  );
+  const openContextMenuAt = useCallback((point: { clientX: number; clientY: number }) => {
+    touchContextMenuRef.current = true;
+    const event = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+      clientX: point.clientX,
+      clientY: point.clientY,
+    });
+    Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
+    rowLinkRef.current?.dispatchEvent(event);
+  }, []);
   const runArchiveRef = useRef(runArchive);
   useEffect(() => {
     runArchiveRef.current = runArchive;
@@ -4027,10 +3999,7 @@ function ConversationRowImpl({
     if (action === "archive") runArchiveRef.current();
     else setDeleteOpen(true);
   }, []);
-  const closeContextMenu = useCallback(() => {
-    cancelPendingMenuOpen();
-    setContextMenuOpen(false);
-  }, [cancelPendingMenuOpen]);
+  const closeContextMenu = useCallback(() => setContextMenuOpen(false), []);
   const gesture = useRowGesture({
     enabled: gestureEnabled,
     swipeEnabled,

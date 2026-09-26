@@ -1373,8 +1373,6 @@ describe("right-click context menu", () => {
 
       fireEvent.pointerDown(link, pointer);
       act(() => vi.advanceTimersByTime(400));
-      // The touch menu opens one frame after the hold (anchor priming).
-      act(() => vi.advanceTimersToNextFrame());
       expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
 
       fireEvent.keyDown(screen.getByTestId("rename-conversation"), { key: "Escape" });
@@ -2112,8 +2110,6 @@ describe("touch swipe actions", () => {
     try {
       pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
       act(() => vi.advanceTimersByTime(400));
-      // The touch menu opens one frame after the hold (anchor priming).
-      act(() => vi.advanceTimersToNextFrame());
       expect(screen.getByTestId("leave-conversation")).toBeInTheDocument();
       pointerEventAt("pointerMove", li, { clientX: 115, clientY: 100 }, 1_410);
       expect(screen.queryByTestId("leave-conversation")).toBeNull();

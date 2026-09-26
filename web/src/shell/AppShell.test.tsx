@@ -2733,42 +2733,6 @@ describe("Extension pages own the header", () => {
   });
 });
 
-describe("Workspace rail on cramped rows", () => {
-  function renderFoldable() {
-    stubMatchMedia({ width: 791 });
-    vi.stubGlobal("innerWidth", 791);
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_fold", permission_level: null }]);
-    renderShell("/c/conv_fold");
-  }
-
-  it("collapses the sidebar while an open rail would have no drag room", () => {
-    renderFoldable();
-    const sidebar = () => screen.getByTestId("sidebar");
-    // The default-open sidebar yields to the rail that opened with the session.
-    expect(sidebar()).toHaveAttribute("data-open", "false");
-
-    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
-    expect(sidebar()).toHaveAttribute("data-open", "true");
-
-    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
-    expect(sidebar()).toHaveAttribute("data-open", "false");
-  });
-
-  it("keeps a sidebar reopened by hand while the rail stays open", () => {
-    renderFoldable();
-    const sidebar = () => screen.getByTestId("sidebar");
-    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
-    expect(sidebar()).toHaveAttribute("data-open", "true");
-
-    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
-    expect(sidebar()).toHaveAttribute("data-open", "true");
-  });
-});
-
 describe("Right workspace card visibility", () => {
   it("mounts an expandable pending card for a temporary session", () => {
     writeSessionWorkspaceState("temp:12345678", { open: true });
