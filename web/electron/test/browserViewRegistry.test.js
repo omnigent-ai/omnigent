@@ -245,6 +245,7 @@ function makeEventCapturingRegistry() {
   const clipboardWrites = []; // copyTextToClipboard payloads
   const externalOpens = []; // openUrlExternal payloads
   const menus = []; // showContextMenu item lists
+  const copyImageCalls = []; // webContents.copyImageAt(x, y) invocations
   let copyCalls = 0; // webContents.copy() invocations
   let handlers; // { [event]: fn } for the single created view
   let windowOpenHandler;
@@ -260,6 +261,9 @@ function makeEventCapturingRegistry() {
           close() {},
           copy() {
             copyCalls += 1;
+          },
+          copyImageAt(x, y) {
+            copyImageCalls.push([x, y]);
           },
           removeListener() {},
           on(event, fn) {
@@ -287,6 +291,7 @@ function makeEventCapturingRegistry() {
     clipboardWrites,
     externalOpens,
     menus,
+    copyImageCalls,
     copyCalls: () => copyCalls,
     fire: (event, targetUrl) => {
       const ev = {
@@ -444,6 +449,57 @@ describe("browserViewRegistry — pane context menu", () => {
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     fireContextMenu({ linkURL: "", selectionText: "   " });
     assert.equal(menus.length, 0);
+  });
+
+  it("offers Copy Image over an image and routes it to copyImageAt", () => {
+    const { registry, fireContextMenu, menus, copyImageCalls } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    fireContextMenu({
+      linkURL: "",
+      selectionText: "",
+      mediaType: "image",
+      hasImageContents: true,
+      x: 12,
+      y: 34,
+    });
+    assert.equal(menus.length, 1, "an image right-click must pop a menu");
+    assert.deepEqual(
+      menus[0].map((item) => item.label),
+      ["Copy Image"],
+    );
+    menus[0][0].click();
+    assert.deepEqual(copyImageCalls, [[12, 34]], "Copy Image copies the image at the click point");
+  });
+
+  it("keeps link items ahead of Copy Image for a linked image", () => {
+    const { registry, fireContextMenu, menus } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    fireContextMenu({
+      linkURL: "https://example.com/page",
+      selectionText: "",
+      mediaType: "image",
+      hasImageContents: true,
+      x: 1,
+      y: 2,
+    });
+    assert.deepEqual(
+      menus[0].map((item) => item.label || item.type),
+      ["Open Link in Browser", "Copy Link Address", "separator", "Copy Image"],
+    );
+  });
+
+  it("offers no copy item for an image with no contents to copy", () => {
+    const { registry, fireContextMenu, menus } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    fireContextMenu({
+      linkURL: "",
+      selectionText: "",
+      mediaType: "image",
+      hasImageContents: false,
+      x: 3,
+      y: 4,
+    });
+    assert.equal(menus.length, 0, "a broken image has nothing to copy");
   });
 });
 
