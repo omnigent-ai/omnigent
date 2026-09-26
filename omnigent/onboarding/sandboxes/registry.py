@@ -33,8 +33,7 @@ class SandboxRegistryError(Exception):
 
 
 class _WorkspaceHostLauncherFactory(Protocol):
-    def __call__(self, *, workspace_host: str) -> SandboxHostLauncher:
-        pass
+    def __call__(self, *, workspace_host: str) -> SandboxHostLauncher: ...
 
 
 class _ServerUrlLauncherFactory(Protocol):
@@ -43,8 +42,7 @@ class _ServerUrlLauncherFactory(Protocol):
 
 
 class _ConfiguredLauncherFactory(Protocol):
-    def __call__(self, *, config: object) -> SandboxHostLauncher:
-        pass
+    def __call__(self, *, config: object) -> SandboxHostLauncher: ...
 
 
 @dataclass(frozen=True)
