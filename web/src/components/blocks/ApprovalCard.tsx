@@ -45,6 +45,7 @@ import {
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -64,6 +65,11 @@ import {
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+
+const AUTO_RESOLVED_DETAIL =
+  "This request was answered outside this view — for example in the " +
+  "agent's own terminal, another tab, or the approve page — so the " +
+  "verdict isn't shown here.";
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -500,13 +506,17 @@ export function ApprovalCard({
       icon = <ClockIcon className="size-4 text-muted-foreground" />;
       label = "Prompt expired";
     } else if (autoResolved) {
-      // Card was cleared by the chat store when the gated tool's
-      // function_call_output arrived without a UI verdict —
-      // typically because the user approved (or denied) via Claude
-      // Code's TUI prompt directly. We can't know the actual
-      // verdict, so render a neutral pill rather than implying an
-      // accept/reject decision the UI never witnessed.
-      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      // The verdict is unknown in this view, so explain the neutral status.
+      icon = (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={0} className="inline-flex" aria-label={AUTO_RESOLVED_DETAIL}>
+              <InfoIcon className="size-4 text-muted-foreground" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-72">{AUTO_RESOLVED_DETAIL}</TooltipContent>
+        </Tooltip>
+      );
       label = "Resolved elsewhere";
     } else if (response.action === "cancel") {
       // Dismissed without deciding — neither approved nor rejected.

@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
@@ -1432,6 +1433,44 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
   });
 });
 
+describe("ApprovalCard — resolved-elsewhere pill", () => {
+  const props = {
+    elicitationId: "elic_auto",
+    message: "Cursor wants approval to run a shell command",
+    phase: "pre_tool_use",
+    policyName: "cursor_native_permission",
+    contentPreview: "Bash({})",
+    requestedSchema: {},
+    status: "responded",
+    response: { action: "auto_resolved" },
+  } as const;
+
+  it("explains the status from the info icon's accessible label", () => {
+    // Match the app’s root tooltip provider.
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("Resolved elsewhere")).toBeDefined();
+    const trigger = screen.getByLabelText(/answered outside this view/i);
+    expect(trigger).toBeDefined();
+    expect(trigger.getAttribute("aria-label")?.toLowerCase()).not.toBe("resolved elsewhere");
+  });
+
+  it("keeps the trigger keyboard-reachable so the tooltip opens on focus", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} />
+      </TooltipProvider>,
+    );
+
+    const trigger = screen.getByLabelText(/answered outside this view/i);
+    expect(trigger.getAttribute("tabindex")).toBe("0");
+  });
+});
+
 describe("ApprovalCard — cancel verdict", () => {
   it("renders a cancel as Cancelled, not Rejected", () => {
     // A prompt dismissed without a decision (turn aborted, prompt
@@ -1482,16 +1521,18 @@ describe("ApprovalCard — prompt expired", () => {
 
   it("keeps the neutral pill for an auto-resolve with no reason", () => {
     render(
-      <ApprovalCard
-        elicitationId="elic_neutral"
-        message="Claude wants to call **Bash**"
-        phase="pre_tool_use"
-        policyName="claude_native_permission"
-        contentPreview="Bash({})"
-        requestedSchema={{}}
-        status="responded"
-        response={{ action: "auto_resolved" }}
-      />,
+      <TooltipProvider>
+        <ApprovalCard
+          elicitationId="elic_neutral"
+          message="Claude wants to call **Bash**"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview="Bash({})"
+          requestedSchema={{}}
+          status="responded"
+          response={{ action: "auto_resolved" }}
+        />
+      </TooltipProvider>,
     );
 
     expect(screen.getByText(/Resolved elsewhere/)).toBeDefined();
