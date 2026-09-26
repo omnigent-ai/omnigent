@@ -455,15 +455,40 @@ def register_agent_routes(
             )
 
         if method == "tools/list":
-            return await _handle_mcp_tools_list(
+            response = await _handle_mcp_tools_list(
                 rpc_id,
                 session_id,
                 runner_router,
             )
+            registry = getattr(request.app.state, "mcp_registry", None)
+            if registry is not None and not params.get("_omnigent_skip_registry"):
+                import json
+
+                from omnigent.server.registry_gateway import registry_tools
+                from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
+
+                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if conv is not None and not conv.archived:
+                    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+                    if spec is not None and any(
+                        c.transport == "registry" for c in spec.mcp_servers
+                    ):
+                        extra = await registry_tools(
+                            registry,
+                            request,
+                            spec,
+                            user_id,
+                        )
+                        data = json.loads(bytes(response.body))
+                        tools = data.get("result", {}).get("tools", [])
+                        return _mcp_ok_response(rpc_id, {"tools": tools + extra})
+            return response
 
         if method == "tools/call":
-            _mcp_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            turn_actor = _mcp_conv.labels.get(_TURN_ACTOR_LABEL) if _mcp_conv is not None else None
+            from omnigent.server.mcp_identity import mcp_policy_actor
+
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,
@@ -471,7 +496,8 @@ def register_agent_routes(
                 conversation_store,
                 agent_store,
                 runner_router,
-                actor=_build_actor(turn_actor or user_id),
+                actor=actor,
+                credential_user=user_id,
                 request=request,
             )
 

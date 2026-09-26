@@ -1,3 +1,4 @@
+import { McpRegistryPicker } from "@/components/McpRegistry";
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
@@ -751,6 +752,10 @@ function McpServerManagerDialog({
   dirty: boolean;
   onDirty: () => void;
 }) {
+  const info = useServerInfo();
+  const registryEnabled = info !== "loading" && info.enabled_connections?.includes("mcp");
+  const [showCustom, setShowCustom] = useState(false);
+  const customServers = servers.filter((server) => server.transport !== "registry");
   const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
   const [formError, setFormError] = useState<string | null>(null);
   const createServer = useCreateMcpServer(sessionId);
@@ -810,225 +815,263 @@ function McpServerManagerDialog({
     >
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Manage MCP Servers</DialogTitle>
-          <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
+          <DialogTitle>{registryEnabled ? "MCP services" : "Manage MCP Servers"}</DialogTitle>
+          <DialogDescription>
+            {registryEnabled
+              ? "Enable tools for this session. Account connections are shared across your sandboxes."
+              : "Add, edit, or remove MCP servers for this session."}
+          </DialogDescription>
         </DialogHeader>
+        {registryEnabled && (
+          <McpRegistryPicker
+            attached={servers.filter((s) => s.transport === "registry").map((s) => s.name)}
+            reservedNames={customServers.map((s) => s.name)}
+            busy={saving || deleteServer.isPending}
+            onToggle={(name, enabled) =>
+              enabled
+                ? createServer.mutate({ name, transport: "registry" }, { onSuccess: notifyRestart })
+                : deleteServer.mutate(name, { onSuccess: notifyRestart })
+            }
+          />
+        )}
+        {mutationError && (
+          <p role="alert" className="text-sm text-destructive">
+            {mutationError}
+          </p>
+        )}
         {dirty && (
           <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-ui text-yellow-700 dark:text-yellow-400">
             <AlertTriangleIcon className="size-4 shrink-0" />
             Restart the session to apply your changes.
           </div>
         )}
-        <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-          <div className="flex min-w-0 flex-col gap-1.5">
-            <SectionLabel>Servers</SectionLabel>
-            {servers.length > 0 ? (
-              <div className="flex max-h-56 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
-                {servers.map((server) => (
-                  <div key={server.name} className="flex min-w-0 items-center gap-1.5 px-2 py-2">
-                    <ServerIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setForm(mcpFormFromServer(server));
-                        setFormError(null);
-                      }}
-                      className="min-w-0 flex-1 text-left"
-                    >
-                      <span className="block truncate font-mono text-sm">{server.name}</span>
-                      <span className="block truncate text-sm text-muted-foreground">
-                        {server.transport}
-                      </span>
-                    </button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={`Edit ${server.name}`}
-                      onClick={() => {
-                        setForm(mcpFormFromServer(server));
-                        setFormError(null);
-                      }}
-                    >
-                      <PencilIcon className="size-3" />
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={`Delete ${server.name}`}
-                      onClick={() => deleteServer.mutate(server.name, { onSuccess: notifyRestart })}
-                      disabled={deleteServer.isPending}
-                    >
-                      <TrashIcon className="size-3 text-destructive" />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="py-3 text-sm text-muted-foreground">No MCP servers</p>
-            )}
-            {form.originalName && (
-              <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
-                <PlusIcon className="size-3.5" />
-                New server
-              </Button>
-            )}
-          </div>
-
-          <div className="flex min-w-0 flex-col gap-2">
-            <SectionLabel>{form.originalName ? "Edit Server" : "New Server"}</SectionLabel>
-            <label className="flex flex-col gap-1 text-sm text-muted-foreground">
-              Name
-              <Input
-                value={form.name}
-                onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
-                className="font-mono"
-                placeholder="github"
-              />
-            </label>
-            <label className="flex flex-col gap-1 text-sm text-muted-foreground">
-              Transport
-              <select
-                value={form.transport}
-                onChange={(e) =>
-                  setForm((prev) => ({
-                    ...prev,
-                    transport: e.target.value === "stdio" ? "stdio" : "http",
-                  }))
-                }
-                className="h-8 rounded-lg border border-input bg-background px-2 text-ui text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-              >
-                <option value="http">HTTP</option>
-                <option value="stdio">stdio</option>
-              </select>
-            </label>
-            {form.transport === "http" ? (
-              <>
-                <label className="flex flex-col gap-1 text-sm text-muted-foreground">
-                  URL
-                  <Input
-                    value={form.url}
-                    onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
-                    placeholder="https://example.com/sse"
-                  />
-                </label>
-                <div className="flex flex-col gap-1">
-                  <div className="flex items-center justify-between text-sm text-muted-foreground">
-                    <span>Headers</span>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setForm((prev) => ({
-                          ...prev,
-                          headers: [...prev.headers, mcpHeader()],
-                        }))
-                      }
-                      className="rounded p-0.5 hover:bg-muted"
-                      aria-label="Add header"
-                    >
-                      <PlusIcon className="size-3" />
-                    </button>
-                  </div>
-                  {form.headers.map((header, i) => (
-                    <div key={header.id} className="flex items-center gap-1">
-                      <Input
-                        value={header.key}
-                        onChange={(e) =>
-                          setForm((prev) => {
-                            const headers = [...prev.headers];
-                            headers[i] = { ...headers[i], key: e.target.value };
-                            return { ...prev, headers };
-                          })
-                        }
-                        className="font-mono text-sm"
-                        placeholder="Header-Name"
-                      />
-                      <Input
-                        value={header.value}
-                        onChange={(e) =>
-                          setForm((prev) => {
-                            const headers = [...prev.headers];
-                            headers[i] = { ...headers[i], value: e.target.value };
-                            return { ...prev, headers };
-                          })
-                        }
-                        className="font-mono text-sm"
-                        placeholder="value"
-                      />
+        {registryEnabled && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="justify-start text-muted-foreground"
+            aria-expanded={showCustom}
+            onClick={() => setShowCustom(!showCustom)}
+          >
+            {showCustom ? "Hide custom MCP servers" : "Advanced: custom MCP servers"}
+            {customServers.length > 0 && ` (${customServers.length})`}
+          </Button>
+        )}
+        {(!registryEnabled || showCustom) && (
+          <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+            <div className="flex min-w-0 flex-col gap-1.5">
+              <SectionLabel>Servers</SectionLabel>
+              {customServers.length > 0 ? (
+                <div className="flex max-h-56 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
+                  {customServers.map((server) => (
+                    <div key={server.name} className="flex min-w-0 items-center gap-1.5 px-2 py-2">
+                      <ServerIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setForm(mcpFormFromServer(server));
+                          setFormError(null);
+                        }}
+                        className="min-w-0 flex-1 text-left"
+                      >
+                        <span className="block truncate font-mono text-sm">{server.name}</span>
+                        <span className="block truncate text-sm text-muted-foreground">
+                          {server.transport}
+                        </span>
+                      </button>
                       <Button
                         type="button"
                         variant="ghost"
                         size="icon-xs"
-                        aria-label="Remove header"
-                        onClick={() =>
-                          setForm((prev) => ({
-                            ...prev,
-                            headers: prev.headers.filter((_, j) => j !== i),
-                          }))
-                        }
+                        aria-label={`Edit ${server.name}`}
+                        onClick={() => {
+                          setForm(mcpFormFromServer(server));
+                          setFormError(null);
+                        }}
                       >
-                        <XIcon className="size-3 text-destructive" />
+                        <PencilIcon className="size-3" />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label={`Delete ${server.name}`}
+                        onClick={() =>
+                          deleteServer.mutate(server.name, { onSuccess: notifyRestart })
+                        }
+                        disabled={deleteServer.isPending}
+                      >
+                        <TrashIcon className="size-3 text-destructive" />
                       </Button>
                     </div>
                   ))}
                 </div>
-              </>
-            ) : (
-              <>
-                <label className="flex flex-col gap-1 text-sm text-muted-foreground">
-                  Command
-                  <Input
-                    value={form.command}
-                    onChange={(e) => setForm((prev) => ({ ...prev, command: e.target.value }))}
-                    placeholder="npx"
-                  />
-                </label>
-                <label className="flex flex-col gap-1 text-sm text-muted-foreground">
-                  Args
-                  <Textarea
-                    value={form.argsText}
-                    onChange={(e) => setForm((prev) => ({ ...prev, argsText: e.target.value }))}
-                    className="min-h-20 font-mono text-sm"
-                    placeholder={"-y\n@modelcontextprotocol/server-github"}
-                  />
-                </label>
-              </>
-            )}
-            <label className="flex flex-col gap-1 text-sm text-muted-foreground">
-              Description
-              <Input
-                value={form.description}
-                onChange={(e) => setForm((prev) => ({ ...prev, description: e.target.value }))}
-                placeholder="Optional"
-              />
-            </label>
-            {(formError || mutationError) && (
-              <div
-                role="alert"
-                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-              >
-                {formError ?? mutationError}
+              ) : (
+                <p className="py-3 text-sm text-muted-foreground">No MCP servers</p>
+              )}
+              {form.originalName && (
+                <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
+                  <PlusIcon className="size-3.5" />
+                  New server
+                </Button>
+              )}
+            </div>
+
+            <div className="flex min-w-0 flex-col gap-2">
+              <SectionLabel>{form.originalName ? "Edit Server" : "New Server"}</SectionLabel>
+              <label className="flex flex-col gap-1 text-sm text-muted-foreground">
+                Name
+                <Input
+                  value={form.name}
+                  onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
+                  className="font-mono"
+                  placeholder="github"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm text-muted-foreground">
+                Transport
+                <select
+                  value={form.transport}
+                  onChange={(e) =>
+                    setForm((prev) => ({
+                      ...prev,
+                      transport: e.target.value === "stdio" ? "stdio" : "http",
+                    }))
+                  }
+                  className="h-8 rounded-lg border border-input bg-background px-2 text-ui text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                >
+                  <option value="http">HTTP</option>
+                  <option value="stdio">stdio</option>
+                </select>
+              </label>
+              {form.transport === "http" ? (
+                <>
+                  <label className="flex flex-col gap-1 text-sm text-muted-foreground">
+                    URL
+                    <Input
+                      value={form.url}
+                      onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
+                      placeholder="https://example.com/sse"
+                    />
+                  </label>
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between text-sm text-muted-foreground">
+                      <span>Headers</span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setForm((prev) => ({
+                            ...prev,
+                            headers: [...prev.headers, mcpHeader()],
+                          }))
+                        }
+                        className="rounded p-0.5 hover:bg-muted"
+                        aria-label="Add header"
+                      >
+                        <PlusIcon className="size-3" />
+                      </button>
+                    </div>
+                    {form.headers.map((header, i) => (
+                      <div key={header.id} className="flex items-center gap-1">
+                        <Input
+                          value={header.key}
+                          onChange={(e) =>
+                            setForm((prev) => {
+                              const headers = [...prev.headers];
+                              headers[i] = { ...headers[i], key: e.target.value };
+                              return { ...prev, headers };
+                            })
+                          }
+                          className="font-mono text-sm"
+                          placeholder="Header-Name"
+                        />
+                        <Input
+                          value={header.value}
+                          onChange={(e) =>
+                            setForm((prev) => {
+                              const headers = [...prev.headers];
+                              headers[i] = { ...headers[i], value: e.target.value };
+                              return { ...prev, headers };
+                            })
+                          }
+                          className="font-mono text-sm"
+                          placeholder="value"
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          aria-label="Remove header"
+                          onClick={() =>
+                            setForm((prev) => ({
+                              ...prev,
+                              headers: prev.headers.filter((_, j) => j !== i),
+                            }))
+                          }
+                        >
+                          <XIcon className="size-3 text-destructive" />
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <label className="flex flex-col gap-1 text-sm text-muted-foreground">
+                    Command
+                    <Input
+                      value={form.command}
+                      onChange={(e) => setForm((prev) => ({ ...prev, command: e.target.value }))}
+                      placeholder="npx"
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 text-sm text-muted-foreground">
+                    Args
+                    <Textarea
+                      value={form.argsText}
+                      onChange={(e) => setForm((prev) => ({ ...prev, argsText: e.target.value }))}
+                      className="min-h-20 font-mono text-sm"
+                      placeholder={"-y\n@modelcontextprotocol/server-github"}
+                    />
+                  </label>
+                </>
+              )}
+              <label className="flex flex-col gap-1 text-sm text-muted-foreground">
+                Description
+                <Input
+                  value={form.description}
+                  onChange={(e) => setForm((prev) => ({ ...prev, description: e.target.value }))}
+                  placeholder="Optional"
+                />
+              </label>
+              {formError && (
+                <div
+                  role="alert"
+                  className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+                >
+                  {formError}
+                </div>
+              )}
+              <div className="flex justify-end gap-2 pt-1">
+                <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
+                  <XIcon className="size-3.5" />
+                  Clear
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={handleSave}
+                  loading={saving}
+                  disabled={validateMcpForm(form) !== null}
+                >
+                  <SaveIcon className="size-3.5" />
+                  Save
+                </Button>
               </div>
-            )}
-            <div className="flex justify-end gap-2 pt-1">
-              <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
-                <XIcon className="size-3.5" />
-                Clear
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                onClick={handleSave}
-                loading={saving}
-                disabled={validateMcpForm(form) !== null}
-              >
-                <SaveIcon className="size-3.5" />
-                Save
-              </Button>
             </div>
           </div>
-        </div>
+        )}
       </DialogContent>
     </Dialog>
   );

@@ -34,6 +34,8 @@ from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
 
+McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
+
 
 class PaginatedList(BaseModel):
     """
@@ -111,7 +113,7 @@ class UpsertMCPServerRequest(BaseModel):
     """
 
     name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
-    transport: Literal["http", "stdio"]
+    transport: Literal["http", "stdio", "registry"]
     description: str | None = Field(default=None, max_length=512)
     url: str | None = None
     headers: dict[str, str] | None = None
@@ -135,6 +137,10 @@ class UpsertMCPServerRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> UpsertMCPServerRequest:
         """Enforce the same transport shape as the agent spec parser."""
+        if self.transport == "registry":
+            if self.url or self.headers or self.command or self.args:
+                raise ValueError("Registry services cannot override server connection settings")
+            return self
         if self.transport == "http":
             if not self.url:
                 raise ValueError("url is required when transport is 'http'")
@@ -1518,6 +1524,7 @@ class _SessionCreateRequestBase(BaseModel):
     agent_id: Any
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
@@ -1718,6 +1725,8 @@ class SessionCreateMetadata(BaseModel):
     """
 
     inference_configuration_revision: str | None = None
+
+    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None

@@ -8366,9 +8366,26 @@ def create_runner_app(
 
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
-            _unwrap_spec_entry(spec_entry)
-        )
+        relay_spec = _unwrap_spec_entry(spec_entry)
+        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
+        if relay_spec is not None and relay_spec.mcp_servers:
+            # Native terminals consume the persistent relay, not per-turn schemas.
+            mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
+            relay_schemas.extend(mcp.schemas)
+            for service, error in mcp.failures.items():
+                _logger.warning(
+                    "Native relay MCP %r unavailable: %s",
+                    service,
+                    error,
+                    extra={"session_id": session_id},
+                )
+            current = _session_comment_relays.get(session_id)
+            if (
+                current is not None
+                and current.spec_entry is spec_entry
+                and current.bridge_dir == bridge_dir
+            ):
+                return
 
         _captured_session_id = session_id
 
@@ -8381,7 +8398,7 @@ def create_runner_app(
                 server_client,
                 publish_event=_publish_event,
                 execution_registry=mcp_execution_registry,
-            ).call_tool(None, name, arguments)
+            ).call_tool(relay_spec, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
             except _json.JSONDecodeError:

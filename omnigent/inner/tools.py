@@ -223,7 +223,7 @@ class CancellableFunctionTool(Tool):
 class MCPTool(Tool):
     """A tool (or set of tools) exposed by an MCP server.
 
-    Exactly one of ``url``, ``command``, or ``databricks_server``
+    Exactly one of ``registry``, ``url``, ``command``, or ``databricks_server``
     selects how the server is reached.
 
     :param url: HTTP(S) URL of an MCP server, e.g.
@@ -250,8 +250,10 @@ class MCPTool(Tool):
         (e.g. ``"unity-catalog"``). ``None`` when ``url`` or
         ``command`` is used.
     :param headers: Extra HTTP headers for the ``url`` transport.
+    :param registry: Resolve the tool's registry key through the server catalog.
     """
 
+    registry: bool = False
     url: str | None = None
     command: str | None = None
     args: list[str] | None = None

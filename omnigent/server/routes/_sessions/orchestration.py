@@ -16,7 +16,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -9358,13 +9358,30 @@ async def _create_session_from_existing_agent(
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
 
-    # Workspace validation: if the caller is binding to a host,
-    # they must also pass a workspace, and the workspace must
-    # satisfy the agent's os_env.cwd boundary on that host (per
-    # designs/SESSION_WORKSPACE_SELECTION.md). Done before
-    # create_conversation so a bad workspace never produces a row.
-    # With git worktree creation, the validated path is the source
-    # repo; the worktree it produces becomes the stored workspace.
+    registry_bundle: bytes | None = None
+    if body.mcp_registry_services:
+        from omnigent.server.routes.session_mcp_servers import prepare_registry_launch_bundle
+
+        if body.sub_agent_name:
+            raise OmnigentError(
+                "Named sub-agents use their authored MCP services",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if artifact_store is None:
+            raise OmnigentError("Artifact store unavailable", code=ErrorCode.INTERNAL_ERROR)
+        source_bundle = await asyncio.to_thread(artifact_store.get, agent.bundle_location)
+        if source_bundle is None:
+            raise OmnigentError("Agent bundle not found", code=ErrorCode.INTERNAL_ERROR)
+        registry_bundle = await asyncio.to_thread(
+            prepare_registry_launch_bundle,
+            request,
+            source_bundle,
+            body.mcp_registry_services,
+            user_id,
+            trusted_template=agent.session_id is None,
+        )
+
+    # Validate the host workspace before creating a session or worktree.
     canonical_workspace: str | None = body.workspace
     if body.host_id is not None:
         canonical_workspace = await _validate_session_workspace(
@@ -9534,6 +9551,7 @@ async def _create_session_from_existing_agent(
     )
     from omnigent.stores.conversation_store.overrides import encode_session_overrides
 
+    session_persisted = False
     try:
         # Include spec-seeded defaults before create; overflow must not leave a session.
         encode_session_overrides(
@@ -9546,29 +9564,91 @@ async def _create_session_from_existing_agent(
             }
         )
         with creation_stage("create_persistence_ms"):
-            conv = conversation_store.create_conversation(
-                agent_id=agent.id,
-                title=body.title,
-                parent_conversation_id=body.parent_session_id,
-                runner_id=inherited_runner_id,
-                kind="sub_agent" if body.parent_session_id else "default",
-                sub_agent_name=body.sub_agent_name,
-                host_id=body.host_id,
-                workspace=canonical_workspace,
-                git_branch=git_branch,
-                terminal_launch_args=validated_launch_args,
-                project_id=project_resolution.project_id,
-                labels=initial_labels or None,
-                model_override=model_override,
-                reasoning_effort=reasoning_effort,
-                cost_control_mode_override=cost_control_mode_override,
-                subagent_routing_override=subagent_routing_override,
-                harness_override=harness_override,
-                **snapshot_kwargs,
-            )
+            if registry_bundle is not None:
+                assert artifact_store is not None
+                # Reuse session+agent persistence, including hosted store overrides.
+                created = await asyncio.to_thread(
+                    _create_session_from_bundle,
+                    conversation_store,
+                    artifact_store,
+                    SessionCreateMetadata(
+                        title=body.title,
+                        labels=initial_labels,
+                        parent_session_id=body.parent_session_id,
+                        host_id=body.host_id,
+                        workspace=canonical_workspace,
+                        terminal_launch_args=validated_launch_args,
+                        project_id=project_resolution.project_id,
+                        reasoning_effort=reasoning_effort,
+                    ),
+                    registry_bundle,
+                    spec=validate_agent_bundle(
+                        registry_bundle,
+                        enforce_handler_allowlist=not (
+                            agent.session_id is None or local_single_user_enabled()
+                        ),
+                    ),
+                    derive_launch_args=False,
+                    runner_id=inherited_runner_id,
+                    inference_snapshot=inference_snapshot,
+                    inference_model=model_override,
+                    created_by=user_id,
+                )
+                session_persisted = True
+                conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, created.session_id
+                )
+                agent = await asyncio.to_thread(agent_store.get, created.agent_id)
+                assert conv is not None and agent is not None
+                if any(
+                    value is not None
+                    for value in (
+                        cost_control_mode_override,
+                        subagent_routing_override,
+                        harness_override,
+                    )
+                ):
+                    conv = await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        conv.id,
+                        cost_control_mode_override=cost_control_mode_override,
+                        subagent_routing_override=subagent_routing_override,
+                        harness_override=harness_override,
+                    )
+                    assert conv is not None
+                if git_branch is not None:
+                    assert body.host_id is not None
+                    conv = await asyncio.to_thread(
+                        conversation_store.set_host_id,
+                        conv.id,
+                        body.host_id,
+                        git_branch=git_branch,
+                    )
+            else:
+                conv = conversation_store.create_conversation(
+                    agent_id=agent.id,
+                    title=body.title,
+                    parent_conversation_id=body.parent_session_id,
+                    runner_id=inherited_runner_id,
+                    kind="sub_agent" if body.parent_session_id else "default",
+                    sub_agent_name=body.sub_agent_name,
+                    host_id=body.host_id,
+                    workspace=canonical_workspace,
+                    git_branch=git_branch,
+                    terminal_launch_args=validated_launch_args,
+                    project_id=project_resolution.project_id,
+                    labels=initial_labels or None,
+                    model_override=model_override,
+                    reasoning_effort=reasoning_effort,
+                    cost_control_mode_override=cost_control_mode_override,
+                    subagent_routing_override=subagent_routing_override,
+                    harness_override=harness_override,
+                    **snapshot_kwargs,
+                )
     except NameAlreadyExistsError as exc:
         if (
-            created_worktree_path is not None
+            not session_persisted
+            and created_worktree_path is not None
             and body.host_id is not None
             and git_branch is not None
         ):
@@ -9585,6 +9665,8 @@ async def _create_session_from_existing_agent(
             )
         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
     except Exception:
+        # After persistence, the workspace belongs to the session even if a
+        # follow-up metadata write fails. Before that, roll back our worktree.
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
         # cleanup before the error propagates. We re-raise unchanged
@@ -9593,7 +9675,8 @@ async def _create_session_from_existing_agent(
         # force-removed. An existing worktree bound via workspace_branch
         # also sets git_branch but is the user's — never destroy it.
         if (
-            created_worktree_path is not None
+            not session_persisted
+            and created_worktree_path is not None
             and body.host_id is not None
             and git_branch is not None
         ):
@@ -9815,6 +9898,8 @@ def _create_session_from_bundle(
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
     created_by: str | None = None,
+    *,
+    derive_launch_args: bool = True,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -9839,6 +9924,8 @@ def _create_session_from_bundle(
         parent session (caller-resolved, ownership-checked),
         e.g. ``"runner_abc123"``. ``None`` leaves the session
         unbound.
+    :param derive_launch_args: False for an internal template copy whose caller
+        already validated the launch arguments, including interactive children.
     :param spec: Optional pre-validated spec for *bundle_bytes*. The
         multipart route validates the bundle once up front (it needs
         ``os_env.cwd`` for workspace validation before any row
@@ -9878,7 +9965,7 @@ def _create_session_from_bundle(
         )
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
-    if metadata.parent_session_id is not None:
+    if derive_launch_args and metadata.parent_session_id is not None:
         try:
             terminal_launch_args = _derive_terminal_launch_args_from_spec(spec)
         except ValueError as exc:
@@ -9887,7 +9974,7 @@ def _create_session_from_bundle(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
-    elif metadata.terminal_launch_args is None:
+    elif derive_launch_args and metadata.terminal_launch_args is None:
         # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the
         # spec's explicit bypass opt-ins (e.g. codex-native ``yolo: true``);
         # an interactive session never inherits the headless default bypass.
@@ -9982,6 +10069,8 @@ async def _handle_mcp_tools_call(
     *,
     actor: dict[str, str] | None = None,
     request: Request | None = None,
+    execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    credential_user: str | None = None,
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -10018,9 +10107,10 @@ async def _handle_mcp_tools_call(
     :param agent_store: Store for agent lookup.
     :param runner_router: Router used to get a tunneled client pointed at
         the session's runner. ``None`` returns an error response.
-    :param actor: Authenticated principal, e.g.
-        ``{"run_as": "alice@example.com"}``. ``None`` when
-        identity is unknown.
+    :param actor: Policy principal: initiating user for a verified runner,
+        authenticated caller for direct calls, or ``None`` when unknown.
+    :param credential_user: Authenticated caller whose registry grant is used;
+        independent of the initiating policy actor.
     :returns: A JSON-RPC 2.0 response carrying the tool result as MCP
         ``content`` blocks, an ``InputRequiredResult`` on ASK, or an
         error response when the call is denied, the runner is
@@ -10082,6 +10172,8 @@ async def _handle_mcp_tools_call(
             state = json.loads(request_state_str)  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001
             return _mcp_error_response(rpc_id, -32000, "Invalid requestState: not valid JSON")
+        if not isinstance(state, dict):
+            return _mcp_error_response(rpc_id, -32000, "Invalid requestState")
         if state.get("session_id") != session_id:
             # Reject cross-session replay.
             return _mcp_error_response(rpc_id, -32000, "requestState session mismatch")
@@ -10128,7 +10220,11 @@ async def _handle_mcp_tools_call(
             approval = input_responses.get(elicitation_id_from_state) or {}
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
-            _pending = _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
+            _pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
+            identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
+            if _pending is not None and _pending.mcp_call_identity not in (None, identity):
+                return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
+            _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
             # Approval applies to the stored call and its reviewed transform.
             # Older pending entries use the re-evaluated transform.
             if _pending is not None and _pending.reviewed_arguments is not None:
@@ -10202,6 +10298,12 @@ async def _handle_mcp_tools_call(
                 from_mcp=True,
                 reviewed_arguments=arguments,
                 transformed_arguments=cast("dict[str, object] | None", call_result.data),
+                mcp_call_identity=(
+                    session_id,
+                    namespaced_name,
+                    (actor or {}).get("run_as"),
+                    credential_user,
+                ),
             )
             # The client carries identifiers; reviewed arguments stay on the server.
             request_state_payload: dict[str, Any] = {
@@ -10237,45 +10339,71 @@ async def _handle_mcp_tools_call(
             runner_router=runner_router,
         )
 
-    # ── Execute on the runner via WS tunnel ──────────────────────────
-    # The runner owns stdio subprocess spawning (correct machine, cwd,
-    # and env). We call its /mcp/execute endpoint through the same WS
-    # tunnel the runner already opened to the Omnigent server at startup.
-    runner_client = await _get_runner_client(session_id, runner_router)
-    if runner_client is None:
-        from omnigent.runtime import get_runner_client
+    from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
 
-        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
-    if runner_client is None:
-        return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
-    try:
-        from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
-
-        exec_resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/mcp/execute",
-            json=_runner_execute_body(
-                {"name": namespaced_name, "arguments": arguments},
-                step="initial",
+    runner_client: httpx.AsyncClient | None = None
+    registry_config = None
+    if request is not None and getattr(request.app.state, "mcp_registry", None) is not None:
+        registry_config = next(
+            (
+                c
+                for c in spec.mcp_servers
+                if c.transport == "registry" and namespaced_name.startswith(c.name + "__")
             ),
-            # ``sys_session_send`` returns a launch handle immediately; this
-            # timeout now protects ordinary runner proxy hangs.
-            timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
+            None,
         )
-        exec_resp.raise_for_status()
-        exec_data = exec_resp.json()
-    except ConnectionError as exc:
-        _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
-        if operation_id is not None:
-            return _mcp_error_response(
-                rpc_id,
-                RUNNER_MCP_EXECUTION_DETACHED_CODE,
-                RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
-            )
-        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
-        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
+    if execute_tool is not None:
+        exec_data = await execute_tool(arguments)
+    elif registry_config is not None:
+        from omnigent.server.registry_gateway import execute_registry_tool
 
+        exec_data = await execute_registry_tool(
+            request,
+            conv,
+            registry_config,
+            namespaced_name,
+            arguments,
+            credential_user,
+        )
+    else:
+        # ── Execute on the runner via WS tunnel ──────────────────────────
+        # The runner owns stdio subprocess spawning (correct machine, cwd,
+        # and env). We call its /mcp/execute endpoint through the same WS
+        # tunnel the runner already opened to the Omnigent server at startup.
+        runner_client = await _get_runner_client(session_id, runner_router)
+        if runner_client is None:
+            from omnigent.runtime import get_runner_client
+
+            runner_client = cast("httpx.AsyncClient | None", get_runner_client())
+        if runner_client is None:
+            return _mcp_error_response(
+                rpc_id, -32000, f"No runner bound for session {session_id!r}"
+            )
+        try:
+            exec_resp = await runner_client.post(
+                f"/v1/sessions/{session_id}/mcp/execute",
+                json=_runner_execute_body(
+                    {"name": namespaced_name, "arguments": arguments},
+                    step="initial",
+                ),
+                # ``sys_session_send`` returns a launch handle immediately; this
+                # timeout now protects ordinary runner proxy hangs.
+                timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
+            )
+            exec_resp.raise_for_status()
+            exec_data = exec_resp.json()
+        except ConnectionError as exc:
+            _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
+            if operation_id is not None:
+                return _mcp_error_response(
+                    rpc_id,
+                    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+                )
+            return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
+            return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
     if "error" in exec_data:
         err = exec_data["error"]
         return _mcp_error_response(
@@ -10322,6 +10450,9 @@ async def _handle_mcp_tools_call(
                 if elicit_result.content is not None:
                     resp_entry["content"] = elicit_result.content
                 elicitation_responses[eid] = resp_entry
+
+        if runner_client is None:
+            return _mcp_error_response(rpc_id, -32000, "Registry MCP elicitation is not supported")
 
         # Retry on the runner with the user's inputResponses.
         try:
@@ -10388,7 +10519,7 @@ async def _handle_mcp_tools_call(
         session_id, spec, conversation_store, conv, result_ctx
     )
 
-    if result_policy.set_labels:
+    if result_policy.set_labels and result_policy.action != PolicyAction.ASK:
         await asyncio.to_thread(engine.apply_label_writes, result_policy.set_labels)
 
     _logger.debug(
@@ -10400,7 +10531,11 @@ async def _handle_mcp_tools_call(
         extra={"session_id": session_id},
     )
 
-    if result_policy.action == PolicyAction.DENY:
+    if result_policy.action == PolicyAction.ASK and (
+        execute_tool is not None or registry_config is not None
+    ):
+        output = "[Result withheld: MCP gateway result-review approval is not supported]"
+    elif result_policy.action == PolicyAction.DENY:
         output = f"[Result suppressed by policy: {result_policy.reason or 'no reason given'}]"
     elif result_policy.data is not None:
         # Policy returned transformed output (e.g. PII-redacted content).
@@ -10418,7 +10553,10 @@ async def _handle_mcp_tools_call(
 
     return _mcp_ok_response(
         rpc_id,
-        {"content": [{"type": "text", "text": output}]},
+        {
+            "content": [{"type": "text", "text": output}],
+            "isError": exec_data.get("isError", False),
+        },
     )
 
 

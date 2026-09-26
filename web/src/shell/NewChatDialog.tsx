@@ -96,6 +96,7 @@ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { McpRegistryLaunchPicker } from "./McpRegistryLaunchPicker";
 import {
   Command,
   CommandEmpty,
@@ -2044,6 +2045,7 @@ export function AgentHarnessPicker({
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
 interface LandingDraft {
+  mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
   // attachments — the agent/host/workspace slots are discarded so the new
@@ -2256,6 +2258,7 @@ export function NewChatLandingScreen() {
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
           sandboxRepoSelections: [],
+          mcpRegistryServices: [],
           workspace: "",
           branchName: "",
           // The branch may be the worktree-default's auto-seed, generated for
@@ -2265,6 +2268,10 @@ export function NewChatLandingScreen() {
         };
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [mcpRegistryServices, setMcpRegistryServices] = useState<string[]>(
+    () => restoredDraft?.mcpRegistryServices ?? [],
+  );
+  const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -2295,6 +2302,7 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const mcpRegistryEnabled = info !== "loading" && info.enabled_connections?.includes("mcp");
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers
   // a family the host runs through the gateway; the built-in judge covers any
@@ -2607,6 +2615,7 @@ export function NewChatLandingScreen() {
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    mcpRegistryServices,
     project: projectParam,
     message,
     files,
@@ -4808,6 +4817,7 @@ export function NewChatLandingScreen() {
 
   const canSubmit =
     (message.trim().length > 0 || files.length > 0) &&
+    !mcpAuthorizing &&
     !pickerLoading &&
     !workspaceLoading &&
     !pendingSkillCompletion &&
@@ -4823,27 +4833,29 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : pendingSkillCompletion
-      ? "Loading skills…"
-      : pickerLoading || workspaceLoading
-        ? "Loading session configuration…"
-        : pickerSelectionError || sandboxCatalogError
-          ? (pickerSelectionError ?? sandboxCatalogError)
-          : sandboxSelected && sandboxRepoOverCap
-            ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-                maxSandboxRepos === 1 ? "repository" : "repositories"
-              } — remove the extras`
-            : sandboxSelected && !sandboxRepoValid
-              ? "Please enter a valid repository URL"
-              : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                ? "Selected host is unavailable. Reconnect it or choose another host."
-                : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                  ? "Please choose a host and working directory"
-                  : configuredAgentUnavailable && selectedAgent == null
-                    ? "This project's configured agent is unavailable — pick an agent to continue"
-                    : message.trim().length === 0 && files.length === 0
-                      ? "Enter a message to get started"
-                      : null;
+    : mcpAuthorizing
+      ? "Finish signing in to the MCP service…"
+      : pendingSkillCompletion
+        ? "Loading skills…"
+        : pickerLoading || workspaceLoading
+          ? "Loading session configuration…"
+          : pickerSelectionError || sandboxCatalogError
+            ? (pickerSelectionError ?? sandboxCatalogError)
+            : sandboxSelected && sandboxRepoOverCap
+              ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+                  maxSandboxRepos === 1 ? "repository" : "repositories"
+                } — remove the extras`
+              : sandboxSelected && !sandboxRepoValid
+                ? "Please enter a valid repository URL"
+                : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                  ? "Selected host is unavailable. Reconnect it or choose another host."
+                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                    ? "Please choose a host and working directory"
+                    : configuredAgentUnavailable && selectedAgent == null
+                      ? "This project's configured agent is unavailable — pick an agent to continue"
+                      : message.trim().length === 0 && files.length === 0
+                        ? "Enter a message to get started"
+                        : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -5350,6 +5362,9 @@ export function NewChatLandingScreen() {
         // same way the fork-resume path does.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = { labels: createLabels };
+        if (mcpRegistryEnabled && mcpRegistryServices.length) {
+          metadata.mcp_registry_services = mcpRegistryServices;
+        }
         // A config-seeded workspace is omitted on a `project_id` create so the
         // server default-fills it (same field semantics as the JSON path).
         if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
@@ -5429,6 +5444,9 @@ export function NewChatLandingScreen() {
             // Config-seeded agent on a `project_id` create: omitted so the
             // server default-fills it from the project config.
             ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
+            ...(mcpRegistryEnabled && mcpRegistryServices.length
+              ? { mcp_registry_services: mcpRegistryServices }
+              : {}),
             ...(createProjectId !== null ? { project_id: createProjectId } : {}),
             ...(sandboxSelected
               ? {
@@ -6467,6 +6485,20 @@ export function NewChatLandingScreen() {
                       />
                     </div>
                     {/* Host chip */}
+                    {mcpRegistryEnabled && (
+                      <McpRegistryLaunchPicker
+                        selected={mcpRegistryServices}
+                        disabled={creating}
+                        onAuthorizingChange={setMcpAuthorizing}
+                        onToggle={(id, enabled) =>
+                          setMcpRegistryServices((current) =>
+                            enabled
+                              ? [...new Set([...current, id])]
+                              : current.filter((service) => service !== id),
+                          )
+                        }
+                      />
+                    )}
                     <DropdownMenu
                       onOpenChange={(open) => {
                         // Run a requested "connect this machine" only once the menu
