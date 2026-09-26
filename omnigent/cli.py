@@ -3630,6 +3630,8 @@ def _build_host_daemon_env(
 
     env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
     env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
+    # Keep status glyphs safe when detached stdio uses a legacy encoding.
+    env.setdefault("PYTHONUTF8", "1")
     return env
 
 
