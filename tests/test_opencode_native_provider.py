@@ -11,13 +11,14 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.opencode_native.provider import (
+    ASK_ALL_PERMISSIONS,
+    OPENAI_COMPATIBLE_PACKAGE,
     OpenCodeGatewayResolution,
     _gateway_endpoint_for_model,
     _strip_jsonc_comments,
     _strip_trailing_commas,
-    build_opencode_model_default_config,
     build_opencode_omnigent_mcp_server,
-    build_opencode_provider_config,
+    build_opencode_provider_block,
     managed_connect_opencode_config,
     maybe_merge_user_provider_config,
     resolve_databricks_gateway,
@@ -76,24 +77,6 @@ def test_build_omnigent_mcp_server_rejects_non_string_values(
         build_opencode_omnigent_mcp_server(Path("/tmp/b"))
 
 
-def test_build_model_default_config_pins_model_without_provider_block() -> None:
-    cfg = build_opencode_model_default_config("anthropic/claude-sonnet-4-5")
-    assert cfg == {
-        "$schema": "https://opencode.ai/config.json",
-        "model": "anthropic/claude-sonnet-4-5",
-    }
-    # No provider block: opencode resolves the provider from the model prefix.
-    assert "provider" not in cfg
-
-
-def test_model_default_config_round_trips_through_writer(tmp_path: Path) -> None:
-    path = write_opencode_provider_config(
-        tmp_path, build_opencode_model_default_config("openai/gpt-5.5")
-    )
-    written = json.loads(path.read_text(encoding="utf-8"))
-    assert written["model"] == "openai/gpt-5.5"
-
-
 def test_qualified_model_joins_provider_and_endpoint() -> None:
     res = OpenCodeGatewayResolution(
         base_url="https://ws/serving-endpoints",
@@ -104,30 +87,50 @@ def test_qualified_model_joins_provider_and_endpoint() -> None:
     assert res.qualified_model == "databricks-gateway/databricks-claude-sonnet-4-6"
 
 
-def test_build_provider_config_shape() -> None:
+def test_ask_all_permissions_is_single_wildcard_ask_rule() -> None:
+    assert ASK_ALL_PERMISSIONS == [{"action": "*", "resource": "*", "effect": "ask"}]
+
+
+def test_build_provider_block_is_v2_shape() -> None:
     res = OpenCodeGatewayResolution(
         base_url="https://ws/serving-endpoints",
         api_key="sekret",
         model_id="databricks-claude-sonnet-4-6",
+        model_ids=("databricks-claude-sonnet-4-6", "databricks-kimi-k3"),
     )
-    cfg = build_opencode_provider_config(res)
-    block = cfg["provider"]["databricks-gateway"]
-    assert block["npm"] == "@ai-sdk/openai-compatible"
-    assert block["options"] == {"baseURL": "https://ws/serving-endpoints", "apiKey": "sekret"}
-    assert "databricks-claude-sonnet-4-6" in block["models"]
-    assert cfg["$schema"].endswith("config.json")
+    block = build_opencode_provider_block(res)
+    assert block == {
+        "databricks-gateway": {
+            "name": "Databricks AI Gateway",
+            "package": OPENAI_COMPATIBLE_PACKAGE,
+            "settings": {
+                "baseURL": "https://ws/serving-endpoints",
+                "apiKey": "sekret",
+                "provider": "databricks-gateway",
+            },
+            "models": {
+                "databricks-claude-sonnet-4-6": {"name": "databricks-claude-sonnet-4-6"},
+                "databricks-kimi-k3": {"name": "databricks-kimi-k3"},
+            },
+        }
+    }
+    # No v1 keys.
+    entry = block["databricks-gateway"]
+    assert "npm" not in entry and "options" not in entry
 
 
 def test_write_provider_config_is_0600_and_valid_json(tmp_path: Path) -> None:
     res = OpenCodeGatewayResolution(
         base_url="https://ws/serving-endpoints", api_key="tok", model_id="databricks-x"
     )
-    path = write_opencode_provider_config(tmp_path, build_opencode_provider_config(res))
+    path = write_opencode_provider_config(
+        tmp_path, {"providers": build_opencode_provider_block(res)}
+    )
     assert path == tmp_path / "opencode" / "opencode.json"
     # Token-bearing config must not be world/group readable.
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     parsed = json.loads(path.read_text())
-    assert parsed["provider"]["databricks-gateway"]["options"]["apiKey"] == "tok"
+    assert parsed["providers"]["databricks-gateway"]["settings"]["apiKey"] == "tok"
 
 
 @pytest.mark.parametrize(
@@ -234,9 +237,9 @@ def test_resolve_gateway_lists_all_chat_endpoints(monkeypatch: pytest.MonkeyPatc
     assert res is not None
     # pinned default first, embeddings + non-databricks dropped, de-duped
     assert res.model_ids == ("databricks-claude-sonnet-4-6", "databricks-kimi-k3")
-    cfg = build_opencode_provider_config(res)
-    models = cfg["provider"]["databricks-gateway"]["models"]  # type: ignore[index]
-    assert set(models) == {"databricks-claude-sonnet-4-6", "databricks-kimi-k3"}
+    block = build_opencode_provider_block(res)
+    models = block["databricks-gateway"]["models"]
+    assert set(models) == {"databricks-claude-sonnet-4-6", "databricks-kimi-k3"}  # type: ignore[bad-argument-type]
 
 
 def test_resolve_gateway_single_model_when_discovery_unavailable(

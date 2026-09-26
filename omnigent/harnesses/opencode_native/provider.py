@@ -1,20 +1,17 @@
-"""Synthesize OpenCode provider config for the native-server harness.
+"""Synthesize the OpenCode 2.x ``opencode.json`` for the native-server harness.
 
-Unlike codex/claude/pi — which consume ``HARNESS_*_GATEWAY_*`` env vars that
-their CLIs translate into provider config — OpenCode reads its provider/auth
-from its own config file under the per-session ``XDG_CONFIG_HOME``. So routing
-opencode-native through the Databricks AI gateway (or any OpenAI-compatible
-endpoint) means writing an ``opencode.json`` into the runner-owned
-``opencode serve``'s config dir at spawn, declaring a custom
-``@ai-sdk/openai-compatible`` provider pointed at ``{host}/serving-endpoints``.
-
-The model is then referenced as ``<provider_id>/<endpoint>`` per prompt.
+The runner-owned ``opencode serve`` reads its config from the per-session
+``XDG_CONFIG_HOME``. This module emits the v2 keys: ``providers`` (an
+OpenAI-compatible gateway declared with the native
+``@opencode/ai/providers/openai-compatible`` package), ``model``
+(``provider/model``), an ask-all ``permissions`` ruleset, ``mcp.servers``,
+``plugins`` and ``instructions``.
 
 Security: the file carries a bearer token, so it is written ``0600`` into the
 per-session XDG dir (never the user's global ``~/.config/opencode``). The token
 is resolved at spawn; a resumed session re-spawns the server and re-resolves, so
-short-lived gateway tokens refresh on resume (documented limitation: a token
-that expires mid-session is not refreshed in place).
+short-lived gateway tokens refresh on resume (a token that expires mid-session
+is not refreshed in place).
 """
 
 from __future__ import annotations
@@ -49,6 +46,12 @@ _SERVING_ENDPOINTS_PATH = "serving-endpoints"
 # catalog. Set it in the runner env to steer every session at one endpoint
 # (e.g. ``databricks-kimi-k3``).
 DATABRICKS_GATEWAY_DEFAULT_MODEL_ENV_VAR = "OMNIGENT_DATABRICKS_GATEWAY_MODEL"
+
+OPENCODE_CONFIG_SCHEMA = "https://opencode.ai/config.json"
+# Native provider package bundled with opencode 2.x (no npm install at runtime).
+OPENAI_COMPATIBLE_PACKAGE = "@opencode/ai/providers/openai-compatible"
+# Every tool call raises ``permission.asked`` so the forwarder can apply Omnigent policy.
+ASK_ALL_PERMISSIONS: list[dict[str, str]] = [{"action": "*", "resource": "*", "effect": "ask"}]
 
 
 @dataclass(frozen=True)
@@ -117,46 +120,28 @@ def resolve_bound_opencode_gateway(
     )
 
 
-def build_opencode_model_default_config(model: str) -> dict[str, object]:
+def build_opencode_provider_block(
+    resolution: OpenCodeGatewayResolution,
+) -> dict[str, dict[str, object]]:
     """
-    Build a minimal ``opencode.json`` that only pins the default model.
+    Build the ``providers`` entry for an OpenAI-compatible gateway.
 
-    Used when the user's own provider auth (``opencode auth login`` /
-    provider env keys) already supplies credentials, but a default model has
-    been chosen — via ``omni opencode --model`` or the ``omni setup`` OpenCode
-    default — so the per-session TUI (and the first turn) launch on that model
-    instead of OpenCode's built-in default (``opencode/big-pickle``). No
-    provider block: OpenCode resolves the provider from the model id's prefix
-    against its own ``auth.json``.
-
-    :param model: A ``provider/model`` id, e.g. ``"anthropic/claude-sonnet-4-5"``.
-    :returns: A config dict ready to serialize to ``opencode.json``.
-    """
-    return {"$schema": "https://opencode.ai/config.json", "model": model}
-
-
-def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dict[str, object]:
-    """
-    Build the ``opencode.json`` declaring a custom OpenAI-compatible provider.
-
-    :param resolution: The resolved gateway (base URL + key + model).
-    :returns: A config dict ready to serialize to ``opencode.json``.
+    :param resolution: The resolved gateway (base URL + key + models).
+    :returns: ``{provider_id: {name, package, settings, models}}``.
     """
     return {
-        "$schema": "https://opencode.ai/config.json",
-        "provider": {
-            resolution.provider_id: {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": resolution.provider_name,
-                "options": {
-                    "baseURL": resolution.base_url,
-                    "apiKey": resolution.api_key,
-                },
-                "models": {
-                    mid: {"name": mid} for mid in (resolution.model_ids or (resolution.model_id,))
-                },
-            }
-        },
+        resolution.provider_id: {
+            "name": resolution.provider_name,
+            "package": OPENAI_COMPATIBLE_PACKAGE,
+            "settings": {
+                "baseURL": resolution.base_url,
+                "apiKey": resolution.api_key,
+                "provider": resolution.provider_id,
+            },
+            "models": {
+                mid: {"name": mid} for mid in (resolution.model_ids or (resolution.model_id,))
+            },
+        }
     }
 
 
@@ -165,8 +150,7 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).
 
     :param xdg_config_home: The per-session ``XDG_CONFIG_HOME`` the server uses.
-    :param config: The provider config dict (see
-        :func:`build_opencode_provider_config`).
+    :param config: The v2 config dict (see :func:`build_opencode_config`).
     :returns: The path written.
     """
     cfg_dir = xdg_config_home / "opencode"
