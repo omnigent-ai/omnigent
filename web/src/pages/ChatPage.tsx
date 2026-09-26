@@ -89,6 +89,7 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  clearPersistedInitialPrompt,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
@@ -97,6 +98,7 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { slashCommandEchoText, type AnyBlock } from "@/lib/blocks";
 import {
   claudeNativeSubagentLabel,
   codexNativeSubagentLabel,
@@ -628,6 +630,21 @@ export function ChatPage() {
     // predicate already guarantees these, so this never fires at runtime.
     if (initialPrompt === null || !agentId || !urlConvId) return;
     initialPromptSentForConvRef.current = urlConvId;
+    // An interrupted POST may have landed before reload. The hydrated
+    // transcript is authoritative, so skip replay when it contains the prompt.
+    if (isInitialPromptDelivered(useChatStore.getState().blocks, initialPrompt.prompt)) {
+      clearPersistedInitialPrompt(urlConvId);
+      return;
+    }
+    // Remove a failed-send draft that duplicates the recovered prompt.
+    const draft = getSessionDraft(urlConvId);
+    if (
+      draft !== undefined &&
+      draft.text === initialPrompt.prompt.text &&
+      draft.files.length === 0
+    ) {
+      setSessionDraft(urlConvId, { text: "", files: [] });
+    }
     const { send, sendSlashCommand } = useChatStore.getState();
     dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
   }, [initialPrompt, urlConvId, loadingConversation, agentId]);
@@ -4149,6 +4166,35 @@ export function shouldSendInitialPrompt(params: {
     return false;
   }
   return true;
+}
+
+/**
+ * Check whether the hydrated transcript already contains a recovered first
+ * message. Plain text matches a user block; a skill matches its receipt or
+ * synthesized user echo.
+ */
+export function isInitialPromptDelivered(
+  blocks: AnyBlock[],
+  prompt: PendingInitialPrompt,
+): boolean {
+  if (prompt.skill !== null) {
+    const { name, args } = prompt.skill;
+    const echo = slashCommandEchoText(name, args);
+    return blocks.some(
+      (block) =>
+        (block.type === "slash_command" &&
+          block.kind === "skill" &&
+          block.name === name &&
+          block.arguments === args) ||
+        (block.type === "user_message" &&
+          block.content.some((c) => c.type === "input_text" && c.text === echo)),
+    );
+  }
+  return blocks.some(
+    (block) =>
+      block.type === "user_message" &&
+      block.content.some((c) => c.type === "input_text" && c.text === prompt.text),
+  );
 }
 
 /**

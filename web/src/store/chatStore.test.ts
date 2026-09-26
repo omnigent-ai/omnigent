@@ -66,6 +66,7 @@ import {
   ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
   ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
   beginLocalConversation,
+  clearPersistedInitialPrompt,
   consumePendingInitialPrompt,
   handleSessionEvent,
   hydrateLocalConversation,
@@ -12172,19 +12173,120 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 });
 
-// The first-message handoff from the landing composer to ChatPage. The
-// read-once delete is what replaces the old router-state clear: it must
-// return the prompt exactly once so a refresh/back can't replay it.
+// The in-memory handoff is read-once; storage survives until server settlement.
+// A per-heap guard and transcript reconciliation prevent duplicate dispatch.
 describe("pending initial prompt transport", () => {
-  it("returns the stashed prompt exactly once, then null", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  it("returns the stashed prompt exactly once within one page load", () => {
     setPendingInitialPrompt("conv_abc", { text: "read the README", skill: null });
     // First consume yields the stashed prompt verbatim.
     expect(consumePendingInitialPrompt("conv_abc")).toEqual({
       text: "read the README",
       skill: null,
     });
-    // Second consume yields null — the delete prevents a replay.
+    // The storage copy must not dispatch again within this heap.
     expect(consumePendingInitialPrompt("conv_abc")).toBeNull();
+  });
+
+  it("persists text + skill only, so a hard navigation can recover them", () => {
+    // A unit test cannot reset the module map; inspect the stored payload.
+    setPendingInitialPrompt("conv_hard", {
+      text: "survive the reload",
+      skill: null,
+      files: [new File(["x"], "a.png", { type: "image/png" })],
+    });
+    const raw = window.sessionStorage.getItem("omnigent.pendingInitialPrompts");
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!)).toEqual({
+      conv_hard: { text: "survive the reload", skill: null },
+    });
+  });
+
+  it("recovers a persisted prompt from a previous page load, once", () => {
+    // A direct storage seed models a fresh page with no in-memory entry.
+    window.sessionStorage.setItem(
+      "omnigent.pendingInitialPrompts",
+      JSON.stringify({ conv_recovered: { text: "came back after wake", skill: null } }),
+    );
+    expect(consumePendingInitialPrompt("conv_recovered")).toEqual({
+      text: "came back after wake",
+      skill: null,
+    });
+    expect(consumePendingInitialPrompt("conv_recovered")).toBeNull();
+  });
+
+  it("clearPersistedInitialPrompt drops the recovery copy", () => {
+    setPendingInitialPrompt("conv_clear", { text: "already delivered", skill: null });
+    consumePendingInitialPrompt("conv_clear");
+    // Reconciliation drops the copy when the transcript already has the prompt.
+    clearPersistedInitialPrompt("conv_clear");
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+  });
+
+  it("tolerates a corrupt persisted payload", () => {
+    window.sessionStorage.setItem("omnigent.pendingInitialPrompts", "{not json");
+    expect(consumePendingInitialPrompt("conv_corrupt")).toBeNull();
+    setPendingInitialPrompt("conv_corrupt", { text: "after corruption", skill: null });
+    expect(consumePendingInitialPrompt("conv_corrupt")).toEqual({
+      text: "after corruption",
+      skill: null,
+    });
+  });
+
+  it("a settled send clears the persisted copy so a reload can't replay it", async () => {
+    // An acknowledged POST must remove its recovery copy.
+    setPendingInitialPrompt("conv_settle", { text: "hello there", skill: null });
+    expect(consumePendingInitialPrompt("conv_settle")).toEqual({
+      text: "hello there",
+      skill: null,
+    });
+    useChatStore.setState({
+      conversationId: "conv_settle",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    await useChatStore.getState().send("hello there", "agent_xyz");
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+  });
+
+  it("a send severed mid-flight keeps the persisted copy for recovery", async () => {
+    // A network failure leaves the copy available for a later reload.
+    setPendingInitialPrompt("conv_severed", { text: "must survive sleep", skill: null });
+    expect(consumePendingInitialPrompt("conv_severed")).toEqual({
+      text: "must survive sleep",
+      skill: null,
+    });
+    useChatStore.setState({
+      conversationId: "conv_severed",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    fetchMock.mockImplementation(async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url).endsWith("/events")) throw new TypeError("network error");
+      return defaultFetchHandler(url, init);
+    });
+    await useChatStore.getState().send("must survive sleep", "agent_xyz");
+    expect(JSON.parse(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")!)).toEqual({
+      conv_severed: { text: "must survive sleep", skill: null },
+    });
+  });
+
+  it("an unrelated settled send does not clear a pending recovery copy", async () => {
+    // A different settled message must not erase the first prompt.
+    setPendingInitialPrompt("conv_unrelated", { text: "still pending", skill: null });
+    consumePendingInitialPrompt("conv_unrelated");
+    useChatStore.setState({
+      conversationId: "conv_unrelated",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    await useChatStore.getState().send("a different message", "agent_xyz");
+    expect(JSON.parse(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")!)).toEqual({
+      conv_unrelated: { text: "still pending", skill: null },
+    });
   });
 
   it("returns null for a conversation with no pending prompt", () => {
