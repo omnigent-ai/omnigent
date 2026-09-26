@@ -5,11 +5,12 @@
 // "is the runner asleep vs. is the host down vs. is this not host-bound"
 // inline at every render site.
 
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { clearSessionStopped, useStoppedSessions } from "@/store/stoppedSessions";
 
 /**
  * How long (seconds) after a session is created to treat it as
@@ -29,6 +30,9 @@ import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHeal
  * is only an upper bound on the "Connecting…" window, not a fixed delay.
  */
 export const STARTING_GRACE_S = 45;
+
+/** Ignore a stale online poll for one interval after a confirmed stop. */
+export const STOPPED_STALE_ONLINE_GRACE_S = 15;
 
 /** The subset of a conversation row this hook reads. */
 export type LivenessRow = Pick<Conversation, "host_id" | "permission_level" | "created_at"> & {
@@ -111,6 +115,8 @@ export function livenessRowFromSession(
  *   host relaunches the runner on the next message, so the composer stays
  *   open. The open view renders no banner for this state — typing
  *   silently relaunches the runner (which then flips it to `starting`).
+ * - `stopped` — an acknowledged explicit stop; unlike `runner_asleep`, the
+ *   open view says so. The composer can still relaunch the runner.
  * - `host_asleep` — the session is host-bound, the host tunnel is down, but
  *   the host is a resumable managed host: the server wakes the sandbox on the
  *   next message (the send-message relaunch path calls `resume_managed_host`).
@@ -137,6 +143,7 @@ export type SessionLiveness =
   | { kind: "online" }
   | { kind: "starting" }
   | { kind: "runner_asleep" }
+  | { kind: "stopped" }
   | { kind: "host_asleep" }
   | { kind: "host_offline"; isOwner: boolean }
   | { kind: "local_stranded" }
@@ -162,16 +169,21 @@ function isOwner(conv: Pick<Conversation, "permission_level"> | null | undefined
  *
  * | # | runner_online | host_online | host_id | turnActive | → state              |
  * |---|---------------|-------------|---------|------------|----------------------|
- * | 1 | true          | (any)       | (any)   | (any)      | online               |
+ * | 1 | true          | (any)       | (any)   | (any)      | online (stopped†)    |
  * | 2 | not-true      | (any)       | (any)   | (any)      | starting (fresh*)    |
  * | 3 | not-true      | false       | set+resumable | true  | starting (waking)    |
  * | 3'| not-true      | false       | set+resumable | false | host_asleep          |
  * | 3"| not-true      | false       | set, non-resum| (any) | host_offline {owner} |
+ * | 3‴| not-true      | (other)     | (any)   | false      | stopped†             |
  * | 4 | undefined     | (any)       | (any)   | (any)      | unknown (pre-poll)   |
  * | 5 | false         | true        | (any)   | true       | starting (relaunch)  |
  * | 5'| false         | true        | (any)   | false      | runner_asleep        |
  * | 6 | false         | undefined   | set     | (any)      | unknown (host unseen)|
  * | 7 | false         | null/false  | null    | (any)      | local_stranded       |
+ *
+ * `†stopped` = a confirmed stop marker: a fresh marker also outranks a
+ * stale-online poll; a dead host or just-sent turn takes precedence.
+ * A later online read clears the marker after the poll grace.
  *
  * `*fresh` = `created_at` is within {@link STARTING_GRACE_S} of now AND
  * the runner tunnel has never been observed online (initial cold boot).
@@ -262,8 +274,27 @@ function useSessionLivenessRaw(
   if (runnerOnline === true) everOnlineRef.current.seen = true;
   const runnerEverOnline = everOnlineRef.current.seen;
 
-  // 1. A live runner tunnel is the only thing that means "chat normally".
-  if (runnerOnline === true) return { kind: "online" };
+  // Keep the confirmed stop visible during one stale-online poll interval.
+  const stoppedAtMs = useStoppedSessions((s) =>
+    sessionId !== undefined ? s.stoppedAt[sessionId] : undefined,
+  );
+  const stopMarkerFresh =
+    typeof stoppedAtMs === "number" &&
+    Date.now() - stoppedAtMs < STOPPED_STALE_ONLINE_GRACE_S * 1000;
+  // Clear after a real relaunch, in an effect because the store is shared.
+  const clearStaleStop =
+    sessionId !== undefined &&
+    runnerOnline === true &&
+    typeof stoppedAtMs === "number" &&
+    (!stopMarkerFresh || opts?.turnActive === true);
+  useEffect(() => {
+    if (clearStaleStop && sessionId !== undefined) clearSessionStopped(sessionId);
+  }, [clearStaleStop, sessionId]);
+
+  // 1. A new turn makes an online read a relaunch, not stale poll data.
+  if (runnerOnline === true) {
+    return stopMarkerFresh && !opts?.turnActive ? { kind: "stopped" } : { kind: "online" };
+  }
 
   const hostId = conv?.host_id ?? null;
 
@@ -310,6 +341,12 @@ function useSessionLivenessRaw(
       return opts?.turnActive ? { kind: "starting" } : { kind: "host_asleep" };
     }
     return { kind: "host_offline", isOwner: isOwner(conv) };
+  }
+
+  // 3‴. A confirmed stop is visible unless a turn is relaunching the runner.
+  // A dead host takes precedence above: sending cannot restart it.
+  if (typeof stoppedAtMs === "number") {
+    return opts?.turnActive ? { kind: "starting" } : { kind: "stopped" };
   }
 
   // 4. The runner has not been observed yet (pre-poll) — don't surface any

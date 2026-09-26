@@ -1,4 +1,4 @@
-import { Loader2Icon, WifiOffIcon } from "lucide-react";
+import { CircleStopIcon, Loader2Icon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
@@ -111,9 +111,26 @@ export function ConnectionIndicator({
     );
   }
 
+  // Show explicit stops even in terminal-first sessions; idle sleep stays silent.
+  if (liveness.kind === "stopped") {
+    return (
+      <div
+        data-testid="stopped-indicator"
+        role="status"
+        className={cn(
+          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-sm",
+          CHAT_COLUMN_WIDTH,
+        )}
+      >
+        <CircleStopIcon className="size-3.5 shrink-0" aria-hidden />
+        <span>Session stopped — send a message to start it again</span>
+      </div>
+    );
+  }
+
   // Terminal-first sessions: the Chat/Terminal switcher lives in the header
   // (ViewModeToggle) on every shell, iOS included — this band renders
-  // nothing for them outside the unreachable states above.
+  // nothing for them outside the unreachable/stopped states above.
   if (terminalFirst?.isTerminalFirst) {
     return null;
   }

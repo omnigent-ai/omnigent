@@ -482,6 +482,15 @@ export function computeShiftSelectRange(
   return visibleIds.slice(start, end + 1);
 }
 
+/** Acknowledge a stop even when its session is not open. */
+function showStoppedToast(label: string) {
+  showToast(
+    <span>
+      Stopped <span className="font-medium">{label}</span> — sending a message starts it again
+    </span>,
+  );
+}
+
 /** Stable empty array for the pinned-conversations fallback (referential
     equality keeps dependent memos from re-firing while the query loads). */
 const EMPTY_CONVERSATIONS: Conversation[] = [];
@@ -4658,7 +4667,12 @@ function ConversationRowImpl({
                 variant="destructive"
                 data-testid="stop-session-confirm"
                 onClick={() =>
-                  stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
+                  stopSession.mutate(conversation.id, {
+                    onSuccess: () => {
+                      setStopOpen(false);
+                      showStoppedToast(label);
+                    },
+                  })
                 }
                 loading={stopSession.isPending}
                 componentId="sidebar.conversation.stop"
