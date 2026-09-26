@@ -922,6 +922,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex-native": BackgroundTitleGeneratorSpec(
             "omnigent.runner.background_titles.codex_native:generate_background_title"
         ),
+        "opencode-native": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.opencode_native:generate_background_title"
+        ),
     },
     harness_labels={
         "antigravity": "Antigravity",
