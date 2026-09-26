@@ -33,7 +33,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
-from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
+from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS, SIDE_CHAT_LABEL_KEY
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -701,6 +701,20 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fork_call["agent_id"] == body["agent_id"], (
         "Fork must bind the same cloned agent id it asked the store to create"
     )
+
+
+@pytest.mark.asyncio
+async def test_normal_fork_of_side_chat_drops_sidebar_hiding_label() -> None:
+    """Promoting a side chat creates a normal session visible in the sidebar."""
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    conv = _make_conversation(labels={SIDE_CHAT_LABEL_KEY: "1"})
+    conv_store = _ConversationStore(conversations={source_id: conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    assert SIDE_CHAT_LABEL_KEY not in resp.json()["labels"]
 
 
 @pytest.mark.asyncio
