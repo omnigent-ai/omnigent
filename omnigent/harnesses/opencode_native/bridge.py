@@ -458,6 +458,20 @@ def xdg_data_home_for_bridge_dir(bridge_dir: Path) -> Path:
     return bridge_dir / _XDG_DATA_DIR
 
 
+def user_xdg_data_home() -> Path:
+    """
+    Return the user's real ``XDG_DATA_HOME`` (not a per-session one).
+
+    The runner's own env carries the user's data home; per-session overrides
+    are set only on spawned servers.
+
+    :returns: ``$XDG_DATA_HOME`` or ``~/.local/share``.
+    """
+    from omnigent.onboarding.opencode_auth import opencode_data_dir
+
+    return opencode_data_dir().parent
+
+
 def xdg_config_home_for_bridge_dir(bridge_dir: Path) -> Path:
     """
     Return the per-session ``XDG_CONFIG_HOME`` for *bridge_dir*.

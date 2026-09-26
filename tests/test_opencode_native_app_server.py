@@ -516,3 +516,35 @@ def test_server_reserves_user_data_store_flag(
         bridge_dir=tmp_path, workspace=tmp_path, verify_version=False, user_data_store=True
     )
     assert importer.user_data_store is True
+
+
+def test_filtered_server_env_user_data_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real_data = tmp_path / "real-data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(real_data))
+    monkeypatch.setenv("OPENCODE_DB", "/elsewhere/other.db")
+
+    env = filtered_server_env(
+        bridge_dir=tmp_path / "bridge", auth_secret="pw", user_data_store=True
+    )
+
+    assert env["XDG_DATA_HOME"] == str(real_data)
+    assert "OPENCODE_DB" not in env, "import must let OpenCode resolve the user's own DB"
+    # Config stays isolated so user plugins and MCP servers never start.
+    assert env["XDG_CONFIG_HOME"] == str(tmp_path / "bridge" / "xdg-config")
+
+
+def test_server_user_data_store_sets_real_data_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "real-data"))
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        verify_version=False,
+        user_data_store=True,
+    )
+    assert server.xdg_data_home == tmp_path / "real-data"
+    assert "OPENCODE_DB" not in server.env
