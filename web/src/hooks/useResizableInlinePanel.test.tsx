@@ -2,7 +2,11 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { setInnerWidth } from "./resizeHookTestHelpers";
-import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizableInlinePanel";
+import {
+  inlinePanelHasDragRoom,
+  resetWidthStoreForTesting,
+  useResizableInlinePanel,
+} from "./useResizableInlinePanel";
 
 // useResizableInlinePanel keeps its width in a module-level store shared across
 // all callers, re-seeded per storage key. resetWidthStoreForTesting clears it
@@ -762,5 +766,18 @@ describe("useResizableInlinePanel drag overlay", () => {
     // leave the transparent overlay swallowing every click on the page.
     unmount();
     expect(overlaySelector()).toBeNull();
+  });
+});
+
+describe("inlinePanelHasDragRoom", () => {
+  it("reports no travel when an open sidebar pins an unfolded foldable's rail", () => {
+    setInnerWidth(791);
+    expect(inlinePanelHasDragRoom(320)).toBe(false);
+    expect(inlinePanelHasDragRoom(0)).toBe(true);
+  });
+
+  it("keeps travel on a desktop row with the sidebar open", () => {
+    setInnerWidth(1440);
+    expect(inlinePanelHasDragRoom(320)).toBe(true);
   });
 });

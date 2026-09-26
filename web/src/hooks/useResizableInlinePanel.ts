@@ -61,10 +61,7 @@ function defaultWidthPx(): number {
 // Width the panel may not eat into: the sidebar when it's open. Passed down
 // from AppShell so opening the sidebar tightens the ceiling instead of
 // squeezing the chat.
-function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
-  // No viewport ceiling available off the DOM (SSR / node test env) — this runs
-  // during render, so guard before reading `window` to avoid a hard throw.
-  if (typeof window === "undefined") return Math.max(minPx, w);
+function widthBounds(minPx: number, reservedPx: number): { floor: number; ceiling: number } {
   // Reserve the largest possible gutter footprint so a pointer-capability
   // change cannot pull the chat below its floor.
   const available = window.innerWidth - reservedPx - COARSE_GUTTER_PX;
@@ -85,10 +82,23 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
   );
   // The chat's hard floor wins over the panel's own comfort minimum: when the
   // viewport (with the sidebar open) is too small to grant both, the panel
-  // yields below `minPx` rather than let the chat break its floor. Clamping
-  // the floor to the ceiling keeps the range valid so `Math.max` can't push the
-  // width back up past the chat-preserving cap.
-  return Math.max(Math.min(minPx, ceiling), Math.min(w, ceiling));
+  // yields below `minPx` rather than let the chat break its floor.
+  return { floor: Math.min(minPx, ceiling), ceiling };
+}
+
+function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
+  // No viewport ceiling available off the DOM (SSR / node test env) — this runs
+  // during render, so guard before reading `window` to avoid a hard throw.
+  if (typeof window === "undefined") return Math.max(minPx, w);
+  const { floor, ceiling } = widthBounds(minPx, reservedPx);
+  return Math.max(floor, Math.min(w, ceiling));
+}
+
+/** Whether the rail keeps a usable drag range with `reservedPx` claimed. */
+export function inlinePanelHasDragRoom(reservedPx: number, minPx = MIN_WIDTH_PX): boolean {
+  if (typeof window === "undefined") return true;
+  const { floor, ceiling } = widthBounds(minPx, reservedPx);
+  return ceiling - floor >= MIN_DRAG_RANGE_PX;
 }
 
 // ---------------------------------------------------------------------------

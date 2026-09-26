@@ -95,7 +95,7 @@ import {
   livenessRowFromSession,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
-import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
+import { inlinePanelHasDragRoom, useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ChatHeader } from "./ChatHeader";
@@ -2038,6 +2038,35 @@ export function AppShell() {
     workspacePanelVisible && !mobileViewport,
     rootSessionResolved,
   );
+
+  // On tablet / unfolded-foldable widths a pushed sidebar can leave the rail no
+  // drag travel. Collapse it when the rail opens or the viewport changes, and
+  // restore it when the rail closes; a manual reopen in between is kept.
+  const railActive = workspacePanelVisible && !mobileViewport;
+  const sidebarCollapsedForRailRef = useRef(false);
+  const sidebarLayoutRef = useRef({ open: sidebarOpen, width: sidebarWidth });
+  sidebarLayoutRef.current = { open: sidebarOpen, width: sidebarWidth };
+  useEffect(() => {
+    if (sidebarOpen) sidebarCollapsedForRailRef.current = false;
+  }, [sidebarOpen]);
+  useEffect(() => {
+    if (!railActive) {
+      if (sidebarCollapsedForRailRef.current) {
+        sidebarCollapsedForRailRef.current = false;
+        setSidebarOpen(true);
+      }
+      return undefined;
+    }
+    const collapseIfCramped = () => {
+      const { open, width } = sidebarLayoutRef.current;
+      if (!open || inlinePanelHasDragRoom(width, inlinePanelMinWidth)) return;
+      sidebarCollapsedForRailRef.current = true;
+      setSidebarOpen(false);
+    };
+    collapseIfCramped();
+    window.addEventListener("resize", collapseIfCramped);
+    return () => window.removeEventListener("resize", collapseIfCramped);
+  }, [railActive, inlinePanelMinWidth]);
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
