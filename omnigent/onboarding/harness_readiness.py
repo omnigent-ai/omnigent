@@ -55,6 +55,7 @@ from omnigent.onboarding.harness_install import (
     KIRO_KEY,
     OPENCODE_KEY,
     PI_KEY,
+    PRIME_AGENT_KEY,
     QWEN_KEY,
     READINESS_CLI_PROBE_TIMEOUT_S,
     harness_cli_installed,
@@ -162,6 +163,15 @@ _KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"
 # ``hermes model``); the headless ``hermes`` harness gates on the same binary.
 _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-hermes"})
 
+# prime-agent harnesses. The ``prime-agent`` CLI takes per-spawn
+# ``--provider`` / ``--model`` flags (plus ACP mode), so like the other
+# OpenAI-compatible CLIs it can't launch without the binary on ``PATH`` —
+# gate the headless and native spellings on it. Auth lives in its own
+# settings (``~/.prime/agent/settings.json``).
+_PRIME_AGENT_HARNESSES: frozenset[str] = frozenset(
+    {"prime-agent", "prime-agent-native", "native-prime-agent"}
+)
+
 # Native Devin harnesses boot the resident ``devin`` TUI (``omni devin``). Devin
 # owns its own auth (``devin auth login`` writes a credential file it reads back
 # at spawn), so there is no Omnigent-managed key to gate on and readiness is
@@ -263,6 +273,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(GOOSE_KEY)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
         return _installer_only_availability(HERMES_KEY)
+    if canonical in _PRIME_AGENT_HARNESSES:
+        return _installer_only_availability(PRIME_AGENT_KEY)
     if canonical in _DEVIN_NATIVE_HARNESSES:
         return _installer_only_availability(DEVIN_KEY)
     if canonical == CURSOR_KEY:
@@ -1058,6 +1070,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(KIMI_SURFACE)
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
+    spellings.update(_PRIME_AGENT_HARNESSES)  # prime-agent wraps its own CLI
     spellings.add(COPILOT_KEY)
     canonical_by_cache_key: dict[tuple[str, ...], str] = {}
     cache_key_by_spelling: dict[str, tuple[str, ...]] = {}

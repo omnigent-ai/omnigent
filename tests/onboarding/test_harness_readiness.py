@@ -422,6 +422,11 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # prime-agent — headless CLI + native spellings; all gate on the
+        # prime-agent binary.
+        "prime-agent",
+        "prime-agent-native",
+        "native-prime-agent",
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
         # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
         "acp",
