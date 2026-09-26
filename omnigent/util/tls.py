@@ -52,16 +52,36 @@ def resolve_ca_file() -> str:
     return certifi.where()
 
 
+def resolve_ca_dir() -> str | None:
+    """Return a valid hashed-cert CA directory (capath), or ``None``.
+
+    Honors ``SSL_CERT_DIR`` via ``ssl.get_default_verify_paths`` so a corporate CA
+    shipped only as an OpenSSL hashed directory stays trusted; a missing or
+    non-directory path is ignored rather than raised.
+
+    :returns: An existing capath directory, or ``None`` when none is configured.
+    """
+    capath = ssl.get_default_verify_paths().capath
+    if capath and Path(capath).is_dir():
+        logger.debug("Using system CA directory: %s", capath)
+        return capath
+    return None
+
+
 def client_ssl_context() -> ssl.SSLContext:
     """Return a cached verifying client SSL context.
 
-    Built once (lazily) so a reconnect loop doesn't re-read the bundle on every
-    attempt. Keeps the secure defaults of :func:`ssl.create_default_context`
-    (hostname checking enabled, ``verify_mode == CERT_REQUIRED``).
+    Built once so reconnect loops do not re-read the bundle. Trusts the resolved CA
+    bundle plus a configured ``SSL_CERT_DIR`` (:func:`resolve_ca_dir`) and keeps
+    :func:`ssl.create_default_context`'s hostname checking and ``CERT_REQUIRED``.
 
-    :returns: A shared :class:`ssl.SSLContext` trusting the resolved CA bundle.
+    :returns: A shared :class:`ssl.SSLContext`.
     """
     global _client_ssl_context
     if _client_ssl_context is None:
-        _client_ssl_context = ssl.create_default_context(cafile=resolve_ca_file())
+        context = ssl.create_default_context(cafile=resolve_ca_file())
+        capath = resolve_ca_dir()
+        if capath is not None:
+            context.load_verify_locations(capath=capath)
+        _client_ssl_context = context
     return _client_ssl_context
