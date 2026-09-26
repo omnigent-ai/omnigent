@@ -369,46 +369,76 @@ async def test_connect_provider_key() -> None:
     await client.aclose()
 
 
-async def test_events_parses_sse_stream() -> None:
+async def test_stream_events_parses_v2_frames_and_skips_heartbeats() -> None:
     sse_body = (
-        "event: message\n"
-        'data: {"type": "session.next.text.delta", '
-        '"properties": {"sessionID": "ses_1", "delta": "hel"}}\n'
+        'data: {"id": "evt_0", "created": 1, "type": "server.connected", "data": {}}\n'
         "\n"
-        "id: evt_2\n"
-        'data: {"type": "session.next.text.ended", '
-        '"properties": {"sessionID": "ses_1", "text": "hello"}}\n'
+        ": heartbeat\n"
         "\n"
-        ": heartbeat comment\n"
+        'data: {"id": "evt_1", "created": 2, "type": "session.text.delta", '
+        '"location": {"directory": "/repo"}, '
+        '"data": {"sessionID": "ses_1", "ordinal": 0, "delta": "hel"}}\n'
         "\n"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/event"
+        assert request.url.path == "/api/event"
         return httpx.Response(200, text=sse_body, headers={"content-type": "text/event-stream"})
 
     client = _client(handler)
-    events: list[OpenCodeEvent] = []
-    async for event in client.events():
-        events.append(event)
-    assert [e.type for e in events] == [
-        "session.next.text.delta",
-        "session.next.text.ended",
-    ]
-    assert events[0].properties["delta"] == "hel"
-    assert events[1].id == "evt_2"
+    events = [event async for event in client.stream_events()]
+    assert [e.type for e in events] == ["server.connected", "session.text.delta"]
+    assert events[0].location is None
+    assert events[1] == OpenCodeEvent(
+        id="evt_1",
+        type="session.text.delta",
+        data={"sessionID": "ses_1", "ordinal": 0, "delta": "hel"},
+        location={"directory": "/repo"},
+    )
     await client.aclose()
 
 
-async def test_events_skips_non_json_data() -> None:
-    sse_body = 'data: not-json\n\ndata: {"type": "x", "properties": {}}\n\n'
+async def test_stream_events_heartbeat_inside_frame_does_not_split_it() -> None:
+    sse_body = (
+        'data: {"id": "evt_1", "type": "session.text.delta",\n'
+        ": heartbeat\n"
+        'data:  "data": {"delta": "x"}}\n'
+        "\n"
+    )
+    client = _client(lambda _r: httpx.Response(200, text=sse_body))
+    events = [event async for event in client.stream_events()]
+    assert [(e.id, e.type, e.data) for e in events] == [
+        ("evt_1", "session.text.delta", {"delta": "x"})
+    ]
+    await client.aclose()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text=sse_body)
 
-    client = _client(handler)
-    events = [e async for e in client.events()]
-    assert [e.type for e in events] == ["x"]
+async def test_stream_events_skips_non_json_and_non_object_frames() -> None:
+    sse_body = (
+        "data: not-json\n\n"
+        "data: [1, 2]\n\n"
+        'data: {"id": "evt_2", "type": "session.status", "data": {"type": "idle"}}\n\n'
+    )
+    client = _client(lambda _r: httpx.Response(200, text=sse_body))
+    assert [e.type async for e in client.stream_events()] == ["session.status"]
+    await client.aclose()
+
+
+async def test_stream_events_flushes_trailing_frame_without_blank_line() -> None:
+    sse_body = 'data: {"id": "evt_3", "type": "session.idle", "data": {}}'
+    client = _client(lambda _r: httpx.Response(200, text=sse_body))
+    assert [e.id async for e in client.stream_events()] == ["evt_3"]
+    await client.aclose()
+
+
+async def test_stream_events_http_error_raises() -> None:
+    client = _client(
+        lambda _r: httpx.Response(401, json={"_tag": "UnauthorizedError", "message": "no"})
+    )
+    with pytest.raises(OpenCodeClientError) as exc_info:
+        async for _event in client.stream_events():
+            pass
+    assert exc_info.value.status_code == 401
     await client.aclose()
 
 

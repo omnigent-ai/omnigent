@@ -100,10 +100,13 @@ class _FakeClient:
     ) -> None:
         self.calls.append(("set_model", (session_id, provider_id, model_id)))
 
-    async def events(self) -> Any:
-        self.calls.append(("events", None))
+    async def stream_events(self) -> Any:
+        self.calls.append(("stream_events", None))
         yield SimpleNamespace(
-            id="evt_1", type="message.updated", properties={"k": "v"}, raw={"r": 1}
+            id="evt_1",
+            type="session.status",
+            data={"sessionID": "ses_1", "type": "busy"},
+            location={"directory": "/w"},
         )
 
     async def aclose(self) -> None:
@@ -198,9 +201,10 @@ async def test_events_maps_to_native_event() -> None:
     assert len(events) == 1
     assert (events[0].id, events[0].type, events[0].payload) == (
         "evt_1",
-        "message.updated",
-        {"k": "v"},
+        "session.status",
+        {"sessionID": "ses_1", "type": "busy"},
     )
+    assert events[0].raw["location"] == {"directory": "/w"}
     assert client.closed
 
 

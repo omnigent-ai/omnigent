@@ -109,40 +109,38 @@ class OpenCodeSession:
 @dataclass(frozen=True)
 class OpenCodeEvent:
     """
-    One decoded OpenCode SSE event.
+    One decoded ``GET /api/event`` frame.
 
-    :param id: Optional SSE event id.
-    :param type: Event discriminator, e.g. ``"message.part.updated"`` or
-        ``"session.next.text.delta"``.
-    :param properties: The event's ``properties`` object.
-    :param raw: The full decoded envelope for debugging/forward-compat.
+    :param id: Event id, e.g. ``"evt_abc"``, or ``None`` when absent.
+    :param type: Event discriminator, e.g. ``"session.text.delta"``.
+    :param data: The event payload object.
+    :param location: ``{"directory": ...}`` for location-scoped events, else
+        ``None``.
     """
 
     id: str | None
     type: str
-    properties: _JsonObject
-    raw: _JsonObject
+    data: dict[str, Any]
+    location: dict[str, Any] | None
 
     @classmethod
-    def from_envelope(
-        cls, envelope: _JsonMapping, *, event_id: str | None = None
-    ) -> OpenCodeEvent:
+    def from_frame(cls, frame: _JsonMapping) -> OpenCodeEvent:
         """
-        Build an :class:`OpenCodeEvent` from a decoded SSE data object.
+        Build an :class:`OpenCodeEvent` from one decoded SSE frame.
 
-        :param envelope: Decoded JSON, e.g.
-            ``{"type": "message.part.updated", "properties": {...}}``.
-        :param event_id: Optional SSE ``id:`` framing value.
-        :returns: Parsed event; unknown shapes get ``type=""``.
+        :param frame: e.g. ``{"id": "evt_1", "created": 1, "type":
+            "session.text.delta", "data": {...}, "location": {...}}``.
+        :returns: Parsed event; unknown shapes get ``type=""`` and ``data={}``.
         """
-        type_value = envelope.get("type")
-        props = envelope.get("properties")
-        envelope_id = envelope.get("id")
+        event_id = frame.get("id")
+        type_value = frame.get("type")
+        data = frame.get("data")
+        location = frame.get("location")
         return cls(
-            id=envelope_id if isinstance(envelope_id, str) else event_id,
+            id=event_id if isinstance(event_id, str) else None,
             type=type_value if isinstance(type_value, str) else "",
-            properties=props if isinstance(props, dict) else {},
-            raw=dict(envelope),
+            data=dict(data) if isinstance(data, Mapping) else {},
+            location=dict(location) if isinstance(location, Mapping) else None,
         )
 
 
@@ -648,21 +646,22 @@ class OpenCodeClient:
 
     # --- events ----------------------------------------------------------
 
-    async def events(self) -> AsyncIterator[OpenCodeEvent]:
+    async def stream_events(self) -> AsyncIterator[OpenCodeEvent]:
         """
-        Stream server events over SSE (``GET /event``).
+        Stream server events (``GET /api/event``).
 
-        Yields one :class:`OpenCodeEvent` per parsed SSE event. The
-        iterator ends when the server closes the stream; callers own
-        reconnect/backoff.
+        The first event is ``server.connected``. The iterator ends when the
+        server closes the stream; callers own reconnect and history gap-fill.
 
         :returns: Async iterator of decoded events.
+        :raises OpenCodeClientError: On a non-2xx status.
         """
-        async with self._client.stream("GET", "/event", timeout=None) as response:
+        async with self._client.stream("GET", "/api/event", timeout=None) as response:
             if response.status_code >= 400:
                 body = await response.aread()
                 raise OpenCodeClientError(
-                    f"OpenCode /event failed: {response.status_code} {body[:200]!r}"
+                    f"OpenCode /api/event failed: {response.status_code} {body[:200]!r}",
+                    status_code=response.status_code,
                 )
             async for event in _parse_sse(response.aiter_lines()):
                 yield event
@@ -670,59 +669,42 @@ class OpenCodeClient:
 
 async def _parse_sse(lines: AsyncIterator[str]) -> AsyncIterator[OpenCodeEvent]:
     """
-    Parse a stream of SSE lines into :class:`OpenCodeEvent` objects.
+    Parse SSE lines into :class:`OpenCodeEvent` objects.
 
-    Implements the subset of the SSE spec OpenCode uses: ``id:``,
-    ``event:`` and (possibly multi-line) ``data:`` fields, with a blank
-    line dispatching the accumulated event. ``data`` payloads are decoded
-    as JSON; non-JSON data blocks are skipped (logged at debug).
+    A frame is one or more ``data:`` lines ended by a blank line. Comment lines
+    (``: heartbeat``) never end a frame, and ``id:`` / ``event:`` / ``retry:``
+    are ignored because v2 carries the id and type inside the JSON.
 
     :param lines: Async iterator of decoded SSE text lines.
     :returns: Async iterator of parsed events.
     """
-    event_id: str | None = None
     data_lines: list[str] = []
     async for raw_line in lines:
-        line = raw_line.rstrip("\n").rstrip("\r")
+        line = raw_line.rstrip("\r\n")
         if line == "":
             if data_lines:
-                payload = "\n".join(data_lines)
+                event = _decode_frame("\n".join(data_lines))
                 data_lines = []
-                current_id = event_id
-                event_id = None
-                parsed = _decode_event(payload, current_id)
-                if parsed is not None:
-                    yield parsed
-            else:
-                event_id = None
+                if event is not None:
+                    yield event
             continue
         if line.startswith(":"):
-            # SSE comment / heartbeat.
             continue
         field_name, _, value = line.partition(":")
-        if value.startswith(" "):
-            value = value[1:]
         if field_name == "data":
-            data_lines.append(value)
-        elif field_name == "id":
-            event_id = value
-        # ``event:`` and ``retry:`` are accepted but unused; OpenCode
-        # encodes the discriminator inside the JSON ``type`` field.
-    # Flush a trailing event with no terminating blank line.
+            data_lines.append(value[1:] if value.startswith(" ") else value)
     if data_lines:
-        parsed = _decode_event("\n".join(data_lines), event_id)
-        if parsed is not None:
-            yield parsed
+        event = _decode_frame("\n".join(data_lines))
+        if event is not None:
+            yield event
 
 
-def _decode_event(payload: str, event_id: str | None) -> OpenCodeEvent | None:
+def _decode_frame(payload: str) -> OpenCodeEvent | None:
     """
     Decode one SSE ``data`` payload into an :class:`OpenCodeEvent`.
 
     :param payload: Raw JSON text from one or more ``data:`` lines.
-    :param event_id: Optional SSE ``id:`` value for the event.
-    :returns: Parsed event, or ``None`` when the payload is not a JSON
-        object.
+    :returns: Parsed event, or ``None`` when the payload is not a JSON object.
     """
     try:
         decoded = json.loads(payload)
@@ -731,4 +713,4 @@ def _decode_event(payload: str, event_id: str | None) -> OpenCodeEvent | None:
         return None
     if not isinstance(decoded, dict):
         return None
-    return OpenCodeEvent.from_envelope(decoded, event_id=event_id)
+    return OpenCodeEvent.from_frame(decoded)

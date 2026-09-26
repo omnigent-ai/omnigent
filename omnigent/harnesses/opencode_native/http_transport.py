@@ -269,16 +269,21 @@ class OpenCodeHttpTransport:
             await client.aclose()
 
     async def events(self, session_id: str) -> AsyncIterator[NativeEvent]:
-        """Stream native events, filtered to *session_id*."""
+        """Stream native events from ``GET /api/event`` (unfiltered)."""
         del session_id
         client = self._client()
         try:
-            async for event in client.events():
+            async for event in client.stream_events():
                 yield NativeEvent(
                     id=event.id,
                     type=event.type,
-                    payload=event.properties,
-                    raw=event.raw,
+                    payload=event.data,
+                    raw={
+                        "id": event.id,
+                        "type": event.type,
+                        "data": event.data,
+                        "location": event.location,
+                    },
                 )
         finally:
             await client.aclose()
