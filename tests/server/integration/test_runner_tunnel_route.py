@@ -362,7 +362,7 @@ async def test_ws_tunnel_status_reports_registration(
     disconnected = rows["disconnected"]
     assert disconnected["connection_id"] == "conn-status-1"
     assert disconnected["code"] == 1000
-    assert disconnected["ended_by"] == f"tunnel-receive:{_RUNNER_ID}"
+    assert disconnected["ended_by"] == "tunnel-receive"
     assert disconnected["connection_age_s"] >= 0
 
 
@@ -1257,6 +1257,71 @@ async def test_ping_loop_restamps_runner_liveness(
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=budget(1.0))
         session_live_state.configure(None)
+
+
+async def test_ping_timeout_closes_tunnel_and_names_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A silent runner is closed by the server and both rows name the socket.
+
+    Once no frame arrives within the liveness window the ping loop declares
+    the runner dead and closes the tunnel. The ``runner_ping_timeout`` row and
+    the tunnel's end row must carry the hello's connection id, the
+    connection's age and the silence, and name the ping task among what ended
+    the tunnel. Whether the peer's close reply has arrived by the time the
+    handler observes the end is timing dependent, so the end row is either
+    ``closed`` (ping task alone) or ``disconnected`` (peer close seen too).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import omnigent.server.routes.runner_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 1)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-silent-1")
+        # The runner sends nothing more; pings go unanswered until the server
+        # closes the tunnel with the ping-timeout code.
+        deadline = asyncio.get_event_loop().time() + budget(2.0)
+        while True:
+            message = await communicator.receive_output(timeout=budget(1.0))
+            if message["type"] == "websocket.close":
+                break
+            assert asyncio.get_event_loop().time() < deadline, "ping timeout never closed"
+        assert message["code"] == 4003
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 4003})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=budget(1.0))
+
+    timeouts = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_ping_timeout"
+    ]
+    assert len(timeouts) == 1
+    assert timeouts[0]["runner_id"] == _RUNNER_ID
+    assert timeouts[0]["connection_id"] == "conn-silent-1"
+    assert timeouts[0]["connection_age_s"] >= 0
+    assert timeouts[0]["silent_s"] > 0
+    ends = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel"
+        and r.attributes["phase"] in {"closed", "disconnected"}
+    ]
+    assert len(ends) == 1
+    assert ends[0]["connection_id"] == "conn-silent-1"
+    assert "tunnel-ping" in ends[0]["ended_by"].split(",")
+    assert ends[0]["connection_age_s"] >= 0
+    if ends[0]["phase"] == "disconnected":
+        assert ends[0]["code"] == 4003
 
 
 async def test_keepalive_loop_fires_faster_than_the_ping_interval(

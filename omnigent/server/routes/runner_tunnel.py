@@ -575,9 +575,11 @@ def create_runner_tunnel_router(
                     {sender_task, ping_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                # Every helper that had finished, by role: a server-declared
+                # ping timeout may or may not already carry the peer's close.
+                ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
                 for task in done:
                     task_name = task.get_name()
-                    ended_by = task_name
                     if task.cancelled():
                         _logger.warning(
                             "Tunnel helper task cancelled for runner %s: %s",
@@ -615,9 +617,9 @@ def create_runner_tunnel_router(
                             ),
                         )
                     raise task_error
-                # A helper task ending without an exception is a server-side
-                # close (ping timeout, replaced generation): record it, since no
-                # ``disconnected`` row follows.
+                # Every finished helper ended cleanly: a server-side close (ping
+                # timeout, replaced generation) with no peer close yet, so no
+                # ``disconnected`` row follows. Record it.
                 _logger.info(
                     "Runner %s tunnel closed (%s ended)",
                     runner_id,

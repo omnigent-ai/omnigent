@@ -590,14 +590,15 @@ async def serve_tunnel(
             disconnect_error = exc
             raise
         finally:
+            # Classified once, for the counter and the debug-log row alike.
+            local_shutdown = (
+                shutdown_event is not None and shutdown_event.is_set()
+            ) or isinstance(disconnect_error, asyncio.CancelledError)
             if connected_this_attempt:
                 record_websocket_disconnected(
                     "runner",
                     disconnect_error,
-                    local_shutdown=(
-                        (shutdown_event is not None and shutdown_event.is_set())
-                        or isinstance(disconnect_error, asyncio.CancelledError)
-                    ),
+                    local_shutdown=local_shutdown,
                     resumed_from_suspend=woke_from_suspend,
                 )
         resumed_from_suspend = woke_from_suspend
@@ -625,9 +626,9 @@ async def serve_tunnel(
         jittered = delay_s * (
             1.0 + random.uniform(-_RECONNECT_JITTER_FRACTION, _RECONNECT_JITTER_FRACTION)
         )
-        # One row per ended attempt: what ended the socket, how long it lived,
-        # and how long the runner will wait, so a drop can be attributed and a
-        # late reconnect explained without pairing rows by hand.
+        # One row per attempt the runner retries: what ended the socket, how
+        # long it lived and how long the runner waits. Fatal exits (persistent
+        # auth or protocol rejection, cancellation) raise above instead.
         _logger.info(
             "runner tunnel disconnected: %s; retrying in %.2fs (jittered from %.2fs)",
             retry_reason,
@@ -642,7 +643,9 @@ async def serve_tunnel(
                 connected=connected_this_attempt,
                 connection_age_s=_round_seconds(connection_age_s),
                 disconnect_reason=classify_disconnect_reason(
-                    disconnect_error, resumed_from_suspend=resumed_from_suspend
+                    disconnect_error,
+                    local_shutdown=local_shutdown,
+                    resumed_from_suspend=resumed_from_suspend,
                 ),
                 error_type=(
                     type(disconnect_error).__name__ if disconnect_error is not None else None

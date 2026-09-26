@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from packaging.version import InvalidVersion, Version
+
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
@@ -93,6 +95,10 @@ def _pyproject_paths() -> list[Path]:
     ]
 
 
+def _version_py_path() -> Path:
+    return _repo_root() / "omnigent" / "version.py"
+
+
 def _read_base_version() -> str:
     """Read the base version from the top-level pyproject.toml.
 
@@ -111,15 +117,18 @@ def _read_base_version() -> str:
 def _compute_deploy_version(base: str, explicit: str | None) -> str:
     if explicit:
         # Caller knows what they want — let it through after a sanity check.
-        if not re.match(r"^\d+(\.\d+)*(\.dev\d+|\.post\d+|[+\-][\w.]+)?$", explicit):
-            raise SystemExit(f"--version {explicit!r} is not a recognizable PEP 440 version")
+        # The parser accepts every form this script generates, so a generated
+        # version can be fed back through `--skip-build --version`.
+        try:
+            Version(explicit)
+        except InvalidVersion:
+            raise SystemExit(f"--version {explicit!r} is not a valid PEP 440 version") from None
         return explicit
-    # Strip any existing `.postN` / `.devN` suffix so we don't stack
-    # them if a prior deploy left pyproject.toml dirty (or someone
-    # committed the bumped value). Without this, `0.1.0.post<old>`
-    # would become `0.1.0.post<old>.post<new>` which isn't valid
-    # PEP 440 and fails the wheel build.
-    base = re.sub(r"(\.post\d+|\.dev\d+|\+[\w.]+)+$", "", base)
+    # Strip a previous deploy's stamp so suffixes don't stack if a prior
+    # deploy left pyproject.toml dirty (or someone committed the bumped
+    # value): the local segment first, then `.postN` / `.devN`.
+    base = re.sub(r"\+[\w.]+$", "", base)
+    base = re.sub(r"(\.post\d+|\.dev\d+)+$", "", base)
     # Post-release, not dev: pip treats `.dev` as a pre-release and
     # ignores it when resolving `>=` constraints, so a deploy that
     # bumps via `.dev` clashes with `omnigent-ui-sdk` declaring
@@ -192,11 +201,41 @@ def set_version_in_pyproject(path: Path, new_version: str) -> str:
     return original
 
 
+_VERSION_CONSTANT = re.compile(r'^VERSION = "[^"]*"$', re.MULTILINE)
+
+
+def set_version_constant(path: Path, new_version: str) -> str:
+    """Rewrite the ``VERSION`` constant the runtime imports.
+
+    ``omnigent/version.py`` is what debug-log rows (``app_version``), the
+    runner hello and ``omnigent --version`` report; the wheel build reads
+    only the pyprojects, so the stamped version has to be written here too
+    or the deployed processes keep announcing the unstamped base version.
+
+    :param path: ``<repo>/omnigent/version.py``.
+    :param new_version: Stamped deploy version, e.g.
+        ``"0.16.0.post1790000000+g1a2b3c4"``.
+    :returns: The original file text, for restore after the build.
+    """
+    original = path.read_text()
+    updated, count = _VERSION_CONSTANT.subn(f'VERSION = "{new_version}"', original)
+    if count != 1:
+        raise RuntimeError(f"could not rewrite VERSION in {path}")
+    path.write_text(updated)
+    return original
+
+
 def _stamp_versions(new_version: str) -> dict[Path, str]:
-    """Stamp `new_version` into all three pyprojects. Returns originals for restore."""
+    """Stamp `new_version` into the three pyprojects and the runtime constant.
+
+    :param new_version: Stamped deploy version.
+    :returns: Original file texts keyed by path, for restore after the build.
+    """
     backups: dict[Path, str] = {}
     for path in _pyproject_paths():
         backups[path] = set_version_in_pyproject(path, new_version)
+    version_py = _version_py_path()
+    backups[version_py] = set_version_constant(version_py, new_version)
     return backups
 
 
@@ -794,8 +833,9 @@ def _parse_args() -> argparse.Namespace:
         "--version",
         default=None,
         help=(
-            "Explicit PEP 440 version to stamp into pyprojects for this "
-            "deploy. Default: <base-version>.post<unix-ts>."
+            "Explicit PEP 440 version to stamp into the pyprojects and "
+            "omnigent/version.py for this deploy. Default: "
+            "<base-version>.post<unix-ts>+g<short-sha>."
         ),
     )
     parser.add_argument(

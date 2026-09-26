@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import ssl
+import time
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, TypedDict
@@ -793,6 +794,31 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert isinstance(hello, HelloFrame)
     assert CAP_FILESYSTEM_ATTACHMENTS in hello.capabilities
 
+    # A reconnect's row carries the id the loop minted, the streak position
+    # and the outage it ended, measured from when the previous connection
+    # dropped.
+    await _serve_tunnel_once(
+        _noop_app,
+        tunnel_url="wss://example.databricksapps.com/v1/runners/runner_auth/tunnel",
+        server_url="https://example.databricksapps.com",
+        runner_id="runner_auth",
+        runner_version="0.1.0",
+        auth_token="tok-auth",
+        tunnel_token="bind-token",
+        connection_id="conn-reconnect",
+        reconnect=True,
+        attempt=2,
+        disconnected_monotonic=time.monotonic() - 1.5,
+    )
+    reconnected = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_connected"
+    ][1].attributes
+    assert reconnected["connection_id"] == "conn-reconnect"
+    assert reconnected["reconnect"] is True
+    assert reconnected["attempt"] == 2
+    assert reconnected["downtime_s"] >= 1.5
+    assert json.loads(captured["sent"])["connection_id"] == "conn-reconnect"
+
 
 async def test_serve_tunnel_once_sends_org_header(
     monkeypatch: pytest.MonkeyPatch,
@@ -1038,6 +1064,63 @@ async def test_serve_tunnel_stops_reconnecting_after_graceful_shutdown(
 
     # Exactly one connection attempt, then a clean return (no reconnect).
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_disconnect_row_names_local_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A close that breaks while the runner is stopping is a local shutdown.
+
+    The disconnect row shares its classification inputs with the OTel
+    counter, so a reset close handshake during shutdown is not reported as a
+    transport error announcing a retry the loop never makes.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.transports.ws_tunnel.serve")
+    shutdown_event = asyncio.Event()
+
+    async def _serve_once(app: Any, *, on_connected: Any = None, **_kwargs: Any) -> None:
+        """Connect, then lose the socket while shutdown is already requested."""
+        del app
+        on_connected()
+        shutdown_event.set()
+        raise ConnectionError("close handshake reset")
+
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    await asyncio.wait_for(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_shutdown_reset",
+            runner_version="0.1.0",
+            shutdown_event=shutdown_event,
+        ),
+        timeout=5.0,
+    )
+
+    rows = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel_disconnected"
+    ]
+    assert [r["disconnect_reason"] for r in rows] == ["local_shutdown"]
+    assert rows[0]["connected"] is True
+    assert rows[0]["error_type"] == "ConnectionError"
+    # The loop slept once and then honoured the shutdown instead of reconnecting.
+    assert len(sleeps) == 1
 
 
 @pytest.mark.parametrize(
@@ -2431,6 +2514,7 @@ async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
     caplog.set_level(logging.INFO, logger="omnigent.runner.transports.ws_tunnel.serve")
     outcomes = iter(["error", "error", "stable_drop", "stop"])
     sleeps: list[float] = []
+    handshakes: list[tuple[int, bool, float | None]] = []
     # Provide controlled start/end times for the connected attempt and fall
     # back to the real clock for all other callers (e.g. the asyncio loop).
     _real_monotonic = serve_module.time.monotonic
@@ -2471,6 +2555,9 @@ async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
         :raises asyncio.CancelledError: On the final attempt to end the test.
         """
         del app, tunnel_url, server_url, runner_id, runner_version, auth_token, tunnel_token
+        handshakes.append(
+            (_kwargs["attempt"], _kwargs["reconnect"], _kwargs["disconnected_monotonic"])
+        )
         outcome = next(outcomes)
         if outcome == "error":
             raise ConnectionError("outage")
@@ -2521,6 +2608,10 @@ async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
     assert rows[2]["disconnect_reason"] == "transport_error"
     assert rows[2]["error_type"] == "ConnectionError"
     assert len({r["connection_id"] for r in rows}) == 3
+    # The failed attempts count up one streak; the reconnect after the stable
+    # drop starts a fresh one and carries when that connection ended, which
+    # becomes the connected row's downtime.
+    assert handshakes == [(1, False, None), (2, False, None), (3, False, None), (1, True, 6.0)]
 
 
 @pytest.mark.asyncio
