@@ -51,7 +51,7 @@ def fake_store(
     """Install a persisting fake cognee module and open the gate."""
     store = _FakeStore()
     fake = MagicMock()
-    fake.SearchType = SimpleNamespace(GRAPH_COMPLETION="graph_completion")
+    fake.SearchType = SimpleNamespace(GRAPH_COMPLETION="graph_completion", CHUNKS="chunks")
     fake.add = AsyncMock(side_effect=store.add)
     fake.cognify = AsyncMock(side_effect=store.cognify)
     fake.search = AsyncMock(side_effect=store.search)
@@ -65,8 +65,9 @@ def fake_store(
     # Registration mirroring is covered by its own unit tests; keep it inert
     # here so the flow doesn't reach the real cognee agent registry.
     monkeypatch.setattr(memory_mod, "ensure_agent_registered", MagicMock())
-    memory_mod.breaker.reset()
-    memory_mod._store_configured = False
+    memory_mod.search_breaker.reset()
+    memory_mod.ingest_breaker.reset()
+    memory_mod._store_fingerprint = None
     memory_mod._registered_agent_connections.clear()
     # Serve the tools even though the real registry gated them out at import
     # (the cognee package is absent from the dev environment).
@@ -82,8 +83,9 @@ def fake_store(
 
     monkeypatch.setattr(builtins_mod, "get_builtin_tool", serving_get)
     yield store
-    memory_mod.breaker.reset()
-    memory_mod._store_configured = False
+    memory_mod.search_breaker.reset()
+    memory_mod.ingest_breaker.reset()
+    memory_mod._store_fingerprint = None
     if memory_mod._background_executor is not None:
         memory_mod._background_executor.shutdown(wait=True)
         memory_mod._background_executor = None
@@ -115,7 +117,7 @@ def test_remember_then_search_round_trip(fake_store: _FakeStore) -> None:
         spec,
         agent_id="ag_flow",
     )
-    assert stored == "Stored to long-term memory."
+    assert stored.startswith("Stored to long-term memory;")
     # The write landed in the agent's private dataset and was queued for
     # background cognify (drain the worker so the assertion is deterministic).
     assert fake_store.datasets["ag_flow"] == ["DuckDB is the preferred analytics database"]

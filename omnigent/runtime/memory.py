@@ -18,9 +18,23 @@ not enable or disable the integration. Non-``harness`` config keys
 shallow-replace between global and project config, so a project-level
 ``cognee:`` block overrides the global one wholesale.
 
+Cross-agent access is COOPERATIVE namespacing, not authenticated access
+control: grants resolve from the agent's own spec config, and one embedded
+store serves the whole process with no workspace binding, so any spec
+author can name any dataset. Two mitigations exist: the operator may set
+``cognee: allowed_shared_datasets`` (csv/list) in the global config, and
+then only allowlisted names are honored for tier/shared/peer grants
+(private datasets are unaffected); and dataset names normalize through
+:func:`sanitize_dataset_name`, documented there. Identity-bound datasets
+(per workspace/user resolved server-side) are the planned hardening step —
+until then, treat cognee memory as shared among mutually trusted specs.
+
 Memory must never fail or slow a turn: every cognee call is bounded by a
-timeout, failures return empty results / error strings (never raise), and a
-circuit breaker stops hammering a broken store.
+timeout, failures return empty results / error strings (never raise), and
+circuit breakers stop hammering a broken store. The breakers are split by
+operation class — ``search_breaker`` for reads, ``ingest_breaker`` for
+add/cognify — so a broken write path (e.g. a bad LLM key failing every
+background cognify) cannot black out recall for every agent.
 
 The embedded local store lives under ``<data-dir>/cognee/`` by default
 (``data_dir()`` honors ``OMNIGENT_DATA_DIR``); override with ``cognee:
@@ -137,6 +151,12 @@ def sanitize_dataset_name(raw: str) -> str:
 
     Lowercases and collapses anything outside ``[a-z0-9_]`` to ``_`` so
     agent/conversation ids map to stable, filesystem/DB-safe dataset names.
+
+    Deliberate consequence: names that normalize identically SHARE a
+    dataset (``ag-Foo`` and ``ag_foo`` are the same memory). That makes
+    grants forgiving about case/punctuation — the common want — at the
+    cost of merging user-chosen names that differ only in punctuation;
+    generated agent ids never collide this way.
     """
     cleaned = _DATASET_SANITIZE_RE.sub("_", raw.strip().lower()).strip("_")
     return cleaned or "default"
@@ -254,6 +274,13 @@ def resolve_grants(
     from ``shared_dataset`` / ``read_datasets`` / ``write_datasets``
     (tool config only — peer access stays an explicit per-agent grant).
 
+    Operator authority: when the ``cognee:`` block sets
+    ``allowed_shared_datasets`` (csv or list), every tier/shared/peer grant
+    outside that allowlist is dropped (and logged) — spec authors can then
+    only reach cross-agent datasets the deployment explicitly sanctioned.
+    The private dataset is never filtered. Absent allowlist = cooperative
+    mode: every spec-declared grant is honored.
+
     :raises ValueError: When no private dataset can be resolved.
     """
     raw_private = config.get("dataset") or agent_id or conversation_id
@@ -262,13 +289,28 @@ def resolve_grants(
             "No cognee dataset could be resolved (no dataset, agent_id, or conversation_id)."
         )
     effective_settings = settings or {}
+    allowlist = _grant_allowlist(effective_settings)
+
+    def _permitted(name: str | None, source: str) -> str | None:
+        if name is None or allowlist is None or name in allowlist:
+            return name
+        _logger.warning(
+            "cognee grant %r from %s dropped: not in cognee.allowed_shared_datasets",
+            name,
+            source,
+        )
+        return None
 
     def _tier(name: str) -> str | None:
         raw = config.get(f"{name}_dataset")
         if raw is None:
             fallback = effective_settings.get(f"{name}_dataset")
             raw = fallback if isinstance(fallback, str) else None
-        return sanitize_dataset_name(raw) if raw and raw.strip() else None
+        resolved = sanitize_dataset_name(raw) if raw and raw.strip() else None
+        return _permitted(resolved, f"{name}_dataset")
+
+    def _permitted_peers(value: str | None, source: str) -> tuple[str, ...]:
+        return tuple(name for name in _csv_datasets(value) if _permitted(name, source) is not None)
 
     shared_raw = config.get("shared_dataset")
     return MemoryGrants(
@@ -276,10 +318,31 @@ def resolve_grants(
         user=_tier("user"),
         team=_tier("team"),
         org=_tier("org"),
-        shared=sanitize_dataset_name(shared_raw) if shared_raw else None,
-        readable_peers=_csv_datasets(config.get("read_datasets")),
-        writable_peers=_csv_datasets(config.get("write_datasets")),
+        shared=_permitted(
+            sanitize_dataset_name(shared_raw) if shared_raw else None, "shared_dataset"
+        ),
+        readable_peers=_permitted_peers(config.get("read_datasets"), "read_datasets"),
+        writable_peers=_permitted_peers(config.get("write_datasets"), "write_datasets"),
     )
+
+
+def _grant_allowlist(settings: dict[str, Any]) -> frozenset[str] | None:
+    """Parse ``cognee.allowed_shared_datasets`` into sanitized names, or ``None``.
+
+    ``None`` (key absent or not a csv/list) means no operator restriction.
+    An empty list is a valid, maximally strict allowlist: no cross-agent
+    grants at all.
+    """
+    raw = settings.get("allowed_shared_datasets")
+    if isinstance(raw, str):
+        return frozenset(_csv_datasets(raw))
+    if isinstance(raw, (list, tuple)):
+        return frozenset(
+            sanitize_dataset_name(entry)
+            for entry in raw
+            if isinstance(entry, str) and entry.strip()
+        )
+    return None
 
 
 def spec_declares_cognee_builtin(spec: Any | None) -> bool:
@@ -344,7 +407,11 @@ class _CircuitBreaker:
             self._open_until = 0.0
 
 
-breaker = _CircuitBreaker()
+# Split by operation class: a failing write path (add/cognify — commonly a
+# bad or missing LLM key) must not open the breaker that gates every
+# agent's recall, and vice versa.
+search_breaker = _CircuitBreaker()
+ingest_breaker = _CircuitBreaker()
 
 # Serializes background cognify runs (LLM-heavy; one at a time is plenty)
 # and detaches them from the tool call's short-lived event loop. Daemon
@@ -352,34 +419,67 @@ breaker = _CircuitBreaker()
 _background_executor: ThreadPoolExecutor | None = None
 _background_lock = threading.Lock()
 
-# The embedded store is configured once per process; cognee.config calls
-# are global, so repeating them per tool call is wasted work.
-_store_configured = False
+# cognee.config calls are global, so the store setup is applied once per
+# distinct settings fingerprint — a config change (new data_root, new LLM
+# key) takes effect on the next call instead of requiring a restart.
+_store_fingerprint: tuple[Any, ...] | None = None
 _store_lock = threading.Lock()
 
 
+def _resolve_llm_api_key(value: str) -> str | None:
+    """Resolve the configured LLM key, honoring secret references.
+
+    ``keychain:<name>`` / ``env:<VAR>`` / ``$VAR`` shapes go through
+    :func:`omnigent.onboarding.provider_config.resolve_secret`, so the
+    plaintext key can stay out of config.yaml. A failed resolution logs
+    and returns ``None`` (cognee falls back to its own env/config).
+    """
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if stripped.startswith(("keychain:", "env:")) or "$" in stripped:
+        from omnigent.onboarding.provider_config import resolve_secret
+
+        try:
+            return resolve_secret(stripped)
+        except Exception as e:
+            _logger.error("cognee llm_api_key reference %r failed to resolve: %s", stripped, e)
+            return None
+    return stripped
+
+
 def _ensure_local_store(settings: dict[str, Any]) -> None:
-    """Point cognee's global config at the embedded local store (once).
+    """Point cognee's global config at the embedded local store.
 
     Also applies optional LLM settings from the ``cognee:`` block
-    (``llm_api_key`` / ``llm_provider`` / ``llm_model``) so the cognify
+    (``llm_api_key`` — plaintext or a ``keychain:``/``env:``/``$VAR``
+    reference — plus ``llm_provider`` / ``llm_model``) so the cognify
     pipeline can run without a separate cognee config file. Absent keys
-    leave cognee's own defaults (its env vars / .env) untouched.
+    leave cognee's own defaults (its env vars / .env) untouched. Applied
+    once per settings fingerprint; the first differing settings re-apply.
     """
-    global _store_configured
+    global _store_fingerprint
     with _store_lock:
-        if _store_configured:
+        root = cognee_data_root(settings)
+        fingerprint = (
+            str(root),
+            settings.get("llm_api_key"),
+            settings.get("llm_provider"),
+            settings.get("llm_model"),
+        )
+        if fingerprint == _store_fingerprint:
             return
         import cognee
 
-        root = cognee_data_root(settings)
         (root / "system").mkdir(parents=True, exist_ok=True)
         (root / "data").mkdir(parents=True, exist_ok=True)
         cognee.config.system_root_directory(str(root / "system"))
         cognee.config.data_root_directory(str(root / "data"))
         llm_api_key = settings.get("llm_api_key")
-        if isinstance(llm_api_key, str) and llm_api_key.strip():
-            cognee.config.set_llm_api_key(llm_api_key.strip())
+        if isinstance(llm_api_key, str):
+            resolved = _resolve_llm_api_key(llm_api_key)
+            if resolved:
+                cognee.config.set_llm_api_key(resolved)
         llm_config = {
             key: settings[cfg_key]
             for key, cfg_key in (("llm_provider", "llm_provider"), ("llm_model", "llm_model"))
@@ -387,7 +487,7 @@ def _ensure_local_store(settings: dict[str, Any]) -> None:
         }
         if llm_config:
             cognee.config.set_llm_config(llm_config)
-        _store_configured = True
+        _store_fingerprint = fingerprint
 
 
 def _run_bounded(coro_factory: Any, timeout_s: float) -> Any:
@@ -400,11 +500,11 @@ def _run_bounded(coro_factory: Any, timeout_s: float) -> Any:
     return asyncio.run(asyncio.wait_for(coro_factory(), timeout=timeout_s))
 
 
-def _record_outcome(ok: bool) -> None:
+def _record_outcome(target: _CircuitBreaker, ok: bool) -> None:
     if ok:
-        breaker.record_success()
+        target.record_success()
     else:
-        breaker.record_failure()
+        target.record_failure()
 
 
 def memory_search(
@@ -420,16 +520,19 @@ def memory_search(
     return ``[]`` — memory must never fail a turn.
     """
     effective = cognee_settings() if settings is None else settings
-    if not cognee_available() or not breaker.allow():
+    if not cognee_available() or not search_breaker.allow():
         return []
     try:
         _ensure_local_store(effective)
         import cognee
 
-        search_type_name = str(effective.get("search_type", "GRAPH_COMPLETION"))
+        # CHUNKS by default: raw stored memories, no LLM completion inside
+        # the tool call (GRAPH_COMPLETION adds seconds of latency plus LLM
+        # cost per search, and returns generated prose instead of memories).
+        search_type_name = str(effective.get("search_type", "CHUNKS"))
         search_type = getattr(cognee.SearchType, search_type_name, None)
         if search_type is None:
-            search_type = cognee.SearchType.GRAPH_COMPLETION
+            search_type = cognee.SearchType.CHUNKS
 
         async def _search() -> Any:
             return await cognee.search(
@@ -440,10 +543,10 @@ def memory_search(
             )
 
         results = _run_bounded(_search, SEARCH_TIMEOUT_S)
-        _record_outcome(True)
+        _record_outcome(search_breaker, True)
         return _flatten_search_results(results)
     except Exception as e:
-        _record_outcome(False)
+        _record_outcome(search_breaker, False)
         _logger.error("cognee search failed: %s", e)
         return []
 
@@ -501,7 +604,7 @@ def memory_add(
     Returns ``False`` (never raises) when the write failed.
     """
     effective = cognee_settings() if settings is None else settings
-    if not cognee_available() or not breaker.allow():
+    if not cognee_available() or not ingest_breaker.allow():
         return False
     try:
         _ensure_local_store(effective)
@@ -514,9 +617,9 @@ def memory_add(
             return await cognee.add(content, **kwargs)
 
         _run_bounded(_add, ADD_TIMEOUT_S)
-        _record_outcome(True)
+        _record_outcome(ingest_breaker, True)
     except Exception as e:
-        _record_outcome(False)
+        _record_outcome(ingest_breaker, False)
         _logger.error("cognee add failed: %s", e)
         return False
 
@@ -550,10 +653,10 @@ def _cognify_blocking(dataset: str) -> None:
             return await cognee.cognify(datasets=[dataset])
 
         result = _run_bounded(_cognify, COGNIFY_TIMEOUT_S)
-        breaker.record_success()
+        ingest_breaker.record_success()
         _logger.info("cognee cognify finished for dataset %r: %.300s", dataset, result)
     except Exception as e:
-        breaker.record_failure()
+        ingest_breaker.record_failure()
         _logger.error("cognee cognify failed for dataset %r: %s", dataset, e)
 
 
@@ -591,6 +694,11 @@ def ensure_agent_registered(
     with _registration_lock:
         if key in _registered_agent_connections:
             return
+        # Bound the dedupe set: past ~4k live (dataset, session) pairs, drop
+        # the history — re-registration is idempotent, so the only cost of
+        # forgetting is an occasional duplicate best-effort mirror post.
+        if len(_registered_agent_connections) >= 4096:
+            _registered_agent_connections.clear()
         _registered_agent_connections.add(key)
     effective = cognee_settings() if settings is None else settings
     _get_background_executor().submit(_register_agent_blocking, grants, session_id, effective)

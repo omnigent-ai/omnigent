@@ -54,6 +54,24 @@ Decisions taken after the plan was drafted:
   native relay, and the gated framework instruction), plus the
   agent-registry mirroring above. Phases 4–7 (ingest coordinator, server
   recall endpoint, push-based recall, hardening) remain.
+- **Hardening batch (2026-09-26, from the live functional-test review):**
+  circuit breaker split into `search_breaker` / `ingest_breaker` (a failing
+  write path — commonly a bad LLM key breaking cognify — no longer blacks
+  out recall); store config applied per settings fingerprint instead of
+  once-per-process (config changes take effect without a restart);
+  `llm_api_key` accepts `keychain:`/`env:`/`$VAR` secret references via
+  `resolve_secret`; tool search defaults to `CHUNKS` (raw memories, no LLM
+  call inside the tool — `GRAPH_COMPLETION` is opt-in); `cognee:
+  allowed_shared_datasets` gives the deployment operator authority over
+  cross-agent grants (absent = cooperative mode, documented as such);
+  remember messages state that indexing is asynchronous; the
+  agent-registration dedupe set is bounded. The cognify silent-loss race
+  was root-caused upstream (loop-bound `asyncio.Lock`s on cached
+  registries/adapters) and fixed in topoteretes/cognee#5227 — bump the
+  extra's floor once it ships. Remaining known gaps: identity-bound
+  datasets (workspace/user resolved server-side) and per-call
+  `asyncio.run` loops (empirically fine post-upstream-fix; revisit if a
+  long-lived background loop is ever needed).
 
 ## Spine and rationale
 

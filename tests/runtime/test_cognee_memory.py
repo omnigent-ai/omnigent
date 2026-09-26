@@ -36,12 +36,14 @@ from omnigent.runtime.memory import (
 def _reset_memory_state(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Isolate the module's process-level state between tests."""
     monkeypatch.delenv(memory_mod.COGNEE_DISABLE_ENV, raising=False)
-    memory_mod.breaker.reset()
-    memory_mod._store_configured = False
+    memory_mod.search_breaker.reset()
+    memory_mod.ingest_breaker.reset()
+    memory_mod._store_fingerprint = None
     memory_mod._registered_agent_connections.clear()
     yield
-    memory_mod.breaker.reset()
-    memory_mod._store_configured = False
+    memory_mod.search_breaker.reset()
+    memory_mod.ingest_breaker.reset()
+    memory_mod._store_fingerprint = None
     memory_mod._registered_agent_connections.clear()
     if memory_mod._background_executor is not None:
         memory_mod._background_executor.shutdown(wait=True)
@@ -278,16 +280,16 @@ def test_instruction_absent_when_kill_switched(monkeypatch: pytest.MonkeyPatch) 
 
 def test_breaker_opens_after_consecutive_failures() -> None:
     for _ in range(3):
-        memory_mod.breaker.record_failure()
-    assert memory_mod.breaker.allow() is False
+        memory_mod.search_breaker.record_failure()
+    assert memory_mod.search_breaker.allow() is False
 
 
 def test_breaker_success_resets_failure_streak() -> None:
-    memory_mod.breaker.record_failure()
-    memory_mod.breaker.record_failure()
-    memory_mod.breaker.record_success()
-    memory_mod.breaker.record_failure()
-    assert memory_mod.breaker.allow() is True
+    memory_mod.search_breaker.record_failure()
+    memory_mod.search_breaker.record_failure()
+    memory_mod.search_breaker.record_success()
+    memory_mod.search_breaker.record_failure()
+    assert memory_mod.search_breaker.allow() is True
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +323,7 @@ def test_search_returns_stringified_results(
     kwargs = fake.search.call_args.kwargs
     assert kwargs["query_text"] == "about the user"
     assert kwargs["datasets"] == ["ds_a"]
-    assert kwargs["query_type"] == "graph_completion"
+    assert kwargs["query_type"] == "chunks"
 
 
 def test_search_honors_configured_search_type(
@@ -469,7 +471,7 @@ def test_registration_failure_is_swallowed_and_spares_breaker(
     grants = resolve_grants({}, agent_id="ag_me", conversation_id=None)
     memory_mod._register_agent_blocking(grants, "conv_9", _settings(tmp_path))
     # Observability-only: no exception escaped and the breaker is untouched.
-    assert memory_mod.breaker.allow() is True
+    assert memory_mod.search_breaker.allow() is True
 
 
 def test_local_store_configured_once_with_llm_settings(
@@ -487,3 +489,124 @@ def test_local_store_configured_once_with_llm_settings(
     fake.config.set_llm_config.assert_called_once_with({"llm_provider": "openai"})
     assert (root / "system").is_dir()
     assert (root / "data").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Operator allowlist (cognee.allowed_shared_datasets)
+# ---------------------------------------------------------------------------
+
+
+def test_allowlist_filters_ungranted_cross_agent_datasets() -> None:
+    grants = resolve_grants(
+        {
+            "shared_dataset": "team",
+            "team_dataset": "platform",
+            "read_datasets": "ag_peer, ag_rogue",
+            "write_datasets": "ag_rogue",
+        },
+        agent_id="ag_me",
+        conversation_id=None,
+        settings={"allowed_shared_datasets": "team, ag_peer"},
+    )
+    assert grants.shared == "team"
+    assert grants.tier("team") is None  # 'platform' not allowlisted
+    assert grants.readable_peers == ("ag_peer",)
+    assert grants.writable_peers == ()
+    # The private dataset is never subject to the allowlist.
+    assert grants.private == "ag_me"
+
+
+def test_allowlist_list_form_and_empty_means_deny_all() -> None:
+    grants = resolve_grants(
+        {"shared_dataset": "team", "read_datasets": "ag_peer"},
+        agent_id="ag_me",
+        conversation_id=None,
+        settings={"allowed_shared_datasets": []},
+    )
+    assert grants.shared is None
+    assert grants.readable_peers == ()
+    permissive = resolve_grants(
+        {"shared_dataset": "team"},
+        agent_id="ag_me",
+        conversation_id=None,
+        settings={"allowed_shared_datasets": ["Team"]},  # sanitized match
+    )
+    assert permissive.shared == "team"
+
+
+def test_absent_allowlist_keeps_cooperative_mode() -> None:
+    grants = resolve_grants(
+        {"shared_dataset": "team"},
+        agent_id="ag_me",
+        conversation_id=None,
+        settings={},
+    )
+    assert grants.shared == "team"
+
+
+# ---------------------------------------------------------------------------
+# Store config re-application + secret references
+# ---------------------------------------------------------------------------
+
+
+def test_store_config_reapplies_when_settings_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = _fake_cognee(search_results=["m"])
+    _install(monkeypatch, fake)
+    memory_search("q", ["ds"], settings=_settings(tmp_path, llm_api_key="sk-a"))
+    memory_search("q", ["ds"], settings=_settings(tmp_path, llm_api_key="sk-a"))
+    assert fake.config.set_llm_api_key.call_count == 1  # same fingerprint: applied once
+    memory_search("q", ["ds"], settings=_settings(tmp_path, llm_api_key="sk-b"))
+    assert fake.config.set_llm_api_key.call_count == 2  # changed key: re-applied
+    assert fake.config.set_llm_api_key.call_args.args == ("sk-b",)
+
+
+def test_llm_api_key_keychain_reference_is_resolved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import omnigent.onboarding.provider_config as provider_config
+
+    fake = _fake_cognee(search_results=["m"])
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(provider_config, "resolve_secret", lambda ref: f"resolved:{ref}")
+    memory_search("q", ["ds"], settings=_settings(tmp_path, llm_api_key="keychain:openai"))
+    fake.config.set_llm_api_key.assert_called_once_with("resolved:keychain:openai")
+
+
+def test_llm_api_key_failed_reference_falls_back_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import omnigent.onboarding.provider_config as provider_config
+
+    def boom(ref: str) -> str:
+        raise RuntimeError("no such secret")
+
+    fake = _fake_cognee(search_results=["m"])
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(provider_config, "resolve_secret", boom)
+    results = memory_search(
+        "q", ["ds"], settings=_settings(tmp_path, llm_api_key="keychain:missing")
+    )
+    assert results == ["m"]  # search still works; cognee keeps its own defaults
+    fake.config.set_llm_api_key.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Breaker isolation: a broken write path never gates reads
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_failures_do_not_open_the_search_breaker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = _fake_cognee(search_results=["still recalled"])
+    fake.add = AsyncMock(side_effect=RuntimeError("bad llm key"))
+    _install(monkeypatch, fake)
+    settings = _settings(tmp_path)
+    for _ in range(3):
+        assert memory_add("fact", "ds", settings=settings) is False
+    assert memory_mod.ingest_breaker.allow() is False
+    # Reads stay live: the search breaker is independent.
+    assert memory_mod.search_breaker.allow() is True
+    assert memory_search("q", ["ds"], settings=settings) == ["still recalled"]

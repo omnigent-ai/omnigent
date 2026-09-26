@@ -84,7 +84,11 @@ def main() -> int:
     gc, _ = timed(
         "search GRAPH_COMPLETION",
         lambda: m.memory_search(
-            "What is Vasilije's favorite analytics database?", ["ag_e2e_alpha"], settings=settings
+            "What is Vasilije's favorite analytics database?",
+            ["ag_e2e_alpha"],
+            # Explicit: the tool-path default is CHUNKS; this check exercises
+            # the opt-in LLM-synthesized answer.
+            settings={**settings, "search_type": "GRAPH_COMPLETION"},
         ),
     )
     check("GRAPH_COMPLETION answers", any("uck" in r for r in gc), f"got: {gc[:1]}")
@@ -130,7 +134,7 @@ def main() -> int:
         if not any("DuckDB" in x for x in r):
             ok_repeat = False
     check("3 sequential searches on fresh loops", ok_repeat)
-    check("breaker still closed", m.breaker.allow())
+    check("breakers still closed", m.search_breaker.allow() and m.ingest_breaker.allow())
 
     print("=== Phase B: runner dispatch boundary ===", flush=True)
     from omnigent.runner.tool_dispatch import _execute_cognee_tool

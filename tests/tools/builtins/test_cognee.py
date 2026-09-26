@@ -302,7 +302,7 @@ def test_remember_stores_to_private_dataset(
 ) -> None:
     add = _patch_add(monkeypatch)
     result = CogneeRememberTool({}).invoke(json.dumps({"content": "prefers dark mode"}), tool_ctx)
-    assert result == "Stored to long-term memory."
+    assert result.startswith("Stored to long-term memory;")
     assert add.call_args.args == ("prefers dark mode", "agent_test")
 
 
@@ -343,7 +343,7 @@ def test_remember_store_unavailable_reports_failure(
     _patch_add(monkeypatch, stored=False)
     result = CogneeRememberTool({}).invoke(json.dumps({"content": "x"}), tool_ctx)
     assert "failed" in result.lower()
-    assert result != "Stored to long-term memory."
+    assert not result.startswith("Stored to long-term memory")
 
 
 def test_remember_missing_content_returns_error(

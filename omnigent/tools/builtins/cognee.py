@@ -41,8 +41,15 @@ Config keys (all optional):
   names) this agent may search.
 - ``write_datasets``: Comma-separated peer datasets this agent may publish
   into. List a peer in both keys for full read/write access.
-- ``search_type``: cognee search type (default ``GRAPH_COMPLETION``).
+- ``search_type``: cognee search type (default ``CHUNKS`` — raw stored
+  memories, no LLM call inside the tool; set ``GRAPH_COMPLETION`` for an
+  LLM-synthesized answer at extra latency and cost).
 - ``top_k``: max search results (default 10).
+
+Operator authority: cross-agent grants are cooperative — any spec can name
+any dataset — unless the deployment sets ``cognee: allowed_shared_datasets``
+in the global config, which restricts tier/shared/peer grants to the
+allowlisted names (see :func:`omnigent.runtime.memory.resolve_grants`).
 """
 
 from __future__ import annotations
@@ -334,10 +341,14 @@ class CogneeRememberTool(_CogneeToolBase):
                 return "cognee remember failed: the memory store is unavailable."
             if dataset != grants.private:
                 return (
-                    f"Stored to long-term memory dataset {dataset!r} "
-                    "(visible to agents granted access to it)."
+                    f"Stored to long-term memory dataset {dataset!r} (visible to agents "
+                    "granted access to it); knowledge-graph indexing continues in the "
+                    "background, so recall may lag by a few seconds."
                 )
-            return "Stored to long-term memory."
+            return (
+                "Stored to long-term memory; knowledge-graph indexing continues "
+                "in the background, so recall may lag by a few seconds."
+            )
         except Exception as e:
             _logger.error("cognee remember failed: %s", e)
             return f"cognee remember failed: {e}"
