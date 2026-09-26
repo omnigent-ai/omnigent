@@ -1053,7 +1053,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             console.print("  [dim]  sudo rm /usr/local/bin/databricks[/dim]")
             console.print(
                 "  [dim]  curl -fsSL https://raw.githubusercontent.com/databricks/"
-                "setup-cli/main/install.sh | sudo sh[/dim]"
+                "setup-cli/main/install.sh | sh[/dim]"
             )
             return "✗ Databricks credential not added — `ucode configure` failed"
         # Wipe the verbose login + ucode output so the menu we return to (with a

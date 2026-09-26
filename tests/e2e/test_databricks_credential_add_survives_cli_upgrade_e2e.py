@@ -94,12 +94,11 @@ def main() -> int:
         return 2
     # Verbatim reported user-visible failure: the auto-upgrade (setup-cli
     # install.sh) refuses to overwrite an existing /usr/local/bin/databricks.
-    print("Databricks CLI is too old. Upgrading...")
-    print(
-        "If you have an existing Databricks CLI installation, please "
-        "first remove it using 'sudo rm /usr/local/bin/databricks'."
-    )
-    print("Failed to install/upgrade Databricks CLI automatically.")
+    print("! Databricks CLI v0.299.2 is too old (need v1.0.0 or newer). Upgrading...")
+    print("Target path /usr/local/bin/databricks already exists.")
+    print("If you have an existing Databricks CLI installation, please first remove it using")
+    print("  sudo rm '/usr/local/bin/databricks'")
+    print("ERROR Failed to install/upgrade Databricks CLI automatically.")
     return 1
 
 
