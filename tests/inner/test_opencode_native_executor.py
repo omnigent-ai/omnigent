@@ -298,13 +298,14 @@ async def test_interrupt_calls_interrupt(
     assert [path for _, path, _ in fake_server.requests] == ["/api/session/ses_1/interrupt"]
 
 
-async def test_enqueue_message_injects_prompt(
+async def test_enqueue_message_injects_queued_prompt(
     fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A mid-turn web message waits for the active turn (delivery=queue)."""
     _seed_state(tmp_path)
     executor = _executor(tmp_path, monkeypatch)
     assert await executor.enqueue_session_message("k", "steer me") is True
-    assert [body["text"] for body in _prompts(fake_server)] == ["steer me"]
+    assert _prompts(fake_server) == [{"text": "steer me", "delivery": "queue"}]
 
 
 async def _run_with_system_prompt(

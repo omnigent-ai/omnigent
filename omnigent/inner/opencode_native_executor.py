@@ -44,9 +44,8 @@ class OpenCodeNativeExecutor(NativeServerHarness):
         self._request_session_id = _request_session_id_from_env()
         super().__init__(
             harness_id=OPENCODE_NATIVE_HARNESS_ID,
-            # OpenCode has no live-steer endpoint, so a mid-turn message is
-            # admitted as a new prompt and the native server's own queue
-            # promotes it when the active turn finishes.
+            # A mid-turn web message is admitted with delivery="queue" and
+            # OpenCode's inbox runs it when the active turn finishes.
             supports_enqueue=True,
             transport=OpenCodeHttpTransport(bridge_dir=self._bridge_dir),
             resolve_session_id=self._resolve_opencode_session_id,
