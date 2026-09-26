@@ -1,7 +1,7 @@
 """WebSocket tunnel frame schema (Phase 4).
 
-Eight frame kinds, all JSON, per ``designs/RUNNER.md`` §3 "Frame
-wire format". Frames carrying request/response correlation use an
+Typed JSON frames on the existing runner tunnel, per the runner frame
+wire format. Frames carrying request/response correlation use an
 ``id`` field; ``hello`` / ``ping`` / ``pong`` don't.
 
 Body-bearing frames (``request``, ``response.body``) carry an
@@ -45,6 +45,9 @@ class FrameKind(str, Enum):
     WS_OPEN = "ws.open"
     WS_FRAME = "ws.frame"
     WS_CLOSE = "ws.close"
+    EVENT_READY = "event.ready"
+    EVENT_BATCH = "event.batch"
+    EVENT_ACK = "event.ack"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -195,6 +198,35 @@ class WSCloseFrame:
     reason: str = ""
 
 
+# Additive extension of the runner tunnel, negotiated after hello. These are
+# not tunneled HTTP responses or terminal WebSocket channel frames.
+EVENT_INGEST_CAPABILITY = "session-event-ingest-v1"
+
+
+@dataclass
+class EventReadyFrame:
+    """Server → runner: event ingestion is available on this tunnel generation."""
+
+
+@dataclass
+class EventBatchFrame:
+    """Runner → server: one ordered batch for a single bound session."""
+
+    id: str
+    session_id: str
+    events: list[dict[str, object]]
+
+
+@dataclass
+class EventAckFrame:
+    """Server → runner: entries [0, applied) completed; retry or reject the rest."""
+
+    id: str
+    applied: int
+    error: str | None = None
+    retryable: bool = False
+
+
 Frame = (
     HelloFrame
     | RequestFrame
@@ -207,6 +239,9 @@ Frame = (
     | WSOpenFrame
     | WSFrame
     | WSCloseFrame
+    | EventReadyFrame
+    | EventBatchFrame
+    | EventAckFrame
 )
 
 
@@ -312,6 +347,27 @@ def encode_frame(frame: Frame) -> str:
                 "reason": frame.reason,
             }
         )
+    if isinstance(frame, EventReadyFrame):
+        return json.dumps({"kind": FrameKind.EVENT_READY.value})
+    if isinstance(frame, EventBatchFrame):
+        return json.dumps(
+            {
+                "kind": FrameKind.EVENT_BATCH.value,
+                "id": frame.id,
+                "session_id": frame.session_id,
+                "events": _validated_batch_events(frame.events),
+            }
+        )
+    if isinstance(frame, EventAckFrame):
+        return json.dumps(
+            {
+                "kind": FrameKind.EVENT_ACK.value,
+                "id": frame.id,
+                "applied": frame.applied,
+                "error": frame.error,
+                "retryable": frame.retryable,
+            }
+        )
     raise TypeError(f"unknown frame type: {type(frame).__name__}")
 
 
@@ -394,8 +450,38 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
             return _decode_ws_frame(msg)
         case FrameKind.WS_CLOSE:
             return _decode_ws_close(msg)
+        case FrameKind.EVENT_READY:
+            return EventReadyFrame()
+        case FrameKind.EVENT_BATCH:
+            return EventBatchFrame(
+                id=_required_str(msg, "id"),
+                session_id=_required_str(msg, "session_id"),
+                events=_validated_batch_events(msg.get("events")),
+            )
+        case FrameKind.EVENT_ACK:
+            applied = _required_int(msg, "applied")
+            if applied < 0:
+                raise ValueError("event.ack applied must be nonnegative")
+            return EventAckFrame(
+                id=_required_str(msg, "id"),
+                applied=applied,
+                error=_optional_nullable_str(msg, "error"),
+                retryable=_optional_bool(msg, "retryable", False),
+            )
     # Unreachable — all enum members handled above.
     raise ValueError(f"unhandled frame kind: {kind.value!r}")  # pragma: no cover
+
+
+def _validated_batch_events(events: object) -> list[dict[str, object]]:
+    if (
+        not isinstance(events, list)
+        or not events
+        or not all(
+            isinstance(event, dict) and isinstance(event.get("type"), str) for event in events
+        )
+    ):
+        raise ValueError("event.batch requires a nonempty event array with string types")
+    return cast("list[dict[str, object]]", events)
 
 
 def _decode_hello(msg: _JsonObject) -> HelloFrame:
@@ -526,6 +612,13 @@ def _required_str(msg: _JsonObject, key: str) -> str:
     val = msg.get(key)
     if not isinstance(val, str):
         raise ValueError(f"frame missing required string field: {key!r}")
+    return val
+
+
+def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
+    val = msg.get(key)
+    if val is not None and not isinstance(val, str):
+        raise ValueError(f"frame field must be a string or null: {key!r}")
     return val
 
 
