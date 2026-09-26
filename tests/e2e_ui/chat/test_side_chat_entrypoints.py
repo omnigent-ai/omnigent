@@ -14,12 +14,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import (
-    configure_mock_llm,
-    fetch_with_retry,
-    open_right_rail,
-    seed_committed_turn,
-)
+from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
@@ -265,32 +260,40 @@ def test_fork_from_side_chat_uses_child_and_creates_visible_session(
     page: Page,
     seeded_session: tuple[str, str],
     side_chat_forks: list[str],
+    mock_llm_server_url: str,
 ) -> None:
     """Fork a side-chat reply from the child and surface the promoted session."""
     base_url, parent_id = seeded_session
     question = f"fork-side-{parent_id}: answer in the side chat"
     reply = "This reply belongs only to the side chat."
-    response_id = "resp_side_fork"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": reply}],
+        key=f"fork-side-{parent_id}",
+        match=f"fork-side-{parent_id}",
+    )
 
     page.goto(f"{base_url}/c/{parent_id}")
     with page.expect_response(f"**/v1/sessions/{parent_id}/fork") as side_chat_response:
         _start_side_chat(page, "panel", question)
     assert side_chat_response.value.ok
     child_id = str(side_chat_response.value.json()["id"])
-    pane = page.locator(".side-chat-backdrop")
-    expect(pane.get_by_text(question, exact=True)).to_be_visible(timeout=30_000)
     assert side_chat_forks == [child_id]
-    seed_committed_turn(
-        child_id,
-        prompt="Seeded side-chat turn",
-        reply=reply,
-        response_id=response_id,
-    )
-    page.reload()
 
+    # The reply must come through the child's own turn: the pane treats what it
+    # sees on its first load as inherited history, so a turn seeded behind its
+    # back and surfaced by a reload can be hidden along with it.
     pane = page.locator(".side-chat-backdrop")
     assistant = pane.locator(_ASSISTANT).filter(has_text=reply)
     expect(assistant).to_be_visible(timeout=30_000)
+    expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+    reply_items = [
+        item
+        for item in _items(base_url, child_id)
+        if item.get("type") == "message" and reply in str(item)
+    ]
+    assert len(reply_items) == 1, reply_items
+    response_id = str(reply_items[0]["response_id"])
 
     assistant.hover()
     assistant.get_by_test_id("fork-from-response").click()
@@ -300,13 +303,15 @@ def test_fork_from_side_chat_uses_child_and_creates_visible_session(
     fork_id: str | None = None
     try:
         fork_pattern = re.compile(r"/v1/sessions/[^/]+/fork$")
+        # Check the target before awaiting the reply, so a fork aimed at the
+        # parent fails on the URL rather than on a response timeout.
         with page.expect_request(fork_pattern) as fork_request:
-            with page.expect_response(fork_pattern) as fork_response:
-                page.get_by_test_id("fork-session-submit").click()
+            page.get_by_test_id("fork-session-submit").click()
         request = fork_request.value
+        assert request.url == f"{base_url}/v1/sessions/{child_id}/fork", request.url
         assert request.post_data_json["up_to_response_id"] == response_id
-        assert request.url == f"{base_url}/v1/sessions/{child_id}/fork"
-        assert fork_response.value.status == 201
+        response = request.response()
+        assert response is not None and response.status == 201, response
 
         expect(page).to_have_url(
             re.compile(rf"/c/(?!{re.escape(parent_id)}|{re.escape(child_id)})[0-9a-f]{{32}}"),
