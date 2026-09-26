@@ -298,10 +298,26 @@ def test_breaker_success_resets_failure_streak() -> None:
 def test_search_returns_stringified_results(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    fake = _fake_cognee(search_results=["likes tea", {"fact": "NYC"}])
+    fake = _fake_cognee(
+        search_results=[
+            # Real cognee shape: one envelope per searched dataset, hits
+            # under ``search_result`` — chunk dicts carry the text next to
+            # store metadata, LLM search types return plain answer strings.
+            # The agent must see the memories, not the plumbing.
+            {
+                "dataset_id": "uuid-noise",
+                "dataset_name": "ds_a",
+                "search_result": [
+                    {"text": "likes tea", "score": 0.9},
+                    "lives in NYC",
+                ],
+            },
+            {"fact": "no text field"},
+        ]
+    )
     _install(monkeypatch, fake)
     results = memory_search("about the user", ["ds_a"], settings=_settings(tmp_path))
-    assert results == ["likes tea", "{'fact': 'NYC'}"]
+    assert results == ["likes tea", "lives in NYC", "{'fact': 'no text field'}"]
     kwargs = fake.search.call_args.kwargs
     assert kwargs["query_text"] == "about the user"
     assert kwargs["datasets"] == ["ds_a"]

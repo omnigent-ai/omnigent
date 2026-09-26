@@ -441,11 +441,49 @@ def memory_search(
 
         results = _run_bounded(_search, SEARCH_TIMEOUT_S)
         _record_outcome(True)
-        return [str(r) for r in results or []]
+        return _flatten_search_results(results)
     except Exception as e:
         _record_outcome(False)
         _logger.error("cognee search failed: %s", e)
         return []
+
+
+def _flatten_search_results(results: Any) -> list[str]:
+    """Flatten cognee search output into the memory texts.
+
+    cognee returns one envelope per searched dataset —
+    ``{dataset_id, dataset_name, ..., search_result: [hits]}`` — where a hit
+    is a chunk dict (with a ``text`` field next to store metadata) or, for
+    LLM search types, a plain answer string. The agent should see the
+    memories, not the plumbing, so envelopes are unwrapped and each hit
+    reduced to its text; unknown shapes fall back to ``str``.
+    """
+    texts: list[str] = []
+    for entry in results or []:
+        if isinstance(entry, dict) and "search_result" in entry:
+            inner = entry["search_result"]
+            hits = inner if isinstance(inner, list) else [inner]
+        else:
+            hits = [entry]
+        for hit in hits:
+            text = _result_text(hit)
+            if text.strip():
+                texts.append(text)
+    return texts
+
+
+def _result_text(hit: Any) -> str:
+    """Reduce one search hit to its memory text (``str`` fallback)."""
+    if isinstance(hit, dict):
+        for key in ("text", "content", "answer"):
+            value = hit.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    else:
+        text = getattr(hit, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text
+    return str(hit)
 
 
 def memory_add(
@@ -498,15 +536,22 @@ def _get_background_executor() -> ThreadPoolExecutor:
 
 
 def _cognify_blocking(dataset: str) -> None:
-    """Background worker body: run cognify for *dataset*, log-and-drop errors."""
+    """Background worker body: run cognify for *dataset*, log-and-drop errors.
+
+    Logs the per-run outcome: a cognify that races the preceding ``add`` can
+    complete as a silent no-op (observed live: the memory then never reaches
+    the vector index until a later cognify), so the pipeline result must be
+    visible in logs rather than discarded.
+    """
     try:
         import cognee
 
         async def _cognify() -> Any:
             return await cognee.cognify(datasets=[dataset])
 
-        _run_bounded(_cognify, COGNIFY_TIMEOUT_S)
+        result = _run_bounded(_cognify, COGNIFY_TIMEOUT_S)
         breaker.record_success()
+        _logger.info("cognee cognify finished for dataset %r: %.300s", dataset, result)
     except Exception as e:
         breaker.record_failure()
         _logger.error("cognee cognify failed for dataset %r: %s", dataset, e)
