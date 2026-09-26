@@ -511,8 +511,8 @@ def copy_opencode_database_for_fork(source_bridge_dir: Path, dest_bridge_dir: Pa
         fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
         with (
-            # Read-only: a sole writer connection would checkpoint (and delete)
-            # the source's WAL on close, discarding an uncheckpointed server.
+            # Read-only: a sole read-write connection would checkpoint and delete
+            # the source's WAL on close.
             contextlib.closing(
                 sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10.0)
             ) as src,
