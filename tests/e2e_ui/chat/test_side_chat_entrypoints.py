@@ -37,7 +37,9 @@ def side_chat_forks(page: Page, seeded_session: tuple[str, str]) -> Iterator[lis
     try:
         yield child_ids
     finally:
-        page.unroute(pattern, track_fork)
+        # A recording run closes the page when the test body ends.
+        if not page.is_closed():
+            page.unroute(pattern, track_fork)
         for child_id in child_ids:
             httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0).raise_for_status()
 
