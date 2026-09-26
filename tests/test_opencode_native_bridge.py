@@ -156,21 +156,133 @@ def test_write_cost_popup_config_writes_ap_routing(bridge_dir: Path) -> None:
     assert json.loads(path.read_text()) == {"ap_server_url": "http://h:1", "ap_auth_headers": {}}
 
 
-def test_write_opencode_policy_plugin(bridge_dir: Path) -> None:
+def test_write_opencode_policy_plugin_is_v2_package(bridge_dir: Path) -> None:
     path = write_opencode_policy_plugin(bridge_dir)
-    assert path.name == "omnigent-policy.js"
-    src = path.read_text(encoding="utf-8")
-    # The two phase hooks the reactive permission path can't reach.
-    assert '"chat.message"' in src  # REQUEST phase
-    assert '"tool.execute.after"' in src  # TOOL_RESULT phase
-    # Posts the proto phases + reads its coordinates from env.
+    # opencode 2.x only loads configured local plugins that are directories.
+    assert path == bridge_dir / "omnigent-policy"
+    assert path.is_dir()
+    package = json.loads((path / "package.json").read_text(encoding="utf-8"))
+    assert package["type"] == "module"
+    src = (path / "server.js").read_text(encoding="utf-8")
+    assert "export default" in src and 'id: "omnigent-policy"' in src
+    assert 'ctx.session.hook("prompt"' in src
+    assert 'ctx.tool.hook("execute.after"' in src
     assert "PHASE_REQUEST" in src and "PHASE_TOOL_RESULT" in src
     assert "OMNIGENT_POLICY_URL" in src and "OMNIGENT_SESSION_ID" in src
+    assert "OMNIGENT_POLICY_HEADERS" in src and "...POLICY_HEADERS" in src
     assert "/policies/evaluate" in src
-    # A function export so opencode's Object.values(mod) loader picks it up.
-    assert "export const OmnigentPolicyPlugin" in src
-    # Idempotent overwrite (re-launch ships fresh code, no error).
+    # No v1 shapes and no unresolved package import from a bare bridge dir.
+    for v1 in (
+        '"chat.message"',
+        "export const OmnigentPolicyPlugin",
+        "require(",
+        "@opencode/plugin",
+    ):
+        assert v1 not in src
+    # Idempotent overwrite.
     assert write_opencode_policy_plugin(bridge_dir) == path
+
+
+_PLUGIN_HARNESS = r"""
+import path from "node:path"
+import { pathToFileURL } from "node:url"
+const [, , pluginDir, verdictJson, mode] = process.argv
+const calls = []
+globalThis.fetch = async (url, init) => {
+  calls.push({ url, body: JSON.parse(init.body) })
+  if (mode === "throw") throw new Error("connection refused")
+  return { ok: true, json: async () => JSON.parse(verdictJson) }
+}
+const modUrl = pathToFileURL(path.join(pluginDir, "server.js")).href
+const mod = await import(modUrl)
+const hooks = {}
+const register = (domain) => async (name, cb) => {
+  hooks[domain + "." + name] = cb
+  return { dispose: async () => {} }
+}
+await mod.default.setup({
+  session: { hook: register("session") },
+  tool: { hook: register("tool") },
+})
+const out = { id: mod.default.id, hooks: Object.keys(hooks).sort() }
+try {
+  await hooks["session.prompt"]({
+    sessionID: "s",
+    messageID: "m",
+    prompt: { text: "hi" },
+    delivery: "steer",
+  })
+  out.prompt = "allowed"
+} catch (e) {
+  out.prompt = "blocked: " + e.message
+}
+const ev = {
+  tool: "shell",
+  sessionID: "s",
+  status: "completed",
+  result: { content: "secret", output: { x: 1 } },
+}
+await hooks["tool.execute.after"](ev)
+out.result = ev.result
+out.calls = calls
+console.log(JSON.stringify(out))
+"""
+
+
+def _run_plugin(tmp_path: Path, plugin_dir: Path, verdict: dict, mode: str) -> dict:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    harness = tmp_path / "harness.mjs"
+    harness.write_text(_PLUGIN_HARNESS, encoding="utf-8")
+    env = {
+        **os.environ,
+        "OMNIGENT_POLICY_URL": "http://srv/",
+        "OMNIGENT_SESSION_ID": "conv_1",
+        "OMNIGENT_RELAY_FILE": "",
+    }
+    proc = subprocess.run(
+        [node, str(harness), str(plugin_dir), json.dumps(verdict), mode],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=True,
+    )
+    return json.loads(proc.stdout)
+
+
+def test_policy_plugin_denies_prompt_and_withholds_tool_result(
+    bridge_dir: Path, tmp_path: Path
+) -> None:
+    out = _run_plugin(
+        tmp_path,
+        write_opencode_policy_plugin(bridge_dir),
+        {"result": "POLICY_ACTION_DENY", "reason": "nope"},
+        "ok",
+    )
+    assert out["id"] == "omnigent-policy"
+    assert out["hooks"] == ["session.prompt", "tool.execute.after"]
+    assert out["prompt"] == "blocked: Omnigent policy blocked this prompt: nope"
+    assert out["result"] == {"content": "[Omnigent policy withheld this tool result: nope]"}
+    assert out["calls"][0] == {
+        "url": "http://srv/v1/sessions/conv_1/policies/evaluate",
+        "body": {"event": {"type": "PHASE_REQUEST", "target": "", "data": {"text": "hi"}}},
+    }
+    assert out["calls"][1]["body"]["event"] == {
+        "type": "PHASE_TOOL_RESULT",
+        "target": "shell",
+        "data": {"result": "secret"},
+    }
+
+
+def test_policy_plugin_fails_open_on_transport_error(bridge_dir: Path, tmp_path: Path) -> None:
+    out = _run_plugin(tmp_path, write_opencode_policy_plugin(bridge_dir), {}, "throw")
+    assert out["prompt"] == "allowed"
+    assert out["result"] == {"content": "secret", "output": {"x": 1}}
 
 
 def test_update_last_event_id(bridge_dir: Path) -> None:
@@ -297,22 +409,6 @@ def test_user_opencode_config_path_prefers_jsonc(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "pref"))
     path = user_opencode_config_path()
     assert path is not None and path.name == "opencode.jsonc"
-
-
-def test_policy_plugin_merges_routing_headers(bridge_dir: Path) -> None:
-    """The generated policy plugin merges OMNIGENT_POLICY_HEADERS into its
-    /policies/evaluate POST.
-
-    The runner bakes the full routing header map (bearer + workspace / deployment
-    selectors) into that env var, so the out-of-process plugin's callbacks reach
-    the same server instance as the runner instead of a different one.
-    """
-    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
-    assert "OMNIGENT_POLICY_HEADERS" in src
-    # The routing map is spread into the request headers.
-    assert "...POLICY_HEADERS" in src
-    # The old bearer-only env var is fully removed.
-    assert "OMNIGENT_POLICY_AUTH" not in src
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
