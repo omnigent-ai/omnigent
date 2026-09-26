@@ -153,6 +153,12 @@ export const PI_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
+// Hermes `--reasoning LEVEL` accepts the Pi levels plus `ultra`.
+export const HERMES_NATIVE_EFFORTS: { value: string; label: string }[] = [
+  ...PI_NATIVE_EFFORTS,
+  { value: "ultra", label: "Ultra" },
+];
+
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,
  * the control on the right. Mirrors the "Configure …" modal layout.

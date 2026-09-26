@@ -418,6 +418,7 @@ def _hosts_body() -> str:
                         "codex-native": True,
                         "cursor-native": True,
                         "devin-native": True,
+                        "hermes-native": True,
                         "kimi-native": True,
                         "opencode-native": True,
                         "pi-native": True,
