@@ -37,7 +37,6 @@ from omnigent.db.compression import CompressedText
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
-
 # Hex length of a bare uuid4 id, the canonical Python-side form.
 _UUID_HEX_LEN = 32
 
@@ -1447,7 +1446,7 @@ class SqlUserDailyCost(OmnigentBase):
     aggregating the per-session ``conversations.session_usage`` blobs
     on every policy evaluation.
 
-    One row per ``(user_id, day_utc)``. Incremented (UPSERT
+    One row per ``(workspace_id, user_id, day_utc)``. Incremented (UPSERT
     ``cost_usd = cost_usd + delta``) at each turn boundary from the
     cost write sites — but only when the session runs under at least
     one policy, so the table is never touched in deployments that

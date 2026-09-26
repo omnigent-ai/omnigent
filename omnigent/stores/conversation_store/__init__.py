@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -90,6 +90,22 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+
+
+class DailyCostState(TypedDict):
+    """Daily cost state record returned by list_daily_cost_states.
+
+    :param cost_usd: Cumulative spend for this user on this day.
+    :param ask_approved_usd: Highest soft-limit checkpoint the user approved.
+    :param day_utc: The UTC day as "YYYY-MM-DD".
+    :param user_id: The user this record belongs to.
+    """
+
+    cost_usd: float
+    ask_approved_usd: float
+    day_utc: str
+    user_id: str
+
 
 # Reserved label-key PREFIX that records whether a session is "pinned" in the
 # sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
@@ -1293,6 +1309,26 @@ class ConversationStore(ABC):
             ``"2026-06-05"``.
         :param ask_approved_usd: The crossed checkpoint value (USD) the
             user approved continuing past, e.g. ``0.05``.
+        """
+        ...
+
+    @abstractmethod
+    def list_daily_cost_states(
+        self,
+        user_id: str,
+        since_day_utc: str,
+    ) -> list[DailyCostState]:
+        """
+        Return daily cost states for a user from since_day_utc onward.
+
+        Reads the full state (cost_usd, ask_approved_usd, day_utc) for
+        each day with recorded cost >= since_day_utc. Used by both daily
+        and period-based cost-budget policies.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
+        :returns: List of :class:`DailyCostState` dicts. Days with no spend
+            are omitted. Sorted ascending by day_utc.
         """
         ...
 
