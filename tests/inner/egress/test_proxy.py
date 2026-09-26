@@ -14,10 +14,16 @@ from functools import partial
 from pathlib import Path
 from unittest.mock import Mock
 
+import boto3
 import pytest
+from botocore.auth import S3SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials as BotocoreCredentials
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
+    AwsSigV4Credentials,
+    AwsSigV4RewriteRule,
     CredentialRewriteRule,
     RefreshingSecretProvider,
     prepare_credential_proxy_runtime,
@@ -1517,6 +1523,47 @@ async def test_connect_blocks_http2_when_host_has_credential_rewrite(
 
 
 @pytest.mark.asyncio
+async def test_connect_blocks_http2_when_host_has_aws_sigv4_rewrite(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """Same H2 opaque-relay block as credential_rewrites, for aws_sigv4."""
+    cert_path, key_path, bundle_path = ca_paths
+    host = "mybucket.s3.us-east-1.amazonaws.com"
+    proxy = EgressProxy(
+        parse_rules([f"* {host}/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[
+            AwsSigV4RewriteRule(
+                host=host,
+                region="us-east-1",
+                service="s3",
+                static_credentials=AwsSigV4Credentials("AKID", "secret"),
+            )
+        ],
+    )
+    proxy_port = await proxy.start_tcp()
+
+    try:
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host}:443",
+                host,
+                bundle_path,
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            ),
+            timeout=15,
+        )
+        assert b"403 Forbidden" in observed
+        assert b"credential rewrite rule" in observed
+    finally:
+        await proxy.stop()
+
+
+@pytest.mark.asyncio
 async def test_s6_connect_rejects_control_byte_in_inner_request_line(
     ca_paths: tuple[Path, Path, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -1869,12 +1916,19 @@ class _CapturedRequest:
     :param method: The request method the upstream received, e.g.
         ``"GET"`` or ``"TRACE"``, or ``None`` when the request line could
         not be parsed.
+    :param headers: Every header the upstream received, lower-cased keys,
+        last value wins on repeats. Populated for every request (a
+        superset of the individually-pulled-out fields above), used by
+        the ``aws_sigv4`` tests to inspect arbitrary ``X-Amz-*`` headers.
+    :param body: The raw request body the upstream received.
     """
 
     authorization: str | None
     connection: list[str] = field(default_factory=list)
     max_forwards: str | None = None
     method: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    body: bytes = b""
 
 
 async def _start_capturing_upstream(
@@ -1896,23 +1950,32 @@ async def _start_capturing_upstream(
         auth: str | None = None
         connection: list[str] = []
         max_forwards: str | None = None
+        headers: dict[str, str] = {}
         lines = head.split(b"\r\n")
         method: str | None = None
         if lines and lines[0]:
             method = lines[0].split(b" ", 1)[0].decode("latin-1")
-        for line in lines:
+        for line in lines[1:]:
+            if not line or b":" not in line:
+                continue
+            name, _, value = line.partition(b":")
+            headers[name.decode("latin-1").lower()] = value.strip().decode("latin-1")
             if line[:14].lower() == b"authorization:":
                 auth = line.partition(b":")[2].strip().decode("latin-1")
             elif line[:11].lower() == b"connection:":
                 connection.append(line.partition(b":")[2].strip().decode("latin-1").lower())
             elif line[:13].lower() == b"max-forwards:":
                 max_forwards = line.partition(b":")[2].strip().decode("latin-1")
+        content_length = int(headers.get("content-length", "0") or "0")
+        body = await reader.readexactly(content_length) if content_length else b""
         captured.append(
             _CapturedRequest(
                 authorization=auth,
                 connection=connection,
                 max_forwards=max_forwards,
                 method=method,
+                headers=headers,
+                body=body,
             )
         )
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
@@ -1992,6 +2055,49 @@ async def _proxied_http_request(
     writer.write(request)
     await writer.drain()
     response = await asyncio.wait_for(reader.read(4096), timeout=5)
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    return response
+
+
+async def _proxied_http_request_with_body(
+    *,
+    proxy_port: int,
+    upstream_port: int,
+    method: str,
+    path: str = "/probe",
+    headers: dict[str, str],
+    body: bytes,
+) -> bytes:
+    """Send one plain-HTTP request carrying an arbitrary header set + body.
+
+    Used by the ``aws_sigv4`` tests, which need to set ``Authorization``
+    plus several ``X-Amz-*`` headers and a real body — beyond what
+    :func:`_proxied_http_request` supports.
+
+    :param proxy_port: Loopback TCP port the proxy listens on.
+    :param upstream_port: Port of the local capturing upstream.
+    :param method: HTTP method to send, e.g. ``"PUT"``.
+    :param path: Request path (may include a query string).
+    :param headers: Header name/value pairs sent verbatim (in addition to
+        ``Host``/``Content-Length``/``Connection``, which are added here).
+    :param body: Raw request body bytes.
+    :returns: The raw response bytes the client received from the proxy.
+    """
+    reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+    header_lines = "".join(f"{name}: {value}\r\n" for name, value in headers.items())
+    request = (
+        f"{method} http://127.0.0.1:{upstream_port}{path} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{upstream_port}\r\n"
+        f"{header_lines}"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("latin-1") + body
+    writer.write(request)
+    await writer.drain()
+    response = await asyncio.wait_for(reader.read(65536), timeout=5)
     writer.close()
     with contextlib.suppress(Exception):
         await writer.wait_closed()
@@ -2586,6 +2692,378 @@ async def test_synthetic_not_swapped_on_loopback_method(
     # secret on a loopback/diagnostic verb.
     assert captured[0].authorization == f"Bearer {synthetic}"
     assert "real-secret-value" not in (captured[0].authorization or "")
+
+
+# ---------------------------------------------------------------------------
+# AWS SigV4 resigning (aws_sigv4 credential_proxy type) — a separate
+# mechanism from the header-swap rewrites above: the whole request's
+# auth-related headers are discarded and rebuilt, not one value swapped.
+# ---------------------------------------------------------------------------
+
+_GARBAGE_ACCESS_KEY_ID = "FAKEGARBAGEPLACEHOLD"
+_GARBAGE_SECRET_ACCESS_KEY = "garbagesecretkeynotreal0000000000000000"
+_REAL_ACCESS_KEY_ID = "FAKEREALTESTKEY00000"
+_REAL_SECRET_ACCESS_KEY = "realTestSecretKeyExample1234567890abcdef"
+
+
+class _NoRehashS3SigV4Auth(S3SigV4Auth):  # type: ignore[misc]
+    """Test-local double of the resigning module's private signer variant.
+
+    Skips S3SigV4Auth's own X-Amz-Content-Sha256 recompute so this test
+    can independently verify a resigned request's Authorization without
+    needing an un-framed/un-chunked body -- see
+    omnigent.inner.egress.aws_sigv4's module docstring for why that
+    header must never be recomputed from a (possibly chunk-framed) body.
+    """
+
+    def _modify_request_before_signing(self, request: object) -> None:
+        from botocore.auth import SigV4Auth
+
+        SigV4Auth._modify_request_before_signing(self, request)
+
+
+def _garbage_signed_put(
+    *, bucket: str, key: str, body: bytes, chunked: bool = True
+) -> dict[str, object]:
+    """Build the header/body shape a sandboxed boto3 client would send.
+
+    Captures a real ``put_object`` call's fully-prepared wire request
+    (method, url, headers, body) signed with garbage credentials — the
+    exact shape the egress proxy sees arrive from the sandbox. No network
+    call is made; the ``before-send`` handler intercepts and returns a
+    synthetic response.
+
+    :param chunked: When ``True`` (the default), uses botocore's own
+        default client config — current botocore computes a checksum (and
+        thus chunks, via ``aws-chunked`` + ``STREAMING-*``) on every S3
+        upload regardless of body size. When ``False``, sets
+        ``request_checksum_calculation="when_required"`` to get the
+        plain, non-chunked signed-payload shape instead.
+    :returns: ``{"method", "path", "headers", "body"}``.
+    """
+    captured: dict[str, object] = {}
+
+    def _capture(request: object, **kwargs: object) -> object:
+        raw_body = request.body  # type: ignore[attr-defined]
+        data = raw_body.read() if hasattr(raw_body, "read") else raw_body
+        captured["headers"] = {
+            k: (v.decode() if isinstance(v, bytes) else v)
+            for k, v in request.headers.items()  # type: ignore[attr-defined]
+        }
+        captured["body"] = data
+        captured["url"] = request.url  # type: ignore[attr-defined]
+        captured["method"] = request.method  # type: ignore[attr-defined]
+
+        class _Resp:
+            status_code = 200
+            headers: dict[str, str] = {}
+            content = b""
+
+            class raw:
+                @staticmethod
+                def read(*_a: object, **_kw: object) -> bytes:
+                    return b""
+
+        return _Resp()
+
+    from botocore.config import Config
+
+    config = None if chunked else Config(request_checksum_calculation="when_required")
+    client = boto3.client(
+        "s3",
+        region_name="us-east-1",
+        aws_access_key_id=_GARBAGE_ACCESS_KEY_ID,
+        aws_secret_access_key=_GARBAGE_SECRET_ACCESS_KEY,
+        config=config,
+    )
+    client.meta.events.register_first("before-send.s3.*", _capture)
+    client.put_object(Bucket=bucket, Key=key, Body=body)
+
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(str(captured["url"]))
+    path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    return {
+        "method": captured["method"],
+        "path": path,
+        "headers": captured["headers"],
+        "body": captured["body"],
+    }
+
+
+def _expected_resigned_authorization(
+    *, method: str, url: str, headers: dict[str, str], body: bytes
+) -> str:
+    """Independently recompute the expected Authorization with the real keys."""
+    managed = {"authorization", "x-amz-date", "date", "x-amz-security-token"}
+    filtered = {k: v for k, v in headers.items() if k.lower() not in managed}
+    aws_request = AWSRequest(method=method, url=url, data=body, headers=filtered)
+    creds = BotocoreCredentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY)
+    _NoRehashS3SigV4Auth(creds, "s3", "us-east-1").add_auth(aws_request)
+    return aws_request.headers["Authorization"]
+
+
+@pytest.mark.asyncio
+async def test_aws_sigv4_resigns_non_chunked_put_with_real_credentials(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A small in-memory-bytes PUT (unchunked) is resigned with the real keys.
+
+    The upstream must receive a request whose Authorization is a valid
+    SigV4 signature over the actual forwarded bytes using the REAL
+    credentials — proving the garbage signature never reached upstream and
+    the real one was computed correctly, not merely "some Authorization
+    header changed".
+    """
+    cert_path, key_path, _ = ca_paths
+    garbage = _garbage_signed_put(
+        bucket="mybucket", key="plain-key", body=b"hello world", chunked=False
+    )
+    assert "aws-chunked" not in str(garbage["headers"].get("Content-Encoding", ""))  # type: ignore[union-attr]
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1",
+        region="us-east-1",
+        service="s3",
+        static_credentials=AwsSigV4Credentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY),
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request_with_body(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method=str(garbage["method"]),
+            path=str(garbage["path"]),
+            headers={
+                k: v
+                for k, v in garbage["headers"].items()  # type: ignore[union-attr]
+                if k.lower() not in ("content-length", "host")
+            },
+            body=bytes(garbage["body"]),  # type: ignore[arg-type]
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    upstream_url = f"http://127.0.0.1:{upstream_port}{garbage['path']}"
+    expected = _expected_resigned_authorization(
+        method=str(garbage["method"]),
+        url=upstream_url,
+        headers=captured[0].headers,
+        body=captured[0].body,
+    )
+    assert captured[0].headers.get("authorization") == expected
+    assert _GARBAGE_ACCESS_KEY_ID not in (captured[0].headers.get("authorization") or "")
+    assert _REAL_ACCESS_KEY_ID in (captured[0].headers.get("authorization") or "")
+    assert captured[0].body == b"hello world"
+
+
+@pytest.mark.asyncio
+async def test_aws_sigv4_resigns_default_chunked_put_with_real_credentials(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """The DEFAULT put_object shape (aws-chunked + streaming-trailer
+    checksum, current botocore's default regardless of body size) is
+    resigned correctly with no special-casing — same code path as the
+    non-chunked test above."""
+    cert_path, key_path, _ = ca_paths
+    garbage = _garbage_signed_put(
+        bucket="mybucket", key="chunked-key", body=b"chunked payload test content"
+    )
+    assert str(garbage["headers"]["Content-Encoding"]) == "aws-chunked"  # type: ignore[index]
+    assert str(garbage["headers"]["X-Amz-Content-SHA256"]).startswith(  # type: ignore[index]
+        "STREAMING-"
+    )
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1",
+        region="us-east-1",
+        service="s3",
+        static_credentials=AwsSigV4Credentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY),
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request_with_body(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method=str(garbage["method"]),
+            path=str(garbage["path"]),
+            headers={
+                k: v
+                for k, v in garbage["headers"].items()  # type: ignore[union-attr]
+                if k.lower() not in ("content-length", "host")
+            },
+            body=bytes(garbage["body"]),  # type: ignore[arg-type]
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    # The chunk-framed body must reach upstream byte-for-byte unchanged —
+    # the resign step never decodes/re-encodes it.
+    assert captured[0].body == garbage["body"]
+    expected_sha256 = garbage["headers"]["X-Amz-Content-SHA256"]  # type: ignore[index]
+    assert captured[0].headers.get("x-amz-content-sha256") == expected_sha256
+    upstream_url = f"http://127.0.0.1:{upstream_port}{garbage['path']}"
+    expected = _expected_resigned_authorization(
+        method=str(garbage["method"]),
+        url=upstream_url,
+        headers=captured[0].headers,
+        body=captured[0].body,
+    )
+    assert captured[0].headers.get("authorization") == expected
+    assert _REAL_ACCESS_KEY_ID in (captured[0].headers.get("authorization") or "")
+
+
+@pytest.mark.asyncio
+async def test_aws_sigv4_rejects_presigned_query_auth(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    cert_path, key_path, _ = ca_paths
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1",
+        region="us-east-1",
+        service="s3",
+        static_credentials=AwsSigV4Credentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY),
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request_with_body(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="GET",
+            path="/probe?X-Amz-Signature=abc123",
+            headers={"Authorization": "AWS4-HMAC-SHA256 Credential=x/us-east-1/s3/aws4_request"},
+            body=b"",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"403" in response
+    assert len(captured) == 0
+
+
+@pytest.mark.asyncio
+async def test_aws_sigv4_passes_through_non_sigv4_authorization_unchanged(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A non-SigV4 Authorization on a bound host is left alone — defense
+    in depth against clobbering an unrelated credential."""
+    cert_path, key_path, _ = ca_paths
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1",
+        region="us-east-1",
+        service="s3",
+        static_credentials=AwsSigV4Credentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY),
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_get(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            authorization="Bearer some-other-token",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response
+    assert len(captured) == 1
+    assert captured[0].authorization == "Bearer some-other-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["TRACE", "OPTIONS"])
+async def test_aws_sigv4_forbidden_methods_pass_through(
+    ca_paths: tuple[Path, Path, Path],
+    method: str,
+) -> None:
+    cert_path, key_path, _ = ca_paths
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1",
+        region="us-east-1",
+        service="s3",
+        static_credentials=AwsSigV4Credentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY),
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    garbage_auth = "AWS4-HMAC-SHA256 Credential=garbage/x, SignedHeaders=host, Signature=deadbeef"
+    try:
+        response = await _proxied_http_request(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method=method,
+            authorization=garbage_auth,
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    assert captured[0].authorization == garbage_auth
 
 
 @pytest.mark.asyncio
