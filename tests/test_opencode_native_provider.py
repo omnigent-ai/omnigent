@@ -385,231 +385,132 @@ def test_strip_jsonc_comments_does_not_corrupt_urls() -> None:
     assert parsed["baseURL"] == "https://my-gateway/v1"
 
 
+def _user_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str) -> None:
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(text, encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+
 def test_merge_user_provider_config_noop_without_user_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No user config file → config returned unchanged."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "nonexistent"))
-
     config = {"model": "anthropic/claude-sonnet-4-5"}
-    result = maybe_merge_user_provider_config(config)
-    assert result == config
+    assert maybe_merge_user_provider_config(config) == config
 
 
-def test_merge_user_provider_config_adds_user_providers(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """User's provider definitions are merged into the synthesized config."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text(
-        '{"provider": {"my-openai": {"npm": "@ai-sdk/openai-compatible", '
-        '"options": {"baseURL": "https://my-gateway/v1", "apiKey": "sk-"}, '
-        '"models": {"gpt-4": {"name": "gpt-4"}}}}}',
-        encoding="utf-8",
+def test_merge_converts_v1_provider_to_v2(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        '{"provider": {"my-openai": {"npm": "@ai-sdk/openai-compatible", "name": "Mine", '
+        '"options": {"baseURL": "https://gw/v1", "apiKey": "sk-", "headers": {"X-A": "1"}}, '
+        '"models": {"gpt-4": {"name": "gpt-4", "id": "gpt-4-0613"}}}}}',
     )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    config: dict[str, object] = {}
-    result = maybe_merge_user_provider_config(config)
-
-    assert "provider" in result
-    providers = result["provider"]
-    assert isinstance(providers, dict)
-    assert "my-openai" in providers
-    assert providers["my-openai"]["options"]["baseURL"] == "https://my-gateway/v1"
-    # Synthesized $schema should have been added.
-    assert "$schema" in result
-
-
-def test_merge_user_provider_config_does_not_clobber_synthesized_providers(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A user provider with the same key as a synthesized one is NOT overwritten."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text(
-        '{"provider": {"databricks-gateway": {"options": {"baseURL": "http://evil"}}}}',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    config = {
-        "provider": {
-            "databricks-gateway": {
-                "npm": "@ai-sdk/openai-compatible",
-                "options": {
-                    "baseURL": "https://real-databricks/serving-endpoints",
-                    "apiKey": "tok",
-                },
-            }
-        }
+    result = maybe_merge_user_provider_config({})
+    assert "provider" not in result
+    assert result["providers"]["my-openai"] == {
+        "name": "Mine",
+        "package": "aisdk:@ai-sdk/openai-compatible",
+        "settings": {"baseURL": "https://gw/v1", "apiKey": "sk-"},
+        "headers": {"X-A": "1"},
+        "models": {"gpt-4": {"name": "gpt-4", "modelID": "gpt-4-0613"}},
     }
-    result = maybe_merge_user_provider_config(config)
-    assert (
-        result["provider"]["databricks-gateway"]["options"]["baseURL"]
-        == "https://real-databricks/serving-endpoints"
-    )
+    assert result["$schema"] == "https://opencode.ai/config.json"
 
 
-def test_merge_user_provider_config_adopts_user_model_when_synthesized_has_none(
+def test_merge_reads_v2_providers_and_v2_wins_over_v1(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """User's default model is adopted when the synthesized config pins none.
-
-    Regression: with no gateway and no spec model_override, the synthesized
-    config had no ``model`` key; opencode-native then picked its own default
-    over the merged models map (landing on a served Gemini endpoint) instead of
-    the user's configured Claude default. The merge now carries ``model``.
-    """
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text(
-        '{"model": "databricks/databricks-claude-opus-4-8", '
-        '"provider": {"databricks": {"npm": "@ai-sdk/openai-compatible", '
-        '"options": {"baseURL": "https://ws/serving-endpoints", "apiKey": "t"}, '
-        '"models": {"databricks-claude-opus-4-8": {"name": "Claude"}, '
-        '"databricks-gemini-2-5-pro": {"name": "Gemini"}}}}}',
-        encoding="utf-8",
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        '{"provider": {"p": {"npm": "@ai-sdk/openai"}}, '
+        '"providers": {"p": {"package": "@opencode/ai/providers/openai"}, '
+        '"q": {"settings": {"baseURL": "https://q"}}}}',
     )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    config: dict[str, object] = {}  # no gateway, no model_override
-    result = maybe_merge_user_provider_config(config)
-
-    assert result["model"] == "databricks/databricks-claude-opus-4-8"
+    result = maybe_merge_user_provider_config({})
+    assert result["providers"]["p"] == {"package": "@opencode/ai/providers/openai"}
+    assert result["providers"]["q"] == {"settings": {"baseURL": "https://q"}}
 
 
-def test_merge_user_provider_config_does_not_override_synthesized_model(
+def test_merge_does_not_clobber_synthesized_providers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A synthesized ``model`` (gateway / spec override) wins over the user's."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text(
-        '{"model": "databricks/databricks-claude-opus-4-8", '
-        '"provider": {"databricks": {"models": {"m": {"name": "m"}}}}}',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    config: dict[str, object] = {"model": "databricks-gateway/pinned-model"}
+    _user_config(monkeypatch, tmp_path, '{"providers": {"databricks-gateway": {"name": "user"}}}')
+    config: dict[str, object] = {"providers": {"databricks-gateway": {"name": "synth"}}}
     result = maybe_merge_user_provider_config(config)
+    assert result["providers"]["databricks-gateway"] == {"name": "synth"}
 
-    assert result["model"] == "databricks-gateway/pinned-model"
 
-
-def test_merge_user_provider_config_carries_model_without_user_providers(
+def test_merge_adopts_user_model_only_when_unset(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """User's default model is adopted even when the user declares no providers."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text(
-        '{"model": "databricks/databricks-claude-opus-4-8"}',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    config: dict[str, object] = {}
-    result = maybe_merge_user_provider_config(config)
-
-    assert result["model"] == "databricks/databricks-claude-opus-4-8"
+    _user_config(monkeypatch, tmp_path, '{"model": {"providerID": "anthropic", "model": "c-4"}}')
+    assert maybe_merge_user_provider_config({})["model"] == "anthropic/c-4"
+    assert maybe_merge_user_provider_config({"model": "openai/g"})["model"] == "openai/g"
 
 
-def test_merge_user_provider_config_preserves_plugins_and_deduplicates(
+def test_merge_adopts_user_string_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _user_config(monkeypatch, tmp_path, '{"model": "databricks/databricks-claude-opus-4-8"}')
+    assert maybe_merge_user_provider_config({})["model"] == "databricks/databricks-claude-opus-4-8"
+
+
+def test_merge_plugins_v1_and_v2_after_synthesized(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Global plugins survive per-session config synthesis."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text(
-        '{"plugin": ["/opt/pulse-agents-harnesses/marshal-opencode", '
-        '"/opt/pulse-agents-harnesses/other"]}',
-        encoding="utf-8",
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        '{"plugin": ["/opt/a", ["pkg-b", {"k": 1}], "", 42], '
+        '"plugins": ["/opt/a", {"package": "pkg-c"}, {"bad": 1}]}',
     )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    result = maybe_merge_user_provider_config({"plugins": ["/b/omnigent-policy", "/opt/a"]})
+    assert "plugin" not in result
+    assert result["plugins"] == [
+        "/b/omnigent-policy",
+        "/opt/a",
+        {"package": "pkg-b", "options": {"k": 1}},
+        {"package": "pkg-c"},
+    ]
 
+
+def test_merge_mcp_v1_flat_and_v2_servers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        '{"mcp": {"legacy": {"type": "local", "command": ["x"], "enabled": false,'
+        ' "timeout": 5000}, "omnigent": {"type": "local", "command": ["user"]},'
+        ' "servers": {"modern": {"type": "remote", "url": "https://m"}}}}',
+    )
     config: dict[str, object] = {
-        "plugin": ["/tmp/omnigent-policy.js", "/opt/pulse-agents-harnesses/other"]
+        "mcp": {"servers": {"omnigent": {"type": "local", "command": ["r"]}}}
     }
     result = maybe_merge_user_provider_config(config)
-
-    assert result["plugin"] == [
-        "/tmp/omnigent-policy.js",
-        "/opt/pulse-agents-harnesses/other",
-        "/opt/pulse-agents-harnesses/marshal-opencode",
-    ]
-
-
-def test_merge_user_provider_config_skips_non_string_plugins(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Malformed plugin entries are dropped rather than propagated."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text(
-        '{"plugin": ["/opt/pulse-agents-harnesses/marshal-opencode", {"bad": "entry"}, "", 42]}',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    config: dict[str, object] = {"plugin": ["/tmp/omnigent-policy.js"]}
-    result = maybe_merge_user_provider_config(config)
-
-    assert result["plugin"] == [
-        "/tmp/omnigent-policy.js",
-        "/opt/pulse-agents-harnesses/marshal-opencode",
-    ]
-
-
-def test_merge_user_provider_config_merges_alongside_synthesized_providers(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """User providers appear alongside the synthesized ones when keys differ."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text(
-        '{"provider": {"my-openai": {"options": {"baseURL": "http://my-gw/v1"}}}}',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    config = {
-        "provider": {
-            "databricks-gateway": {
-                "options": {"baseURL": "https://dbx/serving-endpoints", "apiKey": "tok"},
-            }
-        }
+    servers = result["mcp"]["servers"]
+    assert servers["omnigent"] == {"type": "local", "command": ["r"]}  # synthesized wins
+    assert servers["legacy"] == {
+        "type": "local",
+        "command": ["x"],
+        "disabled": True,
+        "timeout": {"catalog": 5000, "execution": 5000},
     }
-    result = maybe_merge_user_provider_config(config)
-    providers = result["provider"]
-    assert "databricks-gateway" in providers
-    assert "my-openai" in providers
-    assert providers["my-openai"]["options"]["baseURL"] == "http://my-gw/v1"
+    assert servers["modern"] == {"type": "remote", "url": "https://m"}
 
 
 def test_merge_user_provider_config_handles_jsonc_comments(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The user's JSONC file with comments is parsed correctly."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text(
-        "{\n"
-        "  // my custom provider\n"
-        '  "provider": {\n'
-        '    "my-openai": {\n'
-        '      "options": {"baseURL": "https://my-gw/v1"}\n'
-        "    }\n"
-        "  }\n"
-        "}\n",
-        encoding="utf-8",
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        '{\n  // comment\n  "providers": {"p": {"settings":'
+        ' {"baseURL": "https://x/v1"}}}, /* b */\n}',
     )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    result = maybe_merge_user_provider_config({})
-    assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
+    assert maybe_merge_user_provider_config({})["providers"]["p"]["settings"]["baseURL"] == (
+        "https://x/v1"
+    )
 
 
 def test_strip_trailing_commas_object() -> None:
@@ -643,28 +544,6 @@ def test_strip_trailing_commas_nested_with_string_values() -> None:
     raw = '{"a": "x, }", "b": [1, 2,],}'
     expected = '{"a": "x, }", "b": [1, 2]}'
     assert _strip_trailing_commas(raw) == expected
-
-
-def test_merge_user_provider_config_handles_jsonc_trailing_commas(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Trailing commas in JSONC are handled (they're valid in JSONC but not JSON)."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text(
-        "{\n"
-        '  "provider": {\n'
-        '    "my-openai": {\n'
-        '      "options": {"baseURL": "https://my-gw/v1",},\n'  # trailing comma
-        "    },\n"  # trailing comma
-        "  },\n"  # trailing comma
-        "}\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-
-    result = maybe_merge_user_provider_config({})
-    assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
 
 
 def test_build_mcp_block_preserves_custom_timeout() -> None:

@@ -598,118 +598,237 @@ def _strip_trailing_commas(text: str) -> str:
     return "".join(result)
 
 
-def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
-    """
-    Merge the user's global OpenCode provider definitions into *config*.
+_AISDK_PREFIX = "aisdk:"
 
-    OpenCode reads ``XDG_CONFIG_HOME/opencode/opencode.json(c)`` for custom
-    provider definitions (e.g. OpenAI-compatible endpoints with custom base
-    URLs). When running under Omnigent, the per-session ``XDG_CONFIG_HOME``
-    override hides this global config. This function reads the user's real
-    config and merges any ``provider`` block into *config* so the spawned
-    server sees both the user's providers (with their custom base URLs) and
-    any Omnigent-synthesized providers (e.g. Databricks gateway).
 
-    ``provider`` entries are merged, and the user's top-level ``plugin``
-    entries are appended after any synthesized ones (synthesized policy
-    plugins stay first; duplicate paths are dropped) so plugin-based
-    provider auth keeps working in native sessions. The user config's
-    ``model`` default is adopted **only when the synthesized config pins
-    none** — for the other keys it sets (model, mcp, permission, etc.) the
-    synthesized config still takes precedence. The ``model`` carry-over
-    matters because when
-    neither a gateway nor a spec-supplied ``model_override`` is present, the
-    synthesized config has no ``model`` key, and opencode-native would otherwise
-    pick its own default over the merged models map (e.g. landing on a served
-    Gemini endpoint even though the user's config defaults to Claude).
-
-    :param config: The synthesized config dict (may be empty).
-    :returns: *config* with user's ``provider`` entries (and, if unset, the
-        user's default ``model``) merged in.
-    """
+def _read_user_opencode_config() -> dict[str, object] | None:
+    """Parse the user's global ``opencode.json(c)``; ``None`` when absent or invalid."""
     from omnigent.harnesses.opencode_native.bridge import user_opencode_config_path
 
     user_path = user_opencode_config_path()
     if user_path is None:
-        return config
-
+        return None
     try:
         raw = user_path.read_text(encoding="utf-8")
-        # Try plain JSON first (handles .json files without comments).
-        # If that fails, strip JSONC comments and trailing commas, then
-        # retry (handles .jsonc).
         try:
-            user_config = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
-            cleaned = _strip_jsonc_comments(raw)
-            cleaned = _strip_trailing_commas(cleaned)
-            user_config = json.loads(cleaned)
+            parsed = json.loads(_strip_trailing_commas(_strip_jsonc_comments(raw)))
     except (OSError, UnicodeDecodeError):
-        return config
+        return None
     except json.JSONDecodeError:
-        _logger.warning(
-            "Failed to parse user OpenCode config at %s — ignoring user providers",
-            user_path,
-        )
+        _logger.warning("Failed to parse user OpenCode config at %s — ignoring it", user_path)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _string_map(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(k): v for k, v in value.items() if isinstance(v, str)}
+
+
+def _v1_model_to_v2(model: Mapping[str, object]) -> dict[str, object]:
+    """Subset of opencode's v1 model migration (``migrate.ts:304-354``)."""
+    out: dict[str, object] = {}
+    if isinstance(model.get("name"), str):
+        out["name"] = model["name"]
+    if isinstance(model.get("id"), str):
+        out["modelID"] = model["id"]
+    headers = _string_map(model.get("headers"))
+    if headers:
+        out["headers"] = headers
+    options = model.get("options")
+    if isinstance(options, Mapping) and options:
+        out["settings"] = dict(options)
+    limit = model.get("limit")
+    if isinstance(limit, Mapping):
+        limits = {
+            key: int(limit[key])
+            for key in ("context", "input", "output")
+            if isinstance(limit.get(key), (int, float)) and not isinstance(limit.get(key), bool)
+        }
+        if limits:
+            out["limit"] = limits
+    return out
+
+
+def v1_provider_to_v2(entry: Mapping[str, object]) -> dict[str, object]:
+    """
+    Convert a v1 ``provider.<id>`` entry to a v2 ``providers.<id>`` entry.
+
+    Mirrors opencode's own migration (``migrate.ts:247-260``): ``npm`` becomes an
+    ``aisdk:``-prefixed ``package``, ``options`` becomes ``settings`` with
+    ``headers``/``body`` lifted out, and ``api`` becomes ``settings.baseURL``.
+
+    :param entry: The v1 provider object.
+    :returns: The v2 provider object.
+    """
+    out: dict[str, object] = {}
+    if isinstance(entry.get("name"), str):
+        out["name"] = entry["name"]
+    env = entry.get("env")
+    if isinstance(env, list) and all(isinstance(item, str) for item in env):
+        out["env"] = list(env)
+    npm = entry.get("npm")
+    if isinstance(npm, str) and npm:
+        out["package"] = npm if npm.startswith(_AISDK_PREFIX) else _AISDK_PREFIX + npm
+    options = entry.get("options")
+    options = options if isinstance(options, Mapping) else {}
+    settings = {str(k): v for k, v in options.items() if k not in ("headers", "body")}
+    if isinstance(entry.get("api"), str):
+        settings["baseURL"] = entry["api"]
+    if settings:
+        out["settings"] = settings
+    headers = _string_map(options.get("headers"))
+    if headers:
+        out["headers"] = headers
+    body = options.get("body")
+    if isinstance(body, Mapping) and body:
+        out["body"] = dict(body)
+    models = entry.get("models")
+    if isinstance(models, Mapping):
+        out["models"] = {
+            str(mid): _v1_model_to_v2(model)
+            for mid, model in models.items()
+            if isinstance(model, Mapping)
+        }
+    return out
+
+
+def _user_providers(user: Mapping[str, object]) -> dict[str, object]:
+    providers: dict[str, object] = {}
+    legacy = user.get("provider")
+    if isinstance(legacy, Mapping):
+        for pid, entry in legacy.items():
+            if isinstance(entry, Mapping):
+                providers[str(pid)] = v1_provider_to_v2(entry)
+    native = user.get("providers")
+    if isinstance(native, Mapping):
+        for pid, entry in native.items():
+            if isinstance(entry, Mapping):
+                providers[str(pid)] = dict(entry)
+    return providers
+
+
+def _user_model(user: Mapping[str, object]) -> str | None:
+    model = user.get("model")
+    if isinstance(model, str) and "/" in model:
+        return model
+    if isinstance(model, Mapping):
+        provider_id, model_id = model.get("providerID"), model.get("model")
+        if isinstance(provider_id, str) and isinstance(model_id, str):
+            variant = model.get("variant")
+            suffix = f"#{variant}" if isinstance(variant, str) and variant else ""
+            return f"{provider_id}/{model_id}{suffix}"
+    return None
+
+
+def _user_plugins(user: Mapping[str, object]) -> list[object]:
+    plugins: list[object] = []
+    legacy = user.get("plugin")
+    for item in legacy if isinstance(legacy, list) else []:
+        if isinstance(item, str) and item:
+            plugins.append(item)
+        elif (
+            isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], Mapping)
+        ):
+            plugins.append({"package": item[0], "options": dict(item[1])})
+    native = user.get("plugins")
+    for item in native if isinstance(native, list) else []:
+        if isinstance(item, str) and item:
+            plugins.append(item)
+        elif isinstance(item, Mapping) and isinstance(item.get("package"), str):
+            plugins.append(dict(item))
+    return plugins
+
+
+def _v1_mcp_to_v2(entry: Mapping[str, object]) -> dict[str, object]:
+    """Subset of opencode's v1 MCP migration (``migrate.ts:202-227``)."""
+    out = {str(k): v for k, v in entry.items() if k not in ("enabled", "timeout")}
+    enabled = entry.get("enabled")
+    if isinstance(enabled, bool):
+        out["disabled"] = not enabled
+    timeout = entry.get("timeout")
+    if isinstance(timeout, int) and not isinstance(timeout, bool) and timeout > 0:
+        out["timeout"] = {"catalog": timeout, "execution": timeout}
+    return out
+
+
+def _user_mcp_servers(user: Mapping[str, object]) -> dict[str, object]:
+    mcp = user.get("mcp")
+    if not isinstance(mcp, Mapping):
+        return {}
+    servers: dict[str, object] = {}
+    for name, entry in mcp.items():
+        if not isinstance(entry, Mapping):
+            continue
+        if entry.get("type") in ("local", "remote"):
+            servers[str(name)] = _v1_mcp_to_v2(entry)
+    native = mcp.get("servers")
+    if isinstance(native, Mapping) and native.get("type") not in ("local", "remote"):
+        for name, entry in native.items():
+            if isinstance(entry, Mapping):
+                servers[str(name)] = dict(entry)
+    return servers
+
+
+def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
+    """
+    Merge the user's global OpenCode config into the synthesized v2 config.
+
+    The per-session ``XDG_CONFIG_HOME`` hides ``~/.config/opencode``, so carry over
+    the user's providers, default model, plugins and MCP servers. Both v1
+    (``provider``, ``plugin``, flat ``mcp``) and v2 (``providers``, ``plugins``,
+    ``mcp.servers``) spellings are read; the result uses v2 keys only.
+    Synthesized entries always win; the user's model applies only when none is set.
+
+    :param config: The synthesized config dict.
+    :returns: A new dict with the user's entries merged in.
+    """
+    user = _read_user_opencode_config()
+    if user is None:
         return config
-
-    if not isinstance(user_config, dict):
-        return config
-
-    # Adopt the user's default ``model`` when the synthesized config pins none.
-    # ``setdefault`` keeps the synthesized value authoritative (gateway /
-    # spec-supplied ``model_override`` win); it only fills the gap where both
-    # were absent, so opencode-native launches on the user's chosen default
-    # instead of picking its own over the merged models map.
-    def _carry_model(target: dict[str, object]) -> None:
-        user_model = user_config.get("model")
-        if isinstance(user_model, str) and user_model:
-            target.setdefault("model", user_model)
-
-    def _merge_plugins(target: dict[str, object]) -> None:
-        """Preserve user plugins while retaining synthesized policy hooks."""
-        user_plugins = user_config.get("plugin")
-        if not isinstance(user_plugins, list):
-            return
-        existing = target.get("plugin")
-        merged: list[object] = list(existing) if isinstance(existing, list) else []
-        for plugin in user_plugins:
-            # Plugin entries are paths/identifiers; skip anything that isn't a
-            # non-empty string so we never emit a config OpenCode would reject.
-            if not isinstance(plugin, str) or not plugin:
-                continue
-            if plugin not in merged:
-                merged.append(plugin)
-        if merged:
-            target["plugin"] = merged
-
-    user_providers = user_config.get("provider")
-    if not isinstance(user_providers, dict) or not user_providers:
-        # No custom providers to merge, but the user's default model still
-        # applies when the synthesized config didn't pin one.
-        result = dict(config)
-        _carry_model(result)
-        _merge_plugins(result)
-        return result
-
     result = dict(config)
-    existing = result.get("provider")
-    if isinstance(existing, dict):
-        # Merge user's providers alongside existing ones; don't clobber
-        # synthesized providers (Omnigent's keys like "databricks-gateway"
-        # take priority).
-        merged = dict(existing)
-        for key, value in user_providers.items():
-            if key not in merged:
-                merged[key] = value
-        result["provider"] = merged
-    else:
-        result["provider"] = dict(user_providers)
 
-    _carry_model(result)
-    _merge_plugins(result)
-    result.setdefault("$schema", "https://opencode.ai/config.json")
+    user_providers = _user_providers(user)
+    if user_providers:
+        existing = result.get("providers")
+        merged = dict(existing) if isinstance(existing, Mapping) else {}
+        for pid, entry in user_providers.items():
+            merged.setdefault(pid, entry)
+        result["providers"] = merged
 
+    user_model = _user_model(user)
+    if user_model:
+        result.setdefault("model", user_model)
+
+    user_plugins = _user_plugins(user)
+    if user_plugins:
+        existing_plugins = result.get("plugins")
+        plugins: list[object] = (
+            list(existing_plugins) if isinstance(existing_plugins, list) else []
+        )
+        for plugin in user_plugins:
+            if plugin not in plugins:
+                plugins.append(plugin)
+        result["plugins"] = plugins
+
+    user_servers = _user_mcp_servers(user)
+    if user_servers:
+        mcp = result.get("mcp")
+        mcp_block = dict(mcp) if isinstance(mcp, Mapping) else {}
+        current = mcp_block.get("servers")
+        servers = dict(current) if isinstance(current, Mapping) else {}
+        for name, entry in user_servers.items():
+            servers.setdefault(name, entry)
+        mcp_block["servers"] = servers
+        result["mcp"] = mcp_block
+
+    result.setdefault("$schema", OPENCODE_CONFIG_SCHEMA)
     return result
 
 
