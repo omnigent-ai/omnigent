@@ -447,13 +447,16 @@ def browser_type_launch_args(
 def browser_context_args(
     browser_context_args: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return a new context options dict for each test.
+    """Return fresh Playwright context options with optional video recording.
 
-    pytest-playwright already creates a fresh context for its function-scoped
-    ``context`` and ``page`` fixtures. Keeping this wrapper function-scoped
-    makes that contract explicit and prevents accidental mutable option reuse.
-    """
-    return {**browser_context_args}
+    Sync page/context fixtures need these options in addition to the Browser
+    patch. An explicit record_video_dir takes precedence over the environment."""
+    args = {**browser_context_args}
+    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+    if record_dir:
+        Path(record_dir).mkdir(parents=True, exist_ok=True)
+        args.setdefault("record_video_dir", record_dir)
+    return args
 
 
 def _validate_ui_base_url(base_url: str) -> None:
@@ -2358,33 +2361,17 @@ def _workspace_panel_test_baseline(request: pytest.FixtureRequest) -> None:
     page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
 
 
-@pytest.fixture(autouse=True)
-def _record_video(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[None]:
-    """Capture a screen recording of the journey when recording is requested.
-
-    Most e2e_ui tests drive Playwright through ``async_playwright()`` directly
-    (``browser.new_page()`` / ``browser.new_context()``), not the
-    pytest-playwright ``page`` fixture, so ``pytest --video`` records nothing for
-    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
-    methods to inject ``record_video_dir`` into every page/context they open, so
-    the rendered journey lands as a ``.webm`` regardless of how the test opened
-    the browser. A caller that already passes ``record_video_dir`` is left alone.
-    Playwright writes the file (a random hash name) when the context closes;
-    callers/harnesses pick it up from the directory. No-op when the env var is
-    unset, so ordinary runs are unaffected.
-    """
-    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
-    if not record_dir:
-        yield
-        return
-
+def _install_record_video_patches(monkeypatch: pytest.MonkeyPatch, record_dir: str) -> None:
+    """Inject ``record_video_dir`` into every page/context a ``Browser`` opens,
+    on both the async and sync Playwright APIs. A caller that already passes
+    ``record_video_dir`` is left alone."""
     from playwright.async_api import Browser as _AsyncBrowser
+    from playwright.sync_api import Browser as _SyncBrowser
 
-    Path(record_dir).mkdir(parents=True, exist_ok=True)
     _orig_new_page = _AsyncBrowser.new_page
     _orig_new_context = _AsyncBrowser.new_context
+    _orig_sync_new_page = _SyncBrowser.new_page
+    _orig_sync_new_context = _SyncBrowser.new_context
 
     async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("record_video_dir", record_dir)
@@ -2394,8 +2381,36 @@ def _record_video(
         kwargs.setdefault("record_video_dir", record_dir)
         return await _orig_new_context(self, *args, **kwargs)
 
+    def _sync_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _orig_sync_new_page(self, *args, **kwargs)
+
+    def _sync_new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _orig_sync_new_context(self, *args, **kwargs)
+
     monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
     monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
+    monkeypatch.setattr(_SyncBrowser, "new_page", _sync_new_page)
+    monkeypatch.setattr(_SyncBrowser, "new_context", _sync_new_context)
+
+
+@pytest.fixture(autouse=True)
+def _record_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Record async and sync browser journeys when OMNIGENT_E2E_RECORD_DIR is set.
+
+    Patch Browser methods for direct calls; browser_context_args covers sync
+    fixtures. Preserve explicit recording paths. Playwright writes the video
+    when the context closes; an unset environment variable leaves recording off."""
+    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+    if not record_dir:
+        yield
+        return
+
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    _install_record_video_patches(monkeypatch, record_dir)
     yield
 
 
