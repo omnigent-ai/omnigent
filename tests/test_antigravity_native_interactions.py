@@ -93,22 +93,26 @@ def _question_step(
     }
 
 
-def _permission_step(*, step_index: int) -> dict[str, Any]:
+def _permission_step(*, step_index: int, persist_pattern: str | None = None) -> dict[str, Any]:
     """
     Build a WAITING command-permission step dict at a given trajectory index.
 
     :param step_index: Trajectory ``stepIndex`` for this step.
+    :param persist_pattern: When set, the spec advertises agy's always-allow
+        persist choice for this pattern.
     :returns: A step dict carrying ``requestedInteraction.permission``.
     """
+    permission: dict[str, Any] = {
+        "resource": {"action": "command", "target": "ls -la"},
+        "actionDescription": "List files",
+    }
+    if persist_pattern is not None:
+        permission["persistSuggestionType"] = "PERSIST_SUGGESTION_TYPE_SUGGESTED"
+        permission["suggestedPersistPattern"] = persist_pattern
     return {
         "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
         "status": "CORTEX_STEP_STATUS_WAITING",
-        "requestedInteraction": {
-            "permission": {
-                "resource": {"action": "command", "target": "ls -la"},
-                "actionDescription": "List files",
-            }
-        },
+        "requestedInteraction": {"permission": permission},
         "metadata": {
             "sourceTrajectoryStepInfo": {
                 "trajectoryId": _TRAJ,
@@ -144,18 +148,26 @@ def _pending_question(*, step_index: int) -> PendingInteraction:
     )
 
 
-def _pending_permission(*, step_index: int) -> PendingInteraction:
+def _pending_permission(
+    *, step_index: int, persist_pattern: str | None = None
+) -> PendingInteraction:
     """
     Build a captured permission :class:`PendingInteraction` at an index.
 
     :param step_index: The captured ``step_index``.
+    :param persist_pattern: When set, the captured spec advertises agy's
+        always-allow persist choice for this pattern.
     :returns: A ``PendingInteraction`` of kind ``"permission"``.
     """
+    spec: dict[str, Any] = {"resource": {"action": "command", "target": "ls -la"}}
+    if persist_pattern is not None:
+        spec["persistSuggestionType"] = "PERSIST_SUGGESTION_TYPE_SUGGESTED"
+        spec["suggestedPersistPattern"] = persist_pattern
     return PendingInteraction(
         kind="permission",
         trajectory_id=_TRAJ,
         step_index=step_index,
-        spec={"resource": {"action": "command", "target": "ls -la"}},
+        spec=spec,
     )
 
 
@@ -442,6 +454,65 @@ async def test_permission_reject_delivers_allow_false_and_types_no() -> None:
     assert deliver.calls[0]["payload"] == {"permission": {"allow": False}}
     # #1200: Reject drives agy's TUI prompt to option 4 ("No") + Enter.
     assert inject_tui.calls == [["4", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_persist_accept_types_the_delivered_gates_persist_entry() -> None:
+    """A persist accept types agy's own always-allow entry for the gate."""
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    waiting = _permission_step(step_index=2, persist_pattern="ls")
+    result = ElicitationResult.model_validate(
+        {"action": "accept", "_meta": {"persist": "session"}}
+    )
+    request, _ = _elicitation_returner(result)
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    # The RPC payload stays allow-only; the persist choice rides the TUI keys
+    # (option 2 = "always allow in this conversation").
+    assert deliver.calls[0]["payload"] == {"permission": {"allow": True}}
+    assert inject_tui.calls == [["2", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_fallback_gate_without_persist_advertisement_types_plain_approve() -> None:
+    """TUI keys follow the DELIVERED gate's spec, not the stale captured one.
+
+    The surfaced step advertised a persist pattern but timed out, and the
+    fallback same-kind gate does not advertise one — so a persist verdict must
+    type the plain "Yes", never a persist entry the on-screen menu lacks.
+    """
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    fallback = _permission_step(step_index=3)  # re-asked without the persist offer
+    result = ElicitationResult.model_validate(
+        {"action": "accept", "_meta": {"persist": "session"}}
+    )
+    request, _ = _elicitation_returner(result)
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([fallback]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls[0]["step_index"] == 3
+    assert inject_tui.calls == [["1", "Enter"]]
 
 
 @pytest.mark.asyncio

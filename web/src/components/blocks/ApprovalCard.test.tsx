@@ -563,6 +563,86 @@ describe("ApprovalCard — Codex MCP persistence choices", () => {
   });
 });
 
+describe("ApprovalCard — Antigravity permission prompt details", () => {
+  const baseProps = {
+    elicitationId: "elic_agy_perm",
+    message: "Antigravity wants to run: pwd",
+    phase: "agy_permission",
+    policyName: "agy_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+  } as const;
+
+  it("shows the action description and both persist choices when advertised", () => {
+    // agy's own TUI prompt describes the action and offers two
+    // always-allow entries (conversation-scoped, and persisted to its
+    // settings); the card must surface all of it instead of a bare
+    // binary Approve/Reject.
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    expect(screen.getByText("Running pwd command")).toBeDefined();
+    fireEvent.click(screen.getByTestId("approval-card-agy-session-allow"));
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "session",
+    });
+    fireEvent.click(screen.getByTestId("approval-card-agy-always-allow"));
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "always",
+    });
+  });
+
+  it("offers no persist choice when agy's prompt advertises none", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: null }}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-card-agy-session-allow")).toBeNull();
+    expect(screen.queryByTestId("approval-card-agy-always-allow")).toBeNull();
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
+  });
+
+  it("labels an always-allow accept on the responded pill", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "always" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText(/always allowed/i)).toBeDefined();
+  });
+
+  it("labels a session-scoped accept on the responded pill", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "session" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText(/approved for this session/i)).toBeDefined();
+  });
+});
+
 describe("ApprovalCard — multi-choice options", () => {
   beforeEach(() => {
     useChatStore.setState({

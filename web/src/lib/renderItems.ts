@@ -34,7 +34,7 @@ import {
   routingExtras,
 } from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
-import type { CodexPersistMode, RememberScope } from "./types";
+import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -150,6 +150,7 @@ export type RenderItem =
       allowAutoMode?: boolean;
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
+      agyPermission?: AgyPermission | null;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -1638,6 +1639,7 @@ function buildAssistantItems(
         allowAutoMode: b.allowAutoMode,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,
+        agyPermission: b.agyPermission,
       });
       i += 1;
       continue;

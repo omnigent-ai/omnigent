@@ -54,7 +54,7 @@ import {
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
-import type { CodexPersistMode, RememberScope } from "@/lib/types";
+import type { AgyPermission, CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
@@ -177,6 +177,19 @@ interface ApprovalCardProps {
   /** Codex-native MCP persistence scopes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
   /**
+   * Antigravity (agy) permission prompts only: the prompt details agy's
+   * own TUI shows. ``actionDescription`` renders as the card's context
+   * line; ``alwaysAllowPattern``, when set, grows "Allow <pattern> for
+   * this session" / "Always allow <pattern>" buttons whose accept
+   * verdicts carry ``_meta.persist`` of ``"session"`` / ``"always"``
+   * (the server types agy's own conversation-scoped or
+   * settings-persisted always-allow menu entry into the TUI).
+   * Absent/null for every other
+   * elicitation, so the affordances never appear where agy's prompt
+   * doesn't offer them.
+   */
+  agyPermission?: AgyPermission | null;
+  /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
    * The Inbox page passes its own handler because its cards belong to
@@ -204,6 +217,7 @@ export function ApprovalCard({
   allowAutoMode,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
+  agyPermission,
   onSubmit,
 }: ApprovalCardProps) {
   // In a side-chat pane this resolves to the child id, so the verdict targets
@@ -266,6 +280,14 @@ export function ApprovalCard({
     submit(elicitationId, "accept", { remember: true });
   };
   const submitCodexPersist = (mode: CodexPersistMode) => {
+    submit(elicitationId, "accept", undefined, { persist: mode });
+  };
+  const submitAgyPersist = (mode: CodexPersistMode) => {
+    // Accept AND ask the bridge to take agy's own always-allow menu
+    // entry — conversation-scoped for "session", persisted to agy's
+    // settings for "always" — so agy records its advertised persist
+    // pattern. Same `_meta.persist` shape as the Codex persistence
+    // verdicts.
     submit(elicitationId, "accept", undefined, { persist: mode });
   };
   const submitPlanRejection = (feedback: string) => {
@@ -342,7 +364,9 @@ export function ApprovalCard({
   const acceptedAutoMode =
     response?.action === "accept" && response.content?.allow_auto_mode === true;
   const acceptedRemember = response?.content?.remember === true;
-  const acceptedCodexPersist = response?.["_meta"]?.persist;
+  // Codex MCP persistence AND the agy always-allow choice both ride
+  // `_meta.persist`, so one read covers the responded-state label.
+  const acceptedPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
   // domain when present, else the tool name. Drives the third binary
   // button and the responded-state pill.
@@ -361,6 +385,39 @@ export function ApprovalCard({
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
+      {agyPermission?.alwaysAllowPattern && (
+        <>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => submitAgyPersist("session")}
+            title={`Antigravity won't ask again for “${agyPermission.alwaysAllowPattern}” in this conversation`}
+            data-testid="approval-card-agy-session-allow"
+            componentId="approval.approve_session_agy"
+          >
+            <CheckIcon className="mr-1 size-3.5" />
+            Allow{" "}
+            <code className="rounded bg-muted px-1 font-mono">
+              {agyPermission.alwaysAllowPattern}
+            </code>{" "}
+            for this session
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => submitAgyPersist("always")}
+            title={`Antigravity will persist always-allowing “${agyPermission.alwaysAllowPattern}” to its settings`}
+            data-testid="approval-card-agy-always-allow"
+            componentId="approval.approve_always_agy"
+          >
+            <CheckIcon className="mr-1 size-3.5" />
+            Always allow{" "}
+            <code className="rounded bg-muted px-1 font-mono">
+              {agyPermission.alwaysAllowPattern}
+            </code>
+          </Button>
+        </>
+      )}
       {codexPersistModes.includes("session") && (
         <Button
           size="sm"
@@ -532,10 +589,10 @@ export function ApprovalCard({
       label = rememberTarget
         ? `Approved · won't ask again for ${rememberTarget}`
         : "Approved · won't ask again";
-    } else if (acceptedCodexPersist === "session") {
+    } else if (acceptedPersist === "session") {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved for this session";
-    } else if (acceptedCodexPersist === "always") {
+    } else if (acceptedPersist === "always") {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Always allowed";
     } else if (accepted) {
@@ -586,7 +643,14 @@ export function ApprovalCard({
                 )}
               </>
             ) : showGatingMessage ? (
-              <span>{message}</span>
+              <>
+                <span>{message}</span>
+                {agyPermission?.actionDescription && (
+                  <span className="text-sm text-muted-foreground">
+                    {agyPermission.actionDescription}
+                  </span>
+                )}
+              </>
             ) : null}
             {submittedAnswers !== null && (
               <ul className="flex flex-col gap-0.5">
@@ -682,6 +746,11 @@ export function ApprovalCard({
         ) : (
           <>
             <span>{message}</span>
+            {agyPermission?.actionDescription && (
+              <span className="text-sm text-muted-foreground" data-testid="agy-action-description">
+                {agyPermission.actionDescription}
+              </span>
+            )}
             {formattedPreview && (
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
@@ -757,6 +826,7 @@ export function ElicitationCard({
       allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
+      agyPermission={item.agyPermission}
       onSubmit={onSubmit}
     />
   );
