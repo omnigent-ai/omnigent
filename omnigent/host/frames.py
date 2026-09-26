@@ -41,6 +41,11 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# Only these categorical refusals are safe to persist and log as expected.
+SAFE_LAUNCH_REFUSAL_CODES = frozenset(
+    {HARNESS_NOT_CONFIGURED_ERROR_CODE, WORKSPACE_MISSING_ERROR_CODE}
+)
+
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
 # presence — no host-version table to maintain, and a build that lacks the
@@ -85,10 +90,8 @@ def classify_launch_refusal(
         :data:`WORKSPACE_MISSING_ERROR_CODE`, or ``None`` when the failure
         is not a safe categorical refusal.
     """
-    if error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
-        return HARNESS_NOT_CONFIGURED_ERROR_CODE
-    if error_code == WORKSPACE_MISSING_ERROR_CODE:
-        return WORKSPACE_MISSING_ERROR_CODE
+    if error_code is not None and error_code in SAFE_LAUNCH_REFUSAL_CODES:
+        return error_code
     # Rolling upgrade: an older host sends this exact categorical reason
     # with no error_code.
     if error_code is None and error == workspace_missing_message(workspace):
