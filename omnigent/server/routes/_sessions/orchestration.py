@@ -6791,6 +6791,8 @@ async def _relay_runner_stream(
     """
     loop = asyncio.get_running_loop()
     deadline: float | None = None
+    outage_started = 0.0
+    retries = 0
     while True:
         started = loop.time()
         try:
@@ -6807,7 +6809,22 @@ async def _relay_runner_stream(
             # tunnel dropping anew — give the new outage a fresh window.
             if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
+                outage_started = now
+                retries = 0
+                _logger.info(
+                    "Relay: runner transport lost for session=%s; holding the turn for %.1fs",
+                    session_id,
+                    RUNNER_DISCONNECT_GRACE_S,
+                    extra=debug_event(
+                        "runner_stream_transport_lost",
+                        session_id=session_id,
+                        intentional_stop=lost.intentional,
+                        cached_session_status=_session_status_cache.get(session_id),
+                        grace_s=RUNNER_DISCONNECT_GRACE_S,
+                    ),
+                )
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
+                retries += 1
                 _logger.info(
                     "Relay: runner transport lost for session=%s; retrying for %.1fs",
                     session_id,
@@ -6816,20 +6833,33 @@ async def _relay_runner_stream(
                 )
                 await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
-            _logger.warning(
-                "Relay: runner transport lost for session=%s",
-                session_id,
-                exc_info=True,
-                extra={
-                    "session_id": session_id,
-                    "event_name": "runner_stream_disconnected",
-                    "attributes": {
-                        "intentional_stop": lost.intentional,
-                        "cached_session_status": _session_status_cache.get(session_id),
-                    },
-                },
-            )
             if lost.intentional:
+                decision = "intentional_stop"
+            elif shutdown_state.server_shutting_down():
+                decision = "server_shutdown"
+            elif await _runner_drop_interrupted_turn(session_id, conversation_store):
+                decision = "failed_mid_turn"
+            else:
+                decision = "idle_no_failure"
+            # One row per outage outcome: which branch below fired, how long the
+            # runner was gone against the grace, and how many retries it got.
+            _logger.warning(
+                "Relay: runner transport lost for session=%s (%s)",
+                session_id,
+                decision,
+                exc_info=True,
+                extra=debug_event(
+                    "runner_stream_disconnected",
+                    session_id=session_id,
+                    intentional_stop=lost.intentional,
+                    cached_session_status=_session_status_cache.get(session_id),
+                    decision=decision,
+                    grace_s=RUNNER_DISCONNECT_GRACE_S,
+                    outage_s=round(now - outage_started, 3),
+                    retries=retries,
+                ),
+            )
+            if decision == "intentional_stop":
                 # User clicked Stop: the Stop handler brought this runner's
                 # tunnel down on purpose (see _stop_session_host_runner), so
                 # the drop is expected — not a failure. Publish a quiet idle
@@ -6844,7 +6874,7 @@ async def _relay_runner_stream(
                     None,
                     conversation_store,
                 )
-            elif shutdown_state.server_shutting_down():
+            elif decision == "server_shutdown":
                 # This server closed the tunnel on its way down; the runner is
                 # reachable, just not by a process that stopped listening. The
                 # replacement server re-adopts it on reconnect.
@@ -6854,7 +6884,7 @@ async def _relay_runner_stream(
                     session_id,
                     extra={"session_id": session_id},
                 )
-            elif not await _runner_drop_interrupted_turn(session_id, conversation_store):
+            elif decision == "idle_no_failure":
                 # The runner went away while this session sat idle (host
                 # asleep, host restart, `omnigent host` stopped). Nothing was
                 # interrupted, so there is no error to report: publishing one

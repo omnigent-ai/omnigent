@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
@@ -192,12 +193,14 @@ async def _send_hello(
     registry: TunnelRegistry,
     *,
     runner_id: str = _RUNNER_ID,
+    connection_id: str | None = None,
 ) -> None:
     """Send the runner hello frame.
 
     :param communicator: Connected ASGI WebSocket communicator.
     :param registry: Registry shared with the tunnel router.
     :param runner_id: Runner id expected to register.
+    :param connection_id: Optional runner-minted connection id to advertise.
     :returns: None.
     """
     hello = HelloFrame(
@@ -205,6 +208,7 @@ async def _send_hello(
         frame_protocol_version=1,
         harnesses=["claude-sdk"],
         envs=["os_sandbox"],
+        connection_id=connection_id,
     )
     await communicator.send_input(
         {"type": "websocket.receive", "text": encode_frame(hello)},
@@ -317,14 +321,18 @@ async def test_ws_tunnel_route_round_trips_request_to_runner(
     assert response.json() == {"status": "ok"}
 
 
-async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
+async def test_ws_tunnel_status_reports_registration(
+    app: FastAPI, caplog: pytest.LogCaptureFixture
+) -> None:
     """Runner status flips online after tunnel registration.
 
     :param app: Production FastAPI app from ``tests.server``
         fixtures.
+    :param caplog: Pytest log capture fixture.
     :returns: None.
     """
     registry = app.state.tunnel_registry
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -333,7 +341,7 @@ async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
         offline = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
 
         communicator = await _connect_route(app, _TUNNEL_PATH)
-        await _send_hello(communicator, registry)
+        await _send_hello(communicator, registry, connection_id="conn-status-1")
         try:
             online = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
         finally:
@@ -343,6 +351,19 @@ async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
 
     assert offline.json() == {"runner_id": _RUNNER_ID, "online": False}
     assert online.json() == {"runner_id": _RUNNER_ID, "online": True}
+    # Both tunnel rows carry the hello's connection id; the disconnect row adds
+    # the connection's age and the helper task that observed the close.
+    rows = {
+        r.attributes["phase"]: r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel"
+    }
+    assert rows["connected"]["connection_id"] == "conn-status-1"
+    disconnected = rows["disconnected"]
+    assert disconnected["connection_id"] == "conn-status-1"
+    assert disconnected["code"] == 1000
+    assert disconnected["ended_by"] == f"tunnel-receive:{_RUNNER_ID}"
+    assert disconnected["connection_age_s"] >= 0
 
 
 async def test_ws_tunnel_list_runners_reports_online_harnesses(app: FastAPI) -> None:

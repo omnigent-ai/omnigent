@@ -385,3 +385,7 @@ async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
     assert all(row["session_id"] == conversation.id for row in events)
     assert all(row["attributes"]["runner_id"] == conversation.runner_id for row in events)
     assert events[1]["attributes"]["status_code"] == "503"
+    # The init-started row says what the server asked the runner to do.
+    assert events[0]["attributes"]["resume_interrupted_turn"] == "False"
+    assert events[0]["attributes"]["suppress_recovery_turn"] == "False"
+    assert "recovery_id" not in events[0]["attributes"]

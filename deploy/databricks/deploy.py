@@ -119,13 +119,42 @@ def _compute_deploy_version(base: str, explicit: str | None) -> str:
     # committed the bumped value). Without this, `0.1.0.post<old>`
     # would become `0.1.0.post<old>.post<new>` which isn't valid
     # PEP 440 and fails the wheel build.
-    base = re.sub(r"(\.post\d+|\.dev\d+)+$", "", base)
+    base = re.sub(r"(\.post\d+|\.dev\d+|\+[\w.]+)+$", "", base)
     # Post-release, not dev: pip treats `.dev` as a pre-release and
     # ignores it when resolving `>=` constraints, so a deploy that
     # bumps via `.dev` clashes with `omnigent-ui-sdk` declaring
     # `omnigent-client>=0.1.0`. `.post` is a final release and
-    # sorts strictly above the base.
-    return f"{base}.post{int(time.time())}"
+    # sorts strictly above the base. The local segment names the commit
+    # so a debug-log row's app_version (and a runner's hello) says which
+    # build it came from.
+    return f"{base}.post{int(time.time())}{_git_build_suffix()}"
+
+
+def _git_build_suffix() -> str:
+    """PEP 440 local segment for the checked-out commit, e.g. ``+g1a2b3c4``.
+
+    ``.dirty`` is appended when tracked files have uncommitted changes, so a
+    deploy from a modified tree is not mistaken for the commit itself. Empty
+    when the tree is not a git checkout.
+    """
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return f"+g{sha}.dirty" if dirty else f"+g{sha}"
 
 
 def set_version_in_pyproject(path: Path, new_version: str) -> str:

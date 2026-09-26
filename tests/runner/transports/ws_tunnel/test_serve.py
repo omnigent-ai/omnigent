@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import ssl
 from dataclasses import dataclass
 from types import TracebackType
@@ -753,6 +755,16 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert connected_rows[0].session_id == "session_auth"
     assert connected_rows[0].attributes["runner_id"] == "runner_auth"
     assert connected_rows[0].levelno == logging.INFO
+    # The row identifies this socket and process, and the hello carried the
+    # same connection id so the server's row joins to it.
+    attributes = connected_rows[0].attributes
+    assert attributes["reconnect"] is False
+    assert attributes["attempt"] == 1
+    assert attributes["pid"] == os.getpid()
+    assert attributes["downtime_s"] is None
+    sent = captured["sent"]
+    assert isinstance(sent, str)
+    assert json.loads(sent)["connection_id"] == attributes["connection_id"]
 
     assert captured["url"] == "wss://example.databricksapps.com/v1/runners/runner_auth/tunnel"
     # A wss:// tunnel carries a verifying SSL context (asserted separately since
@@ -2401,6 +2413,7 @@ async def test_serve_tunnel_403_keeps_genuine_no_auth_decline_latched(
 @pytest.mark.asyncio
 async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An abnormal drop after a stable connection resets the reconnect backoff.
 
@@ -2410,8 +2423,12 @@ async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
     sleeps the initial 0.5 s instead of the accumulated 2.0 s.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
     :returns: None.
     """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.transports.ws_tunnel.serve")
     outcomes = iter(["error", "error", "stable_drop", "stop"])
     sleeps: list[float] = []
     # Provide controlled start/end times for the connected attempt and fall
@@ -2489,6 +2506,21 @@ async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
     # Attempt 3 (stable_drop): connected for 6 s ≥ 5 s → reset delay to 0.5
     # Attempt 4 (stop): CancelledError before sleep
     assert sleeps == [0.5, 1.0, 0.5]
+    # Each attempt's row explains the wait: the failed attempts escalate, the
+    # stable connection's drop carries its age and the backoff reset.
+    rows = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel_disconnected"
+    ]
+    assert [r["attempt"] for r in rows] == [1, 2, 3]
+    assert [r["connected"] for r in rows] == [False, False, True]
+    assert [r["backoff_reset"] for r in rows] == [False, False, True]
+    assert [r["delay_s"] for r in rows] == [0.5, 1.0, 0.5]
+    assert [r["connection_age_s"] for r in rows] == [None, None, 6.0]
+    assert rows[2]["disconnect_reason"] == "transport_error"
+    assert rows[2]["error_type"] == "ConnectionError"
+    assert len({r["connection_id"] for r in rows}) == 3
 
 
 @pytest.mark.asyncio

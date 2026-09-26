@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from types import SimpleNamespace, TracebackType
 from typing import Any
@@ -617,7 +618,9 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
             if getattr(r, "event_name", None) == "runner_stream_disconnected"
         )
         assert record.session_id == session_id
-        assert record.attributes == {"intentional_stop": False, "cached_session_status": "running"}
+        assert record.attributes["intentional_stop"] is False
+        assert record.attributes["cached_session_status"] == "running"
+        assert record.attributes["decision"] == "failed_mid_turn"
         assert record.exc_info is not None
     finally:
         gate.set()
@@ -911,7 +914,9 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
             if getattr(r, "event_name", None) == "runner_stream_disconnected"
         )
         assert record.session_id == session_id
-        assert record.attributes == {"intentional_stop": True, "cached_session_status": None}
+        assert record.attributes["intentional_stop"] is True
+        assert record.attributes["cached_session_status"] is None
+        assert record.attributes["decision"] == "intentional_stop"
 
         # No durable runner_disconnected label persists, so snapshots and
         # child summaries stay clean.
@@ -1152,7 +1157,9 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
             if getattr(r, "event_name", None) == "runner_stream_disconnected"
         )
         assert record.session_id == session_id
-        assert record.attributes == {"intentional_stop": False, "cached_session_status": "idle"}
+        assert record.attributes["intentional_stop"] is False
+        assert record.attributes["cached_session_status"] == "idle"
+        assert record.attributes["decision"] == "idle_no_failure"
     finally:
         gate.set()
         if collector is not None:
@@ -1320,6 +1327,7 @@ class _FlakyThenHealthyRunnerClient:
 @pytest.mark.asyncio
 async def test_relay_retries_transport_drop_within_grace(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A transport drop inside the grace reconnects without failing the session.
@@ -1336,6 +1344,7 @@ async def test_relay_retries_transport_drop_within_grace(
         0.01,
     )
     sessions_module._runner_relay_tasks.clear()
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
     fake_runner = _FlakyThenHealthyRunnerClient()
     store = _RecordingLabelStore()
     session_id = "5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d"
@@ -1355,6 +1364,20 @@ async def test_relay_retries_transport_drop_within_grace(
         # and no runner_disconnected labels were persisted.
         assert sessions_module._session_status_cache.get(session_id) is None
         assert store.labels.get(session_id) is None
+        # It is still recorded: one outage-start row naming the grace the turn
+        # was held for, and no give-up row since the retry rode it out.
+        from omnigent.server.routes._sessions.orchestration import RUNNER_DISCONNECT_GRACE_S
+
+        events = [getattr(r, "event_name", None) for r in caplog.records]
+        assert events.count("runner_stream_transport_lost") == 1
+        assert "runner_stream_disconnected" not in events
+        lost = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_stream_transport_lost"
+        )
+        assert lost.session_id == session_id
+        assert lost.attributes["grace_s"] == RUNNER_DISCONNECT_GRACE_S
     finally:
         handle = sessions_module._runner_relay_tasks.get(session_id)
         if handle is not None and not handle.task.done():
