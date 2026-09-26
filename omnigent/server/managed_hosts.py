@@ -97,6 +97,10 @@ stores into ``create_app``):
            memory_mb: 4096
            disk_gb: 20
           idle_pause_after_s: 900           # optional; null disables idle pause
+         e2b:                     # optional block (provider: e2b)
+           template: omnigent-host          # E2B template name or id, not an image
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES
+           on_timeout: kill                 # default; pause preserves idle sandboxes
          openshell:               # optional block (provider: openshell)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected

@@ -138,6 +138,9 @@ deletes it, ``"pause"`` snapshots its filesystem and memory for a later resume."
 _PAUSE_MIN_WINDOW_S: int = 300
 """Floor on the timeout pause-mode :meth:`E2BSandboxLauncher.keep_alive` sets."""
 
+_BOOT_GRACE_S: int = 1200
+"""Startup grace before a connected runner starts refreshing the pause window."""
+
 # No _SANDBOX_CPU / _MEMORY constants: E2B bakes resources into the template
 # at build time, not at Sandbox.create() (see deploy/e2b/README.md).
 
@@ -175,15 +178,20 @@ def pause_window_s() -> int:
     """
     Timeout that pause-mode keepalive sets, in seconds.
 
-    Five keepalive intervals, the ratio ``agent_sandbox`` uses, so several
-    delayed or failed refreshes cannot pause a sandbox whose runner is
-    working; floored at :data:`_PAUSE_MIN_WINDOW_S`. It is also how long an
+    Five keepalive intervals leave room for several delayed or failed
+    refreshes; floored at :data:`_PAUSE_MIN_WINDOW_S`. The default cadence
+    gives the same five-minute window as ``agent_sandbox``. It is also how long an
     idle sandbox keeps running after its runner exits.
 
     :returns: The window in seconds (300 at the default 60 s cadence).
     """
     interval_s = resolve_managed_keepalive_interval_s("e2b")
     return max(_PAUSE_MIN_WINDOW_S, math.ceil(5 * interval_s))
+
+
+def initial_pause_window_s() -> int:
+    """Allow at least 20 minutes to boot before runner-driven keepalive starts."""
+    return max(pause_window_s(), _BOOT_GRACE_S)
 
 
 def _lifetime_cap_from_error(message: str) -> int | None:
@@ -532,7 +540,7 @@ class E2BSandboxLauncher(SandboxLauncher):
         """
         Create a new E2B sandbox from the host template.
 
-        The sandbox is created at the requested lifetime
+        In kill mode, the sandbox is created at the requested lifetime
         (:func:`resolve_max_lifetime_s`, default E2B's 24 h Pro maximum);
         the SDK default is only 300 s and there is no never-expire option,
         so the timeout is passed explicitly. E2B *rejects* a request above
@@ -540,6 +548,8 @@ class E2BSandboxLauncher(SandboxLauncher):
         once clamped to that cap. The sandbox lives until the managed-
         session machinery terminates it or the timeout lapses (a managed
         host outliving the cap relies on the dead-sandbox relaunch path).
+        Pause mode instead starts with :func:`initial_pause_window_s`;
+        runner-driven keepalive then applies the shorter steady window.
 
         :param name: Human-readable label, e.g. ``"managed-a1b2c3d4"``.
             Recorded as sandbox metadata; the returned id is the
@@ -552,7 +562,7 @@ class E2BSandboxLauncher(SandboxLauncher):
         template = self._resolved_template()
         env_vars = self._resolve_sandbox_env()
         click.echo(f"▸ Creating E2B sandbox '{name}' from template '{template}'")
-        timeout = pause_window_s() if self._pause else resolve_max_lifetime_s()
+        timeout = initial_pause_window_s() if self._pause else resolve_max_lifetime_s()
         sandbox = self._create_sandbox(template, timeout, name, env_vars)
         sandbox_id = str(sandbox.sandbox_id)
         self._sandboxes[sandbox_id] = sandbox
@@ -745,10 +755,12 @@ class E2BSandboxLauncher(SandboxLauncher):
 
     def resume(self, sandbox_id: str) -> None:
         """
-        Resume a paused sandbox under the same id (a no-op when running).
+        Resume a paused sandbox under the same id and grant startup grace.
 
         Only brings back the VM; the managed wake path then starts a fresh
-        host with a new token (see :meth:`start_host`).
+        host with a new token unless a restored host reconnects first.
+        Connecting an already-running sandbox keeps its identity but may
+        extend its timeout to the startup window.
 
         :param sandbox_id: The sandbox to resume.
         :raises SandboxCapabilityError: In kill mode.
@@ -763,7 +775,7 @@ class E2BSandboxLauncher(SandboxLauncher):
 
         click.echo(f"▸ Resuming E2B sandbox '{sandbox_id}'")
         try:
-            handle = Sandbox.connect(sandbox_id, timeout=pause_window_s())
+            handle = Sandbox.connect(sandbox_id, timeout=initial_pause_window_s())
         except NotFoundException as exc:
             raise SandboxGoneError(f"E2B sandbox '{sandbox_id}' no longer exists") from exc
         except (SandboxException, httpx.TransportError) as exc:

@@ -658,10 +658,14 @@ def test_kill_mode_create_passes_no_lifecycle(sdk: _State) -> None:
     assert sdk.create_kwargs["lifecycle"] is None  # the SDK default: kill on timeout
 
 
-def test_pause_mode_creates_pause_lifecycle_with_short_timeout(sdk: _State) -> None:
+@pytest.mark.parametrize(("interval", "initial_window"), [("60", 1200), ("300", 1500)])
+def test_pause_mode_creates_pause_lifecycle_with_boot_grace(
+    sdk: _State, monkeypatch: pytest.MonkeyPatch, interval: str, initial_window: int
+) -> None:
+    monkeypatch.setenv(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, interval)
     E2BSandboxLauncher(on_timeout="pause").provision("x")
     assert sdk.create_kwargs["lifecycle"] == {"on_timeout": "pause", "auto_resume": False}
-    assert sdk.create_kwargs["timeout"] == pause_window_s() == 300
+    assert sdk.create_kwargs["timeout"] == initial_window
 
 
 def test_e2b_uses_the_short_window_keepalive_cadence(sdk: _State) -> None:
@@ -728,12 +732,25 @@ def test_pause_is_running_reads_state_without_waking(
     assert sdk.connect_calls == []
 
 
-def test_pause_resume_connects_with_window_and_reuses_handle(sdk: _State) -> None:
+@pytest.mark.parametrize(
+    ("interval", "initial_window", "steady_window"), [("60", 1200, 300), ("300", 1500, 1500)]
+)
+def test_pause_resume_grants_boot_grace_then_keepalive_uses_steady_window(
+    sdk: _State,
+    monkeypatch: pytest.MonkeyPatch,
+    interval: str,
+    initial_window: int,
+    steady_window: int,
+) -> None:
+    monkeypatch.setenv(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, interval)
     launcher = E2BSandboxLauncher(on_timeout="pause")
     launcher.resume("sb-e2b-1")
     launcher.run("sb-e2b-1", "echo hi")
     assert sdk.connect_calls == ["sb-e2b-1"]
-    assert sdk.connect_timeouts == [pause_window_s()]
+    assert sdk.connect_timeouts == [initial_window]
+    assert launcher.keep_alive("sb-e2b-1") is True
+    assert sdk.set_timeouts_by_id == [("sb-e2b-1", steady_window)]
+    assert sdk.connect_calls == ["sb-e2b-1"]
 
 
 def test_pause_resume_missing_sandbox_is_gone(sdk: _State) -> None:

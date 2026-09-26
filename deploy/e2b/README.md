@@ -183,9 +183,13 @@ and is then killed, taking its workspace with it; the next message starts a
 fresh sandbox. With `on_timeout: pause`, sandboxes are created with E2B's
 pause lifecycle instead:
 
+- Creation and resume allow at least 20 minutes for the host and runner to
+  connect (or the keepalive window below, if longer). Connecting an already
+  running sandbox may also extend its timeout to this startup window.
 - While a runner is connected, the server's keepalive keeps pushing the
   sandbox timeout a window ahead: five keepalive intervals, 5 minutes at the
-  1-minute cadence E2B shares with `agent_sandbox`.
+  1-minute cadence E2B shares with `agent_sandbox`. The first keepalive
+  replaces the startup grace with this steady window.
 - After the runner idles out (`runner.idle_timeout_s`, default 1 h), the
   window lapses and E2B pauses the sandbox. Lower `runner.idle_timeout_s` in
   `sandbox.host_config` to pause sooner. A paused sandbox is not billed
