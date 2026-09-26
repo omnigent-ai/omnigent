@@ -26,6 +26,7 @@ _TOOL_CLASSES: dict[str, tuple[str, str]] = {
     ),
     "upload_file": ("omnigent.tools.builtins.upload_file", "UploadFileTool"),
     "web_fetch": ("omnigent.tools.builtins.web_fetch", "WebFetchTool"),
+    "web_read": ("omnigent.tools.builtins.web_read", "WebReadTool"),
     "web_search": ("omnigent.tools.builtins.web_search", "WebSearchTool"),
 }
 
