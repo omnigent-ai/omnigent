@@ -41,10 +41,12 @@ def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     assert set(block) == {"omnigent"}
     entry = block["omnigent"]
     assert entry["type"] == "local"
-    assert entry["enabled"] is True
+    # Relay tools keep their names and are individually permission-gated.
+    assert entry["codemode"] is False
+    assert "enabled" not in entry
     # Milliseconds: must exceed the bridge's outer relay hop (330 s) so the
     # relay's clean timeout error beats opencode's client-side kill.
-    assert entry["timeout"] == 360_000
+    assert entry["timeout"] == {"execution": 360_000}
     cmd = entry["command"]
     # Launches the SHARED serve-mcp relay, pointed at THIS bridge dir.
     assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]
@@ -316,13 +318,13 @@ def test_build_mcp_block_stdio_and_http() -> None:
     assert block["gh"] == {
         "type": "local",
         "command": ["npx", "-y", "server-github"],
-        "enabled": True,
+        "codemode": False,
         "environment": {"GITHUB_TOKEN": "x"},
     }
     assert block["remote"] == {
         "type": "remote",
         "url": "https://mcp.example/sse",
-        "enabled": True,
+        "codemode": False,
         "headers": {"X-Key": "k"},
     }
 
@@ -347,6 +349,8 @@ def test_build_mcp_block_http_databricks_injects_bearer(monkeypatch: pytest.Monk
     ]
     block = prov.build_opencode_mcp_block(servers)
     assert block["dbx"]["headers"] == {"Authorization": "Bearer tok123"}
+    assert block["dbx"]["oauth"] is False  # bearer header → no OAuth discovery
+    assert block["dbx"]["codemode"] is False
 
 
 def test_strip_jsonc_comments_removes_line_and_block_comments() -> None:
@@ -690,9 +694,9 @@ def test_build_mcp_block_preserves_custom_timeout() -> None:
         ),
     ]
     block = build_opencode_mcp_block(servers)
-    # MCPServerConfig.timeout is seconds; the opencode entry is milliseconds.
-    assert block["local_custom"]["timeout"] == 120_000
-    assert block["remote_custom"]["timeout"] == 45_500
+    # MCPServerConfig.timeout is seconds; v2 timeouts are {catalog, execution} in ms.
+    assert block["local_custom"]["timeout"] == {"catalog": 120_000, "execution": 120_000}
+    assert block["remote_custom"]["timeout"] == {"catalog": 45_500, "execution": 45_500}
 
 
 def test_extract_progress_token_variants() -> None:

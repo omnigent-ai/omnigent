@@ -169,23 +169,28 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     return path
 
 
+def _mcp_timeout(seconds: object) -> dict[str, int] | None:
+    """Convert an ``MCPServerConfig.timeout`` in seconds to v2 ``{catalog, execution}`` ms."""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+        return None
+    millis = int(seconds * 1000)
+    return {"catalog": millis, "execution": millis}
+
+
 def build_opencode_mcp_block(
     servers: Sequence[MCPServerConfig],
 ) -> dict[str, dict[str, object]]:
     """
-    Translate Omnigent MCP server declarations into opencode.json's ``mcp`` block.
+    Translate Omnigent MCP server declarations into v2 ``mcp.servers`` entries.
 
-    Mirrors how codex/claude expose the agent's MCP servers, but via opencode's
-    own config (no relay): ``stdio`` → ``{type:"local", command:[cmd, *args],
-    environment, enabled}``; ``http`` → ``{type:"remote", url, headers,
-    enabled}``. A ``databricks_profile`` resolves a bearer token into the
-    ``Authorization`` header at spawn (re-resolved on resume, like the gateway
-    provider). Entries opencode can't represent (missing command / url) are
-    skipped.
+    ``stdio`` → ``{type:"local", command:[cmd, *args], environment}``; ``http`` →
+    ``{type:"remote", url, headers}``. A ``databricks_profile`` resolves a bearer
+    token into ``Authorization`` at spawn. Every entry sets ``codemode: false`` so
+    each tool keeps its name and is individually permission-gated. Entries
+    without a command / url are skipped.
 
     :param servers: The agent spec's ``mcp_servers``.
-    :returns: An opencode ``mcp`` block keyed by server name (empty when none
-        are representable).
+    :returns: A ``mcp.servers`` map keyed by server name.
     """
     block: dict[str, dict[str, object]] = {}
     for server in servers:
@@ -199,7 +204,7 @@ def build_opencode_mcp_block(
             entry: dict[str, object] = {
                 "type": "local",
                 "command": [command, *getattr(server, "args", [])],
-                "enabled": True,
+                "codemode": False,
             }
             env = dict(getattr(server, "env", {}) or {})
             if env:
@@ -214,13 +219,14 @@ def build_opencode_mcp_block(
                 token = _databricks_bearer_token(profile)
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
-            entry = {"type": "remote", "url": url, "enabled": True}
+            entry = {"type": "remote", "url": url, "codemode": False}
             if headers:
                 entry["headers"] = headers
-        timeout = getattr(server, "timeout", None)
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
-            # MCPServerConfig.timeout is seconds; opencode's mcp entry wants ms.
-            entry["timeout"] = int(timeout * 1000)
+            if "Authorization" in headers:
+                entry["oauth"] = False
+        timeout = _mcp_timeout(getattr(server, "timeout", None))
+        if timeout is not None:
+            entry["timeout"] = timeout
         block[str(name)] = entry
     return block
 
@@ -246,7 +252,7 @@ def build_opencode_omnigent_mcp_server(
         + ``tool_relay.json``).
     :param python_executable: Python to run ``serve-mcp`` with; ``None`` uses the
         runner interpreter (has ``omnigent`` importable).
-    :returns: A one-entry ``mcp`` block ``{"omnigent": {type:"local", …}}``.
+    :returns: A one-entry ``mcp.servers`` map ``{"omnigent": {type:"local", codemode: False, …}}``.
     """
     from omnigent.harnesses.claude_native.bridge import (
         _TOOL_RELAY_POST_TIMEOUT_S,
@@ -273,15 +279,11 @@ def build_opencode_omnigent_mcp_server(
     entry: dict[str, object] = {
         "type": "local",
         "command": [command, *args],
-        "enabled": True,
-        # opencode's mcp timeout is in MILLISECONDS and flows straight into the
-        # MCP SDK's per-request deadline (default 60 s). Give the client more
-        # headroom than the bridge's outer relay hop so the relay's own clean
-        # timeout error always arrives before opencode kills the call. This is
-        # server-wide, so a hung local (non-relay) tool also gets this window
-        # before the client kills it — an accepted trade-off; local tools get
-        # no heartbeat, so they stay killable at this deadline.
-        "timeout": int((_TOOL_RELAY_POST_TIMEOUT_S + 30.0) * 1000),
+        # Relay tools keep their names so each call raises its own permission.asked.
+        "codemode": False,
+        # Execution deadline in ms: longer than the bridge's outer relay hop so the
+        # relay's own timeout error arrives before opencode kills the call.
+        "timeout": {"execution": int((_TOOL_RELAY_POST_TIMEOUT_S + 30.0) * 1000)},
     }
     env_value = server.get("env")
     if env_value is None:
