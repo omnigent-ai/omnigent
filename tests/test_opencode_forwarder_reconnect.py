@@ -305,3 +305,65 @@ async def test_fixture_messages_replay_on_catch_up() -> None:
         if item.get("type") == "text" and item.get("text")
     ]
     assert _assistant_texts(server) == expected
+
+
+async def test_catch_up_posts_call_for_running_tool_and_live_success_completes_it() -> None:
+    """A tool ``running`` at catch-up gets its call posted; output waits for the live event."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    running_tool = {
+        "type": "tool",
+        "id": "call_1",
+        "name": "shell",
+        "state": {"status": "running", "input": {"command": "pwd"}, "metadata": {}},
+    }
+    opencode.message_snapshots = [[], [_assistant("msg_a", running_tool, completed=False)]]
+    opencode._event_batches = [
+        [],
+        [
+            _ev(
+                "session.tool.success",
+                assistantMessageID="msg_a",
+                id="call_1",
+                content=[{"type": "text", "text": "/workspace"}],
+            )
+        ],
+    ]
+    await _run(fwd, max_reconnects=1)
+    items = [b["data"] for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    assert [i["item_type"] for i in items] == ["function_call", "function_call_output"]
+    assert items[1]["item_data"]["output"] == "/workspace"
+
+
+async def test_catch_up_skips_streaming_tool() -> None:
+    """A tool still ``streaming`` at catch-up posts nothing; the live call lands once."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    streaming_tool = {
+        "type": "tool",
+        "id": "call_1",
+        "name": "shell",
+        "state": {"status": "streaming", "input": "pw"},
+    }
+    opencode.message_snapshots = [[], [_assistant("msg_a", streaming_tool, completed=False)]]
+    opencode._event_batches = [
+        [],
+        [
+            _ev(
+                "session.tool.input.started",
+                assistantMessageID="msg_a",
+                id="call_1",
+                name="shell",
+            ),
+            _ev(
+                "session.tool.called",
+                assistantMessageID="msg_a",
+                id="call_1",
+                input={"command": "pwd"},
+                executed=True,
+            ),
+        ],
+    ]
+    await _run(fwd, max_reconnects=1)
+    items = [b["data"] for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    assert [i["item_type"] for i in items] == ["function_call"]
