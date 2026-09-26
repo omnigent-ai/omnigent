@@ -1475,6 +1475,72 @@ def _prepare_opencode_native_fork(
     return source_session
 
 
+async def _resolve_opencode_session(
+    *,
+    client: OpenCodeClient,
+    launch_config: _OpenCodeNativeLaunchConfig,
+    omnigent_session_id: str,
+    workspace: str,
+    server_client: httpx.AsyncClient | None,
+    fork_source_session_id: str | None,
+    fresh: bool = False,
+) -> str:
+    """
+    Resume, fork, or create the conversation's OpenCode session.
+
+    Order: resume the persisted session; else fork the staged source session;
+    else create a session that asks for every permission and, for a lost
+    session or a forked clone, seed the Omnigent transcript as context.
+
+    :param client: Client bound to the conversation's ``opencode serve``.
+    :param launch_config: The conversation's launch config.
+    :param omnigent_session_id: Omnigent conversation id.
+    :param workspace: Workspace directory for a new session.
+    :param server_client: Runner Omnigent server client (transcript source).
+    :param fork_source_session_id: Source session staged by
+        :func:`_prepare_opencode_native_fork`, or ``None``.
+    :param fresh: ``True`` for ``/clear``: always create an unseeded session.
+    :returns: The OpenCode session id to attach.
+    """
+    from omnigent.harnesses.opencode_native.client import OpenCodeClientError
+    from omnigent.harnesses.opencode_native.provider import ASK_ALL_PERMISSIONS
+
+    resume_lost_history = False
+    if not fresh and launch_config.external_session_id is not None:
+        existing = await client.get_session(launch_config.external_session_id)
+        if existing is not None:
+            return existing.id
+        resume_lost_history = True
+    if not fresh and fork_source_session_id is not None:
+        try:
+            forked = await client.fork(fork_source_session_id, before=None)
+        except (OpenCodeClientError, httpx.HTTPError):
+            _logger.warning(
+                "opencode fork: native fork of %s failed for %s; using transcript preamble",
+                fork_source_session_id,
+                omnigent_session_id,
+                exc_info=True,
+                extra={"session_id": omnigent_session_id},
+            )
+        else:
+            return forked.id
+    permissions: list[dict[str, object]] = [dict(rule) for rule in ASK_ALL_PERMISSIONS]
+    created = await client.create_session(
+        title=f"omnigent:{omnigent_session_id}",
+        directory=workspace,
+        permissions=permissions,
+        metadata={"omnigent_conversation": omnigent_session_id},
+    )
+    if not fresh and (resume_lost_history or launch_config.fork_carry_history):
+        await _rehydrate_opencode_session_from_transcript(
+            opencode_client=client,
+            opencode_session_id=created.id,
+            omnigent_session_id=omnigent_session_id,
+            server_client=server_client,
+        )
+    return created.id
+
+
 async def _auto_create_opencode_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
