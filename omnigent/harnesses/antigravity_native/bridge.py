@@ -291,7 +291,8 @@ def prune_orphaned_bridge_dirs() -> int:
 # ``HOME`` intact (needed for platform auth such as macOS keyring-backed tokens)
 # and launches agy with its hidden ``--gemini_dir=<bridge_dir>/agy-home/.gemini``
 # flag. That isolated Gemini dir is seeded with onboarding/migration markers and
-# a bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
+# a bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`
+# (the user's own ``~/.gemini`` MCP servers plus the Omnigent relay).
 # This (1) NEVER touches the user's real ``~/.gemini/config/mcp_config.json`` and
 # (2) gives each session its own config so concurrent sessions never clobber one
 # another. Known file-based OAuth markers are copied best-effort for platforms
@@ -449,28 +450,33 @@ def build_mcp_config(
         defaults to the current interpreter (``sys.executable``).
     :returns: The ``mcp_config.json`` payload as a dict.
     """
-    python = python_executable or sys.executable
     return {
         "mcpServers": {
-            _MCP_SERVER_NAME: {
-                "command": python,
-                "args": [
-                    "-I",
-                    "-m",
-                    "omnigent.harnesses.claude_native.bridge",
-                    "serve-mcp",
-                    "--bridge-dir",
-                    str(bridge_dir),
-                ],
-                "enabledTools": list(_AGY_ENABLED_TOOLS),
-                "env": {
-                    "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-                    # Pin the relay to the RUNNER's real home so its bridge-root
-                    # validation matches where the bridge dir lives. See docstring.
-                    "HOME": str(Path.home()),
-                },
-            }
+            _MCP_SERVER_NAME: _build_relay_server(bridge_dir, python_executable=python_executable)
         }
+    }
+
+
+def _build_relay_server(bridge_dir: Path, *, python_executable: str | None) -> dict[str, object]:
+    """Return the ``mcpServers`` entry for this session's Omnigent relay."""
+    python = python_executable or sys.executable
+    return {
+        "command": python,
+        "args": [
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        "enabledTools": list(_AGY_ENABLED_TOOLS),
+        "env": {
+            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+            # Pin the relay to the RUNNER's real home so its bridge-root validation
+            # matches where the bridge dir lives. See :func:`build_mcp_config`.
+            "HOME": str(Path.home()),
+        },
     }
 
 
@@ -511,6 +517,14 @@ def write_mcp_config(
     config. Mirrors cursor #742's :func:`omnigent.harnesses.cursor_native.bridge.write_mcp_config`,
     adapted to agy's hidden ``--gemini_dir`` flag.
 
+    The user's real ``~/.gemini/config/mcp_config.json`` is the base of the
+    isolated file: agy loads MCP servers only from the ``--gemini_dir`` it is
+    launched with, so without this merge a dispatched worker silently loses every
+    server the user's interactive agy has. The Omnigent relay is layered on top
+    and wins a name collision. The real file is re-read on every write (a relaunch
+    picks up edits) and never modified; a missing or malformed file seeds only
+    the relay.
+
     :param bridge_dir: Native Antigravity bridge directory (holds ``bridge.json``
         and the isolated agy Gemini dir).
     :param python_executable: Python interpreter for the relay command;
@@ -521,11 +535,39 @@ def write_mcp_config(
     config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = config_dir / _MCP_CONFIG_FILE
-    payload = build_mcp_config(bridge_dir, python_executable=python_executable)
+    payload = _load_user_mcp_config(Path.home())
+    user_servers = payload.get("mcpServers")
+    servers: dict[str, object] = dict(user_servers) if isinstance(user_servers, dict) else {}
+    servers[_MCP_SERVER_NAME] = _build_relay_server(
+        bridge_dir, python_executable=python_executable
+    )
+    payload["mcpServers"] = servers
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
+
+
+def _load_user_mcp_config(real_home: Path) -> dict[str, object]:
+    """Load the user's real agy MCP config; a missing or malformed file yields ``{}``."""
+    path = real_home / ".gemini" / _MCP_CONFIG_DIR / _MCP_CONFIG_FILE
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        _logger.warning(
+            "Could not read the user's agy MCP config at %s; seeding only the Omnigent relay",
+            path,
+            exc_info=True,
+        )
+        return {}
+    if not isinstance(loaded, dict):
+        _logger.warning(
+            "agy MCP config at %s is not a JSON object; seeding only the Omnigent relay", path
+        )
+        return {}
+    return loaded
 
 
 def seed_isolated_agy_home(
@@ -542,10 +584,10 @@ def seed_isolated_agy_home(
     ``<bridge_dir>/agy-home/.gemini``.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
-    auth that is not portable to a relocated ``HOME``. The relay's
-    ``mcp_config.json`` is written separately by :func:`write_mcp_config` so it
-    lands in this same isolated tree rather than the user's real ``~/.gemini``
-    (the footgun this whole design avoids).
+    auth that is not portable to a relocated ``HOME``. The ``mcp_config.json``
+    (the user's servers plus the relay) is written separately by
+    :func:`write_mcp_config` so it lands in this same isolated tree rather than
+    the user's real ``~/.gemini`` (the footgun this whole design avoids).
 
     :param bridge_dir: Native Antigravity bridge directory.
     :param trusted_workspace: Optional workspace path to pre-trust inside the
