@@ -778,7 +778,7 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse mode={isTextStreaming ? "streaming" : "static"}>
+          <FilePathAwareMessageResponse breaks mode={isTextStreaming ? "streaming" : "static"}>
             {item.text}
           </FilePathAwareMessageResponse>
         </div>
