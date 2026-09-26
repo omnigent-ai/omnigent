@@ -51,6 +51,22 @@ describe("ComposerPrLink", () => {
     expect(screen.getByText("3 PRs")).toHaveAttribute("title", "3 PRs");
   });
 
+  it("uses the GitLab mark and MR terminology for GitLab reviews", () => {
+    render(
+      <ComposerPrLink
+        provider="gitlab"
+        state="ready"
+        prCount={1}
+        prNumber={17}
+        onOpen={() => {}}
+      />,
+    );
+    const link = screen.getByTestId("composer-gitlab-review-link");
+    expect(link).toHaveTextContent("!17");
+    expect(link).toHaveAttribute("title", "View this MR in the GitLab tab");
+    expect(link.querySelector("svg")).toHaveAttribute("viewBox", "0 0 24 24");
+  });
+
   it("renders explicit loading and unknown states without a null PR number", () => {
     const { rerender } = render(
       <ComposerPrLink state="loading" prCount={0} prNumber={null} onOpen={() => {}} />,
@@ -65,5 +81,18 @@ describe("ComposerPrLink", () => {
     render(<ComposerPrLink state="ready" prCount={1} prNumber={null} onOpen={() => {}} />);
     expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("1 PR");
     expect(screen.queryByText("#null")).toBeNull();
+  });
+
+  it("renders GitLab merge-request labels and opens the GitLab tab", () => {
+    const onOpen = vi.fn();
+    render(
+      <ComposerPrLink state="ready" prCount={2} prNumber={7} onOpen={onOpen} provider="gitlab" />,
+    );
+
+    const link = screen.getByTestId("composer-gitlab-review-link");
+    expect(link).toHaveTextContent("2 MRs");
+    expect(link).toHaveAttribute("title", "View these MRs in the GitLab tab");
+    fireEvent.click(link);
+    expect(onOpen).toHaveBeenCalledTimes(1);
   });
 });

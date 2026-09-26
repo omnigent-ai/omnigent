@@ -143,6 +143,14 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
     browser_contract.json(
         f"{api}/resources/github", {"error": {"message": "No GitHub resource"}}, status=404
     )
+    browser_contract.json(
+        f"{api}/resources/gitlab",
+        {
+            "object": "session.gitlab.info",
+            "available": False,
+            "reason": "not_a_git_repo",
+        },
+    )
     browser_contract.json(f"{api}/resources/terminals", empty)
     browser_contract.json(f"{api}/comments", lambda _request: session.comments)
     browser_contract.sse(f"{api}/stream")

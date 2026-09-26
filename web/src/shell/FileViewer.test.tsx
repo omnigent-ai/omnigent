@@ -2037,6 +2037,7 @@ describe("file position navigation", () => {
           openFile: vi.fn(),
           registerNavigationGuard,
           openGithubTab: vi.fn(),
+          openGitlabTab: vi.fn(),
           isChangedPath: () => false,
           conversationId: "conv_1",
           workspaceRoot: null,

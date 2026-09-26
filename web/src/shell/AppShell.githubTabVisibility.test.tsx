@@ -14,6 +14,8 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
@@ -66,6 +68,9 @@ vi.mock("./Sidebar", () => ({
 vi.mock("./GithubPanel", () => ({
   GithubPanel: () => <div data-testid="github-panel">Pull request details</div>,
 }));
+vi.mock("./GitlabPanel", () => ({
+  GitlabPanel: () => <div data-testid="gitlab-panel">Merge request details</div>,
+}));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
 }));
@@ -83,7 +88,7 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { AppShell } from "./AppShell";
-import { useOpenGithubTab } from "./FileViewerContext";
+import { useOpenGithubTab, useOpenGitlabTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
 import { useGithubInfo } from "@/hooks/useGithub";
 import { useConversations } from "@/hooks/useConversations";
@@ -133,19 +138,45 @@ beforeEach(() => {
 
 function GithubLinkProbe() {
   const openGithubTab = useOpenGithubTab();
+  const openGitlabTab = useOpenGitlabTab();
   return (
     <>
       <button type="button" onClick={() => openGithubTab?.()}>
         Open PR
+      </button>
+      <button type="button" onClick={() => openGitlabTab?.()}>
+        Open MR
       </button>
       <Link to="/c/conv_other">Another session</Link>
     </>
   );
 }
 
-function renderShell() {
+function serverInfo(enabledConnections: string[]): ServerInfo {
+  return {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    enabled_connections: enabledConnections,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: {},
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
+}
+
+function renderShell(info?: ServerInfo) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const shell = (
     <QueryClientProvider client={qc}>
       <SidebarDataProvider>
         <TooltipProvider>
@@ -158,8 +189,9 @@ function renderShell() {
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  return render(info ? <CapabilitiesProvider info={info}>{shell}</CapabilitiesProvider> : shell);
 }
 
 describe("GitHub rail tab visibility", () => {
@@ -209,6 +241,27 @@ describe("GitHub rail tab visibility", () => {
     renderShell();
 
     expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+  });
+});
+
+describe("GitLab rail tab visibility", () => {
+  it("hides the GitLab tab when the provider is not configured", () => {
+    renderShell(serverInfo([]));
+
+    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "GitLab" })).not.toBeInTheDocument();
+  });
+
+  it("shows the GitLab tab when the provider is configured", () => {
+    renderShell(serverInfo(["gitlab"]));
+
+    expect(screen.getByRole("tab", { name: "GitLab" })).toBeInTheDocument();
+  });
+
+  it("does not flash the GitLab tab while server capabilities are loading", () => {
+    renderShell();
+
+    expect(screen.queryByRole("tab", { name: "GitLab" })).not.toBeInTheDocument();
   });
 });
 
@@ -262,5 +315,23 @@ describe("opening GitHub from the composer", () => {
     fireEvent.click(screen.getByRole("link", { name: "Another session" }));
 
     expect(screen.getByTestId("github-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+});
+
+describe("opening GitLab from the composer", () => {
+  it("opens and dismisses the configured provider's mobile drawer", () => {
+    vi.mocked(isMobileViewport).mockReturnValue(true);
+    writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "files" });
+    renderShell(serverInfo(["gitlab"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "Open MR" }));
+
+    const drawer = screen.getByTestId("gitlab-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("gitlab-panel")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").open).toBe(false);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
   });
 });

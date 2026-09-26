@@ -27,6 +27,8 @@ interface FileViewerContextType {
   registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
   /** Open GitHub in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
+  /** Open GitLab in the workspace rail. */
+  openGitlabTab: () => void;
   /**
    * Returns true when `path` is a known workspace file (present in the
    * session's changed-files list). Used as the synchronous fast path for
@@ -63,12 +65,14 @@ export function useFileViewer(): ((path: string, options?: OpenFileOptions) => v
   return useContext(FileViewerContext)?.openFile ?? null;
 }
 
-/**
- * Returns a callback that opens the GitHub rail tab or mobile drawer, or `null`
- * when used outside AppShell (tests, Storybook).
- */
+/** Returns a callback that opens the GitHub rail tab or mobile drawer. */
 export function useOpenGithubTab(): (() => void) | null {
   return useContext(FileViewerContext)?.openGithubTab ?? null;
+}
+
+/** Returns a callback that opens the GitLab rail tab. */
+export function useOpenGitlabTab(): (() => void) | null {
+  return useContext(FileViewerContext)?.openGitlabTab ?? null;
 }
 
 // Stable fallback used when the context is absent (tests, Storybook).

@@ -42,6 +42,7 @@ function FileViewerHarness({
     () => ({
       openFile,
       openGithubTab: () => {},
+      openGitlabTab: () => {},
       isChangedPath: () => false,
       conversationId: "conv_abc",
       workspaceRoot: "/home/u/ws",

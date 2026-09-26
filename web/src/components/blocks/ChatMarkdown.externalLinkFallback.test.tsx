@@ -41,6 +41,7 @@ afterEach(() => {
 const FILE_VIEWER = {
   openFile: () => {},
   openGithubTab: () => {},
+  openGitlabTab: () => {},
   isChangedPath: () => false,
   conversationId: undefined,
   workspaceRoot: "/home/u/ws",

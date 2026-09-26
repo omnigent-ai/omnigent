@@ -3439,6 +3439,10 @@ class HostProcess:
             )
         if op == "github_pr_diff":
             return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
+        if op == "gitlab_info":
+            return r.gitlab_info(session_id, cast("str | None", params.get("mr_url")))
+        if op == "gitlab_mr_diff":
+            return r.gitlab_mr_diff(session_id, cast("str | None", params.get("mr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
@@ -3506,7 +3510,7 @@ class HostProcess:
         """
         from typing import cast
 
-        from omnigent.runner import github_resource
+        from omnigent.runner import github_resource, gitlab_resource
 
         if op == "github_set_preference":
             return github_resource.set_github_preference(
@@ -3522,6 +3526,12 @@ class HostProcess:
                 str(params["session_id"]),
                 str(params["url"]),
                 str(params.get("action", "attach")),
+            )
+        if op == "gitlab_mrs_update":
+            return gitlab_resource.update_session_mr(
+                str(params["session_id"]),
+                url=str(params["url"]),
+                action=str(params.get("action", "attach")),
             )
         raise ValueError(f"unknown fs write op: {op!r}")
 
@@ -4860,6 +4870,19 @@ def run_host_process(
     # broker blip at startup can't strand a connected owner for the whole session).
     configure_host_gh(server_url, identity.host_id)
     start_host_gh_refresh(server_url, identity.host_id)
+
+    # GitLab follows the same broker model. Its helper checks the requested HTTPS
+    # host against the connected instance, which supports self-managed instances
+    # without allowing a token to reach another remote.
+    from omnigent.git_credential_gitlab import (
+        configure_host_gitlab,
+        configure_host_glab,
+        start_host_glab_refresh,
+    )
+
+    configure_host_gitlab(server_url, identity.host_id)
+    configure_host_glab(server_url, identity.host_id)
+    start_host_glab_refresh(server_url, identity.host_id)
 
     # Executor-agnostic Databricks setup: when the owner has linked a workspace,
     # materialize their per-user token as a ``~/.databrickscfg`` profile so the

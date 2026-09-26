@@ -2980,6 +2980,78 @@ def register_resources_routes(
             )
         return result
 
+    # ── GitLab integration (read-only) ────────────────────────────
+    # Registered before the generic resource lookup, matching GitHub.
+
+    @router.get("/sessions/{session_id}/resources/gitlab", response_model=None)
+    async def get_session_gitlab(
+        request: Request,
+        session_id: str,
+        mr_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Return GitLab repository, branch, and merge-request context."""
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="gitlab_info",
+            host_params={"mr_url": mr_url} if mr_url else {},
+            runner_params={"mr_url": mr_url} if mr_url else None,
+            runner_path=f"/v1/sessions/{session_id}/resources/gitlab",
+        )
+
+    @router.get("/sessions/{session_id}/resources/gitlab/diff", response_model=None)
+    async def read_gitlab_mr_diff(
+        request: Request,
+        session_id: str,
+        mr_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the selected GitLab merge request as a unified diff."""
+        conv = await _authorize_browse_read(session_id, request)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="gitlab_mr_diff",
+            host_params={"mr_url": mr_url} if mr_url else {},
+            runner_params={"mr_url": mr_url} if mr_url else None,
+            runner_path=f"/v1/sessions/{session_id}/resources/gitlab/diff",
+        )
+
+    @router.post("/sessions/{session_id}/resources/gitlab/mrs", response_model=None)
+    async def update_session_gitlab_mr(request: Request, session_id: str) -> dict[str, Any]:
+        """Attach or detach a GitLab merge request from the session."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(status_code=400, detail="Expected a GitLab merge request URL")
+        params = {
+            "url": body["url"],
+            "action": body.get("action", "attach"),
+            "session_id": session_id,
+        }
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/gitlab/mrs",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="gitlab_mrs_update", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(
+                status_code=status,
+                detail=result.get("detail", "Cannot update merge requests"),
+            )
+        return result
+
     # Generic single-resource lookup — registered AFTER typed
     # collections so "environments", "terminals", "files" are not
     # captured as resource_id.

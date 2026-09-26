@@ -2960,6 +2960,69 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gitlab_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    """GitLab is a typed session resource and is proxied to the runner."""
+    payload = {
+        "object": "session.gitlab.info",
+        "available": True,
+        "authenticated": True,
+        "branch": "feature",
+        "merge_request": None,
+    }
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/gitlab"
+    resp = await client.get(path)
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert ("GET", path) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_gitlab_diff_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    payload = {"object": "session.gitlab.mr_diff", "patch": "diff --git a/x b/x\n"}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/gitlab/diff"
+    resp = await client.get(path)
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert ("GET", path) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_gitlab_mr_update_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    payload = {
+        "object": "session.gitlab.mr_association",
+        "action": "attach",
+        "url": "https://gitlab.example/group/project/-/merge_requests/42",
+    }
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/gitlab/mrs"
+
+    resp = await client.post(path, json={"url": payload["url"], "action": "attach"})
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert ("POST", path) in fake_runner.calls
+    assert fake_runner.post_json_calls == [
+        (
+            path,
+            {
+                "url": payload["url"],
+                "action": "attach",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> None:
     """GET /resources/github/changes proxies the PR file list to the runner."""
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})

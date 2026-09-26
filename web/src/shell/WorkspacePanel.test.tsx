@@ -88,6 +88,7 @@ function renderWorkspace(
     openFiles?: string[];
     changedCount?: number;
     showGithubTab?: boolean;
+    showGitlabTab?: boolean;
     showBrowserTab?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
@@ -124,6 +125,7 @@ function renderWorkspace(
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
         showGithubTab={overrides.showGithubTab ?? false}
+        showGitlabTab={overrides.showGitlabTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}

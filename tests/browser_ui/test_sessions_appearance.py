@@ -124,6 +124,14 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
                 {"error": {"message": "No browser-contract environment"}},
                 status=404,
             )
+        browser_contract.json(
+            f"/v1/sessions/{session_id}/resources/gitlab",
+            {
+                "object": "session.gitlab.info",
+                "available": False,
+                "reason": "not_a_git_repo",
+            },
+        )
         browser_contract.sse(f"/v1/sessions/{session_id}/stream")
     browser_contract.json(
         re.compile(r"/health(?:\?.*)?$"),

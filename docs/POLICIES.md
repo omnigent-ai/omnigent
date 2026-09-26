@@ -356,6 +356,37 @@ github_access:
       - "fix/*"
 ```
 
+### GitLab
+
+#### `gitlab_policy`
+
+Controls `glab`, GitLab MCP tools, and explicit GitLab `git` remotes for one configured GitLab.com, Dedicated, or self-managed instance. Project paths may contain nested groups. Commands targeting another host are left to that host's policy; ambiguous local git remotes ask for approval.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `gitlab_host` | string | required | Canonical HTTPS URL of the GitLab instance, for example `https://gitlab.example.com` |
+| `read_all` | boolean | `true` | Allow all reads on that GitLab host |
+| `read_repos` | string[] | `[]` | Projects readable when `read_all` is false; accepts `group/project`, nested project paths, or instance URLs |
+| `write_repos` | string[] | `[]` | Projects the agent may modify |
+| `write_branches` | string[] | `[]` | Branches writable within allowed projects (empty = any) |
+| `mcp_tool_prefixes` | string[] | `["mcp__gitlab__", "gitlab__"]` | GitLab MCP tool-name prefixes to match |
+| `shell_tools` | string[] | every supported shell tool | Shell tools whose commands are parsed for `git`/`glab` |
+
+```yaml
+gitlab_access:
+  type: function
+  handler: omnigent.policies.builtins.gitlab.gitlab_policy
+  factory_params:
+    gitlab_host: https://gitlab.example.com
+    read_all: false
+    read_repos:
+      - platform/shared-library
+    write_repos:
+      - platform/team/service
+    write_branches:
+      - main
+```
+
 ### Google Workspace
 
 #### `gdrive_policy`

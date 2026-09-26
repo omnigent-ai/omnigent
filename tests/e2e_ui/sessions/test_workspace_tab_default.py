@@ -66,8 +66,8 @@ def test_changed_default_applies_to_visited_session_after_reload(
     page.goto(f"{base_url}/settings/appearance")
     group = page.get_by_role("radiogroup", name="Default Workspace tab")
     options = group.get_by_role("radio")
-    expect(options).to_have_count(4)
-    for index, label in enumerate(["Files", "Changes", "GitHub", "Agents"]):
+    expect(options).to_have_count(5)
+    for index, label in enumerate(["Files", "Changes", "GitHub", "GitLab", "Agents"]):
         expect(options.nth(index)).to_have_accessible_name(label)
     preference = page.get_by_test_id(f"workspace-tab-default-{default_tab}")
     preference.click()

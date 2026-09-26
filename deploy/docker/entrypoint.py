@@ -469,6 +469,26 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
             github_store = GithubConnectionStore(database_url, cipher)
 
+    # GitLab uses the same encrypted store as GitHub, and may target GitLab.com
+    # or a deployment-configured self-managed/Dedicated instance.
+    from omnigent.server.gitlab_app import GitLabAppConfig
+
+    gitlab_config = GitLabAppConfig.from_env()
+    gitlab_store = None
+    if gitlab_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        gitlab_cipher = build_secret_cipher()
+        if gitlab_cipher is None:
+            logger.error(
+                "GitLab OAuth is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
+                "to enable it."
+            )
+        else:
+            from omnigent.connections.gitlab import GitlabConnectionStore
+
+            gitlab_store = GitlabConnectionStore(database_url, gitlab_cipher)
+
     from omnigent.server.databricks_app import DatabricksConfig
 
     databricks_config = DatabricksConfig.from_env()
@@ -510,6 +530,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         server_config=cfg,
         github_config=github_config,
         github_store=github_store,
+        gitlab_config=gitlab_config,
+        gitlab_store=gitlab_store,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
     )

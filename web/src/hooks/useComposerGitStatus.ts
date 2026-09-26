@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 
 import { useGithubInfo } from "@/hooks/useGithub";
+import { useGitlabInfo } from "@/hooks/useGitlab";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 
@@ -74,13 +75,18 @@ export interface ComposerGitStatus {
    * metadata only — never substituted for the live branch, surfaced separately.
    */
   creationBranch: string | null;
-  /** `owner/repo` from the git remote, or `null`. */
+  /** Repository evidence from live Git/workspace provider probes. */
+  repoDetected: boolean;
+  /** `owner/repo` from the GitHub remote, or `null`. */
   repoNameWithOwner: string | null;
-  /** GitHub association query state for fail-closed worktree and PR UI. */
+  /** Provider-specific review association query states. */
   githubState: "loading" | "ready" | "unknown";
+  gitlabState: "loading" | "ready" | "unknown";
   prCount: number;
   prNumber: number | null;
-  /** Re-read live worktree + PR state from the host. */
+  mrCount: number;
+  mrNumber: number | null;
+  /** Re-read live worktree + review state from the host. */
   refresh: () => void;
   refreshing: boolean;
 }
@@ -114,7 +120,9 @@ export function useComposerGitStatus({
 }): ComposerGitStatus {
   const worktrees = useSessionWorktrees(sessionId, hostId, workspace);
   const github = useGithubInfo(sessionId ?? undefined);
+  const gitlab = useGitlabInfo(sessionId ?? undefined);
   const info = github.data;
+  const gitlabInfo = gitlab.data;
   const result = worktrees.data;
 
   let branchState: ComposerBranchState;
@@ -149,16 +157,47 @@ export function useComposerGitStatus({
     }
   }
 
+  // The GitLab workspace probe reads `git branch --show-current` in the same
+  // checkout. Use it when the host-wide worktree listing is temporarily
+  // unavailable; unlike a review head ref, this is live workspace state.
+  const gitlabBranch = gitlabInfo?.branch?.trim() || null;
+  if ((branchState === "loading" || branchState === "unknown") && gitlabBranch) {
+    branchState = "branch";
+    branch = gitlabBranch;
+  }
+
+  const repoDetected =
+    branchState === "branch" ||
+    branchState === "detached" ||
+    info?.repo != null ||
+    gitlabInfo?.repo != null;
+
   const prs = info?.prs;
   const prNumber = prs?.[0]?.number ?? info?.pr?.number ?? null;
   const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
+  const discoveredMrs = gitlabInfo?.merge_requests ?? [];
+  const trackedMrs = gitlabInfo?.tracked_merge_requests ?? [];
+  const mrNumber =
+    discoveredMrs[0]?.iid ??
+    discoveredMrs[0]?.id ??
+    gitlabInfo?.merge_request?.iid ??
+    gitlabInfo?.merge_request?.id ??
+    trackedMrs[0]?.number ??
+    null;
+  const mrUrls = new Set([
+    ...discoveredMrs.map((mr) => mr.web_url).filter((url): url is string => Boolean(url)),
+    ...trackedMrs.map((mr) => mr.url),
+  ]);
+  const mrCount = mrUrls.size || (mrNumber !== null ? 1 : 0);
 
   const worktreeRefetch = worktrees.refetch;
   const githubRefetch = github.refetch;
+  const gitlabRefetch = gitlab.refetch;
   const refresh = useCallback(() => {
     void worktreeRefetch();
     void githubRefetch();
-  }, [worktreeRefetch, githubRefetch]);
+    void gitlabRefetch();
+  }, [worktreeRefetch, githubRefetch, gitlabRefetch]);
 
   return {
     branch,
@@ -166,11 +205,15 @@ export function useComposerGitStatus({
     isWorktree,
     worktreePath,
     creationBranch: creationBranch?.trim() || null,
+    repoDetected,
     repoNameWithOwner: info?.repo?.name_with_owner ?? null,
     githubState: github.isLoading ? "loading" : github.isError || !info ? "unknown" : "ready",
+    gitlabState: gitlab.isLoading ? "loading" : gitlab.isError || !gitlabInfo ? "unknown" : "ready",
     prCount,
     prNumber,
+    mrCount,
+    mrNumber,
     refresh,
-    refreshing: worktrees.isFetching || github.isFetching,
+    refreshing: worktrees.isFetching || github.isFetching || gitlab.isFetching,
   };
 }

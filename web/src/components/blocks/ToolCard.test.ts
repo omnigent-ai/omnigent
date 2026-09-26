@@ -134,6 +134,7 @@ describe("ToolCard rendering", () => {
     const ctx = {
       openFile,
       openGithubTab: () => {},
+      openGitlabTab: () => {},
       isChangedPath: () => false,
       conversationId: "c1",
       workspaceRoot: null,
@@ -166,6 +167,7 @@ describe("ToolCard rendering", () => {
     const ctx = {
       openFile: vi.fn(),
       openGithubTab: () => {},
+      openGitlabTab: () => {},
       isChangedPath: () => false,
       conversationId: "c1",
       workspaceRoot: null,

@@ -162,7 +162,7 @@ def _join_shell_lines(command: str) -> str:
     return "".join(result)
 
 
-def _gh_commands(command: str, depth: int = 0) -> list[list[str]]:
+def _cli_commands(command: str, executable: str, host_env: str, depth: int = 0) -> list[list[str]]:
     if depth > MAX_SHELL_NESTING:
         return []
     found = []
@@ -186,8 +186,8 @@ def _gh_commands(command: str, depth: int = 0) -> list[list[str]]:
             continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
-            found.extend(_gh_commands(inner, depth + 1))
-        elif tokens and PurePath(tokens[0]).name == "gh":
+            found.extend(_cli_commands(inner, executable, host_env, depth + 1))
+        elif tokens and PurePath(tokens[0]).name == executable:
             args, prefix = tokens[1:], []
             while args and args[0].startswith("-"):
                 if args[0] in {"-R", "--repo"} and len(args) > 1:
@@ -198,11 +198,23 @@ def _gh_commands(command: str, depth: int = 0) -> list[list[str]]:
                     args = args[1:]
                 else:
                     break
-            host = next((t.split("=", 1)[1] for t in segment if t.startswith("GH_HOST=")), None)
+            host = next(
+                (t.split("=", 1)[1] for t in segment if t.startswith(host_env + "=")), None
+            )
             if host:
                 prefix.extend(["--hostname", host])
             found.append([*args, *prefix])
     return found
+
+
+def _gh_commands(command: str, depth: int = 0) -> list[list[str]]:
+    return _cli_commands(command, "gh", "GH_HOST", depth)
+
+
+def _glab_commands(command: str) -> list[list[str]]:
+    """Normalize ``glab mr`` writes to the observer's PR command vocabulary."""
+    commands = _cli_commands(command, "glab", "GLAB_HOST")
+    return [["pr", *tokens[1:]] if tokens[:1] == ["mr"] else tokens for tokens in commands]
 
 
 def _flag(tokens: list[str], *names: str) -> str | None:
@@ -500,10 +512,12 @@ def extract_prs(
         if not isinstance(command, str) or len(command) > 100_000:
             return [], False
         # Unrelated setup commands do not affect PR associations.
-        gh_commands = [
-            tokens for tokens in _gh_commands(command) if tokens and tokens[0] in {"pr", "api"}
+        cli_commands = [
+            tokens
+            for tokens in [*_gh_commands(command), *_glab_commands(command)]
+            if tokens and tokens[0] in {"pr", "api"}
         ]
-        commands = [tokens for tokens in gh_commands if _tracks_pr(tokens)]
+        commands = [tokens for tokens in cli_commands if _tracks_pr(tokens)]
         if not commands:
             return [], False
         text = _output_text(result)
@@ -520,7 +534,7 @@ def extract_prs(
         ):
             references.append(ref)
         # Shared stdout cannot attribute a result to a write when reads/comments also ran.
-        if len(commands) == len(gh_commands) and (
+        if len(commands) == len(cli_commands) and (
             len(commands) > 1 or not _content_only(commands[0])
         ):
             for obj in _objects(result):

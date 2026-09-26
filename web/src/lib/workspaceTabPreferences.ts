@@ -5,7 +5,7 @@ import { resetSessionWorkspaceTabSelections } from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 
-export const defaultWorkspaceTabs = ["files", "changes", "github", "subagents"] as const;
+export const defaultWorkspaceTabs = ["files", "changes", "github", "gitlab", "subagents"] as const;
 export type DefaultWorkspaceTab = (typeof defaultWorkspaceTabs)[number];
 
 /** Match today's product default: sessions without remembered state open Files. */

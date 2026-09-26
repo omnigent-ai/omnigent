@@ -57,6 +57,9 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  showGitlabTab: false,
+  gitlabPanelOpen: false,
+  onOpenGitlab: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
@@ -904,5 +907,45 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByRole("link", { name: "Back to parent session" })).toBeInTheDocument();
     expect(screen.getByText("reviewer")).toBeInTheDocument();
+  });
+});
+
+describe("ChatHeader — mobile review panels", () => {
+  it("shows configured GitLab beside GitHub and opens its drawer", () => {
+    isMobileMock.mockReturnValue(true);
+    const onOpenGitlab = vi.fn();
+
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_gitlab",
+      conversationTitle: "GitLab session",
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: {
+        ...mobileMenu,
+        showGitlabTab: true,
+        onOpenGitlab,
+      },
+    });
+
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: /GitHub$/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: /GitLab$/ }));
+    expect(onOpenGitlab).toHaveBeenCalledOnce();
+  });
+
+  it("hides GitLab when the provider is not configured", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_no_gitlab",
+      conversationTitle: "Git session",
+      hasRailContent: true,
+      showFilesPanel: true,
+    });
+
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: /GitHub$/ })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /GitLab$/ })).toBeNull();
   });
 });

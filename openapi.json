@@ -14757,6 +14757,161 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/gitlab": {
+      "get": {
+        "description": "Return GitLab repository, branch, and merge-request context.",
+        "operationId": "get_session_gitlab_v1_sessions__session_id__resources_gitlab_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Mr Url"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Gitlab",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/gitlab/diff": {
+      "get": {
+        "description": "Return the selected GitLab merge request as a unified diff.",
+        "operationId": "read_gitlab_mr_diff_v1_sessions__session_id__resources_gitlab_diff_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Mr Url"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Gitlab Mr Diff",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/gitlab/mrs": {
+      "post": {
+        "description": "Attach or detach a GitLab merge request from the session.",
+        "operationId": "update_session_gitlab_mr_v1_sessions__session_id__resources_gitlab_mrs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Gitlab Mr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/terminals": {
       "get": {
         "description": "Return only terminal resources for a session.\n\nThe runner endpoint's pagination params (`limit` / `after` /\n`before` / `order`) are forwarded from the incoming query\nstring \u2014 without this, a client-requested `order=asc` (the web\nterminal tabs rely on creation order to keep the session's own\nterminal first) would be silently dropped and the runner's\n`desc` default would apply.\n\n**Returns:** `PaginatedList` of terminal resources.",

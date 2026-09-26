@@ -11698,6 +11698,45 @@ def create_runner_app(
             pr_url=body.get("pr_url"),
         )
 
+    # ── GitLab integration (read-only): selected MR metadata and patch ────────
+
+    async def _gitlab_call(session_id: str, operation: str, **kwargs: Any) -> JSONResponse:
+        from omnigent.runner import gitlab_resource
+
+        root = await _github_workspace_root(session_id)
+        function = getattr(gitlab_resource, operation)
+        try:
+            result = await asyncio.to_thread(function, root, session_id=session_id, **kwargs)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/gitlab")
+    async def read_gitlab_info(session_id: str, mr_url: str | None = None) -> JSONResponse:
+        return await _gitlab_call(session_id, "gitlab_info", pr_url=mr_url)
+
+    @app.get("/v1/sessions/{session_id}/resources/gitlab/diff")
+    async def read_gitlab_mr_diff(session_id: str, mr_url: str | None = None) -> JSONResponse:
+        return await _gitlab_call(session_id, "gitlab_mr_diff", pr_url=mr_url)
+
+    @app.post("/v1/sessions/{session_id}/resources/gitlab/mrs")
+    async def update_gitlab_mr_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(status_code=400, detail="Expected a GitLab merge request URL")
+        from omnigent.runner import gitlab_resource
+
+        try:
+            result = await asyncio.to_thread(
+                gitlab_resource.update_session_mr,
+                session_id,
+                url=body["url"],
+                action=body.get("action", "attach"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(status_code=200, content=result)
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"

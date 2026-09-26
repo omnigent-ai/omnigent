@@ -64,15 +64,22 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
     isWorktree: null as boolean | null,
     worktreePath: null as string | null,
     creationBranch: null as string | null,
+    repoDetected: false,
     repoNameWithOwner: "omnigent-ai/omnigent" as string | null,
     githubState: "ready" as "loading" | "ready" | "unknown",
+    gitlabState: "ready" as "loading" | "ready" | "unknown",
     prCount: 0,
     prNumber: null as number | null,
+    mrCount: 0,
+    mrNumber: null as number | null,
     refresh: vi.fn(),
     refreshing: false,
   },
 }));
-const { openGithubTabMock } = vi.hoisted(() => ({ openGithubTabMock: vi.fn() }));
+const { openGithubTabMock, openGitlabTabMock } = vi.hoisted(() => ({
+  openGithubTabMock: vi.fn(),
+  openGitlabTabMock: vi.fn(),
+}));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: (args: unknown) => {
     composerGitStatusArgsSpy(args);
@@ -82,6 +89,7 @@ vi.mock("@/hooks/useComposerGitStatus", () => ({
 vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
   ...(await importOriginal<typeof FileViewerContextModule>()),
   useOpenGithubTab: () => openGithubTabMock,
+  useOpenGitlabTab: () => openGitlabTabMock,
 }));
 
 function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
@@ -93,10 +101,14 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       isWorktree: null,
       worktreePath: null,
       creationBranch: null,
+      repoDetected: false,
       repoNameWithOwner: "omnigent-ai/omnigent",
       githubState: "ready",
+      gitlabState: "ready",
       prCount: 0,
       prNumber: null,
+      mrCount: 0,
+      mrNumber: null,
       refreshing: false,
     },
     overrides,
@@ -2277,6 +2289,7 @@ describe("Composer shared visible controls", () => {
       branchState: "branch",
       isWorktree: true,
       worktreePath: "/home/alice/repo-wt/feature",
+      repoDetected: true,
       githubState: "ready",
       repoNameWithOwner: "omnigent-ai/omnigent",
       prCount: 1,
@@ -2291,6 +2304,7 @@ describe("Composer shared visible controls", () => {
       branchState: "branch",
       isWorktree: true,
       worktreePath: "/home/alice/repo-wt/feature",
+      repoDetected: true,
       githubState: "ready",
       repoNameWithOwner: "omnigent-ai/omnigent",
       prCount: 0,
@@ -2304,7 +2318,7 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-pr-link")).toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
 
-    setComposerGitStatus({ githubState: "loading", repoNameWithOwner: null });
+    setComposerGitStatus({ githubState: "loading", repoDetected: false, repoNameWithOwner: null });
     view.rerender(
       <TooltipProvider>
         <Composer {...composerProps()} />
@@ -2323,12 +2337,26 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
   });
 
+  it("shows the live branch for a GitLab-only repository", () => {
+    setComposerGitStatus({
+      branch: "feature/gitlab-mr",
+      branchState: "branch",
+      repoDetected: true,
+      repoNameWithOwner: null,
+      githubState: "ready",
+      gitlabState: "ready",
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature/gitlab-mr");
+  });
+
   it("keeps the PR to the right of the confirmed worktree status", () => {
     setComposerGitStatus({
       branch: "feature/shared-composer",
       branchState: "branch",
       isWorktree: true,
       worktreePath: "/home/alice/repo-wt/feature",
+      repoDetected: true,
       githubState: "ready",
       repoNameWithOwner: "omnigent-ai/omnigent",
       prCount: 1,
@@ -2426,6 +2454,7 @@ describe("Composer shared visible controls", () => {
       branchState: "branch",
       isWorktree: true,
       worktreePath: "/home/alice/worktrees/feature-x",
+      repoDetected: true,
       creationBranch: "feature-x",
     });
     useChatStore.setState({ conversationId: "conv_worktree", gitBranch: "source-branch" });

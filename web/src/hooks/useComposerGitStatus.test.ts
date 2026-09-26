@@ -1,5 +1,5 @@
 import { renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import type { SessionWorktreesResult } from "@/hooks/useSessionWorktrees";
@@ -7,6 +7,7 @@ import { useComposerGitStatus } from "./useComposerGitStatus";
 
 const useSessionWorktreesMock = vi.fn();
 const useGithubInfoMock = vi.fn();
+const useGitlabInfoMock = vi.fn();
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (
@@ -17,6 +18,9 @@ vi.mock("@/hooks/useSessionWorktrees", () => ({
 }));
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: (id: string | undefined) => useGithubInfoMock(id),
+}));
+vi.mock("@/hooks/useGitlab", () => ({
+  useGitlabInfo: (id: string | undefined) => useGitlabInfoMock(id),
 }));
 
 function wt(overrides: Partial<HostWorktree>): HostWorktree {
@@ -42,8 +46,19 @@ function setWorktrees(
     ...extra,
   });
 }
+
 function setGithub(data: Record<string, unknown> | undefined) {
   useGithubInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn() });
+}
+
+function setGitlab(data: Record<string, unknown> | undefined, refetch = vi.fn()) {
+  useGitlabInfoMock.mockReturnValue({
+    data,
+    isLoading: false,
+    isError: false,
+    isFetching: false,
+    refetch,
+  });
 }
 
 function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
@@ -58,9 +73,20 @@ function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
   );
 }
 
+beforeEach(() => {
+  useGitlabInfoMock.mockReturnValue({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    isFetching: false,
+    refetch: vi.fn(),
+  });
+});
+
 afterEach(() => {
   useSessionWorktreesMock.mockReset();
   useGithubInfoMock.mockReset();
+  useGitlabInfoMock.mockReset();
 });
 
 describe("useComposerGitStatus", () => {
@@ -183,6 +209,20 @@ describe("useComposerGitStatus", () => {
     expect(run({ hostId: null }).result.current.branchState).toBe("unknown");
   });
 
+  it("uses the live GitLab workspace branch when worktree listing is unavailable", () => {
+    setWorktrees({ status: "unknown" });
+    setGithub(undefined);
+    setGitlab({
+      available: true,
+      branch: "feature/from-gitlab-workspace",
+      repo: { host: "gitlab.example", path_with_namespace: "group/project" },
+    });
+    const { result } = run({ creationBranch: "stale/creation" });
+    expect(result.current.branchState).toBe("branch");
+    expect(result.current.branch).toBe("feature/from-gitlab-workspace");
+    expect(result.current.repoDetected).toBe(true);
+  });
+
   it("never substitutes the creation branch for the live branch", () => {
     setWorktrees({ status: "unknown" });
     setGithub(undefined);
@@ -205,18 +245,38 @@ describe("useComposerGitStatus", () => {
     expect(result.current.prNumber).toBe(7);
   });
 
-  it("refresh() refetches both sources and surfaces fetching", () => {
+  it("combines discovered and tracked GitLab merge requests without duplicates", () => {
+    setWorktrees({ status: "ok", worktrees: [wt({ branch: "main" })] });
+    setGithub(undefined);
+    setGitlab({
+      merge_requests: [
+        { iid: 12, web_url: "https://gitlab.example/a/b/-/merge_requests/12" },
+        { iid: 13, web_url: "https://gitlab.other/a/b/-/merge_requests/13" },
+      ],
+      tracked_merge_requests: [
+        { number: 12, url: "https://gitlab.example/a/b/-/merge_requests/12" },
+      ],
+    });
+    const { result } = run();
+    expect(result.current.mrCount).toBe(2);
+    expect(result.current.mrNumber).toBe(12);
+  });
+
+  it("refresh() refetches worktrees and both review providers", () => {
     const wtRefetch = vi.fn();
     const ghRefetch = vi.fn();
+    const glRefetch = vi.fn();
     setWorktrees(
       { status: "ok", worktrees: [wt({ branch: "main" })] },
       { isFetching: true, refetch: wtRefetch },
     );
     useGithubInfoMock.mockReturnValue({ data: undefined, isFetching: false, refetch: ghRefetch });
+    setGitlab(undefined, glRefetch);
     const { result } = run();
     expect(result.current.refreshing).toBe(true);
     result.current.refresh();
     expect(wtRefetch).toHaveBeenCalledTimes(1);
     expect(ghRefetch).toHaveBeenCalledTimes(1);
+    expect(glRefetch).toHaveBeenCalledTimes(1);
   });
 });

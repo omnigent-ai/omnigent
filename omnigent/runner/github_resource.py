@@ -843,7 +843,7 @@ def github_info(
         return _workspace_github_info(root)
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
-    entries = registry.list()
+    entries = [entry for entry in registry.list() if entry.provider == "github"]
     if pr_url:
         info = _reference_info(root, _selected_pr(session_id, pr_url))
     elif entries:
@@ -869,8 +869,10 @@ def github_info(
 
 
 def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
-    """Attach a verified PR or persist an explicit exclusion."""
+    """Attach a verified GitHub PR or persist an explicit exclusion."""
     reference = PullRequestRef.from_url(url)
+    if reference.provider != "github":
+        raise ValueError("Expected a GitHub pull request URL")
     registry = SessionPrRegistry(session_id)
     try:
         if action == "attach":

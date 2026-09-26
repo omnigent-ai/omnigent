@@ -179,7 +179,7 @@ import {
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
-import { useOpenGithubTab } from "@/shell/FileViewerContext";
+import { useOpenGithubTab, useOpenGitlabTab } from "@/shell/FileViewerContext";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
@@ -2606,6 +2606,7 @@ function ComposerImpl(
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
   const openComposerGithubTab = useOpenGithubTab();
+  const openComposerGitlabTab = useOpenGitlabTab();
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
   const devinPermissionControl = modelPickerKind === "devin";
@@ -3618,7 +3619,7 @@ function ComposerImpl(
             branch={composerGit.branch}
             branchState={composerGit.branchState}
             creationBranch={composerGit.creationBranch}
-            showWorktree={composerGit.isWorktree === true}
+            showWorktree={composerGit.repoDetected}
           />
           <ComposerPrLink
             state={composerGit.githubState}
@@ -3626,6 +3627,14 @@ function ComposerImpl(
             prNumber={composerGit.prNumber}
             onOpen={openComposerGithubTab}
           />
+          <ComposerPrLink
+            provider="gitlab"
+            state={composerGit.gitlabState}
+            prCount={composerGit.mrCount}
+            prNumber={composerGit.mrNumber}
+            onOpen={openComposerGitlabTab}
+          />
+
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
             <div
               data-testid="composer-task-indicators"
