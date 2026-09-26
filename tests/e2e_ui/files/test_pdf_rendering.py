@@ -167,3 +167,49 @@ def test_pdf_zoom_percentage_resets(
     reset.click()
     expect(reset).to_have_text("100%")
     expect(reset).to_be_disabled()
+
+
+def test_pdf_worker_failure_keeps_session_and_download_available(
+    page: Page,
+    seeded_pdf_session: tuple[str, str, str],
+) -> None:
+    """A rejected PDF module stays inside the preview without losing the session."""
+    base_url, session_id, _file_path = seeded_pdf_session
+    page.add_init_script("""
+        const NativeWorker = window.Worker;
+        window.Worker = class extends NativeWorker {
+            constructor(url, options) {
+                if (String(url).includes('pdf.worker')) {
+                    window.__pdfWorkerBlocked = true;
+                    throw new DOMException('PDF worker blocked for this test', 'SecurityError');
+                }
+                super(url, options);
+            }
+        };
+    """)
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(_PDF_FILE_PATH)}\b"))
+    expect(file_button).to_be_visible(timeout=30_000)
+    file_button.click()
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(file_viewer.get_by_role("alert")).to_contain_text(
+        "Could not preview this PDF", timeout=30_000
+    )
+    assert page.evaluate("window.__pdfWorkerBlocked") is True
+    assert f"/c/{session_id}" in page.url
+
+    settings = file_viewer.get_by_role("button", name="View settings", exact=True)
+    if settings.is_visible():
+        settings.click()
+    else:
+        file_viewer.get_by_role("button", name="More actions", exact=True).click()
+    with page.expect_download() as download_info:
+        page.get_by_role("menuitem", name="Download file", exact=True).click()
+    download = download_info.value
+    assert download.failure() is None
+    assert download.suggested_filename == _PDF_FILE_PATH
+    expect(file_viewer.get_by_role("alert")).to_be_visible()
+
+    composer = page.get_by_placeholder("Send a message…")
+    composer.fill("The conversation still works after the PDF preview failed.")
+    expect(composer).to_have_value("The conversation still works after the PDF preview failed.")

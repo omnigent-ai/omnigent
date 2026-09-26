@@ -81,6 +81,7 @@ import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
+import { PdfPreviewBoundary } from "./PdfPreviewBoundary";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
 // actually viewed, so the initial bundle and markdown/preview paths don't pay
@@ -778,21 +779,23 @@ export function CodeViewer({
   }
   if (fileQuery.data && isPdfFile(path, fileQuery.data.content_type)) {
     return (
-      <Suspense
-        fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-            Loading…
-          </div>
-        }
-      >
-        <PdfViewer
-          data={fileQuery.data}
-          conversationId={conversationId}
-          comments={previewComments}
-          activeSelection={activeSelection}
-          onSetActiveSelection={onSetActiveSelection}
-        />
-      </Suspense>
+      <PdfPreviewBoundary key={JSON.stringify([conversationId, path])}>
+        <Suspense
+          fallback={
+            <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+              Loading…
+            </div>
+          }
+        >
+          <PdfViewer
+            data={fileQuery.data}
+            conversationId={conversationId}
+            comments={previewComments}
+            activeSelection={activeSelection}
+            onSetActiveSelection={onSetActiveSelection}
+          />
+        </Suspense>
+      </PdfPreviewBoundary>
     );
   }
   if (fileQuery.data && isModelFile(path, fileQuery.data.content_type)) {
