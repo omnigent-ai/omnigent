@@ -26,6 +26,7 @@ from urllib.parse import quote
 
 import httpx
 
+from omnigent.harnesses.opencode_native.bridge import update_active_message_id
 from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeEvent,
@@ -157,6 +158,17 @@ def _event_session_id(event: OpenCodeEvent) -> str | None:
     form = event.data.get("form")
     if isinstance(form, Mapping):
         return _str_field(form, "sessionID")
+    return None
+
+
+def _model_ref(value: object) -> str | None:
+    """Render a v2 ``Model.Ref`` ``{id, providerID, variant?}`` as ``provider/id``."""
+    if not isinstance(value, Mapping):
+        return None
+    provider = value.get("providerID")
+    model_id = value.get("id")
+    if isinstance(provider, str) and provider and isinstance(model_id, str) and model_id:
+        return f"{provider}/{model_id}"
     return None
 
 
@@ -329,6 +341,103 @@ class OpenCodeNativeForwarder:
             )
             return None
 
+    async def _post_status(
+        self, turn: _SessionTurn, status: str, *, extra: _JsonMapping | None = None
+    ) -> None:
+        """Publish a coarse session status edge into *turn*'s conversation."""
+        data: _JsonObject = {"status": status}
+        if extra:
+            data.update(extra)
+        await self._post_event(_EXTERNAL_STATUS, data, conversation_id=turn.conversation_id)
+
+    def _response_id(self, turn: _SessionTurn, message_id: str | None) -> str:
+        """Per-turn ``response_id``: the running edge's id, else the message id."""
+        return turn.running_response_id or message_id or turn.session_id
+
+    async def _begin_turn_if_needed(self, turn: _SessionTurn) -> None:
+        """Emit the turn's id-bearing ``running`` edge once, when the id is known.
+
+        ``session.execution.started`` / ``session.status busy`` open the turn
+        before ``session.step.started`` supplies the assistant message id, so
+        the edge is deferred until that id exists; the mirrored items carry
+        the same id, which lets the web render in-flight tool calls live.
+        """
+        turn.turn_active = True
+        if turn.running_response_id is None and turn.assistant_message_id is not None:
+            turn.running_response_id = turn.assistant_message_id
+            await self._post_status(
+                turn, _STATUS_RUNNING, extra={"response_id": turn.running_response_id}
+            )
+
+    async def _end_turn(
+        self,
+        turn: _SessionTurn,
+        *,
+        status: str = _STATUS_IDLE,
+        extra: _JsonMapping | None = None,
+    ) -> None:
+        """Post the terminal edge stamped with the turn's id and reset per-turn state."""
+        turn.turn_active = False
+        turn.delta_index.clear()
+        turn.reasoning_started.clear()
+        turn.tool_output.clear()
+        turn.retry_label = None
+        terminal_id = turn.running_response_id or turn.assistant_message_id
+        merged: _JsonObject = {"response_id": terminal_id or turn.session_id}
+        if extra:
+            merged.update(extra)
+        if self._bridge_dir is not None and self._is_root(turn):
+            update_active_message_id(self._bridge_dir, None, status="idle")
+        await self._post_status(turn, status, extra=merged)
+        turn.assistant_message_id = None
+        turn.running_response_id = None
+
+    async def _finish_turn(self, turn: _SessionTurn) -> None:
+        """End an active turn as idle; a second terminal signal is a no-op."""
+        if not turn.turn_active:
+            return
+        await self._end_turn(turn)
+
+    async def _on_execution_started(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.execution.started`` — open the turn."""
+        turn = await self._active_turn(event)
+        if turn is not None:
+            await self._begin_turn_if_needed(turn)
+
+    async def _on_execution_succeeded(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.execution.succeeded`` — flush, usage, idle."""
+        turn = await self._active_turn(event)
+        if turn is not None:
+            await self._finish_turn(turn)
+
+    async def _on_session_status(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.status {busy|idle}``."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        status = event.data.get("status")
+        if not isinstance(status, Mapping):
+            return
+        status_type = status.get("type")
+        if status_type == "busy":
+            await self._begin_turn_if_needed(turn)
+        elif status_type == "idle":
+            await self._finish_turn(turn)
+
+    async def _on_step_started(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.step.started`` — record the assistant id and model."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        message_id = _str_field(event.data, "assistantMessageID")
+        if message_id is None:
+            return
+        turn.assistant_message_id = message_id
+        turn.step_model = _model_ref(event.data.get("model"))
+        if self._is_root(turn) and self._bridge_dir is not None:
+            update_active_message_id(self._bridge_dir, message_id, status="busy")
+        await self._begin_turn_if_needed(turn)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -354,4 +463,9 @@ def opencode_tool_output_text(state: _JsonMapping) -> str:
 # Event type -> handler. Keys are v2 ``/api/event`` ``type`` discriminators
 # (packages/schema/src/session-event.ts, session-status-event.ts,
 # permission.ts, form.ts in OpenCode v2.0.18).
-_HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitable[None]]] = {}
+_HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitable[None]]] = {
+    "session.execution.started": OpenCodeNativeForwarder._on_execution_started,
+    "session.execution.succeeded": OpenCodeNativeForwarder._on_execution_succeeded,
+    "session.status": OpenCodeNativeForwarder._on_session_status,
+    "session.step.started": OpenCodeNativeForwarder._on_step_started,
+}

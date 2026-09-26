@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -237,3 +238,110 @@ async def test_run_reconnects_until_cap() -> None:
     finally:
         fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
     assert calls["n"] == 4  # initial + 3 reconnects
+
+
+# --- turn lifecycle ---------------------------------------------------------
+
+
+async def test_lifecycle_emits_running_then_idle() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.execution.started"))
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_event("session.execution.succeeded"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+
+
+async def test_running_edge_deferred_until_step_started() -> None:
+    """``session.status busy`` opens the turn; the edge waits for the assistant id."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    assert _status_edges(server.posts) == []
+    await fwd.handle_event(_step_started("msg_1"))
+    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
+    assert running == [{"status": "running", "response_id": "msg_1"}]
+
+
+async def test_multi_step_turn_keeps_first_response_id() -> None:
+    """Each step has its own assistant id; the turn keeps the id that went live."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.execution.started"))
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_step_started("msg_2"))
+    await fwd.handle_event(_event("session.execution.succeeded"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+
+
+async def test_second_turn_gets_its_own_running_response_id() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    for msg in ("msg_a", "msg_b"):
+        await fwd.handle_event(_event("session.execution.started"))
+        await fwd.handle_event(_step_started(msg))
+        await fwd.handle_event(_event("session.execution.succeeded"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_a"),
+        ("idle", "msg_a"),
+        ("running", "msg_b"),
+        ("idle", "msg_b"),
+    ]
+
+
+async def test_turn_without_step_idles_with_session_fallback() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    await fwd.handle_event(_event("session.status", status={"type": "idle"}))
+    edges = _status_edges(server.posts)
+    assert edges == [{"status": "idle", "response_id": _SESSION}]
+
+
+async def test_status_idle_after_execution_succeeded_posts_one_idle() -> None:
+    """v2 emits both ``execution.succeeded`` and ``status idle``; idle posts once."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.execution.started"))
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_event("session.execution.succeeded"))
+    await fwd.handle_event(_event("session.status", status={"type": "idle"}))
+    assert [e["status"] for e in _status_edges(server.posts)] == ["running", "idle"]
+
+
+async def test_step_started_records_active_message_id_in_bridge(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    calls: list[tuple[str | None, str]] = []
+
+    def _record(bridge_dir: Path, message_id: str | None, *, status: str) -> None:
+        calls.append((message_id, status))
+
+    monkeypatch.setattr(fwd_mod, "update_active_message_id", _record)
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_event("session.execution.succeeded"))
+    assert calls == [("msg_1", "busy"), (None, "idle")]
+
+
+async def test_fixture_turn_opens_and_closes() -> None:
+    """The captured execution/step edges drive one running + one idle edge."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    step = _fixture("session.step.started")
+    await fwd.handle_event(_fixture("session.execution.started"))
+    await fwd.handle_event(step)
+    await fwd.handle_event(_fixture("session.execution.succeeded"))
+    edges = _status_edges(server.posts)
+    assert [e["status"] for e in edges] == ["running", "idle"]
+    assert edges[0]["response_id"] == step.data["assistantMessageID"]
