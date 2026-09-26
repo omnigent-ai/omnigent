@@ -1607,8 +1607,10 @@ async def _auto_create_opencode_terminal(
     from omnigent.harnesses.opencode_native.bridge import (
         OpenCodeNativeBridgeState,
         clear_bridge_state,
+        connect_env_provider_keys,
         prepare_bridge_dir,
         seed_opencode_auth,
+        seeded_provider_ids,
         write_bridge_state,
         write_opencode_policy_plugin,
         write_relay_bridge_config,
@@ -1801,6 +1803,17 @@ async def _auto_create_opencode_terminal(
     try:
         client = server.client()
         try:
+            # Keys that live only in the runner's environment reach the
+            # per-session server through its integration API (best effort).
+            try:
+                await connect_env_provider_keys(client, stored=seeded_provider_ids(bridge_dir))
+            except Exception:  # noqa: BLE001 - never block the launch on a key hand-off.
+                _logger.warning(
+                    "opencode launch: env provider key hand-off failed for %s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
             opencode_session_id = await _resolve_opencode_session(
                 client=client,
                 launch_config=launch_config,

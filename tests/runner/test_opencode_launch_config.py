@@ -27,6 +27,36 @@ class _FakeServer:
         raise _StopBeforeBoot
 
 
+class _StopAtSessionResolve(Exception):
+    pass
+
+
+class _FakeOpenCodeClient:
+    def __init__(self) -> None:
+        self.aclosed = False
+
+    async def aclose(self) -> None:
+        self.aclosed = True
+
+
+class _FakeStartedServer:
+    """A fake server whose ``start()`` succeeds so the launch reaches ``client()``."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.closed = False
+        self._client = _FakeOpenCodeClient()
+
+    async def start(self) -> None:
+        return None
+
+    def client(self) -> _FakeOpenCodeClient:
+        return self._client
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 @pytest.fixture
 def launch_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
@@ -124,3 +154,59 @@ async def test_launch_adopts_managed_connect_providers_plugins_and_model(
     assert written["plugins"] == [ucode_plugin, str(bridge_dir / "omnigent-policy")]
     assert written["model"] == "databricks-ws/served-model"
     assert written["permissions"] == [{"action": "*", "resource": "*", "effect": "ask"}]
+
+
+async def test_launch_connects_env_provider_keys_before_resolving_session(
+    launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_server, "OpenCodeNativeServer", _FakeStartedServer)
+    monkeypatch.setattr(bridge, "seeded_provider_ids", lambda bridge_dir: frozenset({"anthropic"}))
+
+    calls: list[tuple[Any, frozenset[str]]] = []
+    resolve_calls: list[str] = []
+
+    async def _fake_connect_env_provider_keys(client: Any, *, stored: Any = ()) -> list[str]:
+        calls.append((client, frozenset(stored)))
+        return []
+
+    async def _fake_resolve(**kwargs: Any) -> str:
+        resolve_calls.append("reached")
+        raise _StopAtSessionResolve
+
+    monkeypatch.setattr(bridge, "connect_env_provider_keys", _fake_connect_env_provider_keys)
+    monkeypatch.setattr(orchestration, "_resolve_opencode_session", _fake_resolve)
+
+    with pytest.raises(_StopAtSessionResolve):
+        await orchestration._auto_create_opencode_terminal(
+            "conv_launch", cast(Any, object()), lambda *a: None
+        )
+
+    assert len(calls) == 1
+    assert calls[0][1] == frozenset({"anthropic"})
+    assert resolve_calls == ["reached"]
+
+
+async def test_launch_survives_env_provider_key_hand_off_failure(
+    launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_server, "OpenCodeNativeServer", _FakeStartedServer)
+    monkeypatch.setattr(bridge, "seeded_provider_ids", lambda bridge_dir: frozenset())
+
+    resolve_calls: list[str] = []
+
+    async def _fake_connect_env_provider_keys(client: Any, *, stored: Any = ()) -> list[str]:
+        raise RuntimeError("boom")
+
+    async def _fake_resolve(**kwargs: Any) -> str:
+        resolve_calls.append("reached")
+        raise _StopAtSessionResolve
+
+    monkeypatch.setattr(bridge, "connect_env_provider_keys", _fake_connect_env_provider_keys)
+    monkeypatch.setattr(orchestration, "_resolve_opencode_session", _fake_resolve)
+
+    with pytest.raises(_StopAtSessionResolve):
+        await orchestration._auto_create_opencode_terminal(
+            "conv_launch", cast(Any, object()), lambda *a: None
+        )
+
+    assert resolve_calls == ["reached"]
