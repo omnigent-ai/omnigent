@@ -377,6 +377,7 @@ class OpenCodeNativeForwarder:
         extra: _JsonMapping | None = None,
     ) -> None:
         """Post the terminal edge stamped with the turn's id and reset per-turn state."""
+        await self._flush_pending_text(turn)
         turn.turn_active = False
         turn.delta_index.clear()
         turn.reasoning_started.clear()
@@ -438,6 +439,94 @@ class OpenCodeNativeForwarder:
             update_active_message_id(self._bridge_dir, message_id, status="busy")
         await self._begin_turn_if_needed(turn)
 
+    @staticmethod
+    def _stream_id(message_id: str, kind: str, ordinal: int) -> str:
+        """Live-preview id shared by text deltas and the item that retires them."""
+        return f"opencode:{message_id}:{kind}:{ordinal}"
+
+    async def _post_assistant_text(
+        self, turn: _SessionTurn, text: str, *, message_id: str | None, stream_id: str
+    ) -> None:
+        """Persist a finalized assistant message that retires its live preview."""
+        await self._post_event(
+            _EXTERNAL_ITEM,
+            {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": _AGENT_NAME,
+                    "content": [{"type": "output_text", "text": text}],
+                },
+                "response_id": self._response_id(turn, message_id),
+                "message_id": stream_id,
+            },
+            conversation_id=turn.conversation_id,
+        )
+
+    async def _on_text_delta(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.text.delta`` — stream a live assistant preview chunk."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        message_id = _str_field(event.data, "assistantMessageID")
+        ordinal = _int_field(event.data, "ordinal")
+        delta = event.data.get("delta")
+        if message_id is None or ordinal is None or not isinstance(delta, str) or not delta:
+            return
+        key = (message_id, ordinal)
+        await self._begin_turn_if_needed(turn)
+        index = turn.delta_index.get(key, 0)
+        turn.delta_index[key] = index + 1
+        turn.streamed_text[key] = turn.streamed_text.get(key, "") + delta
+        await self._post_event(
+            _EXTERNAL_OUTPUT_TEXT_DELTA,
+            {
+                "delta": delta,
+                "message_id": self._stream_id(message_id, "text", ordinal),
+                "index": index,
+                "final": False,
+            },
+            conversation_id=turn.conversation_id,
+        )
+
+    async def _on_text_ended(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.text.ended`` — buffer the full text for the step-end flush."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        message_id = _str_field(event.data, "assistantMessageID")
+        ordinal = _int_field(event.data, "ordinal")
+        text = event.data.get("text")
+        if message_id is None or ordinal is None or not isinstance(text, str):
+            return
+        turn.streamed_text.pop((message_id, ordinal), None)
+        turn.pending_text[(message_id, ordinal)] = text
+
+    async def _flush_pending_text(self, turn: _SessionTurn) -> None:
+        """Persist buffered assistant text as durable chat items, once each."""
+        # Ordinal order, not arrival order: text around a tool call must read in sequence.
+        for (message_id, ordinal), text in sorted(
+            turn.pending_text.items(), key=lambda item: item[0][1]
+        ):
+            turn.pending_text.pop((message_id, ordinal), None)
+            if not text:
+                continue
+            if not self.state.mark(self._key("text-final", message_id, str(ordinal))):
+                continue
+            await self._post_assistant_text(
+                turn,
+                text,
+                message_id=message_id,
+                stream_id=self._stream_id(message_id, "text", ordinal),
+            )
+
+    async def _on_step_ended(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.step.ended`` — flush the step's buffered text."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        await self._flush_pending_text(turn)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -468,4 +557,7 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.execution.succeeded": OpenCodeNativeForwarder._on_execution_succeeded,
     "session.status": OpenCodeNativeForwarder._on_session_status,
     "session.step.started": OpenCodeNativeForwarder._on_step_started,
+    "session.text.delta": OpenCodeNativeForwarder._on_text_delta,
+    "session.text.ended": OpenCodeNativeForwarder._on_text_ended,
+    "session.step.ended": OpenCodeNativeForwarder._on_step_ended,
 }

@@ -345,3 +345,106 @@ async def test_fixture_turn_opens_and_closes() -> None:
     edges = _status_edges(server.posts)
     assert [e["status"] for e in edges] == ["running", "idle"]
     assert edges[0]["response_id"] == step.data["assistantMessageID"]
+
+
+# --- text streaming ---------------------------------------------------------
+
+
+async def test_text_delta_streams_live_preview_chunks() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    for chunk in ("Hel", "lo"):
+        await fwd.handle_event(
+            _event("session.text.delta", assistantMessageID="msg_1", ordinal=0, delta=chunk)
+        )
+    deltas = _datas(server.posts, "external_output_text_delta")
+    assert deltas == [
+        {"delta": "Hel", "message_id": "opencode:msg_1:text:0", "index": 0, "final": False},
+        {"delta": "lo", "message_id": "opencode:msg_1:text:0", "index": 1, "final": False},
+    ]
+
+
+async def test_text_ended_flushes_on_step_end_and_retires_preview() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event("session.text.delta", assistantMessageID="msg_1", ordinal=0, delta="Hi")
+    )
+    await fwd.handle_event(
+        _event("session.text.ended", assistantMessageID="msg_1", ordinal=0, text="Hi there")
+    )
+    assert _items(server.posts) == []  # buffered until the step ends
+    await fwd.handle_event(_step_ended("msg_1"))
+    items = _items(server.posts)
+    assert len(items) == 1
+    assert items[0]["item_data"]["role"] == "assistant"
+    assert items[0]["item_data"]["content"] == [{"type": "output_text", "text": "Hi there"}]
+    assert items[0]["response_id"] == "msg_1"
+    # Same id as the deltas, so the server retires the live preview.
+    assert items[0]["message_id"] == "opencode:msg_1:text:0"
+
+
+async def test_text_flush_dedupes_repeated_step_end() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    ended = _event("session.text.ended", assistantMessageID="msg_1", ordinal=0, text="once")
+    await fwd.handle_event(ended)
+    await fwd.handle_event(_step_ended("msg_1"))
+    await fwd.handle_event(ended)
+    await fwd.handle_event(_step_ended("msg_1"))
+    assert len(_items(server.posts)) == 1
+
+
+async def test_empty_text_is_not_persisted() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event("session.text.ended", assistantMessageID="msg_1", ordinal=0, text="")
+    )
+    await fwd.handle_event(_step_ended("msg_1"))
+    assert _items(server.posts) == []
+
+
+async def test_two_text_ordinals_flush_in_order() -> None:
+    """Text before and after a tool call (ordinals 0 and 1) become two items, in order."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event("session.text.ended", assistantMessageID="msg_1", ordinal=1, text="after")
+    )
+    await fwd.handle_event(
+        _event("session.text.ended", assistantMessageID="msg_1", ordinal=0, text="before")
+    )
+    await fwd.handle_event(_step_ended("msg_1"))
+    items = _items(server.posts)
+    assert [i["item_data"]["content"][0]["text"] for i in items] == ["before", "after"]
+    assert [i["message_id"] for i in items] == [
+        "opencode:msg_1:text:0",
+        "opencode:msg_1:text:1",
+    ]
+
+
+async def test_fixture_text_deltas_and_final_text_share_stream_id() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    ended = events_of_type("session.text.ended")[0]["data"]
+    message_id, ordinal = ended["assistantMessageID"], ended["ordinal"]
+    await fwd.handle_event(_fixture("session.step.started"))
+    for raw in events_of_type("session.text.delta"):
+        data = raw["data"]
+        if data["assistantMessageID"] == message_id and data["ordinal"] == ordinal:
+            await fwd.handle_event(_to_event(raw))
+    await fwd.handle_event(_fixture("session.text.ended"))
+    await fwd.handle_event(_fixture("session.step.ended"))
+    stream_id = f"opencode:{message_id}:text:{ordinal}"
+    deltas = _datas(server.posts, "external_output_text_delta")
+    assert deltas and {d["message_id"] for d in deltas} == {stream_id}
+    assert "".join(d["delta"] for d in deltas) == ended["text"]
+    item = next(i for i in _items(server.posts) if i["item_type"] == "message")
+    assert item["message_id"] == stream_id
+    assert item["item_data"]["content"][0]["text"] == ended["text"]
