@@ -485,6 +485,10 @@ def register_agent_routes(
             return response
 
         if method == "tools/call":
+            from omnigent.server.mcp_identity import mcp_policy_actor
+
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,
@@ -492,7 +496,8 @@ def register_agent_routes(
                 conversation_store,
                 agent_store,
                 runner_router,
-                actor=_build_actor(user_id),
+                actor=actor,
+                credential_user=user_id,
                 request=request,
             )
 

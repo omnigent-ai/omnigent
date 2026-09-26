@@ -10070,6 +10070,7 @@ async def _handle_mcp_tools_call(
     actor: dict[str, str] | None = None,
     request: Request | None = None,
     execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    credential_user: str | None = None,
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -10106,9 +10107,10 @@ async def _handle_mcp_tools_call(
     :param agent_store: Store for agent lookup.
     :param runner_router: Router used to get a tunneled client pointed at
         the session's runner. ``None`` returns an error response.
-    :param actor: Authenticated principal, e.g.
-        ``{"run_as": "alice@example.com"}``. ``None`` when
-        identity is unknown.
+    :param actor: Policy principal: initiating user for a verified runner,
+        authenticated caller for direct calls, or ``None`` when unknown.
+    :param credential_user: Authenticated caller whose registry grant is used;
+        independent of the initiating policy actor.
     :returns: A JSON-RPC 2.0 response carrying the tool result as MCP
         ``content`` blocks, an ``InputRequiredResult`` on ASK, or an
         error response when the call is denied, the runner is
@@ -10219,7 +10221,7 @@ async def _handle_mcp_tools_call(
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
             _pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
-            identity = (session_id, namespaced_name, (actor or {}).get("run_as"))
+            identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
             if _pending is not None and _pending.mcp_call_identity not in (None, identity):
                 return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
             _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
@@ -10296,7 +10298,12 @@ async def _handle_mcp_tools_call(
                 from_mcp=True,
                 reviewed_arguments=arguments,
                 transformed_arguments=cast("dict[str, object] | None", call_result.data),
-                mcp_call_identity=(session_id, namespaced_name, (actor or {}).get("run_as")),
+                mcp_call_identity=(
+                    session_id,
+                    namespaced_name,
+                    (actor or {}).get("run_as"),
+                    credential_user,
+                ),
             )
             # The client carries identifiers; reviewed arguments stay on the server.
             request_state_payload: dict[str, Any] = {
@@ -10356,7 +10363,7 @@ async def _handle_mcp_tools_call(
             registry_config,
             namespaced_name,
             arguments,
-            actor,
+            credential_user,
         )
     else:
         # ── Execute on the runner via WS tunnel ──────────────────────────

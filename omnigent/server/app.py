@@ -1834,6 +1834,7 @@ def create_app(
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
+    app.state.runner_tunnel_tokens = runner_tunnel_tokens
     if host_store is not None:
         host_registry.launch_authorizer = partial(
             host_store.admit_launch, require_account_owner=runner_account_store is not None

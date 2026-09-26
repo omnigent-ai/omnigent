@@ -102,7 +102,10 @@ sequenceDiagram
 
 Launch waits while OAuth is pending. Existing accounts are reused. Bearer-token
 services must be connected in Settings first. JSON and multipart creation accept
-the selected IDs; a shared agent template is not modified. Unchecking removes
+the selected IDs; a shared agent template is not modified. Operator-template
+environment fields are resolved into the session copy at launch; uploads stay
+unexpanded. Catalog responses use cursor pages of at most 100 services, with
+credential lookups limited to the current page. Unchecking removes
 the session selection without disconnecting the account. Changes to an existing
 session require its runner to reload, as the UI indicates.
 
@@ -126,7 +129,7 @@ sequenceDiagram
   G->>P: Existing tool-call policy / approval
   P-->>G: Allow, otherwise stop here
   G->>G: Check service access and registry/session tool allowlists
-  G->>C: Resolve current user's credential
+  G->>C: Resolve authenticated caller credential
   G->>M: Initialize and call tool with upstream access token
   M-->>G: Result or failure
   G->>P: Existing tool-result policy on returned results
@@ -159,7 +162,10 @@ prove that a write did not execute.
 requires `X-Omnigent-Session-Id` and authenticates the caller before checking edit
 access, session selection, and the authenticated caller's service/tool allowlists.
 The same caller owns the upstream credential, including on the legacy route.
-Session sharing and historical turn labels do not delegate account access.
+A managed runner authenticates as the session owner, so editor-triggered turns
+use that owner's connected account. The runner's binding token lets the policy
+adapter evaluate the server-recorded initiating user instead. Direct requests
+without runner proof use the caller for both purposes; body actor fields are ignored.
 The header is a context reference, not a credential. Sessionless calls are not
 supported by this adapter. No separate policy service needs to be deployed.
 
@@ -184,9 +190,39 @@ flowchart LR
   B <-->|Injected partner client| G[Proprietary enterprise gateway]
 ```
 
+For an editor's turn in an owner-authenticated runner:
+
+```mermaid
+sequenceDiagram
+  participant B as Editor: browser
+  participant S as Server: session API
+  participant R as Harness and runner
+  participant P as Server: MCP policy adapter
+  participant C as Server: credential store
+  participant U as Upstream MCP service
+  B->>S: Submit turn as editor
+  S->>S: Record initiating actor
+  S->>R: Forward turn
+  R->>P: Tool call, owner auth, runner binding proof
+  P->>P: Check editor policy
+  alt Denied
+    P-->>R: Policy error, no upstream execution
+  else Allowed
+    P->>C: Resolve owner's connected account
+    P->>U: Approved call
+    U-->>P: Result
+    P->>P: Check editor result policy
+    P-->>R: Filtered result
+  end
+```
+
+The existing label records sequential turn attribution, not an immutable turn
+identity. Queued messages from different editors can overtake that label; exact
+per-turn binding and per-editor credential delegation remain future work.
+
 The adapter reuses the existing policy handler. Before execution, request policies
 can deny, transform arguments, or require approval. Approval retains the reviewed
-arguments and session/tool/actor identity server-side. After execution, response
+arguments and session/tool/policy-actor/credential-user identity server-side. After execution, response
 policies can transform or suppress output. Result-phase ASK withholds output;
 interactive result review is not implemented. Suppression does not undo an upstream
 side effect. These policies cover traffic through Omnigent's gateway; independently
@@ -271,6 +307,10 @@ sequenceDiagram
   end
   R-->>G: Upstream access token, server-side only
 ```
+
+Refresh locks remain alive while a holder or waiter needs them, then are released
+from the registry. Invalid provider responses return credential-safe errors;
+callbacks redirect to sign-in error so the user can start a new flow.
 
 The credential store supplies persistence and encryption; the resolver owns the
 provider's refresh protocol. Generic OAuth supports explicit endpoints, PKCE,

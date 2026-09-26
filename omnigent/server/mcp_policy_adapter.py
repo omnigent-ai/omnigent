@@ -11,6 +11,7 @@ from fastapi import HTTPException, Request, Response
 from omnigent.entities import Conversation
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.mcp_gateway import gateway_backend
+from omnigent.server.mcp_identity import mcp_policy_actor
 from omnigent.server.mcp_registry import McpRegistry, McpService
 from omnigent.server.registry_gateway import execute_registry_tool, registry_user
 from omnigent.server.routes._auth_helpers import require_access, require_user
@@ -27,7 +28,8 @@ class McpPolicyContext:
     conversation: Conversation
     config: MCPServerConfig
     service: McpService
-    user_id: str
+    credential_user: str
+    policy_actor: dict[str, str] | None
 
 
 class McpPolicyAdapter:
@@ -78,13 +80,15 @@ class McpPolicyAdapter:
             service = registry.service(service_id, user)
         except ConnectionError as exc:
             raise HTTPException(403, str(exc)) from None
-        return McpPolicyContext(conv, config, service, user)
+        return McpPolicyContext(
+            conv, config, service, user, mcp_policy_actor(request, conv, caller)
+        )
 
     async def list_tools(
         self, request: Request, context: McpPolicyContext
     ) -> list[dict[str, Any]]:
         backend = gateway_backend(request.app.state.mcp_registry, request.app.state)
-        tools = await backend.list_tools(context.service, context.user_id)
+        tools = await backend.list_tools(context.service, context.credential_user)
         return [
             t.model_dump(by_alias=True, exclude_none=True)
             for t in tools
@@ -100,11 +104,15 @@ class McpPolicyAdapter:
         params: dict[str, Any],
     ) -> Response:
         name = f"{context.service.id}__{params['name']}"
-        actor = {"run_as": context.user_id}
 
         async def execute(arguments: dict[str, Any]) -> dict[str, Any]:
             return await execute_registry_tool(
-                request, context.conversation, context.config, name, arguments, actor
+                request,
+                context.conversation,
+                context.config,
+                name,
+                arguments,
+                context.credential_user,
             )
 
         return await _handle_mcp_tools_call(
@@ -114,7 +122,8 @@ class McpPolicyAdapter:
             self.conversation_store,
             self.agent_store,
             None,
-            actor=actor,
+            actor=context.policy_actor,
+            credential_user=context.credential_user,
             request=request,
             execute_tool=execute,
         )
