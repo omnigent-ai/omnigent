@@ -723,6 +723,11 @@ def _install_csi_u_sequences() -> None:
     3. Special keys (Escape, Backspace, Delete, ``Ctrl+M``,
        Shift+Enter → ``F20``, focus-in/out markers).
 
+    Also covers Ctrl+Shift+letter, Ctrl+punctuation,
+    Alt+printable, Alt+Shift+letter, and Ctrl+Alt(+Shift)+letter,
+    plus a final ``Keys.Ignore`` fallback for every other modified
+    combo so nothing leaks as literal text.
+
     Idempotent — guarded by :data:`_CSI_U_INSTALLED` so
     repeated :class:`TerminalHost` construction in the same
     process doesn't re-mutate the parser dict.
@@ -769,6 +774,11 @@ def _install_csi_u_sequences() -> None:
     for cp, key in _ctrl_codepoints.items():
         ANSI_SEQUENCES[f"\x1b[{cp};5u"] = key
 
+    # Ctrl+letter a-z, keyed by letter so Alt+Shift/Ctrl+Alt below reuse
+    # this table. Kitty reports the base codepoint under Ctrl (e.g.
+    # Ctrl+I arrives as ``[105;5u``, not the C0 code ``[9;5u``).
+    # No "z": prompt-toolkit's built-in Ctrl+Z binding re-inserts the raw
+    # matched sequence, so 122;5u/;6u are left to the Ignore fallback.
     _ctrl_letter_keys = {
         "a": Keys.ControlA,
         "b": Keys.ControlB,
@@ -778,8 +788,11 @@ def _install_csi_u_sequences() -> None:
         "f": Keys.ControlF,
         "g": Keys.ControlG,
         "h": Keys.ControlH,
+        "i": Keys.ControlI,
+        "j": Keys.ControlJ,
         "k": Keys.ControlK,
         "l": Keys.ControlL,
+        "m": Keys.ControlM,
         "n": Keys.ControlN,
         "o": Keys.ControlO,
         "p": Keys.ControlP,
@@ -788,11 +801,30 @@ def _install_csi_u_sequences() -> None:
         "s": Keys.ControlS,
         "t": Keys.ControlT,
         "u": Keys.ControlU,
+        "v": Keys.ControlV,
         "w": Keys.ControlW,
+        "x": Keys.ControlX,
         "y": Keys.ControlY,
     }
     for ch, key in _ctrl_letter_keys.items():
         ANSI_SEQUENCES[f"\x1b[{ord(ch)};5u"] = key
+        # Ctrl+Shift+letter (;6u): xterm sends the same control byte
+        # regardless of Shift, so decode it the same as plain Ctrl+letter.
+        ANSI_SEQUENCES[f"\x1b[{ord(ch)};6u"] = key
+
+    # Ctrl+<punctuation>: unshifted keys whose legacy byte
+    # (``ord(ch) & 0x1f``) already names a prompt-toolkit key. Not
+    # extended to ``^``/``_`` since those are themselves Shift-modified
+    # on a standard layout, so their base-key codepoint wouldn't match.
+    _ctrl_punct_codepoints = {
+        0x20: Keys.ControlAt,  # Ctrl+Space
+        0x2F: Keys.ControlUnderscore,  # Ctrl+/ (emacs undo)
+        0x5B: Keys.Escape,  # Ctrl+[ (byte-identical to Escape)
+        0x5C: Keys.ControlBackslash,  # Ctrl+\
+        0x5D: Keys.ControlSquareClose,  # Ctrl+]
+    }
+    for cp, key in _ctrl_punct_codepoints.items():
+        ANSI_SEQUENCES[f"\x1b[{cp};5u"] = key
 
     # Other CSI-u sequences power users hit:
     ANSI_SEQUENCES["\x1b[27u"] = Keys.Escape
@@ -829,6 +861,39 @@ def _install_csi_u_sequences() -> None:
     # them as ignored keys so tabbing between iTerm windows/tabs is inert.
     ANSI_SEQUENCES["\x1b[I"] = Keys.Ignore  # focus in
     ANSI_SEQUENCES["\x1b[O"] = Keys.Ignore  # focus out
+
+    # Alt+<printable> (mod 3), cp 0x20-0x7E (space, "!".."~"). Legacy
+    # terminals send Alt+key as ESC + the plain char byte — two key
+    # presses — so the value is a tuple, matching how prompt-toolkit's
+    # own emacs bindings (``M-b``, ``M-f``, ...) are registered as
+    # ``("escape", "b")``. Range excludes 0x0D/0x7F, which already have
+    # more specific ``;3u`` entries above.
+    for cp in range(0x20, 0x7F):
+        ANSI_SEQUENCES[f"\x1b[{cp};3u"] = (Keys.Escape, chr(cp))
+
+    # Alt+Shift+<letter> (mod 4): Kitty reports the base codepoint even
+    # under Shift, so the shifted letter is synthesized by upper-casing.
+    # Letters only (non-letter shifted glyphs are layout-dependent, left
+    # to the Ignore fallback). Iterates a-z directly, not
+    # ``_ctrl_letter_keys`` (which omits "z"): Alt+Shift+Z is unaffected
+    # by the Ctrl+Z fallback decision above.
+    for ch in "abcdefghijklmnopqrstuvwxyz":
+        ANSI_SEQUENCES[f"\x1b[{ord(ch)};4u"] = (Keys.Escape, ch.upper())
+
+    # Ctrl+Alt(+Shift)+<letter> (mod 7 / 8): legacy Alt is an ESC prefix
+    # in front of the Ctrl+letter control byte.
+    for ch, ctrl_key in _ctrl_letter_keys.items():
+        ANSI_SEQUENCES[f"\x1b[{ord(ch)};7u"] = (Keys.Escape, ctrl_key)
+        ANSI_SEQUENCES[f"\x1b[{ord(ch)};8u"] = (Keys.Escape, ctrl_key)
+
+    # Catch-all: any other modified CSI-u combo (Super, Hyper, unbound
+    # punctuation/digit modifiers, etc.) is ignored rather than leaking
+    # as literal text. ``setdefault`` runs last so it never overrides a
+    # specific entry above.
+    _fallback_codepoints = (*range(0x20, 0x7F), 9, 13, 27, 127)
+    for mod in range(2, 17):
+        for cp in _fallback_codepoints:
+            ANSI_SEQUENCES.setdefault(f"\x1b[{cp};{mod}u", Keys.Ignore)
 
     _CSI_U_INSTALLED = True
 
