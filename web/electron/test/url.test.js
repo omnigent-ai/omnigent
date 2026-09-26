@@ -14,6 +14,8 @@ const {
   isPlainHttpRemote,
   normalizeSavedServerUrl,
   isDatabricksManagedServerUrl,
+  workspaceIdentityKey,
+  joinServerUrl,
   databricksWorkspaceUiUrl,
   expandDatabricksWorkspaceUrl,
   WORKSPACE_UI_PATH,
@@ -122,6 +124,59 @@ describe("normalizeRecentServers", () => {
 
   it("returns an empty list for a malformed setting", () => {
     assert.deepEqual(normalizeRecentServers("https://example.com"), []);
+  });
+});
+
+describe("workspaceIdentityKey", () => {
+  it("keys Databricks workspaces by origin plus a normalized organization", () => {
+    assert.equal(
+      workspaceIdentityKey("https://DBC-A.cloud.databricks.com/omnigent?view=chat&o=team%2fblue"),
+      "https://dbc-a.cloud.databricks.com?o=team%2Fblue",
+    );
+    assert.notEqual(
+      workspaceIdentityKey("https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue"),
+      workspaceIdentityKey("https://dbc-a.cloud.databricks.com/omnigent?o=other"),
+    );
+  });
+
+  it("keeps the identity guard narrow to o on Databricks workspace hosts", () => {
+    assert.equal(workspaceIdentityKey("https://example.com/path?o=team"), "https://example.com");
+    assert.equal(
+      workspaceIdentityKey("https://app.aws.databricksapps.com/?o=team"),
+      "https://app.aws.databricksapps.com",
+    );
+    assert.equal(workspaceIdentityKey("not a url"), null);
+  });
+});
+
+describe("joinServerUrl", () => {
+  it("joins mounted routes before a normalized workspace selector", () => {
+    assert.equal(
+      joinServerUrl("https://dbc-a.cloud.databricks.com/omnigent?o=team%2fblue", "/v1/me"),
+      "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=team%2Fblue",
+    );
+    assert.equal(
+      joinServerUrl(
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+        "/auth/login?ticket=one-time&o=duplicate",
+      ),
+      "https://dbc-a.cloud.databricks.com/omnigent/auth/login?o=team%2Fblue&ticket=one-time",
+    );
+  });
+
+  it("can derive an origin-root route while preserving only Databricks o", () => {
+    assert.equal(
+      joinServerUrl(
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+        "/.well-known/omnigent.json",
+        { fromOrigin: true },
+      ),
+      "https://dbc-a.cloud.databricks.com/.well-known/omnigent.json?o=team%2Fblue",
+    );
+    assert.equal(
+      joinServerUrl("https://example.com/base?o=ignored", "/v1/me"),
+      "https://example.com/base/v1/me",
+    );
   });
 });
 
@@ -325,7 +380,7 @@ describe("expandDatabricksWorkspaceUrl", () => {
       },
     );
     // Probed the root with a HEAD request.
-    assert.deepEqual(calls, [{ url: "https://ws.cloud.databricks.com/", method: "HEAD" }]);
+    assert.deepEqual(calls, [{ url: "https://ws.cloud.databricks.com/?o=123", method: "HEAD" }]);
   });
 
   it("leaves a non-Databricks root unchanged", async () => {
@@ -576,6 +631,24 @@ describe("fetchServerManifest", () => {
       async () => {
         const m = await fetchServerManifest("https://ws.example.com/omnigent");
         assert.equal(m.manifestVersion, 1);
+      },
+    );
+  });
+
+  it("preserves the Databricks organization on the manifest probe", async () => {
+    await withFetch(
+      async (url) => {
+        assert.equal(
+          url,
+          "https://dbc-a.cloud.databricks.com/.well-known/omnigent.json?o=team%2Fblue",
+        );
+        return fakeJsonResponse({ manifest_version: 1 });
+      },
+      async () => {
+        const manifest = await fetchServerManifest(
+          "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+        );
+        assert.equal(manifest.manifestVersion, 1);
       },
     );
   });

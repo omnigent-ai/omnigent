@@ -6,6 +6,7 @@ const { createRequire } = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
+const { joinServerUrl, workspaceIdentityKey } = require("../src/url");
 
 function loadMainHarness({
   settings = {},
@@ -163,6 +164,9 @@ function loadMainHarness({
     "./localhost_cors": { registerLocalhostCors: () => {} },
     "./url": {
       normalizeUrl: (url) => url,
+      normalizeRecentServers: (urls) => urls,
+      workspaceIdentityKey,
+      joinServerUrl,
       expandDatabricksWorkspaceUrl: async (url) => url,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
@@ -253,6 +257,7 @@ function loadMainHarness({
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   module.exports.testApi.windows.set(win, {
     origin: new URL(serverUrl).origin,
+    identity: workspaceIdentityKey(serverUrl),
     serverUrl,
     badgeCount: 0,
   });

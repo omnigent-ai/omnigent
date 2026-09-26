@@ -62,12 +62,23 @@ class ServerStore(
             .apply()
     }
 
+    /** The origin that owns [host]'s session cookie, if one has been recorded. */
+    fun sessionCookieOwner(host: String): String? = prefs.getString(KEY_SESSION_OWNER + host, null)
+
+    fun recordSessionCookieOwner(
+        host: String,
+        origin: String,
+    ) {
+        prefs.edit().putString(KEY_SESSION_OWNER + host, origin).apply()
+    }
+
     private fun storedServerUrl(): String? = prefs.getString(KEY_CURRENT, null)
 
     private companion object {
         const val PREFS = "ai.omnigent.android.servers"
         const val KEY_CURRENT = "current_server_url"
         const val KEY_RECENTS = "recent_server_urls"
+        const val KEY_SESSION_OWNER = "session_cookie_owner:"
         const val MAX_RECENTS = 8
 
         // 10.0.2.2 is the host loopback from the Android emulator.

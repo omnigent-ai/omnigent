@@ -16,10 +16,12 @@ describe("parseOmnigentDeepLink", () => {
   it("parses a loopback host with a port as http", () => {
     assert.deepEqual(parseOmnigentDeepLink("omnigent://localhost:8000/c/conv_abc"), {
       origin: "http://localhost:8000",
+      search: "",
       path: "/c/conv_abc",
     });
     assert.deepEqual(parseOmnigentDeepLink("omnigent://127.0.0.1:8000/c/x"), {
       origin: "http://127.0.0.1:8000",
+      search: "",
       path: "/c/x",
     });
   });
@@ -27,6 +29,7 @@ describe("parseOmnigentDeepLink", () => {
   it("parses a remote host as https", () => {
     assert.deepEqual(parseOmnigentDeepLink("omnigent://my-workspace.cloud.databricks.com/c/x"), {
       origin: "https://my-workspace.cloud.databricks.com",
+      search: "",
       path: "/c/x",
     });
   });
@@ -34,6 +37,7 @@ describe("parseOmnigentDeepLink", () => {
   it("preserves a non-default port on a remote host", () => {
     assert.deepEqual(parseOmnigentDeepLink("omnigent://example.com:8443/c/x"), {
       origin: "https://example.com:8443",
+      search: "",
       path: "/c/x",
     });
   });
@@ -41,6 +45,7 @@ describe("parseOmnigentDeepLink", () => {
   it("accepts an IPv6 loopback host as http", () => {
     assert.deepEqual(parseOmnigentDeepLink("omnigent://[::1]:8000/c/x"), {
       origin: "http://[::1]:8000",
+      search: "",
       path: "/c/x",
     });
   });
@@ -52,10 +57,20 @@ describe("parseOmnigentDeepLink", () => {
     );
   });
 
-  it("drops a query string and hash (v1 forwards only the path)", () => {
+  it("keeps the query out of origin and path but carries it through as search", () => {
     const parsed = parseOmnigentDeepLink("omnigent://localhost:8000/c/conv_abc?reply=1#frag");
     assert.equal(parsed.path, "/c/conv_abc");
     assert.equal(parsed.origin, "http://localhost:8000");
+    assert.equal(parsed.search, "?reply=1");
+  });
+
+  it("carries a Databricks ?o= workspace selector through as search", () => {
+    const parsed = parseOmnigentDeepLink("omnigent://ws.cloud.databricks.com/c/x?o=123456789");
+    assert.deepEqual(parsed, {
+      origin: "https://ws.cloud.databricks.com",
+      search: "?o=123456789",
+      path: "/c/x",
+    });
   });
 
   it("rejects a non-omnigent scheme", () => {

@@ -4,8 +4,8 @@
 // user would run by hand — `server --background/stop/status` and `host status` (the
 // long-lived `host` connection is spawned by server_manager.js, which owns its
 // lifetime). This module locates the binary, runs the short exit-quick
-// commands, and parses their `--json` output. The CLI is the single source of
-// truth for live state; nothing here is persisted.
+// commands, parses their `--json` output, and reads the CLI-compatible remote
+// auth store when a CLI login already exists.
 //
 // Unlike src/url.js this is main-process only (it needs child_process / fs),
 // so it's a plain CommonJS module — never loaded in the renderer.
@@ -21,8 +21,6 @@ const { execFile, execFileSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const yaml = require("js-yaml");
-
 const url = require("./url");
 
 /** Default timeout for the short status commands. */
@@ -56,13 +54,7 @@ function normalizeServerUrl(value) {
  * @param {string} serverUrl
  * @returns {boolean}
  */
-function isLoopbackServer(serverUrl) {
-  try {
-    return url.LOCAL_HOSTS.has(new URL(serverUrl).hostname);
-  } catch {
-    return false;
-  }
-}
+const { isLoopbackServer } = url;
 
 /**
  * True when two URLs refer to the same local server — both loopback hosts on
@@ -133,6 +125,26 @@ function stateDir() {
 
 /** Memoized machine host id (stable once generated; never cache a null). */
 let cachedHostId = null;
+let yamlParser = null;
+
+function loadYamlParser() {
+  if (yamlParser) return yamlParser;
+  try {
+    yamlParser = require("js-yaml");
+    return yamlParser;
+  } catch (error) {
+    if (
+      error?.code !== "MODULE_NOT_FOUND" ||
+      !/Cannot find module ['"]js-yaml['"]/.test(error.message)
+    ) {
+      throw error;
+    }
+    throw new Error(
+      "Reading the CLI machine identity requires js-yaml. Reinstall Omnigent Desktop or install the Electron dependencies, then retry.",
+      { cause: error },
+    );
+  }
+}
 
 /**
  * This machine's Omnigent host id (bare 32-char hex, e.g. "ab12…"), read from
@@ -152,12 +164,20 @@ let cachedHostId = null;
  */
 function localHostId() {
   if (cachedHostId) return cachedHostId;
+  let contents;
   try {
-    const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
+    contents = fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  const yaml = loadYamlParser();
+  try {
+    const parsed = yaml.load(contents);
     const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
     if (typeof id === "string" && id) cachedHostId = id.replace(/^host_/, "");
-  } catch {
-    // No config yet, or unparseable.
+  } catch (error) {
+    if (!(error instanceof yaml.YAMLException)) throw error;
   }
   return cachedHostId;
 }
@@ -249,7 +269,9 @@ async function localServerHealthy(timeoutMs = 1500) {
   if (!rec || !isPidAlive(rec.pid)) return null;
   const localUrl = `http://127.0.0.1:${rec.port}`;
   try {
-    const resp = await fetch(`${localUrl}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const resp = await fetch(url.joinServerUrl(localUrl, "/health"), {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     if (resp.ok) return { url: localUrl, pid: rec.pid, port: rec.port };
   } catch {
     // Refused / unreachable / timed out → not a healthy server we can reuse.
@@ -441,35 +463,46 @@ function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
 }
 
 /**
- * Whether the CLI holds valid stored credentials for a server — read straight
- * from `~/.omnigent/auth_tokens.json` (no subprocess), mirroring
+ * The CLI's valid stored credential entry for a server — read straight from
+ * `~/.omnigent/auth_tokens.json` (no subprocess), mirroring
  * omnigent/cli_auth.py: keyed by the trailing-slash-stripped URL, a record is
  * valid if it's a Databricks pointer (has `workspace_host`) or a non-expired
  * session token. The CLI's `state_dir()` is hardcoded to `~/.omnigent`.
  *
  * @param {string} serverUrl
- * @returns {boolean}
+ * @param {{ nowSeconds?: number }} [opts]
+ * @returns {Record<string, unknown> | null}
  */
-function serverAuthed(serverUrl) {
-  if (typeof serverUrl !== "string" || serverUrl === "") return false;
+function serverAuthEntry(serverUrl, { nowSeconds = Date.now() / 1000 } = {}) {
+  if (typeof serverUrl !== "string" || serverUrl === "") return null;
   const key = serverUrl.replace(/\/+$/, "");
   let data;
   try {
     data = JSON.parse(fs.readFileSync(path.join(stateDir(), "auth_tokens.json"), "utf8"));
   } catch {
-    return false;
+    return null;
   }
   const entry = data && typeof data === "object" ? data[key] : null;
-  if (!entry || typeof entry !== "object") return false;
+  if (!entry || typeof entry !== "object") return null;
   if (entry.auth_type === "databricks") {
-    return typeof entry.workspace_host === "string" && entry.workspace_host !== "";
+    return typeof entry.workspace_host === "string" && entry.workspace_host !== "" ? entry : null;
   }
   if (typeof entry.token === "string" && entry.token !== "") {
     // expires_at is unix seconds (cli_auth uses time.time()); treat absent as
     // non-expiring.
-    return typeof entry.expires_at === "number" ? entry.expires_at >= Date.now() / 1000 : true;
+    return typeof entry.expires_at === "number" && entry.expires_at < nowSeconds ? null : entry;
   }
-  return false;
+  return null;
+}
+
+/**
+ * Whether the CLI holds valid stored credentials for a server.
+ *
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function serverAuthed(serverUrl) {
+  return serverAuthEntry(serverUrl) !== null;
 }
 
 /**
@@ -952,21 +985,8 @@ function daemonServerUrl(record) {
  * @returns {string | null}
  */
 function bearerTokenFor(serverUrl) {
-  if (typeof serverUrl !== "string" || serverUrl === "") return null;
-  const key = serverUrl.replace(/\/+$/, "");
-  let data;
-  try {
-    data = JSON.parse(fs.readFileSync(path.join(stateDir(), "auth_tokens.json"), "utf8"));
-  } catch {
-    return null;
-  }
-  const entry = data && typeof data === "object" ? data[key] : null;
-  if (!entry || typeof entry !== "object") return null;
-  if (typeof entry.token === "string" && entry.token !== "") {
-    if (typeof entry.expires_at === "number" && entry.expires_at < Date.now() / 1000) return null;
-    return entry.token;
-  }
-  return null;
+  const entry = serverAuthEntry(serverUrl);
+  return typeof entry?.token === "string" ? entry.token : null;
 }
 
 /**
@@ -998,8 +1018,7 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
   else if (!isLoopbackServer(serverUrl))
     return { status: null, reachable: false, authMissing: true };
-  const base = serverUrl.replace(/\/+$/, "");
-  const target = `${base}/v1/hosts/${encodeURIComponent(hostId)}`;
+  const target = url.joinServerUrl(serverUrl, `/v1/hosts/${encodeURIComponent(hostId)}`);
   try {
     const resp = await fetch(target, { headers, signal: AbortSignal.timeout(timeoutMs) });
     if (!resp.ok) return { status: null, reachable: true, authMissing: false };
@@ -1043,9 +1062,8 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
   const headers = {};
   const token = bearerTokenFor(serverUrl);
   if (token) headers.Authorization = `Bearer ${token}`;
-  const base = serverUrl.replace(/\/+$/, "");
   try {
-    const resp = await fetch(`${base}/v1/me`, {
+    const resp = await fetch(url.joinServerUrl(serverUrl, "/v1/me"), {
       headers,
       redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs),
@@ -1184,6 +1202,7 @@ module.exports = {
   tailLocalServerLog,
   stopLocalServer,
   stopHost,
+  serverAuthEntry,
   serverAuthed,
   probeServerAuth,
   loginServer,

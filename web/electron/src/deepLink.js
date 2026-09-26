@@ -34,10 +34,16 @@ const DEEP_LINK_PATH_RE = /^\/c\/[^/]+\/?$/;
  * already emits for notification `navigatePath`, so the embedded
  * (workspace) build's `basenamedRouting` rebases it under the mount.
  *
+ * The link's query string is carried through as ``search`` so the caller can
+ * keep Databricks' ``?o=`` workspace selector in the target's identity
+ * (workspaceIdentityKey drops every other parameter, and `o` on
+ * non-workspace hosts, so nothing else in the query can influence identity).
+ *
  * @param {string} raw e.g. ``"omnigent://localhost:8000/c/conv_abc"``.
- * @returns {{ origin: string, path: string } | null} ``null`` for anything
- *   that isn't a valid `omnigent://.../c/<id>` link (wrong scheme, no host,
- *   non-`/c/` path, unparseable input).
+ * @returns {{ origin: string, search: string, path: string } | null} ``null``
+ *   for anything that isn't a valid `omnigent://.../c/<id>` link (wrong
+ *   scheme, no host, non-`/c/` path, unparseable input). ``search`` is the
+ *   link's raw query string (``"?o=123"`` form, or ``""``).
  */
 function parseOmnigentDeepLink(raw) {
   let url;
@@ -64,7 +70,7 @@ function parseOmnigentDeepLink(raw) {
   } catch {
     return null;
   }
-  return { origin, path };
+  return { origin, search: url.search, path };
 }
 
 /**
