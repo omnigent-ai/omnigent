@@ -537,3 +537,119 @@ class TestMcpBridgeConfigSecureDir:
         with pytest.raises(RuntimeError, match="owned by uid"):
             cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
         assert not (bridge_dir / "bridge.json").exists()
+
+
+class TestBridgeIdResolution:
+    """A ``/clear`` rotation binds a new conversation to an existing pane.
+
+    The bridge dir must therefore be addressable by the *launching* conversation
+    (carried in a session label) rather than always by the live conversation.
+    """
+
+    def test_bridge_dir_for_bridge_id_matches_session_id_digest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The two accessors agree, so sessions launched before the label survive."""
+        monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-native")
+
+        assert cursor_native_bridge.bridge_dir_for_bridge_id(
+            "conv_abc"
+        ) == cursor_native_bridge.bridge_dir_for_session_id("conv_abc")
+        assert cursor_native_bridge.bridge_dir_for_bridge_id(
+            "conv_abc"
+        ) != cursor_native_bridge.bridge_dir_for_bridge_id("conv_def")
+
+    def test_build_spawn_env_uses_bridge_id_when_provided(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rotated conversation is spawned against the launcher's bridge dir."""
+        monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-native")
+
+        rotated = cursor_native_bridge.build_cursor_native_spawn_env(
+            "conv_new", bridge_id="conv_launcher"
+        )
+        assert rotated[cursor_native_bridge.BRIDGE_DIR_ENV_VAR] == str(
+            cursor_native_bridge.bridge_dir_for_bridge_id("conv_launcher")
+        )
+
+    def test_build_spawn_env_falls_back_to_session_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No label means the conversation owns its own pane."""
+        monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-native")
+
+        env = cursor_native_bridge.build_cursor_native_spawn_env("conv_new")
+        assert env[cursor_native_bridge.BRIDGE_DIR_ENV_VAR] == str(
+            cursor_native_bridge.bridge_dir_for_session_id("conv_new")
+        )
+
+
+class TestActiveSessionId:
+    """``bridge.json`` names the conversation the pane currently belongs to.
+
+    The shared ``serve-mcp`` bridge reads the same key, so pane-originated tool
+    calls are attributed to whoever owns the pane now.
+    """
+
+    @staticmethod
+    def _bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Mirror the production tree so ``_ensure_secure_bridge_dir`` passes."""
+        uid_dir = tmp_path / "omnigent-test"
+        monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", uid_dir / "cursor-native")
+        return cursor_native_bridge.bridge_dir_for_session_id("conv_old")
+
+    def test_round_trips_and_preserves_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        bridge_dir = self._bridge_dir(tmp_path, monkeypatch)
+        cursor_native_bridge.write_mcp_bridge_config(bridge_dir)
+        token = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+
+        cursor_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+
+        assert cursor_native_bridge.read_active_session_id(bridge_dir) == "conv_new"
+        payload = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
+        assert payload["token"] == token
+        # The legacy key the shared bridge falls back to tracks the same owner.
+        assert payload["conversation_id"] == "conv_new"
+
+    def test_returns_none_for_missing_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge_dir = self._bridge_dir(tmp_path, monkeypatch)
+
+        assert cursor_native_bridge.read_active_session_id(bridge_dir) is None
+
+    def test_returns_none_for_malformed_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge_dir = self._bridge_dir(tmp_path, monkeypatch)
+        bridge_dir.mkdir(parents=True)
+        (bridge_dir / "bridge.json").write_text("{not json", encoding="utf-8")
+
+        assert cursor_native_bridge.read_active_session_id(bridge_dir) is None
+
+    def test_falls_back_to_conversation_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Panes launched before ``active_session_id`` existed still resolve."""
+        import json
+
+        bridge_dir = self._bridge_dir(tmp_path, monkeypatch)
+        bridge_dir.mkdir(parents=True)
+        (bridge_dir / "bridge.json").write_text(
+            json.dumps({"token": "t", "conversation_id": "conv_legacy"}), encoding="utf-8"
+        )
+
+        assert cursor_native_bridge.read_active_session_id(bridge_dir) == "conv_legacy"
+
+    def test_write_rejects_missing_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Never mint a config here — it would clobber the relay token."""
+        bridge_dir = self._bridge_dir(tmp_path, monkeypatch)
+
+        with pytest.raises(RuntimeError, match="bridge config missing"):
+            cursor_native_bridge.write_active_session_id(bridge_dir, "conv_new")
