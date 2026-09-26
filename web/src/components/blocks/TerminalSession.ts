@@ -293,6 +293,34 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
   return null;
 }
 
+/** CSI cursor-left, what terminals expect while DECCKM is off. */
+export const CURSOR_LEFT_CSI = "\x1b[D";
+
+/** SS3 cursor-left, what terminals expect while DECCKM is on. */
+export const CURSOR_LEFT_SS3 = "\x1bOD";
+
+/**
+ * Realign an IME append whose caret lands inside its new text. xterm tracks
+ * composition by textarea value, not caret, so an auto-pair can put the next
+ * candidate after the closing mark. Only the newly appended tail is safe to
+ * unstage while moving the PTY cursor left.
+ */
+export function imeInsertRealignment(
+  previousValue: string,
+  value: string,
+  selectionStart: number | null,
+): { moveLeft: number; stagedValue: string } | null {
+  if (selectionStart === null) return null;
+  if (value.length <= previousValue.length || !value.startsWith(previousValue)) return null;
+  if (selectionStart < previousValue.length || selectionStart >= value.length) return null;
+  // Line editors move one character per arrow key regardless of its column
+  // width, so count code points, not UTF-16 units.
+  return {
+    moveLeft: [...value.slice(selectionStart)].length,
+    stagedValue: value.slice(0, selectionStart),
+  };
+}
+
 // Reused across keystrokes — allocating a fresh TextEncoder per keypress
 // is needless churn on the input hot path.
 const INPUT_ENCODER = new TextEncoder();
@@ -779,6 +807,69 @@ export class TerminalSession {
       },
       { capture: true, signal },
     );
+
+    // Realign auto-pairs only after xterm forwards their append to the PTY.
+    const textarea = this.term.textarea;
+    if (textarea) {
+      let imeComposing = false;
+      // Snapshot at keydown; focus and input also resync IMEs without keydown.
+      let valueBeforeInput = textarea.value;
+      const snapshotValue = () => {
+        valueBeforeInput = textarea.value;
+      };
+      textarea.addEventListener("focus", snapshotValue, { signal });
+      textarea.addEventListener("keydown", snapshotValue, { signal });
+      textarea.addEventListener(
+        "compositionstart",
+        () => {
+          imeComposing = true;
+        },
+        { signal },
+      );
+      textarea.addEventListener(
+        "compositionend",
+        () => {
+          imeComposing = false;
+        },
+        { signal },
+      );
+      textarea.addEventListener(
+        "input",
+        (ev) => {
+          const { isComposing, inputType } = ev as InputEvent;
+          const previousValue = valueBeforeInput;
+          valueBeforeInput = textarea.value;
+          // Leave composition updates, including their commit input, untouched.
+          if (imeComposing || isComposing || inputType === "insertCompositionText") return;
+          const realign = imeInsertRealignment(
+            previousValue,
+            textarea.value,
+            textarea.selectionStart,
+          );
+          if (realign === null) return;
+          const decidedValue = textarea.value;
+          const decidedCaret = textarea.selectionStart;
+          // xterm's zero-delay diff must forward the append before cursor-left.
+          setTimeout(() => {
+            if (imeComposing || this.disposed) return;
+            // A later edit or xterm clear invalidates the earlier decision.
+            if (textarea.value !== decidedValue || textarea.selectionStart !== decidedCaret) {
+              return;
+            }
+            textarea.value = realign.stagedValue;
+            textarea.selectionStart = realign.stagedValue.length;
+            textarea.selectionEnd = realign.stagedValue.length;
+            valueBeforeInput = realign.stagedValue;
+            // DECCKM picks the arrow encoding, as xterm's keyboard path does.
+            const cursorLeft = this.term.modes.applicationCursorKeysMode
+              ? CURSOR_LEFT_SS3
+              : CURSOR_LEFT_CSI;
+            this.term.input(cursorLeft.repeat(realign.moveLeft), true);
+          }, 0);
+        },
+        { signal },
+      );
+    }
 
     this.ws.addEventListener(
       "open",
