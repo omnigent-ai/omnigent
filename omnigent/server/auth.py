@@ -72,6 +72,7 @@ _DELEGATED_ALLOWED_PREFIXES = (
     "/v1/agents",
     "/v1/hosts",
     "/v1/sessions",
+    "/v1/mcp",
     "/v1/skills",
     "/v1/runners",
     "/oauth/token",
