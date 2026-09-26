@@ -2626,8 +2626,15 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     The result is what gets published on the ``failed`` status event
     and ultimately rendered as the REPL's terminal error line.
 
+    A harness ``response.failed`` error already names its failure in ``code``;
+    that code is kept so the failed status edge and the persisted error item
+    describe one failure the same way (the web UI de-duplicates them by code
+    and message). ``type`` is the legacy spelling; ``runner_error`` is the
+    fallback for setup failures that carry neither.
+
     :param error: Raw error dict from a ``_on_proxy_stream_end`` call,
-        e.g. ``{"message": "turn setup failed: ..."}`` or
+        e.g. ``{"message": "turn setup failed: ..."}``,
+        ``{"code": "agent_startup_pending", "message": "..."}`` or
         ``{"status": 502}``.
     :returns: A dict with ``code`` and ``message`` string keys, e.g.
         ``{"code": "runner_error", "message": "turn setup failed: ..."}``.
@@ -2640,8 +2647,12 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
         message = f"turn failed (status {error['status']})"
     else:
         message = "turn failed"
-    raw_code = error.get("type")
-    code = raw_code if isinstance(raw_code, str) and raw_code else "runner_error"
+    code = "runner_error"
+    for key in ("code", "type"):
+        raw_code = error.get(key)
+        if isinstance(raw_code, str) and raw_code:
+            code = raw_code
+            break
     return {"code": code, "message": message}
 
 
@@ -5721,6 +5732,7 @@ def create_runner_app(
         error: Mapping[str, object] | None = None,
         *,
         source_error: Mapping[str, object] | None = None,
+        response_id: str | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -5743,6 +5755,11 @@ def create_runner_app(
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
             event["error"] = error
+        if response_id is not None:
+            # Name the turn this edge closes. The web UI already rendered the
+            # response's own terminal error; the id lets it recognise this edge
+            # as the same failure instead of adding a second card.
+            event["response_id"] = response_id
         if status == "failed":
             source = source_error if source_error is not None else (error or {})
             dimensions: dict[str, str] = {}
@@ -7594,7 +7611,11 @@ def create_runner_app(
         elif error is not None:
             if not _suppress_status:
                 _publish_turn_status(
-                    conv_id, "failed", error=_normalize_turn_error(error), source_error=error
+                    conv_id,
+                    "failed",
+                    error=_normalize_turn_error(error),
+                    source_error=error,
+                    response_id=owner_response_id,
                 )
         else:
             if not has_buffered and not _suppress_status:
@@ -11114,6 +11135,45 @@ def create_runner_app(
             status_code=200,
             content=session_resource_view_to_dict(resource),
         )
+
+    @app.get("/v1/sessions/{session_id}/sign-in-link")
+    async def get_session_sign_in_link(session_id: str) -> JSONResponse:
+        """
+        Return the sign-in prompt a session's terminal is showing right now, if any.
+
+        A launcher wrapper can park a native pane on a device-style sign-in
+        (an address to open, often with a code) before the agent runs. The
+        address is bound to that launcher process, so a link saved in an
+        earlier error card goes stale once the process moves on. The web asks
+        here at click time and opens whatever the pane shows now.
+
+        :param session_id: Session/conversation id.
+        :returns: ``{"pending": true, "url", "code", "terminal_id"}`` when a
+            running terminal shows a prompt; ``{"pending": false}`` otherwise.
+        """
+        from omnigent.harnesses.diagnostics import detect_sign_in_prompt
+
+        registry = resource_registry.terminal_registry
+        entries = registry.list_for_conversation(session_id) if registry is not None else []
+        for entry in entries:
+            if not entry.instance.running:
+                continue
+            # Wrapped rows joined: the address is far wider than the pane.
+            result = await entry.instance.read(join_wrapped=True)
+            screen = result.get("screen") if isinstance(result, dict) else None
+            prompt = detect_sign_in_prompt(screen if isinstance(screen, str) else None)
+            if prompt is None:
+                continue
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "pending": True,
+                    "url": prompt.url,
+                    "code": prompt.code,
+                    "terminal_id": terminal_resource_id(entry.terminal_name, entry.session_key),
+                },
+            )
+        return JSONResponse(status_code=200, content={"pending": False, "url": None, "code": None})
 
     @app.post("/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer")
     async def transfer_session_terminal(

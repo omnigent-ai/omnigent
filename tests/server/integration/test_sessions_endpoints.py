@@ -643,6 +643,84 @@ async def test_native_transcript_preserves_browser_title_preference(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+async def test_native_message_repeat_with_same_stable_id_forwards_once(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A resend that reuses the web client's stable message id is answered with
+    the entry already queued and is not forwarded to the runner again. The
+    first forward reached the host; a second would run the prompt twice.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    pending_inputs.reset_for_tests()
+    forwarded: list[httpx.Request] = []
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request)
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "set up the worktree"}],
+            "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+        },
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "claude-code-native-ui",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        try:
+
+            def message_forwards() -> int:
+                return sum(1 for r in forwarded if r.url.path.endswith("/events"))
+
+            first = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert first.status_code == 202, first.text
+            assert message_forwards() == 1
+
+            second = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert second.status_code == 202, second.text
+            # Same queued entry, no second message forward (the idempotent
+            # terminal ensure may still probe), still exactly one queued message.
+            assert second.json()["pending_id"] == first.json()["pending_id"]
+            assert message_forwards() == 1
+            assert len(pending_inputs.snapshot_for(session_id)) == 1
+        finally:
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+
 async def test_native_user_item_respects_background_title_header_opt_out(
     client: httpx.AsyncClient,
     app: Any,

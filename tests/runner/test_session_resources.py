@@ -775,6 +775,57 @@ async def test_get_terminal_by_id(
 
 
 @pytest.mark.asyncio
+async def test_sign_in_link_reports_the_prompt_a_running_pane_shows(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+) -> None:
+    """
+    GET /sign-in-link lifts the live sign-in prompt from a running pane, reading
+    it with wrapped rows joined so a wide address comes back whole. A saved link
+    in an old error card is bound to a launcher process that has moved on; the
+    web asks here at click time instead.
+    """
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    reads: list[bool] = []
+
+    async def _read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        del scrollback
+        reads.append(join_wrapped)
+        return {
+            "screen": (
+                "Logging in via SSO...\n"
+                "please open the following URL:\n"
+                "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
+                "code: HQ7M-2KPD\n"
+            )
+        }
+
+    instance.read = _read  # type: ignore[method-assign]
+
+    resp = await client.get("/v1/sessions/conv_abc/sign-in-link")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "pending": True,
+        "url": "https://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz",
+        "code": "HQ7M-2KPD",
+        "terminal_id": "terminal_bash_s1",
+    }
+    assert reads == [True]
+
+
+@pytest.mark.asyncio
+async def test_sign_in_link_reports_nothing_pending_without_a_prompt(
+    client: httpx.AsyncClient,
+) -> None:
+    """Panes showing no address (or none running) answer ``pending: false``."""
+    resp = await client.get("/v1/sessions/conv_abc/sign-in-link")
+    assert resp.status_code == 200
+    assert resp.json() == {"pending": False, "url": None, "code": None}
+
+
+@pytest.mark.asyncio
 async def test_get_terminal_by_id_returns_404_when_tmux_exited(
     client: httpx.AsyncClient,
     registry: TerminalRegistry,

@@ -22,6 +22,7 @@ from omnigent.harnesses.codex_native.bridge import (
     pending_mcp_servers,
     prepare_bridge_dir,
     read_bridge_startup_error,
+    read_bridge_startup_failure,
     read_bridge_startup_timeout,
     read_bridge_state,
     read_codex_config_effort,
@@ -575,6 +576,33 @@ def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> No
 
     clear_bridge_state(bridge_dir)
     assert read_bridge_startup_error(bridge_dir) is None
+
+
+def test_bridge_startup_failure_round_trips_structured_fields(bridge_dir: Path) -> None:
+    """
+    A pending-startup record carries its code, title and remediation, and a
+    message-only record (older runners) reads back with those fields unset.
+    """
+    write_bridge_startup_error(
+        bridge_dir,
+        "Codex is waiting for a sign-in in this session's terminal.",
+        code="databricks_sign_in_pending",
+        title="Codex is waiting for a sign-in",
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+    )
+    failure = read_bridge_startup_failure(bridge_dir)
+    assert failure is not None
+    assert failure.code == "databricks_sign_in_pending"
+    assert failure.title == "Codex is waiting for a sign-in"
+    assert failure.remediation is not None
+    assert "HQ7M-2KPD" in failure.remediation
+    assert read_bridge_startup_error(bridge_dir) == failure.message
+
+    write_bridge_startup_error(bridge_dir, "thread never started (TimeoutError)")
+    plain = read_bridge_startup_failure(bridge_dir)
+    assert plain is not None
+    assert plain.message == "thread never started (TimeoutError)"
+    assert (plain.code, plain.title, plain.remediation) == (None, None, None)
 
 
 def test_bridge_startup_timeout_round_trips_and_is_cleared(bridge_dir: Path) -> None:

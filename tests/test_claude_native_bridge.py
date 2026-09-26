@@ -8974,6 +8974,67 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
     )
 
 
+_SIGN_IN_PANE = (
+    "dbexec: launcher 1.2.3\n"
+    "Logging in via SSO...\n"
+    "If the browser does not open automatically, please open the following URL:\n"
+    "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
+)
+
+
+def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launcher sign-in prompt holding the pane fails delivery within a poll
+    interval, carrying the address as the next step, instead of waiting out
+    the budget and reaping the pane the person needs to finish signing in.
+    """
+    captures: list[bool] = []
+
+    def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        captures.append(join_wrapped)
+        return _SIGN_IN_PANE
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeSignInPending) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.title == "Claude Code is waiting for a sign-in"
+    # The one-time address stays out of the error text; the card fetches the
+    # live link from the host when clicked.
+    assert "http" not in raised.value.remediation
+    assert raised.value.remediation.startswith(
+        "Open the sign-in link and sign in. Claude Code continues on its own"
+    )
+    # Two plain polls saw the address; each looked again with wrapped rows joined.
+    assert captures == [False, True, False, True]
+    assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+
+
+def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An address left in scrollback is not a sign-in gate once the input box is up."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target, *, join_wrapped=False: _SIGN_IN_PANE + _READY_PANE,
+    )
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=30.0,
+    )
+
+
 def test_wait_for_claude_prompt_ready_reports_the_exit_when_pane_dead(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

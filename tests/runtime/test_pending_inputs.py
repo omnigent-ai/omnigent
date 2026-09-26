@@ -421,3 +421,23 @@ def test_stable_id_dedup_scoped_per_conversation() -> None:
     id_a = pending_inputs.record("conv_scope_a", [_text_block("x")], stable_id=stable)
     id_b = pending_inputs.record("conv_scope_b", [_text_block("x")], stable_id=stable)
     assert id_a != id_b
+
+
+def test_pending_id_for_stable_id_finds_only_live_entries() -> None:
+    """
+    A queued entry is found by the web client's stable id so a resend can be
+    answered without a second forward; a settled or unknown id finds nothing.
+    """
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    content = [{"type": "input_text", "text": "hello"}]
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) is None
+
+    pending_id = pending_inputs.record("conv_a", content, stable_id=stable_id)
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) == pending_id
+    # Scoped to the conversation and to entries that carry a stable id.
+    assert pending_inputs.pending_id_for_stable_id("conv_b", stable_id) is None
+    pending_inputs.record("conv_a", content)
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) == pending_id
+
+    pending_inputs.resolve("conv_a", pending_id)
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) is None

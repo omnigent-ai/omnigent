@@ -105,3 +105,35 @@ def test_response_failed_no_response_id_returns_none() -> None:
     }
     item = _error_item_from_sse(event, response_id=None)
     assert item is None
+
+
+def test_response_failed_keeps_title_cause_and_remediation() -> None:
+    """
+    A classified failure's headline and next step are persisted with the
+    error item, so a reloaded card still offers the sign-in link it showed
+    live. Absent fields stay ``None`` rather than empty strings.
+    """
+    item = _error_item_from_sse(
+        {
+            "type": "response.failed",
+            "source": "harness",
+            "response": {
+                "error": {
+                    "code": "databricks_sign_in_pending",
+                    "message": "Codex is waiting for a sign-in in this session's terminal.",
+                    "title": "Codex is waiting for a sign-in",
+                    "remediation": (
+                        "Open https://signin.example.com/device and enter code HQ7M-2KPD."
+                    ),
+                    "cause": "",
+                }
+            },
+        },
+        response_id="resp_1",
+    )
+    assert item is not None
+    assert isinstance(item.data, ErrorData)
+    assert item.data.title == "Codex is waiting for a sign-in"
+    assert item.data.remediation is not None
+    assert "HQ7M-2KPD" in item.data.remediation
+    assert item.data.cause is None

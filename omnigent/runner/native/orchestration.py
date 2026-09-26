@@ -5489,6 +5489,83 @@ async def _wait_for_codex_thread_or_terminal_exit(
         await asyncio.gather(thread_task, exit_task, return_exceptions=True)
 
 
+async def _record_agent_startup_pending(
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    terminal_instance: TerminalInstance,
+    routing_summary: str,
+    timeout_seconds: float,
+) -> None:
+    """
+    Record that Codex is still starting behind a live pane, with any sign-in link it shows.
+
+    A launcher wrapper can park the pane on a sign-in prompt for longer than the
+    thread-start budget. Chat turns read this record and fail fast with the
+    next step instead of the generic "thread never started"; the discovery wait
+    then continues without a deadline and clears the record once the thread
+    starts.
+
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Codex bridge directory for this session.
+    :param terminal_instance: The live TUI pane, read once for its screen text.
+    :param routing_summary: One-line description of the resolved launch routing.
+    :param timeout_seconds: The thread-start budget that just expired.
+    """
+    from omnigent.harnesses.codex_native.bridge import write_bridge_startup_error
+    from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+
+    screen = ""
+    try:
+        # A sign-in address is far wider than the 80-column pane the runner
+        # creates, so read wrapped rows joined back into their original lines.
+        result = await terminal_instance.read(join_wrapped=True)
+        raw_screen = result.get("screen") if isinstance(result, dict) else None
+        screen = raw_screen if isinstance(raw_screen, str) else ""
+    except Exception:  # noqa: BLE001 — the pending record must land without the screen
+        _logger.debug("Codex startup pane read failed for %s", session_id, exc_info=True)
+    prompt = detect_sign_in_prompt(screen)
+    if prompt is not None:
+        code = "databricks_sign_in_pending"
+        title = "Codex is waiting for a sign-in"
+        message = "Codex is waiting for a sign-in in this session's terminal."
+        remediation = sign_in_next_step("Codex")
+    else:
+        code = "agent_startup_pending"
+        title = "Codex is still starting"
+        message = (
+            "Codex is still starting in this session's terminal and may be waiting "
+            "for a sign-in there."
+        )
+        remediation = (
+            "Finish any sign-in shown in the session terminal, then send your message again."
+        )
+    write_bridge_startup_error(
+        bridge_dir,
+        f"{message} Launch routing: {routing_summary}.",
+        code=code,
+        title=title,
+        remediation=remediation,
+    )
+    pending_event = debug_event("agent_startup_pending", session_id=session_id)
+    pending_event["attributes"] = {
+        "harness": "codex-native",
+        "phase": "thread_discovery",
+        "timeout_s": timeout_seconds,
+        "sign_in_prompt_detected": prompt is not None,
+        "code": code,
+    }
+    _logger.warning(
+        "Codex TUI for %s has not started a thread after %.0fs but its pane is alive; "
+        "recorded %s and waiting without a deadline%s",
+        session_id,
+        timeout_seconds,
+        code,
+        f" (sign-in prompt: {prompt.url})" if prompt is not None else "",
+        extra=pending_event,
+    )
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -5544,7 +5621,10 @@ async def _codex_discover_thread_and_forward(
         session.
     :param thread_start_timeout_seconds: Configured-command thread-start
         allowance. ``None`` preserves the forwarder's ordinary 30-second
-        default.
+        default. When the budget expires while *terminal_instance* is still
+        running, the wait records a pending cause (see
+        :func:`_record_agent_startup_pending`) and continues without a
+        deadline; only a pane exit or an ended event stream tears down.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -5593,124 +5673,151 @@ async def _codex_discover_thread_and_forward(
         )
 
     discovery_started_at = time.monotonic()
+    startup_pending_recorded = False
     try:
-        try:
-            if login_required:
-                # No deadline: the turn-facing failure is already recorded,
-                # so this wait only serves a possible interactive sign-in.
-                thread_started = wait_for_thread_started(event_client, timeout=None)
-            elif thread_start_timeout_seconds is not None:
-                thread_started = wait_for_thread_started(
-                    event_client,
-                    timeout=thread_start_timeout_seconds,
-                )
-            else:
-                thread_started = wait_for_thread_started(event_client)
-            thread_id = (
-                await thread_started
-                if terminal_instance is None
-                else await _wait_for_codex_thread_or_terminal_exit(
-                    thread_started,
-                    terminal_instance,
-                    poll_interval_s=(
-                        _CODEX_LOGIN_EXIT_POLL_INTERVAL_S
-                        if login_required
-                        else _TERMINAL_INTERACTIVE_POLL_INTERVAL_S
-                    ),
-                )
-            )
-        except (TimeoutError, RuntimeError) as exc:
-            # Expected failure modes of wait_for_thread_started: the TUI exited
-            # at startup, or the event stream ended before a thread was
-            # created. Stop forwarding (cleanup runs in ``finally``); any other
-            # error is a bug and propagates.
+        while True:
             try:
-                diagnostics = collect_codex_startup_diagnostics(app_server)
-                if isinstance(exc, _CodexTerminalExited):
-                    from omnigent.process_logging import harness_stderr_capture_enabled
-
-                    diagnostics.update(
-                        terminal_instance_id=exc.instance.diagnostic_id,
-                        terminal_exit_status=exc.instance.last_exit_status(),
+                if login_required or startup_pending_recorded:
+                    # No deadline: the turn-facing cause is already recorded,
+                    # so this wait only serves a possible interactive sign-in.
+                    thread_started = wait_for_thread_started(event_client, timeout=None)
+                elif thread_start_timeout_seconds is not None:
+                    thread_started = wait_for_thread_started(
+                        event_client,
+                        timeout=thread_start_timeout_seconds,
                     )
-                    if harness_stderr_capture_enabled():
-                        diagnostics["terminal_last_output"] = _codex_startup_terminal_output(
-                            exc.instance
-                        )
-            except Exception as diagnostics_error:  # noqa: BLE001
-                # Diagnostics must not replace the startup error or prevent cleanup.
-                diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
-            failure_event = debug_event("codex_thread_start_failed", session_id=session_id)
-            failure_event["attributes"] = {
-                "harness": "codex-native",
-                "phase": "thread_discovery",
-                "reason": (
-                    "terminal_exited"
-                    if isinstance(exc, _CodexTerminalExited)
-                    else "timeout"
-                    if isinstance(exc, TimeoutError)
-                    else "event_stream_ended"
-                ),
-                "timeout_s": (
-                    None
-                    if login_required
-                    else (
-                        thread_start_timeout_seconds
-                        if thread_start_timeout_seconds is not None
-                        else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
-                    )
-                ),
-                "elapsed_ms": round((time.monotonic() - discovery_started_at) * 1000),
-                "login_required": login_required,
-                **diagnostics,
-            }
-            _logger.exception(
-                "Codex TUI never started a thread for %s; chat will not forward%s%s",
-                session_id,
-                (
-                    f"\nCodex startup stderr:\n{diagnostics['stderr_tail']}"
-                    if diagnostics.get("stderr_tail")
-                    else ""
-                ),
-                (
-                    f"\nCodex startup terminal output:\n{diagnostics['terminal_last_output']}"
-                    if diagnostics.get("terminal_last_output")
-                    else ""
-                ),
-                extra=failure_event,
-            )
-            # Bridge state is never written here; leave the real cause for the executor (#59).
-            if isinstance(exc, _CodexTerminalExited):
-                # The app-server stayed healthy; lead with the TUI's actual
-                # failure instead of the generic thread-discovery wrapper.
-                summary = _codex_terminal_exit_summary(exc.instance, before_thread=True)
-            else:
-                if isinstance(exc, TimeoutError):
-                    timeout_seconds = (
-                        thread_start_timeout_seconds
-                        if thread_start_timeout_seconds is not None
-                        else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
-                    )
-                    cause = f"startup timed out after {timeout_seconds:g}s"
                 else:
-                    cause = "event stream ended before a thread was created"
-                summary = (
-                    f"Codex app-server never started a thread ({cause}: {type(exc).__name__})."
+                    thread_started = wait_for_thread_started(event_client)
+                thread_id = (
+                    await thread_started
+                    if terminal_instance is None
+                    else await _wait_for_codex_thread_or_terminal_exit(
+                        thread_started,
+                        terminal_instance,
+                        poll_interval_s=(
+                            _CODEX_LOGIN_EXIT_POLL_INTERVAL_S
+                            if login_required or startup_pending_recorded
+                            else _TERMINAL_INTERACTIVE_POLL_INTERVAL_S
+                        ),
+                    )
                 )
-            if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
-                write_bridge_startup_error(
-                    bridge_dir,
-                    f"{summary} Launch routing: {routing_summary}. "
-                    "(The runner log has the same near 'native-codex routing'.)"
-                    + (
+                break
+            except (TimeoutError, RuntimeError) as exc:
+                if (
+                    isinstance(exc, TimeoutError)
+                    and not startup_pending_recorded
+                    and terminal_instance is not None
+                    and await terminal_instance.is_alive()
+                ):
+                    # The pane is still running (e.g. parked on a launcher
+                    # sign-in prompt). Record why chat turns cannot run yet and
+                    # keep listening; a pane exit still ends discovery below.
+                    await _record_agent_startup_pending(
+                        session_id=session_id,
+                        bridge_dir=bridge_dir,
+                        terminal_instance=terminal_instance,
+                        routing_summary=routing_summary,
+                        timeout_seconds=(
+                            thread_start_timeout_seconds
+                            if thread_start_timeout_seconds is not None
+                            else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                        ),
+                    )
+                    startup_pending_recorded = True
+                    continue
+                # Expected failure modes of wait_for_thread_started: the TUI exited
+                # at startup, or the event stream ended before a thread was
+                # created. Stop forwarding (cleanup runs in ``finally``); any other
+                # error is a bug and propagates.
+                try:
+                    diagnostics = collect_codex_startup_diagnostics(app_server)
+                    if isinstance(exc, _CodexTerminalExited):
+                        from omnigent.process_logging import harness_stderr_capture_enabled
+
+                        diagnostics.update(
+                            terminal_instance_id=exc.instance.diagnostic_id,
+                            terminal_exit_status=exc.instance.last_exit_status(),
+                        )
+                        if harness_stderr_capture_enabled():
+                            diagnostics["terminal_last_output"] = _codex_startup_terminal_output(
+                                exc.instance
+                            )
+                except Exception as diagnostics_error:  # noqa: BLE001
+                    # Diagnostics must not replace the startup error or prevent cleanup.
+                    diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
+                failure_event = debug_event("codex_thread_start_failed", session_id=session_id)
+                failure_event["attributes"] = {
+                    "harness": "codex-native",
+                    "phase": "thread_discovery",
+                    "reason": (
+                        "terminal_exited"
+                        if isinstance(exc, _CodexTerminalExited)
+                        else "timeout"
+                        if isinstance(exc, TimeoutError)
+                        else "event_stream_ended"
+                    ),
+                    "timeout_s": (
+                        None
+                        if login_required
+                        else (
+                            thread_start_timeout_seconds
+                            if thread_start_timeout_seconds is not None
+                            else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                        )
+                    ),
+                    "elapsed_ms": round((time.monotonic() - discovery_started_at) * 1000),
+                    "login_required": login_required,
+                    **diagnostics,
+                }
+                _logger.exception(
+                    "Codex TUI never started a thread for %s; chat will not forward%s%s",
+                    session_id,
+                    (
+                        f"\nCodex startup stderr:\n{diagnostics['stderr_tail']}"
+                        if diagnostics.get("stderr_tail")
+                        else ""
+                    ),
+                    (
                         f"\nCodex startup terminal output:\n{diagnostics['terminal_last_output']}"
                         if diagnostics.get("terminal_last_output")
                         else ""
                     ),
+                    extra=failure_event,
                 )
-            return
+                # Bridge state is never written here; leave the real cause for the executor (#59).
+                if isinstance(exc, _CodexTerminalExited):
+                    # The app-server stayed healthy; lead with the TUI's actual
+                    # failure instead of the generic thread-discovery wrapper.
+                    summary = _codex_terminal_exit_summary(exc.instance, before_thread=True)
+                else:
+                    if isinstance(exc, TimeoutError):
+                        timeout_seconds = (
+                            thread_start_timeout_seconds
+                            if thread_start_timeout_seconds is not None
+                            else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                        )
+                        cause = f"startup timed out after {timeout_seconds:g}s"
+                    else:
+                        cause = "event stream ended before a thread was created"
+                    summary = (
+                        f"Codex app-server never started a thread ({cause}: {type(exc).__name__})."
+                    )
+                if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+                    terminal_output = diagnostics.get("terminal_last_output")
+                    write_bridge_startup_error(
+                        bridge_dir,
+                        f"{summary} Launch routing: {routing_summary}. "
+                        "(The runner log has the same near 'native-codex routing'.)"
+                        + (
+                            f"\nCodex startup terminal output:\n{terminal_output}"
+                            if terminal_output
+                            else ""
+                        ),
+                        code="codex_thread_not_started",
+                    )
+                return
 
-        if login_required:
+        if login_required or startup_pending_recorded:
             # The user signed in (or the TUI otherwise started a thread):
             # the pre-recorded fail-fast cause no longer applies.
             clear_bridge_startup_error(bridge_dir)
@@ -6981,15 +7088,32 @@ def _is_runner_owned_codex_terminal(
     ``_auto_create_codex_terminal`` without leaking launch argv in public
     metadata.
 
+    A runner-owned pane is still not reusable once its launch has failed and
+    its app-server is gone: the pane cannot carry chat turns, so every send
+    would fail fast on the saved startup error until the terminal is recreated.
+    Reporting it as not owned makes the ensure close it and launch again,
+    which also clears the saved error. A pane whose backend is alive (for
+    example one still waiting on a sign-in prompt) stays reusable.
+
     :param resource_registry: Runner resource registry that owns private
         terminal role markers.
     :param resource: Existing terminal resource view.
-    :returns: ``True`` when the resource is marked as Codex native.
+    :returns: ``True`` when the resource is marked as Codex native and can
+        still carry chat turns.
     """
-    return (
-        resource_registry.terminal_resource_role(resource.session_id, resource.id)
-        == CODEX_NATIVE_TERMINAL_ROLE
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        read_bridge_startup_error,
     )
+
+    if (
+        resource_registry.terminal_resource_role(resource.session_id, resource.id)
+        != CODEX_NATIVE_TERMINAL_ROLE
+    ):
+        return False
+    if resource.session_id in _AUTO_CODEX_APP_SERVERS:
+        return True
+    return read_bridge_startup_error(bridge_dir_for_bridge_id(resource.session_id)) is None
 
 
 def _is_runner_owned_antigravity_terminal(

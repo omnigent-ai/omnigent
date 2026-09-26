@@ -81,6 +81,7 @@ from omnigent.runner.app import (
     _evaluate_policy_via_omnigent,
     _forward_harness_response,
     _harness_error_response_error,
+    _normalize_turn_error,
     _resolve_harness_config,
 )
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -1616,6 +1617,40 @@ def test_harness_error_response_error_parses_runner_error_bodies(
     assert _harness_error_response_error(response) == expected
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        # A harness failure names itself: the status edge keeps that code so the
+        # web UI can de-duplicate it against the persisted error item.
+        (
+            {
+                "code": "databricks_sign_in_pending",
+                "message": "Codex is waiting for a sign-in.",
+            },
+            {
+                "code": "databricks_sign_in_pending",
+                "message": "Codex is waiting for a sign-in.",
+            },
+        ),
+        # The legacy ``type`` spelling still wins over the generic fallback.
+        (
+            {"type": "_ContextWindowOverflow", "message": "too long"},
+            {"code": "_ContextWindowOverflow", "message": "too long"},
+        ),
+        (
+            {"message": "turn setup failed: boom"},
+            {"code": "runner_error", "message": "turn setup failed: boom"},
+        ),
+        ({"status": 503}, {"code": "runner_error", "message": "turn failed (status 503)"}),
+        ({}, {"code": "runner_error", "message": "turn failed"}),
+    ],
+)
+def test_normalize_turn_error_keeps_the_failure_code(
+    error: dict[str, object], expected: dict[str, str]
+) -> None:
+    assert _normalize_turn_error(error) == expected
+
+
 class _SpawnFailingProcessManager(_FakeProcessManager):
     """Process manager stub whose harness spawn always fails.
 
@@ -2406,6 +2441,9 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         f"response.failed was dropped at stream end."
     )
     if until == "failed":
+        # The failed edge names the turn it closes (the harness's response id)
+        # so the web folds it into that response's own error card.
+        assert events[-1].get("response_id") == "resp_sf_1"
         error = events[-1].get("error")
         # The terminal failed edge must carry the harness's real error so
         # clients can render it — a bare ``failed`` with no payload would

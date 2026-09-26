@@ -526,6 +526,79 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
 # ── Error-code classification ──────────────────────────────────
 
 
+def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
+    """
+    An executor that names its failure (``ExecutorError.code``) is raised as
+    :class:`InnerExecutorError`; the detail keeps that code plus the headline
+    and next step, so the web card reads as that failure instead of as a bare
+    ``RuntimeError``.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    error = InnerExecutorError(
+        "Codex is waiting for a sign-in in this session's terminal.",
+        code="databricks_sign_in_pending",
+        title="Codex is waiting for a sign-in",
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+    )
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "databricks_sign_in_pending"
+    assert detail.message == "Codex is waiting for a sign-in in this session's terminal."
+    assert detail.title == "Codex is waiting for a sign-in"
+    assert detail.remediation is not None
+    assert "HQ7M-2KPD" in detail.remediation
+
+
+@pytest.mark.asyncio
+async def test_coded_executor_error_is_raised_with_its_code() -> None:
+    """
+    An ``ExecutorError`` that names its failure surfaces as
+    :class:`InnerExecutorError` carrying that code, headline and next step,
+    with the executor's own sentence as the message (no "inner executor
+    error:" prefix). An uncoded error keeps today's generic wrap.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [
+            ExecutorError(
+                message="Codex is waiting for a sign-in in this session's terminal.",
+                code="databricks_sign_in_pending",
+                title="Codex is waiting for a sign-in",
+                remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+            )
+        ]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    ctx = TurnContext(
+        response_id="resp_coded", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(request, ctx)
+
+    assert str(raised.value) == "Codex is waiting for a sign-in in this session's terminal."
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.title == "Codex is waiting for a sign-in"
+    assert raised.value.remediation is not None
+    assert "HQ7M-2KPD" in raised.value.remediation
+
+
 def test_build_error_detail_uses_omnigent_error_code() -> None:
     """
     :class:`OmnigentError` (and its

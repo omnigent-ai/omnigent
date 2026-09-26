@@ -419,12 +419,21 @@ class ErrorData(BaseModel):
         notice (e.g. codex started a fresh thread) rather than a failure;
         ``None`` / ``"error"`` is the destructive default and is omitted from
         the wire so existing error items are unchanged.
+    :param title: Optional short headline naming the failure, e.g. ``"Codex
+        is waiting for a sign-in"``. Kept so the card reads the same after a
+        reload as it did live.
+    :param cause: Optional one or two sentences explaining why it failed.
+    :param remediation: Optional concrete next step, e.g. the sign-in link
+        and code; the card offers it as an action.
     """
 
     source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
     level: Literal["error", "info"] | None = None
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
     @field_validator("code", "message")
     @classmethod

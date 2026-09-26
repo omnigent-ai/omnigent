@@ -1407,6 +1407,24 @@ def register_resources_routes(
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
         return await _proxy_get_to_runner(session_id, path, conv)
 
+    @router.get("/sessions/{session_id}/sign-in-link", response_model=None)
+    async def get_session_sign_in_link(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Return the sign-in link the session's terminal is waiting on right now.
+
+        Asked by the error card at click time, so the user opens the live
+        prompt rather than a link saved earlier that its launcher process has
+        since abandoned.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The runner's ``{"pending", "url", "code", "terminal_id"}`` payload.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _proxy_get_to_runner(
+            session_id, f"/v1/sessions/{session_id}/sign-in-link", conv
+        )
+
     @router.post(
         "/sessions/{session_id}/resources/terminals/{terminal_id}/transfer",
         # Internal terminal transfer — hidden from the public API reference.

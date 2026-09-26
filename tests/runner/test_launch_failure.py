@@ -226,6 +226,9 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
         ("budget_exhausted", "budget"),
+        ("databricks_sign_in_pending", "Databricks sign-in"),
+        ("agent_startup_pending", "still starting"),
+        ("codex_thread_not_started", "never ran"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

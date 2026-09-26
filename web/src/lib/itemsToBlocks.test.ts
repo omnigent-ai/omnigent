@@ -316,6 +316,27 @@ describe("itemsToBlocks — flat shape", () => {
     expect(error.message).toBe("Native Codex requires the 'codex' CLI on PATH.");
   });
 
+  it("error items keep their title and remediation on reload", () => {
+    // The card's headline and sign-in link come from history after a reload,
+    // not from the live stream, so the persisted item must carry them.
+    const items: ConversationItem[] = [
+      {
+        id: "err_pending",
+        response_id: "resp_pending",
+        type: "error",
+        status: "completed",
+        source: "harness",
+        code: "databricks_sign_in_pending",
+        message: "Codex is waiting for a sign-in in this session's terminal.",
+        title: "Codex is waiting for a sign-in",
+        remediation: "Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+      },
+    ];
+    const [error] = itemsToBlocks(items) as ErrorBlock[];
+    expect(error?.title).toBe("Codex is waiting for a sign-in");
+    expect(error?.remediation).toContain("https://signin.example.com/device");
+  });
+
   it("preserves input_image and input_file content on UserMessageBlock", () => {
     const items: ConversationItem[] = [
       {

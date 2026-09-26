@@ -248,6 +248,28 @@ def record(
     return pending_id
 
 
+def pending_id_for_stable_id(conversation_id: str, stable_id: str) -> str | None:
+    """
+    Return the live pending id recorded for a web client's stable message id.
+
+    Called by the native message route before it records a send. A stable id
+    that is already queued is a client retry of a message the runner already
+    received (the first response was lost in flight); forwarding it again
+    would run the prompt twice, so the route answers with the queued entry.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's stable 32-char hex message id.
+    :returns: The matching entry's pending id, or ``None`` when the message
+        is not queued (never sent, already mirrored, or settled after a failure).
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        for entry in _pending.get(conversation_id, {}).values():
+            if entry.stable_id == stable_id:
+                return entry.pending_id
+    return None
+
+
 def resolve(conversation_id: str, pending_id: str) -> None:
     """
     Drop a pending entry by id.

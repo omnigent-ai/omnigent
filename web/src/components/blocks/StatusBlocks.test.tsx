@@ -1,9 +1,12 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
+import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
 
 afterEach(cleanup);
 
@@ -243,6 +246,119 @@ describe("ErrorBanner", () => {
     expect(screen.getByTestId("error-message-content")).toHaveTextContent(
       "Try this: Run the host as a non-root user (uid != 0).",
     );
+  });
+
+  it.each([
+    ["databricks_sign_in_pending", "The agent is waiting for a Databricks sign-in."],
+    ["agent_startup_pending", "The agent is still starting in the session terminal."],
+    ["codex_thread_not_started", "Codex stopped before it could start, so this turn never ran."],
+  ])("describes a %s failure in plain English", (code, sentence) => {
+    render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
+    expect(screen.getByText(sentence)).toBeInTheDocument();
+  });
+
+  const SIGN_IN_REMEDIATION =
+    "Open the sign-in link and sign in. " +
+    "Codex continues on its own once the sign-in completes; then send your message again.";
+
+  function renderSignInCard() {
+    render(
+      <ErrorBanner
+        message="Codex is waiting for a sign-in in this session's terminal."
+        source="harness"
+        code="databricks_sign_in_pending"
+        title="Codex is waiting for a sign-in"
+        remediation={SIGN_IN_REMEDIATION}
+      />,
+    );
+  }
+
+  it("offers the sign-in action by failure code, with no stored link or code", () => {
+    // The card text carries no address: the link is a one-time URL bound to the
+    // launcher process, so the button fetches the live one from the host.
+    useChatStore.setState({ conversationId: null });
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    renderSignInCard();
+    expect(screen.getByRole("button", { name: "Open sign-in link" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Copy code/ })).not.toBeInTheDocument();
+    // Without a live session there is nothing to fetch, and nothing to open.
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    expect(open).not.toHaveBeenCalled();
+    expect(screen.getByTestId("error-sign-in-note")).toHaveTextContent(
+      "Open this session to fetch the current sign-in link.",
+    );
+    // The actions sit on the collapsed face and must not toggle the pill open.
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
+    open.mockRestore();
+  });
+
+  it("asks the host for the live sign-in link before opening it", async () => {
+    // The saved link belongs to the launcher process that printed it and goes
+    // stale once that process moves on, so the click fetches the current one.
+    useChatStore.setState({ conversationId: "conv_live" });
+    const tab = { location: { href: "" }, close: vi.fn() };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    vi.mocked(getSessionSignInLink).mockResolvedValue({
+      pending: true,
+      url: "https://signin.example.com/device?fresh=1",
+      code: "ZZ99-FRSH",
+    });
+    renderSignInCard();
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await waitFor(() =>
+      expect(tab.location.href).toBe("https://signin.example.com/device?fresh=1"),
+    );
+    expect(getSessionSignInLink).toHaveBeenCalledWith("conv_live");
+    // The tab was pre-opened in the click, so the navigation is not a popup.
+    expect(open).toHaveBeenCalledWith("", "_blank");
+    expect(screen.getByRole("button", { name: "Copy code ZZ99-FRSH" })).toBeInTheDocument();
+    open.mockRestore();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  it("explains when no sign-in is pending any more instead of opening a dead link", async () => {
+    useChatStore.setState({ conversationId: "conv_live" });
+    const tab = { location: { href: "" }, close: vi.fn() };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    vi.mocked(getSessionSignInLink).mockResolvedValue({ pending: false, url: null, code: null });
+    renderSignInCard();
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await waitFor(() => expect(tab.close).toHaveBeenCalled());
+    expect(screen.getByTestId("error-sign-in-note")).toHaveTextContent(
+      "No sign-in is pending in the terminal any more.",
+    );
+    expect(tab.location.href).toBe("");
+    open.mockRestore();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  it("links addresses inside the expanded remediation text", () => {
+    render(
+      <ErrorBanner
+        message="raw diagnostics"
+        source="harness"
+        code="databricks_sign_in_pending"
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD."
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /waiting for a Databricks sign-in/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(within(content).getByRole("link")).toHaveAttribute(
+      "href",
+      "https://signin.example.com/device",
+    );
+  });
+
+  it("shows no sign-in actions for failures that are not a pending sign-in", () => {
+    render(
+      <ErrorBanner
+        message="raw diagnostics"
+        source="harness"
+        code="agent_startup_pending"
+        remediation="Finish any sign-in shown in the session terminal, then send your message again."
+      />,
+    );
+    expect(screen.queryByTestId("error-remediation-actions")).not.toBeInTheDocument();
   });
 
   it("separates terminal diagnostics and last output into tabs", () => {

@@ -128,6 +128,27 @@ def bridge_root() -> Path:
 
 
 @dataclass(frozen=True)
+class CodexStartupFailure:
+    """
+    Why a native Codex app-server has not started its thread.
+
+    :param message: Human-readable cause, e.g. ``"Codex is waiting for a
+        sign-in in this session's terminal."``.
+    :param code: Semantic failure code for the turn error, e.g.
+        ``"databricks_sign_in_pending"``; ``None`` for records written
+        without one.
+    :param title: Short headline for the error card, or ``None``.
+    :param remediation: Concrete next step, e.g. the sign-in link and
+        code, or ``None``.
+    """
+
+    message: str
+    code: str | None = None
+    title: str | None = None
+    remediation: str | None = None
+
+
+@dataclass(frozen=True)
 class CodexNativeBridgeState:
     """
     Runtime state shared by the native Codex wrapper and harness.
@@ -967,21 +988,45 @@ def clear_bridge_state(bridge_dir: Path) -> None:
                 continue
 
 
-def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
+def write_bridge_startup_error(
+    bridge_dir: Path,
+    message: str,
+    *,
+    code: str | None = None,
+    title: str | None = None,
+    remediation: str | None = None,
+) -> None:
     """
-    Record why a native Codex app-server never started its thread (issue #59).
+    Record why a native Codex app-server has not started its thread (issue #59).
+
+    The record is either a hard failure (the TUI exited, the event stream
+    ended) or a still-pending startup (the pane is alive but waiting, e.g.
+    on a sign-in prompt). Chat turns read it to fail fast with the cause.
 
     :param bridge_dir: Native Codex bridge directory.
     :param message: Human-readable failure cause.
+    :param code: Semantic failure code the turn error should carry, e.g.
+        ``"databricks_sign_in_pending"``. ``None`` leaves the turn's
+        generic code in place.
+    :param title: Short headline for the error card, e.g. ``"Codex is
+        waiting for a sign-in"``.
+    :param remediation: Concrete next step, e.g. the sign-in link and code.
     :returns: None.
     """
+    record: dict[str, str] = {"message": message}
+    if code:
+        record["code"] = code
+    if title:
+        record["title"] = title
+    if remediation:
+        record["remediation"] = remediation
     try:
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = bridge_dir / _STARTUP_ERROR_FILE
         fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_ERROR_FILE}.", dir=str(bridge_dir))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"message": message}, handle, sort_keys=True)
+                json.dump(record, handle, sort_keys=True)
                 handle.write("\n")
             os.replace(tmp_name, path)
         finally:
@@ -1006,12 +1051,13 @@ def clear_bridge_startup_error(bridge_dir: Path) -> None:
         (bridge_dir / _STARTUP_ERROR_FILE).unlink()
 
 
-def read_bridge_startup_error(bridge_dir: Path) -> str | None:
+def read_bridge_startup_failure(bridge_dir: Path) -> CodexStartupFailure | None:
     """
-    Read a recorded native Codex startup-failure message, if any.
+    Read the recorded native Codex startup failure, if any.
 
     :param bridge_dir: Native Codex bridge directory.
-    :returns: The recorded failure cause, or ``None`` if absent/unreadable.
+    :returns: The recorded failure with its optional semantic code, title
+        and remediation, or ``None`` if absent/unreadable.
     """
     path = bridge_dir / _STARTUP_ERROR_FILE
     if not path.is_file():
@@ -1023,7 +1069,30 @@ def read_bridge_startup_error(bridge_dir: Path) -> str | None:
     if not isinstance(raw, dict):
         return None
     message = raw.get("message")
-    return message if isinstance(message, str) and message else None
+    if not isinstance(message, str) or not message:
+        return None
+
+    def _optional(key: str) -> str | None:
+        value = raw.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return CodexStartupFailure(
+        message=message,
+        code=_optional("code"),
+        title=_optional("title"),
+        remediation=_optional("remediation"),
+    )
+
+
+def read_bridge_startup_error(bridge_dir: Path) -> str | None:
+    """
+    Read a recorded native Codex startup-failure message, if any.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The recorded failure cause, or ``None`` if absent/unreadable.
+    """
+    failure = read_bridge_startup_failure(bridge_dir)
+    return failure.message if failure is not None else None
 
 
 def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:

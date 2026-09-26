@@ -243,6 +243,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
+    "databricks_sign_in_pending": "The agent is waiting for a Databricks sign-in.",
+    "agent_startup_pending": "The agent is still starting in the session terminal.",
+    "codex_thread_not_started": "Codex stopped before it could start, so this turn never ran.",
     "native_turn_error": "The agent ran into an error during this turn.",
     "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",
     "budget_exhausted": (

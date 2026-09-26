@@ -3369,3 +3369,34 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+@pytest.mark.asyncio
+async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) -> None:
+    """
+    ``read(join_wrapped=True)`` captures with ``-J`` so a token wider than the
+    80-column pane (a sign-in address) reads back as one line; the default
+    read is unchanged.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    async def _tmux_output(*args: str) -> str:
+        calls.append(args)
+        return "open https://signin.example.com/device?user_code=ABCDEFGH"
+
+    instance._tmux_output = _tmux_output  # type: ignore[method-assign]
+
+    plain = await instance.read()
+    joined = await instance.read(join_wrapped=True)
+
+    assert calls[0] == ("capture-pane", "-t", instance.tmux_target, "-p")
+    assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
+    assert plain["screen"] == joined["screen"]
+    assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]

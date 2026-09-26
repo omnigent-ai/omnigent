@@ -1586,6 +1586,41 @@ def test_run_turn_surfaces_recorded_startup_error(
     assert sleep_calls == 0
 
 
+def test_run_turn_surfaces_coded_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A startup record with a semantic code is surfaced as written, with its
+    code, title and remediation, instead of behind the generic "thread never
+    started" prefix. The runner phrased it for the user already.
+    """
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    write_bridge_startup_error(
+        tmp_path,
+        "Codex is waiting for a sign-in in this session's terminal.",
+        code="databricks_sign_in_pending",
+        title="Codex is waiting for a sign-in",
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "hello")
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.message == "Codex is waiting for a sign-in in this session's terminal."
+    assert error.code == "databricks_sign_in_pending"
+    assert error.title == "Codex is waiting for a sign-in"
+    assert error.remediation is not None
+    assert "HQ7M-2KPD" in error.remediation
+
+
 def test_bridge_state_wait_preserves_legacy_and_configured_command_contracts(
     tmp_path: Path,
 ) -> None:

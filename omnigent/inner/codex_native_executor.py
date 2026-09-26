@@ -24,10 +24,12 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
+    CodexStartupFailure,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     mcp_startup_waiting_detail,
     read_bridge_startup_error,
+    read_bridge_startup_failure,
     read_bridge_startup_timeout,
     read_bridge_state,
     read_mcp_startup,
@@ -510,6 +512,7 @@ class CodexNativeExecutor(Executor):
                 )
 
         error_msg: str | None = None
+        startup_failure: CodexStartupFailure | None = None
         while True:
             if state is None:
                 (
@@ -560,8 +563,17 @@ class CodexNativeExecutor(Executor):
                             max_wait_seconds = extended_wait_seconds
                             startup_timeout_observed = True
                             continue
+                    # A record with a semantic code is user-facing as written: the
+                    # runner already phrased the cause and the next step.
+                    startup_failure = (
+                        read_bridge_startup_failure(self._bridge_dir) if startup_error else None
+                    )
+                    if startup_failure is not None and not startup_failure.code:
+                        startup_failure = None
                     error_msg = (
-                        f"Codex native thread never started: {startup_error}"
+                        startup_failure.message
+                        if startup_failure is not None
+                        else f"Codex native thread never started: {startup_error}"
                         if startup_error
                         else "Codex native bridge state is missing"
                     )
@@ -624,7 +636,12 @@ class CodexNativeExecutor(Executor):
                         await client.close()
             break
         if error_msg is not None:
-            yield ExecutorError(message=error_msg)
+            yield ExecutorError(
+                message=error_msg,
+                code=startup_failure.code if startup_failure is not None else None,
+                title=startup_failure.title if startup_failure is not None else None,
+                remediation=startup_failure.remediation if startup_failure is not None else None,
+            )
         else:
             yield TurnComplete(response=None)
 

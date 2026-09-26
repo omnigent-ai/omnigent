@@ -349,12 +349,22 @@ class ExecutorError(ExecutorEvent):
     :param preserve_session: The executor is idle and safe to reuse after this
         failure. Set only when no prompt or tool work remains in progress.
         Defaults to ``False`` so failed turns receive normal teardown.
+    :param code: Semantic failure code the turn error should carry, e.g.
+        ``"databricks_sign_in_pending"``. ``None`` lets the harness adapter
+        fall back to its generic classification of the failure.
+    :param title: Short headline for the error card, e.g. ``"Codex is waiting
+        for a sign-in"``, or ``None``.
+    :param remediation: Concrete next step for the user, e.g. the sign-in link
+        and code, or ``None``.
     """
 
     message: str
     retryable: bool = False
     usage: ExecutorUsage | None = None
     preserve_session: bool = False
+    code: str | None = None
+    title: str | None = None
+    remediation: str | None = None
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:

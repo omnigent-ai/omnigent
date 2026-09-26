@@ -17,6 +17,7 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
+    ClaudeSignInPending,
     ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
     cancellable_injection,
@@ -272,6 +273,20 @@ class ClaudeNativeExecutor(Executor):
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
             yield ExecutorError(message=message)
+            return
+        except ClaudeSignInPending as exc:
+            # The pane is parked on a launcher sign-in the person finishes from
+            # the card's link; reaping it would destroy that prompt.
+            _logger.warning(
+                "claude-native: launcher sign-in pending; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=str(exc),
+                code=exc.code,
+                title=exc.title,
+                remediation=exc.remediation,
+            )
             return
         except RuntimeError as exc:
             _logger.exception(

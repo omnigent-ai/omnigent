@@ -16,6 +16,7 @@ from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
+    ClaudeSignInPending,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
@@ -1650,6 +1651,57 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "waiting for an answer" in events[0].message
+
+
+@pytest.mark.asyncio
+async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A launcher sign-in prompt fails the turn with the link and leaves the pane.
+
+    The person signs in from the card's link and the launcher continues into
+    Claude Code on its own; reaping the pane would destroy that prompt. The
+    error carries the semantic code, headline and next step.
+    """
+    bridge_dir = tmp_path / "bridge"
+    killed: list[Path] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudeSignInPending(
+            "Claude Code is waiting for a sign-in in this session's terminal, "
+            "so the message was not delivered.",
+            title="Claude Code is waiting for a sign-in",
+            remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == []
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.code == "databricks_sign_in_pending"
+    assert error.title == "Claude Code is waiting for a sign-in"
+    assert error.remediation is not None
+    assert "HQ7M-2KPD" in error.remediation
 
 
 @pytest.mark.asyncio
