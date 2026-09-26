@@ -277,7 +277,32 @@ _USER_CONFIG_KEYS = frozenset(
     }
 )
 
-_HERMES_HOME_SUBDIR = "hermes_home"
+_PROFILE_PREFIX = "omnigent-"
+
+
+def user_hermes_root() -> Path:
+    """The user's Hermes root: ``$HERMES_HOME`` (its root if a profile), else ``~/.hermes``."""
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    if not raw:
+        return Path.home() / ".hermes"
+    home = Path(raw).expanduser()
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
+def hermes_profile_home(name: str) -> Path:
+    """A per-session ``HERMES_HOME`` as a Hermes profile of the user's install.
+
+    Hermes scopes its managed runtimes, dependency state and launchers to the
+    root that owns ``HERMES_HOME``. A home outside the user's root is a separate
+    install: the first launch rebuilds every runtime (minutes) and republishes
+    the shared launchers into that home. A profile shares the root's install.
+    """
+    return user_hermes_root() / "profiles" / f"{_PROFILE_PREFIX}{name}"
+
+
+def hermes_home_for_bridge_dir(bridge_dir: Path) -> Path:
+    """The per-session ``HERMES_HOME`` paired with *bridge_dir*."""
+    return hermes_profile_home(bridge_dir.name)
 
 
 def _load_user_hermes_config() -> _ConfigObject:
@@ -329,17 +354,17 @@ def write_policy_hook_config(
     only ``bridge.json`` + the relay's ``tool_relay.json``) is the rendezvous
     the runner and ``serve-mcp`` agree on, while ``hermes_home`` may be a
     private tempdir so the copied ``.env`` / ``auth.json`` never land on the
-    predictable path. Defaults to ``bridge_dir/hermes_home`` when unset.
+    predictable path. Defaults to :func:`hermes_home_for_bridge_dir` when unset.
 
     :param bridge_dir: Per-session bridge dir (runner<->serve-mcp rendezvous).
     :param server_url: Omnigent server base URL.
     :param session_id: Omnigent session / conversation ID.
     :param hermes_home: Where to write the credential-bearing home. ``None``
-        places it under ``bridge_dir``.
+        uses the session's Hermes profile (:func:`hermes_home_for_bridge_dir`).
     :returns: The HERMES_HOME path.
     """
     if hermes_home is None:
-        hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
+        hermes_home = hermes_home_for_bridge_dir(bridge_dir)
     _ensure_dir(bridge_dir)
     # Owner-only: the home holds the copied .env / auth.json credentials and the
     # token-bearing hook wrapper.
@@ -440,7 +465,7 @@ def inject_relay_into_policy_hook(
 
     :returns: ``True`` when the wrapper existed and was rewritten.
     """
-    hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
+    hermes_home = hermes_home_for_bridge_dir(bridge_dir)
     wrapper = hermes_home / "omnigent-policy-hook.sh"
     if not wrapper.is_file():
         return False
@@ -519,7 +544,7 @@ def read_hermes_home(bridge_dir: Path) -> Path | None:
     :param bridge_dir: Per-session bridge dir.
     :returns: The HERMES_HOME path, or ``None`` if it doesn't exist.
     """
-    hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
+    hermes_home = hermes_home_for_bridge_dir(bridge_dir)
     if hermes_home.is_dir():
         return hermes_home
     return None
@@ -686,7 +711,7 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
 def _state_db_path(bridge_dir: Path) -> Path | None:
     """Resolve the Hermes ``state.db`` this session writes to, for delivery checks.
 
-    Prefers the per-session ``HERMES_HOME`` under *bridge_dir* (created by
+    Prefers the per-session ``HERMES_HOME`` paired with *bridge_dir* (created by
     :func:`write_policy_hook_config` and passed to the TUI as ``HERMES_HOME``),
     then ``$HERMES_HOME``, then the default ``~/.hermes``. Returns the EXPECTED
     path even if the file does not exist yet — on a fresh session Hermes creates
@@ -697,7 +722,7 @@ def _state_db_path(bridge_dir: Path) -> Path | None:
         per-session home, no ``$HERMES_HOME``, no ``~/.hermes`` dir) — the caller
         then skips delivery confirmation and falls back to best-effort delivery.
     """
-    home = bridge_dir / _HERMES_HOME_SUBDIR
+    home = hermes_home_for_bridge_dir(bridge_dir)
     if home.is_dir():
         return home / "state.db"
     env_home = os.environ.get("HERMES_HOME", "").strip()

@@ -14,6 +14,14 @@ import pytest
 from omnigent.harnesses.hermes_native import bridge as b
 
 
+@pytest.fixture(autouse=True)
+def _hermes_root(tmp_path, monkeypatch) -> Path:
+    """Per-session homes are profiles of the user's Hermes root; keep that root in tmp."""
+    root = tmp_path / "hermes-root"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    return root
+
+
 def test_bridge_dir_is_per_session_and_under_root() -> None:
     d1 = b.bridge_dir_for_session_id("conv_a")
     d2 = b.bridge_dir_for_session_id("conv_b")
@@ -151,9 +159,9 @@ def test_state_db_path_prefers_per_session_home(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path / "nohome"))
     assert b._state_db_path(tmp_path) is None
-    # Per-session HERMES_HOME under the bridge dir wins, even before state.db exists.
-    home = tmp_path / b._HERMES_HOME_SUBDIR
-    home.mkdir()
+    # The session's own HERMES_HOME wins, even before state.db exists.
+    home = b.hermes_home_for_bridge_dir(tmp_path)
+    home.mkdir(parents=True)
     assert b._state_db_path(tmp_path) == home / "state.db"
 
 
@@ -282,7 +290,9 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
 
     hermes_home = b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "session-123")
 
-    assert hermes_home == bridge_dir / "hermes_home"
+    # A profile of the user's Hermes root, so it shares the root's install.
+    assert hermes_home == b.hermes_home_for_bridge_dir(bridge_dir)
+    assert hermes_home.parent == b.user_hermes_root() / "profiles"
     assert hermes_home.is_dir()
 
     # Wrapper shell script exists and is owner-only (it bakes a one-shot auth
@@ -396,8 +406,9 @@ def test_write_policy_hook_config_merges_user_model(tmp_path, monkeypatch) -> No
 
 
 def test_read_hermes_home_returns_path_when_exists(tmp_path) -> None:
-    (tmp_path / "hermes_home").mkdir()
-    assert b.read_hermes_home(tmp_path) == tmp_path / "hermes_home"
+    home = b.hermes_home_for_bridge_dir(tmp_path)
+    home.mkdir(parents=True)
+    assert b.read_hermes_home(tmp_path) == home
 
 
 def test_read_hermes_home_returns_none_when_missing(tmp_path) -> None:
@@ -411,7 +422,7 @@ def test_build_spawn_env_includes_hermes_home_when_policy_written(tmp_path, monk
     b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "test-session")
 
     env = b.build_hermes_native_spawn_env("test-session")
-    assert env["HERMES_HOME"] == str(bridge_dir / "hermes_home")
+    assert env["HERMES_HOME"] == str(b.hermes_home_for_bridge_dir(bridge_dir))
 
 
 def test_build_spawn_env_no_hermes_home_without_policy(tmp_path, monkeypatch) -> None:
@@ -529,11 +540,11 @@ def test_inject_relay_into_policy_hook_rewrites_wrapper(tmp_path: Path) -> None:
     wrapper.chmod(0o700)
 
     bridge_dir = tmp_path
-    # put hermes_home under bridge_dir/_HERMES_HOME_SUBDIR
+    # the session's HERMES_HOME (a profile of the user's Hermes root)
     import omnigent.harnesses.hermes_native.bridge as _b
 
-    (bridge_dir / _b._HERMES_HOME_SUBDIR).mkdir(parents=True, exist_ok=True)
-    real_wrapper = bridge_dir / _b._HERMES_HOME_SUBDIR / "omnigent-policy-hook.sh"
+    _b.hermes_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
+    real_wrapper = _b.hermes_home_for_bridge_dir(bridge_dir) / "omnigent-policy-hook.sh"
     real_wrapper.write_text("#!/bin/sh\n")
     real_wrapper.chmod(0o700)
 
@@ -562,3 +573,16 @@ def test_inject_relay_into_policy_hook_returns_false_when_wrapper_absent(
     from omnigent.harnesses.hermes_native.bridge import inject_relay_into_policy_hook
 
     assert inject_relay_into_policy_hook(tmp_path, "http://x", "tok", "http://ap", "sid") is False
+
+
+def test_user_hermes_root_of_a_profile_home_is_its_root(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "root" / "profiles" / "work"))
+    assert b.user_hermes_root() == tmp_path / "root"
+    monkeypatch.delenv("HERMES_HOME")
+    monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path / "home"))
+    assert b.user_hermes_root() == tmp_path / "home" / ".hermes"
+
+
+def test_session_home_is_a_profile_of_the_user_root(tmp_path, _hermes_root) -> None:
+    home = b.hermes_home_for_bridge_dir(tmp_path / "abc123")
+    assert home == _hermes_root / "profiles" / "omnigent-abc123"
