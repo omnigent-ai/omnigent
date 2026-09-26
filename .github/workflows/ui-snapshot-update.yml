@@ -125,11 +125,13 @@ jobs:
         # baselines that already pass. Under GitHub Actions, plain compare mode
         # updates only drifting/missing PNGs in place. The first run may therefore
         # fail by design. The second must pass, distinguishing expected baseline
-        # updates from Storybook/index/server/render failures.
+        # updates from Storybook/index/server/render failures. The first run
+        # allows size drift so a story whose captured surface changed size is
+        # rewritten in place too, instead of aborting on the size check.
         run: |
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures \
+            -p no:rerunfailures --ignore-size-diff \
             --ui-skip-build || true
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \

@@ -447,10 +447,8 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-# Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
-# that has produced NO edge at all (no running/waiting/terminal status, no
-# in-flight response) within this window never started — fail it loudly
-# instead of letting the dispatched work wedge forever with no error surfaced.
+# Bound how long a sub-agent dispatch can wait for a start acknowledgment.
+# A timeout reports uncertain launch status, not proof that the process is dead.
 _SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
 _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
 # Interval for the background sweep in the runner entrypoint.
@@ -2238,9 +2236,9 @@ def reap_stalled_subagent_launches(
     """
     Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
 
-    A child that has produced no edge at all (no running/waiting/terminal
-    status) within the budget never started; without this sweep the dispatched
-    work wedges forever and the parent is never told. Each reaped entry is
+    A dispatch with no running/waiting/terminal status acknowledgment can
+    otherwise remain pending forever. Missing acknowledgment does not prove
+    that the child process never started. Each reaped entry is
     marked ``failed`` and its failure is delivered to the parent inbox through
     ``mark_terminal``.
 
@@ -2275,9 +2273,9 @@ def reap_stalled_subagent_launches(
             entry.child_session_id,
             status="failed",
             output=(
-                f"Error: sub-agent {entry.agent!r} title {entry.title!r} produced no "
-                f"activity within {budget:.0f}s of dispatch; the child session never "
-                "started. The dispatched message was not processed."
+                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
+                f"title {entry.title!r} within {budget:.0f}s of dispatch. "
+                "The child may still be running; inspect its session before retrying."
             ),
         )
         reaped.append(entry)
@@ -2895,6 +2893,11 @@ def create_runner_app(
     app.add_middleware(RunnerLogContextMiddleware)
     mcp_execution_registry = McpExecutionRegistry()
     app.state.mcp_execution_registry = mcp_execution_registry
+
+    # Set as soon as SIGINT/SIGTERM is handled, so a required terminal that
+    # dies with the runner's process group is not reported as a crash.
+    _shutting_down = asyncio.Event()
+    app.state.shutting_down = _shutting_down
 
     from omnigent.runtime import telemetry
 
@@ -3544,6 +3547,19 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        if _shutting_down.is_set():
+            # tmux died with this runner's process group on a stop signal, not
+            # a crash; the server settles the turn from the dropped tunnel.
+            _logger.info(
+                "required terminal %s exited for %s while the runner is shutting down; "
+                "not failing the turn",
+                event.terminal_name,
+                event.session_id,
+                extra={"session_id": event.session_id},
+            )
+            _release_required_terminal_session(event.session_id)
+            return
+
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
@@ -3910,6 +3926,7 @@ def create_runner_app(
         resolver_cwd = await _session_runtime_cwd(conversation_id)
         try:
             effective_harness, spawn_env = await _resolve_harness_config(
+                resource_registry=resource_registry,
                 agent_id=resolver_agent_id,
                 spec_resolver=spec_resolver,
                 session_id=conversation_id,
@@ -3924,6 +3941,7 @@ def create_runner_app(
             resolver_harness = generator_spec.resolver_harness or effective_harness
             if resolver_harness != effective_harness:
                 resolved_harness, spawn_env = await _resolve_harness_config(
+                    resource_registry=resource_registry,
                     agent_id=resolver_agent_id,
                     spec_resolver=spec_resolver,
                     session_id=conversation_id,
@@ -4139,12 +4157,12 @@ def create_runner_app(
             # The session's override outranks the spec: resolving from the spec
             # alone made init spawn a harness the turns never ask for, evicting
             # the override's live subprocess (entries are keyed by conversation).
-            harness_name = (
+            raw_harness = (
                 _session_harness_overrides.get(session_id)
                 or spec.executor.config.get("harness")
                 or spec.executor.type
             )
-            harness_name = canonicalize_harness(harness_name) or harness_name
+            harness_name = canonicalize_harness(raw_harness) or raw_harness
 
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
             if _start_verdict is not None:
@@ -4186,14 +4204,22 @@ def create_runner_app(
                 if init_context.envelope is not None
                 else await _fetch_session_model_override(session_id)
             )
-            spawn_env = _build_spawn_env_from_spec(
-                spec,
-                harness_name,
-                workdir=_resolved_spec_workdir(spec_entry),
-                cwd=await _session_runtime_cwd(session_id),
-                session_id=session_id,
-                model_override=_model_override,
-            )
+            try:
+                spawn_env = _build_spawn_env_from_spec(
+                    spec,
+                    raw_harness,
+                    workdir=_resolved_spec_workdir(spec_entry),
+                    cwd=await _session_runtime_cwd(session_id),
+                    session_id=session_id,
+                    model_override=_model_override,
+                    resource_registry=resource_registry,
+                )
+            except OmnigentError as exc:
+                # The relay also needs the failure when init precedes the first turn.
+                _publish_turn_status(
+                    session_id, "failed", error={"code": exc.code, "message": str(exc)}
+                )
+                raise
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
                     harness_name,
@@ -4867,6 +4893,9 @@ def create_runner_app(
             )
         has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
         status = "running" if has_turn else "idle"
+        # A failed setup has no active turn; retain its failure in server status probes.
+        if not has_turn and _native_pane_status.get(session_id) == "failed":
+            status = "failed"
         agent_id = _session_agent_ids.get(session_id)
         if agent_id is None:
             # An agent-cache reset retires the binding while the session
@@ -5669,9 +5698,7 @@ def create_runner_app(
         """
         if not harness_override or harness_override == "auto":
             return
-        _session_harness_overrides[conv_id] = (
-            canonicalize_harness(harness_override) or harness_override
-        )
+        _session_harness_overrides[conv_id] = harness_override
 
     def _session_harness_name(conv_id: str) -> str | None:
         # The override wins: a routed session runs the harness the server
@@ -5681,7 +5708,7 @@ def create_runner_app(
         # the parent inbox (the native path that owes it never ran).
         override = _session_harness_overrides.get(conv_id)
         if override is not None:
-            return override
+            return canonicalize_harness(override) or override
         spec = _session_spec_cache.get(conv_id)
         if spec is None:
             return None
@@ -8625,6 +8652,7 @@ def create_runner_app(
             _session_spec_cache[conv] = cached_spec_entry
 
         harness_name: str | None = None
+        raw_harness: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
         _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
@@ -8634,13 +8662,13 @@ def create_runner_app(
             # per-event harness_override, so resolving from the body alone
             # dropped a later turn back onto the spec's harness and evicted
             # the override harness mid-session.
-            h = (
+            raw_harness = (
                 _session_harness_overrides.get(conv)
                 or cast(str | None, msg_body.get("harness_override"))
                 or cached_spec.executor.config.get("harness")
                 or cached_spec.executor.type
             )
-            harness_name = canonicalize_harness(h) or h
+            harness_name = canonicalize_harness(raw_harness) or raw_harness
 
         if conv not in _session_histories:
             _session_histories[conv] = (
@@ -8650,11 +8678,12 @@ def create_runner_app(
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
-                cast(str, harness_name),
+                cast(str, raw_harness),
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
+                resource_registry=resource_registry,
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
@@ -8789,6 +8818,7 @@ def create_runner_app(
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
+                        os_env_schema_only=True,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -9019,6 +9049,7 @@ def create_runner_app(
             _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
                 harness_name, spawn_env = await _resolve_harness_config(
+                    resource_registry=resource_registry,
                     agent_id=_agent_id,
                     spec_resolver=spec_resolver,
                     session_id=conv_id,
@@ -9041,6 +9072,49 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
                     },
                 )
+        from omnigent.sandbox.copy_on_write import (
+            SHARED_ENVIRONMENT_VAR,
+            export_shared_environment,
+            has_copy_on_write,
+            validate_copy_on_write_harness,
+        )
+
+        stream_spec = _unwrap_resolved_spec(_session_spec_cache.get(conv_id))
+        if stream_spec is None and _ds_agent_id and spec_resolver is not None:
+            try:
+                stream_spec = _unwrap_resolved_spec(await spec_resolver(_ds_agent_id, conv_id))
+            except (OmnigentError, httpx.HTTPError, RuntimeError):
+                stream_spec = None
+        if has_copy_on_write(
+            getattr(stream_spec, "os_env", None)
+        ) or resource_registry.uses_copy_on_write(conv_id):
+            if stream_spec is None:
+                return JSONResponse(
+                    status_code=503, content={"error": "copy_on_write session spec unavailable"}
+                )
+            try:
+                validate_copy_on_write_harness(stream_spec.os_env, harness_name)
+                environment = resource_registry.resolve_environment(
+                    conv_id, DEFAULT_ENVIRONMENT_ID, stream_spec
+                )
+                policy = getattr(environment, "sandbox", None)
+                if policy is None:
+                    raise ValueError("copy_on_write requires a local sandbox environment")
+                environment.prepare_sandbox(policy)
+                spawn_env = dict(spawn_env or {})
+                spawn_env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
+            except ValueError as exc:
+                _logger.warning("copy_on_write setup failed for %s", conv_id, exc_info=True)
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "copy_on_write_setup_failed",
+                        "detail": _client_safe_error_detail(exc, context="copy_on_write setup"),
+                        "hint": "Use executor.harness=openai-agents; start a new session after "
+                        "changing copy_on_write paths.",
+                    },
+                )
+
         if spawn_env is None:
             spawn_env = await _resolve_native_spawn_env(
                 harness_name,
@@ -13190,7 +13264,10 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
-        from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
+        from omnigent.native.native_cost_popup import (
+            _tmux_last_client_input_at,
+            _tmux_window_activity_at,
+        )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,
@@ -13221,8 +13298,18 @@ def create_runner_app(
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
                 return True
-            clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
-            if clients:
+            # An attached viewer alone does not spare the pane (a tab left open
+            # overnight kept idle native stacks resident). Count it only when a
+            # human drove it recently: a CLI keypress, or any web-bridge event.
+            input_at = await asyncio.to_thread(
+                _tmux_last_client_input_at, str(pane.socket_path), "main"
+            )
+            if input_at is not None and time.time() - input_at < PANE_OUTPUT_BUSY_WINDOW_S:
+                return True
+            instance = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+            if instance is not None and instance.client_interaction_within(
+                PANE_OUTPUT_BUSY_WINDOW_S
+            ):
                 return True
             # Primary evidence: tmux stamps window_activity on every byte the
             # pane emits, so a producing terminal stays busy even when the
@@ -13310,6 +13397,7 @@ async def _resolve_harness_config(
     harness_override: str | None = None,
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -13359,15 +13447,18 @@ async def _resolve_harness_config(
                 else:
                     spec = _unwrap_resolved_spec(sub_entry)
                     workdir = _resolved_spec_workdir(sub_entry)
-            harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
-            harness = canonicalize_harness(harness) or harness
+            raw_harness = (
+                harness_override or spec.executor.config.get("harness") or spec.executor.type
+            )
+            harness = canonicalize_harness(raw_harness) or raw_harness
             spawn_env = _build_spawn_env_from_spec(
                 spec,
-                harness,
+                raw_harness,
                 cwd=cwd,
                 workdir=workdir,
                 model_override=model_override,
                 session_id=session_id,
+                resource_registry=resource_registry,
             )
             return harness, spawn_env
 
@@ -13484,11 +13575,12 @@ def _build_spawn_env_from_spec(
     workdir: Path | None = None,
     model_override: str | None = None,
     session_id: str | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
     :param spec: The resolved agent spec.
-    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
+    :param harness: Requested harness, including any ``acp:<slug>`` selection.
     :param cwd: Runtime working directory for harnesses that need it.
     :param workdir: Bundle workdir, threaded to the builders.
     :param session_id: Session/conversation id, used to hand the harness
@@ -13505,9 +13597,19 @@ def _build_spawn_env_from_spec(
     """
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
-    # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    # the concrete agent's slug must also reach the command and model resolvers.
     requested_harness = harness
     harness = canonicalize_harness(harness) or harness
+    if requested_harness.startswith("acp:"):
+        spec = dataclasses.replace(
+            spec,
+            executor=dataclasses.replace(
+                spec.executor, config={**spec.executor.config, "harness": requested_harness}
+            ),
+        )
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(getattr(spec, "os_env", None), harness)
     effective_spec = spec
     from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
 
@@ -13628,6 +13730,28 @@ def _build_spawn_env_from_spec(
 
         env = strip_desktop_session_env(env)
         env.update(desktop_session_passthrough(effective_spec.os_env))
+
+    if (
+        env is not None
+        and spec.os_env is not None
+        and spec.os_env.sandbox is not None
+        and any(p.copy_on_write for p in spec.os_env.sandbox.write_path_specs)
+    ):
+        if resource_registry is None or session_id is None:
+            raise ValueError("copy_on_write harnesses require a session resource registry")
+        from omnigent.sandbox.copy_on_write import (
+            SHARED_ENVIRONMENT_VAR,
+            export_shared_environment,
+        )
+
+        environment = resource_registry.resolve_environment(
+            session_id, DEFAULT_ENVIRONMENT_ID, spec
+        )
+        policy = getattr(environment, "sandbox", None)
+        if policy is None:
+            raise ValueError("copy_on_write requires a local sandbox environment")
+        environment.prepare_sandbox(policy)
+        env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
 
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a

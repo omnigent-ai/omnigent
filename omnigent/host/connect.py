@@ -136,10 +136,12 @@ from omnigent.process_logging import (
     env_truthy,
     open_process_log_file,
     process_log_dir,
+    redact_log_text,
     should_log_to_stderr,
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
+    RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
@@ -268,6 +270,16 @@ _LOG_TAIL_MAX_LINES = 15
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
+# The server's 30s send wait handles user feedback; this host check also
+# covers create-time launches and stays inside the 5m triage window.
+_RUNNER_CONNECT_DEADLINE_S = 120.0
+
+
+def _connect_marker_path(log_path: Path) -> Path:
+    """Return this launch's marker path next to its process log."""
+    return log_path.with_suffix(".connected")
+
+
 # Collect adopted children every two seconds. Process discovery runs off-loop;
 # exit-status collection uses nonblocking waits.
 _ORPHAN_REAP_INTERVAL_S = 2.0
@@ -327,6 +339,14 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
         return ""
 
 
+def _redact_log_tail(tail: str) -> str:
+    """Mask credentials before runner-log excerpts reach the API or SPA.
+
+    Reuse the shared redactor, including whitespace-separated credentials.
+    """
+    return redact_log_text(tail, include_whitespace_credentials=True)
+
+
 def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     """Compose the human-readable error for a runner that died.
 
@@ -334,7 +354,9 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     path (for the full log), and the trailing log lines — the part that
     usually holds the traceback or tunnel-rejection message. Without
     this, the cause stays in a file on the host and every consumer just
-    sees a connect timeout.
+    sees a connect timeout. Credential-shaped values in the tail are
+    masked (see :func:`_redact_log_tail`) because the report travels to
+    session viewers, not just host operators.
 
     :param exit_code: The runner process's exit code, e.g. ``1``.
         ``None`` when unknown.
@@ -349,7 +371,7 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     tail = _read_log_tail(log_path)
     if tail.strip():
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
-        message += "\n--- runner log tail ---\n" + "\n".join(lines)
+        message += "\n--- runner log tail ---\n" + _redact_log_tail("\n".join(lines))
     return message
 
 
@@ -1025,11 +1047,17 @@ class _RunnerHandle:
         previous runner (the server rotates the binding token per
         attempt, so the runner id alone can't identify a predecessor).
         ``None`` for frames from servers that predate ``session_id``.
+    :param connect_marker: First-connect marker watched by the host;
+        ``None`` disables the watchdog.
+    :param stop_requested: Suppress diagnostics for intentional stops
+        or superseded launches, even after the exit watcher pops them.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
     session_id: str | None = None
+    connect_marker: Path | None = None
+    stop_requested: bool = False
 
 
 class HostRetryableConnectionError(Exception):
@@ -1192,6 +1220,10 @@ class HostProcess:
         # Warms the zygote at daemon start so the first launch doesn't pay
         # its one-time import; see run().
         self._zygote_prestart_task: asyncio.Task[ZygoteManager | None] | None = None
+        # Warms the store-backed native model catalogs for this daemon's
+        # lifetime. A tunnel reconnect retains successful or in-flight work;
+        # a completed failed attempt may be retried.
+        self._model_options_prewarm_task: asyncio.Task[bool] | None = None
         # Discovery belongs to the daemon so connection retries share one
         # in-flight probe and registration waits for bounded discovery.
         self._capability_init_task: asyncio.Task[None] | None = None
@@ -1899,13 +1931,22 @@ class HostProcess:
             ]
             for rid, handle in superseded:
                 self._runners.pop(rid, None)
+                handle.stop_requested = True
                 self._spawn_superseded_stop(rid, handle, frame.session_id)
         self._runners[runner_id] = _RunnerHandle(
-            proc=proc, log_path=log_path, session_id=frame.session_id or None
+            proc=proc,
+            log_path=log_path,
+            session_id=frame.session_id or None,
+            connect_marker=_connect_marker_path(log_path),
         )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
+        connect_watchdog = asyncio.create_task(
+            self._watch_runner_connect(runner_id, exit_watcher=watcher)
+        )
+        self._watcher_tasks.add(connect_watchdog)
+        connect_watchdog.add_done_callback(self._watcher_tasks.discard)
         _logger.info(
             "Launched runner %s for workspace %s (pid=%d)",
             runner_id,
@@ -1992,6 +2033,8 @@ class HostProcess:
         log_path, log_fh = open_process_log_file("runner", prefix=f"runner-{session_slug}")
         try:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
+            # The runner and host watchdog share this per-launch marker.
+            env[RUNNER_CONNECT_MARKER_ENV_VAR] = str(_connect_marker_path(log_path))
 
             zygote = self._ensure_zygote_started()
             if zygote is not None:
@@ -2113,6 +2156,7 @@ class HostProcess:
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
+        handle.stop_requested = True
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
@@ -2293,13 +2337,20 @@ class HostProcess:
         self._runners.pop(runner_id)
         self._trigger_maintenance("runner_exited")
         if handle.proc.returncode == 0:
-            # A clean exit (code 0) is a graceful shutdown, not a crash — the
-            # idle reaper shutting an inactive runner down, or any orderly
-            # self-exit. Reporting it as host.runner_exited would attach a
-            # scary "runner process exited" error to a session the user only
-            # has to message to reactivate, so stay silent. A non-zero exit
-            # below is a genuine crash and still reports its cause.
-            _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+            never_connected = handle.connect_marker is not None and not await asyncio.to_thread(
+                handle.connect_marker.exists
+            )
+            if not never_connected:
+                # Post-connect code 0 includes graceful idle-reaper exits.
+                _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+                return
+            # Pre-connect code 0 is a failed launch; send its cause to the server.
+            error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+            _logger.info(
+                "Runner %s exited cleanly (code 0) before connecting; reporting exit",
+                runner_id,
+            )
+            await self._report_runner_exit(runner_id, error)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         # A non-zero runner exit is a runner-process fault that blocks the
@@ -2320,6 +2371,44 @@ class HostProcess:
             ),
         )
         await self._report_runner_exit(runner_id, error)
+
+    async def _watch_runner_connect(
+        self, runner_id: str, *, exit_watcher: asyncio.Task[None]
+    ) -> None:
+        """Log one correlated ERROR if a launched runner never connects.
+
+        Wait for exit or the deadline without polling the zygote socket.
+        Intentional stops and superseded launches stay quiet.
+        """
+        handle = self._runners.get(runner_id)
+        if handle is None or handle.connect_marker is None:  # pragma: no cover
+            return
+        await asyncio.wait({exit_watcher}, timeout=_RUNNER_CONNECT_DEADLINE_S)
+        if handle.stop_requested:
+            return
+        if await asyncio.to_thread(handle.connect_marker.exists):
+            return
+        if handle.stop_requested:
+            # A stop may arrive while the marker check runs off-loop.
+            return
+        _logger.error(
+            "Runner %s for session %s never connected its tunnel within "
+            "%.0fs of launch (pid=%d): the runner process is hung, exited "
+            "before connecting, or cannot reach the server. Runner log: %s",
+            runner_id,
+            handle.session_id or "<unknown>",
+            _RUNNER_CONNECT_DEADLINE_S,
+            handle.proc.pid,
+            handle.log_path,
+            extra=debug_event(
+                "runner_never_connected",
+                session_id=handle.session_id,
+                runner_id=runner_id,
+                error_category=ErrorCategory.RUNNER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+            ),
+        )
 
     def _trigger_maintenance(self, reason: str) -> None:
         """Request host-owned cleanup without joining the session path."""
@@ -3072,7 +3161,7 @@ class HostProcess:
             timeout=10.0,
         )
 
-    async def _prewarm_model_options(self) -> None:
+    async def _prewarm_model_options(self) -> bool:
         """
         Fill the on-disk model catalogs for the probing harnesses at boot.
 
@@ -3082,12 +3171,29 @@ class HostProcess:
         same single-flight probe through the shared store instead of
         starting a second one.
 
-        :returns: None. Probe failures are absorbed by the probe wrappers.
+        :returns: Whether both catalogs were available. Probe failures are
+            absorbed by the probe wrappers.
         """
-        await asyncio.gather(
+        results = await asyncio.gather(
             self._probed_codex_model_options(),
             self._probed_claude_model_options(),
             return_exceptions=True,
+        )
+        return all(
+            result is not None and not isinstance(result, BaseException) for result in results
+        )
+
+    def _ensure_model_options_prewarm(self) -> None:
+        """Start or retry the host-owned catalog prewarm when needed."""
+        task = self._model_options_prewarm_task
+        if task is not None:
+            if not task.done():
+                return
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                if task.result():
+                    return
+        self._model_options_prewarm_task = asyncio.create_task(
+            self._prewarm_model_options(), name="host-model-options-prewarm"
         )
 
     async def _probed_codex_model_options(self) -> ModelOptionsResult | None:
@@ -3740,9 +3846,14 @@ class HostProcess:
                 asyncio.to_thread(self._ensure_zygote_started),
                 name="host-zygote-prestart",
             )
-        self._start_capability_discovery()
         backoff = _RECONNECT_BASE_S
         try:
+            # Warm the pre-launch model listings once for the host lifetime so a
+            # first picker or launch can use the shared store instead of waiting
+            # on a harness probe. This is independent of any one server tunnel:
+            # reconnecting must not discard useful cold-start work.
+            self._ensure_model_options_prewarm()
+            self._start_capability_discovery()
             while True:
                 if self._lifecycle_lost.is_set():
                     break
@@ -3908,15 +4019,27 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            model_options_prewarm_task = self._model_options_prewarm_task
+            if model_options_prewarm_task is not None:
+                model_options_prewarm_task.cancel()
             # Stop accepting lifecycle work before draining teardown tasks.
             # Cancelling an in-flight launch retains its shielded spawn in
             # _runner_stop_tasks, so quiescing frame handlers first closes the
             # race where shutdown took an incomplete snapshot of those tasks.
-            await self._quiesce_frame_tasks()
-            await self._drain_runner_stop_tasks()
-            if self._maintenance_janitor is not None:
-                await self._maintenance_janitor.shutdown()
-                self._maintenance_janitor = None
+            try:
+                await self._quiesce_frame_tasks()
+                await self._drain_runner_stop_tasks()
+                if self._maintenance_janitor is not None:
+                    await self._maintenance_janitor.shutdown()
+                    self._maintenance_janitor = None
+            finally:
+                if model_options_prewarm_task is not None:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await model_options_prewarm_task
+                self._model_options_prewarm_task = None
+                from omnigent.models.model_catalog_store import shutdown_catalog_probes
+
+                await shutdown_catalog_probes()
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3937,9 +4060,6 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._capability_init_task
                 self._capability_init_task = None
-            from omnigent.models.model_catalog_store import shutdown_catalog_probes
-
-            await shutdown_catalog_probes()
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4260,14 +4380,13 @@ class HostProcess:
         except Exception as exc:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
+        # A completed failed boot probe gets another best-effort chance only
+        # after registration reaches the server. Keeping this out of the outer
+        # connection-attempt loop avoids repeatedly spawning native probes while
+        # the server is offline. Successful or in-flight work is retained.
+        self._ensure_model_options_prewarm()
         self._ws = ws
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
-        # Warm the pre-launch model listings once a server can actually ask
-        # for them, so the first picker open is served from cache instead of
-        # waiting on a harness probe. Cache-fresh reconnects are a no-op.
-        prewarm_task = asyncio.create_task(
-            self._prewarm_model_options(), name="host-model-options-prewarm"
-        )
         try:
             # Reports raised while disconnected must wait until registration;
             # the server cannot route them before this connection owns the host.
@@ -4305,9 +4424,6 @@ class HostProcess:
                     # _runner_lifecycle_lock in _dispatch_host_frame.
                     self._start_frame_task(ws, raw)
         finally:
-            prewarm_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await prewarm_task
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task

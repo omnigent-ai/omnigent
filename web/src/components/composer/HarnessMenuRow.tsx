@@ -11,7 +11,20 @@ export const HARNESS_MENU_ROW_CLASS_NAME =
 
 export function PickerSectionHeader({ children }: { children: ReactNode }) {
   return (
-    <div className="px-2 py-1 text-xs leading-5 font-normal text-muted-foreground">{children}</div>
+    <div
+      data-harness-menu-section-label=""
+      className="px-2 py-1 text-xs leading-5 font-normal text-muted-foreground"
+    >
+      {children}
+    </div>
+  );
+}
+
+export function HarnessMenuNavigationLabel({ children }: { children: ReactNode }) {
+  return (
+    <span data-harness-menu-navigation-label="" className="flex-1 text-left">
+      {children}
+    </span>
   );
 }
 
@@ -58,7 +71,9 @@ export function HarnessMenuRowContent({
       <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-1 pl-2 text-[13px] leading-5">
         {icon}
         <span className={cn("flex min-w-0 items-center gap-1 text-left", active && "font-medium")}>
-          <span className="truncate">{label}</span>
+          <span data-harness-menu-choice-label="" className="truncate">
+            {label}
+          </span>
           {warning}
         </span>
         {description ? (

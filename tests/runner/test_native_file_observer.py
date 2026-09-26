@@ -72,6 +72,27 @@ def test_notebook_edit_uses_notebook_path() -> None:
     ]
 
 
+def test_codex_apply_patch_maps_each_file_change() -> None:
+    changes = native_file_changes(
+        _payload(
+            tool_name="apply_patch",
+            tool_input={
+                "changes": [
+                    {"path": "/ws/new.py", "kind": {"type": "add"}},
+                    {"path": "/ws/app.py", "kind": {"type": "update"}},
+                    {"path": "/ws/old.py", "kind": {"type": "delete"}},
+                ]
+            },
+            tool_response={},
+        )
+    )
+    assert changes == [
+        NativeFileChange(path="/ws/new.py", operation="created", baseline=None),
+        NativeFileChange(path="/ws/app.py", operation="modified", baseline=None),
+        NativeFileChange(path="/ws/old.py", operation="deleted", baseline=None),
+    ]
+
+
 def test_missing_input_path_falls_back_to_response_file_path() -> None:
     changes = native_file_changes(
         _payload(

@@ -353,12 +353,16 @@ class ExecutorSpec:
         base_url). Carried through so the omnigent spec translator
         can forward it into the child :class:`ExecutorSpec` without
         re-reading raw YAML.
+    :param context_files: Pi context-file discovery override. None uses Pi's default.
+    :param system_prompt_mode: Pi prompt delivery: append (default) or replace its base prompt.
     """
 
     model: str | None = None
     harness: str | None = None
     profile: str | None = None
     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
+    context_files: bool | None = None
+    system_prompt_mode: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +511,46 @@ class CredentialProxySpec:
     databricks: DatabricksProxySpec | None = None
 
 
+@dataclass(frozen=True)
+class WritePathSpec:
+    """A directory write grant, optionally backed by a disposable overlay."""
+
+    path: str
+    copy_on_write: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or not self.path:
+            raise ValueError("write_paths.path must be a non-empty string")
+        if not isinstance(self.copy_on_write, bool):
+            raise ValueError("write_paths.copy_on_write must be a boolean")
+
+
+def parse_write_paths(raw: object) -> list[str | WritePathSpec] | None:
+    """Validate write grants, preserving the existing string shorthand."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError("os_env.sandbox.write_paths must be a list")
+    result: list[str | WritePathSpec] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            WritePathSpec(entry)
+            result.append(entry)
+        elif isinstance(entry, WritePathSpec):
+            result.append(entry)
+        elif isinstance(entry, dict):
+            if set(entry) - {"path", "copy_on_write"}:
+                raise ValueError("write_paths entries only accept path and copy_on_write")
+            path = entry.get("path")
+            copy_on_write = entry.get("copy_on_write", False)
+            if not isinstance(path, str) or not isinstance(copy_on_write, bool):
+                raise ValueError("write_paths requires a string path and boolean copy_on_write")
+            result.append(WritePathSpec(path, copy_on_write))
+        else:
+            raise ValueError("write_paths entries must be path strings or mappings")
+    return result
+
+
 @dataclass
 class OSEnvSandboxSpec:
     """Sandbox configuration for an OS environment."""
@@ -559,7 +603,8 @@ class OSEnvSandboxSpec:
     # the entry cap; the resulting :class:`OSError` names the
     # offending root and the tunables.
     read_paths: list[str] | None = None
-    write_paths: list[str] | None = None
+    write_paths: list[str | WritePathSpec] | None = None
+
     # Per-file write grants. Use this for single files that can't be
     # expressed as a directory write path (e.g. ``~/.claude.json``).
     # The bwrap backend treats each entry as an additional
@@ -740,6 +785,14 @@ class OSEnvSandboxSpec:
     # hard-isolates the network (``linux_bwrap`` / ``darwin_seatbelt``).
     credential_proxy: CredentialProxySpec | None = None
 
+    @property
+    def write_path_specs(self) -> list[WritePathSpec]:
+        """Normalize shorthand and structured grants at the policy boundary."""
+        return [
+            WritePathSpec(entry) if isinstance(entry, str) else entry
+            for entry in parse_write_paths(self.write_paths) or []
+        ]
+
 
 @dataclass
 class OSEnvSpec:
@@ -758,6 +811,14 @@ class OSEnvSpec:
     sandbox: OSEnvSandboxSpec | None = None
     fork: bool = False
     start_in_scratch: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.fork
+            and self.sandbox is not None
+            and any(p.copy_on_write for p in self.sandbox.write_path_specs)
+        ):
+            raise ValueError("os_env.fork cannot be combined with copy_on_write paths")
 
 
 @dataclass
@@ -879,6 +940,7 @@ class AgentDef:
     # translated to an AgentSpec.
     agent_session_sharing: str = "none"
     os_env: OSEnvSpec | None = None
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
     # Materialized agent-bundle root on disk, when known. Used by

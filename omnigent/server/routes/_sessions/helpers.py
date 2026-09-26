@@ -614,6 +614,43 @@ def _announce_session_added(user_id: str | None, session_id: str) -> None:
     )
 
 
+async def _grant_default_public(
+    app_state: Any,
+    permission_store: PermissionStore | None,
+    session_id: str,
+    *,
+    managed: bool,
+    workspace: str | None,
+    host_id: str | None = None,
+) -> None:
+    """Apply the server's default-public-sessions policy to a just-created session.
+
+    Writes the read-only ``__public__`` grant when the admin setting covers this
+    session (see :func:`new_session_starts_public`); a no-op otherwise, and in
+    single-user mode (no permission store). A session bound to a server-managed
+    sandbox host counts as managed even when it didn't request a new sandbox.
+    """
+    from omnigent.server.sharing_settings import (
+        DefaultPublicSessions,
+        default_public_policy,
+        host_is_managed_sandbox,
+        new_session_starts_public,
+    )
+
+    if permission_store is None:
+        return
+    if (
+        not managed
+        and host_id is not None
+        and default_public_policy(app_state) is DefaultPublicSessions.SANDBOX
+    ):
+        managed = host_is_managed_sandbox(getattr(app_state, "host_registry", None), host_id)
+    if not new_session_starts_public(app_state, managed=managed, workspace=workspace):
+        return
+    await asyncio.to_thread(permission_store.ensure_user, RESERVED_USER_PUBLIC)
+    await asyncio.to_thread(permission_store.grant, RESERVED_USER_PUBLIC, session_id, LEVEL_READ)
+
+
 def announce_hosts_changed(user_id: str | None) -> None:
     """
     Push a ``hosts_changed`` event to a user's session-updates streams.
@@ -1928,7 +1965,7 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     :param value: The raw override from the request body, e.g. ``"pi"``
         or the ``"openai-agents-sdk"`` alias. ``None`` means no override.
     :param agent: The bound agent row (already fetched by the caller).
-    :returns: The canonical harness id, or ``None`` when *value* is.
+    :returns: The canonical id, preserving a namespaced ACP selection.
     :raises OmnigentError: ``invalid_input`` for an unknown harness, a
         non-omnigent executor type, or an unloadable agent bundle.
     """
@@ -1946,6 +1983,13 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
         raise OmnigentError(
             f"invalid harness_override: must be one of "
             f"{sorted(OMNIGENT_HARNESSES)}, got {value!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # The runner owns ACP configuration; the server only validates its syntax.
+    namespaced_acp = value.startswith("acp:")
+    if namespaced_acp and not re.fullmatch(r"acp:[a-z0-9]+(?:-[a-z0-9]+)*", value):
+        raise OmnigentError(
+            f"invalid harness_override: invalid ACP agent identifier {value!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     try:
@@ -1966,7 +2010,7 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
             f"declares executor.type {executor_type!r}",
             code=ErrorCode.INVALID_INPUT,
         )
-    return canonical
+    return value if namespaced_acp else canonical
 
 
 def _validated_harness_override_executor_type(agent: Agent) -> None:
@@ -5569,11 +5613,14 @@ class _HostLaunchAttempt:
     :param error: Human-readable failure message from the host, e.g.
         ``"harness 'codex' is not configured on host 'laptop' — run
         `omnigent setup` ..."``; ``None`` when there was no error.
+    :param acknowledged: Whether the host confirmed ``status="launched"``;
+        timeout and lost-connection attempts remain unconfirmed.
     """
 
     runner_id: str
     error_code: str | None = None
     error: str | None = None
+    acknowledged: bool = False
 
 
 async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttempt:
@@ -5840,7 +5887,7 @@ async def _launch_runner_on_host_locked(
                 error_code=result.get("error_code"),
                 error=result.get("error"),
             )
-        return _HostLaunchAttempt(runner_id=new_runner_id)
+        return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 
 
 async def cancel_managed_launch_tasks() -> None:
@@ -11344,6 +11391,7 @@ __all__ = [
     "_forward_session_change_to_runner",
     "_get_runner_client",
     "_get_runner_client_for_resource_access",
+    "_grant_default_public",
     "_handle_advise_models_mcp",
     "_handle_external_session_todos",
     "_handle_mcp_tools_list",

@@ -25,7 +25,9 @@ from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
+    ModelOptionsResult,
     _build_runner_env,
+    _runner_exit_error,
     _RunnerHandle,
     run_host_process,
 )
@@ -68,6 +70,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
+    RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
@@ -82,6 +85,8 @@ from omnigent.runner.identity import (
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 
 pytestmark = pytest.mark.asyncio
+
+_REAL_PREWARM_MODEL_OPTIONS = HostProcess._prewarm_model_options
 
 
 @pytest.fixture(autouse=True)
@@ -114,6 +119,16 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_model_catalog_prewarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host-loop tests from executing installed native harness CLIs."""
+
+    async def _noop(_host: HostProcess) -> bool:
+        return True
+
+    monkeypatch.setattr(HostProcess, "_prewarm_model_options", _noop)
 
 
 @pytest.fixture(autouse=True)
@@ -1474,6 +1489,30 @@ async def test_watch_runner_reports_unexpected_exit(
     assert maintenance_reasons == ["runner_exited"]
 
 
+def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
+    """Redact credentials before exit reports reach the server or SPA."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "boot: starting\n"
+        "OPENAI_API_KEY=sk-live-abc123\n"
+        "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n"
+        "using ghp_0123456789abcdef0123456789abcdef\n"
+        "tunnel rejected: bad frame\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(3, log)
+
+    assert "sk-live-abc123" not in error
+    assert "eyJhbGciOiJIUzI1NiJ9" not in error
+    # Standalone provider-shaped tokens are masked even without a key label.
+    assert "ghp_0123456789abcdef0123456789abcdef" not in error
+    assert "OPENAI_API_KEY=[REDACTED]" in error
+    # Keep the diagnostic cause.
+    assert "tunnel rejected: bad frame" in error
+    assert "code 3" in error
+
+
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1590,13 +1629,271 @@ async def test_watch_runner_silent_on_clean_exit(
         result = await host._handle_launch(frame)
     assert result.status == "launched", result.error
 
+    # The runner connected before exiting — the graceful idle-reaper shape.
+    marker = host._runners[token_bound_runner_id("tok_clean")].connect_marker
+    assert marker is not None
+    marker.touch()
+
     # Let the watcher observe the clean exit and finish.
     await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
-    # A clean (code 0) exit is graceful, not a crash: no report, nothing parked.
+    # A clean (code 0) exit after connecting is graceful, not a crash:
+    # no report, nothing parked.
     assert tunnel.sent == []
     assert host._unreported_exits == {}
     assert maintenance_reasons == ["runner_exited"]
+
+
+async def test_watch_runner_reports_clean_exit_before_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report a clean pre-connect exit as a failed launch."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Exit cleanly before touching the connect marker."""
+        return original_popen(
+            ["sh", "-c", "echo 'boot aborted: nothing to do' >&2; sleep 0.2; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_clean_preconn",
+        binding_token="tok_clean_preconn",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    assert len(tunnel.sent) == 1
+    report = decode_host_frame(tunnel.sent[0])
+    assert isinstance(report, HostRunnerExitedFrame)
+    assert report.runner_id == token_bound_runner_id("tok_clean_preconn")
+    assert "code 0" in report.error
+    assert "boot aborted: nothing to do" in report.error
+
+
+async def _wait_for_error_record(
+    caplog: pytest.LogCaptureFixture, *, timeout_s: float
+) -> list[logging.LogRecord]:
+    """Poll captured logs for ERROR records until timeout."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        if errors:
+            return errors
+        await asyncio.sleep(0.02)
+    return [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+async def test_connect_watchdog_errors_when_runner_never_connects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log a runner- and session-correlated ERROR for a hung launch."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.05)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned_env: dict[str, str] = {}
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Keep a stand-in runner alive without connecting."""
+        spawned_env.update(kwargs.get("env", {}))  # type: ignore[arg-type]
+        return original_popen(
+            ["sleep", "60"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_conn_watch",
+        binding_token="tok_conn_watch",
+        workspace=str(workspace),
+        session_id="conv_conn_watch",
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        errors = await _wait_for_error_record(caplog, timeout_s=5.0)
+
+    runner_id = token_bound_runner_id("tok_conn_watch")
+    # Check the host-to-runner marker handoff.
+    handle = host._runners[runner_id]
+    assert handle.connect_marker is not None
+    assert spawned_env.get(RUNNER_CONNECT_MARKER_ENV_VAR) == str(handle.connect_marker)
+
+    assert errors, "connect watchdog never emitted its ERROR"
+    message = errors[0].getMessage()
+    assert runner_id in message, message
+    assert "conv_conn_watch" in message, message
+    assert "never connected" in message, message
+    _cleanup_host(host)
+
+
+async def test_connect_watchdog_errors_on_silent_pre_connect_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log a clean pre-connect exit without waiting for the deadline."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    # A long deadline distinguishes exit-triggered logging from timeout.
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 60.0)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Exit cleanly before touching the connect marker."""
+        return original_popen(
+            ["sh", "-c", "sleep 0.2; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_conn_exit0",
+        binding_token="tok_conn_exit0",
+        workspace=str(workspace),
+        session_id="conv_conn_exit0",
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        errors = await _wait_for_error_record(caplog, timeout_s=5.0)
+
+    assert errors, (
+        "a clean pre-connect exit must produce the never-connected ERROR "
+        "without waiting out the 60s deadline"
+    )
+    message = errors[0].getMessage()
+    assert token_bound_runner_id("tok_conn_exit0") in message, message
+    assert "conv_conn_exit0" in message, message
+    assert "never connected" in message, message
+    _cleanup_host(host)
+
+
+async def test_connect_watchdog_silent_when_runner_connects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Suppress the watchdog ERROR after a timely tunnel connect."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.15)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Keep a stand-in runner alive."""
+        return original_popen(
+            ["sleep", "60"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_conn_ok",
+        binding_token="tok_conn_ok",
+        workspace=str(workspace),
+        session_id="conv_conn_ok",
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+
+        # Mirror the real tunnel's marker touch.
+        handle = host._runners[token_bound_runner_id("tok_conn_ok")]
+        assert handle.connect_marker is not None
+        handle.connect_marker.touch()
+
+        # Let the deadline pass; the watchdog must stay silent.
+        await asyncio.sleep(0.4)
+
+    assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+    _cleanup_host(host)
+
+
+async def test_connect_watchdog_silent_on_intentional_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Suppress the watchdog ERROR after an intentional stop."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.2)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Keep a stand-in runner alive."""
+        return original_popen(
+            ["sleep", "60"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_conn_stop",
+        binding_token="tok_conn_stop",
+        workspace=str(workspace),
+        session_id="conv_conn_stop",
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+
+        stop_result = await host._handle_stop(
+            HostStopRunnerFrame(
+                request_id="req_conn_stop_2",
+                runner_id=token_bound_runner_id("tok_conn_stop"),
+            )
+        )
+        assert stop_result.status == "stopped"
+
+        # Let the deadline pass; the watchdog must read the pop as intent.
+        await asyncio.sleep(0.5)
+
+    assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+    _cleanup_host(host)
 
 
 async def test_unreported_exit_flushes_after_reconnect(
@@ -2277,6 +2574,247 @@ async def test_run_prewarms_zygote_during_capability_discovery(
         assert not host._capabilities_initialized
     finally:
         await _cancel(run_task)
+
+
+async def test_run_keeps_one_model_catalog_prewarm_across_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog prewarm belongs to the host lifetime, not a tunnel generation."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_started = asyncio.Event()
+    prewarm_cancelled = asyncio.Event()
+    prewarm_calls = 0
+    connect_calls = 0
+    prewarm_cancelled_while_connecting = False
+
+    async def _prewarm() -> None:
+        nonlocal prewarm_calls
+        prewarm_calls += 1
+        prewarm_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            prewarm_cancelled.set()
+
+    async def _connect_and_serve() -> None:
+        nonlocal connect_calls, prewarm_cancelled_while_connecting
+        connect_calls += 1
+        await asyncio.wait_for(prewarm_started.wait(), timeout=1.0)
+        prewarm_cancelled_while_connecting |= prewarm_cancelled.is_set()
+        if connect_calls < 3:
+            raise ConnectionError("test disconnect")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+
+    await host.run()
+
+    assert connect_calls == 3
+    assert prewarm_calls == 1
+    assert not prewarm_cancelled_while_connecting
+    assert prewarm_cancelled.is_set()
+    assert host._model_options_prewarm_task is None
+
+
+async def test_run_does_not_retry_failed_model_catalog_prewarm_while_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection failures do not repeatedly restart native catalog probes."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_calls = 0
+    connect_calls = 0
+
+    async def _prewarm() -> bool:
+        nonlocal prewarm_calls
+        prewarm_calls += 1
+        await asyncio.sleep(0)
+        return False
+
+    async def _connect_and_serve() -> None:
+        nonlocal connect_calls
+        connect_calls += 1
+        task = host._model_options_prewarm_task
+        assert task is not None
+        await task
+        if connect_calls < 3:
+            raise ConnectionError("test disconnect")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+
+    await host.run()
+
+    assert connect_calls == 3
+    assert prewarm_calls == 1
+    assert host._model_options_prewarm_task is None
+
+
+async def test_registration_retries_failed_model_catalog_prewarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed boot probe gets another chance after host registration."""
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+
+    async def _failed_prewarm() -> bool:
+        return False
+
+    first_task = asyncio.create_task(_failed_prewarm())
+    await first_task
+    host._model_options_prewarm_task = first_task
+    prewarm_calls = 0
+
+    async def _successful_prewarm() -> bool:
+        nonlocal prewarm_calls
+        prewarm_calls += 1
+        return True
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _successful_prewarm)
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(_FakeTunnel())  # type: ignore[arg-type]
+
+    retry_task = host._model_options_prewarm_task
+    assert retry_task is not None
+    assert retry_task is not first_task
+    assert await retry_task
+    assert prewarm_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("codex_available", "claude_available", "expected"),
+    [(False, True, False), (True, True, True)],
+)
+async def test_model_catalog_prewarm_requires_both_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+    codex_available: bool,
+    claude_available: bool,
+    expected: bool,
+) -> None:
+    """Only two available catalogs count as a successful prewarm."""
+    host = _make_host_process()
+    available = ModelOptionsResult(models=[], routable_models=[])
+    monkeypatch.setattr(
+        host,
+        "_probed_codex_model_options",
+        AsyncMock(return_value=available if codex_available else None),
+    )
+    monkeypatch.setattr(
+        host,
+        "_probed_claude_model_options",
+        AsyncMock(return_value=available if claude_available else None),
+    )
+
+    assert await _REAL_PREWARM_MODEL_OPTIONS(host) is expected
+
+
+async def test_model_catalog_prewarm_failure_does_not_block_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Best-effort catalog failures do not prevent connection startup."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_finished = asyncio.Event()
+    connection_started = asyncio.Event()
+
+    async def _prewarm() -> None:
+        prewarm_finished.set()
+        raise RuntimeError("catalog unavailable")
+
+    async def _connect_and_serve() -> None:
+        connection_started.set()
+        await asyncio.wait_for(prewarm_finished.wait(), timeout=1.0)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+
+    await host.run()
+
+    assert connection_started.is_set()
+    assert host._model_options_prewarm_task is None
+
+
+async def test_run_cleans_up_model_catalog_prewarm_after_teardown_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Earlier teardown failures cannot skip host-owned prewarm cancellation."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_started = asyncio.Event()
+    prewarm_cancelled = asyncio.Event()
+
+    async def _prewarm() -> bool:
+        prewarm_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            prewarm_cancelled.set()
+
+    async def _connect_and_serve() -> None:
+        await asyncio.wait_for(prewarm_started.wait(), timeout=1.0)
+        raise KeyboardInterrupt
+
+    async def _fail_teardown() -> None:
+        raise RuntimeError("test teardown failure")
+
+    monkeypatch.setattr(host, "_prewarm_model_options", _prewarm)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(host, "_quiesce_frame_tasks", _fail_teardown)
+
+    with pytest.raises(RuntimeError, match="test teardown failure"):
+        await host.run()
+
+    assert prewarm_cancelled.is_set()
+    assert host._model_options_prewarm_task is None
+
+
+async def test_run_cleans_up_model_catalog_prewarm_after_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup failures after prewarm begins still run host-owned cleanup."""
+    host = _make_host_process()
+    host._zygote_disabled = True
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    prewarm_started = asyncio.Event()
+    prewarm_cancelled = asyncio.Event()
+
+    async def _prewarm() -> bool:
+        prewarm_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            prewarm_cancelled.set()
+
+    prewarm_task = asyncio.create_task(_prewarm())
+    await asyncio.wait_for(prewarm_started.wait(), timeout=1.0)
+    host._model_options_prewarm_task = prewarm_task
+
+    def _fail_startup() -> None:
+        raise RuntimeError("test startup failure")
+
+    monkeypatch.setattr(host, "_start_capability_discovery", _fail_startup)
+
+    with pytest.raises(RuntimeError, match="test startup failure"):
+        await host.run()
+
+    assert prewarm_cancelled.is_set()
+    assert prewarm_task.cancelled()
+    assert host._model_options_prewarm_task is None
 
 
 async def test_run_cancels_inflight_capability_discovery_on_shutdown(

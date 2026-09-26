@@ -69,8 +69,8 @@ echo "Rendering + comparing the baselines in the pinned Playwright image ..."
 # compare leaves passing baselines alone and rewrites only the drift. GITHUB_ACTIONS
 # is set so the plugin behaves exactly as the CI gate does: it updates a mismatching
 # baseline IN PLACE (and creates a missing one) under snapshots/. The first run may
-# fail by design on drift; the second must pass, separating baseline updates from
-# render failures. UV_PROJECT_ENVIRONMENT lives in the container (not the mounted
+# fail by design on drift and allows size drift so a resized capture is rewritten
+# too; the second must pass, separating baseline updates from render failures. UV_PROJECT_ENVIRONMENT lives in the container (not the mounted
 # repo) so no root-owned .venv leaks out.
 RENDER_FAILED=false
 if ! "$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
@@ -84,7 +84,7 @@ if ! "$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /wo
     pip install --quiet uv &&
     uv sync --extra all --group test &&
     (uv run pytest tests/e2e_ui/visual -m visual \
-      -p no:rerunfailures --ui-skip-build || true) &&
+      -p no:rerunfailures --ui-skip-build --ignore-size-diff || true) &&
     uv run pytest tests/e2e_ui/visual -m visual \
       -p no:rerunfailures --ui-skip-build
   '; then

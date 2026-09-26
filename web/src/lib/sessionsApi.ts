@@ -116,6 +116,8 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  runner_online?: boolean | null;
+  host_online?: boolean | null;
   /**
    * Whether this session is bound to a dormant managed host the server can
    * wake in place (its sandbox provider supports resume). Read only when the
@@ -319,7 +321,9 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     agentId: wire.agent_id,
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
+    runnerOnline: wire.runner_online ?? undefined,
     hostId: wire.host_id ?? null,
+    hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
     status: wire.status,
@@ -776,7 +780,7 @@ export async function createBundledSession(
  *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
  * @param options.title - Optional title for the new fork.
- * @param options.agentId - Optional built-in agent to switch the fork to
+ * @param options.agentId - Optional agent to switch the fork to
  *   (e.g. fork a Claude-SDK session into Claude Code). Omitted → keep the
  *   source's agent. The server carries model settings (and native
  *   history) across only within the same provider family.
@@ -880,37 +884,37 @@ export async function forkSession(
 }
 
 /**
- * Open a generic side chat by forking the conversation and launching a runner
- * for the fork on the SOURCE's own host — exactly what the per-message Fork
- * button does. This is host-agnostic: it drives on a local host or a managed
- * one, with no managed-sandbox requirement. Codex sessions do NOT use this —
- * they fork in-process via their native `/side` path (prompt-cache-warm) — so
- * this is the generic (non-Codex) create.
+ * Fork a generic side chat in the parent's current working directory.
+ * Hosted sessions launch a separate runner; CLI sessions use their existing
+ * runner, and in-process sessions use normal server dispatch. Codex uses its
+ * native `/side` fork instead.
  *
- * When the source is on a git branch the fork launches in its OWN worktree
- * (`side-chat/<id>`, based on the source branch) so the side chat stays off the
- * parent's working tree; otherwise it launches in the source's workspace.
+ * Like native Codex side chats, these share the parent's workspace. A saved
+ * branch may belong to a previous host and must not be required to send.
  *
  * @param sourceId - The parent conversation to fork, e.g. "conv_abc123".
  * @returns The new side-chat session id.
- * @throws Error when the source has no host/workspace to launch on, or when the
- *   fork / runner launch fails, so the caller can surface it (a toast).
+ * @throws Error when the source is disconnected or the fork / runner launch fails.
  */
 export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
-  const source = await getSession(sourceId);
-  const { hostId, workspace, gitBranch } = source;
-  if (!hostId || !workspace) {
-    // No host/workspace to run on — fail before creating an orphan fork so the
-    // caller shows an error instead of opening a dead tab.
-    throw new Error("This session has no host to run a side chat on.");
+  let source = await getSession(sourceId);
+  if (source.hostResumable && source.hostOnline === false && source.runnerOnline !== true) {
+    await retrySession(sourceId);
+    source = await getSession(sourceId);
+  }
+  const { hostId, workspace, runnerId } = source;
+  const canLaunchOnHost = hostId && workspace && source.hostOnline !== false;
+  const canUseRunner =
+    source.runnerOnline !== false && (runnerId != null || source.runnerOnline === true);
+  if (!canLaunchOnHost && !canUseRunner) {
+    throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
   const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
-  await launchRunner(
-    hostId,
-    fork.id,
-    workspace,
-    gitBranch ? { branchName: `side-chat/${fork.id.slice(-8)}`, baseBranch: gitBranch } : undefined,
-  );
+  if (canLaunchOnHost) {
+    await launchRunner(hostId, fork.id, workspace);
+  } else if (runnerId) {
+    await updateSession(fork.id, { runnerId });
+  }
   return { childSessionId: fork.id };
 }
 

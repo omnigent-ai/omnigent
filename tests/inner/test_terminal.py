@@ -404,6 +404,24 @@ async def test_duplicate_exit_capture_preserves_good_snapshot(
         await asyncio.gather(primary, *([duplicate] if duplicate is not None else []))
 
 
+def test_client_interaction_within_reports_recency(tmp_path: Path) -> None:
+    """
+    No interaction ever reads False; a fresh stamp reads True only inside the window.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert not instance.client_interaction_within(60.0)
+    instance.note_client_interaction()
+    assert instance.client_interaction_within(60.0)
+    assert not instance.client_interaction_within(0.0)
+
+
 def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> None:
     """The exit-diagnostics summary folds in every signal it has."""
     instance = TerminalInstance(

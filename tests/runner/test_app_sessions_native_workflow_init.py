@@ -743,6 +743,9 @@ async def test_ensure_native_terminal_builder_error_returns_500(
     # (the display name "Goose" identifies the runtime, not the raw cause).
     assert "requires the 'goose' CLI" not in body["error"]["message"]
     assert "Goose" in body["error"]["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in body["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -2054,8 +2057,8 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
         name="codex-bundle-agent",
         skills_filter=["codex_e2e_xyz_greet_a3f9c2"],
         executor=ExecutorSpec(
-            config={"harness": "codex", "profile": "test-profile"},
-            model="databricks-gpt-5-4-mini",
+            config={"harness": "codex"},
+            model="gpt-5.4-mini",
         ),
     )
     harness_client = _ScriptedHarnessClient([])

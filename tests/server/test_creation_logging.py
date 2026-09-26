@@ -5,8 +5,39 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from omnigent import debug_logging
+from omnigent.server import creation_logging
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import create_test_agent
+
+
+def test_creation_stage_accumulates_repeated_measurements(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repeated work in one stage is reported as one accumulated duration."""
+    debug_logging.reset_request_audit_attrs()
+    moments = iter([10.0, 10.002, 20.0, 20.003])
+    monkeypatch.setattr(creation_logging.time, "perf_counter", lambda: next(moments))
+
+    with creation_logging.creation_stage("create_persistence_ms"):
+        pass
+    with creation_logging.creation_stage("create_persistence_ms"):
+        pass
+
+    attrs = debug_logging.current_request_audit_attrs()
+    assert float(attrs["create_persistence_ms"]) == pytest.approx(5.0)
+
+
+def test_creation_stage_records_failed_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stage that raises still contributes timing to the request error row."""
+    debug_logging.reset_request_audit_attrs()
+    moments = iter([30.0, 30.004])
+    monkeypatch.setattr(creation_logging.time, "perf_counter", lambda: next(moments))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with creation_logging.creation_stage("create_acl_ms"):
+            raise RuntimeError("boom")
+
+    attrs = debug_logging.current_request_audit_attrs()
+    assert float(attrs["create_acl_ms"]) == pytest.approx(4.0)
 
 
 @pytest.mark.asyncio
@@ -44,6 +75,7 @@ async def test_creation_request_correlation_and_classification(
         assert response.status_code == 201
         assert ends[0]["event_name"] == "session_creation_accepted"
         assert created[0]["session_id"] == response.json()["id"]
+        assert float(ends[0]["attributes"]["create_persistence_ms"]) >= 0
     else:
         assert response.status_code >= 400
         assert ends[0]["event_name"] == "session_creation_failed"

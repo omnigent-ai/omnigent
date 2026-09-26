@@ -71,6 +71,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   terminal_launch_failed: "The agent's terminal couldn't be started on the host.",
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
+  runner_unavailable: "The session's runner isn't connected to the server.",
   connection_error: "The connection to the agent dropped mid-turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
@@ -408,23 +409,47 @@ export function ErrorBanner({
                 >
                   Message
                 </h4>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className="size-6 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  aria-label={
-                    copiedTarget === "message" ? "Error message copied" : "Copy error message"
-                  }
-                  onClick={() => void copy("message", messageText)}
-                  componentId="diagnostics.status.copy"
-                >
-                  {copiedTarget === "message" ? (
-                    <CheckIcon className="size-3.5" aria-hidden="true" />
-                  ) : (
-                    <CopyIcon className="size-3.5" aria-hidden="true" />
-                  )}
-                </Button>
+                <div className="flex items-center gap-1">
+                  {code === "PROVIDER_AUTH_REQUIRED" && remediation ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      className="h-6 gap-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      aria-label={
+                        copiedTarget === "recovery"
+                          ? "Recovery command copied"
+                          : "Copy recovery command"
+                      }
+                      onClick={() => void copy("recovery", remediation)}
+                      componentId="diagnostics.status.recovery_copy"
+                    >
+                      {copiedTarget === "recovery" ? (
+                        <CheckIcon className="size-3.5" aria-hidden="true" />
+                      ) : (
+                        <CopyIcon className="size-3.5" aria-hidden="true" />
+                      )}
+                      Copy command
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="size-6 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label={
+                      copiedTarget === "message" ? "Error message copied" : "Copy error message"
+                    }
+                    onClick={() => void copy("message", messageText)}
+                    componentId="diagnostics.status.copy"
+                  >
+                    {copiedTarget === "message" ? (
+                      <CheckIcon className="size-3.5" aria-hidden="true" />
+                    ) : (
+                      <CopyIcon className="size-3.5" aria-hidden="true" />
+                    )}
+                  </Button>
+                </div>
               </div>
               <div
                 data-testid="error-message-content"

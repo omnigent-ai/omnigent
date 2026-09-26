@@ -143,6 +143,7 @@ def resolve_host_launch(
     host_registry: HostRegistry,
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
+    conversation: Conversation | None = None,
 ) -> HostLaunchTarget:
     """
     Resolve and authorize a host runner launch.
@@ -165,6 +166,8 @@ def resolve_host_launch(
         session-access check for sub-agent parent delegation).
     :param permission_store: Session permission store, or ``None`` to
         skip the session-owner check (auth disabled).
+    :param conversation: Optional authoritative row already loaded for the
+        target session. Its id must match ``session_id``.
     :returns: A :class:`HostLaunchTarget` with the validated host,
         connection, and conversation.
     :raises HTTPException: 404 if the host or session is missing (or the
@@ -185,7 +188,9 @@ def resolve_host_launch(
     if conn is None:
         raise host_absent_error(host)
 
-    conv = conversation_store.get_conversation(session_id)
+    if conversation is not None and conversation.id != session_id:
+        raise HTTPException(status_code=404, detail="session not found")
+    conv = conversation or conversation_store.get_conversation(session_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="session not found")
 
@@ -193,13 +198,16 @@ def resolve_host_launch(
     # session owner may bind one. A non-owner has no owner-level grant
     # and is rejected. 404 (not 403) avoids leaking the existence of
     # other users' sessions.
-    if permission_store is not None and not check_session_access(
-        user_id,
-        session_id,
-        LEVEL_OWNER,
-        permission_store,
-        conversation_store,
-    ):
-        raise HTTPException(status_code=404, detail="session not found")
+    if permission_store is not None:
+        allowed = check_session_access(
+            user_id,
+            session_id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+            conversation=conv,
+        )
+        if not allowed:
+            raise HTTPException(status_code=404, detail="session not found")
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)

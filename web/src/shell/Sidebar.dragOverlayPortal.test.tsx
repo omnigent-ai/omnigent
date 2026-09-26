@@ -215,6 +215,20 @@ describe("session drag preview portal", () => {
     }
   });
 
+  it("groups the project reorder actions under a Move submenu", () => {
+    vi.mocked(useProjects).mockReturnValue({
+      data: [{ id: "project-a", name: "Alpha" }],
+    } as unknown as ReturnType<typeof useProjects>);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("project-actions"), { button: 0 });
+    expect(screen.getByTestId("move-project")).toHaveTextContent("Move");
+    expect(screen.queryByRole("menuitem", { name: "Move up" })).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("move-project"), { key: "ArrowRight" });
+    for (const name of ["Move up", "Move down", "Move to top", "Move to bottom"]) {
+      expect(screen.getByRole("menuitem", { name })).toBeInTheDocument();
+    }
+  });
+
   it("does not intercept Space on a session action as a keyboard drag", () => {
     renderSidebar();
     const button = screen.getByRole("button", { name: "Pin conversation" });

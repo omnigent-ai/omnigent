@@ -323,6 +323,58 @@ async def test_terminal_exit_fails_without_waiting_for_thread_timeout(
     assert startup.close_order == ["client", "app_server", "subagent", "turn"]
 
 
+@pytest.mark.parametrize("capture", [None, "1"])
+async def test_timeout_captures_tui_exit_when_discovery_misses_it(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    startup: _Startup,
+    capture: str | None,
+) -> None:
+    """A timeout whose TUI actually exited records the exit, not just the app-server.
+
+    The app-server stays healthy while the codex client dies; when the
+    discovery wait times out without the exit race catching it, the failure
+    event must still carry the TUI's exit status and flag it as undetected.
+    """
+    if capture is not None:
+        monkeypatch.setenv(_STDERR_ENV, capture)
+    terminal = _exited_terminal(startup.bridge_dir)
+
+    async def pending_thread(*_args: object, **_kwargs: object) -> str:
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    async def timeout_without_detecting_exit(
+        thread_started: object, _terminal: object, **_kwargs: object
+    ) -> str:
+        if asyncio.iscoroutine(thread_started):
+            thread_started.close()
+        raise TimeoutError
+
+    monkeypatch.setattr(forwarder, "wait_for_thread_started", pending_thread)
+    monkeypatch.setattr(
+        orchestration,
+        "_wait_for_codex_thread_or_terminal_exit",
+        timeout_without_detecting_exit,
+    )
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        await asyncio.wait_for(
+            _discover(startup, terminal_instance=terminal, thread_start_timeout_seconds=120),
+            timeout=1,
+        )
+
+    [record] = _failure_records(caplog)
+    assert record.attributes["reason"] == "timeout"
+    assert record.attributes["terminal_exit_status"] == 2
+    assert record.attributes["terminal_exited_undetected"] is True
+    assert record.attributes["terminal_instance_id"] == terminal.diagnostic_id
+    assert record.attributes["app_server_state"] == "running"
+    if capture == "1":
+        assert "unexpected argument '--invalid'" in record.attributes["terminal_last_output"]
+    else:
+        assert "terminal_last_output" not in record.attributes
+
+
 async def test_stale_terminal_exit_does_not_stop_replacement_launch(
     monkeypatch: pytest.MonkeyPatch, startup: _Startup
 ) -> None:

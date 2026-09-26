@@ -45,8 +45,8 @@ directly instead of going through `data_dir()`.
 | `telemetry.json` | Telemetry state, including the persistent `installation_id`. | `omnigent/telemetry/installation_id.py` |
 | `.update_check.json` **†** | Cached result of the (potentially slow) update check. | `omnigent/update_check.py` |
 | `install_ledger.json` | Record of what the installer wrote, used by uninstall/purge. | `omnigent/install_ledger.py` |
-| `admins`, `allowed_domains` | OSS server operator state: admin list and OIDC allowed-domains, co-located so operator-editable files live together. Operator-managed input files — the cited modules read them. | Read by `omnigent/server/admin_list.py`, `omnigent/server/oidc_access.py` |
-| `sharing_mode`, `public_sharing` | Server-side sharing settings. | `omnigent/server/sharing_settings.py` |
+| `admins`, `allowed_domains` | OSS server operator state: admin list and OIDC allowed-domains, co-located so operator-editable files live together. Operator-managed input files — the cited modules read them. A listed identity is promoted to the database admin flag on login (OIDC, accounts) or on first page load (header auth); removing it from `admins` does not revoke that flag, which must be cleared separately. | Read by `omnigent/server/admin_list.py`, `omnigent/server/oidc_access.py` |
+| `sharing_mode`, `public_sharing`, `default_public_sessions` | Server-side sharing settings, written from Settings > Sharing. Each overrides its boot default: `OMNIGENT_SHARING_MODE`, `OMNIGENT_PUBLIC_SHARING` and `OMNIGENT_DEFAULT_PUBLIC_SESSIONS` (`off` / `sandbox` / `all`, which new sessions start with public read access). | `omnigent/server/sharing_settings.py` |
 
 ## Directories
 

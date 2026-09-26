@@ -49,6 +49,7 @@ from .sandbox import (
     create_exec_launcher,
     create_private_tmpdir,
     resolve_sandbox,
+    with_additional_read_roots,
     with_additional_write_roots,
     with_denied_unix_sockets,
 )
@@ -959,6 +960,8 @@ def build_terminal_os_env_spec(
                 "enforcement while egress_rules remain as inert "
                 "decoration on the policy."
             )
+        if any(p.copy_on_write for p in sandbox.write_path_specs):
+            raise ValueError("sandbox_override is not allowed with copy_on_write paths")
         sandbox.type = sandbox_override
         effective_os_env_spec.sandbox = sandbox
 
@@ -1109,6 +1112,20 @@ class TerminalInstance:
         :returns: None.
         """
         self._last_client_interaction_at = time.monotonic()
+
+    def client_interaction_within(self, window_s: float) -> bool:
+        """
+        Whether a web client interacted with this terminal in the last *window_s* seconds.
+
+        Read by the native pane reaper as its "a human is here" signal for
+        browser viewers: tmux cannot see control-mode input, so the bridge's
+        own stamp (:meth:`note_client_interaction`) stands in for it.
+
+        :param window_s: Recency window in seconds, e.g. ``120.0``.
+        :returns: ``True`` when the last interaction is younger than *window_s*;
+            ``False`` when none was ever observed.
+        """
+        return time.monotonic() - self._last_client_interaction_at < window_s
 
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
@@ -1519,13 +1536,20 @@ class TerminalInstance:
         # relay daemon during ``activate_sandbox``; the shell
         # spawned beyond the launcher inherits HTTP_PROXY / CA
         # env vars so its outbound traffic is filtered.
+        host_cwd = effective_cwd
         sandbox_for_launcher: SandboxPolicy | None = self.sandbox_policy
         if sandbox_for_launcher is not None and sandbox_for_launcher.active:
             env = strip_desktop_session_env(env)
             if self.egress_rules:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
-            launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+            if sandbox_for_launcher.copy_on_write_namespace:
+                host_cwd = "/"
+                launcher_path = create_exec_launcher(
+                    cli_path, sandbox_for_launcher, cwd=effective_cwd
+                )
+            else:
+                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
@@ -1583,7 +1607,7 @@ class TerminalInstance:
                         "-y",
                         "24",
                         "-c",
-                        effective_cwd,
+                        host_cwd,
                         inner_str,
                     ],
                     *pane_died_hook,
@@ -2565,6 +2589,7 @@ def create_terminal_instance(
     spec: TerminalEnvSpec,
     *,
     parent_os_env_spec: OSEnvSpec | None = None,
+    parent_environment: OSEnvironment | None = None,
     cwd_override: str | None = None,
     sandbox_override: str | None = None,
     conversation_link: str | None = None,
@@ -2641,7 +2666,19 @@ def create_terminal_instance(
         os_env = create_os_environment(forked_spec)
     else:
         cwd = Path(effective_os_env_spec.cwd or os.getcwd()).resolve()
-        os_env = create_os_environment(effective_os_env_spec)
+        inherited_policy = None
+        if parent_environment is not None and (spec.os_env is None or spec.os_env == "inherit"):
+            inherited_policy = getattr(parent_environment, "sandbox", None)
+            parent_cwd = getattr(parent_environment, "cwd", None)
+            if inherited_policy is not None and parent_cwd is not None:
+                inherited_policy = with_additional_read_roots(inherited_policy, [parent_cwd])
+        os_env = create_os_environment(
+            effective_os_env_spec,
+            sandbox_policy=inherited_policy,
+            copy_on_write_environment=(
+                parent_environment.copy_on_write_environment if parent_environment else None
+            ),
+        )
 
     # Resolve sandbox policy for the terminal process.
     sandbox: SandboxPolicy | None = None
@@ -2650,8 +2687,12 @@ def create_terminal_instance(
     if effective_os_env_spec.sandbox is not None:
         sandbox_spec = effective_os_env_spec.sandbox
         if sandbox_spec.type != "none":
-            sandbox = resolve_sandbox(effective_os_env_spec, cwd)
+            sandbox = getattr(os_env, "sandbox", None) or resolve_sandbox(
+                effective_os_env_spec, cwd
+            )
             if sandbox.active:
+                if os_env is not None:
+                    os_env.prepare_sandbox(sandbox)
                 # Add the private dir to write roots so a forked working
                 # tree (``private_dir/root``) and the instance dir stay
                 # writable inside the pane.

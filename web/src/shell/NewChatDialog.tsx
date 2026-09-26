@@ -19,6 +19,7 @@ import {
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
+  HarnessMenuNavigationLabel,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
@@ -55,13 +56,7 @@ import {
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -90,6 +85,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
@@ -137,12 +133,14 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import { isNavigablePath } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
   WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
   WORKTREE_RADIO_SELECTOR_ROW_CLASS,
   WorktreeRadioRow,
+  worktreeDisplayName,
 } from "./WorktreeRadioRow";
 import {
   initialPrefillState,
@@ -638,7 +636,7 @@ export function composerWorktreeHeaderState({
   if (!worktreesResolved) {
     return {
       repositoryLabel: selectedDirectoryLabel,
-      branchLabel: "Worktree",
+      branchLabel: "None",
       branchDescription: "Worktree status loading",
     };
   }
@@ -647,13 +645,13 @@ export function composerWorktreeHeaderState({
     if (selectedWorktree.detached || selectedWorktree.branch === null) {
       return {
         repositoryLabel,
-        branchLabel: "Detached HEAD",
+        branchLabel: worktreeDisplayName(selectedWorktree.path),
         branchDescription: `Existing detached worktree: ${selectedWorktree.path}`,
       };
     }
     return {
       repositoryLabel,
-      branchLabel: selectedWorktree.branch,
+      branchLabel: worktreeDisplayName(selectedWorktree.path),
       branchDescription: `Existing worktree branch: ${selectedWorktree.branch}`,
     };
   }
@@ -664,14 +662,14 @@ export function composerWorktreeHeaderState({
       : `main repository${selectedWorktree.branch ? ` branch: ${selectedWorktree.branch}` : ""}`;
     return {
       repositoryLabel,
-      branchLabel: "New",
+      branchLabel: "None",
       branchDescription: `Create or select a worktree from ${mainState}`,
     };
   }
 
   return {
     repositoryLabel,
-    branchLabel: "Worktree",
+    branchLabel: "None",
     branchDescription: "Create or select a worktree",
   };
 }
@@ -1708,14 +1706,14 @@ export function AgentHarnessPicker({
       : "Other...";
 
   // Split the agents group: built-in bundle agents (Polly / Debby) stay inline
-  // in the main list; user-registered custom agents fold into a "Custom agents"
+  // in the main list; user-registered custom agents fold into an "Other..."
   // submenu so a long roster doesn't crowd out the recommended picks.
   const { builtins: bundleEntries, customs: customEntries } = useMemo(
     () => partitionAgentsByKind(agentEntries),
     [agentEntries],
   );
 
-  // Existing custom / pending agents fold into a "Custom agents" submenu so a
+  // Existing custom / pending agents fold into an "Other..." submenu so a
   // long roster doesn't crowd the recommended picks. When there are none, the
   // submenu would hold only the create action — which is a poor place to
   // discover it — so we surface "Create custom agent" as a top-level row
@@ -1908,7 +1906,7 @@ export function AgentHarnessPicker({
             className="items-center font-medium"
           >
             <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
-            <span className="truncate">Custom agents</span>
+            <span className="truncate">Other</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {customAgentsBody}
@@ -1930,7 +1928,12 @@ export function AgentHarnessPicker({
                 className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
                 <WandSparklesIcon className="size-4" aria-hidden="true" />
-                <span className="min-w-0 flex-1 truncate text-left">{SMART_ROUTING_LABEL}</span>
+                <span
+                  data-harness-menu-choice-label=""
+                  className="min-w-0 flex-1 truncate text-left"
+                >
+                  {SMART_ROUTING_LABEL}
+                </span>
                 <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
                   Harness + model
                 </span>
@@ -1955,7 +1958,7 @@ export function AgentHarnessPicker({
                     }}
                     className="items-center"
                   >
-                    <span className="flex-1 pl-6 text-left">{otherHarnessLabel}</span>
+                    <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
                   </DropdownMenuItem>
                 ) : (
@@ -1975,7 +1978,7 @@ export function AgentHarnessPicker({
                         }
                       }}
                     >
-                      <span className="flex-1 pl-6 text-left">{otherHarnessLabel}</span>
+                      <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     </DropdownMenuSubTrigger>
                     <HarnessPickerSubContent
                       sideOffset={-4}
@@ -1991,14 +1994,14 @@ export function AgentHarnessPicker({
           {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
           <PickerSectionHeader>Agents</PickerSectionHeader>
           {bundleEntries.map(renderEntry)}
-          {/* Existing custom agents fold into a "Custom agents" submenu (with
+          {/* Existing custom agents fold into an "Other..." submenu (with
             the pending upload and the create action). With no custom agents the
             submenu would hold only "Create custom agent", so we surface that as
             a top-level row instead — otherwise creation is invisible on a fresh
             server. A managed sandbox has no create path, so neither appears. */}
           {hasCustomGroup &&
             (isMobile ? (
-              // Touch: drill into a "Custom agents" page in place (with Back).
+              // Touch: drill into the custom-agent page in place (with Back).
               <DropdownMenuItem
                 data-testid="new-chat-landing-custom-agents"
                 onSelect={(e) => {
@@ -2007,7 +2010,7 @@ export function AgentHarnessPicker({
                 }}
                 className="items-center"
               >
-                <span className="flex-1 pl-6 text-left">Custom agents...</span>
+                <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
               </DropdownMenuItem>
             ) : (
@@ -2017,7 +2020,7 @@ export function AgentHarnessPicker({
                   data-testid="new-chat-landing-custom-agents"
                   className="cursor-pointer items-center"
                 >
-                  <span className="flex-1 pl-6 text-left">Custom agents...</span>
+                  <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 </DropdownMenuSubTrigger>
                 <HarnessPickerSubContent
                   sideOffset={-4}
@@ -3191,6 +3194,7 @@ export function NewChatLandingScreen() {
             id: option.id,
             model: option.model,
             displayName: nativeModelLabel(option),
+            isDefault: option.isDefault,
             source: option.source,
           })),
     [availablePiModels, sandboxSelected, sandboxCatalog],
@@ -3286,7 +3290,7 @@ export function NewChatLandingScreen() {
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ??
-        (sandboxInferenceConfigured ? defaultModelLabel(piModelOptions) : "Default");
+        defaultModelLabel(piModelOptions);
       const thinkingLevelValue = normalizeEffortLabel(pickedEffort);
       return [
         { label: "Model", value: modelValue },
@@ -5773,9 +5777,11 @@ export function NewChatLandingScreen() {
           : `Working directory: ${visibleWorkspace || "Not selected"}`
       }
       title={
-        noExecutionTargetSelected
-          ? "No host selected"
-          : visibleWorkspace || "Working directory not selected"
+        workspacePopoverOpen
+          ? undefined
+          : noExecutionTargetSelected
+            ? "No host selected"
+            : visibleWorkspace || "Working directory not selected"
       }
       disabled={noExecutionTargetSelected || workspaceLoading}
       aria-busy={workspaceLoading || undefined}
@@ -6080,24 +6086,26 @@ export function NewChatLandingScreen() {
                       <div className="my-1 h-px bg-border" />
                     </>
                   )}
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted"
-                    onClick={() => {
-                      setWorkspacePopoverOpen(false);
-                      setWorkspacePickerInitialPath(
-                        isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined,
-                      );
-                      setWorkspacePickerOpen(true);
-                    }}
-                    data-testid="new-chat-landing-workspace-open-folder"
-                  >
-                    <FolderOpenIcon
-                      className="size-4 shrink-0 text-muted-foreground"
-                      data-testid="new-chat-landing-workspace-open-folder-icon"
-                    />
-                    Open folder
-                  </button>
+                  <MenuItem asChild density="compact">
+                    <button
+                      type="button"
+                      className="w-full text-left"
+                      onClick={() => {
+                        setWorkspacePopoverOpen(false);
+                        setWorkspacePickerInitialPath(
+                          isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined,
+                        );
+                        setWorkspacePickerOpen(true);
+                      }}
+                      data-testid="new-chat-landing-workspace-open-folder"
+                    >
+                      <FolderOpenIcon
+                        className="size-4 shrink-0 text-muted-foreground"
+                        data-testid="new-chat-landing-workspace-open-folder-icon"
+                      />
+                      Open folder
+                    </button>
+                  </MenuItem>
                 </PopoverContent>
               </Popover>
               {/* Worktree selection stays a separate real action from the directory picker. */}
@@ -6118,11 +6126,13 @@ export function NewChatLandingScreen() {
                             : visibleWorktreeHeader.branchDescription
                         }
                         title={
-                          noExecutionTargetSelected
-                            ? "No host selected"
-                            : workspaceLoading || worktreeControlAvailable
-                              ? visibleWorktreeHeader.branchDescription
-                              : "Choose a Git working directory to use worktrees"
+                          worktreePopoverOpen
+                            ? undefined
+                            : noExecutionTargetSelected
+                              ? "No host selected"
+                              : workspaceLoading || worktreeControlAvailable
+                                ? visibleWorktreeHeader.branchDescription
+                                : "Choose a Git working directory to use worktrees"
                         }
                         disabled={
                           noExecutionTargetSelected || workspaceLoading || !worktreeControlAvailable
@@ -6143,34 +6153,36 @@ export function NewChatLandingScreen() {
                           role="radiogroup"
                           aria-label="Choose a worktree"
                         >
-                          <label
-                            className={cn(
-                              "flex cursor-pointer items-center gap-2 transition-colors hover:bg-muted focus-within:bg-muted",
-                              WORKTREE_RADIO_SELECTOR_ROW_CLASS,
-                              branchName.trim() === "" && activeWorktree === null && "bg-muted",
-                            )}
-                            data-testid="new-chat-landing-no-worktree-option"
+                          <MenuItem
+                            asChild
+                            active={branchName.trim() === "" && activeWorktree === null}
+                            density="compact"
                           >
-                            <input
-                              type="radio"
-                              name="new-chat-existing-worktree"
-                              checked={branchName.trim() === "" && activeWorktree === null}
-                              onChange={() => {
-                                workspaceFromConfigRef.current = false;
-                                if (activeWorktree !== null && mainWorktree !== null) {
-                                  setWorkspace(mainWorktree.path);
-                                }
-                                setBranchName("");
-                                setAutoSeededBranch("");
-                                setWorktreePopoverOpen(false);
-                              }}
-                              className={cn(
-                                "size-4 shrink-0 accent-primary",
-                                WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
-                              )}
-                            />
-                            <span className="font-medium text-foreground">No worktree</span>
-                          </label>
+                            <label
+                              className={cn("cursor-pointer", WORKTREE_RADIO_SELECTOR_ROW_CLASS)}
+                              data-testid="new-chat-landing-no-worktree-option"
+                            >
+                              <input
+                                type="radio"
+                                name="new-chat-existing-worktree"
+                                checked={branchName.trim() === "" && activeWorktree === null}
+                                onChange={() => {
+                                  workspaceFromConfigRef.current = false;
+                                  if (activeWorktree !== null && mainWorktree !== null) {
+                                    setWorkspace(mainWorktree.path);
+                                  }
+                                  setBranchName("");
+                                  setAutoSeededBranch("");
+                                  setWorktreePopoverOpen(false);
+                                }}
+                                className={cn(
+                                  "size-4 shrink-0 accent-primary",
+                                  WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
+                                )}
+                              />
+                              <span className="font-normal text-foreground">No worktree</span>
+                            </label>
+                          </MenuItem>
                           {linkedWorktrees.length > 0 && (
                             <>
                               <div className="my-1 h-px shrink-0 bg-border" />
@@ -6179,13 +6191,13 @@ export function NewChatLandingScreen() {
                                 data-testid="new-chat-landing-worktree-section"
                               >
                                 <span
-                                  className="shrink-0 px-2 py-1 text-sm leading-5 text-muted-foreground"
+                                  className="shrink-0 px-2 py-1 text-xs font-medium leading-4 text-muted-foreground"
                                   data-testid="new-chat-landing-worktree-heading"
                                 >
                                   Worktrees
                                 </span>
                                 <div
-                                  className="flex min-h-0 max-h-80 flex-1 flex-col overflow-y-auto [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
+                                  className="flex min-h-0 max-h-80 flex-1 flex-col gap-px overflow-y-auto [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
                                   data-testid="new-chat-landing-worktree-dropdown"
                                 >
                                   <TooltipProvider>
@@ -6779,34 +6791,24 @@ export function NewChatLandingScreen() {
               }}
             />
           </form>
-          <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
-            <DialogContent
-              showCloseButton={false}
-              className="max-w-[min(64rem,calc(100vw-2rem))] border-0 bg-transparent p-0 shadow-none sm:max-w-[min(64rem,calc(100vw-2rem))]"
-            >
-              <DialogHeader className="sr-only">
-                <DialogTitle>Select working directory</DialogTitle>
-                <DialogDescription>Choose a folder for the new session.</DialogDescription>
-              </DialogHeader>
-              <WorkspacePicker
-                hostId={selectedHostId}
-                initialPath={workspacePickerInitialPath}
-                onSelect={(path) => {
-                  workspaceFromConfigRef.current = false;
-                  setWorkspace(path);
-                  addRecent(path);
-                  setWorkspacePickerOpen(false);
-                }}
-                onClose={() => setWorkspacePickerOpen(false)}
-                occupancyForPath={
-                  !shouldCreateWorktree
-                    ? (absolutePath) =>
-                        occupancyByDir.get(normalizeWorkspacePath(absolutePath) ?? "") ?? 0
-                    : undefined
-                }
-              />
-            </DialogContent>
-          </Dialog>
+          <WorkspacePickerDialog
+            open={workspacePickerOpen}
+            onOpenChange={setWorkspacePickerOpen}
+            hostId={selectedHostId}
+            initialPath={workspacePickerInitialPath}
+            description="Choose a folder for the new session."
+            onConfirm={(path) => {
+              workspaceFromConfigRef.current = false;
+              setWorkspace(path);
+              addRecent(path);
+            }}
+            occupancyForPath={
+              !shouldCreateWorktree
+                ? (absolutePath) =>
+                    occupancyByDir.get(normalizeWorkspacePath(absolutePath) ?? "") ?? 0
+                : undefined
+            }
+          />
         </div>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {supportsAgySkipPermissions &&
