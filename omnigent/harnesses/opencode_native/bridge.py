@@ -28,7 +28,6 @@ import hashlib
 import json
 import os
 import secrets
-import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -473,19 +472,6 @@ def opencode_db_path_for_bridge_dir(bridge_dir: Path) -> Path:
     return bridge_dir / _OPENCODE_DB_FILE
 
 
-def user_opencode_auth_path() -> Path:
-    """
-    Return the user's real OpenCode ``auth.json`` path (not the per-session one).
-
-    Honors ``XDG_DATA_HOME`` (the runner's own env, which is the user's real
-    data home — the per-session override is set only on the spawned server),
-    defaulting to ``~/.local/share/opencode/auth.json``.
-    """
-    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
-    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
-    return base / "opencode" / "auth.json"
-
-
 def user_opencode_config_path() -> Path | None:
     """
     Return the user's real OpenCode config path (not the per-session one).
@@ -507,35 +493,63 @@ def user_opencode_config_path() -> Path | None:
     return None
 
 
+def _per_session_auth_path(bridge_dir: Path) -> Path:
+    return xdg_data_home_for_bridge_dir(bridge_dir) / "opencode" / "auth.json"
+
+
 def seed_opencode_auth(bridge_dir: Path) -> Path | None:
     """
-    Copy the user's OpenCode ``auth.json`` into the per-session ``XDG_DATA_HOME``.
+    Write the user's OpenCode credentials into the per-session ``auth.json``.
 
-    The runner spawns ``opencode serve`` with a per-session ``XDG_DATA_HOME``
-    that isolates session state — but it also hides the user's
-    ``opencode auth login`` credentials (in their real
-    ``~/.local/share/opencode/auth.json``). Without those, the server can only
-    reach OpenCode's no-auth default model (``opencode/big-pickle``), so a
-    user-selected provider/model never takes effect. Copy the credentials in
-    (best-effort, ``0600``) so the user's providers — and any pinned model that
-    needs them — work. Refreshed on every spawn so re-logins propagate.
+    ``opencode serve`` runs with a per-session ``XDG_DATA_HOME`` and DB. OpenCode 2.x
+    imports ``$XDG_DATA_HOME/opencode/auth.json`` once, when that DB is created, so
+    seed it with the user's legacy ``auth.json`` plus their v2 SQLite credentials
+    (legacy shape; the DB wins on conflicts). Written ``0600``; refreshed each spawn.
 
     :param bridge_dir: Native OpenCode bridge directory.
-    :returns: The destination path written, or ``None`` when there is no
-        source ``auth.json`` or the copy fails.
+    :returns: The written path, or ``None`` when there are no credentials or the write fails.
     """
-    src = user_opencode_auth_path()
-    if not src.is_file():
-        return None
-    dest_dir = xdg_data_home_for_bridge_dir(bridge_dir) / "opencode"
+    from omnigent.onboarding.opencode_auth import opencode_auth_path, stored_v2_credentials
+
+    merged: dict[str, object] = {}
     try:
-        dest_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        dest = dest_dir / "auth.json"
-        shutil.copyfile(src, dest)
-        os.chmod(dest, 0o600)
+        legacy = json.loads(opencode_auth_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        legacy = None
+    if isinstance(legacy, dict):
+        merged.update({str(k): v for k, v in legacy.items() if v})
+    merged.update(stored_v2_credentials())
+    if not merged:
+        return None
+    dest = _per_session_auth_path(bridge_dir)
+    try:
+        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="auth.json.", dir=str(dest.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(merged, handle, sort_keys=True)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, dest)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
     except OSError:
         return None
     return dest
+
+
+def seeded_provider_ids(bridge_dir: Path) -> frozenset[str]:
+    """
+    Return provider ids present in the per-session ``auth.json``.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: Integration ids, empty when nothing was seeded.
+    """
+    try:
+        data = json.loads(_per_session_auth_path(bridge_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(str(k) for k in data) if isinstance(data, dict) else frozenset()
 
 
 def auth_secret_path(bridge_dir: Path) -> Path:

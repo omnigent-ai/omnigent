@@ -331,30 +331,58 @@ def test_spawn_env_bridge_id_override(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert env["HARNESS_OPENCODE_NATIVE_REQUEST_SESSION_ID"] == "conv_abc"
 
 
+def _user_share(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    share = tmp_path / "user-share"
+    (share / "opencode").mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(share))
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+    return share
+
+
 def test_seed_opencode_auth_copies_user_auth(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The user's auth.json is copied into the per-session XDG_DATA_HOME (0600)."""
-    user_data = tmp_path / "user-share"
-    (user_data / "opencode").mkdir(parents=True)
-    (user_data / "opencode" / "auth.json").write_text('{"anthropic": {"type": "api"}}')
-    monkeypatch.setenv("XDG_DATA_HOME", str(user_data))
-
+    share = _user_share(monkeypatch, tmp_path)
+    (share / "opencode" / "auth.json").write_text('{"anthropic": {"type": "api", "key": "k"}}')
     bridge_dir = bridge.prepare_bridge_dir("conv_seed")
     dest = bridge.seed_opencode_auth(bridge_dir)
-    assert dest is not None and dest.is_file()
     assert dest == bridge.xdg_data_home_for_bridge_dir(bridge_dir) / "opencode" / "auth.json"
-    assert "anthropic" in dest.read_text()
+    assert json.loads(dest.read_text()) == {"anthropic": {"type": "api", "key": "k"}}
     assert (os.stat(dest).st_mode & 0o777) == 0o600
+    assert bridge.seeded_provider_ids(bridge_dir) == frozenset({"anthropic"})
+
+
+def test_seed_opencode_auth_merges_v2_db_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """v2-only logins live in SQLite; they are written in legacy shape so the
+    per-session DB's one-time import picks them up."""
+    share = _user_share(monkeypatch, tmp_path)
+    (share / "opencode" / "auth.json").write_text(
+        '{"anthropic": {"type": "api", "key": "stale"}, "groq": {"type": "api", "key": "g"}}'
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.opencode_auth.stored_v2_credentials",
+        lambda db_path=None: {"anthropic": {"type": "api", "key": "fresh"}},
+    )
+    bridge_dir = bridge.prepare_bridge_dir("conv_merge")
+    dest = bridge.seed_opencode_auth(bridge_dir)
+    assert dest is not None
+    assert json.loads(dest.read_text()) == {
+        "anthropic": {"type": "api", "key": "fresh"},
+        "groq": {"type": "api", "key": "g"},
+    }
 
 
 def test_seed_opencode_auth_noop_without_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No user auth.json → no-op (returns None), e.g. on a remote runner."""
+    """No auth.json and no v2 DB → None (e.g. on a remote runner)."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "empty-share"))
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
     bridge_dir = bridge.prepare_bridge_dir("conv_noseed")
     assert bridge.seed_opencode_auth(bridge_dir) is None
+    assert bridge.seeded_provider_ids(bridge_dir) == frozenset()
 
 
 def test_user_opencode_config_path_default_location(
