@@ -2094,6 +2094,52 @@ export function resetLandingDraft(): void {
   writeLandingDraft(null);
 }
 
+/**
+ * Restore a first message stranded by a failed session load to the next
+ * landing visit: the create succeeded (so the draft was already cleared)
+ * but the session never became viewable, leaving the typed text with no
+ * composer to surface it. Only the text and attachments come back: an
+ * existing draft keeps its picker selections (host, workspace, agent, …),
+ * and a draft the user has already typed into is never overwritten.
+ *
+ * @returns Whether the message was written, so the caller keeps the
+ *   stranded source intact when the restore is refused.
+ */
+export function restoreLandingDraftMessage(message: string, files: File[]): boolean {
+  if (message.trim() === "" && files.length === 0) return false;
+  if (landingDraft !== null) {
+    if (landingDraft.message.trim() !== "" || landingDraft.files.length > 0) return false;
+    writeLandingDraft({ ...landingDraft, message, files });
+    return true;
+  }
+  writeLandingDraft({
+    project: "",
+    message,
+    files,
+    pickedAgentId: null,
+    selectedHostId: null,
+    sandboxSelected: false,
+    sandboxProvider: null,
+    sandboxRepoSelections: readLastSandboxRepos(),
+    workspace: "",
+    branchName: "",
+    autoSeededBranch: "",
+    permissionMode: CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    approvalMode: CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+    bypassSandbox: false,
+    cursorExecMode: CURSOR_NATIVE_DEFAULT_EXEC_MODE,
+    agySkipMode: AGY_NATIVE_DEFAULT_SKIP_MODE,
+    devinPermissionMode: DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
+    pickedHarness: null,
+    pickedModel: "",
+    pickedEffort: "",
+    costControlMode: null,
+    agentFromConfig: false,
+    workspaceFromConfig: false,
+  });
+  return true;
+}
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();

@@ -54,6 +54,7 @@ import {
   worktreePathTail,
   NewChatLandingScreen,
   resetLandingDraft,
+  restoreLandingDraftMessage,
 } from "./NewChatDialog";
 import { useSandboxModelOptions, type SandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
@@ -10374,6 +10375,61 @@ describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () 
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
       "Smart Routing",
     );
+  });
+});
+
+// A create that succeeded but whose session never became viewable strands the
+// typed text with no composer to surface it. The load-error screen hands the
+// text back through restoreLandingDraftMessage; the next landing visit must
+// restore it — without clobbering anything the user has composed since.
+describe("restoreLandingDraftMessage", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  function landingValue(): string {
+    return (screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value;
+  }
+
+  it("restores a stranded first message into the landing composer", () => {
+    expect(restoreLandingDraftMessage("prompt stranded by a failed first load", [])).toBe(true);
+    renderLanding();
+    expect(landingValue()).toBe("prompt stranded by a failed first load");
+  });
+
+  it("refuses to overwrite a draft the user composed since", () => {
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "newer text the user typed" },
+    });
+    // Unmount stashes the in-progress text as the module-scoped draft.
+    cleanup();
+    // The refusal is reported so the caller keeps the stranded copy.
+    expect(restoreLandingDraftMessage("stranded", [])).toBe(false);
+    renderLanding();
+    expect(landingValue()).toBe("newer text the user typed");
+  });
+
+  it("keeps picker-only selections while restoring the stranded text", () => {
+    renderLanding();
+    selectAgent("a2");
+    // No text typed: unmount stashes a picker-only draft (agent = Codex).
+    cleanup();
+    expect(restoreLandingDraftMessage("stranded", [])).toBe(true);
+    renderLanding();
+    expect(landingValue()).toBe("stranded");
+    // The chip labels the selection by its model: GPT-5.5 is the mocked Codex
+    // default, so the picked agent survived (a clobber would show Claude's).
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("GPT-5.5");
+  });
+
+  it("ignores an empty stranded message", () => {
+    expect(restoreLandingDraftMessage("   ", [])).toBe(false);
+    renderLanding();
+    expect(landingValue()).toBe("");
   });
 });
 

@@ -89,10 +89,12 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  clearFailedSendDraft,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
   isTempConvId,
+  peekFailedSendDraft,
   type PendingInitialPrompt,
   type QueuedMessage,
   useChatStore,
@@ -236,7 +238,11 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
-import { ComposerAgentIcon, NewChatLandingScreen } from "@/shell/NewChatDialog";
+import {
+  ComposerAgentIcon,
+  NewChatLandingScreen,
+  restoreLandingDraftMessage,
+} from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
@@ -1135,7 +1141,22 @@ export function ChatPage() {
     if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
       return <HydratingPlaceholder />;
     if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+      return (
+        <ConversationLoadError
+          conversationId={urlConvId}
+          error={conversationLoadError}
+          // A consumed-but-never-sent first prompt (the auto-send gates never
+          // opened because the session failed to load) — recoverable text the
+          // error screen can hand back to the landing composer.
+          strandedPrompt={
+            initialPrompt !== null &&
+            initialPrompt.conversationId === urlConvId &&
+            initialPromptSentForConvRef.current !== urlConvId
+              ? initialPrompt.prompt
+              : null
+          }
+        />
+      );
     }
   }
 
@@ -1962,11 +1983,31 @@ function HydratingPlaceholder() {
 function ConversationLoadError({
   conversationId,
   error,
+  strandedPrompt,
 }: {
   conversationId: string;
   error: Error;
+  strandedPrompt: PendingInitialPrompt | null;
 }) {
   const navigate = useNavigate();
+  // The session never became viewable, so its composer never rendered — hand
+  // any stranded first message back to the landing composer before leaving.
+  // A failed send's returned draft wins (it is the settled truth); a
+  // consumed-but-never-dispatched initial prompt covers the path where the
+  // auto-send gates never opened.
+  const startNewChat = () => {
+    const stranded =
+      peekFailedSendDraft(conversationId) ??
+      (strandedPrompt !== null
+        ? { text: strandedPrompt.text, files: strandedPrompt.files ?? [] }
+        : null);
+    // Clear the store copy only once the landing draft accepted the text — a
+    // newer draft refuses the restore and must not destroy the stranded copy.
+    if (stranded !== null && restoreLandingDraftMessage(stranded.text, stranded.files)) {
+      clearFailedSendDraft(conversationId);
+    }
+    navigate("/");
+  };
   return (
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-md flex-col items-center gap-3 text-center">
@@ -1977,7 +2018,7 @@ function ConversationLoadError({
           : {error.message}
         </p>
         {/* Route to the home composer ("/"), which owns session creation. */}
-        <Button type="button" variant="outline" onClick={() => navigate("/")}>
+        <Button type="button" variant="outline" onClick={startNewChat}>
           Start a new chat
         </Button>
       </div>
