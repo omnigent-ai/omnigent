@@ -5858,9 +5858,9 @@ async def _collect_sub_agents(
     """
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
 
-    Returns ``[{"agent", "title", "conversation_id"}, ...]``, skipping
-    closed and titleless/colonless rows so they never re-surface to the
-    LLM. Includes the caller's own children and, when the caller is
+    Returns ``[{"agent", "title", "conversation_id", "status"}, ...]``,
+    skipping closed and titleless/colonless rows so they never re-surface
+    to the LLM. Includes the caller's own children and, when the caller is
     itself a child (e.g. a user-added agent), its parent (surfaced as
     ``agent="main"``) and its siblings — so an added agent can still
     discover ``main`` and its session-mates. Best-effort: a failed
@@ -5885,7 +5885,10 @@ async def _collect_sub_agents(
     # If the caller is itself a child, surface main + siblings too.
     parent_id = await _session_parent_id(conversation_id, server_client)
     if parent_id is not None:
-        result.append({"agent": "main", "title": None, "conversation_id": parent_id})
+        # The caller snapshot does not provide the parent's live status.
+        result.append(
+            {"agent": "main", "title": None, "conversation_id": parent_id, "status": None}
+        )
         try:
             sib_resp = await server_client.get(
                 f"/v1/sessions/{parent_id}/child_sessions",
@@ -6014,10 +6017,11 @@ def _child_rows_to_entries(
 
     Skips closed and titleless/colonless rows. The server already
     parses ``tool``/``session_name`` from the title (including the
-    ``"ui:<agent>:<label>"`` form), so those are reused.
+    ``"ui:<agent>:<label>"`` form), so those are reused. The API's
+    ``status`` passes through, or is ``None`` when absent.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
-    :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
+    :returns: ``[{"agent", "title", "conversation_id", "status"}, ...]``.
     """
     entries: list[dict[str, str | None]] = []
     for row in rows:
@@ -6030,6 +6034,7 @@ def _child_rows_to_entries(
                 "agent": _optional_string(row.get("tool")),
                 "title": _optional_string(row.get("session_name")),
                 "conversation_id": _optional_string(row.get("id")),
+                "status": _optional_string(row.get("status")),
             }
         )
     return entries

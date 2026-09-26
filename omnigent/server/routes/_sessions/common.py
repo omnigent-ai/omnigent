@@ -39,6 +39,15 @@ from omnigent.harness_plugins import (
     harness_capabilities,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runtime.session_status import (
+    LAST_TASK_ERROR_CODE_LABEL_KEY as _LAST_TASK_ERROR_CODE_LABEL_KEY,
+)
+from omnigent.runtime.session_status import (
+    LAST_TASK_ERROR_MESSAGE_LABEL_KEY as _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
+)
+from omnigent.runtime.session_status import (
+    session_status_cache as _session_status_cache,
+)
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -282,12 +291,6 @@ _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 
 
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
-
-
-_LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
-
-
-_LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 
 _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: str = "omnigent.last_task_error_agent_name"
@@ -564,9 +567,6 @@ _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(Serve
 
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _WATCHER_TASKS: set[asyncio.Task[None]] = set()
-
-
-_session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
 @dataclass

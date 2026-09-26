@@ -18,6 +18,7 @@ from omnigent.entities import (
 )
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
+from omnigent.runtime.session_status import resolve_child_session_status
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
 from omnigent.tools.base import Tool, ToolContext
@@ -508,7 +509,8 @@ class SysSessionListTool(Tool):
     Returns two views:
 
     - ``sub_agents`` — the named ``(agent, title)`` children (and, for
-      a child caller, its parent/siblings) under this conversation. The
+      a child caller, its parent/siblings) under this conversation, with
+      live ``status`` (or ``None`` when unknown). The
       LLM uses these to decide which pairs already exist (so a follow-up
       ``sys_session_send`` continues rather than spawns) and to grab each
       child's ``conversation_id`` for ``sys_session_get_history`` /
@@ -537,7 +539,9 @@ class SysSessionListTool(Tool):
         return (
             "List sessions in two views. 'sub_agents': the named "
             "(agent, title) children under this conversation (and your "
-            "parent/siblings) — use their conversation_id to read "
+            "parent/siblings), each with its live status (idle/running/"
+            "waiting/failed; null when unknown) — use their "
+            "conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
             "every session "
             "you can access, each with status + runner connectivity, "
@@ -615,7 +619,7 @@ class SysSessionListTool(Tool):
             view).
         :param ctx: Server-side execution context.
         :returns: JSON ``{"sub_agents": [{"agent": ..., "title": ...,
-            "conversation_id": ...}, ...], "sessions": []}``.
+            "conversation_id": ..., "status": ...}, ...], "sessions": []}``.
         """
         del arguments
         from omnigent.runtime import get_conversation_store
@@ -630,7 +634,7 @@ class SysSessionListTool(Tool):
             # would lose track regardless.
             limit=100,
         )
-        result: list[dict[str, str]] = []
+        result: list[dict[str, str | None]] = []
         for child in children.data:
             # Title is "<agent>:<title>" — split into the LLM-
             # friendly fields. Skip rows whose title doesn't
@@ -649,6 +653,9 @@ class SysSessionListTool(Tool):
                     "agent": sa_agent,
                     "title": sa_title,
                     "conversation_id": child.id,
+                    "status": resolve_child_session_status(
+                        child.id, child.live_status, child.labels
+                    ),
                 }
             )
         # ``sessions`` (the global, permission-bounded view) is empty on

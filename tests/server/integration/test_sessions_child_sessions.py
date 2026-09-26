@@ -236,6 +236,9 @@ async def test_child_sessions_surfaces_durable_failure_error(
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
     """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.spawn import SysSessionListTool
+
     session = await _create_parent_session(client)
     conv_store = SqlAlchemyConversationStore(db_uri)
     child = _seed_child(
@@ -244,6 +247,7 @@ async def test_child_sessions_surfaces_durable_failure_error(
         title="researcher:auth",
         agent_id=session["agent_id"],
     )
+    conv_store.set_session_live_status(child.id, "running")
     conv_store.set_labels(
         child.id,
         {
@@ -254,10 +258,26 @@ async def test_child_sessions_surfaces_durable_failure_error(
         },
     )
 
-    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+        tool_result = json.loads(
+            SysSessionListTool().invoke(
+                "{}",
+                ToolContext(
+                    task_id="test_task",
+                    agent_id=session["agent_id"],
+                    conversation_id=session["id"],
+                ),
+            )
+        )
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
 
     assert resp.status_code == 200
     row = resp.json()["data"][0]
+    assert row["status"] == "failed"
+    assert tool_result["sub_agents"][0]["status"] == row["status"]
     assert row["busy"] is False
     assert row["current_task_status"] == "failed"
     assert row["last_task_error"] == {
