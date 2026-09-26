@@ -17,15 +17,21 @@ form, and reasoning, auto-answers the permission/form prompts, runs
 
 Requires a real ``opencode`` CLI, >=2.0.0 <3.0.0, on PATH, and real model
 credentials for the provider passed via --model (the harness calls a real
-provider; there is no mock path). Run:
+provider; there is no mock path). The isolated recon server has no
+credentials of its own, so either export the provider's env var
+(``ANTHROPIC_API_KEY``, ...) or point ``--seed-credentials-from`` at your
+real v2 ``opencode`` SQLite store to copy one stored key across. Run:
 
-    uv run python dev/opencode_v2_recon.py --model anthropic/claude-sonnet-4-5
+    uv run python dev/opencode_v2_recon.py --model anthropic/claude-sonnet-4-5 \\
+        --seed-credentials-from ~/.local/share/opencode/opencode.db
 
 The generated server password, every temp path, the user's home directory,
-and any provider credentials found in the environment are redacted from the
-fixtures before they're written. The server's stdout/stderr are logged to
+any provider credentials found in the environment, and any credential seeded
+from ``--seed-credentials-from`` are redacted from the fixtures before
+they're written. The server's stdout/stderr are logged to
 ``server.stdout.log``/``server.stderr.log`` in the temp workdir (kept only
-with ``--keep-workdir``) for debugging.
+with ``--keep-workdir``) for debugging; a failed run also dumps everything
+captured so far to ``events-debug.ndjson`` there.
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ import json
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -65,12 +72,25 @@ _INSTRUCTIONS_MARKER = "OMNIGENT_RECON_MARKER_1f6f6c6f-opencode-v2"
 # run actually exercises the permission-reply path.
 ASK_ALL_PERMISSIONS: list[dict[str, str]] = [{"action": "*", "resource": "*", "effect": "ask"}]
 
-# A minimal Plugin.define plugin (packages/plugin/src/promise/plugin.ts) that
-# logs the three hooks the omnigent-policy plugin (Stage 3) will use:
-# ctx.session.hook("prompt"), ctx.tool.hook("execute.after"), and
+# A configured plugin path that resolves to a *file* is silently dropped
+# (v2 logs "configured plugin path must be a directory" and skips it, per
+# packages/core/src/config/plugin/source.ts's `scan`), so the recon plugin
+# is written as a directory with its own package.json + entrypoint, per the
+# resolution in packages/plugin/src/host.ts's `resolve`.
+_PLUGIN_PACKAGE_JSON: dict[str, str] = {
+    "name": "omnigent-recon-plugin",
+    "type": "module",
+    "main": "server.js",
+}
+
+# The module loader (packages/core/src/plugin/module.ts's `Module` schema)
+# only requires a default export shaped `{id, setup}` (or `{id, effect}`);
+# `Plugin.define` is the identity on that shape, and a bare directory path
+# can't resolve the `@opencode/plugin` package, so this plugs a plain object
+# in directly. Logs the three hooks the omnigent-policy plugin (Stage 3)
+# will use: ctx.session.hook("prompt"), ctx.tool.hook("execute.after"), and
 # ctx.permission.hook("evaluate") (packages/plugin/src/promise/{session,tool,permission}.ts).
-_PLUGIN_TEMPLATE = """\
-import { Plugin } from "@opencode/plugin"
+_PLUGIN_SERVER_TEMPLATE = """\
 import { appendFileSync } from "node:fs"
 
 const LOG_FILE = process.env.OMNIGENT_RECON_PLUGIN_LOG
@@ -80,7 +100,7 @@ function log(event, data) {
   appendFileSync(LOG_FILE, JSON.stringify({ event, data }) + "\\n")
 }
 
-export default Plugin.define({
+export default {
   id: "omnigent-recon",
   setup: async (ctx) => {
     await ctx.session.hook("prompt", async (event) => {
@@ -97,7 +117,7 @@ export default Plugin.define({
       })
     })
   },
-})
+}
 """
 
 
@@ -130,6 +150,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--keep-workdir",
         action="store_true",
         help="Don't delete the temp XDG/workspace dirs on exit (for debugging).",
+    )
+    parser.add_argument(
+        "--seed-credentials-from",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a v2 opencode SQLite store (its `credential` table) to read a "
+            "stored provider API key from and seed into the isolated recon server."
+        ),
+    )
+    parser.add_argument(
+        "--seed-provider",
+        default=None,
+        help="Integration id to seed a credential for (default: the provider half of --model).",
     )
     return parser
 
@@ -175,6 +209,43 @@ def credential_values_from_env(env: Mapping[str, str]) -> list[str]:
     ]
 
 
+def read_stored_key(db_path: Path, provider: str) -> str | None:
+    """
+    Read the newest active key-type credential for *provider* from a v2 SQLite store.
+
+    v2 stores provider credentials in the SQLite ``credential`` table, not
+    env vars (``packages/core/src/credential/sql.ts``): columns ``id``,
+    ``integration_id``, ``label``, ``value`` (JSON), ``connector_id``,
+    ``method_id``, ``active``, ``time_created``, ``time_updated``. ``value``
+    is a tagged union (``packages/schema/src/credential.ts``): either
+    ``{type: "key", key, ...}`` or ``{type: "oauth", ...}`` — an oauth
+    credential can't be seeded as a static key, so it's skipped.
+
+    :param db_path: Path to the v2 ``opencode`` SQLite database, opened read-only.
+    :param provider: Integration id to look up (e.g. ``"anthropic"``).
+    :returns: The stored API key, or ``None`` if there's no usable key credential.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT value FROM credential WHERE integration_id = ? "
+            "ORDER BY active DESC, time_updated DESC LIMIT 1",
+            (provider,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    value = json.loads(row[0])
+    if value.get("type") == "oauth":
+        print(
+            f"stored credential for {provider!r} is oauth, not a static key; skipping seed",
+            file=sys.stderr,
+        )
+        return None
+    return value.get("key") if value.get("type") == "key" else None
+
+
 def build_recon_opencode_config(
     *,
     instructions_path: Path,
@@ -189,7 +260,8 @@ def build_recon_opencode_config(
         (``Config.Info.instructions`` in ``packages/schema/src/config.ts``).
     :param mcp_server_command: Argv for a trivial local stdio MCP server
         (the recon run uses ``tests/tools/fixtures/echo_stdio_mcp_server.py``).
-    :param plugin_path: Path to the recon test plugin (``Plugin.define``).
+    :param plugin_path: Path to the recon test plugin's directory (a plain
+        ``{id, setup}`` default export, not a single-file path).
     :returns: A v2-shaped config dict, ready for ``json.dump``.
     """
     return {
@@ -314,21 +386,59 @@ async def _auto_answer_prompts(
                     )
 
 
-async def _wait_for_session_idle(
+_TERMINAL_EXECUTION_EVENT_TYPES = frozenset(
+    {
+        "session.execution.succeeded",
+        "session.execution.failed",
+        "session.execution.interrupted",
+    }
+)
+
+
+def is_terminal_session_event(event: dict[str, Any], session_id: str) -> bool:
+    """
+    True if *event* signals that session *session_id* has left the running state.
+
+    Per v2's schema, a completed turn is signalled by one of: the live-only
+    ``session.status`` event whose ``status.type`` is ``"idle"`` (as opposed
+    to ``"busy"``/``"retry"``, ``session-event.ts`` ``Status``); one of the
+    durable ``session.execution.{succeeded,failed,interrupted}`` events
+    (``session-event.ts`` ``Execution``); or the deprecated ``session.idle``
+    event, kept for older clients, which carries only ``sessionID``
+    (``session-status-event.ts`` ``Idle``). Any of these ends the "still
+    running" window this recon script waits out.
+
+    :param event: One decoded ``/api/event`` frame.
+    :param session_id: The session this recon run is driving.
+    :returns: Whether *event* is a terminal signal for *session_id*.
+    """
+    data = event.get("data", {})
+    if data.get("sessionID") != session_id:
+        return False
+    event_type = event.get("type")
+    if event_type == "session.idle" or event_type in _TERMINAL_EXECUTION_EVENT_TYPES:
+        return True
+    if event_type == "session.status":
+        status = data.get("status")
+        if status == "idle":
+            return True
+        if isinstance(status, dict) and status.get("type") == "idle":
+            return True
+    return False
+
+
+async def _wait_for_session_terminal(
     events: list[dict[str, Any]], session_id: str, timeout: float
-) -> bool:
-    """Poll captured events for a ``session.idle`` frame for *session_id*."""
+) -> dict[str, Any] | None:
+    """Poll captured events until one signals *session_id* has left the running state."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
         for event in events:
-            if (
-                event.get("type") == "session.idle"
-                and event.get("data", {}).get("sessionID") == session_id
-            ):
-                return True
+            if is_terminal_session_event(event, session_id):
+                return event
         await asyncio.sleep(0.5)
-    return False
+    return None
 
 
 def _fill_recon_findings(
@@ -418,6 +528,22 @@ def _drain_pipe_to_file(pipe: Any, log_path: Path) -> None:
         pass
 
 
+def _write_debug_events(workdir: Path, events: list[dict[str, Any]]) -> None:
+    """Dump captured events to ``<workdir>/events-debug.ndjson`` so a failed run is diagnosable."""
+    debug_path = workdir / "events-debug.ndjson"
+    text = "\n".join(json.dumps(event, sort_keys=True) for event in events)
+    debug_path.write_text(text + ("\n" if text else ""), encoding="utf-8")
+
+    type_counts: dict[str, int] = {}
+    for event in events:
+        event_type = str(event.get("type", "<unknown>"))
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+    summary = ", ".join(f"{name}={count}" for name, count in sorted(type_counts.items()))
+
+    print(f"wrote {len(events)} captured events to {debug_path}", file=sys.stderr)
+    print(f"event types seen: {summary or '(none)'}", file=sys.stderr)
+
+
 async def run_recon(args: argparse.Namespace) -> int:
     """Drive one live turn against a real opencode v2 server and write the fixtures."""
     opencode_path = args.opencode_path or shutil.which("opencode")
@@ -435,8 +561,12 @@ async def run_recon(args: argparse.Namespace) -> int:
     password = secrets.token_urlsafe(32)
     marker_path = workdir / "recon-instructions.txt"
     marker_path.write_text(_INSTRUCTIONS_MARKER, encoding="utf-8")
-    plugin_path = workdir / "omnigent-recon-plugin.js"
-    plugin_path.write_text(_PLUGIN_TEMPLATE, encoding="utf-8")
+    plugin_path = workdir / "omnigent-recon-plugin"
+    plugin_path.mkdir(parents=True, exist_ok=True)
+    (plugin_path / "package.json").write_text(
+        json.dumps(_PLUGIN_PACKAGE_JSON, indent=2), encoding="utf-8"
+    )
+    (plugin_path / "server.js").write_text(_PLUGIN_SERVER_TEMPLATE, encoding="utf-8")
     plugin_log = workdir / "plugin.log.ndjson"
 
     config = build_recon_opencode_config(
@@ -463,6 +593,9 @@ async def run_recon(args: argparse.Namespace) -> int:
     findings: dict[str, str] = {}
     events: list[dict[str, Any]] = []
 
+    provider_id, model_id = args.model.split("/", 1)
+    seed_provider = args.seed_provider or provider_id
+
     stderr_log_path = workdir / "server.stderr.log"
     stdout_log_path = workdir / "server.stdout.log"
     stderr_fh = stderr_log_path.open("wb")
@@ -476,12 +609,23 @@ async def run_recon(args: argparse.Namespace) -> int:
             info_resp.raise_for_status()
             print("server info:", info_resp.json())
 
+            if args.seed_credentials_from:
+                key = read_stored_key(args.seed_credentials_from, seed_provider)
+                if key is None:
+                    findings["credential_seed_status"] = "no key credential found"
+                else:
+                    secrets_to_redact.append(key)
+                    connect_resp = await client.post(
+                        f"/api/integration/{seed_provider}/connect/key",
+                        json={"key": key},
+                    )
+                    findings["credential_seed_status"] = str(connect_resp.status_code)
+
             openapi = (await client.get("/openapi.json")).json()
 
             stop = asyncio.Event()
             stream_task = asyncio.create_task(_stream_events(client, events, stop))
 
-            provider_id, model_id = args.model.split("/", 1)
             create_resp = await client.post(
                 "/api/session",
                 json={
@@ -526,17 +670,21 @@ async def run_recon(args: argparse.Namespace) -> int:
 
             await _auto_answer_prompts(client, session_id, events, findings)
 
-            idle_reached = await _wait_for_session_idle(events, session_id, _IDLE_TIMEOUT_SECONDS)
-            if not idle_reached:
+            terminal_event = await _wait_for_session_terminal(
+                events, session_id, _IDLE_TIMEOUT_SECONDS
+            )
+            if terminal_event is None:
                 print(
-                    f"session {session_id} did not reach idle within "
+                    f"session {session_id} did not reach a terminal state within "
                     f"{_IDLE_TIMEOUT_SECONDS}s of the auto-answer window; aborting without "
                     "writing fixtures",
                     file=sys.stderr,
                 )
                 stop.set()
                 stream_task.cancel()
+                _write_debug_events(workdir, events)
                 return None
+            findings["terminal_event"] = str(terminal_event.get("type", "unknown"))
 
             await asyncio.sleep(2.0)  # drain trailing events once the turn settles
 
@@ -589,6 +737,11 @@ async def run_recon(args: argparse.Namespace) -> int:
                 "writing fixtures",
                 file=sys.stderr,
             )
+            _write_debug_events(workdir, events)
+            return 1
+        except httpx.HTTPError as exc:
+            print(f"recon turn failed with an HTTP error: {exc!r}", file=sys.stderr)
+            _write_debug_events(workdir, events)
             return 1
 
         if result is None:
