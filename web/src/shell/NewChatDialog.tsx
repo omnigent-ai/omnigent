@@ -674,35 +674,12 @@ export function composerWorktreeHeaderState({
   };
 }
 
-/**
- * Existing sessions that would share an on-disk working directory with a new
- * session created in ``workspace`` on ``hostId``.
- *
- * Matches on host plus normalized workspace path: a session whose stored
- * ``workspace`` equals the picked directory works in that same directory.
- * Branch sessions live in isolated worktree dirs (a different ``workspace``),
- * so they only match when the user explicitly picked that worktree path.
- *
- * Only *connected* sessions count — ``isRunnerOnline(s.id)`` must hold. An
- * offline or unbound session has no live process that could write the
- * directory, so it isn't a conflict. The caller backs this predicate with
- * the shared runner-health poll — the same ``/health`` signal as the
- * sidebar's connectivity dots — so the hint agrees with what the sidebar
- * shows.
- * Deleted sessions (≈ openui's archived) are already filtered out
- * server-side. An errored (``failed``) session whose runner is still online
- * counts, mirroring openui: only *disconnected* agents are excluded, not
- * merely errored ones.
- *
- * Returns ``[]`` when ``hostId`` is unset or ``workspace`` is blank.
- *
- * @param sessions The caller's sessions from ``useDirectorySessions``.
- * @param hostId The selected host id, or ``null`` when none is picked.
- * @param workspace The picked absolute directory, e.g. ``"/Users/me/repo"``.
- * @param isRunnerOnline Predicate: is this session's runner online right now?
- *   Backed by the shared runner-health poll in the component.
- * @returns Matching connected sessions; callers use ``.length`` for the count.
- */
+/** Only known-idle sessions are excluded; missing status errs toward warning. */
+export function isWorkingStatus(status: Conversation["status"]): boolean {
+  return status !== "idle";
+}
+
+/** Sessions actively using the same normalized directory on a host. */
 export function sessionsSharingDirectory(
   sessions: Conversation[],
   hostId: string | null,
@@ -712,18 +689,13 @@ export function sessionsSharingDirectory(
   if (!hostId) return [];
   const target = normalizeWorkspacePath(workspace);
   if (target === null) return [];
-  // TODO: headless agents (no `os_env`, no filesystem access) still get a
-  // workspace via the web flow, so they count here — a false positive, since
-  // they can't write. SessionListItem doesn't expose filesystem capability to
-  // filter on; revisit (expose a flag + skip them) if headless agents with
-  // working directories become common.
+  // TODO: Exclude headless agents once session rows expose filesystem capability.
   return sessions.filter(
     (s) =>
       s.host_id === hostId &&
       s.workspace != null &&
       normalizeWorkspacePath(s.workspace) === target &&
-      // Only a session whose runner is actually online has a live process
-      // that could write here — same connectivity signal as the sidebar.
+      isWorkingStatus(s.status) &&
       isRunnerOnline(s.id),
   );
 }
@@ -4304,11 +4276,12 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Only register loaded owned sessions on the selected host with a workspace
-  // for live directory-conflict checks.
+  // Poll only working sessions on the selected host with a workspace.
   const conflictCandidates = useMemo(
     () =>
-      (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
+      (directorySessions ?? []).filter(
+        (s) => s.host_id === selectedHostId && s.workspace != null && isWorkingStatus(s.status),
+      ),
     [directorySessions, selectedHostId],
   );
   const runnerHealth = useRunnerHealthRegistration(conflictCandidates);
