@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -53,8 +54,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runtime.websocket_metrics import (
+    classify_disconnect_reason,
     record_websocket_connected,
     record_websocket_disconnected,
+    websocket_close_code,
+    websocket_close_reason,
 )
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -371,6 +375,12 @@ async def serve_tunnel(
     http_auth_rejection_streak = 0
     connected_this_attempt = False
     connect_monotonic: float | None = None
+    # Debug-log correlation: the attempt ordinal within the current reconnect
+    # streak (reset once a connected attempt ends), and when the last accepted
+    # connection ended, so the next ``runner_connected`` row carries the outage
+    # the server actually saw.
+    attempt = 0
+    disconnected_monotonic: float | None = None
 
     def _mark_connected() -> None:
         nonlocal connected_this_attempt
@@ -423,6 +433,8 @@ async def serve_tunnel(
         reconnecting = ever_connected
         retry_reason = "connection closed cleanly"
         recycle = False
+        attempt += 1
+        connection_id = uuid.uuid4().hex
         try:
             activity_kwargs = {"on_activity": on_activity} if on_activity is not None else {}
             await _serve_tunnel_once(
@@ -440,6 +452,10 @@ async def serve_tunnel(
                 on_resume_note=_note_resume_from_suspend,
                 direct_attach_port=direct_attach_port,
                 direct_attach_token=direct_attach_token,
+                connection_id=connection_id,
+                reconnect=reconnecting,
+                attempt=attempt,
+                disconnected_monotonic=disconnected_monotonic,
                 **activity_kwargs,
             )
             # A graceful shutdown drains and closes the connection cleanly,
@@ -574,16 +590,18 @@ async def serve_tunnel(
             disconnect_error = exc
             raise
         finally:
+            # Classified once, for the counter and the debug-log row alike.
+            local_shutdown = (
+                shutdown_event is not None and shutdown_event.is_set()
+            ) or isinstance(disconnect_error, asyncio.CancelledError)
             if connected_this_attempt:
                 record_websocket_disconnected(
                     "runner",
                     disconnect_error,
-                    local_shutdown=(
-                        (shutdown_event is not None and shutdown_event.is_set())
-                        or isinstance(disconnect_error, asyncio.CancelledError)
-                    ),
+                    local_shutdown=local_shutdown,
                     resumed_from_suspend=woke_from_suspend,
                 )
+        resumed_from_suspend = woke_from_suspend
         if woke_from_suspend:
             # A wake from system suspend already aborted the live tunnel (see
             # _serve_tunnel_once's watcher). The abrupt close would otherwise
@@ -593,11 +611,14 @@ async def serve_tunnel(
             delay_s = _INITIAL_RECONNECT_DELAY_S
             recycle = True
             retry_reason = "resumed from system suspend; reconnecting promptly"
-        if (
-            connected_this_attempt
-            and connect_monotonic is not None
-            and time.monotonic() - connect_monotonic >= _STABLE_CONNECTION_DURATION_S
-        ):
+        connection_age_s: float | None = None
+        if connected_this_attempt and connect_monotonic is not None:
+            disconnected_monotonic = time.monotonic()
+            connection_age_s = disconnected_monotonic - connect_monotonic
+        backoff_reset = (
+            connection_age_s is not None and connection_age_s >= _STABLE_CONNECTION_DURATION_S
+        )
+        if backoff_reset:
             # The tunnel was live long enough to consider it a healthy connection.
             # Reset the backoff so accumulated failures from previous sessions do
             # not delay a reconnect after an abrupt drop (e.g. close 1006).
@@ -605,13 +626,42 @@ async def serve_tunnel(
         jittered = delay_s * (
             1.0 + random.uniform(-_RECONNECT_JITTER_FRACTION, _RECONNECT_JITTER_FRACTION)
         )
+        # One row per attempt the runner retries: what ended the socket, how
+        # long it lived and how long the runner waits. Fatal exits (persistent
+        # auth or protocol rejection, cancellation) raise above instead.
         _logger.info(
             "runner tunnel disconnected: %s; retrying in %.2fs (jittered from %.2fs)",
             retry_reason,
             jittered,
             delay_s,
-            extra={"session_id": runner_primary_session_id()},
+            extra=debug_event(
+                "runner_tunnel_disconnected",
+                session_id=runner_primary_session_id(),
+                runner_id=runner_id,
+                connection_id=connection_id,
+                attempt=attempt,
+                connected=connected_this_attempt,
+                connection_age_s=_round_seconds(connection_age_s),
+                disconnect_reason=classify_disconnect_reason(
+                    disconnect_error,
+                    local_shutdown=local_shutdown,
+                    resumed_from_suspend=resumed_from_suspend,
+                ),
+                error_type=(
+                    type(disconnect_error).__name__ if disconnect_error is not None else None
+                ),
+                close_code=websocket_close_code(disconnect_error),
+                close_reason=websocket_close_reason(disconnect_error),
+                close_rcvd_code=_close_frame_code(disconnect_error, "rcvd"),
+                close_sent_code=_close_frame_code(disconnect_error, "sent"),
+                recycle=recycle,
+                backoff_reset=backoff_reset,
+                delay_s=delay_s,
+                retry_in_s=round(jittered, 3),
+            ),
         )
+        if connected_this_attempt:
+            attempt = 0
         await asyncio.sleep(jittered)
         # Match the host tunnel (connect.py): escalate the backoff only on
         # non-recycle failures. A routine ingress recycle keeps reconnecting
@@ -760,6 +810,10 @@ async def _serve_tunnel_once(
     on_resume_note: Callable[[], None] | None = None,
     direct_attach_port: int | None = None,
     direct_attach_token: str | None = None,
+    connection_id: str | None = None,
+    reconnect: bool = False,
+    attempt: int = 1,
+    disconnected_monotonic: float | None = None,
 ) -> None:
     """Serve one WebSocket connection until it closes.
 
@@ -794,6 +848,15 @@ async def _serve_tunnel_once(
         system suspend is detected on this connection (just before the dead
         socket is aborted). ``serve_tunnel`` uses it to force a prompt
         reconnect instead of the escalating backoff.
+    :param connection_id: Identifier for this connection attempt, sent in
+        the hello frame and stamped on both ends' tunnel rows so one
+        socket's runner and server records join. Minted here when absent.
+    :param reconnect: Whether this process already had a connection
+        accepted; separates a reconnect from a fresh runner process.
+    :param attempt: Ordinal of this attempt within the reconnect streak.
+    :param disconnected_monotonic: ``time.monotonic()`` when the previous
+        connection ended, or ``None``. The gap to this connect is the
+        outage the server saw.
     :returns: None.
     """
     import websockets
@@ -834,6 +897,7 @@ async def _serve_tunnel_once(
         if shutdown_event is not None
         else _RUNNER_TUNNEL_CLOSE_TIMEOUT_S
     )
+    connection_id = connection_id or uuid.uuid4().hex
     async with websockets.connect(
         tunnel_url,
         additional_headers=headers,
@@ -848,11 +912,15 @@ async def _serve_tunnel_once(
     ) as ws:
         if on_connected is not None:
             on_connected()
+        downtime_s = (
+            None if disconnected_monotonic is None else time.monotonic() - disconnected_monotonic
+        )
         await _send_hello(
             ws.send,
             runner_version,
             direct_attach_port=direct_attach_port,
             direct_attach_token=direct_attach_token,
+            connection_id=connection_id,
         )
         if on_ready is not None:
             await on_ready()
@@ -865,6 +933,11 @@ async def _serve_tunnel_once(
                 session_id=runner_primary_session_id(),
                 runner_id=runner_id,
                 stage="runner_connect",
+                connection_id=connection_id,
+                reconnect=reconnect,
+                attempt=attempt,
+                downtime_s=_round_seconds(downtime_s),
+                pid=os.getpid(),
             ),
         )
 
@@ -1041,6 +1114,7 @@ async def _send_hello(
     *,
     direct_attach_port: int | None = None,
     direct_attach_token: str | None = None,
+    connection_id: str | None = None,
 ) -> None:
     """Send the runner's opening hello frame.
 
@@ -1053,6 +1127,8 @@ async def _send_hello(
         listener is not running.
     :param direct_attach_token: Bearer token guarding that listener;
         travels only alongside *direct_attach_port*.
+    :param connection_id: Runner-minted id for this connection attempt,
+        echoed on both ends' debug-log rows.
     :returns: None.
     """
     # Signal host-side telemetry opt-out to the server so it can honour
@@ -1076,6 +1152,7 @@ async def _send_hello(
                 telemetry_opt_out=_tel_opt_out,
                 direct_attach_port=direct_attach_port,
                 direct_attach_token=direct_attach_token,
+                connection_id=connection_id,
                 harnesses=[
                     "claude-native",
                     "claude-sdk",
@@ -1451,3 +1528,23 @@ def _websocket_close_code(exc: WebSocketException) -> int | None:
         if isinstance(code, int):
             return code
     return None
+
+
+def _close_frame_code(exc: BaseException | None, direction: str) -> int | None:
+    """Return the close code the peer sent (``"rcvd"``) or this side sent (``"sent"``).
+
+    A 1006 carries neither: the transport died without a close handshake,
+    which is itself the signal an intermediary cut the connection.
+
+    :param exc: Exception that ended the connection, or ``None``.
+    :param direction: ``"rcvd"`` or ``"sent"``.
+    :returns: The close code, or ``None`` when no frame went that way.
+    """
+    close = getattr(exc, direction, None)
+    code = getattr(close, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _round_seconds(value: float | None) -> float | None:
+    """Round a duration for a debug-log attribute; ``None`` passes through."""
+    return None if value is None else round(value, 3)

@@ -4674,6 +4674,7 @@ def create_runner_app(
             or _turn_bind_epoch.get(session_id) != initial_turn_epoch
             or resource_registry.session_activity_epoch(session_id) != initial_native_activity
         )
+        recovery_turn = "none"
         if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]
@@ -4690,6 +4691,7 @@ def create_runner_app(
                 and not _suppress_recovery
                 and session_id not in _active_turns
             ):
+                recovery_turn = "history_resume"
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -4718,6 +4720,7 @@ def create_runner_app(
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
             ):
+                recovery_turn = "recovery_prompt"
                 if is_native_harness(harness_name):
                     _session_histories[session_id] = []
                 _begin_turn_slot(session_id)
@@ -4750,13 +4753,28 @@ def create_runner_app(
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
         status = "running" if session_id in _active_turns else "idle"
+        # The recovery decision and its inputs, so a turn that restarted after a
+        # reconnect can be attributed to the history heuristic, the server's
+        # continuation request, or neither.
         _logger.info(
             "Runner session initialization finished",
             extra=debug_event(
                 "runner_session_initialized",
+                session_id=session_id,
                 stage="session_init",
                 status_code=201,
                 harness=harness_name,
+                status=status,
+                recovery_turn=recovery_turn,
+                recovery_id=recovery_id,
+                resume_interrupted_turn=(
+                    init_context.envelope is not None
+                    and init_context.envelope.resume_interrupted_turn
+                ),
+                suppress_recovery_turn=_suppress_recovery,
+                execution_seen=execution_seen,
+                history_len=len(history),
+                last_item_type=history[-1].get("type") if history else None,
             ),
         )
         return JSONResponse(
