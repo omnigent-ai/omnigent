@@ -14,9 +14,10 @@ equivalents:
   :mod:`psutil` walking on every platform. On POSIX both also signal every
   member of the child's session, which reaches descendants that moved to a
   process group of their own.
-* :func:`terminate_session` / :func:`kill_session` — signal whatever is left
-  in the POSIX session a child led, including orphans re-parented to init
-  after the child exited, which no walk from the child can find any more.
+* :func:`session_member_pids` / :func:`terminate_session` /
+  :func:`kill_session` — find or signal whatever is left in the POSIX session
+  a child led, including orphans re-parented to init after the child exited,
+  which no walk from the child can find any more.
 * :func:`process_alive` — liveness check that doesn't rely on ``os.kill(pid, 0)``.
 
 :mod:`psutil` is already a core dependency, so the descendant walk needs no new
@@ -181,7 +182,7 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
-def _session_member_pids(leader_pid: int) -> list[int]:
+def session_member_pids(leader_pid: int) -> list[int]:
     """
     Pids of the live processes in the POSIX session *leader_pid* leads.
 
@@ -226,7 +227,7 @@ def _signal_session(leader_pid: int, sig: int) -> int:
     :returns: How many processes were signaled.
     """
     signaled = 0
-    for pid in _session_member_pids(leader_pid):
+    for pid in session_member_pids(leader_pid):
         with suppress(OSError):
             os.kill(pid, sig)
             signaled += 1

@@ -713,8 +713,8 @@ def test_session_member_pids_never_targets_our_own_session() -> None:
     """
     The sweep refuses pid <= 1 and our own session and never lists this process.
     """
-    assert _proc._session_member_pids(0) == []
-    assert _proc._session_member_pids(1) == []
+    assert _proc.session_member_pids(0) == []
+    assert _proc.session_member_pids(1) == []
     if _platform.IS_POSIX:
-        assert _proc._session_member_pids(os.getsid(0)) == []
-        assert os.getpid() not in _proc._session_member_pids(os.getpid())
+        assert _proc.session_member_pids(os.getsid(0)) == []
+        assert os.getpid() not in _proc.session_member_pids(os.getpid())

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import json
 import logging
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -21,6 +24,7 @@ import pytest
 
 import omnigent.inner.terminal as terminal_mod
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+from omnigent.inner import _proc
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
     TerminalInstance,
@@ -3369,3 +3373,77 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize(
+    ("terminal_name", "straggler_reaped"),
+    [("claude", True), ("bash", False)],
+    ids=["native-pane", "user-shell"],
+)
+@pytest.mark.asyncio
+async def test_close_reaps_a_native_panes_sighup_immune_stragglers_real_tmux(
+    tmp_path: Path,
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_name: str,
+    straggler_reaped: bool,
+) -> None:
+    """
+    Closing a native pane kills what ignored the hangup; a user shell does not.
+
+    The pane command spawns a child in its own process group that ignores
+    ``SIGHUP``, the shape of an MCP server a native agent started. ``kill-server``
+    hangs the pane up and the leader exits, so only the pane's session id can
+    still find the child. A user's shell terminal keeps ``nohup`` semantics.
+    """
+    monkeypatch.setattr(terminal_mod, "_PANE_SESSION_DRAIN_SECONDS", 1.0)
+    pid_file = tmp_path / "straggler.pid"
+    child_code = (
+        "import os, pathlib, signal, time\n"
+        "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(120)\n"
+    )
+    leader_code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "time.sleep(120)\n"
+    )
+    instance = TerminalInstance(
+        name=terminal_name,
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-c", leader_code],
+    )
+    straggler_pid = 0
+    try:
+        await instance.launch(cwd=tmp_path)
+        for _ in range(250):
+            if pid_file.exists() and pid_file.read_text().strip():
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("pane never spawned its straggler")
+        straggler_pid = int(pid_file.read_text().strip())
+        pane_pid = instance.pane_pid_sync()
+        assert pane_pid is not None
+        assert pane_pid in _proc.session_member_pids(pane_pid)
+        assert straggler_pid in _proc.session_member_pids(pane_pid)
+
+        await instance.close()
+
+        # The hangup reaches the leader asynchronously; only the native case
+        # waited for it inside close().
+        for _ in range(250):
+            if not _proc.process_alive(pane_pid):
+                break
+            await asyncio.sleep(0.02)
+        assert not _proc.process_alive(pane_pid)
+        assert _proc.process_alive(straggler_pid) is not straggler_reaped
+    finally:
+        if straggler_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(straggler_pid, signal.SIGKILL)
