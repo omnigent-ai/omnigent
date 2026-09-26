@@ -141,6 +141,7 @@ from omnigent.runner.native import (
     _is_spec_local_native_python_tool,
     _launch_native_terminal,
     _log_terminal_lookup_miss,
+    _opencode_model_ref,
     _publish_terminal_pending,
     _publish_tmux_target_for_bridge,
     _required_runner_env,
@@ -6968,8 +6969,11 @@ def create_runner_app(
     async def _handle_opencode_native_model_change(conv_id: str, model: str | None) -> Response:
         from omnigent.harnesses.opencode_native.bridge import (
             bridge_dir_for_bridge_id,
+            read_bridge_state,
+            update_last_applied_model,
             update_model_override,
         )
+        from omnigent.harnesses.opencode_native.client import OpenCodeClientError
         from omnigent.inference_config import (
             binding_for_harness,
             load_runtime_inference_config,
@@ -6980,9 +6984,32 @@ def create_runner_app(
         if binding_for_harness(inference_config, "opencode-native") is not None:
             selected = resolve_bound_model(inference_config, "opencode-native", model)
             model = f"omnigent/{selected}" if selected is not None else None
-        updated = await asyncio.to_thread(
-            update_model_override, bridge_dir_for_bridge_id(conv_id), model
-        )
+        bridge_dir = bridge_dir_for_bridge_id(conv_id)
+        updated = await asyncio.to_thread(update_model_override, bridge_dir, model)
+        model_ref = _opencode_model_ref(model)
+        server = _AUTO_OPENCODE_SERVERS.get(conv_id)
+        state = read_bridge_state(bridge_dir) if server is not None else None
+        if model_ref is not None and server is not None and state is not None:
+            # The TUI and the next turn pick the model up from the session.
+            client = server.client()
+            try:
+                await client.set_model(
+                    state.opencode_session_id,
+                    provider_id=model_ref["providerID"],
+                    model_id=model_ref["id"],
+                    variant=model_ref.get("variant"),
+                )
+            except (httpx.HTTPError, OpenCodeClientError):
+                _logger.warning(
+                    "OpenCode set_model failed for %s; the next prompt retries it",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+            else:
+                await asyncio.to_thread(update_last_applied_model, bridge_dir, model)
+            finally:
+                await client.aclose()
         return Response(status_code=200 if updated else 204)
 
     async def _handle_opencode_native_clear(conv_id: str) -> Response:

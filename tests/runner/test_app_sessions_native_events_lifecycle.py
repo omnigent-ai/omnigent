@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
@@ -795,6 +796,176 @@ async def test_bound_opencode_switch_qualifies_the_literal_gateway_id(
             )
     assert response.status_code == 200, response.text
     assert update.call_args.args[1] == "omnigent/omnigent/literal"
+
+
+@pytest.mark.asyncio
+async def test_opencode_model_switch_sets_model_on_live_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
+    from omnigent.runner.app import _AUTO_OPENCODE_SERVERS
+
+    conv_id = "c6d1e2f3a4b54c6d8e9f0a1b2c3d4e5f"
+    update = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge.update_model_override", update)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.read_bridge_state",
+        lambda _dir: OpenCodeNativeBridgeState(
+            session_id=conv_id,
+            server_base_url="http://127.0.0.1:1",
+            opencode_session_id="ses_live",
+        ),
+    )
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str, str | None]] = []
+            self.closed = False
+
+        async def set_model(
+            self, session_id: str, *, provider_id: str, model_id: str, variant: str | None = None
+        ) -> None:
+            self.calls.append((session_id, provider_id, model_id, variant))
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    fake_client = _Client()
+
+    class _Server:
+        def client(self, *, directory: str | None = None) -> _Client:
+            return fake_client
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_client(app) as client:
+            response = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_1"}
+            )
+            assert response.status_code == 201, response.text
+            _AUTO_OPENCODE_SERVERS[conv_id] = _Server()  # type: ignore[assignment]
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "openai/gpt-5#high"},
+            )
+    finally:
+        _AUTO_OPENCODE_SERVERS.pop(conv_id, None)
+
+    assert response.status_code == 200, response.text
+    assert update.call_args.args[1] == "openai/gpt-5#high"
+    assert fake_client.calls == [("ses_live", "openai", "gpt-5", "high")]
+    assert fake_client.closed
+
+
+@pytest.mark.asyncio
+async def test_opencode_model_switch_records_last_applied_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
+    from omnigent.runner.app import _AUTO_OPENCODE_SERVERS
+
+    conv_id = "d7e2f3a4b5c64d7e8f9a0b1c2d3e4f5a"
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.update_model_override",
+        Mock(return_value=True),
+    )
+    record = Mock(return_value=True)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.update_last_applied_model", record
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.read_bridge_state",
+        lambda _dir: OpenCodeNativeBridgeState(
+            session_id=conv_id,
+            server_base_url="http://127.0.0.1:1",
+            opencode_session_id="ses_live",
+        ),
+    )
+
+    class _OkClient:
+        closed = False
+
+        async def set_model(
+            self, session_id: str, *, provider_id: str, model_id: str, variant: str | None = None
+        ) -> None:
+            del session_id, provider_id, model_id, variant
+
+        async def aclose(self) -> None:
+            _OkClient.closed = True
+
+    class _FailingClient:
+        closed = False
+
+        async def set_model(
+            self, session_id: str, *, provider_id: str, model_id: str, variant: str | None = None
+        ) -> None:
+            del session_id, provider_id, model_id, variant
+            raise httpx.HTTPError("boom")
+
+        async def aclose(self) -> None:
+            _FailingClient.closed = True
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_client(app) as client:
+            response = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_1"}
+            )
+            assert response.status_code == 201, response.text
+
+            class _OkServer:
+                def client(self, *, directory: str | None = None) -> _OkClient:
+                    return _OkClient()
+
+            _AUTO_OPENCODE_SERVERS[conv_id] = _OkServer()  # type: ignore[assignment]
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "openai/gpt-5#high"},
+            )
+            assert response.status_code == 200, response.text
+            assert record.call_args.args[1] == "openai/gpt-5#high"
+
+            record.reset_mock()
+
+            class _FailingServer:
+                def client(self, *, directory: str | None = None) -> _FailingClient:
+                    return _FailingClient()
+
+            _AUTO_OPENCODE_SERVERS[conv_id] = _FailingServer()  # type: ignore[assignment]
+            response = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "openai/gpt-5-mini"},
+            )
+            assert response.status_code == 200, response.text
+            record.assert_not_called()
+    finally:
+        _AUTO_OPENCODE_SERVERS.pop(conv_id, None)
 
 
 @pytest.mark.asyncio

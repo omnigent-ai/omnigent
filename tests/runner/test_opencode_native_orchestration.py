@@ -16,6 +16,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     write_bridge_state,
 )
 from omnigent.runner.native.orchestration import (
+    _opencode_model_ref,
     _OpenCodeNativeLaunchConfig,
     _prepare_opencode_native_fork,
     _sanitize_opencode_tui_args,
@@ -196,3 +197,20 @@ def test_auto_create_opencode_terminal_has_no_v1_session_calls() -> None:
     assert "_resolve_opencode_session(" in source
     assert "_prepare_opencode_native_fork(" in source
     assert "_sanitize_opencode_tui_args(" in source
+
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        ("anthropic/claude-sonnet-4-5", {"providerID": "anthropic", "id": "claude-sonnet-4-5"}),
+        ("omnigent/omnigent/literal", {"providerID": "omnigent", "id": "omnigent/literal"}),
+        ("openai/gpt-5#high", {"providerID": "openai", "id": "gpt-5", "variant": "high"}),
+        (None, None),
+        ("  ", None),
+        ("no-provider", None),
+        ("/missing-provider", None),
+        ("openai/", None),
+    ],
+)
+def test_opencode_model_ref(model: str | None, expected: dict[str, str] | None) -> None:
+    assert _opencode_model_ref(model) == expected

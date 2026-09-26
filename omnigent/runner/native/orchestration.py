@@ -2086,6 +2086,28 @@ def _opencode_native_model_from_spec(
         return None
 
 
+def _opencode_model_ref(model: str | None) -> dict[str, str] | None:
+    """
+    Parse ``provider/model[#variant]`` into an OpenCode ``Model.Ref``.
+
+    Splits on the first ``/`` (gateway ids such as ``omnigent/omnigent/x``
+    keep the rest as the model id) and on the first ``#`` after it.
+
+    :param model: Qualified model string, e.g. ``"openai/gpt-5#high"``.
+    :returns: ``{"providerID", "id"[, "variant"]}``, or ``None`` when unparsable.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return None
+    provider_id, slash, rest = model.strip().partition("/")
+    model_id, hash_sign, variant = rest.partition("#")
+    if not slash or not provider_id or not model_id or "#" in provider_id:
+        return None
+    ref = {"providerID": provider_id, "id": model_id}
+    if hash_sign and variant:
+        ref["variant"] = variant
+    return ref
+
+
 def _opencode_native_profile_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
 ) -> str | None:
