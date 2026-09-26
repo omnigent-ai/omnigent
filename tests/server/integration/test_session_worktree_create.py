@@ -531,3 +531,60 @@ async def test_create_failure_rollback_preserves_existing_branch(
         "rollback of an existing-branch recreate must preserve the user's "
         "pre-existing branch (unpushed commits would be lost)"
     )
+
+
+@pytest.mark.parametrize("failed_write", ["update_conversation", "set_host_id"])
+async def test_registry_metadata_failure_preserves_persisted_worktree(
+    register_worktree_host, client, app, monkeypatch, failed_write
+):
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    app.state.mcp_registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id="tracker",
+                    title="Tracker",
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                )
+            ]
+        ),
+        None,
+    )
+    cap = register_worktree_host()
+    agent = await create_test_agent(client, name="registry-worktree-failure")
+    persisted = []
+    original_create = SqlAlchemyConversationStore.create_session_with_agent
+
+    def capture(self, **kwargs):
+        result = original_create(self, **kwargs)
+        persisted.append(result.conversation.id)
+        return result
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("simulated metadata write failure")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "create_session_with_agent", capture)
+    monkeypatch.setattr(SqlAlchemyConversationStore, failed_write, fail)
+    with pytest.raises(RuntimeError, match="simulated metadata write failure"):
+        await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": _SOURCE_REPO,
+                "git": {"branch_name": "feature/registry"},
+                "mcp_registry_services": ["tracker"],
+                "cost_control_mode_override": "off",
+            },
+        )
+    assert len(cap.create) == len(persisted) == 1
+    assert not cap.remove
+    assert (
+        get_conversation_store().get_conversation(persisted[0]).workspace
+        == f"{_SOURCE_REPO}-worktrees/feature-registry"
+    )

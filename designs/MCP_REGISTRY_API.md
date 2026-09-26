@@ -17,9 +17,10 @@ authentication and session binding. An upstream provider token is not an
 Omnigent API credential.
 
 Catalog/account operations use the authenticated user. Session operations apply
-the existing session permissions. Gateway calls resolve the server-recorded turn
-actor, falling back to the authenticated caller; the request cannot choose an
-arbitrary `user_id`. Generic grants are keyed by workspace, user and service.
+the existing session permissions. Gateway calls use the authenticated caller
+for service entitlements, policy identity and credential ownership; the request
+cannot choose an arbitrary `user_id`. Sharing a session does not share connected
+accounts. Historical turn labels never authorize another user's credentials. Generic grants are keyed by workspace, user and service.
 
 Registry declarations in session bundles contain a service ID, never its upstream
 URL or credential. Direct HTTP/stdio declarations retain their existing behavior.
@@ -121,15 +122,24 @@ request model, so clients must not depend on rejection of unsupported fields.
 Per-session tool restrictions are authored in the agent bundle, not edited by
 this API. Existing running sessions need a runner reload to see changed tools.
 
+KMS-backed connections must fit within 4096 bytes after JSON serialization and
+UTF-8 encoding, including both access and refresh tokens. Oversized credentials
+are rejected before encryption with an operator-facing message; use the existing
+Vault Transit backend for larger grants. OAuth connection failures return to the
+UI as sign-in errors, with the storage-limit diagnosis in the server log.
+
 ## Gateway requests and policy context
 
 `POST /v1/mcp/{service_id}` is the per-service JSON-RPC endpoint. Use
 `Content-Type: application/json`, normal Omnigent authentication, and the required
 `X-Omnigent-Session-Id` header. This header supplies policy context, not authority:
 the adapter validates session edit access, an active session, the selected service,
-service entitlements and tool allowlists. It resolves the trusted turn actor from
-server state, falling back to the authenticated caller. Caller-supplied identity
-does not select whose upstream credential is used.
+service entitlements and tool allowlists for the authenticated caller. Both this
+endpoint and the legacy session MCP route use that caller's upstream account.
+Runner calls use the identity authenticated by their server token; a delegated
+path scope alone does not authorize impersonating a different turn actor.
+Per-turn on-behalf-of delegation would require a verified runner/turn binding and
+an explicit delegation contract; it is not implemented.
 
 The URL and execution backend are independent of sessions. The **Omnigent policy
 adapter still requires a session**; calls without one return 422. This prototype

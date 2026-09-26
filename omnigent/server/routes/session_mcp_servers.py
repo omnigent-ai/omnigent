@@ -437,15 +437,16 @@ def prepare_registry_launch_bundle(
     bundle_bytes: bytes,
     service_ids: list[str],
     user_id: str | None,
+    *,
+    trusted_template: bool = False,
 ) -> bytes:
     """Add authorized catalog references without changing the shared source agent."""
     if not service_ids:
         return bundle_bytes
     for service_id in service_ids:
         _require_registry_service(request, service_id, user_id)
-    spec = validate_agent_bundle(
-        bundle_bytes, enforce_handler_allowlist=not local_single_user_enabled()
-    )
+    enforce_allowlist = not (trusted_template or local_single_user_enabled())
+    spec = validate_agent_bundle(bundle_bytes, enforce_handler_allowlist=enforce_allowlist)
     existing = {server.name: server for server in spec.mcp_servers}
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "agent"
@@ -471,7 +472,7 @@ def prepare_registry_launch_bundle(
                 root, UpsertMCPServerRequest(name=service_id, transport="registry")
             )
         result = _tar_gz_dir(root)
-    validate_agent_bundle(result, enforce_handler_allowlist=not local_single_user_enabled())
+    validate_agent_bundle(result, enforce_handler_allowlist=enforce_allowlist)
     return result
 
 

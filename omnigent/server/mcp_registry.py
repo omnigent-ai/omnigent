@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities import ProviderConnection
 from omnigent.server.routes.connections_base import ConnectionError, ConnectStart
+from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
 _logger = logging.getLogger(__name__)
@@ -225,13 +226,16 @@ class McpRegistry:
                     service, {"grant_type": "refresh_token", "refresh_token": refresh}
                 )
                 tokens.setdefault("refresh_token", refresh)
-                updated = await asyncio.to_thread(
-                    self.store.update_secret,
-                    user_id,
-                    f"mcp:{service.id}",
-                    secret=tokens,
-                    metadata=self.metadata(tokens),
-                )
+                try:
+                    updated = await asyncio.to_thread(
+                        self.store.update_secret,
+                        user_id,
+                        f"mcp:{service.id}",
+                        secret=tokens,
+                        metadata=self.metadata(tokens),
+                    )
+                except SecretTooLargeError as exc:
+                    raise ConnectionError(str(exc)) from None
                 if not updated:
                     raise ConnectionError("MCP account disconnected")
                 return str(tokens["access_token"])
@@ -400,10 +404,13 @@ class McpOAuthHooks:
                 "code_verifier": pending.secret["verifier"],
             },
         )
-        await asyncio.to_thread(
-            store.upsert,
-            user_id,
-            f"mcp:{self.service.id}",
-            secret=tokens,
-            metadata=self.registry.metadata(tokens),
-        )
+        try:
+            await asyncio.to_thread(
+                store.upsert,
+                user_id,
+                f"mcp:{self.service.id}",
+                secret=tokens,
+                metadata=self.registry.metadata(tokens),
+            )
+        except SecretTooLargeError as exc:
+            raise ConnectionError(str(exc)) from None

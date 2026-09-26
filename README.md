@@ -584,6 +584,9 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 For centrally managed remote tools, reusable account connections, and a gateway
 with session policies around built-in or external backends, see the
 [MCP registry and gateway prototype](examples/mcp-registry/README.md).
+Managed MCP calls use the authenticated caller's account; sharing a session does
+not share credentials. Databricks connections ask for a workspace URL before
+OAuth. KMS limits serialized grants to 4096 bytes; use Vault for larger grants.
 
 An agent is a short YAML file: your prompt, your tools — local Python
 functions, MCP servers, and sub-agents a supervisor can delegate to. You don't

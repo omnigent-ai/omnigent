@@ -477,7 +477,7 @@ def register_agent_routes(
                             registry,
                             request,
                             spec,
-                            conv.labels.get(_TURN_ACTOR_LABEL) or user_id,
+                            user_id,
                         )
                         data = json.loads(bytes(response.body))
                         tools = data.get("result", {}).get("tools", [])
@@ -485,8 +485,6 @@ def register_agent_routes(
             return response
 
         if method == "tools/call":
-            _mcp_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            turn_actor = _mcp_conv.labels.get(_TURN_ACTOR_LABEL) if _mcp_conv is not None else None
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,
@@ -494,7 +492,7 @@ def register_agent_routes(
                 conversation_store,
                 agent_store,
                 runner_router,
-                actor=_build_actor(turn_actor or user_id),
+                actor=_build_actor(user_id),
                 request=request,
             )
 

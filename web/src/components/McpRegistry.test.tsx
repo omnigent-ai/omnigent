@@ -168,3 +168,26 @@ describe("MCP service selection", () => {
     expect(screen.getByRole("checkbox", { name: "Custom conflict" })).toBeDisabled();
   });
 });
+
+it("asks for a Databricks workspace before connecting and selecting it", async () => {
+  const databricks = { ...service, auth: "databricks", connect_provider: "databricks" };
+  vi.mocked(registryRequest).mockResolvedValueOnce({ data: [databricks] });
+  const toggle = vi.fn();
+  render(<McpRegistryPicker attached={[]} onToggle={toggle} busy={false} />);
+  fireEvent.click(await screen.findByRole("checkbox", { name: "Work tracker" }));
+  expect(authorizeRegistryService).not.toHaveBeenCalled();
+  expect(toggle).not.toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Connect workspace" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("Databricks workspace URL"), {
+    target: { value: "https://workspace.example.test" },
+  });
+  vi.mocked(authorizeRegistryService).mockResolvedValue();
+  vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...databricks, connected: true }] });
+  fireEvent.click(screen.getByRole("button", { name: "Connect workspace" }));
+  await waitFor(() => expect(toggle).toHaveBeenCalledWith("tracker", true));
+  expect(authorizeRegistryService).toHaveBeenCalledWith(
+    databricks,
+    expect.any(AbortSignal),
+    "https://workspace.example.test",
+  );
+});

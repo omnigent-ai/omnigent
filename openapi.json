@@ -8619,7 +8619,8 @@
           "transport": {
             "enum": [
               "http",
-              "stdio"
+              "stdio",
+              "registry"
             ],
             "title": "Transport",
             "type": "string"
@@ -10200,6 +10201,57 @@
         "summary": "Info",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/v1/mcp/{service_id}": {
+      "post": {
+        "operationId": "gateway_v1_mcp__service_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "title": "Service Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Omnigent-Session-Id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "X-Omnigent-Session-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Gateway",
+        "tags": [
+          "mcp_gateway"
         ]
       }
     },
