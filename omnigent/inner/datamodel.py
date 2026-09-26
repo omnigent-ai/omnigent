@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
@@ -64,7 +64,7 @@ class Message:
 
     role: Literal["system", "user", "assistant", "tool_call", "tool_result"]
     content: MessageContent
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     source: str | None = None
     metadata: MessageMetadata = field(default_factory=dict)
 
