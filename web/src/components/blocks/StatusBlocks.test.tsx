@@ -318,6 +318,19 @@ describe("ErrorBanner", () => {
     expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
   });
 
+  it("names an undelivered native web message in the headline", () => {
+    render(
+      <ErrorBanner
+        message="Claude Code never recorded this message in its transcript before accepting a later one, so it was not delivered."
+        source="execution"
+        code="native_prompt_not_recorded"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The agent never received this message, so it was not delivered.",
+    );
+  });
+
   it("dismisses only the visible banner", () => {
     render(
       <div>

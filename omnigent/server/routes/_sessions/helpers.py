@@ -65,6 +65,7 @@ from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -4337,6 +4338,27 @@ def _merge_pending_file_blocks(
         return item
     merged_data = item.data.model_copy(update={"content": [*file_blocks, *item.data.content]})
     return item.model_copy(update={"data": merged_data})
+
+
+# Attachment reference lines a native executor prepends to a pasted message
+# ("[Attached: /tmp/.../x.png]", "[Attachment x.png could not be loaded]").
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
+
+
+def _strip_attachment_markers(text: str) -> str:
+    """
+    Remove the attachment marker lines a native executor prepends to a paste.
+
+    A web message is queued as its typed text plus file blocks; the executor
+    pastes the files as ``[Attached: <path>]`` lines ahead of that text, and
+    the transcript mirrors those lines back verbatim. Stripping them lets the
+    mirrored message be matched to its queued entry by text.
+
+    :param text: Mirrored user-message text, e.g.
+        ``"[Attached: /tmp/x.png]\\n\\nlook at this"``.
+    :returns: The text without marker lines, e.g. ``"\\n\\nlook at this"``.
+    """
+    return _ATTACHMENT_MARKER_RE.sub("", text)
 
 
 def _message_text(content: list[dict[str, Any]]) -> str | None:
@@ -11530,6 +11552,7 @@ __all__ = [
     "_stop_session_via_runner",
     "_stored_file_to_resource",
     "_stream_live_events",
+    "_strip_attachment_markers",
     "_structured_ask_user_question",
     "_targeted_elicitation_event",
     "_title_content_from_item",

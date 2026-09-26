@@ -22,8 +22,9 @@ uses for transient recovery state (:mod:`pending_elicitations`,
   :func:`snapshot_for`, so a (re)connecting client re-hydrates the
   bubble instead of showing nothing;
 * drained when the transcript forwarder persists the matching user
-  message (via :func:`resolve_oldest`), so the now-committed item
-  doesn't double-render alongside a stale pending entry.
+  message (via :func:`resolve_matching_text`, falling back to
+  :func:`resolve_oldest`), so the now-committed item doesn't
+  double-render alongside a stale pending entry.
 
 Unlike :mod:`pending_elicitations` / :mod:`inflight_text`, this index
 is NOT populated through the :func:`session_stream.publish` chokepoint:
@@ -32,20 +33,25 @@ sender can adopt it and dedupe cleanly), and draining needs to run at
 the persist site so the ``session.input.consumed`` event can carry the
 cleared id. Both are caller-driven, so the access is explicit.
 
-Draining is by FIFO order (oldest first), NOT by text. Native gives no
-id channel back through the TUI to correlate the forwarded POST with the
-mirrored transcript item, and the transcript freely reformats the text
-(reply-quote ``>`` blockquotes, ``[Attached:]`` markers, whitespace), so
-matching on text is unreliable — it would leave a reformatted message
-stuck pending and double-rendered. Per-session SSE ordering guarantees
-the i-th persisted user message corresponds to the i-th queued one, so
-each persisted native user message drains the oldest pending entry.
+Draining matches the mirrored text to its entry first and falls back to
+FIFO order (oldest first). Native gives no id channel back through the
+TUI to correlate the forwarded POST with the mirrored transcript item.
+Position alone is not safe either: a pasted message the TUI never
+recorded (a host that died mid-paste, a hook that failed closed) leaves
+its entry at the head of the queue, and every later message would then
+drain the wrong entry — the receipt names the previous message, clients
+settle the wrong bubble, and the new message renders twice. So the
+persist site drains the oldest entry whose text equals the mirror
+(whitespace-normalized, attachment markers stripped) and reports the
+older entries it skipped, which the caller persists as undelivered. When
+no entry matches — the transcript may still reformat text in ways not
+normalized here — the oldest entry is drained, as before.
 
 The one imperfect case is interleaving a web-composer message with a
 message typed directly in the TUI: the TUI message (which has no pending
-entry) drains the oldest web entry, so that web bubble briefly
-disappears and reappears once it persists. It self-heals; the committed
-bubble always renders the just-persisted content regardless.
+entry and matches none) drains the oldest web entry, so that web bubble
+briefly disappears and reappears once it persists. It self-heals; the
+committed bubble always renders the just-persisted content regardless.
 
 Limitations (identical to :mod:`pending_elicitations`):
 
@@ -57,10 +63,12 @@ Limitations (identical to :mod:`pending_elicitations`):
   is one in-flight message, same as every other AP-side transient.
 
 A forwarded message the vendor TUI never accepts (runner crash, dropped
-keystrokes) is never persisted, so :func:`resolve_oldest` never
-drains its entry. :data:`_TTL_S` bounds that ghost: stale entries are
-evicted lazily on the next :func:`record` / :func:`snapshot_for` /
-:func:`resolve_oldest` for the same conversation.
+keystrokes) is never persisted, so no mirror drains its entry. The next
+text-matched mirror skips it (see :func:`resolve_matching_text`) and the
+persist site records it as undelivered; :data:`_TTL_S` bounds a ghost no
+later message follows: stale entries are evicted lazily on the next
+:func:`record` / :func:`snapshot_for` / :func:`resolve_oldest` for the
+same conversation.
 """
 
 from __future__ import annotations
@@ -274,13 +282,12 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.
 
-    Called at the persist site when a native user message is mirrored
-    back from the transcript, so the now-committed item doesn't
-    double-render alongside its stale pending entry. Draining is by
-    insertion order, NOT text: per-session SSE ordering guarantees the
-    i-th persisted user message is the i-th queued one, and the
-    transcript reformats text (reply-quote blockquotes, ``[Attached:]``
-    markers) in ways a text match can't survive.
+    Called at the persist site when a native user message mirrored back
+    from the transcript matches no entry by text (see
+    :func:`resolve_matching_text`): the transcript can reformat text in
+    ways the match does not normalize, and leaving such a message pending
+    would double-render it alongside its stale entry. Draining here is by
+    insertion order — the oldest entry is the best remaining guess.
 
     Returns the drained entry (id + content) so the caller can echo the
     id to clients AND merge its file blocks into the durable item — the
@@ -343,17 +350,20 @@ def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
 
-    Kiro persists accepted web prompts as structured ``Prompt`` records. If an
-    earlier injected web message errors before Kiro records a prompt, FIFO
-    draining would consume that failed entry when the next successful prompt is
-    mirrored, leaving the successful prompt stuck pending. This resolver lets
-    Kiro match the accepted prompt text and returns any older skipped entries so
-    the caller can surface them as failed web injections.
+    If an earlier web message was injected but the TUI never recorded it (it
+    errored, the host died mid-paste, a hook failed closed), FIFO draining
+    would consume that lost entry when the next recorded message is mirrored
+    and name it in ``session.input.consumed`` — every client would settle the
+    wrong bubble. Matching the mirrored text selects the right entry and
+    returns the older skipped entries so the caller can surface them as
+    undelivered web messages.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
-    :param text: Accepted prompt text mirrored from Kiro's structured JSONL.
+    :param text: User-message text mirrored from the native transcript, with
+        any attachment marker lines already stripped.
     :returns: Matched entry plus older skipped entries, or no match with an
-        empty skipped list when the text was typed directly in the TUI.
+        empty skipped list when nothing carries this text (e.g. it was typed
+        directly in the TUI).
     """
     needle = _normalize_text(text)
     if not needle:
@@ -470,7 +480,7 @@ def _content_text(content: list[dict[str, Any]]) -> str:
 
 
 def _normalize_text(text: str) -> str:
-    """Normalize text enough to compare pending input with Kiro Prompt text."""
+    """Normalize text enough to compare a pending input with its mirrored text."""
     return " ".join(text.split())
 
 
