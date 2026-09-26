@@ -1,27 +1,28 @@
-"""Typed HTTP + SSE client for an ``opencode serve`` native server.
+"""Typed HTTP + SSE client for an OpenCode 2.x ``opencode serve`` server.
 
-Shaped from the pinned OpenCode OpenAPI (``opencode`` 1.17.x–1.18.x,
-``packages/sdk/openapi.json``). This is a thin typed wrapper over the v1
-REST endpoints the Omnigent OpenCode-native harness needs plus the SSE
-``GET /event`` stream — not a full generated SDK. Unknown response fields
-are preserved under ``raw`` for forward-compatible logging and fixtures.
+Hand-shaped from the ``@opencode/cli`` 2.0.x OpenAPI (``/api/*`` routes). This
+is a thin typed wrapper over the endpoints the Omnigent OpenCode-native harness
+needs plus the SSE ``GET /api/event`` stream — not a full generated SDK.
 
 Transport notes:
 
 - REST + SSE over ``httpx.AsyncClient``; the server binds loopback only.
-- Basic auth headers (``OPENCODE_SERVER_PASSWORD``) are attached per
-  request when provided.
-- SSE is parsed with standard ``event:`` / ``data:`` framing; each event
-  payload is OpenCode's ``{id?, type, properties}`` envelope.
+- Basic auth (``opencode:<OPENCODE_PASSWORD>``) is attached per request.
+- JSON bodies arrive as ``{"data": ...}`` (or ``{"location", "data"}``);
+  :func:`_unwrap` strips the envelope. ``/api/info`` and ``/interrupt``
+  answer with bare objects, which :func:`_unwrap` passes through.
+- SSE frames are ``data: {id, created, type, location?, data}`` lines;
+  ``: heartbeat`` comments are skipped.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import urllib.parse
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
 import httpx
 
@@ -37,16 +38,33 @@ _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 _JsonMapping: TypeAlias = Mapping[str, object]
 
+# Upper bound on message pages fetched by list_messages (guards a cursor loop).
+_MAX_MESSAGE_PAGES = 1000
+
+
+def _unwrap(body: object) -> object:
+    """
+    Strip OpenCode's response envelope.
+
+    :param body: Decoded JSON, e.g. ``{"data": {...}}``,
+        ``{"location": {...}, "data": [...]}``, or a bare ``/api/info`` object.
+    :returns: ``body["data"]`` when present, else *body* unchanged.
+    """
+    if isinstance(body, dict) and "data" in body:
+        return body["data"]
+    return body
+
 
 @dataclass(frozen=True)
 class OpenCodeSession:
     """
-    An OpenCode session as returned by the REST API.
+    An OpenCode session as returned by ``/api/session`` endpoints.
 
     :param id: OpenCode session id, e.g. ``"ses_abc123"``.
     :param title: Optional human-readable title.
-    :param parent_id: Parent session id for forked/child sessions.
-    :param directory: Session working directory, when reported.
+    :param parent_id: Parent session id for child (subagent) sessions.
+    :param directory: Session location directory, when reported.
+    :param model: The session's ``{"id", "providerID", "variant"?}``, when set.
     :param raw: The full server payload for forward-compatibility.
     """
 
@@ -54,14 +72,15 @@ class OpenCodeSession:
     title: str | None = None
     parent_id: str | None = None
     directory: str | None = None
+    model: dict[str, Any] | None = None
     raw: _JsonObject = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, payload: _JsonMapping) -> OpenCodeSession:
         """
-        Build an :class:`OpenCodeSession` from a raw server payload.
+        Build an :class:`OpenCodeSession` from a ``Session.Info`` payload.
 
-        :param payload: Decoded JSON object from ``/session`` endpoints.
+        :param payload: Decoded, unwrapped session object.
         :returns: Parsed session.
         :raises ValueError: When the payload has no string ``id``.
         """
@@ -70,12 +89,15 @@ class OpenCodeSession:
             raise ValueError("OpenCode session payload missing string 'id'")
         title = payload.get("title")
         parent_id = payload.get("parentID")
-        directory = payload.get("directory")
+        location = payload.get("location")
+        directory = location.get("directory") if isinstance(location, Mapping) else None
+        model = payload.get("model")
         return cls(
             id=session_id,
             title=title if isinstance(title, str) else None,
             parent_id=parent_id if isinstance(parent_id, str) else None,
             directory=directory if isinstance(directory, str) else None,
+            model=dict(model) if isinstance(model, Mapping) else None,
             raw=dict(payload),
         )
 
@@ -121,7 +143,17 @@ class OpenCodeEvent:
 
 
 class OpenCodeClientError(RuntimeError):
-    """Raised when an OpenCode REST call returns a non-2xx response."""
+    """
+    Raised when an OpenCode REST call fails.
+
+    :param message: Human-readable failure.
+    :param status_code: HTTP status of the failing response, or ``None`` when
+        the failure was not an HTTP status (e.g. a malformed body).
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class OpenCodeClient:
@@ -148,7 +180,10 @@ class OpenCodeClient:
         self._base_url = base_url.rstrip("/")
         default_headers: dict[str, str] = dict(headers or {})
         if directory:
-            default_headers.setdefault("x-opencode-directory", directory)
+            # The server URI-decodes this header, so non-ASCII paths survive.
+            default_headers.setdefault(
+                "x-opencode-directory", urllib.parse.quote(directory, safe="/")
+            )
         self._directory = directory
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
@@ -180,98 +215,203 @@ class OpenCodeClient:
 
     # --- helpers ---------------------------------------------------------
 
+    async def _request_body(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: _JsonMapping | None = None,
+        params: Mapping[str, str] | None = None,
+    ) -> object:
+        """
+        Issue a request and return the decoded JSON body without unwrapping.
+
+        :param method: HTTP method, e.g. ``"POST"``.
+        :param path: Path relative to ``base_url``, e.g. ``"/api/session"``.
+        :param json_body: Optional JSON request body.
+        :param params: Optional query parameters.
+        :returns: Decoded JSON, or ``None`` for an empty (e.g. 204) body.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        response = await self._client.request(
+            method,
+            path,
+            json=dict(json_body) if json_body is not None else None,
+            params=dict(params) if params is not None else None,
+        )
+        if response.status_code >= 400:
+            raise OpenCodeClientError(
+                f"OpenCode {method} {path} failed: {response.status_code} {response.text[:500]}",
+                status_code=response.status_code,
+            )
+        if not response.content:
+            return None
+        try:
+            decoded: object = response.json()
+        except json.JSONDecodeError:
+            return None
+        return decoded
+
     async def _request_json(
         self,
         method: str,
         path: str,
         *,
         json_body: _JsonMapping | None = None,
+        params: Mapping[str, str] | None = None,
     ) -> object:
         """
-        Issue a request and return decoded JSON, raising on HTTP errors.
+        Issue a request and return the ``data``-unwrapped JSON body.
 
-        :param method: HTTP method, e.g. ``"POST"``.
-        :param path: Path relative to ``base_url``, e.g. ``"/session"``.
-        :returns: Decoded JSON (object/array/scalar), or ``None`` for an
-            empty body.
+        :param method: HTTP method.
+        :param path: Path relative to ``base_url``.
+        :param json_body: Optional JSON request body.
+        :param params: Optional query parameters.
+        :returns: The unwrapped body (see :func:`_unwrap`).
         :raises OpenCodeClientError: On a non-2xx status.
         """
-        if json_body is None:
-            response = await self._client.request(method, path)
-        else:
-            response = await self._client.request(method, path, json=dict(json_body))
-        if response.status_code >= 400:
-            raise OpenCodeClientError(
-                f"OpenCode {method} {path} failed: {response.status_code} {response.text[:500]}"
-            )
-        if not response.content:
-            return None
-        try:
-            decoded: object = response.json()
-            return decoded
-        except json.JSONDecodeError:
-            return None
+        body = await self._request_body(method, path, json_body=json_body, params=params)
+        return _unwrap(body)
+
+    # --- server ----------------------------------------------------------
+
+    async def info(self) -> _JsonObject:
+        """
+        Fetch server info (``GET /api/info``).
+
+        :returns: ``{"version": "2.0.18", "pid": ..., "urls": [...], "paths": {...}}``.
+        :raises OpenCodeClientError: On a non-2xx status or a non-object body.
+        """
+        data = await self._request_json("GET", "/api/info")
+        if not isinstance(data, dict):
+            raise OpenCodeClientError("OpenCode /api/info returned a non-object body")
+        return data
 
     # --- sessions --------------------------------------------------------
 
-    async def create_session(self, payload: _JsonMapping | None = None) -> OpenCodeSession:
+    async def create_session(
+        self,
+        *,
+        title: str,
+        directory: str,
+        permissions: list[_JsonObject] | None = None,
+        model: _JsonObject | None = None,
+        metadata: _JsonObject | None = None,
+    ) -> OpenCodeSession:
         """
-        Create an OpenCode session (``POST /session``).
+        Create a session (``POST /api/session``).
 
-        :param payload: Optional create body, e.g. ``{"title": "..."}``.
-            Note: OpenCode's create body only accepts ``title`` / ``parentID``
-            — it does NOT accept a model (the model is a per-prompt field on
-            ``POST /session/{id}/message``). Pin the model per prompt via
-            :func:`omnigent.harnesses.opencode_native.http_transport.build_prompt_payload`.
+        :param title: Session title, e.g. ``"omnigent:conv_abc"``.
+        :param directory: Workspace directory the session is located in.
+        :param permissions: Session rules, e.g.
+            ``[{"action": "*", "resource": "*", "effect": "ask"}]``.
+        :param model: Initial ``{"id", "providerID", "variant"?}``.
+        :param metadata: Free-form metadata, e.g.
+            ``{"omnigent_conversation": "conv_abc"}``.
         :returns: The created session.
+        :raises OpenCodeClientError: On a non-2xx status or a non-object body.
         """
-        data = await self._request_json("POST", "/session", json_body=payload or {})
+        body: _JsonObject = {"title": title, "location": {"directory": directory}}
+        if permissions is not None:
+            body["permissions"] = permissions
+        if model is not None:
+            body["model"] = model
+        if metadata is not None:
+            body["metadata"] = metadata
+        data = await self._request_json("POST", "/api/session", json_body=body)
         if not isinstance(data, Mapping):
             raise OpenCodeClientError("OpenCode create_session returned a non-object body")
         return OpenCodeSession.from_payload(data)
 
     async def get_session(self, session_id: str) -> OpenCodeSession | None:
         """
-        Fetch one session (``GET /session/{id}``).
+        Fetch one session (``GET /api/session/{id}``).
 
         :param session_id: OpenCode session id.
-        :returns: The session, or ``None`` when it does not exist.
+        :returns: The session, or ``None`` when it does not exist (404).
+        :raises OpenCodeClientError: On any other non-2xx status.
         """
-        response = await self._client.request("GET", f"/session/{session_id}")
-        if response.status_code == 404:
-            return None
-        if response.status_code >= 400:
-            raise OpenCodeClientError(
-                f"OpenCode get_session failed: {response.status_code} {response.text[:500]}"
-            )
-        data = response.json()
+        try:
+            data = await self._request_json("GET", f"/api/session/{session_id}")
+        except OpenCodeClientError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
         if not isinstance(data, Mapping):
             return None
         return OpenCodeSession.from_payload(data)
 
-    async def list_messages(self, session_id: str) -> list[_JsonObject]:
+    async def list_messages(
+        self, session_id: str, *, after_id: str | None = None
+    ) -> list[_JsonObject]:
         """
-        List a session's messages (``GET /session/{id}/message``).
+        List a session's messages, oldest first (``GET /api/session/{id}/message``).
+
+        Follows ``cursor.next`` across pages until the server stops returning one.
 
         :param session_id: OpenCode session id.
-        :returns: A list of message objects (each typically
-            ``{"info": {...}, "parts": [...]}``).
+        :param after_id: When set, only messages after this message id are
+            returned; all messages are returned when the id is not found.
+        :returns: v2 message objects, e.g. ``{"id": "msg_1", "type": "assistant", ...}``.
+        :raises OpenCodeClientError: On a non-2xx status.
         """
-        data = await self._request_json("GET", f"/session/{session_id}/message")
+        path = f"/api/session/{session_id}/message"
+        messages: list[_JsonObject] = []
+        params: dict[str, str] = {"order": "asc"}
+        seen_cursors: set[str] = set()
+        for _ in range(_MAX_MESSAGE_PAGES):
+            body = await self._request_body("GET", path, params=params)
+            if not isinstance(body, dict):
+                break
+            page = body.get("data")
+            if isinstance(page, list):
+                messages.extend(item for item in page if isinstance(item, dict))
+            cursor = body.get("cursor")
+            next_cursor = cursor.get("next") if isinstance(cursor, dict) else None
+            if not page or not isinstance(next_cursor, str) or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            params = {"cursor": next_cursor}
+        if after_id is None:
+            return messages
+        for index, message in enumerate(messages):
+            if message.get("id") == after_id:
+                return messages[index + 1 :]
+        return messages
+
+    async def list_root_sessions(self, *, limit: int = 100) -> list[OpenCodeSession]:
+        """
+        List top-level sessions, newest first (``GET /api/session?parentID=null``).
+
+        :param limit: Maximum sessions to return.
+        :returns: Root (non-subagent) sessions; malformed rows are skipped.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        data = await self._request_json(
+            "GET",
+            "/api/session",
+            params={"parentID": "null", "order": "desc", "limit": str(limit)},
+        )
+        if not isinstance(data, list):
+            return []
+        return [
+            OpenCodeSession.from_payload(item)
+            for item in data
+            if isinstance(item, Mapping) and isinstance(item.get("id"), str) and item.get("id")
+        ]
+
+    async def get_context(self, session_id: str) -> list[_JsonObject]:
+        """
+        Fetch the messages the model sees next turn (``GET .../context``).
+
+        :param session_id: OpenCode session id.
+        :returns: v2 message objects after the latest compaction boundary.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        data = await self._request_json("GET", f"/api/session/{session_id}/context")
         if isinstance(data, list):
             return [item for item in data if isinstance(item, dict)]
         return []
-
-    async def get_message(self, session_id: str, message_id: str) -> _JsonObject:
-        """
-        Fetch one message (``GET /session/{id}/message/{messageID}``).
-
-        :param session_id: OpenCode session id.
-        :param message_id: OpenCode message id.
-        :returns: The message object, or ``{}`` when absent.
-        """
-        data = await self._request_json("GET", f"/session/{session_id}/message/{message_id}")
-        return data if isinstance(data, dict) else {}
 
     async def list_models(self) -> list[_JsonObject]:
         """

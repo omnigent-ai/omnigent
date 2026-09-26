@@ -201,7 +201,8 @@ class OpenCodeHttpTransport:
                 if existing is not None:
                     return existing.id
             created = await client.create_session(
-                {"title": f"omnigent:{launch.omnigent_session_id}"}
+                title=f"omnigent:{launch.omnigent_session_id}",
+                directory=launch.workspace,
             )
             return created.id
         finally:

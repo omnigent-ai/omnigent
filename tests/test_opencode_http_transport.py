@@ -82,8 +82,8 @@ class _FakeClient:
         self.calls.append(("get_session", session_id))
         return self.existing
 
-    async def create_session(self, payload: Any = None) -> SimpleNamespace:
-        self.calls.append(("create_session", payload))
+    async def create_session(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(("create_session", kwargs))
         return SimpleNamespace(id="ses_new")
 
     async def prompt_async(self, session_id: str, payload: Any) -> dict[str, Any]:
@@ -129,6 +129,7 @@ async def test_create_session_when_no_external_id() -> None:
     sid = await _transport(client).create_or_resume_session(_launch())
     assert sid == "ses_new"
     assert client.closed
+    assert ("create_session", {"title": "omnigent:conv_1", "directory": "/w"}) in client.calls
 
 
 async def test_resume_returns_existing_session() -> None:

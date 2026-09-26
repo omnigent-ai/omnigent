@@ -1690,7 +1690,9 @@ async def _auto_create_opencode_terminal(
                     # below instead of silently starting empty.
                     resume_lost_history = True
             if opencode_session_id is None:
-                created = await client.create_session({"title": f"omnigent:{session_id}"})
+                created = await client.create_session(
+                    title=f"omnigent:{session_id}", directory=workspace
+                )
                 opencode_session_id = created.id
                 # Rehydrate prior context (text-prefix replay) when this is a
                 # lost-session resume OR a forked clone carrying history — both
