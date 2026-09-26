@@ -336,6 +336,7 @@ def _user_share(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     (share / "opencode").mkdir(parents=True)
     monkeypatch.setenv("XDG_DATA_HOME", str(share))
     monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     return share
 
 
@@ -374,12 +375,44 @@ def test_seed_opencode_auth_merges_v2_db_credentials(
     }
 
 
+def test_seed_opencode_auth_merges_real_v2_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real v2 SQLite ``credential`` row (no mocking) merges into the seeded file."""
+    import sqlite3
+
+    share = _user_share(monkeypatch, tmp_path)
+    (share / "opencode" / "auth.json").write_text('{"groq": {"type": "api", "key": "g"}}')
+    db_path = share / "opencode" / "opencode.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL,"
+        " value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER,"
+        " time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO credential VALUES ('cred_0', 'anthropic', 'x', ?, NULL, NULL, 1, 0, 1)",
+        (json.dumps({"type": "key", "key": "fresh"}),),
+    )
+    conn.commit()
+    conn.close()
+
+    bridge_dir = bridge.prepare_bridge_dir("conv_real_db")
+    dest = bridge.seed_opencode_auth(bridge_dir)
+    assert dest is not None
+    assert json.loads(dest.read_text()) == {
+        "anthropic": {"type": "api", "key": "fresh"},
+        "groq": {"type": "api", "key": "g"},
+    }
+
+
 def test_seed_opencode_auth_noop_without_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """No auth.json and no v2 DB → None (e.g. on a remote runner)."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "empty-share"))
     monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     bridge_dir = bridge.prepare_bridge_dir("conv_noseed")
     assert bridge.seed_opencode_auth(bridge_dir) is None
     assert bridge.seeded_provider_ids(bridge_dir) == frozenset()
