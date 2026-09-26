@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import errno
 import hashlib
 import json
 import logging
@@ -53,7 +54,11 @@ from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cu
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
 # (one chat per workspace) and reads the live ``-wal`` state correctly.
-from omnigent.harnesses.cursor_native.forwarder import _discover_store, _read_blob_rows
+from omnigent.harnesses.cursor_native.forwarder import (
+    _discover_store,
+    _fd_exhaustion_errno,
+    _read_blob_rows,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -860,6 +865,8 @@ async def supervise_cursor_transcript_elicitations(
     # tool_call_id → (loop-time of last auto-accept attempt, attempts) — yolo only.
     auto_accept_attempts: dict[str, tuple[float, int]] = {}
     store_path: Path | None = None
+    # Loop-time when the current fd-exhaustion episode began, or None.
+    fd_exhausted_since: float | None = None
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
@@ -968,10 +975,43 @@ async def supervise_cursor_transcript_elicitations(
                     first_seen.pop(call.tool_call_id, None)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                _logger.exception(
-                    "cursor transcript elicitation poll failed; session=%s bridge_dir=%s",
-                    session_id,
-                    bridge_dir,
-                )
+            except Exception as exc:
+                fd_errno = _fd_exhaustion_errno(exc)
+                if fd_errno is not None:
+                    # The process is out of descriptors; the pass will succeed
+                    # again once they free up. One WARNING per episode.
+                    if fd_exhausted_since is None:
+                        fd_exhausted_since = loop.time()
+                        _logger.warning(
+                            "cursor transcript elicitation poll degraded by fd "
+                            "exhaustion (%s: %s); retrying every %.2fs; session=%s "
+                            "bridge_dir=%s",
+                            errno.errorcode.get(fd_errno, fd_errno),
+                            exc,
+                            poll_interval_s,
+                            session_id,
+                            bridge_dir,
+                        )
+                    else:
+                        _logger.debug(
+                            "cursor transcript elicitation poll still fd-exhausted "
+                            "(%.1fs); session=%s",
+                            loop.time() - fd_exhausted_since,
+                            session_id,
+                        )
+                else:
+                    _logger.exception(
+                        "cursor transcript elicitation poll failed; session=%s bridge_dir=%s",
+                        session_id,
+                        bridge_dir,
+                    )
+            else:
+                if fd_exhausted_since is not None:
+                    _logger.info(
+                        "cursor transcript elicitation poll recovered from fd "
+                        "exhaustion after %.1fs; session=%s",
+                        loop.time() - fd_exhausted_since,
+                        session_id,
+                    )
+                    fd_exhausted_since = None
             await asyncio.sleep(poll_interval_s)
