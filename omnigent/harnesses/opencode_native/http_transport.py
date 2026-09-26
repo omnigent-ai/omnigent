@@ -248,11 +248,10 @@ class OpenCodeHttpTransport:
             await client.aclose()
 
     async def fork(self, session_id: str, *, at_message_id: str | None = None) -> str:
-        """Fork the session via ``POST /session/{id}/fork``."""
+        """Fork the session via ``POST /api/session/{id}/fork``."""
         client = self._client()
         try:
-            payload = {"messageID": at_message_id} if at_message_id else None
-            forked = await client.fork(session_id, payload)
+            forked = await client.fork(session_id, before=at_message_id)
             return forked.id
         finally:
             await client.aclose()

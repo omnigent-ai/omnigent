@@ -267,17 +267,6 @@ async def test_abort_returns_bool() -> None:
     await client.aclose()
 
 
-async def test_fork() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/session/ses_1/fork"
-        return httpx.Response(200, json={"id": "ses_2", "parentID": "ses_1"})
-
-    client = _client(handler)
-    forked = await client.fork("ses_1", {"messageID": "msg_1"})
-    assert forked.id == "ses_2"
-    await client.aclose()
-
-
 async def test_reply_permission() -> None:
     captured: dict[str, object] = {}
 
@@ -364,12 +353,6 @@ async def test_list_messages_non_list_returns_empty() -> None:
     await client.aclose()
 
 
-async def test_prompt_non_dict_returns_empty() -> None:
-    client = _client(lambda _r: httpx.Response(200, json=[1]))
-    assert await client.prompt("ses_1", {"parts": []}) == {}
-    await client.aclose()
-
-
 async def test_fork_non_object_body_raises() -> None:
     client = _client(lambda _r: httpx.Response(200, json="nope"))
     with pytest.raises(OpenCodeClientError):
@@ -377,65 +360,159 @@ async def test_fork_non_object_body_raises() -> None:
     await client.aclose()
 
 
+async def test_prompt_posts_v2_body_and_unwraps() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"data": {"id": "msg_1", "sessionID": "ses_1", "type": "user"}}
+        )
+
+    client = _client(handler)
+    result = await client.prompt(
+        "ses_1",
+        text="hi",
+        files=[{"uri": "data:image/png;base64,AAAA", "name": "shot.png"}],
+        delivery="queue",
+        message_id="msg_1",
+    )
+    assert seen["path"] == "/api/session/ses_1/prompt"
+    assert seen["body"] == {
+        "text": "hi",
+        "delivery": "queue",
+        "files": [{"uri": "data:image/png;base64,AAAA", "name": "shot.png"}],
+        "id": "msg_1",
+    }
+    assert result["id"] == "msg_1"
+    await client.aclose()
+
+
+async def test_prompt_defaults_to_steer_without_files() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"data": {"id": "msg_1"}})
+
+    client = _client(handler)
+    await client.prompt("ses_1", text="hi", files=[])
+    assert seen["body"] == {"text": "hi", "delivery": "steer"}
+    await client.aclose()
+
+
+async def test_seed_context_records_without_resuming() -> None:
+    requests: list[tuple[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"data": {"id": "msg_1", "type": "user"}})
+
+    client = _client(handler)
+    await client.seed_context("ses_1", "prior transcript")
+    assert requests == [
+        ("/api/session/ses_1/prompt", {"text": "prior transcript", "resume": False})
+    ]
+    await client.aclose()
+
+
+async def test_seed_context_falls_back_to_synthetic_on_rejection() -> None:
+    requests: list[tuple[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, json.loads(request.content)))
+        if request.url.path.endswith("/prompt"):
+            return httpx.Response(
+                400, json={"_tag": "InvalidRequestError", "message": "resume unsupported"}
+            )
+        return httpx.Response(200, json={"data": {"id": "msg_2", "type": "synthetic"}})
+
+    client = _client(handler)
+    await client.seed_context("ses_1", "ctx")
+    assert [path for path, _ in requests] == [
+        "/api/session/ses_1/prompt",
+        "/api/session/ses_1/synthetic",
+    ]
+    assert requests[1][1] == {"text": "ctx", "resume": False}
+    await client.aclose()
+
+
+async def test_seed_context_server_error_is_not_retried() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(500, json={"_tag": "UnknownError", "message": "boom"})
+
+    client = _client(handler)
+    with pytest.raises(OpenCodeClientError):
+        await client.seed_context("ses_1", "ctx")
+    assert requests == ["/api/session/ses_1/prompt"]
+    await client.aclose()
+
+
+async def test_set_model_posts_model_ref() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(204)
+
+    client = _client(handler)
+    await client.set_model("ses_1", provider_id="opencode", model_id="big-pickle", variant="high")
+    assert seen["path"] == "/api/session/ses_1/model"
+    assert seen["body"] == {
+        "model": {"id": "big-pickle", "providerID": "opencode", "variant": "high"}
+    }
+    await client.aclose()
+
+
+@pytest.mark.parametrize("interrupted", [True, False])
+async def test_interrupt_reads_bare_flag(interrupted: bool) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert (request.method, request.url.path) == ("POST", "/api/session/ses_1/interrupt")
+        return httpx.Response(200, json={"interrupted": interrupted})
+
+    client = _client(handler)
+    assert await client.interrupt("ses_1") is interrupted
+    await client.aclose()
+
+
+async def test_compact_posts_without_model() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"data": {"id": "msg_c", "type": "compaction"}})
+
+    client = _client(handler)
+    assert (await client.compact("ses_1"))["type"] == "compaction"
+    assert seen == {"path": "/api/session/ses_1/compact", "body": {}}
+    await client.aclose()
+
+
+async def test_fork_before_message() -> None:
+    bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/session/ses_1/fork"
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": {**_SESSION, "id": "ses_2"}})
+
+    client = _client(handler)
+    assert (await client.fork("ses_1", before="msg_3")).id == "ses_2"
+    assert (await client.fork("ses_1")).id == "ses_2"
+    assert bodies == [{"before": "msg_3"}, {}]
+    await client.aclose()
+
+
 async def test_request_json_http_error_raises() -> None:
     client = _client(lambda _r: httpx.Response(503, json={"error": "down"}))
     with pytest.raises(OpenCodeClientError):
         await client.list_messages("ses_1")
-    await client.aclose()
-
-
-async def test_summarize_posts_v1_endpoint_with_model() -> None:
-    seen: dict[str, object] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["method"] = request.method
-        seen["path"] = request.url.path
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json=True)
-
-    client = _client(handler)
-    assert await client.summarize("ses_1", provider_id="anthropic", model_id="claude-sonnet-4-5")
-    assert seen["method"] == "POST"
-    assert seen["path"] == "/session/ses_1/summarize"
-    assert seen["body"] == {"providerID": "anthropic", "modelID": "claude-sonnet-4-5"}
-    await client.aclose()
-
-
-async def test_summarize_raises_on_error() -> None:
-    client = _client(lambda _r: httpx.Response(503, json={"error": "compact not available"}))
-    with pytest.raises(OpenCodeClientError):
-        await client.summarize("ses_1", provider_id="opencode", model_id="big-pickle")
-    await client.aclose()
-
-
-async def test_seed_context_posts_noreply_message() -> None:
-    seen: dict[str, object] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"info": {"id": "msg_1"}})
-
-    client = _client(handler)
-    assert await client.seed_context("ses_1", "prior context", provider_id="p", model_id="m")
-    assert seen["path"] == "/session/ses_1/message"
-    body = seen["body"]
-    assert body["noReply"] is True
-    assert body["parts"] == [{"type": "text", "text": "prior context"}]
-    assert body["model"] == {"providerID": "p", "modelID": "m"}
-    await client.aclose()
-
-
-async def test_seed_context_omits_model_when_absent() -> None:
-    seen: dict[str, object] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={})
-
-    client = _client(handler)
-    assert await client.seed_context("ses_1", "ctx")
-    assert "model" not in seen["body"]
     await client.aclose()
 
 

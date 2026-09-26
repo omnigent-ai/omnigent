@@ -98,8 +98,8 @@ class _FakeClient:
         self.calls.append(("list_messages", session_id))
         return [{"info": {"id": "msg_1"}}]
 
-    async def fork(self, session_id: str, payload: Any = None) -> SimpleNamespace:
-        self.calls.append(("fork", (session_id, payload)))
+    async def fork(self, session_id: str, *, before: str | None = None) -> SimpleNamespace:
+        self.calls.append(("fork", (session_id, before)))
         return SimpleNamespace(id="ses_fork")
 
     async def reply_permission(self, request_id: str, reply: Any) -> bool:
@@ -180,7 +180,7 @@ async def test_fork_with_and_without_message_id() -> None:
     transport = _transport(client)
     assert await transport.fork("ses_1") == "ses_fork"
     assert await transport.fork("ses_1", at_message_id="msg_9") == "ses_fork"
-    assert ("fork", ("ses_1", {"messageID": "msg_9"})) in client.calls
+    assert ("fork", ("ses_1", "msg_9")) in client.calls
     assert ("fork", ("ses_1", None)) in client.calls
 
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import urllib.parse
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
@@ -427,16 +427,36 @@ class OpenCodeClient:
                 return [m for m in models if isinstance(m, dict)]
         return []
 
-    async def prompt(self, session_id: str, payload: _JsonMapping) -> _JsonObject:
+    async def prompt(
+        self,
+        session_id: str,
+        *,
+        text: str,
+        files: Sequence[Mapping[str, str]] | None = None,
+        delivery: str = "steer",
+        message_id: str | None = None,
+    ) -> _JsonObject:
         """
-        Send a (blocking) prompt (``POST /session/{id}/message``).
+        Admit a user prompt (``POST /api/session/{id}/prompt``).
+
+        Returns once OpenCode has accepted the input; output streams over SSE.
 
         :param session_id: OpenCode session id.
-        :param payload: Prompt body, e.g. ``{"parts": [...]}``.
-        :returns: The server response object (often the assistant message).
+        :param text: Prompt text.
+        :param files: Attachments, each ``{"uri": "data:<mime>;base64,...", "name": ...}``.
+        :param delivery: ``"steer"`` (join the active turn or start one) or
+            ``"queue"`` (run after the active turn).
+        :param message_id: Optional client-chosen ``msg_`` id.
+        :returns: The admitted inbox entry, e.g. ``{"id": "msg_1", "type": "user", ...}``.
+        :raises OpenCodeClientError: On a non-2xx status.
         """
+        body: _JsonObject = {"text": text, "delivery": delivery}
+        if files:
+            body["files"] = [dict(entry) for entry in files]
+        if message_id is not None:
+            body["id"] = message_id
         data = await self._request_json(
-            "POST", f"/session/{session_id}/message", json_body=payload
+            "POST", f"/api/session/{session_id}/prompt", json_body=body
         )
         return data if isinstance(data, dict) else {}
 
@@ -466,60 +486,76 @@ class OpenCodeClient:
         data = await self._request_json("POST", f"/session/{session_id}/abort")
         return bool(data)
 
-    async def summarize(self, session_id: str, *, provider_id: str, model_id: str) -> bool:
+    async def seed_context(self, session_id: str, text: str) -> None:
         """
-        Compact a session in place (``POST /session/{id}/summarize``).
+        Record context in a session without running a turn.
 
-        opencode summarizes the session with the given model and emits a
-        ``session.compacted`` event when done. (The v2
-        ``POST /api/session/{id}/compact`` endpoint returns ``503 "Session
-        compact is not available yet"`` in 1.17.x — verified against a live
-        ``opencode serve`` — so this uses the v1 ``/summarize`` path, which
-        requires the model explicitly.)
+        Used to rehydrate a fresh session with a prior transcript. Sends
+        ``prompt {resume: false}``; when the server rejects that with a 4xx,
+        falls back to ``POST .../synthetic {resume: false}``.
 
         :param session_id: OpenCode session id.
-        :param provider_id: Provider id for the compaction model, e.g.
-            ``"anthropic"``.
-        :param model_id: Model id for the compaction model, e.g.
-            ``"claude-sonnet-4-5"``.
-        :returns: ``True`` once opencode has accepted the compaction request.
-        :raises OpenCodeClientError: On a non-2xx status.
+        :param text: Context to record, e.g. the rendered prior transcript.
+        :raises OpenCodeClientError: When the prompt fails with a 5xx, or both
+            calls fail.
         """
-        await self._request_json(
-            "POST",
-            f"/session/{session_id}/summarize",
-            json_body={"providerID": provider_id, "modelID": model_id},
-        )
-        return True
+        body = {"text": text, "resume": False}
+        try:
+            await self._request_json("POST", f"/api/session/{session_id}/prompt", json_body=body)
+        except OpenCodeClientError as exc:
+            if exc.status_code is None or exc.status_code >= 500:
+                raise
+            await self._request_json(
+                "POST", f"/api/session/{session_id}/synthetic", json_body=body
+            )
 
-    async def seed_context(
+    async def set_model(
         self,
         session_id: str,
-        text: str,
         *,
-        provider_id: str | None = None,
-        model_id: str | None = None,
-    ) -> bool:
+        provider_id: str,
+        model_id: str,
+        variant: str | None = None,
+    ) -> None:
         """
-        Inject a context message without triggering a reply (``noReply``).
-
-        Used to rehydrate a fresh session with prior conversation context on a
-        cross-host resume (opencode has no history-import API). ``noReply``
-        admits the message as history without running a model turn.
+        Switch the session's model (``POST /api/session/{id}/model``).
 
         :param session_id: OpenCode session id.
-        :param text: The context text to seed (e.g. the prior transcript).
-        :param provider_id: Optional model provider (opencode requires only
-            ``parts``, but a model keeps the seeded message attributed).
-        :param model_id: Optional model id.
-        :returns: ``True`` once opencode has accepted the message.
+        :param provider_id: Provider id, e.g. ``"opencode"``.
+        :param model_id: Model id within the provider, e.g. ``"big-pickle"``.
+        :param variant: Optional model variant, e.g. ``"high"``.
         :raises OpenCodeClientError: On a non-2xx status.
         """
-        body: _JsonObject = {"parts": [{"type": "text", "text": text}], "noReply": True}
-        if provider_id and model_id:
-            body["model"] = {"providerID": provider_id, "modelID": model_id}
-        await self._request_json("POST", f"/session/{session_id}/message", json_body=body)
-        return True
+        model: _JsonObject = {"id": model_id, "providerID": provider_id}
+        if variant is not None:
+            model["variant"] = variant
+        await self._request_json(
+            "POST", f"/api/session/{session_id}/model", json_body={"model": model}
+        )
+
+    async def interrupt(self, session_id: str) -> bool:
+        """
+        Interrupt active work (``POST /api/session/{id}/interrupt``).
+
+        :param session_id: OpenCode session id.
+        :returns: ``True`` when an active execution was interrupted.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        data = await self._request_json("POST", f"/api/session/{session_id}/interrupt")
+        return bool(data.get("interrupted")) if isinstance(data, dict) else False
+
+    async def compact(self, session_id: str) -> _JsonObject:
+        """
+        Queue a compaction (``POST /api/session/{id}/compact``).
+
+        Progress arrives as ``session.compaction.*`` events.
+
+        :param session_id: OpenCode session id.
+        :returns: The queued compaction inbox entry.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        data = await self._request_json("POST", f"/api/session/{session_id}/compact", json_body={})
+        return data if isinstance(data, dict) else {}
 
     async def reply_question(self, request_id: str, answers: list[list[str]]) -> bool:
         """
@@ -556,17 +592,17 @@ class OpenCodeClient:
         await self._request_json("POST", f"/question/{request_id}/reject")
         return True
 
-    async def fork(self, session_id: str, payload: _JsonMapping | None = None) -> OpenCodeSession:
+    async def fork(self, session_id: str, *, before: str | None = None) -> OpenCodeSession:
         """
-        Fork a session (``POST /session/{id}/fork``).
+        Fork a session (``POST /api/session/{id}/fork``).
 
         :param session_id: Source OpenCode session id.
-        :param payload: Optional fork body, e.g. ``{"messageID": "msg_..."}``.
+        :param before: Optional ``msg_`` id; the fork keeps history before it.
         :returns: The new forked session.
+        :raises OpenCodeClientError: On a non-2xx status or a non-object body.
         """
-        data = await self._request_json(
-            "POST", f"/session/{session_id}/fork", json_body=payload or {}
-        )
+        body: _JsonObject = {"before": before} if before is not None else {}
+        data = await self._request_json("POST", f"/api/session/{session_id}/fork", json_body=body)
         if not isinstance(data, Mapping):
             raise OpenCodeClientError("OpenCode fork returned a non-object body")
         return OpenCodeSession.from_payload(data)
