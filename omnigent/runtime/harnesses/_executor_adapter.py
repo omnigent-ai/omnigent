@@ -335,7 +335,8 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
-                        raise RuntimeError(f"inner executor error: {detail}")
+                        # Preserve the SDK cause for semantic error classification.
+                        raise RuntimeError(f"inner executor error: {detail}") from event.exception
         except ElicitationDeclinedError:
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
             _logger.info(
@@ -1037,24 +1038,27 @@ def _classify_anthropic_exception(exception: BaseException) -> str | None:
 
 
 def classify_inner_exception(exception: BaseException) -> str | None:
-    """Fan out across per-SDK classifiers; first match wins. Returns ``None`` when unrecognized.
+    """Classify the exception and its explicit causes, returning the first SDK match.
 
-    New classifiers plug in here once. Order matters if SDK hierarchies ever overlap —
-    more-specific classifiers should come first.
-    """
-    for classifier in (
-        _classify_openai_exception,
-        _classify_anthropic_exception,
-        _classify_claude_sdk_exception,
-        _classify_httpx_exception,
-    ):
-        code = classifier(exception)
-        if code is not None:
-            return code
+    Unrecognized or cyclic chains return None. Keep specific classifiers first."""
     from omnigent.llms.errors import is_context_length_exceeded
 
-    if is_context_length_exceeded(exception):
-        return "context_length_exceeded"
+    seen: set[int] = set()
+    current: BaseException | None = exception
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for classifier in (
+            _classify_openai_exception,
+            _classify_anthropic_exception,
+            _classify_claude_sdk_exception,
+            _classify_httpx_exception,
+        ):
+            code = classifier(current)
+            if code is not None:
+                return code
+        if is_context_length_exceeded(current):
+            return "context_length_exceeded"
+        current = current.__cause__
     return None
 
 

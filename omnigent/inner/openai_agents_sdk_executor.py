@@ -1756,7 +1756,8 @@ class OpenAIAgentsSDKExecutor(Executor):
                     yield ExecutorError(message=auth_msg)
                 else:
                     logger.error("OpenAIAgentsSDKExecutor: run failed: %s", exc)
-                    yield ExecutorError(message=f"OpenAI Agents SDK error: {exc}")
+                    # Preserve the SDK exception for the adapter’s error classifier.
+                    yield ExecutorError(message=f"OpenAI Agents SDK error: {exc}", exception=exc)
                 return
             finally:
                 # If the outer generator was aclose'd before the
