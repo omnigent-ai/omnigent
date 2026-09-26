@@ -3,12 +3,15 @@ package ai.omnigent.android
 import android.content.Context
 import android.content.RestrictionsManager
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Bundle
 import android.os.Looper
 import android.text.TextUtils
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.widget.TextView
 import androidx.core.view.WindowInsetsControllerCompat
@@ -16,6 +19,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -31,6 +35,28 @@ import java.time.Duration
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class MainActivityTest {
+    @Test
+    fun `main-frame http error opens server selection once and finishes`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val request = request("https://example.com/app")
+        val response = httpError(503)
+        val activityShadow = shadowOf(activity)
+        activityShadow.clearNextStartedActivities()
+
+        webView.webViewClient.onReceivedHttpError(webView, request, response)
+
+        assertEquals(
+            ConnectActivity::class.java.name,
+            activityShadow.nextStartedActivity.component?.className,
+        )
+        assertTrue(activity.isFinishing)
+
+        webView.webViewClient.onReceivedHttpError(webView, request, response)
+
+        assertNull(activityShadow.nextStartedActivity)
+    }
+
     @Test
     fun `webview leaves algorithmic darkening disabled`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
@@ -306,6 +332,31 @@ class MainActivityTest {
 
             override fun rendererPriorityAtExit(): Int = WebView.RENDERER_PRIORITY_IMPORTANT
         }
+
+    private fun request(url: String) =
+        object : WebResourceRequest {
+            override fun getUrl(): Uri = Uri.parse(url)
+
+            override fun isForMainFrame(): Boolean = true
+
+            override fun isRedirect(): Boolean = false
+
+            override fun hasGesture(): Boolean = false
+
+            override fun getMethod(): String = "GET"
+
+            override fun getRequestHeaders(): Map<String, String> = emptyMap()
+        }
+
+    private fun httpError(statusCode: Int) =
+        WebResourceResponse(
+            "text/html",
+            "UTF-8",
+            statusCode,
+            "HTTP error",
+            emptyMap(),
+            null,
+        )
 
     @Test
     fun `a managed preset never overrides the server the user picked`() {

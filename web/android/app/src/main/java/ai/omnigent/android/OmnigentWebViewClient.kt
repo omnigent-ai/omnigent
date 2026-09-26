@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 
@@ -35,6 +36,7 @@ class OmnigentWebViewClient(
     private val onLoginRequired: () -> Unit,
     private val onRendererGone: (view: WebView, didCrash: Boolean) -> Unit,
     private val onNavigationStarted: () -> Unit = {},
+    private val onMainFrameHttpError: (statusCode: Int) -> Unit = {},
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -181,6 +183,17 @@ class OmnigentWebViewClient(
             onLoginRequired()
         }
         return true
+    }
+
+    override fun onReceivedHttpError(
+        view: WebView,
+        request: WebResourceRequest,
+        errorResponse: WebResourceResponse,
+    ) {
+        super.onReceivedHttpError(view, request, errorResponse)
+        if (!request.isForMainFrame) return
+        if (originOf(request.url.toString()) != pinnedOrigin()) return
+        onMainFrameHttpError(errorResponse.statusCode)
     }
 
     /**
