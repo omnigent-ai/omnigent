@@ -7739,6 +7739,13 @@ _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-std
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 _BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 _BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+# Claude wraps teammate deliveries in tags containing prose or idle JSON.
+# Parse them before either can become a user bubble.
+_TEAMMATE_MESSAGE_RE = re.compile(
+    r"<teammate-message\b([^>]*)>(.*?)</teammate-message>", re.DOTALL
+)
+_TEAMMATE_ATTR_RE = re.compile(r'([A-Za-z_][\w-]*)="([^"]*)"')
+_TEAMMATE_DELIVERY_PREFIX = "Another Claude session sent a message:"
 # Claude Code wraps text pasted into its TUI in these markers (the id repeats
 # in the closing tag). Omnigent injects every web-UI message as one bracketed
 # paste (see ``inject_user_message``), so even a short typed line comes back
@@ -8075,6 +8082,61 @@ def _is_task_notification_text(text: str) -> bool:
     )
 
 
+def _teammate_idle_result(body: str) -> str | None:
+    """Return an idle notification's result, or ``None`` for prose."""
+    if not body.startswith("{"):
+        return None
+    try:
+        decoded = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict) or decoded.get("type") != "idle_notification":
+        return None
+    result = decoded.get("result")
+    return result if isinstance(result, str) else ""
+
+
+def _teammate_message_payloads(content: str) -> list[_JsonObject] | None:
+    """
+    Parse Claude teammate prose deliveries into ``teammate_message`` payloads.
+
+    Returns one payload per prose ``<teammate-message>`` block. The
+    machine-side ``idle_notification`` twin is dropped so it never renders
+    in chat, so an idle-only record yields an empty list (the caller
+    suppresses it). ``None`` is reserved for a record that isn't a
+    complete teammate delivery (markup drift / partial write), which the
+    caller keeps on the plain-message path.
+    """
+    if not content.lstrip().startswith(_TEAMMATE_DELIVERY_PREFIX):
+        return None
+
+    matched_block = False
+    payloads: list[_JsonObject] = []
+    pasted_ranges = [wrapper.span() for wrapper in _PASTED_CONTENT_RE.finditer(content)]
+    for match in _TEAMMATE_MESSAGE_RE.finditer(content):
+        if any(start <= match.start() < end for start, end in pasted_ranges):
+            continue
+        attrs = dict(_TEAMMATE_ATTR_RE.findall(match.group(1)))
+        teammate_id = attrs.get("teammate_id", "").strip()
+        if not teammate_id:
+            continue
+        matched_block = True
+        body = match.group(2).strip()
+        # Drop the idle-notification twin; only prose deliveries are shown.
+        if _teammate_idle_result(body) is not None:
+            continue
+        data: _JsonObject = {"teammate_id": teammate_id, "text": body}
+        color = attrs.get("color", "").strip()
+        if color:
+            data["color"] = color
+        summary = attrs.get("summary", "").strip()
+        if summary:
+            data["summary"] = summary
+        payloads.append(data)
+    # A matched-but-idle-only record returns [] (suppressed), not None.
+    return payloads if matched_block else None
+
+
 def _local_command_transcript_items_from_entry(
     entry: _JsonObject,
     *,
@@ -8301,6 +8363,23 @@ def _user_transcript_items_from_entry(
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
             return fallback_response_id, items
+        if "<teammate-message" in stripped:
+            teammate_payloads = _teammate_message_payloads(content)
+            # No complete block (markup drift / partial write): keep the
+            # record on the plain-message path rather than dropping it.
+            if teammate_payloads is not None:
+                for payload_index, payload in enumerate(teammate_payloads):
+                    items.append(
+                        ClaudeTranscriptItem(
+                            source_id=_source_id(source_key, payload_index, "teammate_message"),
+                            item_type="teammate_message",
+                            data=payload,
+                            response_id=fallback_response_id,
+                        )
+                    )
+                # A delivery wakes the parent; the wake's assistant output
+                # clusters with the delivery, not the prior bubble.
+                return fallback_response_id, items
         # ``!cmd`` terminal commands may arrive here in older Claude
         # builds; newer builds use top-level ``local_command`` records.
         # In both shapes, surface the command and result as their own
@@ -8378,6 +8457,20 @@ def _user_transcript_items_from_entry(
                 stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
             ):
                 continue
+            if "<teammate-message" in stripped:
+                teammate_payloads = _teammate_message_payloads(text)
+                if teammate_payloads is not None:
+                    for payload in teammate_payloads:
+                        items.append(
+                            ClaudeTranscriptItem(
+                                source_id=_source_id(source_key, item_index, "teammate_message"),
+                                item_type="teammate_message",
+                                data=payload,
+                                response_id=fallback_response_id,
+                            )
+                        )
+                        item_index += 1
+                    continue
             if _is_task_notification_text(text):
                 items.append(
                     ClaudeTranscriptItem(

@@ -1263,6 +1263,9 @@
               },
               {
                 "$ref": "#/components/schemas/TerminalCommandData"
+              },
+              {
+                "$ref": "#/components/schemas/TeammateMessageData"
               }
             ],
             "description": "The typed data payload (MessageData, etc.).",
@@ -7944,6 +7947,51 @@
           "kind"
         ],
         "title": "StoreHarnessCredentialRequest",
+        "type": "object"
+      },
+      "TeammateMessageData": {
+        "description": "Data payload for a harness-internal teammate delivery observed in a\nharness transcript (today: Claude Code's in-process agent teams).\n\nA teammate is spawned inside the harness process (Claude Code's\n`Agent` tool with a `name`) and is not an Omnigent session, so\nits prose deliveries reach the parent transcript as\n`<teammate-message>` markup on the user channel. The bridge parses\nthat markup into this structured item so the web can render the\ndelivery readably instead of leaking the raw wrapper (and the\nmachine-side idle-notification twin) into the chat as a user bubble.\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop's history\nfilter skips it (native harnesses keep the original markup in their\nown context).",
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Teammate accent color from the markup (e.g. `\"blue\"`), else `None`.",
+            "title": "Color"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "One-line `summary` attribute when the delivery carried one, else `None`.",
+            "title": "Summary"
+          },
+          "teammate_id": {
+            "description": "The teammate's name, e.g. `\"buddy\"`.",
+            "title": "Teammate Id",
+            "type": "string"
+          },
+          "text": {
+            "default": "",
+            "description": "Prose body of the delivery.",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "teammate_id"
+        ],
+        "title": "TeammateMessageData",
         "type": "object"
       },
       "TerminalCommandData": {

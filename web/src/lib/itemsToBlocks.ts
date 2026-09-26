@@ -24,6 +24,7 @@ import {
   type ReasoningBlock,
   type RoutingDecisionBlock,
   type SlashCommandBlock,
+  type TeammateMessageBlock,
   type TerminalCommandBlock,
   type TextDone,
   type ToolExecution,
@@ -47,6 +48,7 @@ import {
   type ReasoningItem,
   type RoutingDecisionItem,
   type SlashCommandItem,
+  type TeammateMessageItem,
   type TerminalCommandItem,
   isCompactionItem,
   isErrorItem,
@@ -57,6 +59,7 @@ import {
   isReasoningItem,
   isRoutingDecisionItem,
   isSlashCommandItem,
+  isTeammateMessageItem,
   isTerminalCommandItem,
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
@@ -293,6 +296,9 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
   if (isTerminalCommandItem(item)) {
     return terminalCommandToBlock(item);
   }
+  if (isTeammateMessageItem(item)) {
+    return teammateMessageToBlock(item);
+  }
   // Unknown future item types — skip silently so the page still renders.
   return null;
 }
@@ -467,6 +473,17 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
     rationale: typeof item.rationale === "string" ? item.rationale : "",
     ...(item.agent !== undefined && { agent: item.agent }),
     routing: routingExtrasFromWire(item as unknown as Record<string, unknown>),
+  };
+}
+
+function teammateMessageToBlock(item: TeammateMessageItem): TeammateMessageBlock {
+  return {
+    type: "teammate_message",
+    ctx: ctxFor(item),
+    teammateId: item.teammate_id,
+    text: typeof item.text === "string" ? item.text : "",
+    summary: typeof item.summary === "string" && item.summary ? item.summary : null,
+    color: typeof item.color === "string" && item.color ? item.color : null,
   };
 }
 

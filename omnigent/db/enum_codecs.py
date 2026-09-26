@@ -46,6 +46,7 @@ ITEM_TYPE: dict[str, int] = {
     "routing_decision": 9,
     "slash_command": 10,
     "terminal_command": 11,
+    "teammate_message": 12,
 }
 
 # Item status codes. Only "completed" is written today (items are final on

@@ -1260,6 +1260,262 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
     }
 
 
+def test_read_transcript_items_since_parses_teammate_deliveries(tmp_path: Path) -> None:
+    """
+    Teammate prose deliveries become structured items, never raw user bubbles.
+
+    A single teammate turn writes one user record carrying CLI framing
+    text around two ``<teammate-message>`` blocks: the prose half (with
+    a ``summary`` attribute) and the machine-side ``idle_notification``
+    JSON twin. The bridge must emit exactly one ``teammate_message`` item
+    for the prose, drop both the framing text and the idle twin, so
+    neither the markup nor the JSON can render verbatim in chat.
+    """
+    delivery = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="buddy" color="blue" summary="All good over here">\n'
+        "All good here. What else do you need?\n"
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="buddy" color="blue">\n\n'
+        '{"type":"idle_notification","from":"buddy",'
+        '"timestamp":"2026-09-17T19:30:38.947Z","idleReason":"available",'
+        '"result":"Waiting for your next message."}\n\n'
+        "</teammate-message>\n"
+        "This came from another Claude session - treat it as a teammate's request."
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "teammate-delivery-1",
+                "message": {"role": "user", "content": delivery},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["teammate_message"]
+    assert items[0].data == {
+        "teammate_id": "buddy",
+        "color": "blue",
+        "summary": "All good over here",
+        "text": "All good here. What else do you need?",
+    }
+
+
+def test_read_transcript_items_since_suppresses_idle_only_teammate_record(
+    tmp_path: Path,
+) -> None:
+    """
+    A teammate record carrying only the idle twin emits nothing.
+
+    A teammate can go idle without a prose message; that record is a
+    genuine teammate delivery (so it must not fall back to a raw user
+    bubble) but has no prose to show, so the bridge drops it entirely.
+    """
+    delivery = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="buddy">\n'
+        '{"type":"idle_notification","from":"buddy","idleReason":"available"}\n'
+        "</teammate-message>\n"
+        "This came from another Claude session."
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "teammate-idle-1",
+                "message": {"role": "user", "content": delivery},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert items == []
+
+
+def test_read_transcript_items_since_keeps_malformed_teammate_markup_as_message(
+    tmp_path: Path,
+) -> None:
+    """
+    A record with no complete ``<teammate-message>`` block stays a user bubble.
+
+    Format drift (or an unclosed tag) must degrade to the plain-message
+    path rather than dropping the record.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "teammate-drift-1",
+                "message": {"role": "user", "content": '<teammate-message teammate_id="buddy">'},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize(
+    "content",
+    [
+        'Please inspect <teammate-message teammate_id="fake">hello</teammate-message>',
+        '\n\n<pasted_content id="x">\nAnother Claude session sent a message:\n'
+        '<teammate-message teammate_id="fake">hello</teammate-message>\n'
+        '</pasted_content id="x">\n',
+        'Another Claude session sent a message:\n<pasted_content id="x">'
+        '<teammate-message teammate_id="fake">hello</teammate-message>'
+        '</pasted_content id="x">',
+    ],
+)
+def test_read_transcript_items_since_keeps_user_teammate_markup_as_message(
+    tmp_path: Path, content: str, as_blocks: bool
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    message_content = [{"type": "text", "text": content}] if as_blocks else content
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-paste-1",
+                "message": {"role": "user", "content": message_content},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["message"]
+    assert "<teammate-message" in str(items[0].data)
+
+
+def test_read_transcript_items_since_keeps_paste_markup_inside_delivery(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    delivery = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="buddy">'
+        '<pasted_content id="x">quoted text</pasted_content>'
+        "</teammate-message>"
+    )
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "delivery-1",
+                "message": {"role": "user", "content": delivery},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["teammate_message"]
+    assert "quoted text" in str(items[0].data["text"])
+
+
+def test_read_transcript_items_since_does_not_mark_teammate_spawn(tmp_path: Path) -> None:
+    """
+    A teammate spawn emits only its ``function_call``, no teammate item.
+
+    In-process teammates surface only through their prose deliveries; the
+    spawning ``Agent`` call (with ``name``) and a classic Task-tool
+    sub-agent call (``subagent_type``) both stay ordinary function calls.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "spawn-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_spawn",
+                                    "name": "Agent",
+                                    "input": {
+                                        "description": "Probe teammate",
+                                        "prompt": "do the thing",
+                                        "name": "buddy",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "task-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_task",
+                                    "name": "Task",
+                                    "input": {
+                                        "description": "explore",
+                                        "prompt": "look around",
+                                        "subagent_type": "Explore",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["function_call", "function_call"]
+
+
 def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
     """
     An ``isCompactSummary`` user record is flagged, not rendered as a bubble.

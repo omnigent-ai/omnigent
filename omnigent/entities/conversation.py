@@ -735,6 +735,36 @@ class SlashCommandData(BaseModel):
     output: str | None = None
 
 
+class TeammateMessageData(BaseModel):
+    """
+    Data payload for a harness-internal teammate delivery observed in a
+    harness transcript (today: Claude Code's in-process agent teams).
+
+    A teammate is spawned inside the harness process (Claude Code's
+    ``Agent`` tool with a ``name``) and is not an Omnigent session, so
+    its prose deliveries reach the parent transcript as
+    ``<teammate-message>`` markup on the user channel. The bridge parses
+    that markup into this structured item so the web can render the
+    delivery readably instead of leaking the raw wrapper (and the
+    machine-side idle-notification twin) into the chat as a user bubble.
+    Listed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's history
+    filter skips it (native harnesses keep the original markup in their
+    own context).
+
+    :param teammate_id: The teammate's name, e.g. ``"buddy"``.
+    :param text: Prose body of the delivery.
+    :param summary: One-line ``summary`` attribute when the delivery
+        carried one, else ``None``.
+    :param color: Teammate accent color from the markup (e.g.
+        ``"blue"``), else ``None``.
+    """
+
+    teammate_id: str
+    text: str = ""
+    summary: str | None = None
+    color: str | None = None
+
+
 ItemData = (
     MessageData
     | FunctionCallData
@@ -747,6 +777,7 @@ ItemData = (
     | RoutingDecisionData
     | SlashCommandData
     | TerminalCommandData
+    | TeammateMessageData
 )
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
@@ -761,6 +792,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "routing_decision": RoutingDecisionData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
+    "teammate_message": TeammateMessageData,
 }
 
 # Item types that are metadata / lifecycle events — not content
@@ -773,6 +805,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "resource_event",
         "routing_decision",
         "slash_command",
+        "teammate_message",
         "terminal_command",
     }
 )

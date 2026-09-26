@@ -412,6 +412,17 @@ export interface TerminalCommandEvent {
   responseId: string;
 }
 
+/** Teammate delivery decoded from `output_item.done`. */
+export interface TeammateMessageEvent {
+  type: "teammate_message";
+  teammateId: string;
+  text: string;
+  summary: string | null;
+  color: string | null;
+  itemId: string;
+  responseId: string;
+}
+
 // ── File output ──────────────────────────────────────────
 
 /** `response.output_file.done` — file artifact produced. */
@@ -995,6 +1006,7 @@ export type StreamEvent =
   | SlashCommand
   | RoutingDecision
   | TerminalCommandEvent
+  | TeammateMessageEvent
   | MessageDone
   | ReasoningDone
   | OutputFileDone

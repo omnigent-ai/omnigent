@@ -156,6 +156,15 @@ export interface TerminalCommandItem extends BaseItem {
   stderr?: string;
 }
 
+/** Display-only teammate prose delivery (Claude Code agent teams). */
+export interface TeammateMessageItem extends BaseItem {
+  type: "teammate_message";
+  teammate_id: string;
+  text?: string;
+  summary?: string;
+  color?: string;
+}
+
 /**
  * An intelligent-model-router decision item. Display-only (server-side
  * NON_CONTENT_ITEM_TYPES), so the model never sees it; the web UI renders
@@ -184,6 +193,7 @@ export type ConversationItem =
   | SlashCommandItem
   | RoutingDecisionItem
   | TerminalCommandItem
+  | TeammateMessageItem
   | (BaseItem & Record<string, unknown>);
 
 export function isMessageItem(item: ConversationItem): item is MessageItem {
@@ -224,6 +234,10 @@ export function isRoutingDecisionItem(item: ConversationItem): item is RoutingDe
 
 export function isTerminalCommandItem(item: ConversationItem): item is TerminalCommandItem {
   return item.type === "terminal_command";
+}
+
+export function isTeammateMessageItem(item: ConversationItem): item is TeammateMessageItem {
+  return item.type === "teammate_message";
 }
 
 // Cursor-paginated history fetching lives in `sessionsApi.ts`

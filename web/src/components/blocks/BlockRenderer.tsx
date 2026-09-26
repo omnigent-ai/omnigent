@@ -39,6 +39,7 @@ import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
+import { TeammateMessageCard } from "./TeammateMessageCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
@@ -849,6 +850,16 @@ function renderItem(
           input={item.input}
           stdout={item.stdout}
           stderr={item.stderr}
+        />
+      );
+    case "teammate_message":
+      return (
+        <TeammateMessageCard
+          key={key}
+          teammateId={item.teammateId}
+          text={item.text}
+          summary={item.summary}
+          color={item.color}
         />
       );
     case "error":

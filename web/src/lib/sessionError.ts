@@ -67,6 +67,7 @@ export function latestActivityErrorWindow(
       case "reasoning_chunk":
       case "reasoning_block":
       case "slash_command":
+      case "teammate_message":
       case "terminal_command":
       case "file":
       case "policy_denied":
