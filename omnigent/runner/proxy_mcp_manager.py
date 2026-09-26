@@ -187,7 +187,9 @@ class ProxyMcpManager:
         """
         return f"/v1/sessions/{self._session_id}/mcp"
 
-    async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
+    async def schemas_for(
+        self, spec: AgentSpec, *, sync_when_empty: bool = False
+    ) -> McpSchemasResult:
         """Fetch tool schemas from the Omnigent server MCP proxy (``tools/list``).
 
         Sends a ``tools/list`` JSON-RPC 2.0 request to the Omnigent server's MCP
@@ -202,10 +204,11 @@ class ProxyMcpManager:
 
         :param spec: The agent spec.  When ``spec.mcp_servers`` is empty,
             returns an empty result immediately without hitting the network.
+        :param sync_when_empty: Sync an empty config to clear retained failures.
         :returns: :class:`McpSchemasResult` containing schemas, tool name
             set, and per-server failure messages.
         """
-        if not spec.mcp_servers:
+        if not spec.mcp_servers and not sync_when_empty:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
 
         payload: _JsonObject = {
@@ -293,7 +296,17 @@ class ProxyMcpManager:
             schemas.append(schema)
             tool_names.add(name)
 
-        return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures={})
+        meta = _json_object(result.get("_meta"))
+        failures: dict[str, str] = {}
+        if meta is not None:
+            raw_failures = _json_object(meta.get("omnigent/mcpFailures"))
+            if raw_failures is not None:
+                failures = {
+                    name: message
+                    for name, message in raw_failures.items()
+                    if isinstance(message, str)
+                }
+        return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures=failures)
 
     async def call_tool(
         self,

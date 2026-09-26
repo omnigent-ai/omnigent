@@ -8858,7 +8858,10 @@ def create_runner_app(
                         )
                     ]
                     _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
-                    _session_mcp_spec_hash[conv] = _mcp_hash
+                    # Retry degraded listings even when the MCP config is unchanged.
+                    _session_mcp_spec_hash[conv] = (
+                        _mcp_hash if not mcp_result.failures else f"{_mcp_hash}:degraded"
+                    )
                 except (
                     httpx.HTTPError,
                     RuntimeError,
@@ -8870,6 +8873,36 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
+        elif cached_spec is not None and conv in _session_mcp_spec_hash:
+            # Sync once after the final server is removed to clear stale failures.
+            try:
+                await ProxyMcpManager(
+                    conv,
+                    server_client,
+                    execution_registry=mcp_execution_registry,
+                ).schemas_for(cached_spec, sync_when_empty=True)
+            except (
+                httpx.HTTPError,
+                RuntimeError,
+                ValueError,
+            ):
+                _logger.warning(
+                    "MCP empty-config sync failed for %s",
+                    conv,
+                    exc_info=True,
+                    extra={"session_id": conv},
+                )
+            else:
+                _session_mcp_spec_hash.pop(conv, None)
+                _session_tool_schemas[conv] = [
+                    t
+                    for t in _session_tool_schemas.get(conv, [])
+                    if not (
+                        isinstance(t, dict)
+                        and isinstance(t.get("name"), str)
+                        and "__" in cast(str, t.get("name"))
+                    )
+                ]
 
         _spec_tools = _session_tool_schemas.get(conv) or []
         # Request-driven harnesses should not advertise browser tools when no

@@ -209,6 +209,40 @@ async def test_schemas_for_happy_path_parses_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_schemas_for_surfaces_meta_failures() -> None:
+    rpc_resp = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [],
+                "_meta": {"omnigent/mcpFailures": {"pipeshub": "401 Unauthorized", "bogus": 7}},
+            },
+        }
+    )
+    transport = _StubTransport([rpc_resp])
+    manager = _make_manager(transport)
+
+    result = await manager.schemas_for(_make_spec("pipeshub"))
+
+    assert result.failures == {"pipeshub": "401 Unauthorized"}, (
+        "String failure entries in _meta must surface; non-string values are dropped"
+    )
+
+
+@pytest.mark.asyncio
+async def test_schemas_for_sync_when_empty_hits_network() -> None:
+    rpc_resp = _json_resp({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
+    transport = _StubTransport([rpc_resp])
+    manager = _make_manager(transport)
+
+    result = await manager.schemas_for(_empty_spec(), sync_when_empty=True)
+
+    assert len(transport.calls) == 1, "sync_when_empty must send the tools/list request"
+    assert result == McpSchemasResult(schemas=[], tool_names=set(), failures={})
+
+
+@pytest.mark.asyncio
 async def test_schemas_for_normalizes_null_input_schema() -> None:
     """A tool with ``inputSchema: null`` must normalize to ``{type: object, properties: {}}``.
 

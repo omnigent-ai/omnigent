@@ -3467,27 +3467,7 @@ class McpServerStartup(BaseModel):
 
 
 class SessionMcpStartupEvent(_SSEEventBase):
-    """
-    Per-MCP-server startup progress for a native harness session.
-
-    A codex-native session brings up its configured MCP servers when its
-    Codex thread starts; slow or failing servers previously left the web
-    session looking hung with no signal. The native forwarder mirrors
-    Codex's ``mcpServer/startupStatus/updated`` notifications as
-    ``external_mcp_startup`` posts, republished here so the web UI can
-    show which servers are still starting and which failed or were
-    cancelled.
-
-    :param type: Always ``"session.mcp_startup"``.
-    :param conversation_id: Session identifier,
-        e.g. ``"conv_abc123"``.
-    :param servers: Latest per-server startup map, e.g.
-        ``{"safe": {"status": "starting", "error": None}}``.
-
-    Category: **transient** (SSE + snapshot cache). Not persisted; a
-    client connecting mid-startup seeds from the session snapshot's
-    ``mcp_startup`` field and updates live off this event.
-    """
+    """Transient per-server startup state from native or SDK harnesses."""
 
     type: Literal["session.mcp_startup"]
     conversation_id: str
