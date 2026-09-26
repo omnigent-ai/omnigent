@@ -1,10 +1,11 @@
-"""E2E: an OpenCode question event round-trips through the web form."""
+"""E2E: an OpenCode v2 question form round-trips through the web form."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import threading
+from typing import Any
 
 import httpx
 import pytest
@@ -18,16 +19,16 @@ _SUBMIT = '[data-testid="ask-user-question-submit"]'
 
 
 class _RecordingOpenCodeClient:
-    """Record the answer returned by the live web elicitation flow."""
+    """Record the form answer returned by the live web elicitation flow."""
 
     def __init__(self) -> None:
-        self.replies: list[tuple[str, list[list[str]]]] = []
+        self.replies: list[tuple[str, str, dict[str, Any]]] = []
 
-    async def reply_question(self, request_id: str, answers: list[list[str]]) -> bool:
-        self.replies.append((request_id, answers))
+    async def reply_form(self, session_id: str, form_id: str, answer: dict[str, Any]) -> bool:
+        self.replies.append((session_id, form_id, answer))
         return True
 
-    async def reject_question(self, request_id: str) -> bool:
+    async def cancel_form(self, session_id: str, form_id: str) -> bool:
         return True
 
 
@@ -36,7 +37,7 @@ def test_opencode_question_round_trips_through_web(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """question.asked -> web checkboxes -> reply_question selected labels."""
+    """form.created (multiselect) -> web checkboxes -> reply_form option values."""
     base_url, session_id = seeded_session
     opencode = _RecordingOpenCodeClient()
     result: dict[str, object] = {}
@@ -52,27 +53,33 @@ def test_opencode_question_round_trips_through_web(
             await forwarder.handle_event(
                 OpenCodeEvent(
                     id=None,
-                    type="question.asked",
-                    properties={
-                        "sessionID": "ses_e2e",
-                        "id": "que_e2e",
-                        "questions": [
-                            {
-                                "header": "Choose tools",
-                                "question": "Which tools should run?",
-                                "multiple": True,
-                                "options": [
-                                    {"label": "Tests"},
-                                    {"label": "Lint"},
-                                    {"label": "Build"},
-                                ],
-                            }
-                        ],
+                    type="form.created",
+                    data={
+                        "form": {
+                            "id": "frm_e2e",
+                            "sessionID": "ses_e2e",
+                            "title": "Choose tools",
+                            "metadata": {"kind": "question"},
+                            "fields": [
+                                {
+                                    "key": "q0",
+                                    "type": "multiselect",
+                                    "title": "Choose tools",
+                                    "description": "Which tools should run?",
+                                    "options": [
+                                        {"value": "Tests", "label": "Tests"},
+                                        {"value": "Lint", "label": "Lint"},
+                                        {"value": "Build", "label": "Build"},
+                                    ],
+                                    "custom": True,
+                                }
+                            ],
+                        }
                     },
-                    raw={},
+                    location=None,
                 )
             )
-            task = forwarder._question_tasks["que_e2e"]
+            task = forwarder._form_tasks["frm_e2e"]
             await task
 
     def _run_forwarder() -> None:
@@ -99,13 +106,13 @@ def test_opencode_question_round_trips_through_web(
                     f"{base_url}/v1/sessions/{session_id}/events",
                     json={
                         "type": "approval",
-                        "data": {"elicitation_id": "que_e2e", "action": "decline"},
+                        "data": {"elicitation_id": "frm_e2e", "action": "decline"},
                     },
                     timeout=10.0,
                 ).raise_for_status()
             thread.join(timeout=30)
 
-    assert not thread.is_alive(), "OpenCode question hook did not receive the web verdict"
+    assert not thread.is_alive(), "OpenCode form hook did not receive the web verdict"
     if "error" in result:
         raise AssertionError(f"forwarder failed: {result['error']}") from result["error"]
-    assert opencode.replies == [("que_e2e", [["Tests", "Lint"]])]
+    assert opencode.replies == [("ses_e2e", "frm_e2e", {"q0": ["Tests", "Lint"]})]
