@@ -321,6 +321,16 @@ def clipboard_browser(
         {"error": {"message": "No browser-contract OS environment"}},
         status=404,
     )
+    browser_contract.json(
+        re.compile(
+            rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/resources/gitlab(?:\?.*)?$"
+        ),
+        {
+            "object": "session.gitlab.info",
+            "available": False,
+            "reason": "not_a_git_repo",
+        },
+    )
     browser_contract.sse(
         re.compile(rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/stream(?:\?.*)?$")
     )
