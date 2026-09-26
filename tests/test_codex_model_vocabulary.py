@@ -12,6 +12,7 @@ from omnigent.models.codex_model_vocabulary import (
     codex_reachable_model_slug,
     codex_spawn_model,
     comparable_model_id,
+    is_openai_codex_model,
 )
 from omnigent.util.reasoning_effort import clamp_effort_for_model
 
@@ -160,3 +161,46 @@ def test_catalog_prefixes_match_the_routing_defaults() -> None:
     from omnigent.server.smart_routing import MODEL_ID_PREFIXES
 
     assert _CATALOG_PREFIXES == MODEL_ID_PREFIXES
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "databricks-gpt-5-4-mini",
+        "system.ai.gpt-6-nova",
+        "codex-5",
+        "Databricks-GPT-5-6-Sol[1M]",
+        "gpt-5.6-codex-max",
+        "gpt-4o",
+        "o3",
+        "o4-mini",
+    ],
+)
+def test_is_openai_codex_model_accepts_gpt_and_codex_ids(model: str) -> None:
+    assert is_openai_codex_model(model) is True
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "system.ai.grok-4-6",
+        "grok-4-6",
+        "databricks-glm-5-2",
+        "system.ai.glm-5-2",
+        "kimi-k2-6",
+        "databricks-claude-sonnet-5",
+        "system.ai.olmo-3",
+        "",
+        "   ",
+    ],
+)
+def test_is_openai_codex_model_rejects_every_other_vendor(model: str) -> None:
+    assert is_openai_codex_model(model) is False
+
+
+def test_is_openai_codex_model_rejects_none() -> None:
+    # The caller's launch model is unresolved (Codex's own default), not a
+    # vendor to recognize.
+    assert is_openai_codex_model(None) is False

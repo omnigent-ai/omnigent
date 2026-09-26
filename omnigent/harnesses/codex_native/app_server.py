@@ -83,7 +83,11 @@ from omnigent.inner.databricks_executor import (
     _databricks_gateway_host,
     _read_databrickscfg_host,
 )
-from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
+from omnigent.models.codex_model_vocabulary import (
+    codex_reachable_model_slug,
+    codex_spawn_model,
+    is_openai_codex_model,
+)
 from omnigent.process_logging import (
     harness_stderr_capture_enabled,
     log_info_once,
@@ -3054,6 +3058,12 @@ def build_codex_native_server(
     """
     Build a configured native Codex app-server process wrapper.
 
+    Also disables Codex's built-in ``web_search`` tool when the resolved
+    launch model is a known non-OpenAI id (GLM, Kimi, Grok, ...) — the
+    gateway rejects that tool for every vendor besides OpenAI's own
+    gpt/codex family. An unresolved model (Codex's own default) is left
+    untouched.
+
     :param socket_path: Unix socket path for the app-server.
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param cwd: Working directory for Codex, e.g. the user's repo.
@@ -3157,6 +3167,11 @@ def build_codex_native_server(
         override.split("=", 1)[0] == "model" for override in config_overrides
     ):
         config_overrides.append(f"model={json.dumps(pinned_model)}")
+    if pinned_model and not is_openai_codex_model(pinned_model):
+        # The gateway rejects Codex's built-in web_search tool for
+        # non-OpenAI models; an unresolved model (Codex's own default)
+        # keeps its normal web_search behavior.
+        config_overrides.append('web_search="disabled"')
     return CodexNativeAppServer(
         codex_path=resolved_codex,
         socket_path=socket_path,

@@ -63,6 +63,8 @@ _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", _MODEL_ROUTE_PREFIX)
 #: version only when there is a minor, and keeps the tier hyphenated, so an
 #: arm whose tier hangs off a major alone carries no dot at all.
 _GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)(?:-(\d+))?(?:-([a-z0-9]+))?$")
+# OpenAI's own model ids: gpt-*, codex-*, and the o-series reasoning models.
+_OPENAI_MODEL_ID_RE = re.compile(r"^(?:gpt-|codex-|o\d)")
 
 #: Models the gateway serves that codex's bundled catalog does not carry, so
 #: omnigent adds them to the session's own catalog (``model_catalog_json``)
@@ -131,6 +133,26 @@ def codex_spawn_model(model: str) -> str | None:
     family, major, minor, tier = match.groups()
     slug = f"{family}-{major}.{minor}" if minor else f"{family}-{major}"
     return f"{slug}-{tier}" if tier else slug
+
+
+def is_openai_codex_model(model: str | None) -> bool:
+    """Report whether *model* is one of OpenAI's own models.
+
+    Codex's built-in ``web_search`` tool only exists on OpenAI's Responses
+    API; a gateway rejects it for every other vendor codex can route to
+    (GLM, Kimi, Grok, ...). Matches by id prefix (``gpt-``, ``codex-``,
+    ``o<digit>``) rather than :data:`_GPT_ID_RE`, so multi-segment tiers
+    such as ``gpt-5.6-codex-max`` still count as OpenAI's.
+
+    :param model: Any model id, catalog or codex spelling, e.g.
+        ``"databricks-gpt-5-6-luna"`` or ``"system.ai.grok-4-6"``; ``None``
+        or empty when the launch model is not known.
+    :returns: ``True`` only for a recognized OpenAI id; ``False`` for every
+        other vendor, including ``None`` and empty strings.
+    """
+    if not model:
+        return False
+    return _OPENAI_MODEL_ID_RE.match(comparable_model_id(model)) is not None
 
 
 def clamp_spawn_effort(effort: str | None, model: str | None) -> str | None:

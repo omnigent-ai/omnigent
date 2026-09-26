@@ -1227,6 +1227,130 @@ def test_build_codex_native_server_bypass_emits_full_access_config(
 
 
 @pytest.mark.parametrize(
+    "model", ["system.ai.grok-4-6", "grok-4-6", "system.ai.glm-5-2", "kimi-k2-6"]
+)
+def test_build_codex_native_server_disables_web_search_for_non_openai_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    """The gateway rejects Codex's built-in web_search tool for non-OpenAI models."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=model,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    assert 'web_search="disabled"' in app_server.config_overrides
+
+
+@pytest.mark.parametrize(
+    "model", ["gpt-5.5", "gpt-5.6-luna", "databricks-gpt-5-4-mini", "codex-5"]
+)
+def test_build_codex_native_server_keeps_web_search_for_openai_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    """OpenAI's own gpt/codex models keep Codex's default web_search behavior."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=model,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    assert "web_search" not in "\n".join(app_server.config_overrides)
+
+
+def test_build_codex_native_server_leaves_web_search_untouched_for_unknown_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex's own default (no resolved model) keeps its normal web_search behavior."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    assert "web_search" not in "\n".join(app_server.config_overrides)
+
+
+@pytest.mark.parametrize(
+    ("resolved_model", "expect_disabled"),
+    [
+        pytest.param("system.ai.grok-4-6", True, id="grok"),
+        pytest.param("system.ai.glm-5-2", True, id="glm"),
+        pytest.param("databricks-gpt-5-6-luna", False, id="gpt"),
+    ],
+)
+def test_build_codex_native_server_profile_web_search_follows_resolved_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_model: str,
+    expect_disabled: bool,
+) -> None:
+    """A Databricks-profile launch disables web_search only for a non-OpenAI resolved model."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_databricks_launch_materialization",
+        lambda *, model, profile, codex_path: (
+            codex_native_app_server._DatabricksLaunchMaterialization(
+                config_overrides=[f'model="{resolved_model}"'],
+                model=resolved_model,
+                host="https://ws.example",
+            )
+        ),
+    )
+
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile="oss",
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    assert ('web_search="disabled"' in app_server.config_overrides) == expect_disabled
+
+
+@pytest.mark.parametrize(
     ("model", "expected_pin"),
     [
         pytest.param(None, "gpt-5.4-mini", id="default-launch"),
