@@ -546,17 +546,56 @@ def _strip_trailing_commas(text: str) -> str:
     return "".join(result)
 
 
+def _load_user_config_file(path: Path) -> dict[str, object] | None:
+    """Parse one user OpenCode config file (JSON, with a JSONC fallback)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            cleaned = _strip_jsonc_comments(raw)
+            cleaned = _strip_trailing_commas(cleaned)
+            parsed = json.loads(cleaned)
+    except (OSError, UnicodeDecodeError):
+        return None
+    except json.JSONDecodeError:
+        _logger.warning(
+            "Failed to parse user OpenCode config at %s — ignoring this file",
+            path,
+        )
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _deep_merge_configs(
+    base: dict[str, object], override: Mapping[str, object]
+) -> dict[str, object]:
+    """Merge *override* into *base* the way OpenCode merges its global config:
+    nested dicts merge recursively, any other value from *override* wins."""
+    merged = dict(base)
+    for key, value in override.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, Mapping):
+            merged[key] = _deep_merge_configs(existing, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
     """
     Merge the user's global OpenCode provider definitions into *config*.
 
-    OpenCode reads ``XDG_CONFIG_HOME/opencode/opencode.json(c)`` for custom
-    provider definitions (e.g. OpenAI-compatible endpoints with custom base
-    URLs). When running under Omnigent, the per-session ``XDG_CONFIG_HOME``
-    override hides this global config. This function reads the user's real
-    config and merges any ``provider`` block into *config* so the spawned
-    server sees both the user's providers (with their custom base URLs) and
-    any Omnigent-synthesized providers (e.g. Databricks gateway).
+    OpenCode resolves its global config by deep-merging
+    ``XDG_CONFIG_HOME/opencode/config.json`` → ``opencode.json`` →
+    ``opencode.jsonc`` (later files win on conflicting keys), and users keep
+    custom provider definitions there (e.g. OpenAI-compatible endpoints with
+    custom base URLs). When running under Omnigent, the per-session
+    ``XDG_CONFIG_HOME`` override hides this global config. This function
+    resolves the user's effective config the same way opencode does and merges
+    any ``provider`` block into *config* so the spawned server sees both the
+    user's providers (with their custom base URLs) and any
+    Omnigent-synthesized providers (e.g. Databricks gateway).
 
     ``provider`` entries are merged, and the user's top-level ``plugin``
     entries are appended after any synthesized ones (synthesized policy
@@ -575,33 +614,17 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     :returns: *config* with user's ``provider`` entries (and, if unset, the
         user's default ``model``) merged in.
     """
-    from omnigent.harnesses.opencode_native.bridge import user_opencode_config_path
+    from omnigent.harnesses.opencode_native.bridge import user_opencode_config_paths
 
-    user_path = user_opencode_config_path()
-    if user_path is None:
-        return config
-
-    try:
-        raw = user_path.read_text(encoding="utf-8")
-        # Try plain JSON first (handles .json files without comments).
-        # If that fails, strip JSONC comments and trailing commas, then
-        # retry (handles .jsonc).
-        try:
-            user_config = json.loads(raw)
-        except json.JSONDecodeError:
-            cleaned = _strip_jsonc_comments(raw)
-            cleaned = _strip_trailing_commas(cleaned)
-            user_config = json.loads(cleaned)
-    except (OSError, UnicodeDecodeError):
-        return config
-    except json.JSONDecodeError:
-        _logger.warning(
-            "Failed to parse user OpenCode config at %s — ignoring user providers",
-            user_path,
-        )
-        return config
-
-    if not isinstance(user_config, dict):
+    user_config: dict[str, object] = {}
+    loaded_any = False
+    for user_path in user_opencode_config_paths():
+        parsed = _load_user_config_file(user_path)
+        if parsed is None:
+            continue
+        user_config = _deep_merge_configs(user_config, parsed)
+        loaded_any = True
+    if not loaded_any:
         return config
 
     # Adopt the user's default ``model`` when the synthesized config pins none.
