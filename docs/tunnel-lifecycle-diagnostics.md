@@ -38,8 +38,10 @@ both ends.
   acknowledged, such as a ping timeout, which previously left no row.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
   `silent_s`.
-- `runner_stream_transport_lost`: one row per outage when the relay starts
-  holding a session's turn, with `grace_s`.
+- `runner_stream_transport_lost`: one row per outage when the relay first
+  observes the loss, with `intentional_stop` and `grace_s`. An unintentional
+  loss is then held for `grace_s`; an intentional stop goes straight to the
+  give-up row.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
   (`intentional_stop`, `server_shutdown`, `idle_no_failure` or
   `failed_mid_turn`), `grace_s`, `outage_s`, `retries`.
@@ -59,8 +61,9 @@ intermediary timeout rather than either endpoint.
 ## Build identity
 
 Databricks App deploys append the checked-out commit to the stamped version
-(`0.16.0.post1790000000+g1a2b3c4`, with `.dirty` when deploying a modified
-tree under `--allow-dirty`). The stamp is written to the pyprojects and to
+(`0.16.0.post1790000000+g1a2b3c4`, with `.dirty` when the tree has
+uncommitted or untracked non-ignored files, which only `--allow-dirty`
+permits). The stamp is written to the pyprojects and to
 `omnigent/version.py`, the constant the runtime imports, so `app_version` on
 every row and `version` on the server's `runner_tunnel` connected row name
 the build. The generated version is itself valid for

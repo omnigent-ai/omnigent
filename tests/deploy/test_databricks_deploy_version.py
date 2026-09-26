@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -64,6 +65,35 @@ def test_build_suffix_is_empty_outside_a_git_checkout(
 ) -> None:
     monkeypatch.setattr(deploy_mod, "_repo_root", lambda: tmp_path)
     assert deploy_mod._git_build_suffix() == ""
+
+
+def test_build_suffix_marks_untracked_and_modified_trees_dirty(
+    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An untracked module ships in the wheel, so it must not pass as the commit."""
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    (tmp_path / "omnigent").mkdir()
+    (tmp_path / "omnigent" / "version.py").write_text('VERSION = "0.16.0.dev0"\n')
+    git("add", ".")
+    git("commit", "-q", "-m", "baseline")
+    monkeypatch.setattr(deploy_mod, "_repo_root", lambda: tmp_path)
+
+    assert re.fullmatch(r"\+g[0-9a-f]{7,}", deploy_mod._git_build_suffix())
+    (tmp_path / "omnigent" / "extra.py").write_text("EXTRA = 1\n")
+    assert deploy_mod._git_build_suffix().endswith(".dirty")
+    git("add", ".")
+    git("commit", "-q", "-m", "add extra")
+    (tmp_path / "omnigent" / "version.py").write_text('VERSION = "0.16.0.dev1"\n')
+    assert deploy_mod._git_build_suffix().endswith(".dirty")
 
 
 def test_stamp_writes_runtime_constant_and_restore_reverts(

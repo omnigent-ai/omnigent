@@ -142,9 +142,10 @@ def _compute_deploy_version(base: str, explicit: str | None) -> str:
 def _git_build_suffix() -> str:
     """PEP 440 local segment for the checked-out commit, e.g. ``+g1a2b3c4``.
 
-    ``.dirty`` is appended when tracked files have uncommitted changes, so a
-    deploy from a modified tree is not mistaken for the commit itself. Empty
-    when the tree is not a git checkout.
+    ``.dirty`` is appended when the tree has uncommitted changes or untracked,
+    non-ignored files (the wheel packages those too), so a deploy from a
+    modified tree is not mistaken for the commit itself. Empty when the tree
+    is not a git checkout.
     """
     try:
         sha = subprocess.run(
@@ -155,7 +156,7 @@ def _git_build_suffix() -> str:
             text=True,
         ).stdout.strip()
         dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
+            ["git", "status", "--porcelain"],
             cwd=_repo_root(),
             check=True,
             capture_output=True,

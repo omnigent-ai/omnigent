@@ -6812,8 +6812,9 @@ async def _relay_runner_stream(
                 outage_started = now
                 retries = 0
                 _logger.info(
-                    "Relay: runner transport lost for session=%s; holding the turn for %.1fs",
+                    "Relay: runner transport lost for session=%s (intentional=%s, grace=%.1fs)",
                     session_id,
+                    lost.intentional,
                     RUNNER_DISCONNECT_GRACE_S,
                     extra=debug_event(
                         "runner_stream_transport_lost",
