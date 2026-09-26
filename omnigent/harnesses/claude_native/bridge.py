@@ -46,6 +46,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
@@ -321,6 +322,10 @@ _SUBMIT_SLOW_ACCEPT_WARN_S = 10.0
 # (so a slow-but-successful first Enter isn't double-tapped), short
 # enough that a swallowed Enter is retried promptly.
 _SUBMIT_RETRY_INTERVAL_S = 1.0
+# How long the input box must stay empty, with no UserPromptSubmit hook
+# recorded, before a submit is assumed accepted anyway (hook log present but
+# the hook itself silent). Long enough for a slow hook process to land.
+_SUBMIT_HOOK_GRACE_S = 5.0
 # Cap for the exponential backoff between repeated submit Enters. An
 # Enter sent into a stalled TUI queues in the pty and replays when it
 # recovers, so retries slow down instead of piling up there.
@@ -4113,6 +4118,7 @@ def _paste_and_submit(
     # when the draft never becomes identifiable (e.g. whitespace-only
     # first line, custom statusline containing the glyph), fall through
     # after the timeout and submit blind, matching the old behavior.
+    hook_baseline = _count_user_prompt_submits(bridge_dir)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -4126,22 +4132,28 @@ def _paste_and_submit(
             "Claude is waiting for an explicit answer; message not sent."
         )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
+    if not draft_seen and hook_baseline is None:
+        # The draft was never observed and there is no hook log, so its
+        # absence proves nothing — verification would trivially "pass".
+        # Submit blind as before.
         return
-    # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
+    # Verify the submit took: Claude Code records a UserPromptSubmit hook
+    # when it accepts the message, and a successful Enter clears the input
+    # box. If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
+    # empty prompt or a permission dialog of the started turn. A draft that
+    # was never seen (a TUI still booting when the paste landed) is still
+    # watched: if it shows up late, the retry Enter submits it.
     if _verify_submit_accepted(
         socket_path,
         tmux_target,
         needle=needle,
         what="submitted message",
         bridge_dir=bridge_dir,
+        hook_baseline=hook_baseline,
+        draft_seen=draft_seen,
     ):
         return
     raise RuntimeError(
@@ -4157,9 +4169,19 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    hook_baseline: int | None = None,
+    draft_seen: bool = True,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
+
+    With *hook_baseline* (the ``UserPromptSubmit`` count before the Enter)
+    a new hook record is the proof of acceptance; the input box merely
+    emptying is not enough, because a transcript echo or a torn capture
+    can read as "draft gone" while the message still sits unsent. Without
+    a hook record the box must stay empty for
+    :data:`_SUBMIT_HOOK_GRACE_S` before the submit counts as accepted, so
+    a session whose hook never fires still completes.
 
     A transiently unresponsive TUI (a CPU-starved host, a long paste
     burst) can take tens of seconds to process the submit while the
@@ -4183,18 +4205,44 @@ def _verify_submit_accepted(
     last_enter = start
     retry_interval = _SUBMIT_RETRY_INTERVAL_S
     warned = False
+    absent_since: float | None = None
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
-        if not _draft_in_input_box(pane, needle):
-            if warned:
-                _logger.info(
-                    "claude-native: %s accepted after %.1fs of an unresponsive TUI",
-                    what,
-                    time.monotonic() - start,
-                )
-            return True
         now = time.monotonic()
+        if hook_baseline is not None:
+            submits = _count_user_prompt_submits(bridge_dir)
+            if submits is not None and submits > hook_baseline:
+                if warned:
+                    _logger.info(
+                        "claude-native: %s accepted after %.1fs of an unresponsive TUI",
+                        what,
+                        now - start,
+                    )
+                return True
+        if _draft_in_input_box(pane, needle):
+            draft_seen = True
+            absent_since = None
+        else:
+            if hook_baseline is None:
+                if warned:
+                    _logger.info(
+                        "claude-native: %s accepted after %.1fs of an unresponsive TUI",
+                        what,
+                        now - start,
+                    )
+                return True
+            if absent_since is None:
+                absent_since = now
+            if draft_seen and now - absent_since >= _SUBMIT_HOOK_GRACE_S:
+                _logger.warning(
+                    "claude-native: %s left the input box but no UserPromptSubmit "
+                    "hook was recorded within %.0fs; assuming it was delivered",
+                    what,
+                    _SUBMIT_HOOK_GRACE_S,
+                )
+                return True
+            continue
         if not warned and now - start >= _SUBMIT_SLOW_ACCEPT_WARN_S:
             warned = True
             _logger.warning(
@@ -4209,6 +4257,17 @@ def _verify_submit_accepted(
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
+    if hook_baseline is not None and not draft_seen:
+        # Never identified the draft and never saw the hook: the blind
+        # Enter may well have landed. Keep the pre-verification contract
+        # rather than failing a turn on missing evidence.
+        _logger.warning(
+            "claude-native: %s could not be verified (draft never identified, "
+            "no UserPromptSubmit hook within %.0fs); assuming it was delivered",
+            what,
+            _SUBMIT_VERIFY_TIMEOUT_S,
+        )
+        return True
     return False
 
 
@@ -5686,12 +5745,12 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     """
     Return whether the pasted draft is visible in Claude's input box.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
+    Looks only inside the live composer's framed region, so it cannot
+    match the submitted message's transcript echo. The whole region matters:
+    a leading newline and terminal wrapping both put some or all of the draft
+    below the row carrying :data:`_CLAUDE_PROMPT_GLYPH`. The draft counts as
+    visible when that region contains *needle* (ignoring display-only line
+    wrapping and non-rendered format characters) or the
     :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
     collapses large pastes).
 
@@ -5700,14 +5759,95 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         ``"fix the bug"``. Empty means the draft can't be identified;
         only the paste placeholder is then considered.
     :returns: ``True`` when the draft is still sitting in the input box.
+
+    Whether the draft was *accepted* is decided separately by
+    :func:`_verify_submit_accepted`, which also consults the
+    ``UserPromptSubmit`` hook record.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
+    region = _composer_region(pane)
+    if region is None:
         return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
+    if _PASTED_PLACEHOLDER_PREFIX in region:
         return True
-    return bool(needle) and needle in tail
+    # Claude Code omits Unicode format characters from its rendered input
+    # while retaining them in the editor until submit. Compare the same
+    # visible representation on both sides so a pasted U+FEFF/U+200B does not
+    # make the draft unobservable and bypass submit verification. Claude then
+    # removes those characters on the first Enter and asks for confirmation;
+    # the existing verification loop sees the cleaned draft and sends the
+    # required second Enter.
+    visible_needle = _visible_draft_text(needle)
+    visible_region = _visible_draft_text(region)
+    if not visible_needle:
+        return False
+    if visible_needle in visible_region:
+        return True
+    # tmux capture preserves display rows. A long logical line can therefore
+    # split in the middle of the marker, with continuation indentation that
+    # was never part of the input. Whitespace-insensitive comparison rebuilds
+    # that marker while staying scoped to the live composer box.
+    compact_needle = "".join(visible_needle.split())
+    compact_region = "".join(visible_region.split())
+    return bool(compact_needle) and compact_needle in compact_region
+
+
+def _composer_region(pane: str) -> str | None:
+    """Return the live composer's editable text inside its framing rules."""
+    lines = pane.splitlines()
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if not rules:
+        return None
+    # Prefer the frame opening at the second-to-last rule: the row under the
+    # last rule can be the shortcuts panel's "! for shell mode" look-alike
+    # (see _composer_row). A clipped pane leaves the last rule as the opener.
+    for opening in rules[-2:]:
+        closing = next((idx for idx in rules if idx > opening), len(lines))
+        row = opening + 1
+        while row < closing and not lines[row].strip():
+            row += 1
+        if row < closing and lines[row].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+            first = lines[row]
+            mode = first.find(first.strip()[0])
+            return "\n".join([first[:mode] + first[mode + 1 :], *lines[row + 1 : closing]])
+    return None
+
+
+def _visible_draft_text(text: str) -> str:
+    """Return the characters Claude Code exposes through terminal capture."""
+    return "".join(char for char in text if unicodedata.category(char) not in {"Cc", "Cf"})
+
+
+def _count_user_prompt_submits(bridge_dir: Path | None) -> int | None:
+    """
+    Count ``UserPromptSubmit`` records in the bridge's ``hooks.jsonl``.
+
+    Claude Code fires that hook exactly when a message is accepted, so a
+    new record after the submit Enter is proof of delivery that no
+    screen-scrape can give. ``None`` when there is no hook log to consult
+    (no bridge dir, or the file isn't there yet), in which case callers
+    fall back to the pane-based check alone.
+
+    :param bridge_dir: Bridge directory holding ``hooks.jsonl``.
+    :returns: The record count, or ``None`` when unavailable.
+    """
+    if bridge_dir is None:
+        return None
+    try:
+        text = (bridge_dir / _HOOKS_FILE).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    count = 0
+    for line in text.splitlines():
+        if "UserPromptSubmit" not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        payload = record.get("payload") if isinstance(record, dict) else None
+        if isinstance(payload, dict) and payload.get("hook_event_name") == "UserPromptSubmit":
+            count += 1
+    return count
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
