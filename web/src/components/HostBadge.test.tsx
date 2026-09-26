@@ -46,13 +46,47 @@ describe("resolveHostBadge", () => {
   });
 
   it("falls back to the raw host_id when the host record is unresolved", () => {
-    // Shared session on another owner's host, or hosts not loaded yet:
-    // there's no name to show, but the session IS host-bound, so the
-    // badge must still answer "which host" with the id.
+    // Older snapshots and deleted hosts still expose the bound ID.
     expect(resolveHostBadge({ hostId: "host_x9", host: undefined, online: true })).toEqual({
       label: "host_x9",
       status: "online",
     });
+  });
+
+  it("uses the snapshot-carried host name when the host list can't resolve it", () => {
+    // Shared viewers use the snapshot because the host list is owner-scoped.
+    expect(
+      resolveHostBadge({
+        hostId: "host_x9",
+        host: undefined,
+        online: true,
+        snapshotName: "alices-macbook",
+      }),
+    ).toEqual({ label: "alices-macbook", status: "online" });
+  });
+
+  it("labels a snapshot-resolved sandbox host by provider, like the owner's view", () => {
+    expect(
+      resolveHostBadge({
+        hostId: "host_sb",
+        host: undefined,
+        online: true,
+        snapshotName: "managed-abc123",
+        snapshotSandboxProvider: "lakebox",
+      }),
+    ).toEqual({ label: "Databricks Sandbox", status: "online" });
+  });
+
+  it("prefers the caller's own host-list record over the snapshot identity", () => {
+    // Prefer live owner-list entries so renames propagate.
+    expect(
+      resolveHostBadge({
+        hostId: "host_a1b2",
+        host: host(),
+        online: true,
+        snapshotName: "stale-name",
+      }),
+    ).toEqual({ label: "mac-laptop", status: "online" });
   });
 
   it("reports unknown status while liveness is still settling", () => {
@@ -166,6 +200,20 @@ describe("HostBadge", () => {
     useHostsMock.mockReturnValue({ data: [] });
     render(<HostBadge sessionId="conv_1" />);
     expect(screen.getByTestId("host-badge").textContent).toContain("host_x9");
+  });
+
+  it("shows the snapshot host name for a shared session's viewer", () => {
+    // Shared viewers resolve the name from the snapshot.
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_x9", hostName: "alices-macbook" },
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({ data: [] });
+    render(<HostBadge sessionId="conv_1" />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.textContent).toContain("alices-macbook");
+    expect(badge.textContent).not.toContain("host_x9");
   });
 
   it("falls back to the host record's status when liveness is unobserved", () => {

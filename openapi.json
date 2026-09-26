@@ -6673,6 +6673,18 @@
             "description": "Host that launched (or should launch) the runner for this session, e.g. `\"host_a1b2c3d4...\"`. `None` for CLI-initiated sessions.",
             "title": "Host Id"
           },
+          "host_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Bound host name for viewers without host-list access; None if unbound or the host row is gone.",
+            "title": "Host Name"
+          },
           "host_online": {
             "anyOf": [
               {
@@ -6690,6 +6702,18 @@
             "description": "Whether this session is bound to a dormant managed host the server can wake in place (its provider sets `SandboxLauncher.can_resume`). The open view reads it only when `host_online` is `False`, to split a confirmed host-down into a recoverable \"asleep\" state (send a message \u2014 the relaunch path resumes the sandbox) versus the terminal `host_offline` dead-end (reconnect from your machine / fork). `False` for non-managed or non-resumable hosts.",
             "title": "Host Resumable",
             "type": "boolean"
+          },
+          "host_sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider label for a managed host; None for an external host or missing host row.",
+            "title": "Host Sandbox Provider"
           },
           "id": {
             "description": "Unique session identifier (also the underlying conversation ID), e.g. `\"conv_abc123\"`.",
