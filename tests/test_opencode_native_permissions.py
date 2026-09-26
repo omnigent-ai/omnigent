@@ -10,7 +10,6 @@ from omnigent.harnesses.opencode_native.permissions import (
     map_verdict_to_decision,
     normalize_for_policy,
     parse_permission_request,
-    reply_body,
 )
 
 
@@ -99,12 +98,11 @@ def test_decision_to_reply() -> None:
     assert decision_to_reply("ask") is None
 
 
-def test_reply_body() -> None:
-    assert reply_body("once") == {"reply": "once"}
-    assert reply_body("reject", message="blocked by policy") == {
-        "reply": "reject",
-        "message": "blocked by policy",
-    }
+def test_v1_reply_body_is_gone() -> None:
+    """The v2 client owns the reply body (``{decision, message}``)."""
+    import omnigent.harnesses.opencode_native.permissions as permissions
+
+    assert not hasattr(permissions, "reply_body")
 
 
 @pytest.mark.parametrize(

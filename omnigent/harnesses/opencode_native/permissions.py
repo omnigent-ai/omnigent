@@ -238,17 +238,3 @@ def decision_to_reply(decision: PolicyDecision) -> OpenCodeReply | None:
     if decision == "reject":
         return "reject"
     return None
-
-
-def reply_body(reply: OpenCodeReply, *, message: str | None = None) -> _JsonObject:
-    """
-    Build the JSON body for ``POST /permission/{requestID}/reply``.
-
-    :param reply: ``once`` / ``always`` / ``reject``.
-    :param message: Optional human-readable note attached to the reply.
-    :returns: The reply request body.
-    """
-    body: _JsonObject = {"reply": reply}
-    if message is not None:
-        body["message"] = message
-    return body
