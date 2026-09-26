@@ -49,6 +49,9 @@ OPENCODE_PASSWORD_ENV_VAR = "OPENCODE_PASSWORD"
 OPENCODE_SERVER_PASSWORD_ENV_VAR = "OPENCODE_SERVER_PASSWORD"
 # The v2 server's fixed basic-auth username.
 OPENCODE_DEFAULT_USERNAME = "opencode"
+# Per-session SQLite store ``opencode serve`` keeps sessions and credentials in.
+OPENCODE_DB_ENV_VAR = "OPENCODE_DB"
+_OPENCODE_DB_FILE = "opencode.db"
 
 _STATE_FILE = "state.json"
 _AUTH_SECRET_FILE = "auth.secret"
@@ -446,6 +449,17 @@ def xdg_config_home_for_bridge_dir(bridge_dir: Path) -> Path:
     :returns: Absolute ``XDG_CONFIG_HOME`` directory.
     """
     return bridge_dir / _XDG_CONFIG_DIR
+
+
+def opencode_db_path_for_bridge_dir(bridge_dir: Path) -> Path:
+    """
+    Return the per-session OpenCode SQLite path for *bridge_dir*.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: Absolute ``opencode.db`` path, passed to the server as
+        ``OPENCODE_DB``.
+    """
+    return bridge_dir / _OPENCODE_DB_FILE
 
 
 def user_opencode_auth_path() -> Path:

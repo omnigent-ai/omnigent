@@ -27,6 +27,7 @@ never to the OpenCode HTTP port.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -40,10 +41,12 @@ import httpx
 from packaging.version import InvalidVersion, Version
 
 from omnigent.harnesses.opencode_native.bridge import (
+    OPENCODE_DB_ENV_VAR,
     OPENCODE_PASSWORD_ENV_VAR,
     OPENCODE_SERVER_PASSWORD_ENV_VAR,
     auth_headers_for_secret,
     ensure_auth_secret,
+    opencode_db_path_for_bridge_dir,
     xdg_config_home_for_bridge_dir,
     xdg_data_home_for_bridge_dir,
 )
@@ -81,17 +84,22 @@ _ENV_PASSTHROUGH_KEYS = (
     "https_proxy",
 )
 _RUNNER_ENV_PASSTHROUGH_ENV_VAR = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
-# OpenCode env vars that point the server at the user's GLOBAL config — they
-# would defeat the per-session XDG isolation by re-introducing whatever
-# config/model/permission settings the parent shell has set. Dropped from
-# the passthrough even though they match the ``OPENCODE_`` prefix, so an
-# isolated session never inherits unrelated global OpenCode config.
-_ENV_OPENCODE_CONFIG_DENYLIST = frozenset(
+# OpenCode env the parent must never leak into the isolated per-session server:
+# global config paths, a foreign SQLite store, or another server's password.
+# Dropped even though they match the ``OPENCODE_`` passthrough prefix; the
+# launcher sets its own DB and password below.
+_ENV_OPENCODE_DENYLIST = frozenset(
     {
         "OPENCODE_CONFIG",
         "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_DB",
+        "OPENCODE_PASSWORD",
+        "OPENCODE_SERVER_PASSWORD",
     }
 )
+# How long a ``--stdio`` server gets to exit after its stdin closes.
+_STDIN_CLOSE_GRACE_S = 3.0
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 # Strip ANSI escape sequences from ``opencode models`` output.
@@ -283,16 +291,17 @@ def build_opencode_serve_args(
     """
     Build the ``opencode serve`` argv tail (after the executable).
 
-    Always passes explicit ``--hostname``/``--port`` so config can't
-    override them (the source default port is ``0``).
+    Always passes explicit ``--hostname``/``--port``. ``--stdio`` ties the
+    server's lifetime to its stdin: it exits when the launcher closes the pipe,
+    so a crashed runner never orphans it.
 
     :param hostname: Bind hostname, e.g. ``"127.0.0.1"``.
     :param port: Bind port.
     :param opencode_args: Extra pass-through args.
     :returns: Argv tail, e.g. ``["serve", "--hostname", "127.0.0.1",
-        "--port", "49231"]``.
+        "--port", "49231", "--stdio"]``.
     """
-    return ["serve", "--hostname", hostname, "--port", str(port), *opencode_args]
+    return ["serve", "--hostname", hostname, "--port", str(port), "--stdio", *opencode_args]
 
 
 def build_tui_command(
@@ -355,9 +364,8 @@ def filtered_server_env(
     }
     env: dict[str, str] = {}
     for key, value in os.environ.items():
-        if key in _ENV_OPENCODE_CONFIG_DENYLIST:
-            # Never inherit the parent's global OpenCode config — the
-            # per-session XDG dirs are the only config source.
+        if key in _ENV_OPENCODE_DENYLIST:
+            # Never inherit the parent's OpenCode config, DB, or password.
             continue
         if (
             key in _ENV_PASSTHROUGH_KEYS
@@ -368,6 +376,7 @@ def filtered_server_env(
     env.update(extra_env or {})
     env["XDG_DATA_HOME"] = str(xdg_data_home_for_bridge_dir(bridge_dir))
     env["XDG_CONFIG_HOME"] = str(xdg_config_home_for_bridge_dir(bridge_dir))
+    env[OPENCODE_DB_ENV_VAR] = str(opencode_db_path_for_bridge_dir(bridge_dir))
     env[OPENCODE_PASSWORD_ENV_VAR] = auth_secret
     env[OPENCODE_SERVER_PASSWORD_ENV_VAR] = auth_secret
     return env
@@ -414,6 +423,9 @@ class OpenCodeNativeServer:
     :param extra_env: Provider env merged into the launch environment.
     :param opencode_args: Extra ``serve`` pass-through args.
     :param verify_version: Whether to version-check the CLI on start.
+    :param user_data_store: Reserved for the session-import server, which runs
+        against the user's real OpenCode data store; unused by per-session
+        servers.
     """
 
     def __init__(
@@ -427,6 +439,7 @@ class OpenCodeNativeServer:
         extra_env: Mapping[str, str] | None = None,
         opencode_args: Sequence[str] = (),
         verify_version: bool = True,
+        user_data_store: bool = False,
     ) -> None:
         self.bridge_dir = bridge_dir
         self.workspace = workspace
@@ -435,6 +448,8 @@ class OpenCodeNativeServer:
         self._extra_env = dict(extra_env or {})
         self._opencode_args = tuple(opencode_args)
         self._verify_version = verify_version
+        # Reserved for the import server; per-session servers always isolate.
+        self.user_data_store = user_data_store
         self.opencode_path = find_opencode_cli(opencode_path)
         self.auth_secret = ensure_auth_secret(bridge_dir)
         self.xdg_data_home = xdg_data_home_for_bridge_dir(bridge_dir)
@@ -514,6 +529,8 @@ class OpenCodeNativeServer:
             argv,
             cwd=str(self.workspace),
             env=self.env,
+            # ``--stdio`` serves until stdin closes; keep the pipe open.
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -526,14 +543,17 @@ class OpenCodeNativeServer:
 
     async def _wait_until_ready(self, *, attempts: int = 60, delay: float = 0.5) -> None:
         """
-        Poll the HTTP API until the server answers or attempts run out.
+        Poll ``GET /api/info`` until the server reports ready.
+
+        The server answers 503 while booting and 200 once its routes are live;
+        the ready body's ``version`` is recorded on :attr:`version`.
 
         :param attempts: Maximum readiness polls.
         :param delay: Seconds between polls.
-        :raises RuntimeError: When the server never becomes ready (or the
-            process died early).
+        :raises RuntimeError: When the server rejects the password, exits early,
+            or never becomes ready.
         """
-        last_error: Exception | None = None
+        last_error = "no response"
         async with httpx.AsyncClient(
             base_url=self.base_url,
             headers=self.auth_headers,
@@ -545,13 +565,33 @@ class OpenCodeNativeServer:
                         f"opencode serve exited early with code {self.process.returncode}"
                     )
                 try:
-                    response = await client.get("/session")
-                    if response.status_code < 500:
-                        return
+                    response = await client.get("/api/info")
                 except httpx.HTTPError as exc:
-                    last_error = exc
+                    last_error = repr(exc)
+                else:
+                    if response.status_code == 200:
+                        self._record_info(response)
+                        return
+                    if response.status_code == 401:
+                        raise RuntimeError("opencode serve rejected the per-session password")
+                    last_error = f"HTTP {response.status_code}"
                 await asyncio.sleep(delay)
-        raise RuntimeError(f"opencode serve did not become ready: {last_error!r}")
+        raise RuntimeError(f"opencode serve did not become ready: {last_error}")
+
+    def _record_info(self, response: httpx.Response) -> None:
+        """
+        Record the server-reported version from a ready ``/api/info`` response.
+
+        :param response: The 200 response; its body is the bare ``ServerInfo``
+            object ``{version, pid, urls, paths}``.
+        """
+        try:
+            body = response.json()
+        except ValueError:
+            return
+        version = body.get("version") if isinstance(body, dict) else None
+        if isinstance(version, str) and version:
+            self.version = version
 
     def client(self, *, directory: str | None = None) -> OpenCodeClient:
         """
@@ -566,18 +606,24 @@ class OpenCodeNativeServer:
             directory=directory or str(self.workspace),
         )
 
-    async def close(self) -> None:  # pragma: no cover
-        """Terminate the server subprocess if running."""
+    async def close(self) -> None:
+        """Stop the server: close stdin (graceful ``--stdio`` exit), then escalate."""
         process = self.process
         if process is None:
             return
+        if process.stdin is not None:
+            with contextlib.suppress(OSError):
+                process.stdin.close()
         if process.poll() is None:
-            process.terminate()
             try:
-                await asyncio.to_thread(process.wait, 10)
+                await asyncio.to_thread(process.wait, _STDIN_CLOSE_GRACE_S)
             except subprocess.TimeoutExpired:
-                process.kill()
-                await asyncio.to_thread(process.wait)
+                process.terminate()
+                try:
+                    await asyncio.to_thread(process.wait, 10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    await asyncio.to_thread(process.wait)
         self.process = None
 
 
