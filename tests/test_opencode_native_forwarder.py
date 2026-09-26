@@ -1887,3 +1887,57 @@ async def test_seed_from_captured_history_suppresses_replay() -> None:
         assert item["item_type"] not in ("function_call", "function_call_output")
         if item["item_type"] == "message":
             assert item["item_data"].get("role") not in ("assistant", "user")
+
+
+# --- full fixture replay ----------------------------------------------------
+
+
+async def test_full_fixture_turn_replays_consistently() -> None:
+    """Every captured frame flows through the forwarder without contradictions."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    for raw in load_events():
+        await fwd.handle_event(_to_event(raw))
+    await _drain(fwd)
+
+    statuses = [e["status"] for e in _status_edges(server.posts)]
+    assert statuses[0] == "running"
+    assert statuses[-1] == "idle"
+
+    ended_texts = [
+        raw["data"]["text"]
+        for raw in events_of_type("session.text.ended")
+        if raw["data"]["sessionID"] == _FIX_SESSION and raw["data"]["text"]
+    ]
+    assistant_texts = [
+        i["item_data"]["content"][0]["text"]
+        for i in _items(server.posts)
+        if i["item_type"] == "message" and i["item_data"]["role"] == "assistant"
+    ]
+    assert assistant_texts == ended_texts
+
+    called_ids = [
+        raw["data"]["id"]
+        for raw in events_of_type("session.tool.called")
+        if raw["data"]["sessionID"] == _FIX_SESSION
+    ]
+    call_items = [
+        i["item_data"]["call_id"]
+        for i in _items(server.posts)
+        if i["item_type"] == "function_call"
+    ]
+    assert [call_id for call_id in call_items if call_id in called_ids] == called_ids
+    outputs = {
+        i["item_data"]["call_id"]
+        for i in _items(server.posts)
+        if i["item_type"] == "function_call_output"
+    }
+    assert set(called_ids) <= outputs
+
+    stream_ids = {d["message_id"] for d in _datas(server.posts, "external_output_text_delta")}
+    retired = {
+        i["message_id"]
+        for i in _items(server.posts)
+        if i["item_type"] == "message" and i["item_data"]["role"] == "assistant"
+    }
+    assert stream_ids <= retired, "every live preview is retired by a final item"
