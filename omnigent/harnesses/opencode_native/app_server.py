@@ -47,7 +47,6 @@ from omnigent.harnesses.opencode_native.bridge import (
     auth_headers_for_secret,
     ensure_auth_secret,
     opencode_db_path_for_bridge_dir,
-    user_xdg_data_home,
     xdg_config_home_for_bridge_dir,
     xdg_data_home_for_bridge_dir,
 )
@@ -275,7 +274,6 @@ def filtered_server_env(
     bridge_dir: Path,
     auth_secret: str,
     extra_env: Mapping[str, str] | None = None,
-    user_data_store: bool = False,
 ) -> dict[str, str]:
     """
     Build the launch environment for ``opencode serve``.
@@ -288,7 +286,6 @@ def filtered_server_env(
     :param bridge_dir: Native OpenCode bridge directory.
     :param auth_secret: Server password for basic auth.
     :param extra_env: Additional provider env (e.g. from Omnigent setup).
-    :param user_data_store: Read the user's own OpenCode data dir and DB (session import).
     :returns: The environment mapping for the server subprocess.
     """
     extra_names = {
@@ -313,10 +310,6 @@ def filtered_server_env(
     env[OPENCODE_DB_ENV_VAR] = str(opencode_db_path_for_bridge_dir(bridge_dir))
     env[OPENCODE_PASSWORD_ENV_VAR] = auth_secret
     env[OPENCODE_SERVER_PASSWORD_ENV_VAR] = auth_secret
-    if user_data_store:
-        # Session import reads the user's own store in place.
-        env["XDG_DATA_HOME"] = str(user_xdg_data_home())
-        env.pop(OPENCODE_DB_ENV_VAR, None)
     return env
 
 
@@ -361,8 +354,6 @@ class OpenCodeNativeServer:
     :param extra_env: Provider env merged into the launch environment.
     :param opencode_args: Extra ``serve`` pass-through args.
     :param verify_version: Whether to version-check the CLI on start.
-    :param user_data_store: Serve the user's own OpenCode store instead of
-        the per-session one.
     """
 
     def __init__(
@@ -376,7 +367,6 @@ class OpenCodeNativeServer:
         extra_env: Mapping[str, str] | None = None,
         opencode_args: Sequence[str] = (),
         verify_version: bool = True,
-        user_data_store: bool = False,
     ) -> None:
         self.bridge_dir = bridge_dir
         self.workspace = workspace
@@ -385,12 +375,9 @@ class OpenCodeNativeServer:
         self._extra_env = dict(extra_env or {})
         self._opencode_args = tuple(opencode_args)
         self._verify_version = verify_version
-        self.user_data_store = user_data_store
         self.opencode_path = find_opencode_cli(opencode_path)
         self.auth_secret = ensure_auth_secret(bridge_dir)
-        self.xdg_data_home = (
-            user_xdg_data_home() if user_data_store else xdg_data_home_for_bridge_dir(bridge_dir)
-        )
+        self.xdg_data_home = xdg_data_home_for_bridge_dir(bridge_dir)
         self.xdg_config_home = xdg_config_home_for_bridge_dir(bridge_dir)
         self.port: int | None = port
         self.process: subprocess.Popen[bytes] | None = None
@@ -415,7 +402,6 @@ class OpenCodeNativeServer:
             bridge_dir=self.bridge_dir,
             auth_secret=self.auth_secret,
             extra_env=self._extra_env,
-            user_data_store=self.user_data_store,
         )
 
     def build_argv(self) -> list[str]:

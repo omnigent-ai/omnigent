@@ -35,12 +35,16 @@ from omnigent.harnesses.opencode_native.app_server import (
     client_for_state,
     find_opencode_cli,
 )
-from omnigent.harnesses.opencode_native.bridge import user_xdg_data_home
+from omnigent.harnesses.opencode_native.bridge import (
+    snapshot_opencode_database,
+    user_xdg_data_home,
+)
 from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeClientError,
     OpenCodeSession,
 )
+from omnigent.onboarding.opencode_auth import opencode_db_path
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
@@ -167,23 +171,26 @@ def _opencode_user_store_exists() -> bool:
 
 @contextlib.asynccontextmanager
 async def _opencode_import_client() -> AsyncIterator[OpenCodeClient]:
-    """Start a short-lived ``opencode serve`` on the user's store and yield a client.
+    """Start a short-lived ``opencode serve`` on a snapshot of the user's DB.
 
-    The server gets a throwaway config home, so the user's plugins and MCP
-    servers never start; it is stopped when the block exits.
+    The server runs fully isolated on a read-only copy, so it never writes to
+    or resumes turns in the user's live store; it is stopped on exit.
     """
     try:
         opencode_path = find_opencode_cli(None)
     except OpenCodeCliNotFoundError as exc:
         raise SessionImportNotFoundError(str(exc)) from exc
     with tempfile.TemporaryDirectory(prefix="omnigent-opencode-import-") as scratch:
-        server = OpenCodeNativeServer(
-            bridge_dir=Path(scratch),
-            workspace=Path.home(),
-            opencode_path=opencode_path,
-            user_data_store=True,
-        )
+        bridge_dir = Path(scratch)
+        user_db = opencode_db_path()
+        if user_db is None or not snapshot_opencode_database(user_db, bridge_dir):
+            raise SessionImportNotFoundError("OpenCode database could not be copied")
         try:
+            server = OpenCodeNativeServer(
+                bridge_dir=bridge_dir,
+                workspace=Path.home(),
+                opencode_path=opencode_path,
+            )
             await asyncio.wait_for(server.start(), timeout=_OPENCODE_IMPORT_START_TIMEOUT_SECONDS)
         except (OSError, RuntimeError, TimeoutError) as exc:
             raise SessionImportNotFoundError(f"OpenCode server could not start: {exc}") from exc
@@ -191,8 +198,10 @@ async def _opencode_import_client() -> AsyncIterator[OpenCodeClient]:
         try:
             yield client
         finally:
-            await client.aclose()
-            await server.close()
+            try:
+                await client.aclose()
+            finally:
+                await server.close()
 
 
 def _run_opencode_import(coro: Coroutine[Any, Any, _T]) -> _T:

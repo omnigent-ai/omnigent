@@ -23,6 +23,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     opencode_db_path_for_bridge_dir,
     prepare_bridge_dir,
     read_bridge_state,
+    snapshot_opencode_database,
     update_active_message_id,
     update_last_applied_model,
     update_last_event_id,
@@ -767,3 +768,21 @@ def test_copy_opencode_database_for_fork_unknown_schema_leaves_no_copy(tmp_path:
 
     assert copy_opencode_database_for_fork(source_dir, dest_dir) is False
     assert not opencode_db_path_for_bridge_dir(dest_dir).exists()
+
+
+def test_snapshot_opencode_database_copies_any_source_path(tmp_path: Path) -> None:
+    """Session import snapshots the user's own DB, which is not in a bridge dir."""
+    user_db = tmp_path / "share" / "opencode" / "custom.db"
+    _make_opencode_db(user_db, claimed=True)
+    dest_dir = tmp_path / "import-bridge"
+
+    assert snapshot_opencode_database(user_db, dest_dir) is True
+
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(dest_dir)) as conn:
+        rows = conn.execute("SELECT id, time_suspended FROM session_v2").fetchall()
+    conn.close()
+    assert rows == [("ses_src", None)]
+    with sqlite3.connect(user_db) as conn:
+        claim = conn.execute("SELECT time_suspended FROM session_v2").fetchone()[0]
+    conn.close()
+    assert claim is not None, "the user's live store must never be modified"

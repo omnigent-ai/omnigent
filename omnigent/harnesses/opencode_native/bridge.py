@@ -500,21 +500,19 @@ def _remove_database_files(database: Path) -> None:
             database.with_name(database.name + suffix).unlink()
 
 
-def copy_opencode_database_for_fork(source_bridge_dir: Path, dest_bridge_dir: Path) -> bool:
+def snapshot_opencode_database(source: Path, dest_bridge_dir: Path) -> bool:
     """
-    Snapshot a source conversation's OpenCode DB into a fork's bridge dir.
+    Snapshot an OpenCode SQLite DB into *dest_bridge_dir*'s per-session DB.
 
-    The fork's own ``opencode serve`` must see the source session to run
-    ``POST /api/session/{id}/fork``. The copy releases execution claims
-    (``session_v2.time_suspended``) so the fork's server does not resume the
-    source's unfinished turn on boot.
+    The source is opened read-only and never written. The copy releases
+    execution claims (``session_v2.time_suspended``) so a server booted on it
+    does not resume another server's unfinished turn.
 
-    :param source_bridge_dir: Bridge dir of the conversation being forked.
-    :param dest_bridge_dir: Bridge dir of the new (forked) conversation.
+    :param source: OpenCode DB to copy (a bridge's DB or the user's own store).
+    :param dest_bridge_dir: Bridge dir that receives the copy.
     :returns: ``True`` when the copy is in place; ``False`` (and no copy left
         behind) when the source DB is missing or its schema is unrecognized.
     """
-    source = opencode_db_path_for_bridge_dir(source_bridge_dir)
     if not source.is_file():
         return False
     dest = opencode_db_path_for_bridge_dir(dest_bridge_dir)
@@ -539,6 +537,22 @@ def copy_opencode_database_for_fork(source_bridge_dir: Path, dest_bridge_dir: Pa
         _remove_database_files(dest)
         return False
     return True
+
+
+def copy_opencode_database_for_fork(source_bridge_dir: Path, dest_bridge_dir: Path) -> bool:
+    """
+    Snapshot a source conversation's OpenCode DB into a fork's bridge dir.
+
+    The fork's own ``opencode serve`` must see the source session to run
+    ``POST /api/session/{id}/fork``; see :func:`snapshot_opencode_database`.
+
+    :param source_bridge_dir: Bridge dir of the conversation being forked.
+    :param dest_bridge_dir: Bridge dir of the new (forked) conversation.
+    :returns: ``True`` when the copy is in place, else ``False``.
+    """
+    return snapshot_opencode_database(
+        opencode_db_path_for_bridge_dir(source_bridge_dir), dest_bridge_dir
+    )
 
 
 def user_opencode_config_path() -> Path | None:

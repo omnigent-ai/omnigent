@@ -278,6 +278,109 @@ def test_opencode_import_client_reports_missing_cli(monkeypatch: pytest.MonkeyPa
         local_import._run_opencode_import(_open())
 
 
+class _FakeImportServer:
+    """Records how the import server is built, started, and stopped."""
+
+    instances: list[_FakeImportServer] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.base_url = "http://127.0.0.1:1"
+        self.auth_secret = "pw"
+        self.started = False
+        self.closed = False
+        _FakeImportServer.instances.append(self)
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeHttpClient:
+    def __init__(self, *, fail_close: bool = False) -> None:
+        self.fail_close = fail_close
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+        if self.fail_close:
+            raise RuntimeError("aclose failed")
+
+
+def _patch_import_server(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    snapshot_ok: bool,
+    client: _FakeHttpClient | None = None,
+) -> list[tuple[Path, Path]]:
+    snapshots: list[tuple[Path, Path]] = []
+
+    def _snapshot(source: Path, dest_bridge_dir: Path) -> bool:
+        snapshots.append((source, dest_bridge_dir))
+        return snapshot_ok
+
+    _FakeImportServer.instances = []
+    monkeypatch.setattr(local_import, "find_opencode_cli", lambda _path=None: "/fake/opencode")
+    monkeypatch.setattr(local_import, "snapshot_opencode_database", _snapshot)
+    monkeypatch.setattr(local_import, "OpenCodeNativeServer", _FakeImportServer)
+    monkeypatch.setattr(
+        local_import, "client_for_state", lambda **_kwargs: client or _FakeHttpClient()
+    )
+    return snapshots
+
+
+def test_opencode_import_client_serves_a_snapshot_of_the_user_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The import server boots on a copy, never on the user's live store."""
+    user_db = tmp_path / "custom.db"
+    monkeypatch.setenv("OPENCODE_DB", str(user_db))
+    snapshots = _patch_import_server(monkeypatch, snapshot_ok=True)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    local_import._run_opencode_import(_open())
+
+    [server] = _FakeImportServer.instances
+    assert snapshots == [(user_db, server.kwargs["bridge_dir"])]
+    assert "user_data_store" not in server.kwargs
+    assert server.started and server.closed
+
+
+def test_opencode_import_client_reports_failed_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_import_server(monkeypatch, snapshot_ok=False)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    with pytest.raises(SessionImportNotFoundError, match="could not be copied"):
+        local_import._run_opencode_import(_open())
+    assert _FakeImportServer.instances == []
+
+
+def test_opencode_import_client_stops_server_when_client_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeHttpClient(fail_close=True)
+    _patch_import_server(monkeypatch, snapshot_ok=True, client=client)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    with pytest.raises(RuntimeError, match="aclose failed"):
+        local_import._run_opencode_import(_open())
+    [server] = _FakeImportServer.instances
+    assert client.closed and server.closed
+
+
 _V2_MESSAGES: list[dict[str, Any]] = [
     {
         "id": "msg_user",
