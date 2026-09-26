@@ -172,8 +172,11 @@ allow, transform or suppress output. A result-phase ASK withholds the output;
 interactive result review is not implemented. Adding it requires a server-held
 pending result and an approval continuation that releases or discards that result
 without executing the upstream tool again. Pending results need bounded retention,
-identity binding and cancellation cleanup; restart recovery would require shared
-protected storage. Result filtering cannot undo a side effect already performed upstream.
+identity binding and cancellation cleanup. An in-memory implementation can expire
+reviews on restart; restart recovery and multiple workers require protected shared
+storage. See the [result-review design](MCP_REGISTRY_GATEWAY.md#adding-interactive-result-review)
+for the continuation flow and required tests. Result filtering cannot undo a side
+effect already performed upstream.
 
 The existing `/v1/sessions/{session}/mcp` route remains for built-in tools, custom
 HTTP/stdio declarations and older runners. Its registry compatibility path uses

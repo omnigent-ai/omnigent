@@ -197,6 +197,57 @@ implementation. Both are wrapped by the same policy adapter, including response
 filtering. An external gateway owns its downstream credentials; Omnigent stores
 only the credential needed to call that gateway. See the API doc for exact types.
 
+## Adding interactive result review
+
+Result review is a supported architectural direction, but is not implemented in
+this prototype. Request approval pauses **before execution**. Result approval
+pauses **after execution**, before the harness or model receives the output.
+Reusing the current request continuation unchanged would execute the tool again.
+A result continuation must instead release or discard the retained output.
+
+```mermaid
+sequenceDiagram
+  participant H as Runner: harness / relay
+  participant A as Server: MCP policy adapter
+  participant E as Server: gateway backend
+  participant Q as Server: pending result store
+  participant U as Browser: authorized reviewer
+  H->>A: tools/call
+  A->>E: Execute approved request once
+  E-->>A: Tool result
+  A->>A: Result policy requests review
+  A->>Q: Retain output and bound call identity
+  A-->>H: Approval required, opaque continuation only
+  A-->>U: Review card with authorized preview
+  U->>A: Approve or decline through existing approval API
+  H->>A: Resume pending operation
+  A->>A: Recheck identity, access and current policy
+  A->>Q: Resolve retained result atomically
+  alt Approved
+    A-->>H: Release policy-checked result
+  else Declined, expired or cancelled
+    A-->>H: Result withheld
+  end
+  Note over A,E: Continuation never calls the backend again
+```
+
+The smallest implementation can reuse the existing approval events, card and
+runner wait/resume loop. It needs a result-phase continuation, an authorized
+preview that is not written into model-visible history, and a bounded server-side
+pending record containing the session, actor, service/tool, call ID, output and
+expiry. Resolve it atomically so duplicate approvals or retries cannot execute
+the upstream call or release another call's result. Recheck authorization and any
+new policy denial before release; apply deferred policy writes only on approval.
+
+For this single-worker prototype, an in-memory store with expiry and cancellation
+cleanup is sufficient if restart explicitly expires pending reviews. Protected
+shared persistence is needed for restart recovery and multiple workers. Credential
+storage and token refresh do not need to change: they own grants, not tool outputs.
+Tests must cover approval, decline, expiry, cancellation, changed access/policy,
+duplicate continuation and both SDK/native runners, with upstream execution counted
+exactly once. Suppressing a result cannot undo a write that already happened;
+approval of a side effect belongs in the request phase.
+
 ## Credential lifecycle and refresh
 
 ```mermaid
