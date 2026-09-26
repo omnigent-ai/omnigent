@@ -20,11 +20,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import math
+import os
 import secrets
 import shlex
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, ClassVar
 
 import click
@@ -48,6 +52,86 @@ pins a commit). It bakes the full omnigent install plus git / tmux /
 curl and the coding-harness CLIs, so sandbox creation skips the
 in-sandbox dependency install. Providers layer their own override
 mechanisms (env var / server config) on top of this default."""
+
+_logger = logging.getLogger(__name__)
+
+MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
+"""Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
+
+# Global default keepalive cadence, used by every managed provider except
+# agent_sandbox. Providers whose keep_alive is idempotent ("configure once")
+# don't need a fast cadence, so the default stays cheap.
+_DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
+# agent_sandbox pushes an absolute shutdownTime forward and runs a SHORT window,
+# so it must refresh fast (its window floor is twice this). Scoped to the
+# provider so lowering it does not multiply every other provider's write load.
+_AGENT_SANDBOX_KEEPALIVE_INTERVAL_S: float = 60.0
+_MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
+# Ceiling so a finite-but-huge override (e.g. 1e308) cannot overflow the
+# window-floor math (ceil(2 * interval)); an hour is already far past useful.
+_MAX_MANAGED_KEEPALIVE_INTERVAL_S: float = 3600.0
+
+
+def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
+    """
+    How often the server refreshes a live managed sandbox's liveness, in seconds.
+
+    Provider-scoped default: ``agent_sandbox`` refreshes fast (60s) because it
+    pushes an absolute deadline forward under a short window; every other
+    provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
+    overrides both when set (advanced/experimental — the operator-facing knob is
+    ``keep_warm_s``), floored at a small minimum so a typo cannot spin the loop.
+    Resolved live from the env on each call (no snapshot), so the server loop
+    cadence and the ``agent_sandbox`` window floor cannot disagree.
+    """
+    default = (
+        _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S
+        if provider == "agent_sandbox"
+        else _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+    )
+    raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        _logger.warning(
+            "ignoring %s=%r (not a number); using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            default,
+        )
+        return default
+    if not math.isfinite(parsed):
+        # "nan"/"inf" parse cleanly but blow up downstream in int/ceil(2 * x);
+        # a non-finite typo must fail safe like any other bad value.
+        _logger.warning(
+            "ignoring %s=%r (not a finite number); using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            default,
+        )
+        return default
+    if parsed < _MIN_MANAGED_KEEPALIVE_INTERVAL_S:
+        _logger.warning(
+            "%s=%r is below the %ss minimum; using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
+            _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _MIN_MANAGED_KEEPALIVE_INTERVAL_S
+    if parsed > _MAX_MANAGED_KEEPALIVE_INTERVAL_S:
+        _logger.warning(
+            "%s=%r is above the %ss maximum; using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _MAX_MANAGED_KEEPALIVE_INTERVAL_S,
+            _MAX_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _MAX_MANAGED_KEEPALIVE_INTERVAL_S
+    return parsed
+
 
 # Ceiling for the in-sandbox host restart backoff, so a host that crashes on
 # every attempt settles into a slow retry instead of a hot loop.
@@ -308,6 +392,15 @@ class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
     """
 
 
+class SandboxGoneError(click.ClickException, _sandbox_types.SandboxError):
+    """Raised when a sandbox generation definitively no longer exists.
+
+    Resumable providers use this only for a definitive absence, never for a
+    timeout, connectivity failure, or unknown state. The managed-host wake path
+    catches it and provisions a fresh sandbox generation instead.
+    """
+
+
 @dataclass
 class RemoteCommandResult:
     """
@@ -418,6 +511,11 @@ class SandboxLifecycle(ABC):
             file_copy=self._is_capability_overridden("put"),
             streaming_exec=self._is_capability_overridden("stream_exec"),
             foreground_exec=self._is_capability_overridden("exec_foreground"),
+            git_clone_options=(
+                getattr(type(self), "start_host", None) is ExecModelHostLauncher.start_host
+                and getattr(type(self), "materialize_workspace", None)
+                is ExecModelHostLauncher.materialize_workspace
+            ),
         )
 
     def _is_capability_overridden(self, name: str) -> bool:
@@ -483,12 +581,15 @@ class SandboxLifecycle(ABC):
         """
         raise self._capability_error("attach to an existing sandbox")
 
-    def keep_alive(self, sandbox_id: str) -> None:
+    def keep_alive(self, sandbox_id: str) -> bool | None:
         """
         Keep the sandbox from being reclaimed while it is still in use,
         so long agent runs don't lose their host. Soft-fail:
         implementations should warn rather than raise when the provider
-        rejects the setting.
+        rejects the setting. Return ``False`` when an extension was attempted
+        but could not be confirmed (a soft failure the provider already logged),
+        so the managed keepalive loop can skip its success line; ``None`` or
+        ``True`` otherwise.
 
         Called BOTH once after a CLI bootstrap provision AND periodically
         by the managed path for as long as the sandbox has a live runner
@@ -584,6 +685,8 @@ class SandboxLifecycle(ABC):
             ``"sb-a1b2c3"``.
         :raises SandboxCapabilityError: When the provider cannot resume a
             stopped sandbox (ephemeral sandboxes / no persistent volume).
+        :raises SandboxGoneError: When the sandbox generation definitively no
+            longer exists.
         :raises click.ClickException: If the resume fails.
         """
         raise self._capability_error("resume a stopped sandbox")
@@ -813,6 +916,13 @@ class SandboxHostLauncher(SandboxLifecycle):
     transport.
     """
 
+    def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
+        """Set request context before provider preparation, allocation, or resume.
+
+        Providers with pre-created resources can use the resolved agent name
+        to select and validate compatible infrastructure before allocation.
+        """
+
     def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
         """Bind credentials needed for background cleanup in one workspace."""
         return nullcontext()
@@ -896,6 +1006,12 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
 
         :returns: The absolute in-sandbox workspace path.
         """
+        if any(repo.git_clone != _sandbox_types.GitCloneOptions() for repo in repos):
+            if not self.capabilities.git_clone_options:
+                raise click.ClickException(
+                    f"sandbox provider '{self.provider}' does not support "
+                    "sandbox.git_clone options"
+                )
         home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
         if not home:
             raise click.ClickException(
@@ -909,16 +1025,21 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
                 on_stage("cloning")
             # Distinct URLs can derive the same repo_name (e.g. two orgs' "api");
             # disambiguate so they don't clone into one colliding directory.
-            clone_dirs = [
-                self.materialize_workspace(
-                    sandbox_id,
-                    workspace=workspace,
-                    repo_url=repo.url,
-                    repo_branch=repo.branch,
-                    repo_name=dirname,
+            clone_dirs = []
+            for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True):
+                materialize = self.materialize_workspace
+                # Preserve the old override signature when no policy was configured.
+                if repo.git_clone != _sandbox_types.GitCloneOptions():
+                    materialize = partial(materialize, git_clone=repo.git_clone)
+                clone_dirs.append(
+                    materialize(
+                        sandbox_id,
+                        workspace=workspace,
+                        repo_url=repo.url,
+                        repo_branch=repo.branch,
+                        repo_name=dirname,
+                    )
                 )
-                for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True)
-            ]
             # One repo → drop the agent straight into it; several → the
             # workspace root that parents them all.
             workspace = clone_dirs[0] if len(clone_dirs) == 1 else workspace
@@ -949,6 +1070,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         repo_branch: str | None,
         repo_name: str | None,
         on_stage: Callable[[str], None] | None = None,
+        git_clone: _sandbox_types.GitCloneOptions = _sandbox_types.GitCloneOptions(),
     ) -> str:
         """
         Materialize the requested repository into the sandbox and return the
@@ -960,15 +1082,13 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         if on_stage is not None:
             on_stage("cloning")
         clone_dir = f"{workspace}/{repo_name}"
-        branch_args = (
-            f"--branch {shlex.quote(repo_branch)} --single-branch "
-            if repo_branch is not None
-            else ""
+        command = shlex.join(
+            ["git", "clone", *git_clone.clone_args(repo_branch), "--", repo_url, clone_dir]
         )
         try:
             self.run(
                 sandbox_id,
-                f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
+                command,
             )
         except click.ClickException as exc:
             raise click.ClickException(

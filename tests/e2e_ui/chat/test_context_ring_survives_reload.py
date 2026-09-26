@@ -40,9 +40,7 @@ from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configur
 _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
-# The composer status tray's context ring exposes its value via aria-label,
-# e.g. "1% of context used".
-_RING = '[data-testid="composer-status-line"] [aria-label$="of context used"]'
+_RING = '[data-testid="composer-context-ring"][aria-label$="of context used"]'
 
 # Spec-declared window; the ring's percentage derives from it.
 _CONTEXT_WINDOW = 200_000
@@ -69,7 +67,7 @@ def _build_claude_sdk_bundle(name: str, mock_llm_server_url: str) -> bytes:
         "prompt": "You are a terse assistant. Answer in as few words as possible.",
         "executor": {
             "harness": "claude-sdk",
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "context_window": _CONTEXT_WINDOW,
             "auth": {
                 "type": "api_key",
@@ -163,6 +161,7 @@ def test_context_ring_survives_page_reload(
             _send(page, f"Say ack. {token1}")
             expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=120_000)
             expect(page.locator(_WORKING)).to_have_count(0, timeout=120_000)
+            expect(page.locator(_ASSISTANT).first.get_by_text("ack", exact=True)).to_be_visible()
             ring = page.locator(_RING)
             expect(ring).to_be_visible(timeout=30_000)
             expect(ring).to_have_attribute(

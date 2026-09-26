@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import omnigent.inner.codex_native_executor as codex_native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
@@ -16,10 +19,12 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     write_bridge_startup_error,
+    write_bridge_startup_timeout,
     write_bridge_state,
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
 # enough to embed, used to prove image blocks are materialized to disk
@@ -457,6 +462,85 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
     )
 
 
+def test_resize_notice_is_encoded_in_model_visible_image_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex receives resize metadata without adding user-visible text."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        async for _ in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                        {
+                            "type": "_omnigent_framework_notice",
+                            "source_metadata": {"width": 4600, "height": 3400},
+                        },
+                        {"type": "input_text", "text": "inspect this"},
+                    ],
+                },
+            ],
+            [],
+            "",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    start = next(
+        params for method, params in _FakeCodexNativeClient.requests if method == "turn/start"
+    )
+    image = start["input"][0]
+    assert image["type"] == "localImage"
+    assert "downscaled-from-4600x3400" in image["path"]
+    assert start["input"][1] == {"type": "text", "text": "inspect this"}
+    assert len(start["input"]) == 2
+
+
+def test_resize_paths_preserve_multiple_images_and_cached_originals(tmp_path: Path) -> None:
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    content = []
+    for image_bytes, dimensions in [
+        (b"first image", {"width": 6000, "height": 4000}),
+        (b"second image", {"width": 6000, "height": 4000}),
+        (b"third image", {"width": 8000, "height": 5000}),
+    ]:
+        content.extend(
+            [
+                {
+                    "type": "input_image",
+                    "filename": "same.png",
+                    "image_url": "data:image/png;base64," + base64.b64encode(image_bytes).decode(),
+                },
+                framework_notice_block(dimensions),
+            ]
+        )
+    items = _content_to_input_items(content, tmp_path)
+    paths = [Path(item["path"]) for item in items]
+    assert len(set(paths)) == 3
+    assert [path.read_bytes() for path in paths] == [
+        b"first image",
+        b"second image",
+        b"third image",
+    ]
+    assert "downscaled-from-8000x5000" in paths[2].name
+    assert (attachment_cache_dir(tmp_path) / "same.png").read_bytes() == b"first image"
+    assert _content_to_input_items(content, tmp_path) == items
+
+
 def test_input_file_text_is_inlined_as_a_text_item(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -509,7 +593,7 @@ def test_input_file_text_is_inlined_as_a_text_item(
     assert items == [{"type": "text", "text": file_text}]
     # No image channel item for a file, and no uploads dir written.
     assert all(item["type"] != "localImage" for item in items)
-    assert not (tmp_path / "uploads").exists()
+    assert not (attachment_cache_dir(tmp_path)).exists()
 
 
 def test_input_file_binary_is_materialized_and_referenced_by_path(
@@ -571,8 +655,121 @@ def test_input_file_binary_is_materialized_and_referenced_by_path(
     assert base64.b64encode(pdf_bytes).decode() not in text
     referenced = Path(text[len("[Attached file: ") : -len("]")])
     # The referenced file exists under uploads/ and holds the decoded bytes.
-    assert referenced.parent == tmp_path / "uploads"
+    assert referenced.parent == attachment_cache_dir(tmp_path)
     assert referenced.read_bytes() == pdf_bytes
+
+
+def test_input_file_zip_is_materialized_outside_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ZIP reaches Codex by absolute cache path without changing the checkout."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+            cwd=str(workspace),
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    zip_bytes = b"PK\x03\x04 fake zip bytes"
+    data_uri = "data:application/zip;base64," + base64.b64encode(zip_bytes).decode()
+    block = {"type": "input_file", "file_data": data_uri, "filename": "bundle.zip"}
+
+    async def run() -> None:
+        """Drive one turn carrying a single zip ``input_file`` block."""
+        async for _event in executor.run_turn([{"role": "user", "content": [block]}], [], ""):
+            pass
+
+    asyncio.run(run())
+
+    _method, params = _FakeCodexNativeClient.requests[-1]
+    text = params["input"][0]["text"]
+    referenced = Path(text[len("[Attached: ") : -len("]")])
+    assert referenced.parent == attachment_cache_dir(tmp_path)
+    assert referenced.read_bytes() == zip_bytes
+    assert list(workspace.iterdir()) == []
+
+
+def test_zip_submitted_as_an_image_block_still_uses_a_file_reference(
+    tmp_path: Path,
+) -> None:
+    """
+    Delivery follows the stored filename, not the block type.
+
+    A zip uploaded under an image MIME comes back as an ``input_image``
+    block carrying the authoritative filename. Taking the image branch would
+    stage it in the bridge dir and hand codex a localImage it cannot open.
+    """
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    zip_bytes = b"PK\x03\x04 fake zip bytes"
+    block = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(zip_bytes).decode(),
+        "filename": "bundle.zip",
+    }
+
+    items = _content_to_input_items([block], tmp_path)
+
+    expected = attachment_cache_dir(tmp_path) / "bundle.zip"
+    assert items == [{"type": "text", "text": f"[Attached: {expected}]"}]
+    assert expected.read_bytes() == zip_bytes
+    assert list(workspace.iterdir()) == []
+
+
+def test_input_file_zip_is_materialized_without_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Attachment delivery does not depend on cwd being recorded in bridge state."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    data_uri = "data:application/zip;base64," + base64.b64encode(b"PK\x03\x04").decode()
+    block = {"type": "input_file", "file_data": data_uri, "filename": "bundle.zip"}
+
+    async def run() -> None:
+        """Drive one turn carrying a zip with no workspace recorded."""
+        async for _event in executor.run_turn([{"role": "user", "content": [block]}], [], ""):
+            pass
+
+    asyncio.run(run())
+
+    _method, params = _FakeCodexNativeClient.requests[-1]
+    assert params["input"] == [
+        {"type": "text", "text": f"[Attached: {attachment_cache_dir(tmp_path) / 'bundle.zip'}]"}
+    ]
 
 
 async def test_executor_reaches_app_server_over_ws_transport(
@@ -752,6 +949,7 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     error: Exception,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Only Codex's explicit idle semantic is safe to retry."""
 
@@ -781,6 +979,25 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_maybe_active"
+
+    from omnigent.debug_logging import record_to_row
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "Codex native turn injection failed"
+    )
+    row = record_to_row(record, source="runner")
+    assert row["session_id"] == state.session_id
+    assert row["event_name"] == "codex_turn_injection_failed"
+    attrs = row["attributes"]
+    assert row["turn_id"] == "turn_maybe_active"
+    assert attrs["thread_id"] == state.thread_id
+    if isinstance(error, CodexAppServerResponseError):
+        assert attrs["rpc_error_code"] == "-32600"
+    else:
+        assert "rpc_error_code" not in attrs
+    assert "do not duplicate" not in json.dumps(attrs)
 
 
 def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
@@ -1342,8 +1559,12 @@ def test_run_turn_surfaces_recorded_startup_error(
     generic "bridge state is missing" (issue #59).
     """
 
+    sleep_calls = 0
+
     async def _no_sleep(_seconds: float) -> None:
         """No-op the poll backoff so the missing-state path is fast."""
+        nonlocal sleep_calls
+        sleep_calls += 1
 
     # asyncio.run does not depend on asyncio.sleep, so patching it is safe.
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
@@ -1351,6 +1572,7 @@ def test_run_turn_surfaces_recorded_startup_error(
         tmp_path,
         "Codex app-server never started a thread within the startup timeout.",
     )
+    write_bridge_startup_timeout(tmp_path, 120.0)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
     events = _collect_turn_events(executor, "hello")
@@ -1361,6 +1583,320 @@ def test_run_turn_surfaces_recorded_startup_error(
     assert "never started" in error.message
     assert "startup timeout" in error.message
     assert error.message != "Codex native bridge state is missing"
+    assert sleep_calls == 0
+
+
+def test_bridge_state_wait_preserves_legacy_and_configured_command_contracts(
+    tmp_path: Path,
+) -> None:
+    """Only an advertised configured-command launch extends the legacy 60s wait."""
+    assert codex_native_executor._bridge_state_wait_seconds(tmp_path) == 60.0
+
+    write_bridge_startup_timeout(tmp_path, 120.0)
+
+    assert codex_native_executor._bridge_state_wait_seconds(tmp_path) == 125.0
+
+
+def test_run_turn_polls_bridge_state_at_fast_startup_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A queued first turn observes state after one 50 ms polling interval."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    sleep_delays: list[float] = []
+
+    async def _publish_state(seconds: float) -> None:
+        sleep_delays.append(seconds)
+        _start_state(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _publish_state)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert sleep_delays == [0.05]
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
+
+
+def test_run_turn_polls_startup_error_at_fast_startup_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sleep_delays: list[float] = []
+
+    async def _publish_error(seconds: float) -> None:
+        sleep_delays.append(seconds)
+        write_bridge_startup_error(tmp_path, "app-server exited")
+
+    monkeypatch.setattr(asyncio, "sleep", _publish_error)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert sleep_delays == [0.05]
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].message == "Codex native thread never started: app-server exited"
+
+
+def test_bridge_state_polling_backs_off_after_fast_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sleep_delays: list[float] = []
+
+    async def _record_until_backoff(seconds: float) -> None:
+        sleep_delays.append(seconds)
+        if seconds == 0.25:
+            write_bridge_startup_error(tmp_path, "test completed")
+
+    monkeypatch.setattr(asyncio, "sleep", _record_until_backoff)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert sleep_delays[-1] == 0.25
+    assert sum(sleep_delays[:-1]) == pytest.approx(2.0)
+    assert all(delay == 0.05 for delay in sleep_delays[:-1])
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_bridge_polling_wait_exits_cleanly(tmp_path: Path) -> None:
+    """Cancelling a queued first turn interrupts its polling sleep."""
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def _drive() -> None:
+        async for _event in executor.run_turn(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            [],
+            "",
+        ):
+            pass
+
+    task = asyncio.create_task(_drive())
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_run_turn_without_marker_keeps_bounded_legacy_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The ordinary path retains the existing 60-second nominal bound."""
+    sleep_delays: list[float] = []
+
+    async def _count_sleep(seconds: float) -> None:
+        sleep_delays.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _count_sleep)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert sum(sleep_delays) == pytest.approx(60.0)
+    assert set(sleep_delays) == {0.05, 0.25}
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_extended_bridge_wait_does_not_block_concurrent_enqueue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The configured-command wait remains outside the injection lock."""
+    write_bridge_startup_timeout(tmp_path, 120.0)
+    sleep_entered = asyncio.Event()
+    release_sleep = asyncio.Event()
+    sleep_calls = 0
+
+    async def _block_first_sleep(seconds: float) -> None:
+        nonlocal sleep_calls
+        assert seconds == 0.05
+        sleep_calls += 1
+        if sleep_calls == 1:
+            sleep_entered.set()
+            await release_sleep.wait()
+
+    async def _drive_run_turn(executor: CodexNativeExecutor) -> list[Any]:
+        events: list[Any] = []
+        async for event in executor.run_turn(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            [],
+            "",
+        ):
+            events.append(event)
+        return events
+
+    monkeypatch.setattr(asyncio, "sleep", _block_first_sleep)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    run_turn_task = asyncio.create_task(_drive_run_turn(executor))
+    await asyncio.wait_for(sleep_entered.wait(), timeout=5.0)
+
+    accepted = await asyncio.wait_for(
+        executor.enqueue_session_message("session", "steer"),
+        timeout=5.0,
+    )
+    write_bridge_startup_error(tmp_path, "test completed")
+    release_sleep.set()
+    events = await asyncio.wait_for(run_turn_task, timeout=5.0)
+
+    assert accepted is False
+    assert sleep_calls == 1
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+def test_run_turn_honors_marker_published_after_wait_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A late persistent marker grants its full allowance exactly once."""
+    sleep_delays: list[float] = []
+
+    async def _publish_marker_during_wait(seconds: float) -> None:
+        sleep_delays.append(seconds)
+        if len(sleep_delays) == 3:
+            write_bridge_startup_timeout(tmp_path, 120.0)
+
+    monkeypatch.setattr(asyncio, "sleep", _publish_marker_during_wait)
+    caplog.set_level(logging.DEBUG, logger=codex_native_executor.__name__)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert sum(sleep_delays) == pytest.approx(125.15)
+    assert caplog.text.count("by startup marker") == 1
+    assert "extended from 60.00 to 125.15 seconds" in caplog.text
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+def test_run_turn_rechecks_marker_before_reporting_the_generic_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A marker first observed after the wait exhausts still extends it once.
+
+    Boundary race: the runner can publish ``startup_timeout.json`` in the
+    instant after the wait loop's final re-read (for example while a steer
+    holds the injection lock). The executor must re-read the marker
+    immediately before surfacing the generic bridge-state miss and resume its
+    bounded wait, instead of reporting the false "never started" failure
+    while the forwarder is still inside its advertised budget.
+    """
+    waited_seconds = 0.0
+
+    async def _count_sleep(seconds: float) -> None:
+        nonlocal waited_seconds
+        waited_seconds += seconds
+
+    real_read_startup_error = codex_native_executor.read_bridge_startup_error
+    marker_published = False
+
+    def _publish_marker_at_the_locked_recheck(bridge_dir: Path) -> str | None:
+        nonlocal marker_published
+        if waited_seconds >= 60.0 and not marker_published:
+            write_bridge_startup_timeout(tmp_path, 120.0)
+            marker_published = True
+        return real_read_startup_error(bridge_dir)
+
+    monkeypatch.setattr(asyncio, "sleep", _count_sleep)
+    monkeypatch.setattr(
+        codex_native_executor,
+        "read_bridge_startup_error",
+        _publish_marker_at_the_locked_recheck,
+    )
+    caplog.set_level(logging.DEBUG, logger=codex_native_executor.__name__)
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert marker_published
+    assert waited_seconds == pytest.approx(185.0)
+    assert "extended from 60.00 to 185.00 seconds" in caplog.text
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.message == "Codex native bridge state is missing"
+
+
+@pytest.mark.asyncio
+async def test_late_marker_allows_state_after_legacy_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A late marker's full allowance permits state after the legacy deadline."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    waited_seconds = 0.0
+    marker_published = False
+
+    async def _publish_marker_then_state(seconds: float) -> None:
+        nonlocal marker_published, waited_seconds
+        waited_seconds += seconds
+        if waited_seconds >= 0.5 and not marker_published:
+            write_bridge_startup_timeout(tmp_path, 120.0)
+            marker_published = True
+        if waited_seconds >= 61.0:
+            _start_state(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _publish_marker_then_state)
+    events: list[Any] = []
+    async for event in executor.run_turn(
+        [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        [],
+        "",
+    ):
+        events.append(event)
+
+    assert 61.0 <= waited_seconds <= 61.25
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_honors_configured_command_wait_past_legacy_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A delayed wrapped launch can publish state after the legacy wait expires."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_startup_timeout(tmp_path, 120.0)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    waited_seconds = 0.0
+
+    async def _publish_after_legacy_deadline(seconds: float) -> None:
+        nonlocal waited_seconds
+        waited_seconds += seconds
+        if waited_seconds >= 61.0:
+            _start_state(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _publish_after_legacy_deadline)
+    events: list[Any] = []
+    async for event in executor.run_turn(
+        [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        [],
+        "",
+    ):
+        events.append(event)
+
+    assert 61.0 <= waited_seconds <= 61.25
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
 
 
 # ── MCP startup: no client-side gate + Stop cancel (issue #2058) ────────
@@ -1436,6 +1972,7 @@ def test_turn_start_is_not_gated_on_pending_mcp_startup(
 def test_turn_error_names_pending_mcp_servers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A turn failure during MCP startup names the still-pending servers.
@@ -1476,6 +2013,23 @@ def test_turn_error_names_pending_mcp_servers(
 
     assert [type(event) for event in events] == [ExecutorError]
     assert "MCP startup still waiting on storage-console" in events[0].message
+
+    from omnigent.debug_logging import record_to_row
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Codex native turn injection failed"
+    ]
+    assert len(records) == 1
+    row = record_to_row(records[0], source="runner")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert row["session_id"] == state.session_id
+    assert row["event_name"] == "codex_turn_injection_failed"
+    assert row["attributes"]["thread_id"] == state.thread_id
+    assert row["attributes"]["exception_type"] == "RuntimeError"
+    assert str(tmp_path) not in json.dumps(row["attributes"])
 
 
 def test_interrupt_with_active_turn_and_pending_mcp_stops_both(
@@ -1617,3 +2171,54 @@ def test_interrupt_tolerates_stale_active_turn_mismatch(
     assert _MismatchInterruptClient.requests == [
         ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_gone"}),
     ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id is None, (
+        f"the authoritatively superseded turn record must be cleared; bridge={state!r}"
+    )
+
+
+class _RefusedInterruptClient(_FakeCodexNativeClient):
+    """Reject a recorded-turn interrupt with an unrelated app-server error."""
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Reject a non-empty ``turn/interrupt``; defer to the base fake otherwise.
+
+        :param method: JSON-RPC method, e.g. ``"turn/interrupt"``.
+        :param params: JSON-RPC params.
+        :returns: Codex-shaped response payload.
+        """
+        if method == "turn/interrupt" and params.get("turnId"):
+            type(self).requests.append((method, params))
+            raise CodexAppServerResponseError({"code": -32600, "message": "thread not found"})
+        return await super().request(method, params)
+
+
+def test_interrupt_reraises_unrelated_rejections(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Only the superseded-turn mismatch is tolerated; other rejections raise.
+
+    A genuinely failed interrupt (any error other than "the recorded turn
+    is no longer the active one") must keep propagating so callers can
+    log and bound it — the tolerance must not become blanket swallowing.
+    """
+    _RefusedInterruptClient.requests = []
+    _RefusedInterruptClient.created = []
+    _RefusedInterruptClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _RefusedInterruptClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    with pytest.raises(CodexAppServerResponseError, match="thread not found"):
+        asyncio.run(executor.interrupt_session("key"))
+
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_active", (
+        f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
+    )

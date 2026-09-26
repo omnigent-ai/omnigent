@@ -7,6 +7,7 @@ import stat
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from omnigent.harnesses.pi_native import credentials as creds
@@ -152,6 +153,554 @@ def test_key_provider_resolves_to_inline_family() -> None:
     assert provider.api_key == "sk-test-literal"
     assert provider.auth_header is False
     assert provider.model == "claude-sonnet-4-6"
+
+
+def test_inline_databricks_gateway_enumerates_all_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inline gateway on a Databricks AI Gateway surfaces every family.
+
+    The web UI's credential flow writes a single-family ``openai-gateway`` when
+    the Databricks AI Gateway is entered for Codex, and pins it as Pi's default
+    when nothing else serves Pi. Pi must not be capped to that one family: the
+    gateway fronts a workspace serving Claude, GPT and Gemini, so the resolver
+    enumerates the workspace and exposes all of them — Claude on Pi's native
+    Anthropic surface, GPT/Gemini as additional providers — while the configured
+    default stays the launch model.
+    """
+    canned = (
+        [{"id": "system.ai.claude-opus-5"}],  # claude → anthropic surface
+        [{"id": "system.ai.gpt-5"}],  # gpt → responses surface
+        [],  # completions
+        [{"id": "system.ai.gemini-3-flash"}],  # gemini → mlflow surface
+    )
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda host, token: canned)
+    config = {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    # Claude on the native Anthropic surface — not a single-family OpenAI config.
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+    assert [m["id"] for m in provider.extra_models] == ["system.ai.claude-opus-5"]
+    # GPT and Gemini surface as additional providers (the openai-only bug hid these).
+    assert set(provider.additional_providers) == {"omnigent-openai", "omnigent-mlflow"}
+    # The configured default is still what Pi launches with, served by its surface.
+    assert provider.model == "system.ai.gpt-5"
+    rendered = provider.to_models_config()["providers"]
+    assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
+def _databricks_openai_gateway_config(**family_extra: object) -> dict[str, object]:
+    return {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5", **family_extra},
+                },
+            }
+        }
+    }
+
+
+def test_inline_databricks_gateway_keeps_configured_model_when_listing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed workspace listing keeps the configured model on its own surface.
+
+    A token without Unity Catalog access (or an unreachable workspace) must not
+    swap the working OpenAI config for a Claude default the gateway may reject.
+    """
+
+    def _boom(host: str, token: str):
+        raise RuntimeError("403 from unity-catalog/model-services")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _boom)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_openai_gateway_config)
+
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    assert provider.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1"
+    assert provider.model == "system.ai.gpt-5"
+    assert not provider.additional_providers
+
+
+def test_inline_databricks_gateway_respects_curated_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured multi-model tier map is a shortlist; it is not widened."""
+
+    def _unexpected(host: str, token: str):
+        raise AssertionError("a curated tier map must not trigger enumeration")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _unexpected)
+
+    provider = creds.resolve_pi_native_provider(
+        config_loader=lambda: _databricks_openai_gateway_config(mini="system.ai.gpt-5-mini")
+    )
+
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    assert provider.curated_models is True
+    assert [m["id"] for m in provider.extra_models] == ["system.ai.gpt-5", "system.ai.gpt-5-mini"]
+
+
+def test_inline_databricks_gateway_enumerates_only_the_selected_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Family priority is unchanged: a working first family is never overridden.
+
+    With no override the Anthropic family leads, so a vendor-direct Anthropic
+    key wins and the OpenAI family's Databricks gateway is never listed. A GPT
+    override selects the OpenAI family, and only then is the gateway enumerated.
+    """
+    listings: list[str] = []
+
+    def _listing(host: str, token: str):
+        listings.append(host)
+        return ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], [])
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
+    config = {
+        "providers": {
+            "mixed": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-ant",
+                    "models": {"default": "claude-opus-4-8"},
+                },
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    default = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert default is not None
+    assert default.base_url == "https://api.anthropic.com"
+    assert not default.additional_providers
+    assert listings == []
+
+    override = creds.resolve_pi_native_provider(
+        model="system.ai.gpt-5", config_loader=lambda: config
+    )
+    assert override is not None
+    assert override.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+    assert override.model == "system.ai.gpt-5"
+    assert "omnigent-openai" in override.additional_providers
+    assert listings == ["https://wkspc.cloud.databricks.com"]
+
+
+def test_inline_databricks_gateway_leaves_unused_family_secret_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later family's unset secret is not expanded when an earlier family wins."""
+    monkeypatch.delenv("OMNIGENT_TEST_UNSET_GATEWAY_KEY", raising=False)
+    config = {
+        "providers": {
+            "mixed": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-ant",
+                    "models": {"default": "claude-opus-4-8"},
+                },
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "$OMNIGENT_TEST_UNSET_GATEWAY_KEY",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.base_url == "https://api.anthropic.com"
+    assert provider.api_key == "sk-ant"
+
+
+def test_inline_databricks_gateway_mlflow_url_derives_surfaces_from_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An MLflow-surface input still puts Claude on ``/ai-gateway/anthropic``."""
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [],
+            [],
+            [{"id": "system.ai.gemini-3-flash"}],
+        ),
+    )
+    config = {
+        "providers": {
+            "oss-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "chat",
+                    "models": {"default": "system.ai.gemini-3-flash"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+    assert provider.model == "system.ai.gemini-3-flash"
+    rendered = provider.to_models_config()["providers"]
+    assert rendered["omnigent-mlflow"]["baseUrl"] == (
+        "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1"
+    )
+    assert [m["id"] for m in rendered["omnigent-mlflow"]["models"]] == ["system.ai.gemini-3-flash"]
+
+
+def test_inline_databricks_gateway_partial_listing_keeps_default_on_declared_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default the listing omits stays on its configured surface, not a guessed one."""
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_openai_gateway_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.gpt-5"
+    rendered = provider.to_models_config()["providers"]
+    assert "omnigent-mlflow" not in rendered
+    assert rendered["omnigent-openai"]["baseUrl"] == (
+        "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1"
+    )
+    assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
+@pytest.mark.parametrize("default_listed", [True, False], ids=["listed", "omitted"])
+def test_inline_databricks_gateway_keeps_configured_limits_on_default(
+    monkeypatch: pytest.MonkeyPatch, default_listed: bool
+) -> None:
+    """Explicit ``context_window`` / ``max_output_tokens`` survive enumeration.
+
+    They outrank the listing's metadata for the configured default, whether the
+    workspace listed that default or the default had to be registered on its
+    declared surface.
+    """
+    gpt = [{"id": "system.ai.gpt-5", "contextWindow": 128000, "maxTokens": 16384}]
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            gpt if default_listed else [],
+            [],
+            [],
+        ),
+    )
+    config = _databricks_openai_gateway_config()
+    config["providers"]["openai-gateway"]["openai"].update(
+        {"context_window": 1_000_000, "max_output_tokens": 8192}
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    rendered = provider.to_models_config()["providers"]
+    entry = next(m for m in rendered["omnigent-openai"]["models"] if m["id"] == "system.ai.gpt-5")
+    assert entry["contextWindow"] == 1_000_000
+    assert entry["maxTokens"] == 8192
+
+
+def test_inline_databricks_gateway_picking_omitted_default_keeps_its_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting the configured default from the picker launches on its declared surface.
+
+    With a partial listing the picker offers the omitted default under
+    ``omnigent-openai``; resolving that explicit selection must register it there
+    too, not on a surface guessed from its name.
+    """
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+    )
+    config = _databricks_openai_gateway_config()
+
+    options = creds.pi_native_model_options(config_loader=lambda: config)
+    option = next(o for o in options if o["id"] == "omnigent-openai/system.ai.gpt-5")
+
+    provider = creds.resolve_pi_native_provider(
+        model=option["model"], config_loader=lambda: config
+    )
+
+    assert provider is not None
+    assert provider.model == "system.ai.gpt-5"
+    rendered = provider.to_models_config()["providers"]
+    assert "omnigent-mlflow" not in rendered
+    assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
+def test_run_auth_command_uses_the_shell() -> None:
+    """An inline ``auth_command`` may use shell syntax; the listing token honors it."""
+    assert creds._run_auth_command("printf 'tok' | tr a-z A-Z") == "TOK"
+    assert creds._run_auth_command("exit 3") is None
+
+
+def test_run_auth_command_undecodable_output_is_a_failed_mint() -> None:
+    """Non-UTF-8 output is a failed token mint, not an exception for the caller."""
+    assert creds._run_auth_command("printf '\\xff\\xfe'") is None
+
+
+def test_inline_databricks_gateway_failed_token_mint_keeps_the_provider() -> None:
+    """A failing ``auth_command`` skips discovery but keeps the configured provider.
+
+    Pi must not lose its provider (and fall to its own login) because the
+    one-shot listing token could not be minted; the single-family config with
+    the ``!command`` apiKey still launches, and Pi retries the command itself.
+    """
+    config = {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "auth_command": "printf '\\xff\\xfe'",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    assert provider.model == "system.ai.gpt-5"
+    assert provider.api_key == "!printf '\\xff\\xfe'"
+    assert not provider.additional_providers
+
+
+def test_run_auth_command_timeout_kills_the_helper(tmp_path: Path) -> None:
+    """A helper that stalls past the timeout does not outlive the call."""
+    import shlex
+    import sys
+    import time
+
+    from omnigent.inner._proc import process_alive
+
+    pid_file = tmp_path / "helper.pid"
+    helper = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
+    command = shlex.join([sys.executable, "-c", helper, str(pid_file)])
+
+    assert creds._run_auth_command(command, timeout=1.0) is None
+
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while process_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not process_alive(pid)
+
+
+def test_inline_databricks_gateway_listed_default_follows_the_workspace_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default the workspace lists is served on the surface the listing reports.
+
+    The entry's declared surface is a fallback for a default the listing omits;
+    a listed model follows the workspace's own capability data, as on the
+    cli-config and databricks-kind paths. Here a GPT default configured on the
+    MLflow surface is listed as a Responses model and is registered there.
+    """
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [],
+        ),
+    )
+    config = {
+        "providers": {
+            "oss-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "chat",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.gpt-5"
+    rendered = provider.to_models_config()["providers"]
+    assert "omnigent-mlflow" not in rendered
+    assert rendered["omnigent-openai"]["baseUrl"] == (
+        "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1"
+    )
+    assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
+def test_inline_databricks_gateway_unlisted_override_is_routed_like_databricks_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the configured default carries the entry's declared surface.
+
+    Any other override the listing omits is routed exactly as the
+    databricks-kind path routes it: by the model's family classification.
+    """
+    from omnigent.models.pi_model_compatibility import databricks_pi_surface_for_model
+
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+    )
+    override = "system.ai.gpt-5-mini"
+    expected_provider = creds._SURFACE_PROVIDER_IDS[databricks_pi_surface_for_model(override)]
+
+    provider = creds.resolve_pi_native_provider(
+        model=override, config_loader=_databricks_openai_gateway_config
+    )
+
+    assert provider is not None
+    assert provider.model == override
+    rendered = provider.to_models_config()["providers"]
+    assert [m["id"] for m in rendered[expected_provider]["models"]] == [override]
+
+
+def test_inline_dedicated_gateway_host_stays_single_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dedicated ``ai-gateway`` host names no workspace, so nothing is enumerated."""
+
+    def _unexpected(host: str, token: str):
+        raise AssertionError("a dedicated gateway host must not trigger enumeration")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _unexpected)
+    config = {
+        "providers": {
+            "anthropic-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {
+                    "base_url": "https://123.ai-gateway.cloud.databricks.com/anthropic",
+                    "api_key": "gw-token",
+                    "models": {"default": "system.ai.claude-opus-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://123.ai-gateway.cloud.databricks.com/anthropic"
+    assert provider.model == "system.ai.claude-opus-5"
+    assert not provider.additional_providers
+
+
+def test_databricks_gateway_builder_derives_codex_surface_from_anthropic_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dedicated host's Anthropic URL yields ``/codex/v1``, not ``/anthropic/codex/v1``."""
+    monkeypatch.setattr(
+        creds, "_databricks_workspace_url_for_gateway", lambda url: "https://wkspc.example.com"
+    )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: "tok")
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [],
+        ),
+    )
+
+    provider = creds._databricks_gateway_pi_provider(
+        gateway_base_url="https://123.ai-gateway.cloud.databricks.com/anthropic",
+        model=None,
+        auth_command="print-token",
+    )
+
+    codex_url = "https://123.ai-gateway.cloud.databricks.com/codex/v1"
+    assert provider.base_url == "https://123.ai-gateway.cloud.databricks.com/anthropic"
+    assert provider.databricks_surfaces[creds.DatabricksPiSurface.RESPONSES] == codex_url
+    assert provider.additional_providers["omnigent-openai"]["baseUrl"] == codex_url
+
+
+def test_inline_non_databricks_gateway_stays_single_family() -> None:
+    """A non-Databricks gateway keeps single-family behavior (no enumeration)."""
+    config = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "responses",
+                    "models": {"default": "openai/gpt-4o"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+    assert provider.model == "openai/gpt-4o"
+    assert not provider.additional_providers
 
 
 def test_managed_picker_prefix_is_not_part_of_provider_model() -> None:
@@ -417,6 +966,86 @@ def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) ->
     ]
 
 
+@pytest.mark.parametrize(
+    ("listing", "selection", "expected_provider"),
+    [
+        # A pre-upgrade selection named the single-family primary; the workspace
+        # listing now serves the model from the Responses surface.
+        (
+            ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], []),
+            "omnigent/system.ai.gpt-5",
+            "omnigent-openai",
+        ),
+        # The picker offered the model on the Responses surface; discovery then
+        # failed at launch and the single-family fallback owns it again.
+        (None, "omnigent-openai/system.ai.gpt-5", "omnigent"),
+    ],
+    ids=["saved-primary-selection-after-discovery", "picker-selection-after-discovery-failure"],
+)
+def test_inline_databricks_gateway_selection_follows_the_model_across_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    listing: tuple[list, list, list, list] | None,
+    selection: str,
+    expected_provider: str,
+) -> None:
+    """A saved selection launches whichever provider serves its model now."""
+
+    def _fetch(host: str, token: str):
+        if listing is None:
+            raise RuntimeError("workspace listing unavailable")
+        return listing
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch)
+    config = _databricks_openai_gateway_config()
+
+    provider = creds.resolve_pi_native_provider(model=selection, config_loader=lambda: config)
+    assert provider is not None
+    _, args, _ = creds.pi_native_provider_launch(
+        tmp_path / "pi-agent", provider, selection=selection
+    )
+
+    assert args[:4] == ["--provider", expected_provider, "--model", "system.ai.gpt-5"]
+
+
+def test_inline_databricks_gateway_default_launches_with_thinking_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After enumeration the GPT default is gateway-routed, so effort is dropped with a notice.
+
+    The default now lives in the generated OpenAI provider rather than the
+    primary, so the launch takes the same gateway-routed branch as the
+    databricks-kind path: thinking off, and a warning when an effort was set.
+    """
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [],
+        ),
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_openai_gateway_config)
+    assert provider is not None
+    _, args, effort_warning = creds.pi_native_provider_launch(
+        tmp_path / "pi-agent", provider, reasoning_effort="high"
+    )
+
+    assert args == [
+        "--provider",
+        "omnigent-openai",
+        "--model",
+        "system.ai.gpt-5",
+        "--thinking",
+        "off",
+    ]
+    assert effort_warning is not None
+    assert "system.ai.gpt-5" in effort_warning
+
+
 def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path) -> None:
     """A stale picker value must not silently launch the provider default."""
     provider = creds.PiProviderConfig(
@@ -439,10 +1068,126 @@ def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path)
     assert not agent_dir.exists()
 
 
+def test_key_provider_model_options_list_the_live_anthropic_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key/gateway provider's picker rows come from its live model listing.
+
+    The pre-launch picker renders the resolved provider's ``models.json``;
+    for key/gateway providers that config carried only the configured
+    default (one row), so the picker offered exactly one model while the
+    endpoint serves several. The listing must be fetched live via the
+    model-catalog fetchers — the same lane the Databricks paths use — with
+    the configured default still present (it launches offline).
+    """
+    config = {
+        "providers": {
+            "zai": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://gw.example.com/anthropic",
+                    "api_key": "sk-test-literal",
+                    "models": {"default": "glm-5.3"},
+                },
+            }
+        }
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "glm-5.3"}, {"id": "glm-5.3-flash"}, {"id": "glm-5.2"}]},
+        )
+
+    options = creds.pi_native_model_options(
+        config_loader=lambda: config, transport=httpx.MockTransport(_handler)
+    )
+
+    assert {o["model"] for o in options} == {
+        "omnigent/glm-5.3",
+        "omnigent/glm-5.3-flash",
+        "omnigent/glm-5.2",
+    }
+
+
+def test_key_provider_model_options_list_the_live_openai_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An openai-family key/gateway provider lists its /v1/models rows too."""
+    config = {
+        "providers": {
+            "deepseek": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://gw.example.com/v1",
+                    "api_key": "sk-test-literal",
+                    "wire_api": "chat",
+                    "models": {"default": "deepseek-flash"},
+                },
+            }
+        }
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]},
+        )
+
+    options = creds.pi_native_model_options(
+        config_loader=lambda: config, transport=httpx.MockTransport(_handler)
+    )
+
+    assert {o["model"] for o in options} == {
+        "omnigent/deepseek-flash",
+        "omnigent/deepseek-v4-pro",
+    }
+
+
+def test_key_provider_model_options_degrade_to_default_when_listing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable listing endpoint degrades to the configured default.
+
+    The launch picker must not hard-fail when the vendor's /models endpoint
+    is offline or rejects the key: the configured default model still
+    launches, exactly as it did before live listing existed.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "bad key"})
+
+    config = {
+        "providers": {
+            "zai": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://gw.example.com/anthropic",
+                    "api_key": "sk-test-literal",
+                    "models": {"default": "glm-5.3"},
+                },
+            }
+        }
+    }
+
+    options = creds.pi_native_model_options(
+        config_loader=lambda: config, transport=httpx.MockTransport(_handler)
+    )
+
+    assert {o["model"] for o in options} == {"omnigent/glm-5.3"}
+
+
 def test_pi_native_model_options_lists_only_managed_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pre-launch choices come only from the provider built by ``omni setup``."""
+    """Pre-launch choices come only from the provider built by ``omni setup``.
+
+    The configured model is the one Pi opens without a selection, so its row
+    alone is the default.
+    """
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://api.anthropic.com",
@@ -466,13 +1211,45 @@ def test_pi_native_model_options_lists_only_managed_models(
             "id": "omnigent-openai/gpt-5.6-sol",
             "model": "omnigent-openai/gpt-5.6-sol",
             "displayName": "GPT 5.6 Sol",
+            "isDefault": False,
         },
         {
             "id": "omnigent/claude-sonnet-4-6",
             "model": "omnigent/claude-sonnet-4-6",
             "displayName": "claude-sonnet-4-6",
+            "isDefault": True,
         },
     ]
+
+
+def test_pi_native_model_options_default_row_is_the_no_selection_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exactly one row is the default: the model a launch without a selection opens.
+
+    After enumeration the configured GPT default lives in the generated OpenAI
+    provider, so the default row must follow it there instead of naming the
+    primary provider, and it must agree with the launch's ``--provider``.
+    """
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [],
+        ),
+    )
+    config = _databricks_openai_gateway_config()
+
+    options = creds.pi_native_model_options(config_loader=lambda: config)
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    _, args, _ = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
+
+    assert [o["id"] for o in options if o["isDefault"]] == ["omnigent-openai/system.ai.gpt-5"]
+    assert args[:4] == ["--provider", "omnigent-openai", "--model", "system.ai.gpt-5"]
 
 
 def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2720,3 +3497,316 @@ def test_connect_broker_skipped_without_sidecar(monkeypatch: pytest.MonkeyPatch)
         "omnigent.host.databricks_credential.broker_token_command", lambda host, *a, **k: None
     )
     assert creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}}) is None
+
+
+def test_inline_family_registers_curated_shortlist_as_extra_models() -> None:
+    """The family's ``models:`` tier map registers as Pi ``extra_models``.
+
+    Pi then shows exactly the deployment's curated, verified set in /model
+    (verified empirically: Pi lists only the models its models.json
+    declares), instead of just the launch model. Duplicate ids collapse to
+    their first occurrence; the selected model is not registered twice.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "GLM-5.3-Flash",
+                        "opus": "GLM-5.3",
+                        "fable": "claude-fable-5",
+                        "pro": "deepseek-v4-pro",
+                        "sonnet": "GLM-5.3-Flash",  # duplicate id of the default
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+
+    extra_ids = [entry["id"] for entry in provider.extra_models]
+    assert extra_ids == ["GLM-5.3-Flash", "GLM-5.3", "claude-fable-5", "deepseek-v4-pro"]
+    by_id = {entry["id"]: entry for entry in provider.extra_models}
+    # The gateway entry builder flags reasoning for DeepSeek (reasoning
+    # channel) and for Claude (thinking-level controls) on every surface;
+    # GLM gets neither.
+    assert by_id["deepseek-v4-pro"].get("reasoning") is True
+    assert by_id["claude-fable-5"].get("reasoning") is True
+    assert "reasoning" not in by_id["GLM-5.3"]
+
+    # The rendered models.json registers the shortlist alongside the launch
+    # model, each exactly once (the launch model is not re-appended).
+    rendered = provider.to_models_config()
+    registered = rendered["providers"][provider.provider_id]["models"]
+    assert [entry["id"] for entry in registered] == [
+        "GLM-5.3-Flash",
+        "GLM-5.3",
+        "claude-fable-5",
+        "deepseek-v4-pro",
+    ]
+
+
+def test_inline_family_without_models_map_registers_only_the_launch_model() -> None:
+    """No ``models:`` map → no shortlist, behaviour unchanged."""
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(model="glm-5.3", config_loader=lambda: config)
+    assert provider is not None
+    assert [entry["id"] for entry in provider.extra_models] == ["glm-5.3"]
+
+
+def test_curated_tier_ids_strip_bracket_suffixes() -> None:
+    """Tier ids get the same bracket-suffix strip as the selected model.
+
+    A ``[1m]``-style operator id renders (and scopes) as the bare gateway
+    model id; a suffixed duplicate of the launch model collapses into the
+    launch model's existing entry.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "GLM-5.3-Flash",
+                        "opus": "GLM-5.3[16m]",
+                        "sonnet": "GLM-5.3-Flash[16m]",  # same stripped id as default
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3-Flash", "GLM-5.3"]
+
+
+def test_provider_launch_scopes_picker_via_enabled_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The managed settings.json scopes the picker to the rendered catalog.
+
+    Provider-qualified refs distinguish managed models from built-in entries.
+    Users can still toggle the picker back to the full catalog.
+    """
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "global-agent"
+    )
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        extra_models=[{"id": "GLM-5.3-Flash"}, {"id": "claude-fable-5"}],
+        curated_models=True,
+    )
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider)
+
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings["enabledModels"] == [
+        "omnigent/GLM-5.3-Flash",
+        "omnigent/claude-fable-5",
+        "omnigent/claude-sonnet-4-6",
+    ]
+    assert settings["defaultThinkingLevel"] is None
+
+
+@pytest.mark.parametrize("kind", ["key", "gateway"])
+@pytest.mark.parametrize("duplicate_tiers", [False, True])
+@pytest.mark.parametrize("override", [None, "gpt-4.1"])
+@pytest.mark.parametrize("prior_scope", [None, ["openai/gpt-5", "anthropic/claude-sonnet-4-6"]])
+def test_setup_single_model_preserves_picker_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    duplicate_tiers: bool,
+    override: str | None,
+    prior_scope: list[str] | None,
+) -> None:
+    """Selecting a default in setup must not replace existing Pi picker preferences."""
+    from omnigent.inner import pi_settings
+    from omnigent.onboarding.configure_models import (
+        build_gateway_provider_entry,
+        build_key_provider_entry,
+    )
+
+    monkeypatch.setenv("PI_TEST_API_KEY", "fake-key")
+    if kind == "key":
+        entry = build_key_provider_entry(
+            "openai", "https://api.openai.com/v1", "env:PI_TEST_API_KEY", "gpt-5"
+        )
+    else:
+        entry = build_gateway_provider_entry(
+            "https://gateway.example/v1",
+            "env:PI_TEST_API_KEY",
+            families=["openai"],
+            models={"openai": "gpt-5"},
+        )
+    entry["default"] = True
+    if duplicate_tiers:
+        family = entry["openai"]
+        assert isinstance(family, dict)
+        family["models"] = {"default": "preferred", "preferred": "gpt-5", "fast": "gpt-5"}
+    config = {"providers": {"configured": entry}}
+
+    global_dir = tmp_path / "global-agent"
+    global_dir.mkdir()
+    global_settings: dict[str, object] = {"theme": "light"}
+    if prior_scope is not None:
+        global_settings["enabledModels"] = prior_scope
+    global_file = global_dir / "settings.json"
+    global_file.write_text(json.dumps(global_settings), encoding="utf-8")
+    monkeypatch.setattr(pi_settings, "DEFAULT_PI_AGENT_DIR", global_dir)
+
+    provider = creds.resolve_pi_native_provider(model=override, config_loader=lambda: config)
+    assert provider is not None
+    assert [model["id"] for model in provider.extra_models] == [override or "gpt-5"]
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider)
+
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    if prior_scope is None:
+        assert "enabledModels" not in settings
+    else:
+        assert settings["enabledModels"] == prior_scope
+    assert settings["theme"] == "light"
+    assert settings["defaultThinkingLevel"] is None
+    assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
+
+
+@pytest.mark.parametrize("catalog", ["single", "multi_model", "multi_provider"])
+@pytest.mark.parametrize("prior_scope", [None, ["anthropic/claude-sonnet-4-6"]])
+def test_provider_launch_without_curated_set_does_not_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog: str,
+    prior_scope: list[str] | None,
+) -> None:
+    """Discovered catalogs preserve picker preferences regardless of model count."""
+    global_dir = tmp_path / "global-agent"
+    global_dir.mkdir()
+    global_settings = {"enabledModels": prior_scope} if prior_scope is not None else {}
+    global_file = global_dir / "settings.json"
+    global_file.write_text(json.dumps(global_settings), encoding="utf-8")
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://gateway.example/anthropic",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        extra_models=[{"id": "claude-opus-4-7"}] if catalog == "multi_model" else [],
+        additional_providers={
+            "omnigent-openai": {
+                "baseUrl": "https://gateway.example/codex/v1",
+                "apiKey": "synthetic-api-key",
+                "api": "openai-responses",
+                "models": [{"id": "gpt-5"}],
+            }
+        }
+        if catalog == "multi_provider"
+        else {},
+    )
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider)
+
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    if prior_scope is None:
+        assert "enabledModels" not in settings
+    else:
+        assert settings["enabledModels"] == prior_scope
+    assert settings["defaultThinkingLevel"] is None
+    assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
+
+
+def test_curated_tier_alias_resolves_to_concrete_id() -> None:
+    """A tier value naming another tier resolves to the concrete id.
+
+    Deployments alias tier names to ids (``deepseek-pro: deepseek-v4-pro``)
+    and reference the alias from elsewhere (``default: deepseek-pro``). The
+    alias must reach neither the launch model nor the picker's shortlist —
+    the gateway serves the id, not the tier name.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "deepseek-pro",  # aliases the tier below
+                        "deepseek-pro": "deepseek-v4-pro",
+                        "glm": "GLM-5.3",
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    # The launch model is the id, not the alias ...
+    assert provider.model == "deepseek-v4-pro"
+    # ... and the alias never renders as a picker row of its own.
+    assert [entry["id"] for entry in provider.extra_models] == [
+        "deepseek-v4-pro",
+        "GLM-5.3",
+    ]
+
+
+def test_curated_tier_alias_resolves_before_bracket_strip() -> None:
+    """An aliased tier resolves first, then gets the bracket-suffix strip.
+
+    The alias key is matched against the raw map, so a bracketed target
+    still collapses to its bare gateway id instead of rendering (or
+    launching) with the suffix.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "long-context",  # aliases the tier below
+                        "long-context": "GLM-5.3[16m]",
+                        "glm": "GLM-5.3-Flash",
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert provider.model == "GLM-5.3"
+    assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3", "GLM-5.3-Flash"]

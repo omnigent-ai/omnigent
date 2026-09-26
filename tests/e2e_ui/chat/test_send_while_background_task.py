@@ -31,60 +31,20 @@ turn whose timing would make the assertions flaky.
 
 from __future__ import annotations
 
-import httpx
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.chat.test_working_indicator_background_tasks import (
+    _MONITOR_TASK,
+    _pill_badge,
+    _publish_status,
+)
 
 _QUEUED_STRIP = '[data-testid="composer-queued-strip"]'
-_PILL = '[data-testid="background-task-pill"]'
 _COMPOSER_PLACEHOLDER_IDLE = "Send a message…"
-
-
-def _pill_badge(page: Page, count: int) -> Locator:
-    """Locate the compact count badge by its accessible name.
-
-    The badge renders only the bare count as visible text; the sentence form
-    ("N background task(s) still running") is its accessible name.
-    """
-    plural = "" if count == 1 else "s"
-    return page.get_by_role(
-        "button", name=f"{count} background task{plural} still running", exact=True
-    )
 
 
 _SEND_MSG = "sentinel-bg-send-2a9c sent while a background task runs"
 _RELOAD_SEND_MSG = "sentinel-bg-send-7f31 sent after reopening the session"
-
-
-def _publish_status(
-    base_url: str,
-    session_id: str,
-    status: str,
-    *,
-    response_id: str | None = None,
-    background_task_count: int | None = None,
-) -> None:
-    """Publish a session status through the native-harness events route.
-
-    :param base_url: Base URL of the local e2e server.
-    :param session_id: Session/conversation id.
-    :param status: Session status to publish, e.g. ``"waiting"``.
-    :param response_id: Ended turn's response id, as the native Stop hook
-        attaches it. ``None`` omits the field.
-    :param background_task_count: Background shells still running as of this
-        edge. ``None`` omits the field (leaves the sticky tally untouched).
-    :returns: None.
-    """
-    data: dict[str, object] = {"status": status}
-    if response_id is not None:
-        data["response_id"] = response_id
-    if background_task_count is not None:
-        data["background_task_count"] = background_task_count
-    resp = httpx.post(
-        f"{base_url}/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": data},
-        timeout=10.0,
-    )
-    resp.raise_for_status()
 
 
 def _user_bubble(page: Page, text: str):
@@ -114,16 +74,14 @@ def test_message_sends_directly_while_background_task_runs(
     page.goto(f"{base_url}/c/{session_id}")
     expect(composer).to_be_visible()
 
-    # The turn ended but a background shell outlives it: the Stop hook posts
-    # `waiting` with the ended turn's response_id and a positive count. The
-    # composer's badge counts the shell (accessible name "1 background task
-    # still running", visible text "1").
+    # A monitor outlives the turn, but does not make the composer busy.
     _publish_status(
         base_url,
         session_id,
         "waiting",
         response_id="resp_bg_1",
         background_task_count=1,
+        background_tasks=[_MONITOR_TASK],
     )
     expect(_pill_badge(page, 1)).to_have_text("1", timeout=15_000)
 
@@ -165,14 +123,14 @@ def test_message_sends_directly_after_reopening_with_background_task(
         "waiting",
         response_id="resp_bg_2",
         background_task_count=1,
+        background_tasks=[_MONITOR_TASK],
     )
 
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible()
-    # The shells are still reported (the tally rides the snapshot) …
     expect(_pill_badge(page, 1)).to_have_text("1", timeout=15_000)
-    # … but the turn is over, so the composer is free.
+    # The turn is over, so the composer is free.
     expect(composer).to_have_attribute("placeholder", _COMPOSER_PLACEHOLDER_IDLE, timeout=15_000)
 
     composer.fill(_RELOAD_SEND_MSG)

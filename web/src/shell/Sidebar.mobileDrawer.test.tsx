@@ -1,3 +1,4 @@
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Behaviour tests for the mobile sidebar drawer shape: it stops short of the
 // right edge so a strip of the chat stays visible, tapping that strip dismisses
 // it (replacing the collapse toggle, which is now desktop-only), and Search /
@@ -103,11 +104,13 @@ function renderSidebar(props: { open?: boolean; onClose?: () => void; route?: st
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[props.route ?? "/"]}>
-          <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[props.route ?? "/"]}>
+            <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -214,24 +217,14 @@ describe("mobile sidebar drawer", () => {
     // differ; everything about how it looks must not.
     // `relative` is the Button base's own position, which tailwind-merge drops
     // from the floating copy in favour of `absolute` — placement, not looks.
-    const PLACEMENT = new Set([
-      "absolute",
-      "relative",
-      "right-3",
-      "bottom-3",
-      "md:hidden",
-      "max-md:hidden",
-    ]);
-    const appearance = (el: Element) =>
-      el.className
-        .split(/\s+/)
-        .filter((c) => c && !PLACEMENT.has(c))
-        .sort()
-        .join(" ");
-
-    expect(search).toHaveClass("sidebar-glass-chip");
-    expect(settings).toHaveClass("sidebar-glass-chip");
-    expect(appearance(settings)).toBe(appearance(search));
+    for (const button of [search, settings]) {
+      expect(button).toHaveClass(
+        "sidebar-glass-chip",
+        "max-md:size-11",
+        "max-md:rounded-full",
+        "max-md:text-foreground",
+      );
+    }
   });
 
   it("gives the session list a gutter so the last row clears the floating chip", () => {

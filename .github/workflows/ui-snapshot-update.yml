@@ -94,7 +94,7 @@ jobs:
           standalone: true
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -125,11 +125,13 @@ jobs:
         # baselines that already pass. Under GitHub Actions, plain compare mode
         # updates only drifting/missing PNGs in place. The first run may therefore
         # fail by design. The second must pass, distinguishing expected baseline
-        # updates from Storybook/index/server/render failures.
+        # updates from Storybook/index/server/render failures. The first run
+        # allows size drift so a story whose captured surface changed size is
+        # rewritten in place too, instead of aborting on the size check.
         run: |
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures \
+            -p no:rerunfailures --ignore-size-diff \
             --ui-skip-build || true
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \

@@ -14,6 +14,9 @@ def test_composer_pill_highlighted_label_is_clickable(
     """The model label shares the trigger's hover paint and click target."""
     base_url, session_id = seeded_session
     _patch_session_as_claude_native(page, session_id)
+    # Wide enough for the model label to show beside the sidebar and workspace
+    # rail; narrower columns collapse it to the harness icon.
+    page.set_viewport_size({"width": 1800, "height": 900})
     try:
         page.goto(f"{base_url}/c/{session_id}")
         trigger = page.get_by_test_id("composer-config-gear")

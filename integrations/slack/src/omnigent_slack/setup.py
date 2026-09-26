@@ -104,11 +104,18 @@ class SetupFlow:
         server_url: str,
         auth_manager: AuthManager | None = None,
         enrollment_url: Callable[[str, str, str, str], str | None] | None = None,
+        default_agent_id: str | None = None,
+        default_host_type: str | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
         self._server_url = server_url
         self._auth = auth_manager
+        # Operator-set picker defaults (unset = today's blank picker). They are
+        # only ever pre-selections: applied against what this user is actually
+        # offered, and never substituted for something else if unavailable.
+        self._default_agent_id = default_agent_id
+        self._default_host_type = default_host_type
         # In Databricks web-auth mode, returns the signed enrollment link for a
         # (team, user, email) or ``None`` if the web server isn't configured.
         # ``None`` here means the historical device-grant / OIDC-ticket login
@@ -393,9 +400,18 @@ class SetupFlow:
             if validated.online_hosts
             else None
         )
+        # Resolved here, against the listing fetched as this authenticated user,
+        # so an operator default is only pre-selected when it is genuinely on
+        # offer. The submit handler stays network-free.
         await ack(
             response_action="update",
-            view=select_modal(server_url, validated, workspace_default=workspace_default),
+            view=select_modal(
+                server_url,
+                validated,
+                workspace_default=workspace_default,
+                default_agent_id=self._default_agent_id,
+                default_host_type=self._default_host_type,
+            ),
         )
 
     async def _revalidate_and_advance(
@@ -1007,38 +1023,99 @@ def select_modal(
     server_url: str,
     validated: ValidatedServer,
     workspace_default: str | None = None,
+    *,
+    default_agent_id: str | None = None,
+    default_host_type: str | None = None,
 ) -> dict[str, Any]:
+    """Build the agent/host/workspace picker.
+
+    ``default_agent_id`` / ``default_host_type`` are the operator's optional
+    pre-selections. Each is applied only when it names an option this user is
+    actually being offered; an unavailable one leaves its menu blank and adds a
+    note saying so, rather than quietly selecting something else. Unset (the
+    normal case) renders exactly the picker this always rendered.
+    """
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"Connected to *{server_url}*."},
         },
+    ]
+    agent_options = _agent_options(validated.agents)
+    agent_initial = _option_with_value(agent_options, default_agent_id)
+    agent_element: dict[str, Any] = {
+        "type": "static_select",
+        "action_id": AGENT_ACTION,
+        "placeholder": {"type": "plain_text", "text": "Choose an agent"},
+        "options": agent_options,
+    }
+    if agent_initial is not None:
+        agent_element["initial_option"] = agent_initial
+    blocks.append(
         {
             "type": "input",
             "block_id": AGENT_BLOCK,
             "label": {"type": "plain_text", "text": "Agent"},
-            "element": {
-                "type": "static_select",
-                "action_id": AGENT_ACTION,
-                "placeholder": {"type": "plain_text", "text": "Choose an agent"},
-                "options": _agent_options(validated.agents),
-            },
-        },
-    ]
+            "element": agent_element,
+        }
+    )
+    if default_agent_id and agent_initial is None:
+        # "not in this menu", not "not on this server": an agent past the option
+        # cap exists and is usable, it just didn't fit — so name that when it is
+        # what happened, and never claim more than the menu can tell us.
+        why = (
+            f", which lists only the first {_MAX_SELECT_OPTIONS} of {len(validated.agents)} agents"
+            if len(validated.agents) > _MAX_SELECT_OPTIONS
+            else ""
+        )
+        blocks.append(
+            _unavailable_default_block(
+                "Your Omnigent operator's default agent "
+                f"(`{truncate_option(default_agent_id)}`) isn't available in this "
+                f"menu{why} — pick one above."
+            )
+        )
+
     host_options = _host_options(validated)
+    # Only the managed sandbox is defaultable, so the sentinel is the whole
+    # lookup; ``_host_options`` omits it when the server provisions none, which
+    # is exactly the "configured default unavailable" case.
+    host_initial = (
+        _option_with_value(host_options, MANAGED_HOST_VALUE)
+        if default_host_type == "managed"
+        else None
+    )
+    host_element: dict[str, Any] = {
+        "type": "static_select",
+        "action_id": HOST_ACTION,
+        "placeholder": {"type": "plain_text", "text": "Choose a host"},
+        "options": host_options,
+    }
+    if host_initial is not None:
+        host_element["initial_option"] = host_initial
     blocks.append(
         {
             "type": "input",
             "block_id": HOST_BLOCK,
             "label": {"type": "plain_text", "text": "Host"},
-            "element": {
-                "type": "static_select",
-                "action_id": HOST_ACTION,
-                "placeholder": {"type": "plain_text", "text": "Choose a host"},
-                "options": host_options,
-            },
+            "element": host_element,
         }
     )
+    if default_host_type == "managed" and host_initial is None:
+        # A capability probe that could not be READ is not a server that answered
+        # "no" — withhold the option either way, but never report the failure to
+        # ask as a finding about the operator's server.
+        blocks.append(
+            _unavailable_default_block(
+                "Your Omnigent operator's default host is a managed sandbox, but "
+                + (
+                    "this server doesn't provision one"
+                    if validated.managed_support_known
+                    else "whether this server provisions one couldn't be checked just now"
+                )
+                + " — pick a host above."
+            )
+        )
     workspace_element: dict[str, Any] = {
         "type": "plain_text_input",
         "action_id": WORKSPACE_ACTION,
@@ -1125,6 +1202,23 @@ def managed_host_label(provider: str | None) -> str:
 
 def _option(text: str, value: str) -> dict[str, Any]:
     return {"text": {"type": "plain_text", "text": text}, "value": value}
+
+
+def _option_with_value(options: list[dict[str, Any]], value: str | None) -> dict[str, Any] | None:
+    """Return the offered option carrying ``value``, or ``None`` if there is none.
+
+    Slack rejects an ``initial_option`` that isn't one of the menu's own
+    options, so the pre-selection is looked up in the built list (identity
+    included) rather than constructed from the configured value.
+    """
+    if not value:
+        return None
+    return next((option for option in options if option.get("value") == value), None)
+
+
+def _unavailable_default_block(text: str) -> dict[str, Any]:
+    """Context note under a picker whose configured default can't be offered."""
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": f":warning: {text}"}]}
 
 
 def _input_value(view: dict[str, Any], block_id: str, action_id: str) -> str:

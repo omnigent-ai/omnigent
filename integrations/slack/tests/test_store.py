@@ -143,3 +143,72 @@ async def test_store_unclaim_event_allows_reclaim(tmp_path: Path) -> None:
     # A no-op without an id, and harmless on an unknown id.
     await store.unclaim_event(None)
     await store.unclaim_event("never-seen")
+
+
+async def test_store_turn_inflight_marker_survives_reopen(tmp_path: Path) -> None:
+    # The marker is what tells a RESTARTED process that a turn was abandoned
+    # mid-stream, so it must persist across closing and reopening the database.
+    path = tmp_path / "store.sqlite3"
+    store = SQLiteStore(path)
+    await store.initialize()
+
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_1", "t", owner_user_id="U1")
+    record = await store.get_session(key)
+    assert record is not None and record.turn_inflight is False
+
+    await store.set_turn_inflight(key, True)
+
+    reopened = SQLiteStore(path)
+    await reopened.initialize()
+    record = await reopened.get_session(key)
+    assert record is not None and record.turn_inflight is True
+
+    await reopened.set_turn_inflight(key, False)
+    record = await reopened.get_session(key)
+    assert record is not None and record.turn_inflight is False
+
+
+async def test_store_adds_turn_inflight_to_a_pre_existing_database(tmp_path: Path) -> None:
+    # A store written before turn_inflight existed keeps the old table shape;
+    # initialize() must add the column in place, reading existing rows as False
+    # (no abandoned turn) and accepting marker writes afterwards.
+    path = tmp_path / "store.sqlite3"
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """
+            CREATE TABLE thread_sessions (
+                team_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                thread_ts TEXT NOT NULL,
+                omnigent_session_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                owner_user_id TEXT,
+                host_id TEXT,
+                workspace TEXT,
+                host_type TEXT NOT NULL DEFAULT 'external',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (team_id, channel_id, thread_ts)
+            )
+            """
+        )
+        await db.execute(
+            "INSERT INTO thread_sessions VALUES "
+            "('T1','C1','100.1','conv_1','t','U1',NULL,NULL,'external',1,1)"
+        )
+        await db.commit()
+
+    store = SQLiteStore(path)
+    await store.initialize()
+
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    record = await store.get_session(key)
+    assert record is not None
+    assert record.turn_inflight is False
+
+    await store.set_turn_inflight(key, True)
+    record = await store.get_session(key)
+    assert record is not None and record.turn_inflight is True
+    # Idempotent: a second initialize on the upgraded file must not fail.
+    await store.initialize()
