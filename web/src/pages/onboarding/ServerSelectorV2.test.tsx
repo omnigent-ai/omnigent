@@ -115,4 +115,45 @@ describe("ServerSelectorV2", () => {
     );
     expect(onSwitchToLegacy).toHaveBeenCalledOnce();
   });
+
+  it("disables 'Switch to legacy' when the selector is env-forced", () => {
+    const onSwitchToLegacy = vi.fn();
+    render(
+      <ServerSelectorV2 setup={makeSetup({ onSwitchToLegacy, switchToLegacyDisabled: true })} />,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
+      button: 0,
+    });
+    const item = screen.getByRole("menuitem", { name: /switch to legacy selector experience/i });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(item);
+    expect(onSwitchToLegacy).not.toHaveBeenCalled();
+  });
+
+  it("sets a real color scheme from the Appearance radios", () => {
+    const onSetColorScheme = vi.fn();
+    render(<ServerSelectorV2 setup={makeSetup({ onSetColorScheme })} />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Dark" }));
+    expect(onSetColorScheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("seeds the Appearance radio from the shell's current scheme", () => {
+    // Returning to setup after the app set Dark: the radio reflects Dark, not
+    // the "system" default.
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({ onSetColorScheme: vi.fn(), initialColorScheme: "dark" })}
+      />,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitemradio", { name: "Dark" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
 });

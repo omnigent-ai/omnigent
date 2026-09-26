@@ -98,5 +98,14 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
     },
     onCloudSetup: () => log("onCloudSetup"),
     onSwitchToLegacy: () => log("onSwitchToLegacy"),
+    // Browser mock: apply the scheme with the .dark class so the toggle is
+    // visibly real in the vite preview (the real shell drives nativeTheme).
+    onSetColorScheme: (scheme) => {
+      log("onSetColorScheme", scheme);
+      const root = document.documentElement;
+      if (scheme === "dark") root.classList.add("dark");
+      else if (scheme === "light") root.classList.remove("dark");
+      else root.classList.toggle("dark", window.matchMedia("(prefers-color-scheme: dark)").matches);
+    },
   };
 }
