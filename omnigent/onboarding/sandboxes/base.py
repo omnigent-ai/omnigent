@@ -740,7 +740,7 @@ def supervise_host_command(command: str) -> str:
     not just the host — otherwise the loop faithfully restarts it. Both in-sandbox
     stop paths already do: ``foreground_kill_command`` signals the process the
     pidfile recorded (the supervisor, which is what ``exec``s under it), and
-    islo's preserved-daemon stop matches ``"omnigent host"`` against full argv,
+    the preserved-daemon stop matches ``"omnigent host"`` against full argv,
     which the supervisor's own ``sh -c <script>`` argv contains.
 
     The attempt counter in the restart log makes a persistently-crashing host
@@ -962,6 +962,57 @@ class SandboxHostLauncher(SandboxLifecycle):
         """
 
 
+_STOP_PRESERVED_HOST_DAEMON_SCRIPT = """\
+import os, signal, subprocess, time
+
+self_pids = {os.getpid(), os.getppid()}
+try:
+    output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
+except Exception as exc:
+    print(f"could not inspect process table: {exc}")
+    raise SystemExit(0)
+
+targets = []
+for line in output.splitlines():
+    parts = line.strip().split(None, 1)
+    if len(parts) != 2:
+        continue
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        continue
+    args = parts[1]
+    if pid in self_pids:
+        continue
+    if "omnigent host" in args:
+        targets.append(pid)
+
+for pid in targets:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        print(f"could not terminate preserved omnigent host pid {pid}: {exc}")
+
+time.sleep(0.5)
+for pid in targets:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        continue
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+if targets:
+    print(f"stopped preserved omnigent host daemon(s): {', '.join(map(str, targets))}")
+"""
+
+
 class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
     """
     Default exec-model host launcher for providers that exec into a running
@@ -1060,6 +1111,23 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
         )
         return workspace
+
+    def _stop_preserved_host_daemon(self, sandbox_id: str) -> None:
+        """
+        Best-effort cleanup for providers whose pause/resume preserves memory.
+
+        A paused VM can resume with the old ``omnigent host`` process still
+        alive and carrying a stale launch token. Stop it before the shared
+        startup path launches a fresh daemon.
+        """
+        try:
+            self.run(
+                sandbox_id,
+                f"python3 -c {shlex.quote(_STOP_PRESERVED_HOST_DAEMON_SCRIPT)}",
+                check=False,
+            )
+        except click.ClickException as exc:
+            click.echo(f"  → warning: could not stop preserved omnigent host: {exc}", err=True)
 
     def materialize_workspace(
         self,

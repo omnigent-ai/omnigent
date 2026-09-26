@@ -99,56 +99,6 @@ if isinstance(settings, dict) and settings.pop("apiKeyHelper", None) is not None
         json.dump(settings, handle, indent=2)
 """
 
-_STOP_PRESERVED_HOST_DAEMON_SCRIPT = """\
-import os, signal, subprocess, time
-
-self_pids = {os.getpid(), os.getppid()}
-try:
-    output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
-except Exception as exc:
-    print(f"could not inspect process table: {exc}")
-    raise SystemExit(0)
-
-targets = []
-for line in output.splitlines():
-    parts = line.strip().split(None, 1)
-    if len(parts) != 2:
-        continue
-    try:
-        pid = int(parts[0])
-    except ValueError:
-        continue
-    args = parts[1]
-    if pid in self_pids:
-        continue
-    if "omnigent host" in args:
-        targets.append(pid)
-
-for pid in targets:
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except PermissionError as exc:
-        print(f"could not terminate preserved omnigent host pid {pid}: {exc}")
-
-time.sleep(0.5)
-for pid in targets:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        continue
-    except PermissionError:
-        continue
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-if targets:
-    print(f"stopped preserved omnigent host daemon(s): {', '.join(map(str, targets))}")
-"""
-
 
 class _IsloAPIError(RuntimeError):
     """Provider-boundary error with a user-facing message."""
@@ -561,23 +511,6 @@ class IsloSandboxLauncher(SandboxLauncher):
             host_config=host_config,
             on_stage=on_stage,
         )
-
-    def _stop_preserved_host_daemon(self, sandbox_id: str) -> None:
-        """
-        Best-effort cleanup for Islo's memory-preserving pause/resume.
-
-        A paused VM can resume with the old ``omnigent host`` process still
-        alive and carrying a stale launch token. Stop it before the shared
-        startup path launches a fresh daemon.
-        """
-        try:
-            self.run(
-                sandbox_id,
-                f"python3 -c {shlex.quote(_STOP_PRESERVED_HOST_DAEMON_SCRIPT)}",
-                check=False,
-            )
-        except click.ClickException as exc:
-            click.echo(f"  → warning: could not stop preserved omnigent host: {exc}", err=True)
 
     def attach(self, sandbox_id: str) -> None:
         """Validate access to an existing Islo sandbox."""
