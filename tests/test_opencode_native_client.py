@@ -243,30 +243,6 @@ async def test_list_models() -> None:
     await client.aclose()
 
 
-async def test_prompt_async_posts_parts() -> None:
-    captured: dict[str, object] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/session/ses_1/prompt_async"
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={})
-
-    client = _client(handler)
-    await client.prompt_async("ses_1", {"parts": [{"type": "text", "text": "hi"}]})
-    assert captured["body"] == {"parts": [{"type": "text", "text": "hi"}]}
-    await client.aclose()
-
-
-async def test_abort_returns_bool() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/session/ses_1/abort"
-        return httpx.Response(200, json=True)
-
-    client = _client(handler)
-    assert await client.abort("ses_1") is True
-    await client.aclose()
-
-
 async def test_reply_permission() -> None:
     captured: dict[str, object] = {}
 

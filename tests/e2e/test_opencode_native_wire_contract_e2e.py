@@ -13,8 +13,8 @@ Environment requirements (why this is opt-in, not pure-CI)
 * **Opt-in only**: set ``OMNIGENT_E2E_OPENCODE_NATIVE=1`` and have a pinned
   ``opencode`` (>=1.17.7,<1.18.0) on ``PATH``. Unlike the codex/claude native
   e2es this needs **no** interactive login or model credential — session
-  create/list, the SSE ``/event`` stream, permissions, fork and abort are all
-  provider-independent. The gate just keeps it off CI runners without the binary.
+  create/list, the SSE ``/event`` stream, permissions, fork and interrupt are
+  all provider-independent. The gate just keeps it off CI runners without the binary.
 * Run it with::
 
     OMNIGENT_E2E_OPENCODE_NATIVE=1 \
@@ -105,10 +105,10 @@ async def test_opencode_native_wire_contract_against_real_server() -> None:
             if event is not None:
                 assert isinstance(event.type, str)
 
-            # fork creates a new session; abort returns cleanly with no work.
+            # fork creates a new session; interrupt returns cleanly with no work.
             forked = await client.fork(session.id)
             assert forked.id and forked.id != session.id
-            assert isinstance(await client.abort(session.id), bool)
+            assert isinstance(await client.interrupt(session.id), bool)
         finally:
             await client.aclose()
     finally:

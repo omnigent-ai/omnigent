@@ -24,7 +24,7 @@ _PNG_DATA_URI = f"data:image/png;base64,{_PNG_B64}"
 
 
 class _FakeServer:
-    """Records the requests a fake OpenCode HTTP server receives."""
+    """Records the requests a fake OpenCode v2 server receives."""
 
     def __init__(self) -> None:
         self.requests: list[tuple[str, str, dict[str, Any]]] = []
@@ -37,9 +37,15 @@ class _FakeServer:
             except json.JSONDecodeError:
                 body = {}
         self.requests.append((request.method, request.url.path, body))
-        if request.url.path.endswith("/abort"):
-            return httpx.Response(200, json=True)
-        return httpx.Response(200, json={})
+        if request.url.path.endswith("/interrupt"):
+            return httpx.Response(200, json={"interrupted": True})
+        if request.url.path.endswith("/model"):
+            return httpx.Response(204)
+        return httpx.Response(200, json={"data": {"id": "msg_1", "type": "user"}})
+
+
+def _prompts(server: _FakeServer) -> list[dict[str, Any]]:
+    return [body for _, path, body in server.requests if path == "/api/session/ses_1/prompt"]
 
 
 @pytest.fixture
@@ -103,10 +109,7 @@ async def test_run_turn_injects_prompt_and_completes(
     executor = _executor(tmp_path, monkeypatch)
     events = await _run(executor, "hello")
     assert [type(e) for e in events] == [TurnComplete]
-    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
-    assert len(prompt_reqs) == 1
-    parts = prompt_reqs[0][2]["parts"]
-    assert parts == [{"type": "text", "text": "hello"}]
+    assert _prompts(fake_server) == [{"text": "hello", "delivery": "steer"}]
 
 
 async def test_run_turn_with_blocks(
@@ -122,47 +125,11 @@ async def test_run_turn_with_blocks(
         ],
     )
     assert [type(e) for e in events] == [TurnComplete]
-    parts = fake_server.requests[0][2]["parts"]
-    text_parts = [p for p in parts if p["type"] == "text"]
-    file_parts = [p for p in parts if p["type"] == "file"]
-    assert text_parts[0]["text"] == "what is this?"
-    assert len(file_parts) == 1
-    assert file_parts[0]["url"] == _PNG_DATA_URI
-    assert file_parts[0]["mime"] == "image/png"
-    # No inline base64 in any text part.
-    assert all(_PNG_B64 not in p.get("text", "") for p in parts)
-
-
-async def test_run_turn_pins_resolved_model_on_prompt(
-    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The session's resolved model reaches the prompt body from turn one.
-
-    OpenCode's session-create body cannot carry a model, so the override is
-    applied per prompt as ``model: {providerID, modelID}``. This pins the
-    first injected turn (which OpenCode then persists as the session
-    default), so the override governs the run from the start — not only a
-    later web turn.
-    """
-    _seed_state(tmp_path, model_override="anthropic/claude-opus-4")
-    executor = _executor(tmp_path, monkeypatch)
-    events = await _run(executor, "hello")
-    assert [type(e) for e in events] == [TurnComplete]
-    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
-    assert len(prompt_reqs) == 1
-    body = prompt_reqs[0][2]
-    assert body["model"] == {"providerID": "anthropic", "modelID": "claude-opus-4"}
-
-
-async def test_run_turn_omits_model_when_no_override(
-    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With no model_override the prompt carries no model (OpenCode default)."""
-    _seed_state(tmp_path)
-    executor = _executor(tmp_path, monkeypatch)
-    await _run(executor, "hello")
-    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
-    assert "model" not in prompt_reqs[0][2]
+    body = _prompts(fake_server)[0]
+    assert body["text"] == "what is this?"
+    assert body["files"] == [{"uri": _PNG_DATA_URI}]
+    # No inline base64 in the text.
+    assert _PNG_B64 not in body["text"]
 
 
 async def test_run_turn_no_user_content_errors(
@@ -193,14 +160,13 @@ async def test_run_turn_session_mismatch_errors(
     assert [type(e) for e in events] == [ExecutorError]
 
 
-async def test_interrupt_calls_abort(
+async def test_interrupt_calls_interrupt(
     fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_state(tmp_path)
     executor = _executor(tmp_path, monkeypatch)
     assert await executor.interrupt_session("k") is True
-    abort_reqs = [r for r in fake_server.requests if r[1].endswith("/abort")]
-    assert len(abort_reqs) == 1
+    assert [path for _, path, _ in fake_server.requests] == ["/api/session/ses_1/interrupt"]
 
 
 async def test_enqueue_message_injects_prompt(
@@ -209,8 +175,7 @@ async def test_enqueue_message_injects_prompt(
     _seed_state(tmp_path)
     executor = _executor(tmp_path, monkeypatch)
     assert await executor.enqueue_session_message("k", "steer me") is True
-    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
-    assert prompt_reqs[0][2]["parts"] == [{"type": "text", "text": "steer me"}]
+    assert [body["text"] for body in _prompts(fake_server)] == ["steer me"]
 
 
 async def _run_with_system_prompt(
@@ -224,84 +189,17 @@ async def _run_with_system_prompt(
     return events
 
 
-def _prompt_system_fields(server: _FakeServer) -> list[Any]:
-    return [r[2].get("system") for r in server.requests if r[1].endswith("/prompt_async")]
-
-
-async def test_run_turn_authored_sends_gated_composed_system(
+async def test_run_turn_never_sends_system_field(
     fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Authored turns send the gated composed authored + framework text."""
+    """v2 has no per-prompt system field; instructions ship in the config."""
     _seed_state(tmp_path)
     executor = _executor(tmp_path, monkeypatch)
-    events = await _run_with_system_prompt(
-        executor, "hello", "Be a concise assistant.\n\nFramework note."
-    )
+    events = await _run_with_system_prompt(executor, "hello", "Be concise.")
     assert [type(e) for e in events] == [TurnComplete]
-    assert _prompt_system_fields(fake_server) == ["Be a concise assistant.\n\nFramework note."]
-
-
-async def test_run_turn_framework_only_sends_framework_text_alone(
-    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Framework-only turns send only the framework text — no fabricated fallback."""
-    _seed_state(tmp_path)
-    executor = _executor(tmp_path, monkeypatch)
-    events = await _run_with_system_prompt(executor, "hello", "Framework note only.")
-    assert [type(e) for e in events] == [TurnComplete]
-    assert _prompt_system_fields(fake_server) == ["Framework note only."]
-    assert "You are a helpful assistant." not in _prompt_system_fields(fake_server)[0]
-
-
-async def test_run_turn_neither_omits_system_field_entirely(
-    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Neither authored nor framework text → the system field is omitted."""
-    _seed_state(tmp_path)
-    executor = _executor(tmp_path, monkeypatch)
-    events = await _run_with_system_prompt(executor, "hello", "")
-    assert [type(e) for e in events] == [TurnComplete]
-    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
-    assert "system" not in prompt_reqs[0][2]
-
-
-async def test_enqueue_before_any_normal_turn_omits_system(
-    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No prior normal turn on this executor → enqueue sends no system field."""
-    _seed_state(tmp_path)
-    executor = _executor(tmp_path, monkeypatch)
-    assert await executor.enqueue_session_message("k", "steer me") is True
-    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
-    assert "system" not in prompt_reqs[0][2]
-
-
-async def test_enqueue_after_normal_turn_reuses_cached_system(
-    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A promoted queued message reuses the most recent normal turn's system prompt."""
-    _seed_state(tmp_path)
-    executor = _executor(tmp_path, monkeypatch)
-    await _run_with_system_prompt(executor, "hello", "Be concise.")
-
-    assert await executor.enqueue_session_message("k", "steer me") is True
-
-    assert _prompt_system_fields(fake_server) == ["Be concise.", "Be concise."]
-
-
-async def test_instruction_free_turn_clears_previously_populated_cache(
-    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A later instruction-free normal turn clears a previously cached value."""
-    _seed_state(tmp_path)
-    executor = _executor(tmp_path, monkeypatch)
-    await _run_with_system_prompt(executor, "hello", "Be concise.")
-    await _run_with_system_prompt(executor, "again", "")
-
-    assert await executor.enqueue_session_message("k", "steer me") is True
-
-    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
-    assert "system" not in prompt_reqs[-1][2]
+    assert "system" not in _prompts(fake_server)[0]
+    assert await executor.enqueue_session_message("k", "later") is True
+    assert "system" not in _prompts(fake_server)[1]
 
 
 def test_capabilities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -460,32 +460,6 @@ class OpenCodeClient:
         )
         return data if isinstance(data, dict) else {}
 
-    async def prompt_async(self, session_id: str, payload: _JsonMapping) -> _JsonObject:
-        """
-        Admit a prompt without blocking (``POST /session/{id}/prompt_async``).
-
-        Preferred for native-server parity: the call returns once the
-        prompt is admitted; the assistant output streams over SSE.
-
-        :param session_id: OpenCode session id.
-        :param payload: Prompt body, e.g. ``{"parts": [...]}``.
-        :returns: The server response object (may be empty).
-        """
-        data = await self._request_json(
-            "POST", f"/session/{session_id}/prompt_async", json_body=payload
-        )
-        return data if isinstance(data, dict) else {}
-
-    async def abort(self, session_id: str) -> bool:
-        """
-        Abort active work (``POST /session/{id}/abort``).
-
-        :param session_id: OpenCode session id.
-        :returns: ``True`` when the server reports an abort happened.
-        """
-        data = await self._request_json("POST", f"/session/{session_id}/abort")
-        return bool(data)
-
     async def seed_context(self, session_id: str, text: str) -> None:
         """
         Record context in a session without running a turn.
