@@ -358,6 +358,9 @@ function startDisplayCapture(recordDir, display) {
  *   this, so the shell auto-connects on launch.
  * @param {string} [opts.userDataDir] Override the isolated userData dir
  *   (defaults to a fresh temp dir).
+ * @param {string[]} [opts.extraArgs] Extra Electron/Chromium switches.
+ * @param {Record<string, string | undefined>} [opts.env] Env overrides for the
+ *   shell; an `undefined` value removes the variable.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
  *   window: import("playwright").Page, userDataDir: string,
  *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
@@ -376,7 +379,16 @@ async function launchDesktop(opts) {
   }
   fs.mkdirSync(opts.recordDir, { recursive: true });
 
-  const args = [APP_ROOT, `--user-data-dir=${userDataDir}`];
+  const args = [APP_ROOT, `--user-data-dir=${userDataDir}`, ...(opts.extraArgs ?? [])];
+  // Dev builds read dev-app-update.yml and would try to reach the update
+  // endpoint; a version override keeps the app off the update path.
+  const env = Object.fromEntries(
+    Object.entries({
+      ...process.env,
+      OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0",
+      ...(opts.env ?? {}),
+    }).filter(([, value]) => value !== undefined),
+  );
   // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
   // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
   // as root or in a container — Electron's Chromium refuses to start without
@@ -392,7 +404,7 @@ async function launchDesktop(opts) {
   // recording" would silently drop the very content a journey renders inside
   // an embedded browser view. The display capture becomes the primary clip in
   // saveRecording; the per-page clips remain as context.
-  const displayCapture = startDisplayCapture(opts.recordDir, process.env.DISPLAY);
+  const displayCapture = startDisplayCapture(opts.recordDir, env.DISPLAY);
 
   const stopDisplayCapture = async () => {
     if (displayCapture) await displayCapture.stop();
@@ -403,9 +415,7 @@ async function launchDesktop(opts) {
     electronApp = await electron.launch({
       args,
       recordVideo: { dir: opts.recordDir },
-      // Dev builds read dev-app-update.yml and would try to reach the update
-      // endpoint; a version override keeps the app off the update path.
-      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
+      env,
     });
   } catch (err) {
     await stopDisplayCapture();
