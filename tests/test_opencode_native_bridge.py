@@ -599,12 +599,21 @@ def test_last_applied_model_absent_in_older_state_reads_none(bridge_dir: Path) -
 
 def test_update_last_applied_model(bridge_dir: Path) -> None:
     assert update_last_applied_model(bridge_dir, "acme/model-a") is False  # no state yet
-    write_bridge_state(bridge_dir, _state(bridge_dir, model_override="acme/model-a"))
-    assert update_last_applied_model(bridge_dir, "acme/model-a") is True
+    write_bridge_state(bridge_dir, _state(bridge_dir, model_override="openai/gpt-5.5"))
     loaded = read_bridge_state(bridge_dir)
     assert loaded is not None
-    assert loaded.last_applied_model == "acme/model-a"
-    assert loaded.model_override == "acme/model-a"
+    assert loaded.last_applied_model is None
+
+    assert update_last_applied_model(bridge_dir, " openai/gpt-5.5 ") is True
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model == "openai/gpt-5.5"
+    assert loaded.model_override == "openai/gpt-5.5"
+
+    assert update_last_applied_model(bridge_dir, None) is True
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model is None
 
 
 class _KeyClient:

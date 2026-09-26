@@ -837,13 +837,13 @@ def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
     return True
 
 
-def update_last_applied_model(bridge_dir: Path, model: str) -> bool:
+def update_last_applied_model(bridge_dir: Path, model: str | None) -> bool:
     """
     Record the model most recently applied to the OpenCode session.
 
     :param bridge_dir: Native OpenCode bridge directory.
     :param model: Qualified model id that ``POST /api/session/{id}/model``
-        accepted, e.g. ``"opencode/big-pickle"``.
+        accepted, e.g. ``"opencode/big-pickle"``, or ``None`` to clear.
     :returns: ``True`` when the state existed and was updated, ``False`` when
         no bridge state is present.
     """
@@ -852,5 +852,8 @@ def update_last_applied_model(bridge_dir: Path, model: str) -> bool:
         return False
     import dataclasses
 
-    write_bridge_state(bridge_dir, dataclasses.replace(state, last_applied_model=model))
+    normalized = model.strip() if isinstance(model, str) else None
+    write_bridge_state(
+        bridge_dir, dataclasses.replace(state, last_applied_model=normalized or None)
+    )
     return True
