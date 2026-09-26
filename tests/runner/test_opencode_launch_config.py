@@ -34,6 +34,9 @@ def launch_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://omnigent.test")
     seeded: list[Path] = []
     monkeypatch.setattr(bridge, "seed_opencode_auth", lambda d: seeded.append(d))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
+    monkeypatch.setattr(provider, "resolve_bound_opencode_gateway", lambda **k: None)
+    monkeypatch.setattr(provider, "resolve_databricks_gateway", lambda *a, **k: None)
     monkeypatch.setattr(provider, "managed_connect_opencode_config", lambda *a: None)
     monkeypatch.setattr(runner_entry, "_make_auth_token_factory", lambda *a, **k: None)
     monkeypatch.setattr(app_server, "OpenCodeNativeServer", _FakeServer)
@@ -94,3 +97,30 @@ async def test_launch_without_server_still_writes_ask_all_config(
     assert written["permissions"] == [{"action": "*", "resource": "*", "effect": "ask"}]
     assert "mcp" not in written
     assert "plugins" not in written
+
+
+async def test_launch_adopts_managed_connect_providers_plugins_and_model(
+    launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import omnigent.host.databricks_credential as databricks_credential
+
+    ucode_plugin = str(tmp_path / "bridges" / "omnigent-ucode-auth")
+    managed = {
+        "providers": {"databricks-ws": {"api": {"id": "databricks-ws"}}},
+        "plugins": [ucode_plugin],
+        "model": "databricks-ws/served-model",
+    }
+    monkeypatch.setattr(provider, "managed_connect_opencode_config", lambda *a: managed)
+    monkeypatch.setattr(
+        databricks_credential, "_read_sidecar", lambda path: {"workspace_host": "https://ws"}
+    )
+    monkeypatch.setattr(databricks_credential, "broker_token_command", lambda host: "mint-token")
+
+    bridge_dir = await _launch_until_boot(server_client=object())
+    written = json.loads(
+        (bridge_dir / "xdg-config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
+    )
+    assert written["providers"] == managed["providers"]
+    assert written["plugins"] == [ucode_plugin, str(bridge_dir / "omnigent-policy")]
+    assert written["model"] == "databricks-ws/served-model"
+    assert written["permissions"] == [{"action": "*", "resource": "*", "effect": "ask"}]
