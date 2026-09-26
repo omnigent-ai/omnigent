@@ -1830,7 +1830,6 @@ def _captured_sql(store: SqlAlchemyConversationStore, run) -> list[str]:
     return statements
 
 
-@pytest.mark.databricks
 def test_list_conversations_search_sets_statement_timeout(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
