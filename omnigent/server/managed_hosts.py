@@ -177,7 +177,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import click
 from fastapi import HTTPException
@@ -1560,7 +1560,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s
 
         launcher_factory = _e2b_launcher_factory(
-            _parse_e2b_template(raw), _parse_provider_env(raw, "e2b")
+            _parse_e2b_template(raw), _parse_provider_env(raw, "e2b"), _parse_e2b_on_timeout(raw)
         )
         # Derived from OMNIGENT_E2B_MAX_LIFETIME_S so the token always
         # outlives the (operator-overridable) sandbox lifetime — mirrors
@@ -2224,6 +2224,7 @@ def _parse_cwsandbox_env(raw: dict[str, object]) -> list[str] | None:
 def _e2b_launcher_factory(
     template: str | None,
     env: list[str] | None,
+    on_timeout: Literal["kill", "pause"] = "kill",
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: e2b`` path.
@@ -2239,6 +2240,8 @@ def _e2b_launcher_factory(
         every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
         ``None`` to resolve from the launcher's env-var fallback /
         inject nothing.
+    :param on_timeout: ``"kill"`` (default) or ``"pause"``, what E2B does
+        when an idle sandbox's timeout lapses.
     :returns: A factory producing parameterized E2B launchers.
     """
 
@@ -2246,7 +2249,7 @@ def _e2b_launcher_factory(
         """Construct the E2B launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
 
-        return E2BSandboxLauncher(template=template, env=env)
+        return E2BSandboxLauncher(template=template, env=env, on_timeout=on_timeout)
 
     return _build
 
@@ -2328,6 +2331,23 @@ def _parse_e2b_template(raw: dict[str, object]) -> str | None:
             "reference (omit it to use the default template)"
         )
     return template.strip()
+
+
+def _parse_e2b_on_timeout(raw: dict[str, object]) -> Literal["kill", "pause"]:
+    """
+    Extract ``sandbox.e2b.on_timeout``: what E2B does when a sandbox's timeout
+    lapses. Omitted keeps E2B's default ``"kill"``; ``"pause"`` makes idle
+    sandboxes pause and resume in place on the next message.
+
+    :param raw: The raw ``sandbox`` mapping (provider already ``"e2b"``).
+    :returns: ``"kill"`` or ``"pause"``.
+    :raises ValueError: When the value is anything else.
+    """
+    section = _parse_provider_section(raw, "e2b")
+    value = "kill" if section is None else section.get("on_timeout", "kill")
+    if value == "kill" or value == "pause":
+        return value
+    raise ValueError("server config 'sandbox.e2b.on_timeout' must be 'kill' or 'pause'")
 
 
 def _parse_islo_idle_pause_after_s(raw: dict[str, object]) -> int | None:

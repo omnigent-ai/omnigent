@@ -167,6 +167,7 @@ sandbox:
   e2b:
     template: omnigent-host          # E2B template NAME (default: omnigent-host)
     env: [OPENAI_API_KEY, ANTHROPIC_API_KEY, GIT_TOKEN]
+    on_timeout: pause                # optional; default kill (see below)
 ```
 
 > [!NOTE]
@@ -174,6 +175,34 @@ sandbox:
 > registry image reference — the field that holds a `ghcr.io/...` ref on
 > the other providers. Omit it to use the default `omnigent-host`
 > template.
+
+### Pause idle sandboxes instead of killing them
+
+By default an idle managed sandbox keeps running until its lifetime lapses
+and is then killed, taking its workspace with it; the next message starts a
+fresh sandbox. With `on_timeout: pause`, sandboxes are created with E2B's
+pause lifecycle instead:
+
+- While a runner is connected, the server's keepalive keeps pushing the
+  sandbox timeout a window ahead: five keepalive intervals, 5 minutes at the
+  1-minute cadence E2B shares with `agent_sandbox`.
+- After the runner idles out (`runner.idle_timeout_s`, default 1 h), the
+  window lapses and E2B pauses the sandbox. Lower `runner.idle_timeout_s` in
+  `sandbox.host_config` to pause sooner. A paused sandbox is not billed
+  and does not count toward the concurrency limit
+  ([E2B sandbox lifetime FAQ](https://docs.e2b.dev/faq/sandbox-lifetime)).
+- The next message resumes the same sandbox id. Its filesystem — workspace,
+  installed tools, `~/.omnigent`, harness state — is as it was. E2B also
+  restores memory, so the previous `omnigent host` process comes back too. The
+  wake normally stops it and starts a fresh host with a new launch token. If
+  the restored host reconnects first, while its original token is still valid,
+  the wake keeps using that host and token instead.
+- Deleting the session kills the sandbox, paused or not.
+
+Paused sandboxes do not expire on their own, so enable
+[`sandbox.reaper`](../../docs/extending/sandbox_providers.md#server-managed-sandboxes)
+to remove sandboxes whose sessions have been abandoned. The setting applies
+to sandboxes created after it changes.
 
 ## Credentials for the sandbox (LLM keys, git tokens)
 
@@ -276,6 +305,10 @@ Modal guide.
   (vCPU / memory) are fixed when the template is built — pass
   `--cpu-count` / `--memory-mb` to `e2b template build` — not at sandbox
   create time.
+- **Pause instead of kill** (`sandbox.e2b.on_timeout: pause`): idle
+  sandboxes pause shortly after their runner exits and resume in place on
+  the next message; see
+  [Pause idle sandboxes instead of killing them](#pause-idle-sandboxes-instead-of-killing-them).
 - **Custom images** require rebuilding the template: `FROM` your image in
   `e2b.Dockerfile` and `e2b template build` it, then set
   `sandbox.e2b.template` / `OMNIGENT_E2B_TEMPLATE`.

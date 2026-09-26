@@ -662,6 +662,7 @@ def test_parse_valid_e2b_config_builds_parameterized_factory(
     assert cfg.launcher_factory() is fake
     assert fake.template == "omnigent-host"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.on_timeout == "kill"
 
 
 def test_parse_e2b_without_section_defaults(
@@ -680,6 +681,36 @@ def test_parse_e2b_without_section_defaults(
     assert cfg.launcher_factory() is fake
     assert fake.template is None
     assert fake.env is None
+    assert fake.on_timeout == "kill"
+
+
+def test_parse_e2b_on_timeout_pause_reaches_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``sandbox.e2b.on_timeout: pause`` builds launchers in pause mode."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "e2b",
+            "server_url": "https://s.example.com",
+            "e2b": {"on_timeout": "pause"},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_e2b_launcher(monkeypatch, fake)
+    assert cfg.default.launcher_factory() is fake
+    assert fake.on_timeout == "pause"
+
+
+@pytest.mark.parametrize("value", ["stop", "", None, True])
+def test_parse_e2b_on_timeout_rejects_unknown_values(value: object) -> None:
+    """Only E2B's own ``kill`` / ``pause`` actions are accepted."""
+    with pytest.raises(ValueError, match=r"sandbox\.e2b\.on_timeout"):
+        parse_sandbox_config(
+            {
+                "provider": "e2b",
+                "server_url": "https://s.example.com",
+                "e2b": {"on_timeout": value},
+            }
+        )
 
 
 def test_parse_e2b_template_rejects_non_string(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -58,14 +58,16 @@ _logger = logging.getLogger(__name__)
 MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
 """Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
 
-# Global default keepalive cadence, used by every managed provider except
-# agent_sandbox. Providers whose keep_alive is idempotent ("configure once")
-# don't need a fast cadence, so the default stays cheap.
+# Global default keepalive cadence, used by every managed provider except the
+# short-window ones below. Providers whose keep_alive is idempotent ("configure
+# once") don't need a fast cadence, so the default stays cheap.
 _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
-# agent_sandbox pushes an absolute shutdownTime forward and runs a SHORT window,
-# so it must refresh fast (its window floor is twice this). Scoped to the
-# provider so lowering it does not multiply every other provider's write load.
-_AGENT_SANDBOX_KEEPALIVE_INTERVAL_S: float = 60.0
+# agent_sandbox and e2b push an absolute deadline forward under a SHORT window,
+# so they must refresh fast (agent_sandbox's window floor is twice this, e2b's
+# pause window five times). Scoped to those providers so lowering it does not
+# multiply every other provider's write load.
+_SHORT_WINDOW_KEEPALIVE_INTERVAL_S: float = 60.0
+_SHORT_WINDOW_PROVIDERS: frozenset[str] = frozenset({"agent_sandbox", "e2b"})
 _MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
 # Ceiling so a finite-but-huge override (e.g. 1e308) cannot overflow the
 # window-floor math (ceil(2 * interval)); an hour is already far past useful.
@@ -76,17 +78,17 @@ def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
     """
     How often the server refreshes a live managed sandbox's liveness, in seconds.
 
-    Provider-scoped default: ``agent_sandbox`` refreshes fast (60s) because it
-    pushes an absolute deadline forward under a short window; every other
-    provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
+    Provider-scoped default: ``agent_sandbox`` and ``e2b`` refresh fast (60s)
+    because they push an absolute deadline forward under a short window; every
+    other provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
     overrides both when set (advanced/experimental — the operator-facing knob is
     ``keep_warm_s``), floored at a small minimum so a typo cannot spin the loop.
     Resolved live from the env on each call (no snapshot), so the server loop
     cadence and the ``agent_sandbox`` window floor cannot disagree.
     """
     default = (
-        _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S
-        if provider == "agent_sandbox"
+        _SHORT_WINDOW_KEEPALIVE_INTERVAL_S
+        if provider in _SHORT_WINDOW_PROVIDERS
         else _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
     )
     raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()

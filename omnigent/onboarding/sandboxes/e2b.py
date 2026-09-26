@@ -32,6 +32,12 @@ Notes that shape this launcher:
   :meth:`keep_alive` can only re-extend a live sandbox to that max. A
   managed host outliving the cap relies on the dead-sandbox relaunch path
   (same posture as Modal's 24 h cap).
+- **Opt-in pause instead of kill.** With ``on_timeout="pause"`` (the
+  server's ``sandbox.e2b.on_timeout``) sandboxes are created with E2B's
+  pause lifecycle and a short timeout that :meth:`keep_alive` keeps pushing
+  forward while a runner is connected, like the ``agent_sandbox`` provider.
+  An idle sandbox pauses instead of dying, and the managed wake path resumes
+  it under the same id with its filesystem and memory intact.
 - **API-key auth.** ``E2B_API_KEY`` is read from the CLI/server process
   environment by the SDK, 12-factor — like the other providers' keys.
 """
@@ -39,31 +45,36 @@ Notes that shape this launcher:
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import queue
 import re
 import shlex
 import threading
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, ClassVar
+from collections.abc import Callable, Sequence
+from dataclasses import replace
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import click
+import httpx
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
+    SandboxGoneError,
     SandboxLauncher,
     host_image_wheel_install_command,
+    resolve_managed_keepalive_interval_s,
 )
-from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+from omnigent.onboarding.sandboxes.types import RepoWorkspace, SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-    from e2b import CommandHandle, Sandbox
+    from e2b import CommandHandle, Sandbox, SandboxLifecycle
 
 
 # ── Constants ──────────────────────────────────────────
@@ -120,6 +131,13 @@ _TIMEOUT_REJECTED_RE = re.compile(r"greater than\s+(\d+)\s*hour", re.IGNORECASE)
 # time"). A wheel install or git clone must not be killed mid-run.
 _COMMAND_NO_TIMEOUT: int = 0
 
+OnTimeout = Literal["kill", "pause"]
+"""What E2B does when a sandbox's timeout lapses: ``"kill"`` (E2B's default)
+deletes it, ``"pause"`` snapshots its filesystem and memory for a later resume."""
+
+_PAUSE_MIN_WINDOW_S: int = 300
+"""Floor on the timeout pause-mode :meth:`E2BSandboxLauncher.keep_alive` sets."""
+
 # No _SANDBOX_CPU / _MEMORY constants: E2B bakes resources into the template
 # at build time, not at Sandbox.create() (see deploy/e2b/README.md).
 
@@ -151,6 +169,21 @@ def managed_token_ttl_s() -> int:
     :returns: The token lifetime in seconds.
     """
     return resolve_max_lifetime_s() + _TOKEN_TTL_SLACK_S
+
+
+def pause_window_s() -> int:
+    """
+    Timeout that pause-mode keepalive sets, in seconds.
+
+    Five keepalive intervals, the ratio ``agent_sandbox`` uses, so several
+    delayed or failed refreshes cannot pause a sandbox whose runner is
+    working; floored at :data:`_PAUSE_MIN_WINDOW_S`. It is also how long an
+    idle sandbox keeps running after its runner exits.
+
+    :returns: The window in seconds (300 at the default 60 s cadence).
+    """
+    interval_s = resolve_managed_keepalive_interval_s("e2b")
+    return max(_PAUSE_MIN_WINDOW_S, math.ceil(5 * interval_s))
 
 
 def _lifetime_cap_from_error(message: str) -> int | None:
@@ -250,19 +283,6 @@ class _E2BRemoteProcess(RemoteProcess):
     queue — the queue is the combined-output stream the
     :class:`RemoteProcess` contract wants.
     """
-
-    @property
-    def capabilities(self) -> SandboxCapabilities:
-        return SandboxCapabilities(
-            cli_bootstrap=True,
-            managed_launch=True,
-            local_port_forward=False,
-            resume_stopped=False,
-            programmatic_terminate=True,
-            file_copy=True,
-            streaming_exec=True,
-            foreground_exec=True,
-        )
 
     def __init__(self, handle: CommandHandle) -> None:
         """
@@ -370,7 +390,13 @@ class E2BSandboxLauncher(SandboxLauncher):
     # URL); there is no local→sandbox path for the App OAuth callback.
     supports_local_port_forward: ClassVar[bool] = False
 
-    def __init__(self, *, template: str | None = None, env: Sequence[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        template: str | None = None,
+        env: Sequence[str] | None = None,
+        on_timeout: OnTimeout = "kill",
+    ) -> None:
         """
         Initialize the launcher.
 
@@ -387,10 +413,30 @@ class E2BSandboxLauncher(SandboxLauncher):
             managed-host ``sandbox.e2b.env`` config. ``None`` resolves
             :data:`SANDBOX_ENV_PASSTHROUGH_ENV_VAR` (comma-separated)
             and falls back to no injected env.
+        :param on_timeout: ``"kill"`` (default) keeps E2B's delete-on-timeout
+            lifecycle with the full requested lifetime; ``"pause"`` creates
+            sandboxes that pause on timeout and can be resumed in place — the
+            server's managed-host ``sandbox.e2b.on_timeout`` config.
         """
         self._template_ref = template
         self._env_names = tuple(env) if env is not None else None
+        self._pause = on_timeout == "pause"
         self._sandboxes: dict[str, Sandbox] = {}
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        """
+        Base-derived capabilities; pause mode adds in-place resume with memory.
+
+        :meth:`start_host` only stops a restored host before deferring to the
+        shared start path, which still applies Git clone options.
+        """
+        return replace(
+            super().capabilities,
+            resume_stopped=self._pause,
+            snapshot_restore=self._pause,
+            git_clone_options=True,
+        )
 
     def _resolved_template(self) -> str:
         """
@@ -506,7 +552,8 @@ class E2BSandboxLauncher(SandboxLauncher):
         template = self._resolved_template()
         env_vars = self._resolve_sandbox_env()
         click.echo(f"▸ Creating E2B sandbox '{name}' from template '{template}'")
-        sandbox = self._create_sandbox(template, resolve_max_lifetime_s(), name, env_vars)
+        timeout = pause_window_s() if self._pause else resolve_max_lifetime_s()
+        sandbox = self._create_sandbox(template, timeout, name, env_vars)
         sandbox_id = str(sandbox.sandbox_id)
         self._sandboxes[sandbox_id] = sandbox
         click.echo(f"  → created {sandbox_id}")
@@ -531,9 +578,16 @@ class E2BSandboxLauncher(SandboxLauncher):
         from e2b.exceptions import AuthenticationException, SandboxException, TemplateException
 
         metadata = {"omnigent-name": name}
+        lifecycle: SandboxLifecycle | None = (
+            {"on_timeout": "pause", "auto_resume": False} if self._pause else None
+        )
         try:
             return Sandbox.create(
-                template=template, timeout=timeout, metadata=metadata, envs=env_vars or None
+                template=template,
+                timeout=timeout,
+                metadata=metadata,
+                envs=env_vars or None,
+                lifecycle=lifecycle,
             )
         except AuthenticationException as exc:
             # A bad/expired key (HTTP 401) raises AuthenticationException,
@@ -573,7 +627,11 @@ class E2BSandboxLauncher(SandboxLauncher):
         )
         try:
             return Sandbox.create(
-                template=template, timeout=cap, metadata=metadata, envs=env_vars or None
+                template=template,
+                timeout=cap,
+                metadata=metadata,
+                envs=env_vars or None,
+                lifecycle=lifecycle,
             )
         except SandboxException as exc:
             raise click.ClickException(f"E2B sandbox creation failed: {exc}") from exc
@@ -595,9 +653,12 @@ class E2BSandboxLauncher(SandboxLauncher):
                 f"`{cli_invocation()} sandbox create --provider e2b`."
             )
 
-    def keep_alive(self, sandbox_id: str) -> None:
+    def keep_alive(self, sandbox_id: str) -> bool | None:
         """
         Re-extend the sandbox timeout to the requested lifetime.
+
+        In pause mode, push the timeout :func:`pause_window_s` ahead instead,
+        so the sandbox pauses shortly after its runner stops refreshing it.
 
         E2B exposes no idle-autostop to disable and no never-expire
         option, so the best available keep-alive is to set the timeout to
@@ -607,7 +668,10 @@ class E2BSandboxLauncher(SandboxLauncher):
         than aborting the bootstrap.
 
         :param sandbox_id: The sandbox to configure.
+        :returns: ``False`` when a pause-mode extension was not confirmed.
         """
+        if self._pause:
+            return self._extend_pause_window(sandbox_id)
         from e2b.exceptions import SandboxException
 
         lifetime = resolve_max_lifetime_s()
@@ -629,6 +693,110 @@ class E2BSandboxLauncher(SandboxLauncher):
                 f"  → requested a {lifetime // 3600}h lifetime extension "
                 "(capped at the account maximum; E2B has no idle-stop disable)."
             )
+        return None
+
+    def _extend_pause_window(self, sandbox_id: str) -> bool:
+        """
+        Set the timeout one pause window ahead.
+
+        Uses the by-id SDK call: connecting a handle would resume a sandbox
+        that paused between refreshes.
+
+        :param sandbox_id: The sandbox to extend.
+        :returns: ``True`` when E2B accepted the new timeout.
+        """
+        _ensure_sdk()
+        from e2b import Sandbox
+        from e2b.exceptions import SandboxException
+
+        try:
+            Sandbox.set_timeout(sandbox_id, pause_window_s())
+        except (SandboxException, httpx.TransportError) as exc:
+            ui.console.print(
+                f"  → warning: could not extend the pause deadline of '{sandbox_id}' ({exc})",
+                style="omni.warning",
+                markup=False,
+            )
+            return False
+        return True
+
+    def is_running(self, sandbox_id: str) -> bool | None:
+        """
+        Report whether a pause-mode sandbox is running, without waking it.
+
+        :param sandbox_id: The sandbox to inspect.
+        :returns: ``True`` when running, ``False`` when paused or gone, and
+            ``None`` in kill mode or when E2B cannot be asked right now.
+        """
+        if not self._pause:
+            return None
+        _ensure_sdk()
+        from e2b import Sandbox
+        from e2b.exceptions import NotFoundException, SandboxException
+
+        try:
+            info = Sandbox.get_info(sandbox_id)
+        except NotFoundException:
+            return False
+        except (SandboxException, httpx.TransportError):
+            # Unknown, not "stopped": callers fall back to tunnel liveness.
+            return None
+        return info.state == "running"
+
+    def resume(self, sandbox_id: str) -> None:
+        """
+        Resume a paused sandbox under the same id (a no-op when running).
+
+        Only brings back the VM; the managed wake path then starts a fresh
+        host with a new token (see :meth:`start_host`).
+
+        :param sandbox_id: The sandbox to resume.
+        :raises SandboxCapabilityError: In kill mode.
+        :raises SandboxGoneError: When the sandbox no longer exists.
+        :raises click.ClickException: When E2B refuses the resume.
+        """
+        if not self._pause:
+            raise self._capability_error("resume a stopped sandbox")
+        _ensure_sdk()
+        from e2b import Sandbox
+        from e2b.exceptions import NotFoundException, SandboxException
+
+        click.echo(f"▸ Resuming E2B sandbox '{sandbox_id}'")
+        try:
+            handle = Sandbox.connect(sandbox_id, timeout=pause_window_s())
+        except NotFoundException as exc:
+            raise SandboxGoneError(f"E2B sandbox '{sandbox_id}' no longer exists") from exc
+        except (SandboxException, httpx.TransportError) as exc:
+            raise click.ClickException(
+                f"Could not resume E2B sandbox '{sandbox_id}': {exc}"
+            ) from exc
+        self._sandboxes[sandbox_id] = handle
+
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repos: Sequence[RepoWorkspace] = (),
+        host_config: dict[str, object] | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """Start the host; in pause mode, first stop one restored from memory."""
+        if self._pause:
+            self._stop_preserved_host_daemon(sandbox_id)
+        return super().start_host(
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repos=repos,
+            host_config=host_config,
+            on_stage=on_stage,
+        )
 
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """
