@@ -1636,3 +1636,135 @@ async def test_run_awaits_cancelled_background_tasks() -> None:
     assert pending.cancelled()
     assert fwd._form_tasks == {}
     assert fwd._permission_tasks == {}
+
+
+# --- subagents --------------------------------------------------------------
+
+
+def _child_created(child_id: str, parent_id: str = _SESSION) -> OpenCodeEvent:
+    return OpenCodeEvent(
+        id=None,
+        type="session.created",
+        data={
+            "sessionID": child_id,
+            "parentID": parent_id,
+            "projectID": "prj_1",
+            "location": {"directory": "/work"},
+            "slug": "child",
+            "title": "Explore the repo",
+            "agent": "explore",
+            "version": "2.0.18",
+        },
+        location=None,
+    )
+
+
+async def test_subagent_child_is_minted_with_its_tool_call() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event(
+            "session.tool.input.started",
+            assistantMessageID="msg_1",
+            id="call_sub",
+            name="subagent",
+        )
+    )
+    await fwd.handle_event(_child_created("ses_child"))
+    assert "external_subagent_start" not in _types(server.posts)
+    await fwd.handle_event(
+        _event(
+            "session.tool.progress",
+            assistantMessageID="msg_1",
+            id="call_sub",
+            metadata={"sessionID": "ses_child", "status": "running"},
+        )
+    )
+    url, start = next((u, b) for u, b in server.posts if b["type"] == "external_subagent_start")
+    assert url == "/v1/sessions/conv_1/events"
+    assert start["data"] == {
+        "subagent_id": "ses_child",
+        "agent_type": "explore",
+        "description": "Explore the repo",
+        "tool_use_id": "call_sub",
+    }
+
+
+async def test_subagent_child_events_post_to_the_child_conversation() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_child_created("ses_child"))
+    child_step = OpenCodeEvent(
+        id=None,
+        type="session.step.started",
+        data={
+            "sessionID": "ses_child",
+            "assistantMessageID": "msg_c1",
+            "agent": "explore",
+            "model": {"id": "m", "providerID": "p"},
+            "started": 1,
+        },
+        location=None,
+    )
+    await fwd.handle_event(child_step)
+    start = next(b for _u, b in server.posts if b["type"] == "external_subagent_start")
+    # No progress arrived first, so the child's own id stands in for the call id.
+    assert start["data"]["tool_use_id"] == "ses_child"
+    running = [(u, b) for u, b in server.posts if b["type"] == "external_session_status"]
+    assert running == [
+        (
+            "/v1/sessions/conv_child_1/events",
+            {
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "msg_c1"},
+            },
+        )
+    ]
+    # Child steps never touch the parent's model or usage.
+    assert "external_model_change" not in _types(server.posts)
+
+
+async def test_grandchild_session_follows_the_parent_chain() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_child_created("ses_child"))
+    grandchild = _child_created("ses_grand", parent_id="ses_child")
+    assert fwd._event_targets_session(grandchild) is True
+    await fwd.handle_event(grandchild)
+    await fwd.handle_event(
+        OpenCodeEvent(
+            id=None,
+            type="session.compaction.started",
+            data={"sessionID": "ses_grand", "reason": "auto", "recent": ""},
+            location=None,
+        )
+    )
+    starts = [
+        (u, b["data"]["subagent_id"])
+        for u, b in server.posts
+        if b["type"] == "external_subagent_start"
+    ]
+    # The child is minted first (on the root), then the grandchild on the child.
+    assert starts == [
+        ("/v1/sessions/conv_1/events", "ses_child"),
+        ("/v1/sessions/conv_child_1/events", "ses_grand"),
+    ]
+
+
+async def test_unrelated_session_created_is_ignored() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    stranger = _child_created("ses_other_child", parent_id="ses_stranger")
+    assert fwd._event_targets_session(stranger) is False
+    await fwd.handle_event(stranger)
+    assert "ses_other_child" not in fwd._turns
+
+
+async def test_child_permission_replies_to_the_child_session() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_child_created("ses_child"))
+    await fwd.handle_event(_asked("per_c", sessionID="ses_child"))
+    await _drain(fwd)
+    assert opencode.permission_replies == [("ses_child", "per_c", "reject")]

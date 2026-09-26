@@ -428,6 +428,35 @@ def form_answer(
     }
 
 
+@dataclass
+class _PendingChild:
+    """
+    A subagent child session awaiting its Omnigent conversation.
+
+    :param parent_id: Parent OpenCode session id.
+    :param agent: OpenCode agent the child runs, e.g. ``"explore"``.
+    :param title: Child session title (the subagent task description).
+    :param tool_use_id: Parent ``subagent`` tool call id, once known.
+    """
+
+    parent_id: str
+    agent: str
+    title: str
+    tool_use_id: str | None = None
+
+
+def _child_session_id(response: httpx.Response | None) -> str | None:
+    """Read the minted child conversation id from an ``external_subagent_start`` ack."""
+    if response is None or response.status_code >= 400 or not response.content:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    child = body.get("child_session_id") if isinstance(body, dict) else None
+    return child if isinstance(child, str) and child else None
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's v2 event stream into Omnigent events.
@@ -487,6 +516,8 @@ class OpenCodeNativeForwarder:
         self._last_model: str | None = None
         # inboxID -> user prompt payload, posted when the prompt is delivered.
         self._inbox_items: dict[str, _JsonObject] = {}
+        # Child session id -> subagent start details until its conversation exists.
+        self._pending_children: dict[str, _PendingChild] = {}
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -555,15 +586,27 @@ class OpenCodeNativeForwarder:
         Return whether *event* belongs to a mirrored session.
 
         Events carry ``data.sessionID`` (``form.created`` nests it under
-        ``form``). Events without a session id pass through.
+        ``form``). The root session and known subagent children pass; a
+        ``session.created`` whose ``parentID`` is mirrored passes so the child
+        can be registered. Events without a session id pass through.
         """
         session_id = _event_session_id(event)
-        return session_id is None or session_id in self._turns
+        if session_id is None or session_id in self._turns:
+            return True
+        if event.type == "session.created":
+            parent_id = _str_field(event.data, "parentID")
+            return parent_id is not None and parent_id in self._turns
+        return False
 
     async def _active_turn(self, event: OpenCodeEvent) -> _SessionTurn | None:
-        """Return the mirrored session state an event belongs to."""
+        """Return the event's session state once its Omnigent conversation exists."""
         session_id = _event_session_id(event) or self._opencode_session_id
-        return self._turns.get(session_id)
+        turn = self._turns.get(session_id)
+        if turn is None:
+            return None
+        if turn.conversation_id is None:
+            await self._start_child_conversation(session_id)
+        return turn if turn.conversation_id is not None else None
 
     def _is_root(self, turn: _SessionTurn) -> bool:
         """Whether *turn* is this conversation's own OpenCode session."""
@@ -966,7 +1009,7 @@ class OpenCodeNativeForwarder:
         await self._post_tool_output(turn, call_id, output, message_id=message_id)
 
     async def _on_tool_progress(self, event: OpenCodeEvent) -> None:
-        """Handle ``session.tool.progress`` — stream incremental tool output.
+        """Handle ``session.tool.progress`` — register subagents, stream output.
 
         v2 progress metadata is a replacement snapshot. Built-in tools report
         ids only (shell ``{shellID}``, subagent ``{sessionID, status}``), so
@@ -980,6 +1023,9 @@ class OpenCodeNativeForwarder:
         metadata = event.data.get("metadata")
         if call_id is None or not isinstance(metadata, Mapping):
             return
+        child_id = _str_field(metadata, "sessionID")
+        if child_id is not None and turn.tool_names.get(call_id) == "subagent":
+            await self._link_child_to_call(turn, child_id, call_id)
         output = metadata.get("output")
         if not isinstance(output, str):
             return
@@ -1531,6 +1577,58 @@ class OpenCodeNativeForwarder:
             await asyncio.gather(task, return_exceptions=True)
         await self._post_event(_EXTERNAL_ELICITATION_RESOLVED, {"elicitation_id": form_id})
 
+    async def _on_session_created(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.created {parentID}`` — register a subagent child session."""
+        child_id = _str_field(event.data, "sessionID")
+        parent_id = _str_field(event.data, "parentID")
+        if child_id is None or parent_id is None or child_id in self._turns:
+            return
+        self._turns[child_id] = _SessionTurn(session_id=child_id, conversation_id=None)
+        self._pending_children[child_id] = _PendingChild(
+            parent_id=parent_id,
+            agent=_str_field(event.data, "agent") or "subagent",
+            title=_str_field(event.data, "title") or "",
+        )
+
+    async def _link_child_to_call(self, parent: _SessionTurn, child_id: str, call_id: str) -> None:
+        """Bind a child session to its parent ``subagent`` call and mint it."""
+        if child_id not in self._turns:
+            self._turns[child_id] = _SessionTurn(session_id=child_id, conversation_id=None)
+            self._pending_children[child_id] = _PendingChild(
+                parent_id=parent.session_id, agent="subagent", title=""
+            )
+        pending = self._pending_children.get(child_id)
+        if pending is not None and pending.tool_use_id is None:
+            pending.tool_use_id = call_id
+        await self._start_child_conversation(child_id)
+
+    async def _start_child_conversation(self, child_id: str) -> None:
+        """POST ``external_subagent_start`` on the parent and adopt the child id."""
+        turn = self._turns.get(child_id)
+        pending = self._pending_children.get(child_id)
+        if turn is None or pending is None or turn.conversation_id is not None:
+            return
+        parent = self._turns.get(pending.parent_id)
+        if parent is not None and parent.conversation_id is None:
+            await self._start_child_conversation(parent.session_id)
+        parent_conversation = parent.conversation_id if parent is not None else None
+        response = await self._post_event(
+            _EXTERNAL_SUBAGENT_START,
+            {
+                "subagent_id": child_id,
+                "agent_type": pending.agent,
+                "description": pending.title,
+                "tool_use_id": pending.tool_use_id or child_id,
+            },
+            conversation_id=parent_conversation or self._session_id,
+        )
+        child_conversation = _child_session_id(response)
+        if child_conversation is None:
+            _logger.warning("OpenCode subagent start failed for child session=%s", child_id)
+            return
+        self._pending_children.pop(child_id, None)
+        turn.conversation_id = child_conversation
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -1588,4 +1686,5 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "form.created": OpenCodeNativeForwarder._on_form_created,
     "form.replied": OpenCodeNativeForwarder._on_form_resolved,
     "form.cancelled": OpenCodeNativeForwarder._on_form_resolved,
+    "session.created": OpenCodeNativeForwarder._on_session_created,
 }
