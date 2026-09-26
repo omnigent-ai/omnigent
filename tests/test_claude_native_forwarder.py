@@ -6524,6 +6524,412 @@ async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spaw
     assert "toolu_missing" in caplog.text
 
 
+def _spawn_record(tool_use_ids: list[str], *, is_sidechain: bool, uuid: str) -> dict[str, Any]:
+    """One assistant record whose ``Agent`` tool_use blocks spawn sub-agents."""
+    return {
+        "isSidechain": is_sidechain,
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": tool_use_id, "name": "Agent", "input": {}}
+                for tool_use_id in tool_use_ids
+            ],
+        },
+    }
+
+
+def _write_subagent_files(
+    subagents_dir: Path,
+    subagent_id: str,
+    *,
+    agent_type: str,
+    tool_use_id: str,
+    records: list[dict[str, Any]],
+) -> None:
+    """Write a sub-agent's ``.meta.json`` and ``.jsonl`` without touching any transcript."""
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, Any] = {
+        "agentType": agent_type,
+        "description": subagent_id,
+        "toolUseId": tool_use_id,
+    }
+    if agent_type == "fork":
+        meta["isFork"] = True
+    (subagents_dir / f"agent-{subagent_id}.meta.json").write_text(
+        json.dumps(meta), encoding="utf-8"
+    )
+    (subagents_dir / f"agent-{subagent_id}.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in records), encoding="utf-8"
+    )
+
+
+def _count_correlation_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Record every transcript the watcher reads to correlate spawn ids."""
+    reads: list[Path] = []
+    original = forwarder._tool_use_ids_in_transcript
+
+    def counting(path: Path, **kwargs: Any) -> set[str]:
+        reads.append(path)
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(forwarder, "_tool_use_ids_in_transcript", counting)
+    return reads
+
+
+def _subagent_start_recorder() -> tuple[dict[str, str], Callable[[httpx.Request], httpx.Response]]:
+    """Return a MockTransport handler that records each sub-agent start and acks item batches."""
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": f"item-{i}"} for i in range(len(body))])
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202, json={"queued": False, "child_session_id": f"conv_{subagent_id}"}
+        )
+
+    return start_paths, handler
+
+
+async def _poll_subagents(
+    client: httpx.AsyncClient,
+    *,
+    bridge_dir: Path,
+    transcript_path: Path,
+    state: forwarder.SubagentForwardState,
+    resolve_tracker: forwarder._SubagentResolveTracker | None = None,
+) -> forwarder.SubagentForwardState:
+    """Run one sub-agent watcher poll under the root session ``conv_root``."""
+    kwargs: dict[str, Any] = {}
+    if resolve_tracker is not None:
+        kwargs["resolve_tracker"] = resolve_tracker
+    return await forwarder._forward_available_subagents(
+        client=client,
+        parent_session_id="conv_root",
+        bridge_dir=bridge_dir,
+        transcript_path=transcript_path,
+        state=state,
+        agent_name="claude-native-ui",
+        start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        **kwargs,
+    )
+
+
+def test_tool_use_ids_in_transcript_drops_a_forks_inherited_prefix(tmp_path: Path) -> None:
+    """Records through a fork's own spawn call are its parent's context, not its spawns."""
+    transcript = tmp_path / "agent-fork.jsonl"
+    transcript.write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                _spawn_record(["toolu_earlier"], is_sidechain=True, uuid="inherited-1"),
+                _spawn_record(
+                    ["toolu_fork", "toolu_sibling"], is_sidechain=True, uuid="inherited-2"
+                ),
+                _spawn_record(["toolu_own"], is_sidechain=True, uuid="own-work"),
+            )
+        ),
+        encoding="utf-8",
+    )
+    everything = {"toolu_earlier", "toolu_fork", "toolu_sibling", "toolu_own"}
+
+    assert forwarder._tool_use_ids_in_transcript(transcript, include_sidechains=True) == everything
+    assert forwarder._tool_use_ids_in_transcript(
+        transcript, include_sidechains=True, inherited_through="toolu_fork"
+    ) == {"toolu_own"}
+    # A spawn id that never appears (a non-fork's own spawn) drops nothing.
+    assert (
+        forwarder._tool_use_ids_in_transcript(
+            transcript, include_sidechains=True, inherited_through="toolu_absent"
+        )
+        == everything
+    )
+
+
+async def test_subagent_watcher_registers_a_fork_under_the_root_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork's inherited copy of its own spawn call must not make the spawn ambiguous."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="fork",
+        agent_type="fork",
+        description="Fork worker",
+        tool_use_id="toolu_fork",
+        transcript_records=[
+            {"type": "fork-context-ref", "uuid": "fork-context", "isSidechain": True},
+            _spawn_record(["toolu_fork"], is_sidechain=True, uuid="inherited-spawn"),
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "fork-output",
+                "message": {"role": "assistant", "content": "working"},
+            },
+        ],
+    )
+    reads = _count_correlation_reads(monkeypatch)
+    start_paths, handler = _subagent_start_recorder()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await _poll_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+        )
+        assert start_paths == {"fork": "/v1/sessions/conv_root/events"}
+        assert state.subagents["fork"].parent_subagent_id is None
+        assert state.subagents["fork"].child_conversation_id == "conv_fork"
+        assert reads, "the first poll correlates the spawn"
+
+        reads.clear()
+        again = await _poll_subagents(
+            client, bridge_dir=bridge_dir, transcript_path=transcript_path, state=state
+        )
+
+    # Registered: a repeat poll over the unchanged tree has nothing to correlate.
+    assert reads == []
+    assert again.subagents.keys() == {"fork"}
+
+
+async def test_subagent_watcher_registers_a_fork_of_a_sub_agent_and_its_sibling(
+    tmp_path: Path,
+) -> None:
+    """A fork spawned by a sub-agent inlines that parent's records; none of them are its own."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    parent_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="z-parent",
+        agent_type="general-purpose",
+        description="parent worker",
+        tool_use_id="toolu_parent",
+    )
+    parent_prompt = {
+        "isSidechain": True,
+        "type": "user",
+        "uuid": "parent-prompt",
+        "message": {"role": "user", "content": "do the work"},
+    }
+    parent_spawns = _spawn_record(
+        ["toolu_sibling", "toolu_fork"], is_sidechain=True, uuid="parent-spawns"
+    )
+    with parent_transcript.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(parent_prompt) + "\n" + json.dumps(parent_spawns) + "\n")
+    subagents_dir = parent_transcript.parent
+    _write_subagent_files(
+        subagents_dir,
+        "a-sibling",
+        agent_type="Explore",
+        tool_use_id="toolu_sibling",
+        records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sibling-output",
+                "message": {"role": "assistant", "content": "exploring"},
+            }
+        ],
+    )
+    _write_subagent_files(
+        subagents_dir,
+        "b-fork",
+        agent_type="fork",
+        tool_use_id="toolu_fork",
+        records=[
+            parent_prompt,
+            parent_spawns,
+            _spawn_record(["toolu_fork_child"], is_sidechain=True, uuid="fork-own-spawn"),
+        ],
+    )
+    _write_subagent_files(
+        subagents_dir,
+        "c-fork-child",
+        agent_type="Explore",
+        tool_use_id="toolu_fork_child",
+        records=[],
+    )
+    start_paths, handler = _subagent_start_recorder()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await _poll_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+        )
+
+    assert start_paths == {
+        "z-parent": "/v1/sessions/conv_root/events",
+        "a-sibling": "/v1/sessions/conv_z-parent/events",
+        "b-fork": "/v1/sessions/conv_z-parent/events",
+        "c-fork-child": "/v1/sessions/conv_b-fork/events",
+    }
+    assert state.subagents["a-sibling"].parent_subagent_id == "z-parent"
+    assert state.subagents["b-fork"].parent_subagent_id == "z-parent"
+    assert state.subagents["c-fork-child"].parent_subagent_id == "b-fork"
+
+
+async def test_subagent_watcher_does_not_read_transcripts_for_an_unreadable_meta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``.meta.json`` that does not parse is deferred without a transcript read."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True)
+    (subagents_dir / "agent-broken.meta.json").write_text('{"agentType": ', encoding="utf-8")
+    (subagents_dir / "agent-broken.jsonl").write_text("", encoding="utf-8")
+    reads = _count_correlation_reads(monkeypatch)
+    _, handler = _subagent_start_recorder()
+
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await _poll_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+        )
+
+    assert reads == []
+    assert "broken" not in state.subagents
+    assert "unreadable meta" in caplog.text
+
+
+async def test_subagent_watcher_backs_off_between_resolve_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved spawn is not correlated again on the very next poll."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    _write_subagent_files(
+        subagents_dir, "orphan", agent_type="Explore", tool_use_id="toolu_missing", records=[]
+    )
+    reads = _count_correlation_reads(monkeypatch)
+    _, handler = _subagent_start_recorder()
+    tracker = forwarder._SubagentResolveTracker()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await _poll_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            resolve_tracker=tracker,
+        )
+        assert reads
+        reads.clear()
+        state = await _poll_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            resolve_tracker=tracker,
+        )
+
+    assert reads == []
+    assert "orphan" not in state.subagents
+
+
+async def test_subagent_watcher_parks_an_unresolvable_spawn_after_its_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawn no transcript ever owns is retried a bounded number of times, then parked once."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    _write_subagent_files(
+        subagents_dir, "orphan", agent_type="Explore", tool_use_id="toolu_missing", records=[]
+    )
+    reads = _count_correlation_reads(monkeypatch)
+    start_paths, handler = _subagent_start_recorder()
+    tracker = forwarder._SubagentResolveTracker(max_attempts=3, base_delay_s=0.0)
+
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
+    state = forwarder.SubagentForwardState(subagents={})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _attempt in range(2):
+            reads.clear()
+            state = await _poll_subagents(
+                client,
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                resolve_tracker=tracker,
+            )
+            assert reads, "an attempt that is due correlates the transcripts"
+            assert "orphan" not in state.subagents
+        assert "Parking" not in caplog.text
+
+        reads.clear()
+        state = await _poll_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            resolve_tracker=tracker,
+        )
+        assert reads
+        parked = state.subagents["orphan"]
+        assert parked.child_conversation_id == ""
+        assert parked.parent_subagent_id is None
+        assert forwarder._read_subagent_forward_state(bridge_dir) == state
+
+        reads.clear()
+        state = await _poll_subagents(
+            client,
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            resolve_tracker=tracker,
+        )
+
+    # Parked: no further correlation reads, no registration, one WARNING.
+    assert reads == []
+    assert start_paths == {}
+    parking = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "spawn never resolved" in record.getMessage()
+    ]
+    assert len(parking) == 1
+    assert "toolu_missing" in parking[0].getMessage()
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+
+
 async def test_subagent_watcher_forwards_transcript_items_to_child_session(
     tmp_path: Path,
 ) -> None:

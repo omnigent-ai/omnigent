@@ -141,6 +141,12 @@ _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
 _HTTP_POST_RETRY_BASE_DELAY_S = 1.0
 _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
+# An unregistered ``.meta.json`` makes each poll re-read the whole transcript
+# tree to find its spawn call. Back an unresolved one off, and park it after
+# this many misses, so a spawn that never resolves cannot keep that read running.
+_SUBAGENT_RESOLVE_MAX_ATTEMPTS = 10
+_SUBAGENT_RESOLVE_RETRY_BASE_DELAY_S = 0.5
+_SUBAGENT_RESOLVE_RETRY_MAX_DELAY_S = 30.0
 # Ceiling for the backoff exponent. Transient failures retry with no give-up
 # budget (by design — see _PostRetryTracker), so ``attempts`` is unbounded, and
 # ``min()`` evaluates both operands: without this clamp ``2 ** attempts`` is
@@ -916,6 +922,56 @@ class _PostRetryDecision:
     permanent: bool
 
 
+@dataclass(frozen=True)
+class _SubagentResolveDecision:
+    """Outcome of one failed attempt to resolve a sub-agent's spawn."""
+
+    attempts: int
+    delay_s: float
+    exhausted: bool
+
+
+class _SubagentResolveTracker:
+    """Back off between resolve attempts for an unregistered ``.meta.json``, then park it."""
+
+    def __init__(
+        self,
+        *,
+        max_attempts: int = _SUBAGENT_RESOLVE_MAX_ATTEMPTS,
+        base_delay_s: float = _SUBAGENT_RESOLVE_RETRY_BASE_DELAY_S,
+        max_delay_s: float = _SUBAGENT_RESOLVE_RETRY_MAX_DELAY_S,
+    ) -> None:
+        self._max_attempts = max(1, max_attempts)
+        self._base_delay_s = max(0.0, base_delay_s)
+        self._max_delay_s = max(0.0, max_delay_s)
+        self._entries: dict[str, _PostRetryEntry] = {}
+
+    def retry_delay_s(self, subagent_id: str) -> float | None:
+        """Return the remaining backoff for ``subagent_id``, or ``None`` when an attempt is due."""
+        entry = self._entries.get(subagent_id)
+        if entry is None:
+            return None
+        remaining = entry.next_attempt_at - time.monotonic()
+        return remaining if remaining > 0 else None
+
+    def record_miss(self, subagent_id: str) -> _SubagentResolveDecision:
+        """Record one unresolved attempt and schedule the next; ``exhausted`` means park it."""
+        entry = self._entries.setdefault(subagent_id, _PostRetryEntry())
+        entry.attempts += 1
+        exponent = min(entry.attempts - 1, _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT)
+        delay_s = min(self._max_delay_s, self._base_delay_s * (2**exponent))
+        entry.next_attempt_at = time.monotonic() + delay_s
+        return _SubagentResolveDecision(
+            attempts=entry.attempts,
+            delay_s=delay_s,
+            exhausted=entry.attempts >= self._max_attempts,
+        )
+
+    def clear(self, subagent_id: str) -> None:
+        """Forget a sub-agent whose spawn resolved or that was parked."""
+        self._entries.pop(subagent_id, None)
+
+
 class _PostRetryTracker:
     """
     Track bounded retries and backoff for Omnigent event posts.
@@ -1187,6 +1243,7 @@ async def forward_claude_transcript_to_session(
         max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
     )
     subagent_status_retries = _PostRetryTracker()
+    subagent_resolve_tracker = _SubagentResolveTracker()
     session_event_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
     # Dedupe: Claude rewrites the same usage block every poll until
@@ -1295,6 +1352,7 @@ async def forward_claude_transcript_to_session(
                             max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
                         )
                         subagent_status_retries = _PostRetryTracker()
+                        subagent_resolve_tracker = _SubagentResolveTracker()
                         external_session_id_mirrored = False
                         task_subjects = {}
                         task_statuses = {}
@@ -1338,6 +1396,7 @@ async def forward_claude_transcript_to_session(
                             max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
                         )
                         subagent_status_retries = _PostRetryTracker()
+                        subagent_resolve_tracker = _SubagentResolveTracker()
                         external_session_id_mirrored = False
                         task_subjects = {}
                         task_statuses = {}
@@ -1460,6 +1519,7 @@ async def forward_claude_transcript_to_session(
                                         start_retry_tracker=subagent_start_retries,
                                         item_retry_tracker=subagent_item_retries,
                                         status_retry_tracker=subagent_status_retries,
+                                        resolve_tracker=subagent_resolve_tracker,
                                         batch_capability=session_event_batch_capability,
                                         status_capability=subagent_status_capability,
                                     ),
@@ -2373,6 +2433,7 @@ def _tool_use_ids_in_transcript(
     transcript_path: Path,
     *,
     include_sidechains: bool,
+    inherited_through: str | None = None,
 ) -> set[str]:
     """Return assistant tool-use ids from a Claude transcript.
 
@@ -2382,6 +2443,10 @@ def _tool_use_ids_in_transcript(
     :param transcript_path: Claude JSONL transcript to inspect.
     :param include_sidechains: Whether records mirrored from child agents
         belong to this transcript owner.
+    :param inherited_through: The owner's own spawn tool-use id. A fork's
+        transcript opens with its parent's context up to and including the call
+        that spawned it, so records through that call are the parent's and are
+        dropped. ``None``, or an id that never appears, keeps every record.
     :returns: Tool-use ids owned by this transcript.
     """
     try:
@@ -2399,25 +2464,37 @@ def _tool_use_ids_in_transcript(
             continue
         if not isinstance(record, dict):
             continue
+        record_ids = _spawn_tool_use_ids_in_record(record)
+        if inherited_through is not None and inherited_through in record_ids:
+            tool_use_ids.clear()
+            inherited_through = None
+            continue
         if record.get("isSidechain") is True and not include_sidechains:
             continue
-        message = record.get("message")
-        if not isinstance(message, dict):
+        tool_use_ids.update(record_ids)
+    return tool_use_ids
+
+
+def _spawn_tool_use_ids_in_record(record: dict[str, object]) -> set[str]:
+    """Return the sub-agent spawn tool-use ids carried by one transcript record."""
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return set()
+    content = message.get("content")
+    if not isinstance(content, list):
+        return set()
+    tool_use_ids: set[str] = set()
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
             continue
-        content = message.get("content")
-        if not isinstance(content, list):
+        # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
+        # Restricting to it keeps an unrelated tool-use id collision from
+        # making a legitimate spawn look ambiguous.
+        if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
             continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
-            # Restricting to it keeps an unrelated tool-use id collision from
-            # making a legitimate spawn look ambiguous.
-            if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
-                continue
-            tool_use_id = block.get("id")
-            if isinstance(tool_use_id, str) and tool_use_id:
-                tool_use_ids.add(tool_use_id)
+        tool_use_id = block.get("id")
+        if isinstance(tool_use_id, str) and tool_use_id:
+            tool_use_ids.add(tool_use_id)
     return tool_use_ids
 
 
@@ -2428,10 +2505,9 @@ def _subagent_parents_by_tool_use(
     """Correlate Claude spawn tool ids to their immediate transcript owner.
 
     Reads the root transcript and every ``agent-*.jsonl`` in full. The caller
-    only invokes this when unregistered meta files exist, so idle sessions pay
-    nothing. The common case is a transient spawn burst; the exception is an
-    orphan meta whose spawn record never lands, which keeps the transcripts
-    re-read on every poll until it appears (or the process restarts).
+    only invokes this when an unregistered meta file is due for a resolve
+    attempt, so idle sessions pay nothing and an orphan meta whose spawn record
+    never lands is bounded by the caller's resolve budget.
     """
     owners: dict[str, str | None] = {}
     ambiguous: set[str] = set()
@@ -2441,9 +2517,16 @@ def _subagent_parents_by_tool_use(
         for path in sorted(subagents_dir.glob("agent-*.jsonl"))
     )
     for path, owner_id in transcript_owners:
+        inherited_through: str | None = None
+        if owner_id is not None:
+            # A sub-agent never owns its own spawn call. A fork carries a copy of
+            # it (and of the parent context before it) as inherited records.
+            own_meta = _read_subagent_meta(path.with_name(f"agent-{owner_id}.meta.json"))
+            inherited_through = own_meta["toolUseId"] if own_meta is not None else None
         for tool_use_id in _tool_use_ids_in_transcript(
             path,
             include_sidechains=owner_id is not None,
+            inherited_through=inherited_through,
         ):
             if tool_use_id in owners and owners[tool_use_id] != owner_id:
                 ambiguous.add(tool_use_id)
@@ -2452,6 +2535,68 @@ def _subagent_parents_by_tool_use(
     for tool_use_id in ambiguous:
         owners.pop(tool_use_id, None)
     return owners
+
+
+def _with_parked_subagent(
+    state: SubagentForwardState,
+    subagent_id: str,
+    *,
+    parent_subagent_id: str | None,
+) -> SubagentForwardState:
+    """Park ``subagent_id``: its empty child id keeps it out of every forwarding loop."""
+    return SubagentForwardState(
+        subagents={
+            **state.subagents,
+            subagent_id: SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id="",
+                parent_subagent_id=parent_subagent_id,
+            ),
+        }
+    )
+
+
+async def _defer_or_park_unresolved_subagent(
+    *,
+    bridge_dir: Path,
+    parent_session_id: str,
+    subagent_id: str,
+    tool_use_id: str | None,
+    reason: str,
+    resolve_tracker: _SubagentResolveTracker,
+    state: SubagentForwardState,
+) -> SubagentForwardState:
+    """Defer an unresolved sub-agent to a later poll, or park it once its budget is spent."""
+    decision = resolve_tracker.record_miss(subagent_id)
+    if not decision.exhausted:
+        _logger.debug(
+            "Deferring claude-native sub-agent with no resolved parent; "
+            "parent_session=%s subagent_id=%s tool_use_id=%s reason=%s attempt=%s "
+            "next_retry_s=%.3f",
+            parent_session_id,
+            subagent_id,
+            tool_use_id,
+            reason,
+            decision.attempts,
+            decision.delay_s,
+        )
+        return state
+    # No dead letter: without a resolved parent there is no correct session to
+    # replay under. The WARNING is the recovery signal.
+    _logger.warning(
+        "Parking claude-native sub-agent whose spawn never resolved; "
+        "parent_session=%s subagent_id=%s tool_use_id=%s reason=%s attempts=%s",
+        parent_session_id,
+        subagent_id,
+        tool_use_id,
+        reason,
+        decision.attempts,
+        extra={"session_id": parent_session_id},
+    )
+    resolve_tracker.clear(subagent_id)
+    parked = _with_parked_subagent(state, subagent_id, parent_subagent_id=None)
+    await _write_subagent_forward_state_async(bridge_dir, parked)
+    return parked
 
 
 async def _forward_available_subagents(
@@ -2467,6 +2612,7 @@ async def _forward_available_subagents(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
     status_capability: _SubagentStatusCapability | None = None,
+    resolve_tracker: _SubagentResolveTracker | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -2499,6 +2645,8 @@ async def _forward_available_subagents(
         event arrays. A new cache is created for direct callers that omit it.
     :param status_capability: Process-local cache of whether the server accepts
         idle observations. A new cache is created for direct callers that omit it.
+    :param resolve_tracker: Backoff and budget for meta files whose spawn has
+        not resolved. A new tracker is created for direct callers that omit it.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -2509,6 +2657,8 @@ async def _forward_available_subagents(
         batch_capability = _SessionEventBatchCapability()
     if status_capability is None:
         status_capability = _SubagentStatusCapability()
+    if resolve_tracker is None:
+        resolve_tracker = _SubagentResolveTracker()
 
     # ── Register newly-appeared sub-agents ──────────────
     # ``glob`` is sync; offload to a thread so we don't stat the
@@ -2520,35 +2670,52 @@ async def _forward_available_subagents(
         for path in meta_paths
         if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
         and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
+        and resolve_tracker.retry_delay_s(sid) is None
     ]
+    # Read the metas before correlating: an unreadable meta must not cost a full
+    # transcript read, and none happens when no candidate is due.
+    candidates: list[tuple[Path, dict[str, str]]] = []
+    for meta_path in candidate_meta_paths:
+        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
+        if meta is None:
+            updated = await _defer_or_park_unresolved_subagent(
+                bridge_dir=bridge_dir,
+                parent_session_id=parent_session_id,
+                subagent_id=_subagent_id_from_meta_path(meta_path),
+                tool_use_id=None,
+                reason="unreadable meta",
+                resolve_tracker=resolve_tracker,
+                state=updated,
+            )
+            continue
+        candidates.append((meta_path, meta))
     parents_by_tool_use = (
         await asyncio.to_thread(
             _subagent_parents_by_tool_use,
             transcript_path,
             subagents_dir,
         )
-        if candidate_meta_paths
+        if candidates
         else {}
     )
     pending: list[tuple[Path, dict[str, str], str | None]] = []
-    for meta_path in candidate_meta_paths:
-        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
-        if meta is None:
-            continue
+    for meta_path, meta in candidates:
+        subagent_id = _subagent_id_from_meta_path(meta_path)
         tool_use_id = meta["toolUseId"]
         if tool_use_id not in parents_by_tool_use:
             # No transcript owns this spawn yet: the record is still mid-write, or
-            # it resolved to two owners and was dropped as ambiguous. Either way we
-            # retry next tick; log so a persistent miss (e.g. a transcript-format
-            # drift) is diagnosable rather than silent.
-            _logger.debug(
-                "Deferring claude-native sub-agent with no resolved parent; "
-                "parent_session=%s subagent_id=%s tool_use_id=%s",
-                parent_session_id,
-                _subagent_id_from_meta_path(meta_path),
-                tool_use_id,
+            # it resolved to two owners and was dropped as ambiguous.
+            updated = await _defer_or_park_unresolved_subagent(
+                bridge_dir=bridge_dir,
+                parent_session_id=parent_session_id,
+                subagent_id=subagent_id,
+                tool_use_id=tool_use_id,
+                reason="no transcript owns the spawn",
+                resolve_tracker=resolve_tracker,
+                state=updated,
             )
             continue
+        resolve_tracker.clear(subagent_id)
         pending.append((meta_path, meta, parents_by_tool_use[tool_use_id]))
 
     while pending:
@@ -2582,15 +2749,8 @@ async def _forward_available_subagents(
                             subagent_id,
                             parent_subagent_id,
                         )
-                        updated = SubagentForwardState(
-                            subagents={
-                                **updated.subagents,
-                                subagent_id: SubagentEntry(
-                                    subagent_id=subagent_id,
-                                    child_conversation_id="",
-                                    parent_subagent_id=parent_subagent_id,
-                                ),
-                            }
+                        updated = _with_parked_subagent(
+                            updated, subagent_id, parent_subagent_id=parent_subagent_id
                         )
                         await _write_subagent_forward_state_async(bridge_dir, updated)
                         made_progress = True
@@ -2633,15 +2793,8 @@ async def _forward_available_subagents(
                         delivered_ambiguous=False,
                         http_status=_http_status_for_log(exc),
                     )
-                    updated = SubagentForwardState(
-                        subagents={
-                            **updated.subagents,
-                            subagent_id: SubagentEntry(
-                                subagent_id=subagent_id,
-                                child_conversation_id="",
-                                parent_subagent_id=parent_subagent_id,
-                            ),
-                        }
+                    updated = _with_parked_subagent(
+                        updated, subagent_id, parent_subagent_id=parent_subagent_id
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
