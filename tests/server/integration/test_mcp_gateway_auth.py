@@ -144,7 +144,8 @@ async def test_registry_selection_preserves_trusted_template_provenance(
     from tests.server.test_bundles import _single_file_yaml_bundle
 
     bundle = _single_file_yaml_bundle(
-        "name: callable-template\nprompt: Use the square root tool.\nexecutor:\n  harness: claude-sdk\ntools:\n"
+        "name: callable-template\nprompt: Use the square root tool.\n"
+        "executor:\n  harness: claude-sdk\ntools:\n"
         "  square_root:\n    type: function\n    description: Square root\n"
         "    callable: math.sqrt\n    parameters:\n      type: object\n"
         "      properties:\n        x:\n          type: number\n"
