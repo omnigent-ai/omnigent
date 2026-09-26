@@ -504,20 +504,26 @@ def copy_opencode_database_for_fork(source_bridge_dir: Path, dest_bridge_dir: Pa
     if not source.is_file():
         return False
     dest = opencode_db_path_for_bridge_dir(dest_bridge_dir)
-    dest_bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _remove_database_files(dest)
     try:
+        dest_bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _remove_database_files(dest)
+        # Pre-create with 0600 so SQLite's -wal/-shm siblings inherit the mode.
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
         with (
-            contextlib.closing(sqlite3.connect(source, timeout=10.0)) as src,
+            # Read-only: a sole writer connection would checkpoint (and delete)
+            # the source's WAL on close, discarding an uncheckpointed server.
+            contextlib.closing(
+                sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10.0)
+            ) as src,
             contextlib.closing(sqlite3.connect(dest)) as dst,
         ):
             src.backup(dst)
             dst.execute("UPDATE session_v2 SET time_suspended = NULL")
             dst.commit()
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
         _remove_database_files(dest)
         return False
-    os.chmod(dest, 0o600)
     return True
 
 

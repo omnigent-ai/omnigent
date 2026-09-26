@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 from pathlib import Path
@@ -672,7 +673,18 @@ def test_copy_opencode_database_for_fork_releases_claims(tmp_path: Path) -> None
     source_dir = tmp_path / "source"
     dest_dir = tmp_path / "dest"
     dest_dir.mkdir()
-    _make_opencode_db(opencode_db_path_for_bridge_dir(source_dir), claimed=True)
+    source = opencode_db_path_for_bridge_dir(source_dir)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    # Hold the writer connection open, as a live opencode server would, so the
+    # copy must read the session while the source WAL is still uncheckpointed.
+    writer = sqlite3.connect(source)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_suspended INTEGER)")
+    writer.execute(
+        "INSERT INTO session_v2 (id, time_suspended) VALUES (?, ?)",
+        ("ses_src", 1_700_000_000_000),
+    )
+    writer.commit()
 
     assert copy_opencode_database_for_fork(source_dir, dest_dir) is True
 
@@ -683,9 +695,59 @@ def test_copy_opencode_database_for_fork_releases_claims(tmp_path: Path) -> None
     assert rows == [("ses_src", None)], "a copied in-flight claim would re-run the source turn"
     assert (dest.stat().st_mode & 0o777) == 0o600
     # The source keeps its own claim; only the copy is released.
-    with sqlite3.connect(opencode_db_path_for_bridge_dir(source_dir)) as conn:
-        assert conn.execute("SELECT time_suspended FROM session_v2").fetchone()[0] is not None
+    assert writer.execute("SELECT time_suspended FROM session_v2").fetchone()[0] is not None
+    writer.close()
+
+
+def test_copy_opencode_database_for_fork_preserves_uncheckpointed_source_wal(
+    tmp_path: Path,
+) -> None:
+    """A crashed server's WAL is never checkpointed by closing a connection on it."""
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    source = opencode_db_path_for_bridge_dir(source_dir)
+    source.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build the WAL contents on a scratch file, then snapshot its raw bytes to
+    # `source` while the writer is still open. Closing the writer afterwards
+    # only checkpoints the scratch file, not the copied `source` files, so
+    # `source` ends up exactly like a crashed server: main db + uncheckpointed
+    # -wal/-shm and no live connection.
+    scratch = tmp_path / "scratch.db"
+    writer = sqlite3.connect(scratch)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_suspended INTEGER)")
+    writer.execute("INSERT INTO session_v2 (id, time_suspended) VALUES ('ses_src', NULL)")
+    writer.commit()
+    for suffix in ("", "-wal", "-shm"):
+        shutil.copy2(
+            scratch.with_name(scratch.name + suffix), source.with_name(source.name + suffix)
+        )
+    writer.close()
+
+    before = {
+        suffix: source.with_name(source.name + suffix).stat()
+        for suffix in ("", "-wal", "-shm")
+        if source.with_name(source.name + suffix).exists()
+    }
+    assert "-wal" in before, "the fixture must leave rows sitting in an uncheckpointed WAL"
+
+    assert copy_opencode_database_for_fork(source_dir, dest_dir) is True
+
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(dest_dir)) as conn:
+        rows = conn.execute("SELECT id FROM session_v2").fetchall()
     conn.close()
+    assert rows == [("ses_src",)]
+    # The main db and -wal hold the durable data and must be byte-for-byte
+    # untouched. The -shm reader-lock index is expected to be re-touched by
+    # any connection (even read-only) but its size never changes.
+    for suffix in ("", "-wal"):
+        after = source.with_name(source.name + suffix).stat()
+        assert after.st_size == before[suffix].st_size
+        assert after.st_mtime == before[suffix].st_mtime
+    assert source.with_name(source.name + "-shm").stat().st_size == before["-shm"].st_size
 
 
 def test_copy_opencode_database_for_fork_missing_source(tmp_path: Path) -> None:
