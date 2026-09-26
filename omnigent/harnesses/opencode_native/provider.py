@@ -145,6 +145,72 @@ def build_opencode_provider_block(
     }
 
 
+def _permission_rules(extra: Sequence[Mapping[str, str]] | None) -> list[dict[str, str]]:
+    """Ask-all first, then caller ``deny`` rules; other effects would bypass the gate."""
+    rules = [dict(rule) for rule in ASK_ALL_PERMISSIONS]
+    for rule in extra or ():
+        if rule.get("effect") == "deny":
+            rules.append(dict(rule))
+        else:
+            _logger.info("opencode config: dropping non-deny permission rule %r", dict(rule))
+    return rules
+
+
+def build_opencode_config(
+    *,
+    model: str | None,
+    gateway: OpenCodeGatewayResolution | None,
+    mcp_servers: Mapping[str, Mapping[str, object]],
+    plugin_paths: Sequence[str],
+    instructions: str | None,
+    permissions: Sequence[Mapping[str, str]] | None = None,
+    extra_providers: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """
+    Build the per-session v2 ``opencode.json``.
+
+    :param model: Default ``provider/model``; replaced by the gateway's model when set.
+        Dropped (with a log line) when it lacks a ``provider/`` prefix — v2 only
+        accepts ``provider/model``.
+    :param gateway: Resolved OpenAI-compatible gateway, or ``None``. Wins over
+        *model* and *extra_providers* on a provider id collision.
+    :param mcp_servers: ``mcp.servers`` map (see :func:`build_opencode_mcp_block`).
+    :param plugin_paths: Plugin package directories, in load order; de-duplicated.
+    :param instructions: Path of an already-written instructions file (e.g. the
+        per-session ``AGENTS.md`` from Task 56). This is NOT the system prompt:
+        opencode 2.0.18 parses ``instructions`` but never reads it at runtime, so
+        this only records the key when the caller explicitly passes a path — no
+        prompt content is derived from it here.
+    :param permissions: Extra rules; only ``deny`` rules are kept, appended after
+        the mandatory ask-all rule (an ``allow``/``ask`` rule after ask-all would
+        let a tool run without ``permission.asked``).
+    :param extra_providers: Already-v2 provider entries (e.g. the managed ucode
+        config), merged before the gateway's own provider block.
+    :returns: The config dict.
+    """
+    config: dict[str, object] = {
+        "$schema": OPENCODE_CONFIG_SCHEMA,
+        "permissions": _permission_rules(permissions),
+    }
+    providers: dict[str, object] = {k: dict(v) for k, v in (extra_providers or {}).items()}
+    if gateway is not None:
+        providers.update(build_opencode_provider_block(gateway))
+        model = gateway.qualified_model
+    if providers:
+        config["providers"] = providers
+    if model and "/" in model:
+        config["model"] = model
+    elif model:
+        _logger.info("opencode config: ignoring model %r without a provider prefix", model)
+    if mcp_servers:
+        config["mcp"] = {"servers": {name: dict(entry) for name, entry in mcp_servers.items()}}
+    if plugin_paths:
+        config["plugins"] = list(dict.fromkeys(plugin_paths))
+    if instructions:
+        config["instructions"] = [instructions]
+    return config
+
+
 def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:
     """
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).

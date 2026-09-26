@@ -17,6 +17,7 @@ from omnigent.harnesses.opencode_native.provider import (
     _gateway_endpoint_for_model,
     _strip_jsonc_comments,
     _strip_trailing_commas,
+    build_opencode_config,
     build_opencode_omnigent_mcp_server,
     build_opencode_provider_block,
     managed_connect_opencode_config,
@@ -835,3 +836,68 @@ def test_managed_connect_opencode_config_rejects_untrusted_base_url(
     )
 
     assert managed_connect_opencode_config(tmp_path / "session-xdg") is None
+
+
+def test_build_opencode_config_minimal_is_ask_all() -> None:
+    cfg = build_opencode_config(
+        model=None, gateway=None, mcp_servers={}, plugin_paths=[], instructions=None
+    )
+    assert cfg == {
+        "$schema": "https://opencode.ai/config.json",
+        "permissions": [{"action": "*", "resource": "*", "effect": "ask"}],
+    }
+
+
+def test_build_opencode_config_full_v2_shape() -> None:
+    gateway = OpenCodeGatewayResolution(
+        base_url="https://ws/serving-endpoints", api_key="tok", model_id="databricks-x"
+    )
+    cfg = build_opencode_config(
+        model="anthropic/claude-sonnet-4-5",
+        gateway=gateway,
+        mcp_servers={"omnigent": {"type": "local", "command": ["py"], "codemode": False}},
+        plugin_paths=["/b/ucode-auth", "/b/omnigent-policy", "/b/omnigent-policy"],
+        instructions="/x/opencode/AGENTS.md",
+    )
+    # The gateway pins the model to its own provider.
+    assert cfg["model"] == "databricks-gateway/databricks-x"
+    assert set(cfg["providers"]) == {"databricks-gateway"}
+    assert cfg["mcp"] == {
+        "servers": {"omnigent": {"type": "local", "command": ["py"], "codemode": False}}
+    }
+    assert cfg["plugins"] == ["/b/ucode-auth", "/b/omnigent-policy"]
+    assert cfg["instructions"] == ["/x/opencode/AGENTS.md"]
+    for v1_key in ("provider", "permission", "plugin"):
+        assert v1_key not in cfg
+
+
+def test_build_opencode_config_keeps_only_deny_rules_after_ask_all() -> None:
+    cfg = build_opencode_config(
+        model="openai/gpt-5.5",
+        gateway=None,
+        mcp_servers={},
+        plugin_paths=[],
+        instructions=None,
+        permissions=[
+            {"action": "shell", "resource": "rm *", "effect": "deny"},
+            {"action": "read", "resource": "*", "effect": "allow"},
+        ],
+    )
+    assert cfg["permissions"] == [
+        {"action": "*", "resource": "*", "effect": "ask"},
+        {"action": "shell", "resource": "rm *", "effect": "deny"},
+    ]
+    assert cfg["model"] == "openai/gpt-5.5"
+
+
+def test_build_opencode_config_extra_providers_and_bad_model() -> None:
+    cfg = build_opencode_config(
+        model="big-pickle",
+        gateway=None,
+        mcp_servers={},
+        plugin_paths=[],
+        instructions=None,
+        extra_providers={"databricks-oss": {"package": "aisdk:@ai-sdk/openai"}},
+    )
+    assert cfg["providers"] == {"databricks-oss": {"package": "aisdk:@ai-sdk/openai"}}
+    assert "model" not in cfg  # not provider/model
