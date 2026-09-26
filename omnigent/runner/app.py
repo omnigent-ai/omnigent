@@ -1124,6 +1124,8 @@ class _SessionSnapshot:
         ``"cursor-native-ui"``. Used as the sub-agent label when rebuilding a
         work entry for a child the server did not record a ``sub_agent_name``
         for. ``None`` when unbound / the fetch failed.
+    :param wrapper_label: Child ownership marker preserved during recovery;
+        Codex internal threads must not trigger Omnigent inbox wakes.
     """
 
     ok: bool
@@ -1134,6 +1136,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    wrapper_label: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2061,8 +2064,9 @@ async def _recover_subagent_results_from_server(
             child_id in _drained_delivered_subagent_children
         ):
             continue
-        labels = child.get("labels")
-        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+        raw_labels = child.get("labels")
+        labels = raw_labels if isinstance(raw_labels, dict) else {}
+        dispatch_id = undelivered_subagent_dispatch_id(labels)
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
@@ -2085,6 +2089,11 @@ async def _recover_subagent_results_from_server(
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
             title=str(child.get("session_name") or ""),
             work_id=dispatch_id,
+            wrapper_label=(
+                labels["omnigent.wrapper"]
+                if isinstance(labels.get("omnigent.wrapper"), str)
+                else None
+            ),
         )
         if interrupted:
             # This dispatch already existed; a local launch timeout cannot judge it.
@@ -3647,6 +3656,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            wrapper_label: str | None = None
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -3670,6 +3680,12 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    labels = body.get("labels")
+                    raw_wrapper = (
+                        labels.get("omnigent.wrapper") if isinstance(labels, dict) else None
+                    )
+                    if isinstance(raw_wrapper, str):
+                        wrapper_label = raw_wrapper
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -3681,6 +3697,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                wrapper_label=wrapper_label,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -3766,6 +3783,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            wrapper_label=snapshot.labels.get("omnigent.wrapper"),
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -5539,6 +5557,7 @@ def create_runner_app(
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            wrapper_label=snapshot.wrapper_label,
         )
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
@@ -8112,15 +8131,9 @@ def create_runner_app(
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
-        # A codex-native sub-agent (a /side side chat, or one codex spawned) is a
-        # thread in the parent's own app-server, so its completion is not the
-        # parent's to collect — waking the parent would inject an inbox notice
-        # into a chat the user is reading. The wrapper label is only set by the
-        # spawn-tool path, so a forwarder-registered child is caught by the
-        # parent's harness instead.
-        if is_codex_native_subagent_wrapper(entry.wrapper_label) or (
-            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
-        ):
+        # Codex owns its internal threads and /side chats. Independent Omnigent
+        # workers still owe an inbox wake, even when their parent runs Codex.
+        if is_codex_native_subagent_wrapper(entry.wrapper_label):
             return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
