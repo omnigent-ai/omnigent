@@ -842,3 +842,32 @@ async def test_fixture_usage_updated_matches_captured_totals() -> None:
     assert usage["cumulative_cost_usd"] == round(raw["cost"], 6)
     assert usage["cumulative_input_tokens"] == int(raw["tokens"]["input"])
     assert usage["cumulative_output_tokens"] == int(raw["tokens"]["output"])
+
+
+# --- model ------------------------------------------------------------------
+
+
+async def test_first_step_model_is_recorded_not_mirrored() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    assert "external_model_change" not in _types(server.posts)
+
+
+async def test_step_model_change_is_mirrored() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(_step_started("msg_2", model={"id": "gpt-5", "providerID": "openai"}))
+    assert _datas(server.posts, "external_model_change") == [{"model": "openai/gpt-5"}]
+
+
+async def test_model_selected_mirrors_and_dedupes() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    selected = _event(
+        "session.model.selected", model={"id": "claude-opus-4", "providerID": "anthropic"}
+    )
+    await fwd.handle_event(selected)
+    await fwd.handle_event(selected)
+    assert _datas(server.posts, "external_model_change") == [{"model": "anthropic/claude-opus-4"}]

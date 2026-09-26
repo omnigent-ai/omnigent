@@ -278,6 +278,8 @@ class OpenCodeNativeForwarder:
         # Authoritative session totals from ``session.usage.updated``.
         self._session_totals: _UsageTotals | None = None
         self._last_usage_signature: tuple[tuple[str, object], ...] | None = None
+        # Last model mirrored to Omnigent (``provider/id``), to dedupe switches.
+        self._last_model: str | None = None
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -492,8 +494,10 @@ class OpenCodeNativeForwarder:
             return
         turn.assistant_message_id = message_id
         turn.step_model = _model_ref(event.data.get("model"))
-        if self._is_root(turn) and self._bridge_dir is not None:
-            update_active_message_id(self._bridge_dir, message_id, status="busy")
+        if self._is_root(turn):
+            if self._bridge_dir is not None:
+                update_active_message_id(self._bridge_dir, message_id, status="busy")
+            await self._observe_model(turn.step_model, explicit=False)
         await self._begin_turn_if_needed(turn)
 
     @staticmethod
@@ -865,6 +869,28 @@ class OpenCodeNativeForwarder:
         self._last_usage_signature = signature
         await self._post_event(_EXTERNAL_SESSION_USAGE, data)
 
+    async def _observe_model(self, model: str | None, *, explicit: bool) -> None:
+        """Mirror a model change to Omnigent (``external_model_change``), deduped.
+
+        The first model seen on a step is only recorded: it is the model the
+        session already runs, not a switch. An explicit
+        ``session.model.selected`` always mirrors.
+        """
+        if model is None or model == self._last_model:
+            return
+        previous = self._last_model
+        self._last_model = model
+        if previous is None and not explicit:
+            return
+        await self._post_event(_EXTERNAL_MODEL_CHANGE, {"model": model})
+
+    async def _on_model_selected(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.model.selected`` — a TUI ``/model`` or API switch."""
+        turn = await self._active_turn(event)
+        if turn is None or not self._is_root(turn):
+            return
+        await self._observe_model(_model_ref(event.data.get("model")), explicit=True)
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -895,6 +921,7 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.execution.succeeded": OpenCodeNativeForwarder._on_execution_succeeded,
     "session.status": OpenCodeNativeForwarder._on_session_status,
     "session.step.started": OpenCodeNativeForwarder._on_step_started,
+    "session.model.selected": OpenCodeNativeForwarder._on_model_selected,
     "session.text.delta": OpenCodeNativeForwarder._on_text_delta,
     "session.text.ended": OpenCodeNativeForwarder._on_text_ended,
     "session.step.ended": OpenCodeNativeForwarder._on_step_ended,
