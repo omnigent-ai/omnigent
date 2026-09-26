@@ -12,6 +12,7 @@ from dev.opencode_v2_recon import (
     build_recon_opencode_config,
     credential_values_from_env,
     form_answer_for,
+    is_compaction_terminal_event,
     is_terminal_session_event,
     progress_has_incremental_output,
     read_stored_key,
@@ -380,3 +381,30 @@ def test_form_answer_for_mixed_fields() -> None:
         "q3": ["X"],
         "q4": True,
     }
+
+
+def test_is_compaction_terminal_event_matches_ended() -> None:
+    event = {"type": "session.compaction.ended", "data": {"sessionID": "ses_1"}}
+    assert is_compaction_terminal_event(event, "ses_1") is True
+
+
+def test_is_compaction_terminal_event_matches_failed() -> None:
+    event = {"type": "session.compaction.failed", "data": {"sessionID": "ses_1"}}
+    assert is_compaction_terminal_event(event, "ses_1") is True
+
+
+def test_is_compaction_terminal_event_ignores_started_and_delta() -> None:
+    started = {"type": "session.compaction.started", "data": {"sessionID": "ses_1"}}
+    delta = {"type": "session.compaction.delta", "data": {"sessionID": "ses_1"}}
+    assert is_compaction_terminal_event(started, "ses_1") is False
+    assert is_compaction_terminal_event(delta, "ses_1") is False
+
+
+def test_is_compaction_terminal_event_ignores_other_session_ids() -> None:
+    event = {"type": "session.compaction.ended", "data": {"sessionID": "ses_other"}}
+    assert is_compaction_terminal_event(event, "ses_1") is False
+
+
+def test_is_compaction_terminal_event_ignores_unrelated_event_types() -> None:
+    event = {"type": "session.execution.succeeded", "data": {"sessionID": "ses_1"}}
+    assert is_compaction_terminal_event(event, "ses_1") is False

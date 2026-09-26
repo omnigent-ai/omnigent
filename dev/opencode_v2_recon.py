@@ -50,7 +50,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -416,6 +416,42 @@ def is_terminal_session_event(event: dict[str, Any], session_id: str) -> bool:
         if isinstance(status, dict) and status.get("type") == "idle":
             return True
     return False
+
+
+def is_compaction_terminal_event(event: dict[str, Any], session_id: str) -> bool:
+    """
+    True if *event* signals that a ``/compact`` run for *session_id* has finished.
+
+    Per v2's schema (``session-event.ts``'s ``namespace Compaction``),
+    ``session.compaction.started`` is followed by zero or more
+    ``session.compaction.delta`` frames and exactly one of the durable
+    terminal events ``session.compaction.ended`` or
+    ``session.compaction.failed``. Only those two end the compaction.
+
+    :param event: One decoded ``/api/event`` frame.
+    :param session_id: The session the compact request was issued for.
+    :returns: Whether *event* is a compaction-terminal signal for *session_id*.
+    """
+    data = event.get("data", {})
+    if data.get("sessionID") != session_id:
+        return False
+    return event.get("type") in ("session.compaction.ended", "session.compaction.failed")
+
+
+async def _wait_for_event(
+    events: list[dict[str, Any]],
+    timeout: float,
+    predicate: Callable[[dict[str, Any]], bool],
+) -> dict[str, Any] | None:
+    """Poll captured events until one matches *predicate*, or *timeout* elapses."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        for event in events:
+            if predicate(event):
+                return event
+        await asyncio.sleep(0.5)
+    return None
 
 
 _DRIVE_PROMPTS_TIMEOUT_SECONDS = 180.0  # 120s auto-answer + 60s terminal-wait budgets, combined
@@ -838,7 +874,29 @@ async def run_recon(args: argparse.Namespace) -> int:
 
             compact_resp = await client.post(f"/api/session/{session_id}/compact", json={})
             findings["compact_status"] = str(compact_resp.status_code)
-            await asyncio.sleep(2.0)
+
+            if compact_resp.status_code < 300:
+                compaction_terminal = await _wait_for_event(
+                    events, 120.0, lambda e: is_compaction_terminal_event(e, session_id)
+                )
+                if compaction_terminal is None:
+                    findings["compaction_terminal_event"] = "none captured within 120s"
+                else:
+                    findings["compaction_terminal_event"] = str(
+                        compaction_terminal.get("type", "unknown")
+                    )
+                    # A durable compaction.ended/failed can be immediately followed
+                    # by another execution/status transition for the same session;
+                    # capture it too, if one shows up, so the fixture isn't cut short.
+                    await _wait_for_event(
+                        events, 30.0, lambda e: is_terminal_session_event(e, session_id)
+                    )
+            else:
+                findings["compaction_terminal_event"] = (
+                    f"compact request failed ({compact_resp.status_code})"
+                )
+
+            await asyncio.sleep(2.0)  # drain trailing events once compaction settles
 
             stop.set()
             stream_task.cancel()
