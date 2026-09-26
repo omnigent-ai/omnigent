@@ -1289,6 +1289,20 @@ describe("closed bridge overlay", () => {
   });
 });
 
+describe("status overlay stacking", () => {
+  it("keeps the connecting overlay inside the terminal's own stacking context", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    const view = screen.getByTestId("terminal-view");
+    expect(view).toHaveAttribute("data-state", "connecting");
+    expect(within(view).getByText("Connecting…")).toBeInTheDocument();
+    // Without `isolate`, the overlay's z-index resolves at the page level and
+    // paints over dropdowns portaled to <body> at z-50 (the session menu).
+    expect(view).toHaveClass("isolate");
+  });
+});
+
 describe("automatic reconnect", () => {
   beforeEach(() => {
     // Fake only what the backoff scheduling touches; promises and
