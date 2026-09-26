@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.codex_native import process_registry as registry
+from omnigent.inner import _proc
 
 fcntl = pytest.importorskip("fcntl")
 _REAL_PROCESS_START_IDENTITY = registry._process_start_identity
@@ -433,3 +434,61 @@ def test_reap_state_dir_kills_matching_app_server_and_spares_others(tmp_path: Pa
 def test_reap_state_dir_without_matches_is_a_noop(tmp_path: Path) -> None:
     """A state dir no live process references reaps nothing."""
     assert registry.reap_codex_native_processes_for_state_dir(tmp_path / "no-match") == 0
+
+
+def test_reconciliation_kills_session_stragglers_of_a_dead_leader(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """
+    An orphan left in a dead app-server's session is reaped with the entry.
+
+    Mirrors a Codex stdio MCP server: its own process group, so ``killpg`` on
+    the recorded group never reached it, ``SIGTERM`` ignored, and the
+    app-server already gone, so only the session sweep can find it.
+    """
+    monkeypatch.setattr(registry, "_process_start_identity", _REAL_PROCESS_START_IDENTITY)
+    monkeypatch.setattr(
+        registry, "_process_group_matches_entry", _REAL_PROCESS_GROUP_MATCHES_ENTRY
+    )
+    path = tmp_path / "registry.json"
+    pid_file = tmp_path / "straggler.pid"
+    straggler = (
+        "import os, pathlib, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(300)\n"
+    )
+    leader_code = (
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {straggler!r}], process_group=0)\n"
+    )
+    leader = subprocess.Popen([sys.executable, "-c", leader_code], start_new_session=True)
+    straggler_pid = 0
+    try:
+        registry.register_codex_native_process(
+            pid=leader.pid,
+            pgid=leader.pid,
+            session_tag="dead-leader",
+            owner_lock_path=None,
+            registry_path=path,
+        )
+        leader.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not (
+            pid_file.exists() and pid_file.read_text().strip()
+        ):
+            time.sleep(0.05)
+        straggler_pid = int(pid_file.read_text().strip())
+        assert os.getsid(straggler_pid) == leader.pid
+
+        registry.reconcile_codex_native_process_registry(registry_path=path)
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _proc.process_alive(straggler_pid):
+            time.sleep(0.05)
+        assert not _proc.process_alive(straggler_pid), "session straggler survived"
+        assert _registry_payload(path) == []
+    finally:
+        if straggler_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(straggler_pid, signal.SIGKILL)
