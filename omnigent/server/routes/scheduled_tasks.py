@@ -23,6 +23,7 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -38,6 +39,7 @@ from omnigent.server.routes._session_create_validation import (
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -79,6 +81,7 @@ class CreateScheduledTaskRequest(BaseModel):
     # ``managed_sandbox`` runs the task in a fresh server-provisioned sandbox
     # (no host_id/workspace); default keeps the connected-host behavior.
     execution_target: str = "connected_host"
+    project_id: str | None = None
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -111,6 +114,7 @@ class UpdateScheduledTaskRequest(BaseModel):
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     execution_target: str | None = Field(default=None, min_length=1)
+    project_id: str | None = None
     state: str | None = None
 
     @model_validator(mode="after")
@@ -171,6 +175,7 @@ def _to_response(
         "workspace": task.workspace,
         "host_id": task.host_id,
         "execution_target": task.execution_target,
+        "project_id": task.project_id,
         "state": task.state,
         "last_run_at": task.last_run_at,
         "last_run_status": last_run_status,
@@ -217,11 +222,20 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+def _canonical_project_id(project_id: str) -> str:
+    """Normalize a Project id without hiding malformed-id semantics."""
+    try:
+        return uuid_to_bytes(project_id).hex()
+    except InvalidUuidError:
+        raise OmnigentError("Not found.", code=ErrorCode.NOT_FOUND) from None
+
+
 def create_scheduled_tasks_router(
     store: ScheduledTaskStore,
     *,
     agent_store: AgentStore,
     conversation_store: ConversationStore,
+    project_store: ProjectStore | None = None,
     permission_store: PermissionStore | None = None,
     agent_cache: Any | None = None,
     auth_provider: AuthProvider | None = None,
@@ -246,6 +260,23 @@ def create_scheduled_tasks_router(
     def _scheduler(request: Request) -> Any | None:
         """The live scheduler off app state, or ``None`` if not running."""
         return getattr(request.app.state, "scheduled_task_scheduler", None)
+
+    def _project_owner(owner: str) -> str | None:
+        """Return the caller identity as stored on owner-private Projects."""
+        return owner if auth_provider is not None else None
+
+    async def _resolve_requested_project(project_id: str, owner: str | None) -> str:
+        """Resolve an assignment target while preserving the API's 404 privacy."""
+        canonical_project_id = _canonical_project_id(project_id)
+        if project_store is None:
+            raise OmnigentError(
+                "Project assignment is not supported by this server",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        project = await asyncio.to_thread(project_store.get, canonical_project_id, user_id=owner)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return project.id
 
     async def _validate_launch_inputs(
         request: Request,
@@ -360,6 +391,15 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        if "project_id" in body.model_fields_set and body.project_id is None:
+            raise OmnigentError(
+                'project_id must be a project id or "" to unfile; omit the field for unfiled',
+                code=ErrorCode.INVALID_INPUT,
+            )
+        project_id = None
+        if body.project_id:
+            project_id = await _resolve_requested_project(body.project_id, _project_owner(owner))
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
@@ -379,7 +419,7 @@ def create_scheduled_tasks_router(
             name=body.name,
             prompt=body.prompt,
             rrule=body.rrule,
-            user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            user_id=owner_id,
             agent_id=body.agent_id,
             timezone=body.timezone,
             model_override=model_override,
@@ -389,6 +429,7 @@ def create_scheduled_tasks_router(
             workspace=workspace,
             host_id=body.host_id,
             execution_target=body.execution_target,
+            project_id=project_id,
         )
         scheduler = _scheduler(request)
         if scheduler is not None:
@@ -401,7 +442,11 @@ def create_scheduled_tasks_router(
         )
 
     @router.get("/scheduled-tasks")
-    async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
+    async def list_scheduled_tasks(
+        request: Request,
+        project_id: str | None = Query(default=None),
+        unfiled: bool = Query(default=False),
+    ) -> dict[str, list[dict[str, Any]]]:
         """List the caller's scheduled tasks.
 
         Lazy-on-read stale backstop: before returning, force-fail any of this
@@ -415,7 +460,19 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+        if unfiled and project_id is not None:
+            raise OmnigentError(
+                "project_id and unfiled=true cannot be combined",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if unfiled:
+            tasks = store.list(owner_user_id=owner_id, project_id=None)
+        elif project_id is not None:
+            resolved = await _resolve_requested_project(project_id, _project_owner(owner))
+            tasks = store.list(owner_user_id=owner_id, project_id=resolved)
+        else:
+            tasks = store.list(owner_user_id=owner_id)
+        tasks = [task for task in tasks if _owns_task(task, owner_id)]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a
@@ -544,6 +601,13 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
+        if "project_id" in body.model_fields_set:
+            if body.project_id is None:
+                raise OmnigentError(
+                    'project_id must be a project id or "" to unfile; '
+                    "omit the field to leave membership unchanged",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         if body.rrule is not None:
             _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
@@ -558,6 +622,12 @@ def create_scheduled_tasks_router(
             # fires the new harness with the old one's flags.
             for stale in ("model_override", "reasoning_effort", "permission_mode"):
                 fields.setdefault(stale, None)
+        if "project_id" in fields:
+            fields["project_id"] = (
+                None
+                if fields["project_id"] == ""
+                else await _resolve_requested_project(fields["project_id"], _project_owner(owner))
+            )
         if {"model_override", "reasoning_effort"}.intersection(fields):
             model_override, reasoning_effort = validate_session_model_metadata(
                 model_override=fields.get("model_override", existing.model_override),

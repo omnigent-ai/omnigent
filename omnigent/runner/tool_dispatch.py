@@ -4530,6 +4530,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "workspace",
     "host_id",
     "execution_target",
+    "project_id",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4546,6 +4547,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "host_id",
     "execution_target",
     "state",
+    "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 

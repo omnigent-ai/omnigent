@@ -83,6 +83,7 @@ async def test_create_posts_payload() -> None:
                 "agent_id": "ag_1",
                 "workspace": "/repo",
                 "host_id": "host_1",
+                "project_id": "fedcba9876543210fedcba9876543210",
                 "base_branch": "main",
                 "unexpected": "dropped",
             }
@@ -98,6 +99,7 @@ async def test_create_posts_payload() -> None:
         "agent_id": "ag_1",
         "workspace": "/repo",
         "host_id": "host_1",
+        "project_id": "fedcba9876543210fedcba9876543210",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
 
@@ -121,6 +123,7 @@ async def test_update_patches_by_id() -> None:
                 "state": "paused",
                 "workspace": "/repo2",
                 "host_id": "fedcba9876543210fedcba9876543210",
+                "project_id": "",
             }
         ),
         server_client=client,
@@ -131,6 +134,7 @@ async def test_update_patches_by_id() -> None:
         "state": "paused",
         "workspace": "/repo2",
         "host_id": "fedcba9876543210fedcba9876543210",
+        "project_id": "",
     }
 
 
@@ -230,9 +234,11 @@ def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
     # no-workspace research / summary / chat-only task omits both.
     assert "workspace" in properties
     assert "host_id" in properties
+    assert "project_id" in properties
     assert "base_branch" not in properties
     assert "workspace" not in schema["required"]
     assert "host_id" not in schema["required"]
+    assert "project_id" not in schema["required"]
     assert set(schema["required"]) == {"name", "prompt", "rrule", "agent_id"}
 
 
@@ -245,6 +251,7 @@ def test_update_tool_schema_allows_connected_host_changes() -> None:
     assert "host_id" in properties
     # Switching which agent/harness a task runs is part of the update surface.
     assert "agent_id" in properties
+    assert "project_id" in properties
 
 
 def test_tools_in_dispatch_and_relay_sets() -> None:
