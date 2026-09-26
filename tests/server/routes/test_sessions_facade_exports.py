@@ -31,6 +31,8 @@ def test_harness_override_executor_type_reexported() -> None:
     [
         "_HOST_RUNNER_STATUS_TIMEOUT_S",
         "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
+        "_HOST_BOUND_RUNNER_CONNECT_GRACE_S",
+        "_HOST_BOUND_RUNNER_ALIVE_CONNECT_TIMEOUT_S",
     ],
 )
 def test_timeout_constants_reexported(name: str) -> None:

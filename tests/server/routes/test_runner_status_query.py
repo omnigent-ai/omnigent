@@ -1,12 +1,14 @@
 """Tests for ``_query_host_runner_status`` — the host-owned liveness query.
 
-The host owns runner-process liveness (it holds the ``Popen``). Before the
-message-dispatch connect grace, the server asks the host whether an
-absent-from-the-tunnel runner is still coming (``alive``) or gone for good
-(``dead`` / ``unknown``). A verdict of ``None`` means "no authoritative
+The host owns runner-process liveness (it holds the ``Popen``). Raced against
+the message-dispatch connect grace, the server asks the host whether the
+process behind an absent-from-the-tunnel runner is still held (``alive``) or
+gone for good (``dead`` / ``unknown``). A ``dead``/``unknown`` verdict
+shortens the wait so the relaunch runs at once; an ``alive`` one extends it
+to the caller's bounded runner-online budget rather than abandoning a runner
+that may still register. A verdict of ``None`` means "no authoritative
 answer" (host too old, slow, or the connection dropped), and the caller
-falls back to the plain grace wait — so the query can only ever speed up
-the cold path, never slow it down.
+falls back to the plain grace wait unchanged.
 """
 
 from __future__ import annotations
@@ -172,9 +174,9 @@ async def test_query_connection_error_returns_none() -> None:
 async def test_query_future_exception_returns_none() -> None:
     """A future resolved with an exception degrades to ``None``, not a raise.
 
-    Defensive contract: the query only ever speeds up the connect grace, so
-    an unexpected failure must fall back to the wait rather than surface as
-    a 500 on the message POST.
+    Defensive contract: the query only ever adjusts the connect wait, so an
+    unexpected failure must fall back to the plain grace rather than surface
+    as a 500 on the message POST.
     """
     conn = _FakeHostConn()
     registry = _FaultingRegistry()
