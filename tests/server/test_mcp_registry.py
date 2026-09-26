@@ -419,3 +419,161 @@ def test_kms_size_boundary_counts_utf8_bytes():
     with pytest.raises(SecretTooLargeError):
         cipher.encrypt("é" * 2049, context={"user_id": "alice"})
     kms.encrypt.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["timeout", "non-json", "array", "expiry", "infinite", "token-type", "empty-token"]
+)
+async def test_oauth_callback_errors_redirect_without_provider_secrets(
+    db_uri, monkeypatch, caplog, failure
+):
+    from urllib.parse import parse_qs, urlsplit
+
+    monkeypatch.setenv("OMNIGENT_MCP_OAUTH_STATE_SECRET", "test-signing-key-32-characters-long")
+    entry = service(
+        auth="oauth",
+        oauth={
+            "authorize_url": "https://auth.example.test/authorize",
+            "token_url": "https://auth.example.test/token",
+            "client_id": "demo",
+        },
+    )
+    store = CredentialStore(db_uri, _FakeCipher())
+    registry = McpRegistry(McpRegistryConfig(public_url="https://test", services=[entry]), store)
+    app = FastAPI()
+    app.state.mcp_registry_auth = TestIdentity()
+    app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        start = await browser.get("/v1/connections/mcp-tracker/connect?return_to=/settings/mcp")
+        assert start.status_code == 302
+        state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+        marker = "private-provider-response-do-not-log"
+
+        def exchange(request):
+            if failure == "timeout":
+                raise httpx.ReadTimeout(marker, request=request)
+            if failure == "non-json":
+                return httpx.Response(200, text=marker)
+            if failure == "array":
+                return httpx.Response(200, json=[marker])
+            response = {"access_token": marker, "token_type": "Bearer", "expires_in": 3600}
+            if failure == "expiry":
+                response["expires_in"] = marker
+            if failure == "infinite":
+                response["expires_in"] = "Infinity"
+            if failure == "token-type":
+                response["token_type"] = 123
+            if failure == "empty-token":
+                response["access_token"] = ""
+            return httpx.Response(200, json=response)
+
+        client_type = httpx.AsyncClient
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: client_type(transport=httpx.MockTransport(exchange), **kwargs),
+        )
+        callback = await browser.get(
+            "/v1/connections/mcp-tracker/callback",
+            params={"code": "synthetic-code", "state": state},
+        )
+        assert callback.status_code == 302
+        assert callback.headers["location"] == "/settings/mcp?mcp-tracker=error"
+        assert marker not in caplog.text + callback.text + callback.headers["location"]
+        assert store.get("alice", "mcp:tracker") is None
+        assert store.get("alice", "mcp-pending:tracker") is None
+
+
+@pytest.mark.asyncio
+async def test_catalog_cursor_bounds_credential_reads_and_filters_services(db_uri, monkeypatch):
+    from unittest.mock import Mock
+
+    entries = [service(id=f"service-{i:03}") for i in range(105)]
+    entries.append(service(id="private-service", allowed_users=["bob"]))
+    registry = McpRegistry(
+        McpRegistryConfig(services=list(reversed(entries))), CredentialStore(db_uri, _FakeCipher())
+    )
+    lookup = Mock(return_value=None)
+    monkeypatch.setattr(registry.store, "get", lookup)
+    app = FastAPI()
+    app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        seen = []
+        cursor = ""
+        for size in (50, 50, 5):
+            lookup.reset_mock()
+            response = await browser.get("/v1/mcp-registry/services", params={"after": cursor})
+            assert response.status_code == 200
+            assert "private-service" not in response.text
+            assert response.headers["cache-control"] == "no-store"
+            data = response.json()
+            assert len(data["data"]) == lookup.call_count == size
+            seen.extend(s["id"] for s in data["data"])
+            cursor = data["next_cursor"]
+        assert cursor is None
+        assert seen == [f"service-{i:03}" for i in range(105)]
+        for limit in (0, 101):
+            lookup.reset_mock()
+            response = await browser.get("/v1/mcp-registry/services", params={"limit": limit})
+            assert response.status_code == 422
+            lookup.assert_not_called()
+        # A removed continuation key still resumes lexicographically.
+        del registry.services["service-049"]
+        response = await browser.get(
+            "/v1/mcp-registry/services", params={"after": "service-049", "limit": 1}
+        )
+        assert response.json()["data"][0]["id"] == "service-050"
+
+
+@pytest.mark.asyncio
+async def test_refresh_locks_release_after_waiters_finish_or_cancel(registry, monkeypatch):
+    import gc
+
+    entry = service(
+        auth="oauth",
+        oauth={
+            "authorize_url": "https://auth.example.test/authorize",
+            "token_url": "https://auth.example.test/token",
+            "client_id": "demo",
+        },
+    )
+    registry.store.upsert(
+        "alice",
+        "mcp:tracker",
+        secret={"access_token": "expired", "refresh_token": "refresh"},
+        metadata={"expires_at": 0},
+    )
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def exchange(*args):
+        started.set()
+        await release.wait()
+        return {"access_token": "fresh", "expires_in": 3600}
+
+    refresh = AsyncMock(side_effect=exchange)
+    monkeypatch.setattr(registry, "exchange", refresh)
+    leader = asyncio.create_task(registry.token(entry, "alice", SimpleNamespace()))
+    await started.wait()
+    cancelled = asyncio.create_task(registry.token(entry, "alice", SimpleNamespace()))
+    waiter = asyncio.create_task(registry.token(entry, "alice", SimpleNamespace()))
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    assert len(registry._locks) == 1
+    release.set()
+    assert await asyncio.gather(leader, waiter) == ["fresh", "fresh"]
+    refresh.assert_awaited_once()
+    del leader, waiter, cancelled
+    await asyncio.sleep(0)
+    gc.collect()
+    assert not registry._locks

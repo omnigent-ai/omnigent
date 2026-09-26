@@ -31,6 +31,26 @@ def test_managed_mcp_account_controls(page: Page, live_server: str) -> None:
         route.fulfill(response=response, json=body)
 
     def catalog(route: Route) -> None:
+        if "after=" not in route.request.url:
+            route.fulfill(
+                json={
+                    "data": [
+                        {
+                            "id": "announcement",
+                            "title": "Announcements",
+                            "description": "",
+                            "auth": "none",
+                            "connected": True,
+                            "tools": ["read"],
+                            "connect_provider": "none",
+                        }
+                    ],
+                    "next_cursor": "announcement",
+                }
+            )
+            return
+        assert parse_qs(urlsplit(route.request.url).query)["after"] == ["announcement"]
+
         route.fulfill(
             json={
                 "data": [
@@ -63,7 +83,7 @@ def test_managed_mcp_account_controls(page: Page, live_server: str) -> None:
             route.fulfill(json={"tools": ["read_ticket"]})
 
     page.route("**/v1/info", info)
-    page.route("**/v1/mcp-registry/services", catalog)
+    page.route("**/v1/mcp-registry/services*", catalog)
     page.route("**/v1/mcp-registry/services/tracker/connection", connection)
     page.route("**/v1/mcp-registry/services/tracker/test", test_connection)
     page.goto(f"{live_server}/settings/general")
@@ -75,9 +95,9 @@ def test_managed_mcp_account_controls(page: Page, live_server: str) -> None:
     token = page.get_by_label("Token for Demo work tracker")
     token.fill("demo-token")
     page.get_by_role("button", name="Save token").click()
-    expect(page.get_by_text("Connected", exact=True)).to_be_visible()
+    expect(page.get_by_text("Connected", exact=True)).to_have_count(2)
     expect(token).to_have_count(0)
-    page.get_by_role("button", name="Test connection").click()
+    page.get_by_role("button", name="Test connection").last.click()
     expect(page.get_by_role("status")).to_contain_text(
         "Tool discovery succeeded. Tools: read_ticket"
     )
@@ -87,7 +107,7 @@ def test_managed_mcp_account_controls(page: Page, live_server: str) -> None:
     if directory := os.environ.get("E2E_SCREENSHOT_DIR"):
         page.screenshot(path=Path(directory) / "mcp-settings.png", animations="disabled")
     fail_test = True
-    page.get_by_role("button", name="Test connection").click()
+    page.get_by_role("button", name="Test connection").last.click()
     expect(page.get_by_role("alert")).to_contain_text("MCP connection failed")
     page.get_by_role("button", name="Disconnect", exact=True).click()
     expect(page.get_by_text("Not connected", exact=True)).to_be_visible()

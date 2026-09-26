@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import math
 import os
 import secrets
 import time
@@ -13,6 +14,7 @@ from builtins import ExceptionGroup
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
+from weakref import WeakValueDictionary
 
 import httpx
 import yaml
@@ -177,7 +179,9 @@ class McpRegistry:
         self.config = config
         self.services = {service.id: service for service in config.services}
         self.store = store
-        self._locks: dict[tuple[int, str, str], asyncio.Lock] = {}
+        self._locks: WeakValueDictionary[tuple[int, str, str], asyncio.Lock] = (
+            WeakValueDictionary()
+        )
         if any(s.auth in {"oauth", "bearer"} for s in config.services) and store is None:
             raise ValueError("MCP account connections require the existing KMS or Vault cipher")
         self.state_secret = os.environ.get("OMNIGENT_MCP_OAUTH_STATE_SECRET", "")
@@ -211,7 +215,8 @@ class McpRegistry:
 
         assert self.store is not None
         key = (current_workspace_id(), user_id, service.id)
-        async with self._locks.setdefault(key, asyncio.Lock()):
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
             conn = await asyncio.to_thread(
                 self.store.get, user_id, f"mcp:{service.id}", with_secret=True
             )
@@ -243,11 +248,16 @@ class McpRegistry:
 
     @staticmethod
     def metadata(tokens: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "expires_at": time.time() + float(tokens["expires_in"])
-            if tokens.get("expires_in") is not None
-            else None
-        }
+        expiry = tokens.get("expires_in")
+        if expiry is None:
+            return {"expires_at": None}
+        try:
+            seconds = float(expiry)
+            if isinstance(expiry, bool) or not math.isfinite(seconds) or seconds < 0:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise ConnectionError("MCP provider returned an invalid token expiry") from None
+        return {"expires_at": time.time() + seconds}
 
     async def exchange(self, service: McpService, data: dict[str, Any]) -> dict[str, Any]:
         oauth = service.oauth
@@ -260,18 +270,39 @@ class McpRegistry:
             data["client_secret"] = secret
         if oauth.resource:
             data["resource"] = oauth.resource
-        async with httpx.AsyncClient(follow_redirects=False, timeout=20) as client:
-            response = await client.post(
-                oauth.token_url, data=data, headers={"Accept": "application/json"}
-            )
+        try:
+            async with httpx.AsyncClient(follow_redirects=False, timeout=20) as client:
+                response = await client.post(
+                    oauth.token_url, data=data, headers={"Accept": "application/json"}
+                )
+        except httpx.RequestError:
+            raise ConnectionError(
+                "MCP authorization could not reach the provider; try again"
+            ) from None
         if response.status_code != 200:
             raise ConnectionError("MCP authorization failed; reconnect the account")
-        tokens = response.json()
+        try:
+            tokens = response.json()
+        except ValueError:
+            raise ConnectionError("MCP provider returned an invalid token response") from None
+        if not isinstance(tokens, dict):
+            raise ConnectionError("MCP provider returned an invalid token response")
+        access_token = tokens.get("access_token")
+        token_type = tokens.get("token_type", "Bearer")
+        refresh_token = tokens.get("refresh_token")
         if (
-            not isinstance(tokens.get("access_token"), str)
-            or tokens.get("token_type", "Bearer").lower() != "bearer"
+            not isinstance(access_token, str)
+            or not access_token
+            or any(c.isspace() for c in access_token)
+            or not isinstance(token_type, str)
+            or token_type.lower() != "bearer"
+            or (
+                refresh_token is not None
+                and (not isinstance(refresh_token, str) or not refresh_token)
+            )
         ):
-            raise ConnectionError("MCP provider did not return a bearer access token")
+            raise ConnectionError("MCP provider did not return a valid bearer grant")
+        self.metadata(tokens)
         return tokens
 
     async def execute(

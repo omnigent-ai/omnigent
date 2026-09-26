@@ -11,10 +11,18 @@ function useCatalog() {
   const [loading, setLoading] = useState(true);
   const refresh = useCallback(async () => {
     try {
-      const result = await registryRequest<{ data: RegistryService[] }>();
-      setServices(result.data);
+      const entries: RegistryService[] = [];
+      let cursor: string | null = null;
+      do {
+        const result: { data: RegistryService[]; next_cursor?: string | null } =
+          // eslint-disable-next-line no-await-in-loop -- Each page needs the previous cursor.
+          await registryRequest(cursor ? `?after=${encodeURIComponent(cursor)}` : "");
+        entries.push(...result.data);
+        cursor = result.next_cursor ?? null;
+      } while (cursor);
+      setServices(entries);
       setError(null);
-      return result.data;
+      return entries;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not load MCP services");
       return undefined;

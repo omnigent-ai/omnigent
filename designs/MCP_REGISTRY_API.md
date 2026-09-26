@@ -18,9 +18,11 @@ Omnigent API credential.
 
 Catalog/account operations use the authenticated user. Session operations apply
 the existing session permissions. Gateway calls use the authenticated caller
-for service entitlements, policy identity and credential ownership; the request
-cannot choose an arbitrary `user_id`. Sharing a session does not share connected
-accounts. Historical turn labels never authorize another user's credentials. Generic grants are keyed by workspace, user and service.
+for service entitlements and credential ownership. Policy identity is separate:
+direct calls use that caller; a verified runner uses the server-recorded turn actor.
+A managed runner normally authenticates as the session owner, so an editor's turn
+can use the owner's connected account subject to the editor's tool policies.
+Generic grants are keyed by workspace, credential user and service.
 
 Registry declarations in session bundles contain a service ID, never its upstream
 URL or credential. Direct HTTP/stdio declarations retain their existing behavior.
@@ -31,10 +33,14 @@ does not allow users to register arbitrary destinations.
 
 | Method and path | Request | Success response |
 | --- | --- | --- |
-| `GET /v1/mcp-registry/services` | None | `200 {"data": [service, ...]}`; only visible services, `Cache-Control: no-store`. |
+| `GET /v1/mcp-registry/services` | `limit` (default 50, max 100), `after` (previous cursor) | `200 {"data": [service, ...], "next_cursor": "tracker"}`; null cursor on the last page; only visible services, `Cache-Control: no-store`. |
 | `PUT /v1/mcp-registry/services/{id}/connection` | `{"token": "personal-bearer-token"}` | `200 {"connected": true}`; `auth: bearer` only. |
 | `DELETE /v1/mcp-registry/services/{id}/connection` | None | `200 {"disconnected": true}`; deletes generic OAuth/bearer grant and pending authorization. |
 | `POST /v1/mcp-registry/services/{id}/test` | None | `200 {"tools": ["read_ticket"]}`; performs upstream discovery. |
+
+Catalog order is ascending service ID. Pass `next_cursor` as `after` until null;
+credential-status reads occur only for that page. Invalid limits return 422.
+Settings and the launch picker follow the cursors to show the complete catalog.
 
 Example catalog entry:
 
@@ -64,6 +70,10 @@ Generic OAuth uses the shared connection routes:
 | `GET /v1/connections/mcp-{id}/callback?code=...&state=...` | Validate the current user and pending flow, exchange the code, save encrypted tokens and redirect with `mcp-{id}=connected` or `error`. |
 | `GET /v1/connections/mcp-{id}/status` | `{"enabled": true, "connected": true, "connected_at": 1780000000}`; timestamp is null when disconnected. |
 | `POST /v1/connections/mcp-{id}/disconnect` | Shared router compatibility endpoint, returns `{"disconnected": bool}`. |
+
+Provider timeouts, malformed token JSON and invalid expiry values produce the
+`mcp-{id}=error` redirect without logging provider response bodies or tokens.
+The pending flow is consumed; start a new connection attempt to retry.
 
 These routes exist only for configured generic OAuth entries. Prefer the registry
 `DELETE .../connection` endpoint for disconnect: it also clears pending OAuth
@@ -102,7 +112,10 @@ tools. Unknown/disallowed IDs fail with 403 before persistence. Invalid IDs fail
 validation (422 for JSON, 400 for multipart); custom-server name collisions return
 409. A selected shared agent gets a session-scoped copy. Selection does not grant
 OAuth access or change the agent template. Existing narrower tool restrictions
-remain in force.
+remain in force. Operator-template environment fields are resolved at launch
+using the existing bundle resolver, including nested agents, before storing the
+session copy. The source template stays unchanged. Uploaded bundles remain literal
+and never expand against the server environment.
 
 Existing sessions use the shared MCP declaration API:
 
@@ -136,10 +149,17 @@ UI as sign-in errors, with the storage-limit diagnosis in the server log.
 the adapter validates session edit access, an active session, the selected service,
 service entitlements and tool allowlists for the authenticated caller. Both this
 endpoint and the legacy session MCP route use that caller's upstream account.
-Runner calls use the identity authenticated by their server token; a delegated
-path scope alone does not authorize impersonating a different turn actor.
-Per-turn on-behalf-of delegation would require a verified runner/turn binding and
-an explicit delegation contract; it is not implemented.
+For policy attribution, a runner additionally presents its existing
+`X-Omnigent-Runner-Tunnel-Token`, bound to the session's runner ID or trusted by
+the operator's tunnel-token allowlist. Only this proof selects the server-recorded
+turn actor; a caller-supplied actor field or unbound token cannot change identity.
+It does not switch credential owners. Pending approvals bind both policy actor
+and credential user.
+
+This retains the existing sequential-turn attribution model. The turn label is
+written when an event is forwarded; queued messages from different editors can
+overtake attribution. Exact per-turn identity needs a turn-scoped protocol and is
+not implemented. Per-editor upstream credential delegation is also not implemented.
 
 The URL and execution backend are independent of sessions. The **Omnigent policy
 adapter still requires a session**; calls without one return 422. This prototype

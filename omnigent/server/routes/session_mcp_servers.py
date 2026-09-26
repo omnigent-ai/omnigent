@@ -451,6 +451,17 @@ def prepare_registry_launch_bundle(
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "agent"
         extract_safe(bundle_bytes, root)
+        if trusted_template:
+            from omnigent.cli import _resolve_bundle_env_vars
+
+            pending = [root]
+            while pending:
+                directory = pending.pop()
+                for relative_path, text in _resolve_bundle_env_vars(directory).items():
+                    (directory / relative_path).write_text(text, encoding="utf-8")
+                pending.extend(
+                    path.parent for path in (directory / "agents").glob("*/config.yaml")
+                )
         inline_path = _single_yaml_path(root)
         inline_tools = _read_yaml_mapping(inline_path).get("tools", {}) if inline_path else {}
         for service_id in dict.fromkeys(service_ids):
