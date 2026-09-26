@@ -74,6 +74,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from tests.e2e_ui.start_session.helpers import open_landing_workspace_picker
 
 _HOST_NAME = "win11-e2e"
 _WIN_HOME = "C:\\Users\\alice"
@@ -374,8 +375,7 @@ async def _open_picker_at_windows_home(page: Any, base_url: str, host_id: str) -
     # workspace popover mid-test — a Radix timing artifact of clicking
     # faster than any human, not the behavior under test.
     await expect(page.locator('[data-slot="dropdown-menu-content"]')).to_have_count(0)
-    await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-    await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+    await open_landing_workspace_picker(page)
     await expect(page.get_by_test_id("workspace-picker-entry-work")).to_be_visible(timeout=15_000)
 
 

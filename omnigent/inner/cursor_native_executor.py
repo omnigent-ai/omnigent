@@ -16,7 +16,7 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from omnigent.cursor_native_bridge import (
+from omnigent.harnesses.cursor_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     clear_fork_preamble,
     inject_user_message,

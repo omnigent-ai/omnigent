@@ -42,6 +42,12 @@ HOST_ACTION = "host_select"
 WORKSPACE_BLOCK = "workspace_block"
 WORKSPACE_ACTION = "workspace_input"
 
+# ``value`` of the host menu's managed-sandbox entry. Not a host id: the server
+# provisions the host when the session is created, so this marks "let the server
+# choose one" rather than naming a machine. Prefixed and underscored so it can
+# never collide with a real host id.
+MANAGED_HOST_VALUE = "__omnigent_managed__"
+
 # Slack caps a static_select at 100 options; both agents and hosts are far
 # below that in practice, but truncate defensively so a huge server never
 # produces an invalid view payload.
@@ -98,11 +104,18 @@ class SetupFlow:
         server_url: str,
         auth_manager: AuthManager | None = None,
         enrollment_url: Callable[[str, str, str, str], str | None] | None = None,
+        default_agent_id: str | None = None,
+        default_host_type: str | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
         self._server_url = server_url
         self._auth = auth_manager
+        # Operator-set picker defaults (unset = today's blank picker). They are
+        # only ever pre-selections: applied against what this user is actually
+        # offered, and never substituted for something else if unavailable.
+        self._default_agent_id = default_agent_id
+        self._default_host_type = default_host_type
         # In Databricks web-auth mode, returns the signed enrollment link for a
         # (team, user, email) or ``None`` if the web server isn't configured.
         # ``None`` here means the historical device-grant / OIDC-ticket login
@@ -370,19 +383,35 @@ class SetupFlow:
             # routing through the login-framed errors branch.
             await ack(response_action="update", view=no_agents_modal(server_url))
             return
-        if not validated.online_hosts:
-            # A session needs a host to run on, so setup can't finish without
-            # one. Swap the modal for the same guidance a turn shows when no
-            # host is reachable, telling the user how to bring one online.
+        if not validated.online_hosts and not validated.managed_hosts:
+            # Nothing can run a session: the user has no host of their own online
+            # and the server provisions none. Swap the modal for the same
+            # guidance a turn shows when no host is reachable, telling the user
+            # how to bring one online. A server WITH managed sandboxes never
+            # reaches here — the picker offers one instead of dead-ending.
             await ack(response_action="update", view=no_host_modal(server_url))
             return
         # Default the workspace to the host's home directory (where runners
         # actually run), not the bot process's cwd. Fall back to the bot's cwd
-        # only if the host can't be probed.
-        workspace_default = await self._resolve_default_workspace(omnigent, validated.online_hosts)
+        # only if the host can't be probed. With no host to probe, leave it
+        # blank — the bot's cwd names nothing a managed sandbox can use.
+        workspace_default = (
+            await self._resolve_default_workspace(omnigent, validated.online_hosts)
+            if validated.online_hosts
+            else None
+        )
+        # Resolved here, against the listing fetched as this authenticated user,
+        # so an operator default is only pre-selected when it is genuinely on
+        # offer. The submit handler stays network-free.
         await ack(
             response_action="update",
-            view=select_modal(server_url, validated, workspace_default=workspace_default),
+            view=select_modal(
+                server_url,
+                validated,
+                workspace_default=workspace_default,
+                default_agent_id=self._default_agent_id,
+                default_host_type=self._default_host_type,
+            ),
         )
 
     async def _revalidate_and_advance(
@@ -652,7 +681,21 @@ class SetupFlow:
     async def _handle_select_submit(
         self, ack: Any, body: dict[str, Any], view: dict[str, Any], client: Any
     ) -> None:
-        server_url = self._server_url
+        team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
+        user_id = str((body.get("user") or {}).get("id") or "")
+        # Fail closed on a missing team/user: configs key on (team, user), so a
+        # blank one would collapse keys across workspaces. No form field can fix
+        # it, so the modal dead-ends. Matches the guard in the slash-command path.
+        if not team_id or not user_id:
+            self._logger.warning(
+                "Setup submit missing team/user (team=%r user=%r)", team_id, user_id
+            )
+            await ack(
+                response_action="update",
+                view=setup_failed_modal("Slack didn't identify your workspace or account."),
+            )
+            return
+
         agent_option = _selected_option(view, AGENT_BLOCK, AGENT_ACTION)
         if agent_option is None:
             await ack(
@@ -661,14 +704,9 @@ class SetupFlow:
             )
             return
 
-        workspace = _input_value(view, WORKSPACE_BLOCK, WORKSPACE_ACTION).strip()
-        if not workspace.startswith("/"):
-            await ack(
-                response_action="errors",
-                errors={WORKSPACE_BLOCK: "Enter an absolute workspace path (starting with /)."},
-            )
-            return
-
+        # The host choice is read BEFORE the workspace, because it decides what a
+        # valid workspace is: a managed sandbox is created by the server with its
+        # own working directory, so there is no path for the user to supply.
         host_option = _selected_option(view, HOST_BLOCK, HOST_ACTION)
         if host_option is None:
             await ack(
@@ -676,8 +714,25 @@ class SetupFlow:
                 errors={HOST_BLOCK: "Select a host to run your sessions on."},
             )
             return
-        host_id = str(host_option.get("value"))
+        host_value = str(host_option.get("value"))
+        managed = host_value == MANAGED_HOST_VALUE
+        host_id = None if managed else host_value
         host_name = _option_text(host_option)
+
+        # A managed sandbox's working directory is created by the server inside
+        # it, so the path field does not apply and is not stored. An external
+        # host still needs an absolute path to start its runner in.
+        workspace = ""
+        if not managed:
+            workspace = _input_value(view, WORKSPACE_BLOCK, WORKSPACE_ACTION).strip()
+            if not workspace.startswith("/"):
+                await ack(
+                    response_action="errors",
+                    errors={
+                        WORKSPACE_BLOCK: "Enter an absolute workspace path (starting with /)."
+                    },
+                )
+                return
 
         config = UserConfig(
             agent_id=str(agent_option.get("value")),
@@ -685,30 +740,26 @@ class SetupFlow:
             workspace=workspace,
             host_id=host_id,
             host_name=host_name,
+            host_type="managed" if managed else "external",
         )
 
-        team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
-        user_id = str((body.get("user") or {}).get("id") or "")
-        # Fail closed: an empty team/user would write the config under a key that
-        # collapses across workspaces (configs key on (team, user)).
-        if not team_id or not user_id:
-            self._logger.warning(
-                "Setup submit missing team/user (team=%r user=%r)", team_id, user_id
-            )
-            await ack()
-            return
         await self._store.upsert_user_config(team_id, user_id, config)
         await ack()
+        server_url = self._server_url
         self._logger.info(
-            "Saved Omnigent setup team=%s user=%s server=%s agent=%s host=%s",
+            "Saved Omnigent setup team=%s user=%s server=%s agent=%s host_type=%s host=%s",
             team_id,
             user_id,
             server_url,
             config.agent_id,
+            config.host_type,
             host_id,
         )
 
-        host_line = f" on host *{host_name}*" if host_name else ""
+        if managed:
+            host_line = " in a sandbox this server runs for you"
+        else:
+            host_line = f" on host *{host_name}*" if host_name else ""
         await self._dm_user(
             client,
             user_id,
@@ -944,56 +995,156 @@ def login_failed_modal(server_url: str, reason: str) -> dict[str, Any]:
     }
 
 
+def setup_failed_modal(reason: str) -> dict[str, Any]:
+    # Terminal screen when a submitted setup can't be saved for a reason no form
+    # field carries — the picker's inline errors can't express it. Distinct from
+    # the login-failure screen: the sign-in may have succeeded.
+    return {
+        "type": "modal",
+        "callback_id": CALLBACK_SETUP_INFO,
+        "title": {"type": "plain_text", "text": "Set up Omnigent"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":warning: Your setup wasn't saved: {reason}\n"
+                        "Run `/omnigent` to try again."
+                    ),
+                },
+            }
+        ],
+    }
+
+
 def select_modal(
     server_url: str,
     validated: ValidatedServer,
     workspace_default: str | None = None,
+    *,
+    default_agent_id: str | None = None,
+    default_host_type: str | None = None,
 ) -> dict[str, Any]:
+    """Build the agent/host/workspace picker.
+
+    ``default_agent_id`` / ``default_host_type`` are the operator's optional
+    pre-selections. Each is applied only when it names an option this user is
+    actually being offered; an unavailable one leaves its menu blank and adds a
+    note saying so, rather than quietly selecting something else. Unset (the
+    normal case) renders exactly the picker this always rendered.
+    """
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"Connected to *{server_url}*."},
         },
+    ]
+    agent_options = _agent_options(validated.agents)
+    agent_initial = _option_with_value(agent_options, default_agent_id)
+    agent_element: dict[str, Any] = {
+        "type": "static_select",
+        "action_id": AGENT_ACTION,
+        "placeholder": {"type": "plain_text", "text": "Choose an agent"},
+        "options": agent_options,
+    }
+    if agent_initial is not None:
+        agent_element["initial_option"] = agent_initial
+    blocks.append(
         {
             "type": "input",
             "block_id": AGENT_BLOCK,
             "label": {"type": "plain_text", "text": "Agent"},
-            "element": {
-                "type": "static_select",
-                "action_id": AGENT_ACTION,
-                "placeholder": {"type": "plain_text", "text": "Choose an agent"},
-                "options": _agent_options(validated.agents),
-            },
-        },
-    ]
-    host_options = _host_options(validated.online_hosts)
+            "element": agent_element,
+        }
+    )
+    if default_agent_id and agent_initial is None:
+        # "not in this menu", not "not on this server": an agent past the option
+        # cap exists and is usable, it just didn't fit — so name that when it is
+        # what happened, and never claim more than the menu can tell us.
+        why = (
+            f", which lists only the first {_MAX_SELECT_OPTIONS} of {len(validated.agents)} agents"
+            if len(validated.agents) > _MAX_SELECT_OPTIONS
+            else ""
+        )
+        blocks.append(
+            _unavailable_default_block(
+                "Your Omnigent operator's default agent "
+                f"(`{truncate_option(default_agent_id)}`) isn't available in this "
+                f"menu{why} — pick one above."
+            )
+        )
+
+    host_options = _host_options(validated)
+    # Only the managed sandbox is defaultable, so the sentinel is the whole
+    # lookup; ``_host_options`` omits it when the server provisions none, which
+    # is exactly the "configured default unavailable" case.
+    host_initial = (
+        _option_with_value(host_options, MANAGED_HOST_VALUE)
+        if default_host_type == "managed"
+        else None
+    )
+    host_element: dict[str, Any] = {
+        "type": "static_select",
+        "action_id": HOST_ACTION,
+        "placeholder": {"type": "plain_text", "text": "Choose a host"},
+        "options": host_options,
+    }
+    if host_initial is not None:
+        host_element["initial_option"] = host_initial
     blocks.append(
         {
             "type": "input",
             "block_id": HOST_BLOCK,
             "label": {"type": "plain_text", "text": "Host"},
-            "element": {
-                "type": "static_select",
-                "action_id": HOST_ACTION,
-                "placeholder": {"type": "plain_text", "text": "Choose a host"},
-                "options": host_options,
-            },
+            "element": host_element,
         }
     )
+    if default_host_type == "managed" and host_initial is None:
+        # A capability probe that could not be READ is not a server that answered
+        # "no" — withhold the option either way, but never report the failure to
+        # ask as a finding about the operator's server.
+        blocks.append(
+            _unavailable_default_block(
+                "Your Omnigent operator's default host is a managed sandbox, but "
+                + (
+                    "this server doesn't provision one"
+                    if validated.managed_support_known
+                    else "whether this server provisions one couldn't be checked just now"
+                )
+                + " — pick a host above."
+            )
+        )
+    workspace_element: dict[str, Any] = {
+        "type": "plain_text_input",
+        "action_id": WORKSPACE_ACTION,
+        "placeholder": {"type": "plain_text", "text": "/absolute/path/on/the/host"},
+    }
+    # A path only means something on a host the user runs. Seed it from that host
+    # when there is one; with only a managed sandbox on offer, start blank rather
+    # than suggest a directory that exists nowhere the session can reach.
+    workspace_initial = workspace_default or (
+        default_workspace() if validated.online_hosts else ""
+    )
+    if workspace_initial:
+        workspace_element["initial_value"] = workspace_initial
     blocks.append(
         {
             "type": "input",
             "block_id": WORKSPACE_BLOCK,
+            # Optional in Slack's own required-field check, because a managed
+            # sandbox brings its own workspace. The submit handler still demands
+            # an absolute path whenever a real host is chosen.
+            "optional": True,
             "label": {"type": "plain_text", "text": "Workspace path"},
-            "element": {
-                "type": "plain_text_input",
-                "action_id": WORKSPACE_ACTION,
-                "initial_value": workspace_default or default_workspace(),
-                "placeholder": {"type": "plain_text", "text": "/absolute/path/on/the/host"},
-            },
+            "element": workspace_element,
             "hint": {
                 "type": "plain_text",
-                "text": "Absolute directory on the host where each session's runner starts.",
+                "text": (
+                    "Absolute directory on the host where each session's runner "
+                    "starts. Ignored for a managed sandbox."
+                ),
             },
         }
     )
@@ -1018,9 +1169,24 @@ def _agent_options(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return options
 
 
-def _host_options(hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _host_options(validated: ValidatedServer) -> list[dict[str, Any]]:
+    """Host menu entries: the managed sandbox first, then the user's own hosts.
+
+    The managed entry is listed first so a user with nothing online still sees a
+    usable choice at the top of the menu, and is omitted entirely when the server
+    can't provision one — an option that would only 422 is worse than no option.
+    """
     options: list[dict[str, Any]] = []
-    for host in hosts[:_MAX_SELECT_OPTIONS]:
+    if validated.managed_hosts:
+        options.append(
+            _option(
+                truncate_option(managed_host_label(validated.managed_host_provider)),
+                MANAGED_HOST_VALUE,
+            )
+        )
+    # The managed entry counts against Slack's option cap, so the host slice
+    # shrinks by what is already in the menu.
+    for host in validated.online_hosts[: _MAX_SELECT_OPTIONS - len(options)]:
         host_id = host_id_of(host)
         if host_id is None:
             continue
@@ -1029,8 +1195,30 @@ def _host_options(hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return options
 
 
+def managed_host_label(provider: str | None) -> str:
+    """Menu label for the server-provisioned sandbox, named by its provider."""
+    return f"Managed sandbox ({provider})" if provider else "Managed sandbox"
+
+
 def _option(text: str, value: str) -> dict[str, Any]:
     return {"text": {"type": "plain_text", "text": text}, "value": value}
+
+
+def _option_with_value(options: list[dict[str, Any]], value: str | None) -> dict[str, Any] | None:
+    """Return the offered option carrying ``value``, or ``None`` if there is none.
+
+    Slack rejects an ``initial_option`` that isn't one of the menu's own
+    options, so the pre-selection is looked up in the built list (identity
+    included) rather than constructed from the configured value.
+    """
+    if not value:
+        return None
+    return next((option for option in options if option.get("value") == value), None)
+
+
+def _unavailable_default_block(text: str) -> dict[str, Any]:
+    """Context note under a picker whose configured default can't be offered."""
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": f":warning: {text}"}]}
 
 
 def _input_value(view: dict[str, Any], block_id: str, action_id: str) -> str:

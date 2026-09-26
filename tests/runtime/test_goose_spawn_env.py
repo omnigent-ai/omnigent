@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from omnigent.goose_native_bridge import BRIDGE_DIR_ENV_VAR, build_goose_native_spawn_env
+from omnigent.harnesses.goose_native.bridge import BRIDGE_DIR_ENV_VAR, build_goose_native_spawn_env
 
 
 def test_spawn_env_sets_bridge_dir_and_ansi_theme() -> None:

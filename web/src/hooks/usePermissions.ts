@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 /**
  * TanStack Query hooks for session permissions CRUD.
  * Wraps the fetch functions in `permissionsApi.ts`.
@@ -13,7 +14,7 @@ import {
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
-import { useConversations } from "./useConversations";
+import { isTempConvId } from "@/lib/tempConversationId";
 import { useSession } from "./useSession";
 
 function permissionsKey(sessionId: string) {
@@ -25,7 +26,9 @@ function sessionOwnerKey(sessionId: string) {
 }
 
 /** Fetch all permission grants for a session. */
-export function usePermissions(sessionId: string | null) {
+export function usePermissions(rawSessionId: string | null) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session.
+  const sessionId = isTempConvId(rawSessionId) ? null : rawSessionId;
   return useQuery({
     queryKey: permissionsKey(sessionId ?? ""),
     queryFn: () => listPermissions(sessionId!),
@@ -78,7 +81,7 @@ export function useRevokePermission(sessionId: string) {
  * `null` permission level (single-user mode) is treated as unrestricted.
  */
 export function useCanEdit(conversationId: string): boolean {
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);

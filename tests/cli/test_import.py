@@ -114,6 +114,65 @@ def test_import_command_sends_force_override(tmp_path: Path) -> None:
     assert "conv_replaced" in result.output
 
 
+@respx.mock
+def test_import_command_binds_local_host_when_configured(tmp_path: Path) -> None:
+    """A machine that is itself a host binds the imported session to it."""
+    from omnigent.host.identity import HostIdentity
+
+    session_id = "a1b2c3d4-1234-5678-9abc-def01234567a"
+    _write_claude_transcript(tmp_path, session_id, text="bind me")
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_bound", "status": "imported", "item_count": 1},
+        )
+    )
+
+    identity = HostIdentity(host_id="a1b2c3d4e5f67890abcdef1234567890", name="my-box")
+    with (
+        patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
+        # The autouse _no_ambient_host fixture stubs this to None; re-patch so
+        # this machine looks like a configured host.
+        patch(
+            "omnigent.host.identity.load_host_identity_if_present",
+            return_value=identity,
+        ),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "claude", "--session", session_id],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls.last.request.content)["host_id"] == (
+        "a1b2c3d4e5f67890abcdef1234567890"
+    )
+
+
+@respx.mock
+def test_import_command_omits_host_id_when_not_a_host(tmp_path: Path) -> None:
+    """No host config means no host_id on the wire (unchanged behavior)."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def01234567b"
+    _write_claude_transcript(tmp_path, session_id, text="no host")
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_free", "status": "imported", "item_count": 1},
+        )
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "claude", "--session", session_id],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "host_id" not in json.loads(route.calls.last.request.content)
+
+
 def test_import_command_rejects_cursor() -> None:
     """The import command rejects sources without a supported adapter."""
     result = CliRunner().invoke(

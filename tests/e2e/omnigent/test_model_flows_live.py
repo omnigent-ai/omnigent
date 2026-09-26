@@ -27,8 +27,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.claude_native import claude_catalog_fingerprint
-from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
+from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from tests.e2e.omnigent._model_flows_rig import (
     ModelFlowsRig,
     PaneWatcher,
@@ -744,8 +744,11 @@ def test_row18b_codex_cold_resume_honors_a_gateway_spelled_override(
     as "not in this host's current model list" (a raw string-equality check
     did, failing the whole cold resume).
     """
-    from omnigent.codex_model_vocabulary import codex_reachable_model_slug, comparable_model_id
-    from omnigent.model_catalog_store import catalog_contains
+    from omnigent.models.codex_model_vocabulary import (
+        codex_reachable_model_slug,
+        comparable_model_id,
+    )
+    from omnigent.models.model_catalog_store import catalog_contains
 
     harness = "codex-native"
     ready = _COLD_RESUME_HARNESSES[harness][2]

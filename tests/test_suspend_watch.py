@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`omnigent.suspend_watch`.
+"""Unit tests for :mod:`omnigent.util.suspend_watch`.
 
 The suspend watcher must fire exactly once when the wall clock jumps ahead of
 the monotonic clock (a real system sleep), must never fire when both clocks
@@ -14,7 +14,7 @@ import asyncio
 import contextlib
 from collections.abc import Callable
 
-from omnigent.suspend_watch import (
+from omnigent.util.suspend_watch import (
     SUSPEND_GAP_THRESHOLD_S,
     SUSPEND_POLL_INTERVAL_S,
     watch_for_resume,

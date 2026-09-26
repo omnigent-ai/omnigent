@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,14 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
+from omnigent.runner import pending_approvals
+from omnigent.runner.mcp_execution_registry import (
+    MCP_OPERATION_ID_PARAM,
+    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+    McpExecutionRegistry,
+    McpExecutionResult,
+)
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
@@ -361,6 +370,175 @@ async def test_call_tool_happy_path_returns_text() -> None:
     assert call.body["method"] == "tools/call"
     assert call.body["params"]["name"] == "github__search"
     assert call.body["params"]["arguments"] == {"query": "asyncio"}
+
+
+@pytest.mark.asyncio
+async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
+    """A reconnect discards stale requestState and repeats the original call."""
+    old_elicitation = "elicit_old_server"
+    new_elicitation = "elicit_new_server"
+
+    def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
+        return _json_resp(
+            {
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "result": {
+                    "resultType": "input_required",
+                    "inputRequests": {
+                        elicitation_id: {
+                            "method": "elicitation/create",
+                            "params": {
+                                "message": "Approve shell command?",
+                                "requestedSchema": {
+                                    "type": "object",
+                                    "properties": {"approved": {"type": "boolean"}},
+                                    "required": ["approved"],
+                                },
+                            },
+                        }
+                    },
+                    "requestState": request_state,
+                },
+            }
+        )
+
+    transport = _StubTransport(
+        [
+            _input_required(old_elicitation, "old-state", 1),
+            _input_required(new_elicitation, "new-state", 2),
+            _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {
+                        "content": [{"type": "text", "text": "approval-resumed"}],
+                        "isError": False,
+                    },
+                }
+            ),
+        ]
+    )
+    manager = _make_manager(transport)
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(
+        manager.call_tool(_make_spec("github"), "sys_os_shell", {"command": "printf ok"})
+    )
+
+    async def _wait_until_registered(elicitation_id: str) -> None:
+        for _ in range(1000):
+            if elicitation_id in pending_approvals._pending:
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError(f"approval {elicitation_id} was never registered")
+
+    try:
+        await _wait_until_registered(old_elicitation)
+        assert pending_approvals.notify_server_reconnect() == 1
+        await _wait_until_registered(new_elicitation)
+        assert pending_approvals.resolve(new_elicitation, approved=True)
+
+        assert await task == "approval-resumed"
+    finally:
+        if not task.done():
+            task.cancel()
+        pending_approvals.reset_for_tests()
+
+    assert [call.body["id"] for call in transport.calls] == [1, 2, 3]
+    first_params, replay_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert replay_params == first_params
+    assert "requestState" not in replay_params
+    assert retry_params["requestState"] == "new-state"
+    assert new_elicitation in retry_params["inputResponses"]
+    assert old_elicitation not in retry_params["inputResponses"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect wait pins completed work past its normal retention window."""
+    clock = 0.0
+    monkeypatch.setattr(mcp_execution_registry_mod, "_COMPLETED_TTL_S", 1.0)
+    monkeypatch.setattr(mcp_execution_registry_mod, "monotonic", lambda: clock)
+    registry = McpExecutionRegistry()
+
+    class _DetachThenSucceedTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+            operation_id = body["params"][MCP_OPERATION_ID_PARAM]
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(
+                    status_code=200,
+                    content={"result": {"output": "retained"}},
+                )
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=operation_id,
+                step="initial",
+                params={"name": "github__deploy", "arguments": {}},
+                run=_retained_work,
+            )
+            if len(self.calls) == 1:
+                return _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {
+                            "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                            "message": "Runner MCP execution detached.",
+                        },
+                    }
+                )
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "reattached"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _DetachThenSucceedTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "github__deploy", {}))
+    try:
+        for _ in range(1000):
+            if pending_approvals._server_reconnect_waiters:
+                break
+            await asyncio.sleep(0.001)
+        assert pending_approvals._server_reconnect_waiters
+        clock = 2.0
+        pending_approvals.notify_server_reconnect()
+
+        assert await task == "reattached"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == 1
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+    assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
 
 
 @pytest.mark.asyncio

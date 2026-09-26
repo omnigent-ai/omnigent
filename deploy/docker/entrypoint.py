@@ -95,19 +95,23 @@ class _BuiltApp:
 
 
 def run_migrations(database_url: str) -> None:
-    """Run the Alembic upgrade against ``database_url``.
+    """Initialize or upgrade the schema at ``database_url``.
 
     The SQLAlchemy stores refuse to start on a stale schema, so this
-    runs before any store boots. Creates a throwaway engine, upgrades,
-    and disposes it.
+    runs before any store boots. The central initializer preserves the
+    normal Alembic path for existing backends and uses the safe fresh-schema
+    bootstrap for CockroachDB.
     """
-    import sqlalchemy
+    from omnigent.db.utils import (
+        _create_engine,
+        _initialize_or_verify_schema,
+        normalize_database_url,
+    )
 
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
-
-    migration_engine = sqlalchemy.create_engine(database_url)
+    database_url = normalize_database_url(database_url)
+    migration_engine = _create_engine(database_url)
     try:
-        _run_alembic_upgrade(migration_engine, database_url)
+        _initialize_or_verify_schema(migration_engine, database_url)
     finally:
         migration_engine.dispose()
 
@@ -465,6 +469,24 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
             github_store = GithubConnectionStore(database_url, cipher)
 
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logger.error(
+                "Databricks Connect is configured but disabled: set the credential "
+                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(database_url, dbx_cipher)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -488,6 +510,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         server_config=cfg,
         github_config=github_config,
         github_store=github_store,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
     )
 
     log_capabilities(sandbox_config, github_config, github_store)
@@ -515,16 +539,17 @@ def main() -> None:
 
         import uvicorn
 
-        from omnigent.runner.transports.ws_tunnel.limits import (
-            RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        )
+        from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
         uvicorn.run(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            # This image serves external runners only, so every session rides a
+            # tunnel: without the keepalive budget uvicorn's 20 s default closes
+            # a busy-but-healthy one with 1011 after a client-path stall.
+            **uvicorn_tunnel_kwargs(),
         )
     except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())

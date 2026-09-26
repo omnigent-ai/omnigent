@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from omnigent.kimi_native_bridge import (
+from omnigent.harnesses.kimi_native.bridge import (
     read_active_session_id,
     read_hook_config,
     write_hook_config,

@@ -42,8 +42,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import codex_native_forwarder as fwd
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native import forwarder as fwd
+from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
     write_bridge_state,

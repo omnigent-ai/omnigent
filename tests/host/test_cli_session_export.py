@@ -12,8 +12,11 @@ import respx
 from click.testing import CliRunner
 
 from omnigent.cli import cli
+from omnigent.util.server_url import ServerUrl
 
 _BASE = "http://localhost:6767"
+_SPOG_DISPLAY = "https://example.databricks.com/omnigent?o=123"
+_SPOG_API = "https://example.databricks.com/api/2.0/omnigent"
 
 _SESSION_META = {
     "id": "conv_abc123",
@@ -54,7 +57,10 @@ _ITEMS_PAGE = {
 
 def _patch_server(base_url: str = _BASE) -> Any:
     """Patch the CLI so it uses *base_url* without spawning a real server."""
-    return patch("omnigent.cli._resolve_attach_server", return_value=base_url)
+    return patch(
+        "omnigent.cli._resolve_attach_server_url",
+        return_value=ServerUrl(base_url),
+    )
 
 
 @respx.mock
@@ -90,6 +96,40 @@ def test_session_export_writes_jsonl(tmp_path: Path) -> None:
     assert all(r["record_type"] == "item" for r in item_lines)
     assert [r["role"] for r in item_lines] == ["user", "assistant"]
     assert item_lines[1]["content"] == [{"type": "output_text", "text": "hi there"}]
+
+
+@respx.mock
+def test_session_export_spog_url_sends_workspace_selector(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A pasted SPOG URL keeps its ``?o=`` selector in request headers."""
+    monkeypatch.setattr(
+        "omnigent.cli._workspace_api_server_url",
+        lambda _server: _SPOG_API,
+    )
+    session_route = respx.get(f"{_SPOG_API}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=_SESSION_META)
+    )
+    respx.get(f"{_SPOG_API}/v1/sessions/conv_abc123/items").mock(
+        return_value=httpx.Response(200, json={**_ITEMS_PAGE, "data": []})
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "session",
+            "export",
+            "--id",
+            "conv_abc123",
+            "--output",
+            str(tmp_path / "out.jsonl"),
+            "--server",
+            _SPOG_DISPLAY,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert session_route.calls[0].request.headers["X-Databricks-Org-Id"] == "123"
 
 
 @respx.mock

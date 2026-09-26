@@ -54,11 +54,14 @@ from omnigent.conversation_browser import (
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
-from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.native_dispatch import resolve_hook_for_key
+from omnigent.inner.databricks_executor import (
+    _read_databrickscfg,
+    _ReusedDatabricksTokenSource,
+)
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
@@ -593,7 +596,7 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
-        from omnigent.server_url import display_server_url
+        from omnigent.util.server_url import display_server_url
 
         raise click.ClickException(
             f"Session {conversation_id} has no online runner on "
@@ -686,6 +689,7 @@ def _remote_headers(
     server_url: str | None = None,
     *,
     host_id: str | None,
+    org_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build headers for remote AP-server requests.
@@ -711,6 +715,8 @@ def _remote_headers(
         request that keys off the runner-env host_id). Required-keyword with
         no default so every call site consciously decides — pass the request
         path's host when it has one rather than silently defaulting to unkeyed.
+    :param org_id: Workspace selector captured from the current server URL, or
+        ``None`` to fall back to the stored login record.
     :returns: Headers to pass to httpx / OmnigentClient.
     """
     # Resolve the bearer in the documented precedence order (one credential
@@ -746,16 +752,12 @@ def _remote_headers(
     if server_url:
         from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_request_headers(server_url, host_id=host_id))
+        headers.update(databricks_request_headers(server_url, host_id=host_id, org_id=org_id))
     return headers
 
 
-# Cache the resolved _DatabricksBearerAuth object per server URL so that
-# repeated calls to _remote_headers for the same URL reuse the same SDK
-# Config instance. The SDK's Config.authenticate() caches the OAuth token
-# in memory and only re-runs the CLI shell-out when it nears expiry, so
-# reusing the object is both fast and correct for long-running callers.
-_databricks_auth_cache: dict[str, object] = {}
+# Reuse the SDK's in-memory token cache for each server.
+_databricks_auth_cache: dict[str, _ReusedDatabricksTokenSource] = {}
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:
@@ -767,34 +769,21 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     that issue many requests should use :class:`_DatabricksTokenAuth`,
     which reuses the SDK config across requests.
 
-    The resolved ``_DatabricksBearerAuth`` object is cached per
-    ``server_url`` so repeated calls reuse the same SDK ``Config``
-    instance. The SDK serves the cached OAuth token from memory and only
-    re-runs the Databricks CLI when the token nears expiry, so this is
-    both fast on repeat calls and safe for long-running callers.
-
     :param server_url: The remote server URL, e.g.
         ``"https://myapp-123.aws.databricksapps.com"``.
     :returns: A bearer token, or ``None`` when no pointer record is
         stored or the workspace credentials don't resolve.
     """
     from omnigent.cli_auth import load_databricks_workspace_host
-    from omnigent.inner.databricks_executor import (
-        DatabricksAuthError,
-        _resolve_databricks_auth,
-    )
 
     workspace_host = load_databricks_workspace_host(server_url)
     if workspace_host is None:
         return None
-    try:
-        auth = _databricks_auth_cache.get(server_url)
-        if auth is None:
-            auth, _host = _resolve_databricks_auth(host=workspace_host)
-            _databricks_auth_cache[server_url] = auth
-        return auth.current_token()  # type: ignore[union-attr]
-    except (DatabricksAuthError, ImportError, ValueError):
-        return None
+    source = _databricks_auth_cache.get(server_url)
+    if source is None:
+        source = _ReusedDatabricksTokenSource(host=workspace_host)
+        _databricks_auth_cache[server_url] = source
+    return source.current_token()
 
 
 class _DatabricksTokenAuth(httpx.Auth):
@@ -831,8 +820,7 @@ class _DatabricksTokenAuth(httpx.Auth):
         # cache). Resolving per request rebuilt Config and shelled out to
         # the Databricks CLI (~0.5s) every time — a heavy tax on the
         # long-lived transcript-forwarder client that posts reply items.
-        self._sdk_auth: _DatabricksBearerAuth | None = None
-        self._sdk_auth_resolved = False
+        self._sdk_token_source = _ReusedDatabricksTokenSource(server_url)
 
     def pin_session(self, session_id: str | None) -> None:
         """Repoint this auth at a different session's host.
@@ -862,30 +850,7 @@ class _DatabricksTokenAuth(httpx.Auth):
         :returns: Bearer token string, or ``None`` when no Databricks
             credentials resolve.
         """
-        from omnigent.cli_auth import load_databricks_workspace_host
-        from omnigent.inner.databricks_executor import (
-            DatabricksAuthError,
-            _resolve_databricks_auth,
-        )
-
-        if not self._sdk_auth_resolved:
-            workspace_host = (
-                load_databricks_workspace_host(self._server_url) if self._server_url else None
-            )
-            try:
-                if workspace_host is not None:
-                    self._sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
-                else:
-                    self._sdk_auth, _host = _resolve_databricks_auth()
-            except (DatabricksAuthError, ImportError, ValueError):
-                self._sdk_auth = None
-            self._sdk_auth_resolved = True
-        if self._sdk_auth is None:
-            return None
-        try:
-            return self._sdk_auth.current_token()
-        except DatabricksAuthError:
-            return None
+        return self._sdk_token_source.current_token()
 
     def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         """
@@ -1441,7 +1406,7 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
         resp = _server_get(
             f"{base_url}/v1/sessions",
             headers=_remote_headers(server_url=base_url, host_id=None),
-            params={"limit": 100},
+            params={"limit": 100, "visibility": "all"},
             timeout=10.0,
         )
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.InvalidURL) as exc:
@@ -1600,7 +1565,7 @@ def _unreachable_server_message(base_url: str) -> str:
             f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
             f"Server logs are under {process_log_dir_reference('server')}."
         )
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     return (
         f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
@@ -1693,7 +1658,7 @@ async def _prepare_chat_session_via_daemon(
         wait_for_host_online,
         wait_for_runner_online,
     )
-    from omnigent.native_terminal import bind_session_runner
+    from omnigent.native.native_terminal import bind_session_runner
 
     async def resolve_session() -> tuple[str, bool]:
         """Fork, resume, or create the session to bind, and say if it is fresh.
@@ -2617,6 +2582,13 @@ async def _query_sessions_once(
 
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
+    # An auto-woken turn can finish between live-stream subscriptions.
+    # Recheck its durable output once the session has stopped running.
+    if chat.status not in ("running", "launching"):
+        reconciled = await _persisted_turn_text(client, bound.id)
+        if reconciled is not None:
+            logger.info("Recovered headless output from completed session %s", bound.id)
+            return reconciled
     # No assistant text at all. If the runner persisted a terminal
     # ``error`` item (e.g. a harness start failure like the cursor SDK's
     # invalid-model rejection), surface it instead of returning ``None`` —
@@ -3018,6 +2990,7 @@ async def _resolve_latest_conversation_id_async(
         limit=1,
         order="desc",
         sort_by="updated_at",
+        visibility="mine",
     )
     if not sessions:
         return None
@@ -3073,13 +3046,13 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
                 raise click.ClickException(f"{source}: directory has no config.yaml to override.")
             target = config
 
-        raw = yaml.safe_load(target.read_text())
+        raw = yaml.safe_load(target.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise click.ClickException(
                 f"{source}: expected YAML mapping at top level, got {type(raw).__name__}"
             )
         _apply_overrides_to_raw(raw, overrides)
-        target.write_text(yaml.safe_dump(raw, default_flow_style=False))
+        target.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
         materialized = target if source.is_file() else target.parent
         _MATERIALIZED_OVERRIDE_DIRS[materialized.resolve()] = tmpdir
         return materialized
@@ -3126,7 +3099,7 @@ def _load_yaml_for_override_peek(source: Path) -> _YamlMapping | None:
         config = source / "config.yaml"
         if not config.is_file():
             return None
-        parsed = yaml.safe_load(config.read_text())
+        parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
         return parsed if isinstance(parsed, dict) else None
     return _load_yaml_if_single_file(source)
 
@@ -3146,7 +3119,7 @@ def _load_yaml_if_single_file(source: Path) -> _YamlMapping | None:
     """
     if not source.is_file():
         return None
-    parsed = yaml.safe_load(source.read_text())
+    parsed = yaml.safe_load(source.read_text(encoding="utf-8"))
     return parsed if isinstance(parsed, dict) else None
 
 
@@ -3358,20 +3331,24 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     if overrides.model is not None:
         executor_block["model"] = overrides.model
     if overrides.harness is not None:
+        prior_harness = _spec_declared_harness(raw, executor_block)
         _apply_harness_override_to_executor(raw, executor_block, overrides.harness)
-        # A harness-only override drops any prior model pin so the new
-        # harness resolves its provider default — e.g. ``omnigent run
-        # examples/polly --harness pi`` must not keep Polly's Claude-only
-        # a Claude-only ``executor.model``. An explicit ``--model``
-        # (applied above) wins and is left alone.
+        overrides_a_different_harness = prior_harness != (
+            canonicalize_harness(overrides.harness) or overrides.harness
+        )
+        # A real harness switch invalidates spec models. Otherwise, preserve
+        # them and use the environment only when no model remains.
         if overrides.model is None:
-            executor_block.pop("model", None)
             llm_block = raw.get("llm")
-            if isinstance(llm_block, dict):
-                llm_block.pop("model", None)
-            env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
-            if env_model is not None:
-                executor_block["model"] = env_model
+            if overrides_a_different_harness:
+                executor_block.pop("model", None)
+                if isinstance(llm_block, dict):
+                    llm_block.pop("model", None)
+            llm_model = llm_block.get("model") if isinstance(llm_block, dict) else None
+            if not (executor_block.get("model") or llm_model):
+                env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
+                if env_model is not None:
+                    executor_block["model"] = env_model
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)
@@ -3427,6 +3404,18 @@ def _apply_harness_override_to_executor(
         config = {}
         executor_block["config"] = config
     config["harness"] = canonical
+
+
+def _spec_declared_harness(raw: _YamlMapping, executor_block: _YamlMapping) -> str | None:
+    """Read the canonical harness from the spec's flat or bundle executor."""
+    if "spec_version" not in raw:
+        harness = executor_block.get("harness")
+    else:
+        config = executor_block.get("config")
+        harness = config.get("harness") if isinstance(config, dict) else None
+    if not isinstance(harness, str) or not harness.strip():
+        return None
+    return canonicalize_harness(harness.strip()) or harness.strip()
 
 
 def _validate_agent_spec(agent_path: Path) -> None:

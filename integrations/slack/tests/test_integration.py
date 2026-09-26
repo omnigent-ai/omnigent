@@ -60,6 +60,19 @@ async def _configure_user(
     )
 
 
+async def _configure_managed_user(store: SQLiteStore, team_id: str, user_id: str) -> None:
+    """Configure a user whose sessions run in a server-provisioned sandbox.
+
+    No host id and no workspace: the server chooses both when the session is
+    created.
+    """
+    await store.upsert_user_config(
+        team_id,
+        user_id,
+        UserConfig(agent_id="ag_1", agent_name="debby", workspace="", host_type="managed"),
+    )
+
+
 # Generous ceiling for the waits below. These are event-driven (they await the
 # actual turn task), so a healthy run returns near-instantly and never spends
 # this budget; it only bounds a genuine hang. Kept well above any real turn so a
@@ -217,6 +230,53 @@ async def test_app_mention_runs_full_turn_and_streams_answer(tmp_path: Path) -> 
     assert f"/v1/sessions/{server.session_id}/stream" in server.paths("GET")
 
     # Slack side: the SSE answer streamed into the reply.
+    assert "Here is the answer." in client.streamed_text
+
+
+# ── Scenario 3b: managed session → create + submit, never a runner launch ──────
+
+
+@respx.mock
+async def test_managed_session_turn_never_posts_a_runner_launch(tmp_path: Path) -> None:
+    """A managed session's host is provisioned by the server, so the turn goes
+    create → submit → stream with NO ``POST /v1/hosts/{id}/runners`` in between —
+    and the create carries ``host_type`` without a host id or workspace."""
+    server = FakeOmnigentServer(_SERVER)
+    server.managed_sandboxes_enabled = True
+    server.sandbox_provider = "modal"
+    server.install(respx.mock)
+
+    store = await _store(tmp_path)
+    await _configure_managed_user(store, "T1", "U1")
+    pool = OmnigentClientPool()
+    service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
+    client = RecordingSlackClient()
+
+    try:
+        await service.handle_app_mention(
+            body={"team_id": "T1", "event_id": "Ev1"},
+            event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> review this"},
+            client=client,
+            context={"bot_user_id": "B1"},
+        )
+        await _wait_for_stream_stop(client, service)
+    finally:
+        await service.shutdown()
+        await pool.aclose_all()
+
+    # Server side: the create asks the server to provision the host, and sends
+    # neither a host id nor a workspace (both are a 422 for a managed session).
+    create = server.assert_request(
+        "POST", "/v1/sessions", json_contains={"agent_id": "ag_1", "host_type": "managed"}
+    )
+    assert "host_id" not in create[3]
+    assert "workspace" not in create[3]
+    # No runner launch anywhere, and no host listing to pick one from.
+    assert not any(path.endswith("/runners") for path in server.paths("POST"))
+    assert "/v1/hosts" not in server.paths("GET")
+    # The turn still submitted and streamed — the server queues the first message
+    # until its sandbox launch settles.
+    server.assert_request("POST", f"/v1/sessions/{server.session_id}/events")
     assert "Here is the answer." in client.streamed_text
 
 

@@ -17,6 +17,7 @@ from typing import Any, TypeVar
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.llms.errors import (
     ContextWindowExceededError,
     LLMErrorDetail,
@@ -359,5 +360,12 @@ def _emit_retry_and_sleep(
         total_tries,
         delay,
         error.code,
+        extra=debug_event(
+            "llm_retry",
+            error_category=error.category.value,
+            error_impact=error.impact.value,
+            error_phase=error.phase.value,
+            error_code=error.code,
+        ),
     )
     time.sleep(delay)

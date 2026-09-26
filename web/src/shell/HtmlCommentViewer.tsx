@@ -15,6 +15,7 @@ import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { getEmbedRoot } from "@/lib/host";
+import { randomUUID } from "@/lib/randomUUID";
 import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import {
   anchorOccurrence,
@@ -46,9 +47,7 @@ interface FloatingAnchor {
 }
 
 function genNonce(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
-  // Deterministic-enough fallback for environments without crypto.randomUUID.
-  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  return randomUUID();
 }
 
 /** Bridge payload for one comment: its id, anchor text, and which occurrence of

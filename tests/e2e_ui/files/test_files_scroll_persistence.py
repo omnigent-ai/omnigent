@@ -59,7 +59,12 @@ def test_files_panel_scroll_survives_session_switch(
     page.goto(f"{base_url}/c/{session_a}?view=explore")
 
     rail = page.get_by_role("complementary", name="Workspace")
-    expect(rail.get_by_text("scroll_file_000.txt")).to_be_visible(timeout=30_000)
+    # The tree is virtualized, so only the on-screen slice is in the DOM — a
+    # specific bottom-of-sort file (scroll_file_000) need not be mounted. Wait
+    # for the tree to have rendered *some* file row instead; the scroll contract
+    # below is verified by scrollTop, not by any particular row's presence.
+    any_file = rail.get_by_role("button", name=re.compile(r"^scroll_file_\d+\.txt$"))
+    expect(any_file.first).to_be_visible(timeout=30_000)
     # Both sessions must be in the sidebar for the SPA switch.
     expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible(timeout=30_000)
 
@@ -73,10 +78,10 @@ def test_files_panel_scroll_survives_session_switch(
     expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=15_000)
     expect(rail.get_by_text("other_session_file.txt")).to_be_visible(timeout=30_000)
 
-    # Back to session A: once its tree is tall again, the position returns.
+    # Back to session A: once its tree is tall again, the saved position returns.
     page.locator(f'a[href="/c/{session_a}"]').click()
     expect(page).to_have_url(f"{base_url}/c/{session_a}", timeout=15_000)
-    expect(rail.get_by_text("scroll_file_000.txt")).to_be_visible(timeout=30_000)
+    expect(any_file.first).to_be_visible(timeout=30_000)
     expect(section).to_have_js_property("scrollTop", 300, timeout=10_000)
 
 

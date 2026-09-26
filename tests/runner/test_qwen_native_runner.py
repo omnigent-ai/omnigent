@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import qwen_native_bridge as qnb
+from omnigent.harnesses.qwen_native import bridge as qnb
 from omnigent.runner.app import _build_qwen_fork_recording, _persist_qwen_external_session_id
 
 
@@ -17,10 +17,19 @@ class _RecordingClient:
 
     def __init__(self, status: int = 200) -> None:
         self.patches: list[tuple[str, dict]] = []
+        self.params: list[dict[str, str] | None] = []
         self._status = status
 
-    async def patch(self, url: str, *, json: dict, timeout: float | None = None) -> httpx.Response:
+    async def patch(
+        self,
+        url: str,
+        *,
+        json: dict,
+        timeout: float | None = None,
+        params: dict[str, str] | None = None,
+    ) -> httpx.Response:
         self.patches.append((url, json))
+        self.params.append(params)
         return httpx.Response(self._status, request=httpx.Request("PATCH", url))
 
 
@@ -28,6 +37,7 @@ async def test_persist_external_session_id_patches_session() -> None:
     client = _RecordingClient()
     await _persist_qwen_external_session_id(client, "conv_abc", "qsid-1")  # type: ignore[arg-type]
     assert client.patches == [("/v1/sessions/conv_abc", {"external_session_id": "qsid-1"})]
+    assert client.params == [{"include_usage": "false"}]
 
 
 async def test_persist_external_session_id_noop_without_client() -> None:

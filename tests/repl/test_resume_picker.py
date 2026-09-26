@@ -987,12 +987,14 @@ async def test_cross_agent_picker_lists_without_agent_id_filter() -> None:
     result = await pick_conversation_cross_agent_from_sdk(client, out=out, in_=io.StringIO(""))
     assert result is None
     # Verify the picker hit the cross-agent code path on the Sessions API
-    # (server-side ``has_agent_id`` / ``accessible_by`` gates apply).
+    # (server-side ``has_agent_id`` / ownership gates apply).
     assert client.sessions.last_kwargs == {
         "limit": 200,
         "agent_id": None,
         "agent_name": None,
         "order": "desc",
+        "visibility": "mine",
+        "kind": None,
     }
 
 
@@ -1073,6 +1075,8 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
         "agent_id": None,
         "agent_name": None,
         "order": "desc",
+        "visibility": "mine",
+        "kind": None,
     }
     rendered = out.getvalue()
     assert "ad9fa6806e0d3c94166f9b4dafcc1069" in rendered
@@ -1117,7 +1121,7 @@ def test_render_workspace_cell_matching_cwd_no_flag(
     *where* the session was started; only the action-required
     hint is suppressed.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1149,7 +1153,7 @@ def test_render_workspace_cell_mismatched_cwd_shows_cd_flag(
     this row is picked — without it the user has no way to
     anticipate the prompt.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1189,7 +1193,7 @@ def test_workspace_metadata_appears_in_wrapper_picker_list(
     ``show_workspace=True`` somewhere between the wrapper picker
     entry point and item rendering is caught.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import pick_conversation
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1237,7 +1241,7 @@ def test_render_workspace_cell_codex_native_uses_codex_state(
     :param tmp_path: Temporary state root and workspace.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "codex-state"))
@@ -1373,6 +1377,136 @@ async def test_cross_agent_picker_lists_everything_when_owner_unknown() -> None:
 # ── Host scoping and transient-429 retry ─────────────────────────────
 
 
+@pytest.mark.parametrize("wrapper_value", ["pi-native-ui", "codex-native-ui"])
+async def test_wrapper_picker_includes_owned_children_on_the_invoking_host(
+    wrapper_value: str,
+) -> None:
+    """Children resolve their host through listed ancestors; unresolved ones are dropped."""
+    import httpx
+    from omnigent_client._sessions import SessionsNamespace
+
+    from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
+
+    rows = [
+        {
+            "id": "conv_child",
+            "title": "local native child",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_parent",
+        },
+        {
+            "id": "conv_remote_child",
+            "title": "remote native child",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_remote_parent",
+        },
+        {
+            "id": "conv_shared_child",
+            "title": "another owner's child",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_parent",
+            "owner": "other@example.test",
+        },
+        {
+            "id": "conv_other_wrapper",
+            "title": "other native wrapper",
+            "kind": "sub_agent",
+            "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+        },
+        {
+            "id": "conv_local_grandchild",
+            "title": "local native grandchild",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_child",
+        },
+        {
+            "id": "conv_remote_grandchild",
+            "title": "remote native grandchild",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_remote_child",
+        },
+        {
+            "id": "conv_orphan_child",
+            "title": "child of an unlisted parent",
+            "kind": "sub_agent",
+            "parent_session_id": "conv_off_page_parent",
+        },
+        {
+            "id": "conv_parent",
+            "title": "standalone native session",
+            "kind": "default",
+            "host_id": "host_local",
+        },
+        {
+            "id": "conv_remote_parent",
+            "title": "remote native session",
+            "kind": "default",
+            "host_id": "host_remote",
+        },
+    ]
+    sessions = [
+        {
+            "agent_id": "agent_native",
+            "status": "running",
+            "created_at": 1700000100 - index,
+            "updated_at": 1700000100 - index,
+            "owner": "me@example.test",
+            "labels": {"omnigent.wrapper": wrapper_value},
+            **row,
+        }
+        for index, row in enumerate(rows)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions":
+            assert request.url.params["visibility"] == "mine"
+            kind = request.url.params.get("kind", "default")
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        row
+                        for row in sessions
+                        if row["owner"] == "me@example.test" and row["kind"] == kind
+                    ]
+                },
+            )
+        assert request.url.path.endswith("/items")
+        return httpx.Response(200, json={"data": []})
+
+    async def pick(host_id: str | None) -> tuple[str | None, str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = SimpleNamespace(sessions=SessionsNamespace(http, "http://srv"))
+            out = io.StringIO()
+            selected = await pick_conversation_by_wrapper_label_from_sdk(
+                client,
+                wrapper_value=wrapper_value,
+                agent_name="native",
+                host_id=host_id,
+                out=out,
+                in_=io.StringIO("1\n"),
+            )
+            return selected, out.getvalue()
+
+    # A caller without a host identity keeps the top-level-only listing.
+    selected, rendered = await pick(None)
+    assert selected == "conv_parent"
+    assert "remote native session" in rendered
+    assert "native child" not in rendered
+    assert "grandchild" not in rendered
+
+    selected, rendered = await pick("host_local")
+    assert selected == "conv_child"
+    assert "standalone native session" in rendered
+    assert "local native grandchild" in rendered
+    assert "remote native child" not in rendered
+    assert "remote native grandchild" not in rendered
+    assert "remote native session" not in rendered
+    assert "child of an unlisted parent" not in rendered
+    assert "another owner's child" not in rendered
+    assert "other native wrapper" not in rendered
+
+
 async def test_wrapper_label_picker_drops_rows_bound_to_other_hosts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1481,6 +1615,7 @@ class _RateLimitedThenOkSessionsNamespace(_FakeSessionsNamespace):
         """Raise ``RateLimitedError`` until the budget is exhausted."""
         from omnigent_client import RateLimitedError
 
+        assert kwargs["visibility"] == "mine"
         self.calls += 1
         if self.remaining_429 > 0:
             self.remaining_429 -= 1

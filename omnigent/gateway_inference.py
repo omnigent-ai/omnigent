@@ -46,11 +46,11 @@ def claude_gateway_inference_backed() -> bool:
     :returns: ``True`` iff a claude-native launch resolves AI-Gateway-backed
         inference, from omnigent config or managed settings.
     """
-    from omnigent.claude_native import (
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+    from omnigent.harnesses.claude_native.main import (
         managed_claude_gateway_signal,
         resolve_native_claude_config,
     )
-    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
     config = resolve_native_claude_config(spec=None, refresh_models=False)
     if config is not None:
@@ -75,11 +75,11 @@ def codex_gateway_inference_backed() -> bool:
     :returns: ``True`` iff the resolved launch routes through an AI Gateway
         Codex base URL.
     """
-    from omnigent.codex_native_app_server import (
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+    from omnigent.harnesses.codex_native.app_server import (
         native_codex_launch_base_url,
         resolve_native_codex_launch,
     )
-    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
     base_url = native_codex_launch_base_url(resolve_native_codex_launch(model=None))
     if not base_url:

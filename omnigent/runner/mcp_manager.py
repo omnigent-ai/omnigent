@@ -16,10 +16,10 @@ from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
 from omnigent.debug_logging import runner_primary_session_id
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
@@ -324,42 +324,45 @@ class RunnerMcpManager:
             if requested_schema is not None:
                 event_data["requestedSchema"] = requested_schema
 
-            try:
-                resp = await server_client.post(
-                    f"/v1/sessions/{session_id}/events",
-                    json=body,
-                    timeout=30.0,
-                )
-                resp.raise_for_status()
-                data: object = resp.json()
-            except Exception as exc:  # noqa: BLE001
-                _logger.warning(
-                    "MCP elicitation callback: Omnigent server POST failed (%s) — declining",
-                    exc,
-                    extra={"session_id": session_id},
-                )
-                return ElicitResult(action="decline")
+            while True:
+                try:
+                    resp = await server_client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json=body,
+                        timeout=30.0,
+                    )
+                    resp.raise_for_status()
+                    data: object = resp.json()
+                except Exception as exc:  # noqa: BLE001
+                    _logger.warning(
+                        "MCP elicitation callback: Omnigent server POST failed (%s) — declining",
+                        exc,
+                        extra={"session_id": session_id},
+                    )
+                    return ElicitResult(action="decline")
 
-            elicitation_id = data.get("elicitation_id") if isinstance(data, dict) else None
-            if not isinstance(elicitation_id, str) or not elicitation_id:
-                _logger.warning(
-                    "MCP elicitation callback: Omnigent server returned no "
-                    "elicitation_id — declining",
-                    extra={"session_id": session_id},
-                )
-                return ElicitResult(action="decline")
+                elicitation_id = data.get("elicitation_id") if isinstance(data, dict) else None
+                if not isinstance(elicitation_id, str) or not elicitation_id:
+                    _logger.warning(
+                        "MCP elicitation callback: Omnigent server returned no "
+                        "elicitation_id — declining",
+                        extra={"session_id": session_id},
+                    )
+                    return ElicitResult(action="decline")
 
-            # Park until the user approves or declines (or timeout).
-            # No-op publish_event: ``response.elicitation_resolved``
-            # won't fire on timeout/cancellation, so the Omnigent server's
-            # sidebar badge may stay stale. Same pattern as
-            # proxy_mcp_manager. A future enhancement could POST
-            # the resolved event back to the Omnigent server here.
-            verdict = await pending_approvals.wait_for_user_verdict(
-                elicitation_id=elicitation_id,
-                conversation_id=session_id,
-                publish_event=lambda _s, _e: None,
-            )
+                # The runner-owned MCP execution is suspended in this callback.
+                # A reconnect re-publishes the same question under a fresh id;
+                # it never invokes the external tool again.
+                try:
+                    verdict = await pending_approvals.wait_for_user_verdict(
+                        elicitation_id=elicitation_id,
+                        conversation_id=session_id,
+                        publish_event=lambda _s, _e: None,
+                        retry_on_server_reconnect=True,
+                    )
+                except pending_approvals.ServerReconnected:
+                    continue
+                break
 
             if not verdict.approved:
                 return ElicitResult(action="decline")

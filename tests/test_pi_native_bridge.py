@@ -1,4 +1,4 @@
-"""Tests for omnigent.pi_native_bridge inbox enqueue contract."""
+"""Tests for omnigent.harnesses.pi_native.bridge inbox enqueue contract."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import pi_native_bridge
+from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
 
 def _inbox_files(bridge_dir: Path) -> list[str]:
@@ -336,7 +336,7 @@ def test_refresh_config_auth_headers_preserves_launch_written_headers(tmp_path: 
 
 def test_inject_relay_into_config_writes_relay_fields(tmp_path: Path) -> None:
     """inject_relay_into_config writes relayUrl and relayToken into config.json."""
-    from omnigent import pi_native_bridge
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -362,11 +362,29 @@ def test_inject_relay_into_config_writes_relay_fields(tmp_path: Path) -> None:
 
 def test_inject_relay_into_config_noops_when_config_absent(tmp_path: Path) -> None:
     """inject_relay_into_config returns False when config.json is missing."""
-    from omnigent import pi_native_bridge
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
     bridge_dir = tmp_path / "missing"
     bridge_dir.mkdir()
     assert pi_native_bridge.inject_relay_into_config(bridge_dir, "http://x", "tok") is False
+
+
+def test_pi_native_env_unset_parses_operator_denylist() -> None:
+    """Comma-separated names parse sorted and deduplicated; blanks drop."""
+    environ = {
+        "OMNIGENT_PI_ENV_UNSET": " DEEPSEEK_API_KEY,ANTHROPIC_AUTH_TOKEN,,ANTHROPIC_AUTH_TOKEN "
+    }
+    assert pi_native_bridge.pi_native_env_unset(environ) == [
+        "ANTHROPIC_AUTH_TOKEN",
+        "DEEPSEEK_API_KEY",
+    ]
+
+
+def test_pi_native_env_unset_absent_or_empty_strips_nothing() -> None:
+    """Unset or empty denylist means no scrubbing (safe default)."""
+    assert pi_native_bridge.pi_native_env_unset({}) == []
+    assert pi_native_bridge.pi_native_env_unset({"OMNIGENT_PI_ENV_UNSET": ""}) == []
+    assert pi_native_bridge.pi_native_env_unset({"OMNIGENT_PI_ENV_UNSET": "  , ,"}) == []
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
@@ -380,9 +398,9 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
     prune the dir only when its owner is provably dead."""
     import os
 
-    from omnigent.pi_native_bridge import prepare_bridge_dir
+    from omnigent.harnesses.pi_native.bridge import prepare_bridge_dir
 
-    monkeypatch.setattr("omnigent.pi_native_bridge._BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
 
     bridge_dir = prepare_bridge_dir("conv_owner_marker")
 
@@ -398,11 +416,11 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     import subprocess
     import sys
 
-    from omnigent.pi_native_bridge import prune_orphaned_bridge_dirs
+    from omnigent.harnesses.pi_native.bridge import prune_orphaned_bridge_dirs
 
     root = tmp_path / "pi-native"
     root.mkdir(parents=True)
-    monkeypatch.setattr("omnigent.pi_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", root)
 
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()

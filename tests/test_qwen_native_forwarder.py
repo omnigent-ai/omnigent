@@ -15,9 +15,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import qwen_native_bridge as qnb
-from omnigent import qwen_native_forwarder as fwd
-from omnigent.qwen_native_bridge import (
+from omnigent.harnesses.qwen_native import bridge as qnb
+from omnigent.harnesses.qwen_native import forwarder as fwd
+from omnigent.harnesses.qwen_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     bridge_dir_for_session_id,
     build_qwen_native_spawn_env,
@@ -32,7 +32,7 @@ from omnigent.qwen_native_bridge import (
     wait_for_ready,
     write_tmux_target,
 )
-from omnigent.qwen_native_forwarder import (
+from omnigent.harnesses.qwen_native.forwarder import (
     _DEDUP_WINDOW,
     _compaction_status_from_record,
     _event_to_item,
@@ -488,7 +488,7 @@ def test_qwen_session_id_is_deterministic_and_uuid() -> None:
 def test_qwen_session_recording_exists_is_workspace_scoped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent.qwen_native_bridge import _qwen_project_slug
+    from omnigent.harnesses.qwen_native.bridge import _qwen_project_slug
 
     monkeypatch.setenv("HOME", str(tmp_path))
     ws_a = tmp_path / "repo_a"
@@ -514,7 +514,10 @@ def test_qwen_session_recording_exists_is_workspace_scoped(
 def test_qwen_session_recording_path_is_workspace_scoped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent.qwen_native_bridge import _qwen_project_slug, qwen_session_recording_path
+    from omnigent.harnesses.qwen_native.bridge import (
+        _qwen_project_slug,
+        qwen_session_recording_path,
+    )
 
     monkeypatch.setenv("HOME", str(tmp_path))
     ws = tmp_path / "repo"
@@ -613,7 +616,7 @@ def test_spawn_env_carries_bridge_dir() -> None:
 
 def test_harness_registered_aliased_and_native() -> None:
     from omnigent.harness_aliases import canonicalize_harness, is_native_harness
-    from omnigent.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
     from omnigent.runtime.harnesses import _HARNESS_MODULES
     from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 

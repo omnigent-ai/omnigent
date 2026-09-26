@@ -8,14 +8,21 @@
 
 import type { RightRailTab } from "@/shell/railTabs";
 
-const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "subagents", "browser"];
+const RAIL_TABS: readonly RightRailTab[] = [
+  "files",
+  "changes",
+  "github",
+  "subagents",
+  "browser",
+  "sidechat",
+];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected rail tab (Files / Changes / Agents). */
+  /** The selected Workspace navigation tab. */
   rightRailTab?: RightRailTab;
   /** Ordered list of open file tabs. */
   openFiles?: string[];
@@ -25,6 +32,13 @@ export interface SessionWorkspaceState {
   openTerminals?: string[];
   /** The active shell tab (null = a file/scope view is active). */
   selectedTerminalKey?: string | null;
+  openBrowsers?: string[];
+  selectedBrowserId?: string | null;
+  /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
+   *  by design: side chats are ephemeral and vanish when the app is closed. */
+  openSideChats?: string[];
+  /** The active side-chat tab (null = a file/scope/other view is active). */
+  selectedSideChatId?: string | null;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -81,6 +95,30 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedTerminalKey === null || typeof record.selectedTerminalKey === "string") {
     state.selectedTerminalKey = record.selectedTerminalKey;
   }
+  if (Array.isArray(record.openBrowsers)) {
+    state.openBrowsers = [
+      ...new Set(
+        record.openBrowsers.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
+  if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
+    state.selectedBrowserId = record.selectedBrowserId;
+  }
+  if (Array.isArray(record.openSideChats)) {
+    state.openSideChats = [
+      ...new Set(
+        record.openSideChats.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
+  if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
+    state.selectedSideChatId = record.selectedSideChatId;
+  }
   return state;
 }
 
@@ -136,12 +174,34 @@ export function writeSessionWorkspaceState(
   if (next.openTerminals && next.openTerminals.length > MAX_OPEN_FILES) {
     next.openTerminals = next.openTerminals.slice(-MAX_OPEN_FILES);
   }
+  // Same bound for browser tabs. Native view creation enforces its own lower
+  // runtime cap; this keeps the persisted rail from growing without bound.
+  if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
+    next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
+  }
+  // Same bound for side-chat tabs (also appended in open order).
+  if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {
+    next.openSideChats = next.openSideChats.slice(-MAX_OPEN_FILES);
+  }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).
   if (existingIdx >= 0) store.splice(existingIdx, 1);
   store.push({ id: conversationId, state: next });
   if (store.length > MAX_SESSIONS) {
     store.splice(0, store.length - MAX_SESSIONS);
+  }
+  writeStore(store);
+}
+
+/** Let existing chats follow a changed default while keeping their open tabs and layout. */
+export function resetSessionWorkspaceTabSelections(): void {
+  const store = readStore();
+  for (const { state } of store) {
+    delete state.rightRailTab;
+    delete state.selectedFilePath;
+    delete state.selectedTerminalKey;
+    delete state.selectedBrowserId;
+    delete state.selectedSideChatId;
   }
   writeStore(store);
 }

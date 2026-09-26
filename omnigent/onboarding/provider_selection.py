@@ -12,12 +12,12 @@ from dataclasses import dataclass
 import click
 from rich.console import Console
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding.providers import (
     PROVIDER_ENV_VARS,
     AuthField,
     get_provider_config,
 )
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 console = Console()
 

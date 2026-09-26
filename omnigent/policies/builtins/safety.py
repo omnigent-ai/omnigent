@@ -33,7 +33,7 @@ _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os
 NATIVE_WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 
 # Claude Code and Codex native tool names surfaced via the PreToolUse /
-# PostToolUse hook contract (see ``omnigent.native_policy_hook``).
+# PostToolUse hook contract (see ``omnigent.native.native_policy_hook``).
 # These bypass Omnigent' ``sys_os_*`` MCP tools and execute directly
 # inside the CLI subprocess.
 _NATIVE_OS_TOOLS = NATIVE_WRITE_TOOLS | {"Bash", "Read", "Glob", "Grep"}
@@ -518,7 +518,7 @@ _SANDBOX_OVERRIDE_KEYS = frozenset(
 def enforce_sandbox(
     sandbox_type: str = "linux_bwrap",
     allow_network: bool = True,
-    write_paths: list[str] | None = None,
+    write_paths: list[str | dict[str, object]] | None = None,
     read_paths: list[str] | None = None,
     env_passthrough: list[str] | None = None,
 ) -> PolicyCallable:
@@ -823,7 +823,20 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 },
                 "write_paths": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "minLength": 1},
+                                    "copy_on_write": {"type": "boolean", "default": False},
+                                },
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                        ],
+                    },
                     "description": "Writable paths to enforce (null inherits agent's config)",
                 },
                 "read_paths": {

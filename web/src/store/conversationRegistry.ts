@@ -219,6 +219,44 @@ export class ConversationRegistry {
     this.activeId = null;
   }
 
+  /**
+   * Rename an entry `oldId` → `newId`, preserving its state — hydrates a
+   * client-only conversation (`temp:*`) onto its real id so the optimistic
+   * bubble carries over without a remount. `oldId` must be a stream-less local
+   * entry (no live SSE pump to transfer). If `newId` is already live, its entry
+   * wins but inherits any optimistic pending messages before the old one is
+   * disposed. No-op if `oldId` isn't live.
+   */
+  rekey(oldId: string, newId: string): void {
+    const old = this.entries.get(oldId);
+    if (old === undefined) return;
+    if (oldId === newId) return;
+    const existing = this.entries.get(newId);
+    if (existing !== undefined) {
+      const existingState = existing.getState();
+      const existingPendingIds = new Set(
+        existingState.pendingUserMessages.map((item) => item.tempId),
+      );
+      const missingPending = old
+        .getState()
+        .pendingUserMessages.filter((item) => !existingPendingIds.has(item.tempId));
+      if (missingPending.length > 0) {
+        existing.setState({
+          pendingUserMessages: [...missingPending, ...existingState.pendingUserMessages],
+        });
+      }
+      this.release(oldId);
+      if (this.activeId === oldId) this.activeId = newId;
+      return;
+    }
+    const next = this.createEntry(newId);
+    next.setState(old.getState());
+    this.entries.set(newId, next);
+    this.entries.delete(oldId);
+    old.dispose();
+    if (this.activeId === oldId) this.activeId = newId;
+  }
+
   /** Move `id` to the most-recently-viewed end of the LRU order. */
   private touch(id: string): void {
     const entry = this.entries.get(id);

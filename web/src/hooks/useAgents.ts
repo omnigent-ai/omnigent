@@ -1,14 +1,9 @@
-// TanStack Query wrappers for agent information.
-//
-// Agents are now derived from session data rather than a standalone
-// `/api/agents` endpoint. `fetchAgents()` calls `GET /v1/sessions`
-// and extracts unique `{id, name}` pairs from the `agent_id` /
-// `agent_name` fields on each session. `useSessionAgent(sessionId)`
-// fetches the full `AgentObject` for a single session via
-// `GET /v1/sessions/{sessionId}/agent`.
+// Agent discovery and per-session agent information.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { useSessionAgents } from "./useAvailableAgents";
+import { isTempConvId } from "@/lib/tempConversationId";
 
 export interface McpServerSummary {
   name: string;
@@ -64,56 +59,9 @@ export interface Agent {
   terminals?: string[];
 }
 
-/** Wire shape of a session list item from `GET /v1/sessions`. */
-interface SessionListItemWire {
-  id: string;
-  agent_id: string;
-  agent_name?: string | null;
-}
-
-interface SessionsListResponse {
-  data: SessionListItemWire[];
-  has_more: boolean;
-}
-
-/**
- * Fetch unique agents by scanning the sessions list.
- *
- * Calls `GET /v1/sessions?limit=100` and deduplicates by `agent_id`.
- * Sessions without an `agent_name` are skipped (orphaned / deleted
- * agent). The returned `Agent` objects carry only `id` and `name` —
- * `description` and `mcp_servers` require a per-session agent fetch
- * via `useSessionAgent`.
- */
-async function fetchAgents(): Promise<Agent[]> {
-  const res = await authenticatedFetch("/v1/sessions?limit=100");
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as SessionsListResponse;
-
-  const seen = new Map<string, Agent>();
-  for (const session of json.data) {
-    if (!session.agent_id || seen.has(session.agent_id)) continue;
-    seen.set(session.agent_id, {
-      id: session.agent_id,
-      name: session.agent_name ?? session.agent_id,
-    });
-  }
-  return Array.from(seen.values());
-}
-
-/**
- * Fetch the agents list, derived from active sessions.
- *
- * Intended for the landing page (no active session); the session
- * detail page uses `useSessionAgent` for the bound agent instead.
- */
+/** Agents discovered in the first 30 cached Mine sessions, shared with the picker. */
 export function useAgents({ enabled = true }: { enabled?: boolean } = {}) {
-  return useQuery({
-    queryKey: ["agents"],
-    queryFn: fetchAgents,
-    staleTime: Infinity,
-    enabled,
-  });
+  return useSessionAgents(enabled);
 }
 
 /**
@@ -160,10 +108,13 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
  * sessions-derived agent list. Only fires when `sessionId` is non-null.
  */
 export function useSessionAgent(sessionId: string | null) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session —
+  // never fetch its agent.
+  const serverId = isTempConvId(sessionId) ? null : sessionId;
   return useQuery({
-    queryKey: ["session-agent", sessionId],
-    queryFn: () => fetchSessionAgent(sessionId!),
-    enabled: sessionId !== null,
+    queryKey: ["session-agent", serverId],
+    queryFn: () => fetchSessionAgent(serverId!),
+    enabled: serverId !== null,
     staleTime: Infinity,
   });
 }

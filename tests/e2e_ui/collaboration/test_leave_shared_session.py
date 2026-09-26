@@ -72,9 +72,22 @@ def _grant(server: MultiUserServer, user_id: str, level: int) -> None:
     resp.raise_for_status()
 
 
+# Scope every session-link lookup to the sidebar list. A session link to the
+# open session also appears in the Workspace rail's Agents tab (the "main" row),
+# and that tab is the rail's default for a view-only collaborator — who has no
+# file surfaces — so a page-wide ``li``/``a`` match would resolve to two
+# elements (sidebar row + rail row) and trip Playwright's strict mode.
+_SIDEBAR = '[data-testid="sidebar-conversation-list"]'
+
+
+def _sidebar_link(page: Page, session_id: str) -> Locator:
+    """The sidebar's own anchor for *session_id* (excludes the Workspace rail)."""
+    return page.locator(f'{_SIDEBAR} a[href="/c/{session_id}"]')
+
+
 def _row(page: Page, session_id: str) -> Locator:
     """The sidebar row (``<li>``) for *session_id*, located by its href."""
-    return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+    return page.locator(f"{_SIDEBAR} li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
 
 
 def _open_row_menu(page: Page, session_id: str) -> None:
@@ -84,7 +97,7 @@ def _open_row_menu(page: Page, session_id: str) -> None:
     ``ConversationMenuItems`` body as the kebab, so the item testids match and
     it avoids the kebab's pointer-event timing.
     """
-    link = page.locator(f'a[href="/c/{session_id}"]')
+    link = _sidebar_link(page, session_id)
     expect(link).to_be_visible(timeout=30_000)
     link.click(button="right")
 

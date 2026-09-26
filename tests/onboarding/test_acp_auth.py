@@ -132,24 +132,29 @@ def test_env_passthrough_rejects_non_names(value: object) -> None:
 def test_shadowed_builtin_acp_rows_matches_row_ids_only() -> None:
     """Only a slug equal to a row id shadows it — an alias-shaped name does not.
 
-    "Devin" slugifies onto the ``devin`` row id, so the two name the same harness
+    "Grok" slugifies onto the ``grok`` row id, so the two name the same harness
     and the row is dropped in favor of the user's command. "Grok Build" slugifies
     to ``grok-build``, which is a *different* harness id from the ``grok`` row
     (the ``acp:`` prefix survives canonicalization), so both stay addressable.
+
+    "Devin" is the negative case that used to be the positive one: Devin's ACP
+    row is keyed ``devin-acp`` now (the bare spelling belongs to the native
+    ``devin-native`` wrap), so a configured agent named "Devin" shadows nothing.
     """
     entries = acp_agents(
         {
             "acp": {
                 "agents": [
-                    {"name": "Devin", "command": "devin acp --model swe-1-7-medium"},
+                    {"name": "Grok", "command": "grok agent stdio"},
                     {"name": "Grok Build", "command": "grok agent stdio"},
+                    {"name": "Devin", "command": "devin acp --model swe-2-medium"},
                     {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
                 ]
             }
         }
     )
-    assert [e.slug for e in entries] == ["devin", "grok-build", "gemini-cli"]
-    assert shadowed_builtin_acp_rows(entries) == {"devin"}
+    assert [e.slug for e in entries] == ["grok", "grok-build", "devin", "gemini-cli"]
+    assert shadowed_builtin_acp_rows(entries) == {"grok"}
 
 
 def test_shadowed_builtin_acp_rows_empty_without_config() -> None:

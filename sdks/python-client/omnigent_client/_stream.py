@@ -37,6 +37,7 @@ from ._events import (
     NativeToolCall,
     OutputFileDone,
     ReasoningDelta,
+    ReasoningDone,
     ReasoningStarted,
     ReasoningSummaryDelta,
     ResponseCancelled,
@@ -172,6 +173,12 @@ class BlockStream:
         # suppressed so renderers don't show the same text twice
         # (once live, once as a summary panel).
         reasoning_chunks_emitted = False
+        # Set when ANY reasoning section of the current response
+        # streamed via deltas. A later persisted reasoning item
+        # (``ReasoningDone``) is then suppressed — the deltas already
+        # painted the thought — while settled mirrors with no deltas
+        # (claude-native) still render. Reset per response.
+        reasoning_streamed = False
         in_text = False
         accumulated = ""
         full_text = ""
@@ -230,6 +237,7 @@ class BlockStream:
                         )
                 pending_tools.clear()
                 tool_executions_by_call_id.clear()
+                reasoning_streamed = False
                 agent = event.response.model
                 if not started:
                     started = True
@@ -273,6 +281,7 @@ class BlockStream:
                 summary_text = ""
                 reasoning_accumulated = ""
                 reasoning_chunks_emitted = False
+                reasoning_streamed = True
                 yield ReasoningStartBlock(ctx=_ctx())
 
             elif isinstance(event, ReasoningDelta | ReasoningSummaryDelta):
@@ -298,6 +307,7 @@ class BlockStream:
                     summary_text = ""
                     reasoning_accumulated = ""
                     reasoning_chunks_emitted = False
+                    reasoning_streamed = True
                     yield ReasoningStartBlock(ctx=_ctx())
                 if isinstance(event, ReasoningDelta):
                     reasoning_text += event.delta
@@ -547,6 +557,51 @@ class BlockStream:
                             has_code_blocks="```" in text,
                             ctx=_ctx(),
                         )
+
+            # ── Reasoning done ───────────────────────
+            elif isinstance(event, ReasoningDone):
+                # A persisted reasoning item (``output_item.done``, type
+                # ``reasoning``). When this response's reasoning already
+                # streamed via deltas, the thought is painted — the item
+                # only marks the section's end (same dedup contract as
+                # ``MessageDone``'s "deltas already produced the text").
+                # With no deltas at all — a native transcript mirror such
+                # as claude-native thinking blocks — render the item as
+                # one settled reasoning block so the thought surfaces.
+                if in_reasoning:
+                    in_reasoning = False
+                    if reasoning_accumulated:
+                        yield ReasoningChunk(
+                            text=reasoning_accumulated,
+                            ctx=_ctx(),
+                        )
+                        reasoning_chunks_emitted = True
+                        reasoning_accumulated = ""
+                    if not reasoning_chunks_emitted:
+                        yield ReasoningBlock(
+                            reasoning_text=reasoning_text,
+                            summary_text=summary_text,
+                            ctx=_ctx(),
+                        )
+                elif not reasoning_streamed:
+                    # Entering reasoning closes open text — same
+                    # boundary as ReasoningStarted.
+                    if in_text:
+                        if accumulated:
+                            yield TextChunk(text=accumulated, ctx=_ctx())
+                            accumulated = ""
+                        yield TextDone(
+                            full_text=full_text,
+                            has_code_blocks="```" in full_text,
+                            ctx=_ctx(),
+                        )
+                        in_text = False
+                        full_text = ""
+                    yield ReasoningBlock(
+                        reasoning_text=event.text,
+                        summary_text=event.summary,
+                        ctx=_ctx(),
+                    )
 
             # ── Status events ────────────────────────
             elif isinstance(event, CompactionInProgress):

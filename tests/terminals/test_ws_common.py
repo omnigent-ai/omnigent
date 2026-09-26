@@ -25,7 +25,8 @@ def test_importing_claude_native_does_not_import_fastapi() -> None:
         [
             sys.executable,
             "-c",
-            "import sys; import omnigent.claude_native; assert 'fastapi' not in sys.modules",
+            "import sys; import omnigent.harnesses.claude_native.main; "
+            "assert 'fastapi' not in sys.modules",
         ],
         check=True,
     )

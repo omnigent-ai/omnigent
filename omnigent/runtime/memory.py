@@ -515,6 +515,7 @@ def _cognify_blocking(dataset: str) -> None:
 # Agent connections already mirrored into cognee's registry this process,
 # keyed by (private dataset, session id) so a new session re-registers with
 # its current session id but repeat tool calls don't re-post.
+# custom-lint: disable-next=workspace-scoped-cache -- globally-unique session id key
 _registered_agent_connections: set[tuple[str, str]] = set()
 _registration_lock = threading.Lock()
 

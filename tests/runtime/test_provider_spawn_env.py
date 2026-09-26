@@ -21,6 +21,10 @@ subprocess spawn, no real CLI.
 from __future__ import annotations
 
 import logging
+import shlex
+import socket
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +32,7 @@ import pytest
 import yaml as _yaml
 
 from omnigent.errors import OmnigentError
+from omnigent.onboarding import ambient, harness_install
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
@@ -60,27 +65,58 @@ _CATALOG_DEFAULTS = {
 @pytest.fixture(autouse=True)
 def _clear_ambient_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Clear ambient vendor keys so they cannot leak into the spawn env.
+    Clear ambient vendor keys and gateway routing so they cannot leak into
+    the spawn env.
 
     The coding-agent process may have ``ANTHROPIC_API_KEY`` /
-    ``OPENAI_API_KEY`` / ``DATABRICKS_TOKEN`` set; clearing them keeps the
-    tests deterministic (the provider path resolves keys from the config
-    file, not the ambient environment).
+    ``OPENAI_API_KEY`` / ``DATABRICKS_TOKEN`` set; a gateway-driven shell also
+    exports ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_MODEL`` /
+    ``ANTHROPIC_CUSTOM_HEADERS``. Detection folds those routing vars into the
+    detected anthropic entry, which would redirect the "routes to
+    api.anthropic.com" assertions at the developer's own gateway (issue #4279).
+    Clearing them keeps the tests deterministic (the provider path resolves
+    from the config file, not the ambient environment).
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DATABRICKS_TOKEN"):
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "DATABRICKS_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(
         "omnigent.runtime.workflow._resolve_catalog_default_model",
         lambda provider_name, family, *, context: _CATALOG_DEFAULTS[(provider_name, family)],
     )
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=_CATALOG_DEFAULTS[(provider_name, family)]
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_provider_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate host state ambient provider detection reads (issue #4279).
+
+    Two ambient sources leak past ``$OMNIGENT_CONFIG_HOME``:
+
+    - ``~/.codex/config.toml`` and ``~/.databrickscfg`` live under ``$HOME``
+      (``$USERPROFILE`` on Windows), so redirect it to an empty temp dir.
+    - On macOS ``_claude_login_detected()`` falls back to ``claude auth status``,
+      which reads the **Keychain** — no ``$HOME`` override can hide it. A
+      signed-in Mac would inject a ``subscription`` provider that outranks the
+      test's own configured entry, so stub it to "not logged in". Tests that
+      exercise a detected login can still override this in call order.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.ambient._claude_login_detected", lambda: False)
 
 
 @pytest.fixture
@@ -324,6 +360,57 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_MODEL"] == "gpt-default-model"
     # Codex defaults to the Responses wire API when the family omits wire_api.
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+@pytest.mark.parametrize("auth_source", ["spec", "global"])
+@pytest.mark.parametrize("endpoint_url", [None, "https://openrouter.ai/api/v1"])
+def test_codex_inline_api_key_routes_to_declared_endpoint(
+    config_home: Path,
+    auth_source: str,
+    endpoint_url: str | None,
+) -> None:
+    """Inline auth supplies both the key and endpoint, overriding a default when explicit."""
+    api_key = "test-key with ' quotes"
+    auth = ApiKeyAuth(api_key=api_key, base_url=endpoint_url)
+    if auth_source == "spec":
+        _write_config(config_home, _openai_default_config())
+    else:
+        _write_config(
+            config_home,
+            {"auth": {"type": "api_key", "api_key": api_key, "base_url": endpoint_url}},
+        )
+    spec = _make_spec(
+        harness="codex",
+        model="test-model",
+        auth=auth if auth_source == "spec" else None,
+    )
+
+    env = _build_codex_spawn_env(spec)
+
+    assert env["HARNESS_CODEX_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == (endpoint_url or "https://api.openai.com/v1")
+    assert shlex.split(env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]) == ["printf", "%s", api_key]
+    assert env["HARNESS_CODEX_MODEL"] == "test-model"
+    assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+@pytest.mark.parametrize("fragment", [None, "wrong-key"])
+def test_codex_resolved_api_key_preserves_literal_dollars(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch, fragment: str | None
+) -> None:
+    """Provider synthesis must not interpret an already-resolved secret as config."""
+    _write_config(config_home, {})
+    monkeypatch.delenv("OMNIGENT_KEY_FRAGMENT", raising=False)
+    if fragment is None:
+        monkeypatch.delenv("KEY_FRAGMENT", raising=False)
+    else:
+        monkeypatch.setenv("KEY_FRAGMENT", fragment)
+    api_key = "test-$KEY_FRAGMENT-'quoted'"
+    spec = _make_spec(harness="codex", model="test-model", auth=ApiKeyAuth(api_key=api_key))
+
+    env = _build_codex_spawn_env(spec)
+
+    assert shlex.split(env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]) == ["printf", "%s", api_key]
 
 
 def test_codex_rejects_chat_only_openrouter_before_harness_spawn(config_home: Path) -> None:
@@ -1760,3 +1847,164 @@ def test_spawn_env_legacy_env_wins_over_config_command(
 
     # The builder must not set OMNIGENT_* from config when the legacy env wins.
     assert f"OMNIGENT_{harness.upper()}_PATH" not in env
+
+
+# ── Ambient-isolation controls ─────────────────────────────────────────────
+
+
+def test_live_ollama_cannot_shadow_codex_fallback(
+    config_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_ambient_probes: SimpleNamespace,
+) -> None:
+    """A live Ollama on the probe port must not shadow the configured openai fallback.
+
+    Ambient detection connects to the local Ollama port and synthesizes a
+    provider from a successful connect; that provider would outrank the
+    configured-but-not-default openai credential the codex head falls back to.
+    A real listener is bound and the probe pointed at it, so the calibration
+    assertion proves the isolation patch is what suppresses detection rather
+    than the port being coincidentally dead on this machine.
+    """
+    listener = socket.socket()
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        host, port = listener.getsockname()
+        # The probe reads these module globals at call time.
+        monkeypatch.setattr(ambient, "_OLLAMA_HOST", host)
+        monkeypatch.setattr(ambient, "_OLLAMA_PORT", port)
+
+        # Calibration: the unpatched probe sees the live listener.
+        assert real_ambient_probes.ollama_reachable() is True
+        # Isolation: the autouse patch, not a dead port, suppresses detection.
+        assert ambient._ollama_reachable() is False
+
+        monkeypatch.setenv("HOME", str(config_home))
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        config = {
+            "providers": {
+                "vendor-openai": {  # configured, but NOT marked default
+                    "kind": "key",
+                    "openai": _key_family(
+                        "https://openai.example.com/v1",
+                        "sk-oai-secret",
+                        "gpt-default-model",
+                    ),
+                }
+            }
+        }
+        _write_config(config_home, config)
+        spec = _make_spec(harness="codex")
+
+        env = _build_codex_spawn_env(spec, workdir=None)
+
+        assert env["HARNESS_CODEX_GATEWAY"] == "true"
+        assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://openai.example.com/v1"
+        assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    finally:
+        listener.close()
+
+
+def test_claude_cli_login_cannot_shadow_claude_sdk_fallback(
+    config_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_ambient_probes: SimpleNamespace,
+) -> None:
+    """A Keychain-backed Claude CLI login must not shadow the anthropic fallback.
+
+    On macOS the login detector falls back to ``claude auth status``, which
+    reads the Keychain and so reports a login regardless of ``$HOME``; the
+    resulting subscription provider would outrank the configured-but-not-default
+    anthropic credential the brain head falls back to. ``sys.platform`` is
+    pinned to darwin so the macOS-only branch is exercised on every CI OS, and
+    the calibration assertion proves the unpatched detector would report the
+    simulated login.
+    """
+    monkeypatch.setattr(sys, "platform", "darwin")
+    # ``_claude_login_detected`` imports this name from the module at call
+    # time, so the module attribute is the seam.
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda *args, **kwargs: True)
+    monkeypatch.setenv("HOME", str(config_home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    # Calibration: file check misses under the isolated HOME, so the darwin
+    # CLI fallback fires and the unpatched detector reports a login.
+    assert real_ambient_probes.claude_login_detected() is True
+    # Isolation: the patched detector never consults the CLI.
+    assert ambient._claude_login_detected() is False
+
+    config = {
+        "providers": {
+            "vendor-anthropic": {  # configured, but NOT marked default
+                "kind": "key",
+                "anthropic": _key_family(
+                    "https://anthropic.example.com/v1",
+                    "sk-ant-secret",
+                    "claude-default-model",
+                ),
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="claude-sdk")
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+
+
+def test_stale_login_cache_cannot_shadow_claude_sdk_fallback(
+    config_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_ambient_probes: SimpleNamespace,
+) -> None:
+    """A TTL-cached login verdict from an earlier test must not shadow the fallback.
+
+    An earlier test's ambient sweep can run ``claude auth status`` while a
+    vendor key sits in the environment; the CLI reports a login for that key
+    and the positive verdict is TTL-cached per ``(key, binary)``, outliving the
+    test that produced it. A later test with an isolated ``$HOME`` would then
+    consume the stale positive and route through a subscription provider
+    instead of its configured anthropic credential. The fixture boundary must
+    make that cache unreachable.
+    """
+    monkeypatch.setattr(sys, "platform", "darwin")
+    # Prime the cache under the key production writes: (family, resolved
+    # binary path). Binary resolution is stubbed so the cache is hit — and the
+    # status subprocess never spawns — on machines with no claude install.
+    fake_binary = "/fake/bin/claude"
+    monkeypatch.setattr(
+        harness_install, "shutil", SimpleNamespace(which=lambda _name: fake_binary)
+    )
+    harness_install._LOGIN_PROBE_CACHE[("anthropic", fake_binary)] = time.monotonic() + 3600.0
+    monkeypatch.setenv("HOME", str(config_home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    # Calibration: the unpatched detector consumes the stale positive.
+    assert real_ambient_probes.claude_login_detected() is True
+    # Isolation: the patched detector never reaches the cache.
+    assert ambient._claude_login_detected() is False
+
+    config = {
+        "providers": {
+            "vendor-anthropic": {  # configured, but NOT marked default
+                "kind": "key",
+                "anthropic": _key_family(
+                    "https://anthropic.example.com/v1",
+                    "sk-ant-secret",
+                    "claude-default-model",
+                ),
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="claude-sdk")
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"

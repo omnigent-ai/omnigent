@@ -17,7 +17,7 @@ gateway to reject unknown ids promptly.
 
 from __future__ import annotations
 
-from omnigent.model_override import model_family_mismatch, validate_model_override
+from omnigent.models.model_override import model_family_mismatch, validate_model_override
 from tests.harness_bench.driver import infra_failure_reason
 from tests.harness_bench.probes.base import CapabilityProbe
 from tests.harness_bench.profile import BenchProfile

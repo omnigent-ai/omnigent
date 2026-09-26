@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omnigent._wrapper_labels import (
@@ -12,10 +14,11 @@ from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY,
 )
 from omnigent.harness_plugins import KIRO_NATIVE_CODING_AGENT, PI_NATIVE_CODING_AGENT
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
     native_shell_terminal_spec,
+    native_shell_terminal_specs,
     public_agent_name,
 )
 
@@ -122,10 +125,11 @@ def test_native_shell_terminal_spec_offers_installed_shells_default_first(
     is keyed and commanded by its basename and is an unsandboxed caller-process
     shell with cwd override allowed.
     """
-    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setenv("SHELL", "/usr/local/bin/fish")
+    monkeypatch.setattr(
+        "omnigent.native.native_coding_agents.installed_interactive_shells",
+        lambda: ["fish", "bash", "zsh"],
+    )
     spec = native_shell_terminal_spec()
-    # $SHELL (fish) leads, then the remaining offered shells in order.
     assert list(spec) == ["fish", "bash", "zsh"]
     for name, entry in spec.items():
         assert entry["command"] == name
@@ -140,9 +144,49 @@ def test_native_shell_terminal_spec_offers_installed_shells_default_first(
 def test_native_shell_terminal_spec_falls_back_to_bash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no shells installed the spec still offers a single bash terminal."""
-    monkeypatch.setattr("shutil.which", lambda name: None)
-    monkeypatch.delenv("SHELL", raising=False)
+    """The materialized spec retains discovery's non-empty bash fallback."""
+    monkeypatch.setattr(
+        "omnigent.native.native_coding_agents.installed_interactive_shells",
+        lambda: ["bash"],
+    )
     spec = native_shell_terminal_spec()
     assert list(spec) == ["bash"]
     assert spec["bash"]["command"] == "bash"
+
+
+def test_native_shell_terminal_specs_builds_runtime_specs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner can replace the fallback with parsed host terminal specs."""
+    monkeypatch.setattr(
+        "omnigent._platform._resolve_interactive_shell",
+        lambda shell: f"/resolved/{shell}",
+    )
+    spec = native_shell_terminal_specs(["zsh", "bash"])
+    assert list(spec) == ["zsh", "bash"]
+    assert spec["zsh"].command == "/resolved/zsh"
+    assert spec["zsh"].allow_cwd_override is True
+    assert spec["zsh"].os_env != "inherit"
+    assert spec["zsh"].os_env is not None
+    assert spec["zsh"].os_env.cwd == "."
+    assert spec["zsh"].os_env.sandbox is not None
+    assert spec["zsh"].os_env.sandbox.type == "none"
+
+
+@pytest.mark.posix_only
+def test_native_shell_terminal_specs_preserves_login_shell_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Runtime specs launch a nonstandard absolute login-shell executable."""
+    fish = tmp_path / "nix-profile" / "bin" / "fish"
+    fish.parent.mkdir(parents=True)
+    fish.write_text("#!/bin/sh\n")
+    fish.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(fish))
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr("omnigent._platform._INTERACTIVE_SHELL_DIRS", ())
+
+    spec = native_shell_terminal_specs(["fish"])
+
+    assert spec["fish"].command == str(fish)

@@ -1,9 +1,9 @@
 """Executor that bridges Omnigent web turns into a native OpenCode session.
 
-Built on :class:`omnigent.native_server_harness.NativeServerHarness`: the
+Built on :class:`omnigent.native.native_server_harness.NativeServerHarness`: the
 runner owns the ``opencode serve`` process + SSE forwarder, and this
 executor injects the latest web turn over the
-:class:`omnigent.opencode_http_transport.OpenCodeHttpTransport` using the
+:class:`omnigent.harnesses.opencode_native.http_transport.OpenCodeHttpTransport` using the
 loopback URL + auth secret published in the bridge state. Output is
 streamed back by the runner-side forwarder, so ``run_turn`` only admits the
 prompt and yields ``TurnComplete`` — the same injection/completion split as
@@ -18,14 +18,14 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from omnigent.native_server_harness import NativeServerHarness
-from omnigent.native_server_transport import NativePrompt
-from omnigent.opencode_http_transport import OpenCodeHttpTransport
-from omnigent.opencode_native_bridge import (
+from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR,
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     read_bridge_state,
 )
+from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
+from omnigent.native.native_server_harness import NativeServerHarness
+from omnigent.native.native_server_transport import NativePrompt
 
 # Canonical harness id, surfaced in harness error messages.
 OPENCODE_NATIVE_HARNESS_ID = "opencode-native"

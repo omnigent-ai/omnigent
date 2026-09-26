@@ -65,6 +65,7 @@ class FunctionSchemaResult:
     description: str
     parameters_json_schema: dict[str, Any]
     return_annotation: type[Any] | None
+    uses_tool_state: bool
 
 
 def build_function_schema(
@@ -89,6 +90,7 @@ def build_function_schema(
     parsed_doc = parse_google_docstring(fn.__doc__ or "")
 
     fields: dict[str, tuple[Any, FieldInfo]] = {}
+    uses_tool_state = False
     for name, param in sig.parameters.items():
         ann = type_hints.get(name, Any)
 
@@ -107,6 +109,7 @@ def build_function_schema(
                     f"{ann!r}. It must be typed as ToolState "
                     f"(or left unannotated); any other type is a bug."
                 )
+            uses_tool_state = True
             continue
         if ann is ToolState:
             raise TypeError(
@@ -149,6 +152,7 @@ def build_function_schema(
         description=parsed_doc.description,
         parameters_json_schema=params_schema,
         return_annotation=return_annotation,
+        uses_tool_state=uses_tool_state,
     )
 
 

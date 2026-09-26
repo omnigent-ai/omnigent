@@ -34,7 +34,7 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
-from omnigent.native_coding_agents import OPENCODE_NATIVE_AGENT_NAME
+from omnigent.native.native_coding_agents import OPENCODE_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 

@@ -10,9 +10,9 @@ import webbrowser
 from collections.abc import Callable
 
 # The server-URL shape (API mount, UI mount, display mapping) lives in
-# ``omnigent.server_url`` — the one representation of a server URL. The
+# ``omnigent.util.server_url`` — the one representation of a server URL. The
 # helpers below only borrow it to build browser links.
-from omnigent.server_url import WORKSPACE_UI_PATH, ServerUrl
+from omnigent.util.server_url import WORKSPACE_UI_PATH, ServerUrl
 
 # Client-side SPA route for one conversation (see web/src/App.tsx's
 # ``c/:conversationId``). ``conversation_url`` appends it; ``strip_conversation_path``
@@ -75,7 +75,14 @@ def conversation_url(base_url: str, conversation_id: str) -> str:
                 "",
             )
         )
-    return f"{base_url.rstrip('/')}/c/{encoded_id}"
+    # A local server started with --base-path serves the SPA (and its
+    # BrowserRouter basename) under that prefix, so a bare /c/<id> link would
+    # load a shell whose router matches nothing and render blank. Prefix it for
+    # our own local managed server only; "" for remote/root (probe-free).
+    from omnigent.host.local_server import local_server_base_path
+
+    base_path = local_server_base_path(base_url)
+    return f"{base_url.rstrip('/')}{base_path}/c/{encoded_id}"
 
 
 def open_conversation_url(url: str) -> bool:

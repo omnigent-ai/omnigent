@@ -1,10 +1,13 @@
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { Outlet, MemoryRouter } from "react-router-dom";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
-vi.mock("@/lib/analytics", () => ({ useOmnigentPageView: vi.fn() }));
+vi.mock("@/lib/analytics", () => ({
+  useOmnigentPageView: vi.fn(),
+  useOmnigentAnalytics: () => ({ trackClick: vi.fn() }),
+}));
 vi.mock("@/shell/AppShell", () => ({
   AppShell: () => (
     <div>
@@ -16,6 +19,7 @@ vi.mock("@/shell/AppShell", () => ({
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation } = await import("react-router-dom");
   return {
@@ -61,6 +65,63 @@ vi.mock("@/extensions/ExtensionProvider", () => ({
 
 import App from "./App";
 
+const chunkError = vi.hoisted(
+  () => new TypeError("Failed to fetch dynamically imported module: /assets/old.js"),
+);
+vi.mock("@/pages/TasksPage", () => ({
+  TasksPage: () => {
+    throw chunkError;
+  },
+}));
+vi.mock("@/pages/SetupPage", () => ({
+  SetupPage: () => {
+    throw chunkError;
+  },
+}));
+
+// Assert the recovery boundary surrounds both the normal and first-run route trees.
+describe("chunk load recovery", () => {
+  const reload = vi.fn();
+  function suppressExpectedError(event: ErrorEvent) {
+    if (event.error === chunkError) event.preventDefault();
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    reload.mockReset();
+    vi.stubGlobal("location", { reload });
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    window.addEventListener("error", suppressExpectedError);
+  });
+
+  afterEach(() => {
+    cleanup();
+    window.removeEventListener("error", suppressExpectedError);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it.each([
+    { path: "/tasks", basename: undefined, needsSetup: false },
+    { path: "/mount/tasks", basename: "/mount", needsSetup: false },
+    { path: "/setup", basename: undefined, needsSetup: true },
+  ])("recovers from a failed page at $path", async ({ path, basename, needsSetup }) => {
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, accounts_enabled: needsSetup, needs_setup: needsSetup }}
+      >
+        <MemoryRouter initialEntries={[path]}>
+          <App basename={basename} />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to load this page");
+    expect(reload).toHaveBeenCalledOnce();
+  });
+});
+
 function renderUsageRoute(enabled: boolean) {
   const info: typeof FALLBACK_SERVER_INFO = {
     ...FALLBACK_SERVER_INFO,
@@ -75,15 +136,40 @@ function renderUsageRoute(enabled: boolean) {
   );
 }
 
-function renderRoute(path: string) {
+function renderRoute(
+  path: string,
+  features: Record<string, boolean> = {},
+  info: typeof FALLBACK_SERVER_INFO | "loading" = { ...FALLBACK_SERVER_INFO, features },
+) {
   return render(
-    <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+    <CapabilitiesProvider info={info}>
       <MemoryRouter initialEntries={[path]}>
         <App />
       </MemoryRouter>
     </CapabilitiesProvider>,
   );
 }
+
+describe("Canvas route", () => {
+  it("shows a spinner, not 'not found', while server info is still loading", () => {
+    renderRoute("/canvas", {}, "loading");
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("not found")).toBeNull();
+    expect(screen.queryByText("canvas page")).toBeNull();
+  });
+
+  it("renders not found once server info says the canvas feature is off", async () => {
+    renderRoute("/canvas");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("canvas page")).toBeNull();
+  });
+
+  it("renders the native Canvas page inside the shell when the feature is on", async () => {
+    renderRoute("/canvas", { canvas: true });
+    expect(await screen.findByText("canvas page")).toBeInTheDocument();
+    expect(screen.getByText("app shell")).toBeInTheDocument();
+  });
+});
 
 describe("Extension page routes", () => {
   it("renders a catalog-owned namespaced page", async () => {

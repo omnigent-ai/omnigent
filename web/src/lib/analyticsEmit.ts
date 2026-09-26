@@ -19,6 +19,7 @@ import {
   type OmnigentInteractionKind,
   type OmnigentInteractionStatus,
 } from "@/lib/host";
+import { randomUUID } from "@/lib/randomUUID";
 
 /**
  * Emit one analytics event to the host sink. No-op when no host is configured.
@@ -58,15 +59,11 @@ export function emitInteractionPhase(args: InteractionPhaseArgs): void {
 }
 
 // A random correlation id for a timed interaction that has no natural subject id
-// (creating a session, loading the list). Guarded so a missing `crypto.randomUUID`
-// can never throw into the wrapped operation.
+// (creating a session, loading the list). Uses the secure-context-safe helper so
+// a missing `crypto.randomUUID` (plain-http origin) can never throw into the
+// wrapped operation.
 function newInteractionId(): string {
-  try {
-    if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
-  } catch {
-    // fall through to the timestamp fallback
-  }
-  return `iid-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  return `iid-${randomUUID()}`;
 }
 
 /** Handle for an in-flight timed interaction opened by `startTimedInteraction`. */

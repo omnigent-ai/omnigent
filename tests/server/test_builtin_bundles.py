@@ -21,7 +21,7 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
-from omnigent.native_coding_agents import NATIVE_CODING_AGENTS as _NATIVE_CODING_AGENTS
+from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS as _NATIVE_CODING_AGENTS
 from omnigent.server import app
 from omnigent.spec import load, materialize_bundle
 
@@ -249,6 +249,10 @@ _EXPECTED_BUILTIN_AGENT_IDS = {
     "qwen-native-ui": "2cffe181a2fc6cf417a49e1cf8b28d77",
     "kimi-native-ui": "9e7d109e7da66e8b5ed4ec3ecb54cef1",
     "hermes-native-ui": "32113910cf31fcc63dc96bbde428b97c",
+    # Added with the devin-native harness. This is an ADDITION, not a drift:
+    # every id above is byte-identical to before, so no persisted
+    # conversation.agent_id row is orphaned and no migration is owed.
+    "devin-native-ui": "010b5eea4b105dc0af6fb62f46065894",
 }
 
 
@@ -260,7 +264,7 @@ def test_native_seed_ids_are_byte_stable() -> None:
     drift when the 11 hand-written seed helpers collapse into one loop.
     """
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     actual = {a.agent_name: builtin_agent_id(a.agent_name) for a in NATIVE_CODING_AGENTS}
     assert actual == _EXPECTED_BUILTIN_AGENT_IDS, (
@@ -276,7 +280,7 @@ def test_native_seed_loop_covers_every_native_agent() -> None:
     seeded set (the loop raises instead — this pins that contract).
     """
     from omnigent.harness_plugins import native_provider_for_key
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     missing = [a.key for a in NATIVE_CODING_AGENTS if native_provider_for_key(a.key) is None]
     assert missing == [], f"native agents without a provider row to seed from: {missing}"

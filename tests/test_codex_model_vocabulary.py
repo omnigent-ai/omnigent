@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.claude_model_vocabulary import _CATALOG_PREFIXES as _CLAUDE_PREFIXES
-from omnigent.codex_model_vocabulary import (
+from omnigent.models.claude_model_vocabulary import _CATALOG_PREFIXES as _CLAUDE_PREFIXES
+from omnigent.models.codex_model_vocabulary import (
     _CATALOG_PREFIXES,
     EXTENDED_CATALOG_MODELS,
     EXTENDED_MODEL_DEFAULT_EFFORT,
@@ -13,7 +13,7 @@ from omnigent.codex_model_vocabulary import (
     codex_spawn_model,
     comparable_model_id,
 )
-from omnigent.reasoning_effort import clamp_effort_for_model
+from omnigent.util.reasoning_effort import clamp_effort_for_model
 
 # A live ``model/list`` response from a databricks-gateway codex session:
 # codex spells versions with dots, and the extended-catalog row keeps its
@@ -37,6 +37,14 @@ _CATALOG: list[dict[str, object]] = [
         ("databricks-gpt-5-2", "gpt-5.2"),
         # Already a slug, so translating is a no-op.
         ("gpt-5.6-luna", "gpt-5.6-luna"),
+        # A tier hung off a major alone has no minor to dot, so its slug
+        # keeps every segment hyphenated. The id is a shape placeholder,
+        # not a shipped arm.
+        ("system.ai.gpt-6-nova", "gpt-6-nova"),
+        ("databricks-gpt-6-nova", "gpt-6-nova"),
+        ("gpt-6-nova", "gpt-6-nova"),
+        # A numeric second segment is still the minor version, not a tier.
+        ("system.ai.gpt-6-1", "gpt-6.1"),
         # GLM is spawnable only under the id the gateway serves it as, which
         # is the slug omnigent writes into the session's catalog.
         ("databricks-glm-5-2", "system.ai.glm-5-2"),

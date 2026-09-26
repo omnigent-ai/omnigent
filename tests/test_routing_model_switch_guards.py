@@ -52,7 +52,7 @@ def test_the_users_claude_settings_file_is_only_ever_read() -> None:
     wiring, permissions and everything else in the file, so every reference
     here must be a read.
     """
-    tree = _tree("claude_native_bridge.py")
+    tree = _tree("harnesses/claude_native/bridge.py")
     reads: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Attribute):
@@ -79,9 +79,9 @@ def test_the_model_switch_path_polls_and_never_sleeps_a_fixed_interval(name: str
     A sleep on a literal is a guess about how long a TUI takes to render, which
     is what row 100 disproved.
     """
-    from omnigent import claude_native_bridge
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 
-    tree = _tree("claude_native_bridge.py")
+    tree = _tree("harnesses/claude_native/bridge.py")
     functions = {
         node.name: node
         for node in ast.walk(tree)

@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,89 @@ def test_manager_starts_and_pings(manager: ZygoteManager) -> None:
     """
     assert manager.is_running()
     assert isinstance(manager.pid, int)
+
+
+@pytest.fixture
+def managed_child() -> Iterator[tuple[ZygoteManager, subprocess.Popen[bytes]]]:
+    """A manager with a tiny direct child that exits when its stdin closes."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(); sys.exit(7)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    mgr = ZygoteManager()
+    mgr._proc = proc
+    try:
+        yield mgr, proc
+    finally:
+        assert proc.stdin is not None
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_unreaped_pid_is_none_before_start() -> None:
+    """An unstarted manager has no child exit status to protect."""
+    mgr = ZygoteManager()
+    assert mgr.unreaped_pid is None
+    assert mgr.pid is None
+
+
+def test_unreaped_pid_collects_exit_and_preserves_status(managed_child) -> None:
+    """Polling stops protecting an exited child without losing its exit code."""
+    mgr, proc = managed_child
+    assert mgr.unreaped_pid == proc.pid
+    assert proc.returncode is None
+    assert proc.stdin is not None
+    proc.stdin.close()
+
+    deadline = time.monotonic() + 5
+    while mgr.unreaped_pid is not None:
+        assert time.monotonic() < deadline, "child did not exit in time"
+        time.sleep(0.01)
+
+    assert proc.returncode == 7
+    assert mgr.pid == proc.pid
+    assert mgr.unreaped_pid is None
+    assert proc.wait(timeout=0) == 7
+    with pytest.raises(ChildProcessError):
+        os.waitpid(proc.pid, os.WNOHANG)
+
+
+def test_unreaped_pid_does_not_use_control_lock_or_socket(managed_child, monkeypatch) -> None:
+    """The host can collect zygote exits even while its control channel is busy."""
+    mgr, proc = managed_child
+
+    class ForbiddenLock:
+        def __enter__(self):
+            pytest.fail("unreaped_pid must not acquire the control lock")
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(mgr, "_lock", ForbiddenLock())
+    monkeypatch.setattr(
+        mgr, "_exchange", lambda _request: pytest.fail("unreaped_pid must not use the socket")
+    )
+    assert mgr.unreaped_pid == proc.pid
+
+
+def test_unreaped_pid_snapshots_process_during_stop(managed_child, monkeypatch) -> None:
+    """Concurrent shutdown cannot replace the Popen between its poll and pid read."""
+    mgr, proc = managed_child
+    original_poll = proc.poll
+
+    def poll_during_stop():
+        mgr._proc = None
+        return original_poll()
+
+    monkeypatch.setattr(proc, "poll", poll_during_stop)
+    assert mgr.unreaped_pid == proc.pid
+    assert mgr.pid is None
 
 
 def test_fork_runner_reports_pid_and_exit_code(manager: ZygoteManager, tmp_path) -> None:
@@ -476,6 +560,62 @@ def test_fork_harness_argv_round_trips_to_child(manager: ZygoteManager, tmp_path
     reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": argv, "env": env})
     assert _wait_harness_exit(manager, reply["pid"]) == 0
     assert f"harness_argv={' '.join(argv)}" in log.read_text()
+
+
+def test_forked_harness_runs_in_the_session_workspace(manager: ZygoteManager, tmp_path) -> None:
+    """A harness fork chdirs to the session workspace, not the zygote's cwd.
+
+    The zygote inherits the daemon's start cwd — possibly a since-deleted
+    transient worktree — so a harness child that kept it would root every
+    ``os.getcwd()`` fallback in its executors at the FIRST dispatch's
+    directory. The payload env carries the session workspace; the child must
+    chdir there, matching what a directly-exec'd harness inherits from its
+    runner.
+
+    :param manager: The started manager fixture (cwd = the pytest process's).
+    :param tmp_path: Temp dir for the workspace and the harness child's log.
+    """
+    workspace = tmp_path / "session-workspace"
+    workspace.mkdir()
+    log = tmp_path / "harness.log"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(log),
+        "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+    assert f"harness_cwd={workspace.resolve()}\n" in log.read_text()
+
+
+def test_forked_harness_survives_a_missing_workspace(manager: ZygoteManager, tmp_path) -> None:
+    """A workspace that vanished between launch and fork must not kill the fork.
+
+    The chdir is best-effort, matching direct exec (which never validates the
+    workspace either): a deleted workspace leaves the child in the zygote's
+    cwd rather than crashing the harness, and the failure is surfaced in the
+    harness log so a wrong-cwd session is diagnosable.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    log = tmp_path / "harness.log"
+    gone = tmp_path / "gone"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(log),
+        "OMNIGENT_RUNNER_WORKSPACE": str(gone),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+    text = log.read_text()
+    # The child stayed alive in the zygote's cwd — never the vanished one —
+    # and logged why.
+    assert "harness_cwd=" in text
+    assert f"harness_cwd={gone}\n" not in text
+    assert "cannot chdir to workspace" in text
 
 
 @pytest.mark.parametrize(

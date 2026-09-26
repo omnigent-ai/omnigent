@@ -16,6 +16,7 @@ sent on their behalf, because auto-fill takes the first enum value.
 from __future__ import annotations
 
 import asyncio
+import copy
 from typing import Any, cast
 
 import pytest
@@ -202,6 +203,67 @@ async def test_the_server_receives_the_option_the_person_picked() -> None:
 
     assert result.action == "accept"
     assert result.content == {"answer": "prod"}
+
+
+async def test_reconnect_republishes_the_same_question_with_a_fresh_id() -> None:
+    """A restart recreates presentation state without replaying the MCP tool."""
+
+    class _ReconnectServerClient:
+        def __init__(self) -> None:
+            self.bodies: list[dict[str, Any]] = []
+
+        async def post(self, url: str, json: Any = None, timeout: float = 30.0) -> Any:
+            del url, timeout
+            self.bodies.append(copy.deepcopy(json))
+            elicitation_id = f"elicit_generation_{len(self.bodies)}"
+
+            class _Resp:
+                @staticmethod
+                def raise_for_status() -> None:
+                    return None
+
+                @staticmethod
+                def json() -> dict[str, str]:
+                    return {"elicitation_id": elicitation_id}
+
+            return _Resp()
+
+    server_client = _ReconnectServerClient()
+    manager = RunnerMcpManager(server_client=cast(Any, server_client))
+    callback = manager._build_elicitation_callback()
+    params = ElicitRequestFormParams(
+        message="Which environment?", requestedSchema=cast(Any, ENV_SCHEMA)
+    )
+    task = asyncio.create_task(callback(SESSION, params))
+    try:
+        for _ in range(1000):
+            if "elicit_generation_1" in pending_approvals._pending:
+                break
+            await asyncio.sleep(0.001)
+        assert pending_approvals.notify_server_reconnect() == 1
+        for _ in range(1000):
+            if "elicit_generation_2" in pending_approvals._pending:
+                break
+            await asyncio.sleep(0.001)
+        assert pending_approvals.resolve("elicit_generation_2", True, {"answer": "prod"})
+
+        result = await task
+    finally:
+        if not task.done():
+            task.cancel()
+
+    assert result.action == "accept"
+    assert result.content == {"answer": "prod"}
+    assert server_client.bodies == [
+        {
+            "type": "mcp_elicitation",
+            "data": {"message": "Which environment?", "requestedSchema": ENV_SCHEMA},
+        },
+        {
+            "type": "mcp_elicitation",
+            "data": {"message": "Which environment?", "requestedSchema": ENV_SCHEMA},
+        },
+    ]
 
 
 async def test_a_bare_approval_still_falls_back_to_the_schema() -> None:

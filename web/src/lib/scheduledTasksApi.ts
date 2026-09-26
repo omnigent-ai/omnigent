@@ -14,6 +14,13 @@ import { authenticatedFetch } from "./identity";
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
 
+/**
+ * Where each firing runs. `connected_host` pins/resolves the owner's own
+ * machine; `managed_sandbox` provisions a FRESH server-managed sandbox per
+ * firing (no host/workspace), using the server's normal sandbox lifecycle.
+ */
+export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
+
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
   "scheduled" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
@@ -48,6 +55,8 @@ export interface ScheduledTask {
   workspace: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
   hostId: string | null;
+  /** Where firings run — a connected host, or a fresh managed sandbox per fire. */
+  executionTarget: ScheduledTaskExecutionTarget;
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
@@ -96,6 +105,12 @@ export interface CreateScheduledTaskInput {
   workspace?: string | null;
   /** Optional pinned host. */
   hostId?: string | null;
+  /**
+   * Where firings run. Omit (or `connected_host`) for the connected-host
+   * behavior; `managed_sandbox` provisions a fresh sandbox each fire and must
+   * NOT be combined with `hostId` / `workspace`.
+   */
+  executionTarget?: ScheduledTaskExecutionTarget;
 }
 
 /**
@@ -120,6 +135,11 @@ export interface UpdateScheduledTaskInput {
   permissionMode?: string | null;
   workspace?: string;
   hostId?: string;
+  /**
+   * Switch where firings run. `managed_sandbox` clears any pinned host; do not
+   * also set `hostId` / `workspace` in the same update.
+   */
+  executionTarget?: ScheduledTaskExecutionTarget;
   state?: ScheduledTaskState;
 }
 
@@ -139,6 +159,7 @@ interface ScheduledTaskWire {
   permission_mode: string | null;
   workspace: string | null;
   host_id: string | null;
+  execution_target: ScheduledTaskExecutionTarget;
   state: ScheduledTaskState;
   last_run_at: number | null;
   last_run_status: ScheduledTaskRunStatus | null;
@@ -214,6 +235,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     permissionMode: wire.permission_mode,
     workspace: wire.workspace,
     hostId: wire.host_id,
+    executionTarget: wire.execution_target,
     state: wire.state,
     lastRunAt: wire.last_run_at,
     lastRunStatus: wire.last_run_status,
@@ -274,6 +296,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
+  if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   const res = await authenticatedFetch("/v1/scheduled-tasks", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -302,6 +325,7 @@ export async function updateScheduledTask(
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
+  if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.state !== undefined) body.state = input.state;
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",

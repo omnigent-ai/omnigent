@@ -13,6 +13,20 @@ Omnigent identity against it.
 
 ## Setup
 
+**The quick path — create the app from the manifest.** At
+[api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From
+an app manifest** → pick the workspace → paste
+[`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml). That sets
+Socket Mode, Interactivity, the default scopes and events below, and the
+`/omnigent` command in one step. For Databricks web-auth, uncomment
+`users:read` and `users:read.email` in the manifest before pasting it. A
+manifest cannot mint tokens, so finish with the two steps from the manifest
+header — generate a `connections:write` app-level token (**Basic Information →
+App-Level Tokens**) and **Install to Workspace** for the bot token — then
+continue from step 5.
+
+Doing it by hand instead:
+
 1. Create a Slack app with Socket Mode **and** Interactivity enabled (Socket
   Mode delivers the interactive button/modal payloads — no request URL needed).
 2. Add the OAuth scopes and event subscriptions listed under **Required scopes**
@@ -30,7 +44,9 @@ Omnigent identity against it.
 
 ## Required scopes
 
-The bot uses two tokens, each carrying different scopes.
+The bot uses two tokens, each carrying different scopes. These are mirrored in
+[`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml) — change both
+together.
 
 ### Bot token scopes (`OMNIGENT_SLACK_BOT_TOKEN`, `xoxb-…`)
 
@@ -96,8 +112,8 @@ while it's already up is a no-op that reports the existing process.
 ### Configuration
 
 All configuration (the two Slack tokens, `OMNIGENT_SERVER_URL`, and the
-optional `OMNIGENT_DEVICE_CLIENT_SECRET` / `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY`)
-comes from **real environment variables** — the bot does **not** read a `.env`
+optional `OMNIGENT_DEVICE_CLIENT_SECRET` / `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY`
+/ the setup defaults below) comes from **real environment variables** — the bot does **not** read a `.env`
 file itself. For local dev, either export the vars, or launch under a tool that
 injects a `.env` — e.g. `uv run --env-file .env omni integration slack`, or
 `export $(grep -v '^#' .env | xargs)` before running. In production the
@@ -137,6 +153,48 @@ URL to enter):
 
 The choice is saved per `(Slack workspace, user)`. After that, mentioning the
 bot (or DMing it) starts a session on the configured server.
+
+### Operator-set setup defaults (optional)
+
+A team standardized on one agent — or on the managed sandbox — can pre-select
+step 2's choices for everyone, so a new user submits the modal instead of
+making two decisions they have no opinion on:
+
+| Variable | Effect |
+| --- | --- |
+| `OMNIGENT_SLACK_DEFAULT_AGENT_ID` | Opens the **Agent** menu on this agent id. |
+| `OMNIGENT_SLACK_DEFAULT_HOST_TYPE` | Only `managed` — opens the **Host** menu on the server-provisioned sandbox. |
+
+Either variable may be left unset or blank for no default; any other non-blank
+value for `OMNIGENT_SLACK_DEFAULT_HOST_TYPE` fails at startup.
+
+Set them in the bot's environment like every other variable (see
+**Configuration** above); `.env.example` carries the same notes.
+
+Both are pre-selections, nothing more. The modal still opens, still shows the
+full menus, and still has to be submitted — either choice can be changed, and
+what the user submits is what is saved.
+
+Availability is checked per user, each time the modal is rendered, against the
+agents and hosts that user's own login can see. A default that isn't on offer
+— an agent id missing from their menu, or `managed` on a server that provisions
+no sandbox — leaves **that** menu blank and says so in the modal. A different
+agent or host is never substituted, and a valid default in the other menu is
+still applied.
+
+The modal distinguishes what it actually established from what it could not
+check. A server that can't be reached is a login/retry failure as before, not
+an "unavailable default"; a capability probe that fails says the check didn't
+complete, not that the server provisions no sandboxes; and an agent past the
+menu's 100-option cap is reported as missing from the menu, not from the
+server.
+
+There is deliberately **no** default for a specific external host id. On an
+authenticated server `/v1/hosts` is owner-scoped, so one user's host is not
+listed for anyone else and could not be pre-selected in a menu that never
+lists it. (On a server with auth disabled every caller shares the reserved
+`local` owner and does see the same hosts — but a default that only works for
+unauthenticated deployments is not one worth shipping.)
 
 ## Authentication
 

@@ -224,6 +224,12 @@ def _run_in_child(probe: str) -> int:
     :param probe: Python source to run in the child.
     :returns: The child's exit code.
     """
+    # seccomp (prctl/seccomp_load) and os.fork() are Linux-only; off Linux the
+    # child dies with "dlsym(prctl): symbol not found" (macOS) or os.fork raises
+    # (Windows). Skip here so every real-filter test that forks a child is gated
+    # in one place (issue #4279), rather than each carrying its own marker.
+    if sys.platform != "linux":
+        pytest.skip("seccomp filter tests require Linux (prctl/seccomp_load + os.fork)")
     pid = os.fork()
     if pid == 0:
         os.execvp(sys.executable, [sys.executable, "-c", probe])
@@ -314,6 +320,10 @@ def test_apply_baseline_denylist_does_not_break_subprocess_basics() -> None:
     )
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="references socket.AF_NETLINK (Linux-only) while building the probe",
+)
 def test_arg_filter_blocks_socket_family_only() -> None:
     """
     ``SCMP_CMP_EQ`` on ``socket(domain, ...)`` returns ``EPERM`` for

@@ -1,10 +1,13 @@
-import { ChevronRightIcon, FileIcon } from "lucide-react";
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChevronRightIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { RefObject } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  type DirectoryResult,
   RunnerOfflineError,
   type WorkspaceChangedFile,
   type WorkspaceFile,
-  useWorkspaceDirectory,
+  useWorkspaceDirectories,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -21,12 +24,14 @@ import {
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
+import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
 // VS Code–style indentation: folder chevron and file icon share the same x
 // at each depth. GUIDE_OFFSET centers the indent-guide line under the chevron.
 const INDENT_STEP = 16;
 const BASE_PAD = 8;
 const GUIDE_OFFSET = 7;
+const TREE_MOTION_MS = 180;
 const indentFor = (depth: number) => depth * INDENT_STEP + BASE_PAD;
 
 // One vertical guide line per ancestor level; the row must be `relative`.
@@ -38,7 +43,7 @@ function IndentGuides({ depth }: { depth: number }) {
         <span
           key={left}
           aria-hidden
-          className="pointer-events-none absolute top-0 bottom-0 w-px bg-border"
+          className="pointer-events-none absolute top-0 bottom-0 w-px bg-border transition-opacity group-hover:opacity-0"
           style={{ left: `${left}px` }}
         />
       ))}
@@ -157,6 +162,199 @@ function buildTree(files: WorkspaceFile[], sort: ChangedSort = "alpha"): TreeNod
 }
 
 // ---------------------------------------------------------------------------
+// Flattening the visible tree for virtualization
+// ---------------------------------------------------------------------------
+
+/**
+ * One rendered line in the virtualized tree. A `node` row is a real dir/file;
+ * a `placeholder` row is the inline "Loading…" / "all hidden" line a lazy dir
+ * shows in place of its children. Every row carries its `depth` for indent and
+ * a stable `key` for React reconciliation across window slides.
+ */
+type TreeMotion = "enter" | "exit";
+
+type FlatRow =
+  | {
+      kind: "node";
+      key: string;
+      depth: number;
+      node: TreeNode;
+      open: boolean;
+      lazyLoading: boolean;
+      motion: TreeMotion | null;
+    }
+  | {
+      kind: "placeholder";
+      key: string;
+      depth: number;
+      text: string;
+      motion: TreeMotion | null;
+    };
+
+/** Convert fetched children and API-only changed files into sorted TreeNodes. */
+function lazyChildrenToNodes(
+  entries: WorkspaceFile[],
+  sort: ChangedSort,
+  overlay: TreeNode[] = [],
+): TreeNode[] {
+  const nodes = entries.map((file): TreeNode => {
+    if (file.type === "directory") {
+      return {
+        type: "dir",
+        name: file.name,
+        path: file.path,
+        children: [],
+        modifiedAt: file.modified_at,
+        lazy: true,
+      };
+    }
+    return { type: "file", name: file.name, file };
+  });
+  const byPath = new Map(
+    nodes.map((node) => [node.type === "dir" ? node.path : node.file.path, node]),
+  );
+  for (const extra of overlay) {
+    const path = extra.type === "dir" ? extra.path : extra.file.path;
+    const existing = byPath.get(path);
+    if (existing?.type === "dir" && extra.type === "dir") {
+      existing.children = extra.children;
+    } else if (!existing) {
+      nodes.push(extra);
+      byPath.set(path, extra);
+    }
+  }
+  return nodes.sort(compareTreeNodes(sort));
+}
+
+/**
+ * Depth-first flatten of the currently-visible tree into a linear row list.
+ *
+ * Descends only through expanded directories; a lazy dir's children come from
+ * `dirData` (fetched centrally, see {@link useWorkspaceDirectories}) rather than
+ * from the node itself. Emits the same inline "Loading…" / "all hidden"
+ * placeholder rows the recursive renderer used, so behaviour is unchanged — the
+ * output is just a flat array the virtualizer can window.
+ */
+function flattenTree(
+  roots: TreeNode[],
+  opts: {
+    expandedPaths: Set<string>;
+    showHidden: boolean;
+    sort: ChangedSort;
+    dirData: Map<string, DirectoryResult>;
+    pathMotions: Map<string, TreeMotion>;
+  },
+): FlatRow[] {
+  const { expandedPaths, showHidden, sort, dirData, pathMotions } = opts;
+  const rows: FlatRow[] = [];
+  const visible = (nodes: TreeNode[]) =>
+    showHidden ? nodes : nodes.filter((n) => !n.name.startsWith("."));
+
+  function walk(nodes: TreeNode[], depth: number, inheritedMotion: TreeMotion | null = null) {
+    for (const node of nodes) {
+      if (node.type === "file") {
+        rows.push({
+          kind: "node",
+          key: node.file.path,
+          depth,
+          node,
+          open: false,
+          lazyLoading: false,
+          motion: inheritedMotion,
+        });
+        continue;
+      }
+      const open = expandedPaths.has(node.path);
+      const pathMotion = pathMotions.get(node.path);
+      const isLazyDir = node.lazy === true;
+      const lazy = isLazyDir && open ? dirData.get(node.path) : undefined;
+      const lazyLoading = !!lazy?.isLoading && lazy?.data === undefined;
+      const lazyError = !!lazy?.isError && lazy?.data === undefined;
+      rows.push({
+        kind: "node",
+        key: node.path,
+        depth,
+        node,
+        open: open && pathMotion !== "exit",
+        lazyLoading,
+        motion: inheritedMotion,
+      });
+      if (!open) continue;
+
+      const childMotion = pathMotion ?? inheritedMotion;
+      const rawChildren = isLazyDir
+        ? lazy?.data
+          ? lazyChildrenToNodes(lazy.data, sort, node.children)
+          : node.children
+        : node.children;
+      const children = visible(rawChildren);
+      // Placeholder keys are prefixed by kind (not the raw path) so they can't
+      // collide with a real file/dir path.
+      if (lazyLoading) {
+        rows.push({
+          kind: "placeholder",
+          key: `loading:${node.path}`,
+          depth: depth + 1,
+          text: "Loading…",
+          motion: childMotion,
+        });
+      } else if (lazyError) {
+        rows.push({
+          kind: "placeholder",
+          key: `error:${node.path}`,
+          depth: depth + 1,
+          text: "Failed to load this folder.",
+          motion: childMotion,
+        });
+      } else if (children.length === 0 && rawChildren.length > 0) {
+        rows.push({
+          kind: "placeholder",
+          key: `hidden:${node.path}`,
+          depth: depth + 1,
+          text: "All files are hidden — click the eye icon to reveal them.",
+          motion: childMotion,
+        });
+      }
+      walk(children, depth + 1, childMotion);
+    }
+  }
+  walk(visible(roots), 0);
+  return rows;
+}
+
+/**
+ * Every expanded lazy-directory path reachable through currently-available
+ * data — the set to fetch. Descends a lazy dir only once its own listing is in
+ * `dirData`, so deeper expanded lazy dirs are discovered incrementally as their
+ * parents' fetches land (each arrival re-renders and widens the set).
+ */
+function expandedLazyPaths(
+  roots: TreeNode[],
+  expandedPaths: Set<string>,
+  showHidden: boolean,
+  sort: ChangedSort,
+  dirData: Map<string, DirectoryResult>,
+): string[] {
+  const out: string[] = [];
+  const visible = (nodes: TreeNode[]) =>
+    showHidden ? nodes : nodes.filter((n) => !n.name.startsWith("."));
+  function walk(nodes: TreeNode[]) {
+    for (const node of nodes) {
+      if (node.type !== "dir" || !expandedPaths.has(node.path)) continue;
+      if (node.lazy === true) {
+        out.push(node.path);
+        const data = dirData.get(node.path)?.data;
+        if (data) walk(visible(lazyChildrenToNodes(data, sort, node.children)));
+      } else {
+        walk(visible(node.children));
+      }
+    }
+  }
+  walk(visible(roots));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Expanded-path persistence
 // ---------------------------------------------------------------------------
 
@@ -214,8 +412,12 @@ export function FolderTree({
   isSearching = false,
   isSearchError = false,
   searchError = null,
+  searchTruncated = false,
   browseLocation = "",
   onNavigateDir,
+  onExitSearch,
+  scrollParentRef,
+  refreshToken = 0,
 }: {
   files: WorkspaceFile[] | undefined;
   isLoading: boolean;
@@ -246,33 +448,89 @@ export function FolderTree({
   /** Error from a failed search request. */
   searchError?: Error | null;
   /**
+   * True when the server stopped scanning before covering the workspace, so
+   * a miss is not proof of absence and the results must say so.
+   */
+  searchTruncated?: boolean;
+  /**
    * Absolute path currently browsed, or "" for the workspace root. Lazy
    * directory expansion resolves node paths against it.
    */
   browseLocation?: string;
-  /**
-   * Re-root the panel onto one of the tree's directories, given its path
-   * relative to the current location. Double-clicking a folder opens it,
-   * matching Finder; a single click still just expands in place.
-   */
+  /** Re-root the panel onto a directory when its underlined name is clicked. */
   onNavigateDir?: (relativePath: string) => void;
+  /**
+   * Clear the active search query so the tree returns. Called after the user
+   * reveals a directory from the search results, mirroring a click on a folder
+   * in the tree: the panel drops back to the tree with that folder expanded.
+   */
+  onExitSearch?: () => void;
+  /**
+   * The scroll container the tree lives in (FilesPanel's `<section>`). When
+   * provided, the virtualizer windows rows against THIS element so it shares
+   * one scroller with the panel's scroll-position persistence — rather than a
+   * second nested scroll container the restore logic wouldn't track. When
+   * omitted (tests, stories, standalone card mode), the tree falls back to its
+   * own internal scroll container.
+   */
+  scrollParentRef?: RefObject<HTMLElement | null>;
+  /** Changes when the user explicitly refreshes expanded directory listings. */
+  refreshToken?: number;
 }) {
   // Initialise from the module-level cache so expanded state survives
   // unmount/remount (e.g. opening the FileViewer and navigating back).
   const cacheKey = conversationId ? expandedCacheKey(conversationId, browseLocation) : null;
+  // The changes endpoint always speaks workspace-root-relative paths, while a
+  // re-rooted tree speaks paths relative to its current browse location.
+  const scopedChangedFiles = useMemo(() => {
+    if (!changedFiles) return [];
+    if (!browseLocation) return changedFiles;
+    if (browseLocation.startsWith("/")) return [];
+    const prefix = `${browseLocation.replace(/\/$/, "")}/`;
+    return changedFiles
+      .filter((file) => file.path.startsWith(prefix))
+      .map((file) => ({ ...file, path: file.path.slice(prefix.length) }));
+  }, [changedFiles, browseLocation]);
+  // Overlay API-reported changes onto the on-disk listing. This is essential
+  // for deleted files (which no longer exist in `/filesystem`) and also closes
+  // the brief race where a newly-created file reaches `/changes` first.
+  const treeFiles = useMemo<WorkspaceFile[] | undefined>(() => {
+    if (!files) return undefined;
+    const knownPaths = new Set(files.map((file) => file.path));
+    const changedOnly = scopedChangedFiles
+      .filter((file) => !knownPaths.has(file.path))
+      .map((file): WorkspaceFile => ({
+        path: file.path,
+        name: file.name,
+        type: "file",
+        bytes: file.bytes,
+        modified_at: file.modified_at,
+      }));
+    return [...files, ...changedOnly];
+  }, [files, scopedChangedFiles]);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => {
     if (!cacheKey) return new Set();
     const cached = expandedPathsCache.get(cacheKey);
     if (cached) return new Set(cached);
     // If files are already available (React Query cache hit), seed defaults now
     // to avoid a flash of all-collapsed state.
-    if (files) {
-      const initial = defaultExpandedPaths(files);
+    if (treeFiles) {
+      const initial = defaultExpandedPaths(treeFiles);
       expandedPathsCache.set(cacheKey, initial);
       return new Set(initial);
     }
     return new Set();
   });
+  const [pathMotions, setPathMotions] = useState<Map<string, TreeMotion>>(() => new Map());
+  const motionTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  useEffect(
+    () => () => {
+      for (const timer of motionTimers.current.values()) clearTimeout(timer);
+      motionTimers.current.clear();
+    },
+    [],
+  );
 
   // When files arrive for the first time (async load) and no cache entry
   // exists yet, compute and persist the default open set. Also re-sync from
@@ -282,33 +540,36 @@ export function FolderTree({
   // before paint (no collapsed flash).
   const expandedForRef = useRef(cacheKey);
   useLayoutEffect(() => {
-    if (!cacheKey) return;
     const switched = expandedForRef.current !== cacheKey;
     expandedForRef.current = cacheKey;
+    if (switched) {
+      for (const timer of motionTimers.current.values()) clearTimeout(timer);
+      motionTimers.current.clear();
+      setPathMotions(new Map());
+    }
+    if (!cacheKey) return;
     const cached = expandedPathsCache.get(cacheKey);
     if (cached) {
       if (switched) setExpandedPaths(new Set(cached));
       return;
     }
-    if (!files) return;
-    const initial = defaultExpandedPaths(files);
+    if (!treeFiles) return;
+    const initial = defaultExpandedPaths(treeFiles);
     expandedPathsCache.set(cacheKey, initial);
     setExpandedPaths(new Set(initial));
-  }, [cacheKey, files]);
+  }, [cacheKey, treeFiles]);
 
   // Map from file path → change status, for file-level badges in the tree.
   const changedFileMap = useMemo<Map<string, WorkspaceChangedFile["status"]>>(() => {
-    if (!changedFiles) return new Map();
-    return new Map(changedFiles.map((f) => [f.path, f.status]));
-  }, [changedFiles]);
+    return new Map(scopedChangedFiles.map((f) => [f.path, f.status]));
+  }, [scopedChangedFiles]);
 
   // Map from directory path → highest-priority change status of any descendant.
   // Priority: created (3) > modified (2) > deleted (1).
   const dirtyDirMap = useMemo<Map<string, WorkspaceChangedFile["status"]>>(() => {
-    if (!changedFiles) return new Map();
     const STATUS_PRIORITY = { created: 3, modified: 2, deleted: 1 } as const;
     const result = new Map<string, WorkspaceChangedFile["status"]>();
-    for (const file of changedFiles) {
+    for (const file of scopedChangedFiles) {
       const parts = file.path.split("/");
       for (let i = 1; i < parts.length; i++) {
         const dirPath = parts.slice(0, i).join("/");
@@ -319,20 +580,172 @@ export function FolderTree({
       }
     }
     return result;
-  }, [changedFiles]);
+  }, [scopedChangedFiles]);
 
-  const togglePath = useCallback(
-    (path: string) => {
-      setExpandedPaths((prev) => {
-        const next = new Set(prev);
-        if (next.has(path)) next.delete(path);
-        else next.add(path);
-        if (cacheKey) expandedPathsCache.set(cacheKey, next);
-        return next;
-      });
+  const startPathMotion = useCallback(
+    (path: string, motion: TreeMotion) => {
+      const existingTimer = motionTimers.current.get(path);
+      if (existingTimer) clearTimeout(existingTimer);
+      setPathMotions((prev) => new Map(prev).set(path, motion));
+
+      const reduceMotion =
+        typeof window !== "undefined" &&
+        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+      const timer = setTimeout(
+        () => {
+          if (motion === "exit") {
+            setExpandedPaths((prev) => {
+              const next = new Set(prev);
+              next.delete(path);
+              if (cacheKey) expandedPathsCache.set(cacheKey, next);
+              return next;
+            });
+          }
+          setPathMotions((prev) => {
+            if (prev.get(path) !== motion) return prev;
+            const next = new Map(prev);
+            next.delete(path);
+            return next;
+          });
+          motionTimers.current.delete(path);
+        },
+        reduceMotion ? 0 : TREE_MOTION_MS,
+      );
+      motionTimers.current.set(path, timer);
     },
     [cacheKey],
   );
+
+  const togglePath = useCallback(
+    (path: string) => {
+      const currentMotion = pathMotions.get(path);
+      if (expandedPaths.has(path) && currentMotion !== "exit") {
+        startPathMotion(path, "exit");
+        return;
+      }
+
+      setExpandedPaths((prev) => {
+        const next = new Set(prev).add(path);
+        if (cacheKey) expandedPathsCache.set(cacheKey, next);
+        return next;
+      });
+      startPathMotion(path, "enter");
+    },
+    [cacheKey, expandedPaths, pathMotions, startPathMotion],
+  );
+
+  // A directory just revealed from search results: the tree scrolls it into
+  // view and flashes a brief highlight so the eye can find it after the flat
+  // list collapses back to the tree. Cleared once the flash fades.
+  const [revealedPath, setRevealedPath] = useState<string | null>(null);
+  const revealFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The path still awaiting its one scroll+flash. The scroll effect re-runs as
+  // each lazy level lands, but must act exactly once per reveal — otherwise a
+  // later level re-fires scrollToIndex and restarts the 800ms timer, so the
+  // flash lingers through a multi-level load. Cleared when the row is handled.
+  const pendingRevealRef = useRef<string | null>(null);
+  // Clear any in-flight flash timer on unmount only (not per flatRows change).
+  useEffect(() => () => clearTimeout(revealFlashTimer.current ?? undefined), []);
+
+  // Reveal a directory the user picked from search results: expand it and every
+  // ancestor (so the row is visible once the flat tree returns), then leave
+  // search mode. The lazy-fetch fixpoint (see `lazyPaths`) resolves each newly
+  // expanded level as its parent's listing lands; an effect below scrolls to
+  // and highlights the row once it appears.
+  const revealDirectory = useCallback(
+    (path: string) => {
+      setExpandedPaths((prev) => {
+        const next = new Set(prev);
+        const parts = path.split("/");
+        // Expand every ancestor, but not the target itself — revealing a folder
+        // scrolls to it collapsed, the way clicking it in the tree would.
+        for (let i = 1; i < parts.length; i++) next.add(parts.slice(0, i).join("/"));
+        if (cacheKey) expandedPathsCache.set(cacheKey, next);
+        return next;
+      });
+      pendingRevealRef.current = path;
+      setRevealedPath(path);
+      onExitSearch?.();
+    },
+    [cacheKey, onExitSearch],
+  );
+
+  // Build the nested top-level tree once per files/sort/showHidden change.
+  // Hoisted above the early returns (Rules of Hooks) and memoized so an
+  // unrelated re-render (a background refetch toggling isFetching, a store tick)
+  // doesn't rebuild it. `undefined` when there are no files yet.
+  const visibleTree = useMemo<TreeNode[] | undefined>(() => {
+    if (!treeFiles || treeFiles.length === 0) return undefined;
+    const tree = buildTree(treeFiles, sort);
+    return showHidden ? tree : tree.filter((n) => !n.name.startsWith("."));
+  }, [treeFiles, sort, showHidden]);
+
+  // Fetch every expanded lazy directory's listing centrally (not per row), so
+  // rows the virtualizer scrolls out of view can unmount without dropping their
+  // fetch. The set of paths to fetch is grown in state to a fixpoint: each pass
+  // descends only into expanded lazy dirs whose parent listing is already in
+  // `dirData`, so as one level's fetch lands the effect widens the set by the
+  // next level, until it stops changing. Holding it in state (rather than
+  // deriving it inline from a lagging ref) guarantees a real re-render drives
+  // each widening step — so a restored/re-rooted multi-level expansion resolves
+  // all the way down, and it converges the same whether listings arrive async
+  // or are already cached.
+  const [lazyPaths, setLazyPaths] = useState<string[]>([]);
+  const dirData = useWorkspaceDirectories(conversationId, lazyPaths, browseLocation, refreshToken);
+  useEffect(() => {
+    const next = visibleTree
+      ? expandedLazyPaths(visibleTree, expandedPaths, showHidden, sort, dirData)
+      : [];
+    setLazyPaths((prev) =>
+      prev.length === next.length && prev.every((p, i) => p === next[i]) ? prev : next,
+    );
+  }, [visibleTree, expandedPaths, showHidden, sort, dirData]);
+
+  // Flatten the visible tree into linear rows for the virtualizer.
+  const flatRows = useMemo<FlatRow[]>(
+    () =>
+      visibleTree
+        ? flattenTree(visibleTree, {
+            expandedPaths,
+            showHidden,
+            sort,
+            dirData,
+            pathMotions,
+          })
+        : [],
+    [visibleTree, expandedPaths, showHidden, sort, dirData, pathMotions],
+  );
+
+  // Virtualized scroller: window the flat rows against the panel's own scroll
+  // container when one is passed in (so windowing and scroll-position
+  // persistence share one scroller), else against a fallback internal one.
+  const ownScrollRef = useRef<HTMLDivElement>(null);
+  const scrollElementRef = scrollParentRef ?? ownScrollRef;
+  const rowVirtualizer = useVirtualizer({
+    count: flatRows.length,
+    getScrollElement: () => scrollElementRef.current,
+    estimateSize: () => 25,
+    overscan: 12,
+    getItemKey: (index) => flatRows[index]?.key ?? index,
+  });
+
+  // Once a revealed directory's row exists in the flat tree (its ancestors'
+  // lazy listings have landed), smooth-scroll it into view and start the
+  // highlight flash — exactly once. Re-runs as `flatRows` changes so it can
+  // catch the row when a later lazy level resolves, but `pendingRevealRef`
+  // gates it to a single scroll + timer per reveal (a later level must not
+  // re-fire the scroll or restart the 800ms flash).
+  useEffect(() => {
+    const pending = pendingRevealRef.current;
+    if (!pending) return;
+    const index = flatRows.findIndex((r) => r.kind === "node" && r.key === pending);
+    if (index === -1) return; // row not materialized yet; a later level is loading
+    pendingRevealRef.current = null; // handled — don't scroll/flash again
+    rowVirtualizer.scrollToIndex(index, { align: "center", behavior: "smooth" });
+    // Clear once the shared flash animation (800ms) has played out.
+    clearTimeout(revealFlashTimer.current ?? undefined);
+    revealFlashTimer.current = setTimeout(() => setRevealedPath(null), 800);
+  }, [flatRows, rowVirtualizer]);
 
   // When a search query is active, render a flat filtered list instead of the tree.
   if (searchQuery.trim().length > 0) {
@@ -350,6 +763,7 @@ export function FolderTree({
       return (
         <p className="px-2 py-1 text-muted-foreground text-sm">
           No files match "{searchQuery.trim()}"
+          {searchTruncated && " — the search stopped early, so results may be incomplete"}
         </p>
       );
     }
@@ -370,22 +784,38 @@ export function FolderTree({
           >
             Show hidden files
           </button>
+          {searchTruncated && " Search stopped early — results may be incomplete."}
         </p>
       );
     }
+    // Directories first (like the tree), then files — each group by the active
+    // sort. A folder is a place to go, so it reads better above the matched
+    // files sharing its name.
+    const orderedResults = [...visibleResults].sort((a, b) => {
+      const aDir = a.type === "directory";
+      const bDir = b.type === "directory";
+      if (aDir !== bDir) return aDir ? -1 : 1;
+      return compareChangedFiles(sort)(a, b);
+    });
     return (
       <TooltipProvider>
         <ul className="flex flex-col gap-0.5">
-          {[...visibleResults].sort(compareChangedFiles(sort)).map((file) => (
+          {orderedResults.map((file) => (
             <SearchResultRow
               key={file.path}
               file={file}
               onFileSelect={onFileSelect}
+              onRevealDir={revealDirectory}
               conversationId={conversationId}
               changedFileMap={changedFileMap}
             />
           ))}
         </ul>
+        {searchTruncated && (
+          <p className="px-2 py-1 text-muted-foreground text-xs">
+            Search stopped early — results may be incomplete.
+          </p>
+        )}
       </TooltipProvider>
     );
   }
@@ -407,12 +837,10 @@ export function FolderTree({
       </p>
     );
   }
-  if (!files || files.length === 0) {
+  if (!treeFiles || treeFiles.length === 0 || visibleTree === undefined) {
     return <p className="px-2 py-1 text-muted-foreground text-sm">No files in workspace</p>;
   }
 
-  const tree = buildTree(files, sort);
-  const visibleTree = showHidden ? tree : tree.filter((n) => !n.name.startsWith("."));
   if (visibleTree.length === 0) {
     return (
       <p className="px-2 py-1 text-muted-foreground text-sm">
@@ -420,27 +848,69 @@ export function FolderTree({
       </p>
     );
   }
+  const virtualItems = rowVirtualizer.getVirtualItems();
+  // Spacer sized to the full row count so the scroll container scrolls the whole
+  // tree; only the windowed slice is mounted, positioned absolutely by
+  // translateY.
+  const spacer = (
+    <div className="relative w-full" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
+      {virtualItems.map((vi) => {
+        const row = flatRows[vi.index];
+        if (!row) return null;
+        return (
+          <div
+            key={vi.key}
+            data-index={vi.index}
+            ref={rowVirtualizer.measureElement}
+            className="absolute top-0 left-0 w-full"
+            style={{ transform: `translateY(${vi.start}px)` }}
+          >
+            <div
+              data-tree-motion={row.motion ?? undefined}
+              className={cn(
+                row.motion === "enter" && "file-tree-row-enter",
+                row.motion === "exit" && "file-tree-row-exit",
+              )}
+            >
+              {row.kind === "placeholder" ? (
+                <p
+                  className="relative py-1 pr-2 text-muted-foreground text-sm"
+                  style={{ paddingLeft: `${indentFor(row.depth)}px` }}
+                >
+                  <IndentGuides depth={row.depth} />
+                  {row.text}
+                </p>
+              ) : (
+                <TreeNodeRow
+                  node={row.node}
+                  depth={row.depth}
+                  open={row.open}
+                  onFileSelect={onFileSelect}
+                  conversationId={conversationId}
+                  onTogglePath={togglePath}
+                  changedFileMap={changedFileMap}
+                  dirtyDirMap={dirtyDirMap}
+                  onNavigateDir={onNavigateDir}
+                  highlighted={row.kind === "node" && row.key === revealedPath}
+                />
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
   return (
     <TooltipProvider>
-      <ul className="flex flex-col gap-0.5">
-        {visibleTree.map((node) => (
-          <TreeNodeRow
-            key={node.type === "file" ? node.file.path : node.path}
-            node={node}
-            depth={0}
-            onFileSelect={onFileSelect}
-            conversationId={conversationId}
-            expandedPaths={expandedPaths}
-            onTogglePath={togglePath}
-            showHidden={showHidden}
-            changedFileMap={changedFileMap}
-            dirtyDirMap={dirtyDirMap}
-            sort={sort}
-            browseLocation={browseLocation}
-            onNavigateDir={onNavigateDir}
-          />
-        ))}
-      </ul>
+      {/* When the panel owns the scroller (scrollParentRef), render the spacer
+          straight into it; otherwise provide a fallback scroll container. */}
+      {scrollParentRef ? (
+        spacer
+      ) : (
+        <div ref={ownScrollRef} className="h-full overflow-y-auto">
+          {spacer}
+        </div>
+      )}
     </TooltipProvider>
   );
 }
@@ -489,32 +959,31 @@ function FileRowItem({
       ? "text-green-500 dark:text-green-400"
       : fileStatus === "modified"
         ? "text-amber-500 dark:text-amber-400"
-        : isDeleted
-          ? "text-destructive"
-          : undefined;
+        : undefined;
   const { handlers, tooltip } = useCursorTooltip(path);
 
   return (
-    <li>
+    <li className="list-none">
       <div
-        className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
+        className={cn(
+          "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
+          isDeleted ? "opacity-50" : "hover:bg-muted",
+        )}
         style={{ paddingLeft: `${indentFor(depth)}px` }}
       >
         <IndentGuides depth={depth} />
         <button
           type="button"
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
           onClick={() => !isDeleted && onFileSelect(path)}
           disabled={isDeleted}
         >
-          <FileIcon
-            className={cn("size-3.5 shrink-0", fileColorClass ?? "text-muted-foreground")}
-          />
+          <WorkspaceFileIcon path={path} />
           <span
             className={cn(
-              "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
-              labelIsPath ? "[direction:rtl]" : fileStatus === "created" && "font-semibold",
-              isDeleted && "line-through opacity-50",
+              "min-w-0 flex-1 truncate text-ui",
+              labelIsPath && "[direction:rtl]",
+              isDeleted && "line-through",
               fileColorClass,
             )}
             {...handlers}
@@ -550,11 +1019,11 @@ function FileRowItem({
           className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
         >
           {bytes !== null && !isDeleted && (
-            <span className="text-muted-foreground text-[10px] group-hover:invisible">
+            <span className="text-muted-foreground text-sm group-hover:invisible">
               {formatBytes(bytes)}
             </span>
           )}
-          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+          <span className="absolute inset-0 flex items-center justify-end gap-1">
             {!isDeleted && conversationId ? (
               <FileDownloadButton conversationId={conversationId} path={path} />
             ) : (
@@ -576,14 +1045,20 @@ function FileRowItem({
 function SearchResultRow({
   file,
   onFileSelect,
+  onRevealDir,
   conversationId,
   changedFileMap,
 }: {
   file: WorkspaceFile;
   onFileSelect: (path: string) => void;
+  /** Reveal a matched directory in the tree (expand it + ancestors). */
+  onRevealDir: (path: string) => void;
   conversationId: string | undefined;
   changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
 }) {
+  if (file.type === "directory") {
+    return <SearchDirRow file={file} onRevealDir={onRevealDir} />;
+  }
   return (
     <FileRowItem
       path={file.path}
@@ -594,6 +1069,49 @@ function SearchResultRow({
       onFileSelect={onFileSelect}
       conversationId={conversationId}
     />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SearchDirRow — flat directory row used in search-results mode
+// ---------------------------------------------------------------------------
+
+/**
+ * A matched directory in search results. Clicking it reveals the folder in the
+ * tree (expands it and its ancestors, exits search) rather than opening a file
+ * — folders have nothing to show in the viewer. The full path is shown with
+ * rtl truncation and a trailing "/" so it reads as a directory.
+ */
+function SearchDirRow({
+  file,
+  onRevealDir,
+}: {
+  file: WorkspaceFile;
+  onRevealDir: (path: string) => void;
+}) {
+  return (
+    <li className="list-none">
+      <div className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted">
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+          onClick={() => onRevealDir(file.path)}
+        >
+          <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 flex-1 truncate text-ui [direction:rtl]">
+            <bdi>{file.path}/</bdi>
+          </span>
+        </button>
+        <span
+          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+        >
+          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+            <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+            <CopyPathButton path={file.path} label="Copy folder path" revealOnHover />
+          </span>
+        </span>
+      </div>
+    </li>
   );
 }
 
@@ -631,45 +1149,38 @@ function TreeFileRow({
 // TreeNodeRow
 // ---------------------------------------------------------------------------
 
-function TreeNodeRow({
+/**
+ * One presentational tree row — a file leaf or a directory header. Pure: it
+ * owns no hooks, does no fetching, and never renders its children. Expansion
+ * (`open`), lazy-child fetching, and descendant rows are all handled by the
+ * flattening pass in FolderTree; this component just paints a single line.
+ * Memoized so a window slide re-renders only the rows that actually change.
+ */
+const TreeNodeRow = memo(function TreeNodeRow({
   node,
   depth,
+  open,
   onFileSelect,
   conversationId,
-  expandedPaths,
   onTogglePath,
-  showHidden,
   changedFileMap,
   dirtyDirMap,
-  sort,
-  browseLocation,
   onNavigateDir,
+  highlighted = false,
 }: {
   node: TreeNode;
   depth: number;
+  /** Whether this directory is expanded (ignored for file nodes). */
+  open: boolean;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
-  expandedPaths: Set<string>;
   onTogglePath: (path: string) => void;
-  showHidden: boolean;
   changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
   dirtyDirMap: Map<string, WorkspaceChangedFile["status"]>;
-  sort: ChangedSort;
-  /** Absolute path currently browsed; node paths resolve against it. */
-  browseLocation: string;
-  /** Re-root onto a directory (double-click), path relative to the root. */
   onNavigateDir?: (relativePath: string) => void;
+  /** Briefly flash this row — used when a folder is revealed from search. */
+  highlighted?: boolean;
 }) {
-  const open = node.type === "dir" && expandedPaths.has(node.path);
-  const isLazyDir = node.type === "dir" && node.lazy === true;
-
-  // Fetch children on demand when a lazy directory is expanded.
-  const { data: lazyData, isLoading: lazyLoading } = useWorkspaceDirectory(
-    conversationId,
-    isLazyDir && open ? node.path : null,
-    browseLocation,
-  );
-
   if (node.type === "file") {
     return (
       <TreeFileRow
@@ -682,31 +1193,6 @@ function TreeNodeRow({
     );
   }
 
-  // Build the child node list: for lazy dirs use fetched data (converted
-  // directly — no need to run buildTree since the API returns one level at a
-  // time); otherwise use the statically known children.
-  const rawChildNodes: TreeNode[] =
-    isLazyDir && lazyData
-      ? lazyData
-          .map((file): TreeNode => {
-            if (file.type === "directory") {
-              return {
-                type: "dir",
-                name: file.name,
-                path: file.path,
-                children: [],
-                modifiedAt: file.modified_at,
-                lazy: true,
-              };
-            }
-            return { type: "file", name: file.name, file };
-          })
-          .sort(compareTreeNodes(sort))
-      : node.children;
-  const childNodes = showHidden
-    ? rawChildNodes
-    : rawChildNodes.filter((n) => !n.name.startsWith("."));
-
   const dirStatus = dirtyDirMap.get(node.path);
   const dirDotClass =
     dirStatus === "created"
@@ -718,103 +1204,60 @@ function TreeNodeRow({
           : undefined;
 
   return (
-    <li>
-      {/* The row is a div, not a button: the copy button below is a sibling of
-          the toggle, and a button nested inside a button is invalid HTML. The
-          toggle still spans everything up to the copy button, so the clickable
-          area is effectively unchanged. */}
-      <div
-        className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
-        style={{ paddingLeft: `${indentFor(depth)}px` }}
+    // The row is a div so the copy control can remain a sibling of the folder
+    // toggle rather than nesting one button inside another.
+    <div
+      className={cn(
+        "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted",
+        // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
+        // from search catches the eye briefly, then settles.
+        highlighted && "animate-user-msg-flash",
+      )}
+      style={{ paddingLeft: `${indentFor(depth)}px` }}
+    >
+      <IndentGuides depth={depth} />
+      <button
+        type="button"
+        className="group/folder flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+        onClick={() => onTogglePath(node.path)}
+        onDoubleClick={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
+        aria-expanded={open}
       >
-        <IndentGuides depth={depth} />
-        <button
-          type="button"
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
-          onClick={() => onTogglePath(node.path)}
-          // Finder's contract: single click expands in place, double click
-          // opens the folder as the new working folder. The browser fires the
-          // two single clicks first, so the row toggles twice (a no-op) before
-          // re-rooting replaces the tree outright.
-          onDoubleClick={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
-          aria-expanded={open}
-        >
+        <span className="relative flex size-3.5 shrink-0 items-center justify-center">
+          <span className="flex transition-opacity group-hover/folder:opacity-0 group-focus-visible/folder:opacity-0">
+            {open ? (
+              <FolderOpenIcon className="size-3.5 text-muted-foreground" />
+            ) : (
+              <FolderIcon className="size-3.5 text-muted-foreground" />
+            )}
+          </span>
           <ChevronRightIcon
             className={cn(
-              "size-3.5 shrink-0 text-muted-foreground transition-transform",
+              "absolute size-3.5 text-muted-foreground opacity-0 transition-[transform,opacity] group-hover/folder:opacity-100 group-focus-visible/folder:opacity-100",
               open && "rotate-90",
             )}
           />
-          <span
-            className={cn(
-              "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
-              dirStatus === "created" && "font-semibold",
-              dirDotClass,
-            )}
-          >
-            {node.name}/
-          </span>
-          {dirStatus && (
-            <span
-              className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
-              aria-hidden
-            >
-              <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
-            </span>
-          )}
-        </button>
-        {/* The same trailing column as a file row. A folder has no size and
-            nothing to download, so the column shows only the copy button —
-            with the download's footprint reserved beside it so that button
-            lands in the same x as every file row's. */}
-        <span
-          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
-        >
-          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
-            <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
-            <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
-          </span>
         </span>
-      </div>
-      {open && (
-        <ul className="flex flex-col gap-0.5">
-          {lazyLoading && (
-            <li
-              className="relative py-1 pr-2 text-muted-foreground text-sm"
-              style={{ paddingLeft: `${indentFor(depth + 1)}px` }}
-            >
-              <IndentGuides depth={depth + 1} />
-              Loading…
-            </li>
-          )}
-          {!lazyLoading && childNodes.length === 0 && rawChildNodes.length > 0 && (
-            <li
-              className="relative py-1 pr-2 text-muted-foreground text-sm"
-              style={{ paddingLeft: `${indentFor(depth + 1)}px` }}
-            >
-              <IndentGuides depth={depth + 1} />
-              All files are hidden — click the eye icon to reveal them.
-            </li>
-          )}
-          {childNodes.map((child) => (
-            <TreeNodeRow
-              key={child.type === "file" ? child.file.path : child.path}
-              node={child}
-              depth={depth + 1}
-              onFileSelect={onFileSelect}
-              conversationId={conversationId}
-              expandedPaths={expandedPaths}
-              onTogglePath={onTogglePath}
-              showHidden={showHidden}
-              changedFileMap={changedFileMap}
-              dirtyDirMap={dirtyDirMap}
-              sort={sort}
-              browseLocation={browseLocation}
-              onNavigateDir={onNavigateDir}
-            />
-          ))}
-        </ul>
-      )}
-    </li>
+        <span className={cn("min-w-0 flex-1 truncate text-ui", dirDotClass)}>{node.name}/</span>
+        {dirStatus && (
+          <span
+            className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+            aria-hidden
+          >
+            <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
+          </span>
+        )}
+      </button>
+      {/* The same trailing column as a file row. A folder has no size and
+          nothing to download, so the column shows only the copy button — with
+          the download's footprint reserved beside it so that button lands in
+          the same x as every file row's. */}
+      <span className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
+        <span className="absolute inset-0 flex items-center justify-end gap-1">
+          <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+          <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
+        </span>
+      </span>
+    </div>
   );
-}
+});

@@ -4,7 +4,35 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.errors import _CODE_TO_HTTP_STATUS, ErrorCode, OmnigentError
+from omnigent.errors import (
+    _CODE_TO_CATEGORY,
+    _CODE_TO_HTTP_STATUS,
+    _CODE_TO_IMPACT,
+    _CODE_TO_PHASE,
+    _STALE_CURSOR_ATTEMPTS,
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    StaleCursorError,
+    category_for_code,
+    classify_exception,
+    impact_for_code,
+    is_before_harness_start,
+    is_cancelled_rpc_error,
+    phase_for_code,
+    restart_on_stale_cursor,
+)
+
+
+def _all_error_code_values() -> list[str]:
+    """Every string constant declared on :class:`ErrorCode`."""
+    return [
+        value
+        for name, value in vars(ErrorCode).items()
+        if not name.startswith("_") and isinstance(value, str)
+    ]
 
 
 def test_harness_protocol_violation_string_value() -> None:
@@ -53,6 +81,8 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.CONFLICT, 409),
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
+        (ErrorCode.UPSTREAM_CANCELLED, 499),
+        (ErrorCode.STALE_CURSOR, 400),
     ],
 )
 def test_all_error_codes_have_http_status_mapping(code: str, expected_status: int) -> None:
@@ -65,3 +95,403 @@ def test_all_error_codes_have_http_status_mapping(code: str, expected_status: in
     default.
     """
     assert _CODE_TO_HTTP_STATUS[code] == expected_status
+
+
+def test_every_error_code_has_a_concrete_category() -> None:
+    """Anti-rot: a named ErrorCode may never be UNKNOWN or unmapped.
+
+    UNKNOWN is reserved for sites with no error code (the catch-all handler, an
+    uncoded frame failure). If a new ErrorCode is added without a
+    ``_CODE_TO_CATEGORY`` entry, this fails rather than letting it default into
+    the honesty-margin bucket and silently skew the fault-share numbers.
+    """
+    for code in _all_error_code_values():
+        assert code in _CODE_TO_CATEGORY, f"{code!r} missing from _CODE_TO_CATEGORY"
+        assert _CODE_TO_CATEGORY[code] is not ErrorCategory.UNKNOWN, (
+            f"{code!r} maps to UNKNOWN; a named code must attribute a concrete owner"
+        )
+
+
+@pytest.mark.parametrize(
+    "code,expected_category",
+    [
+        (ErrorCode.INTERNAL_ERROR, ErrorCategory.SERVER),
+        (ErrorCode.HARNESS_PROTOCOL_VIOLATION, ErrorCategory.SERVER),
+        (ErrorCode.WRONG_REPLICA, ErrorCategory.SERVER),
+        (ErrorCode.RUNNER_UNAVAILABLE, ErrorCategory.CONFIG),
+        (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorCategory.CONFIG),
+        (ErrorCode.RUNNER_CAPABILITY_MISMATCH, ErrorCategory.CONFIG),
+        (ErrorCode.NOT_FOUND, ErrorCategory.USER),
+        (ErrorCode.INVALID_INPUT, ErrorCategory.USER),
+        (ErrorCode.UNAUTHORIZED, ErrorCategory.USER),
+        (ErrorCode.WORKSPACE_MISSING, ErrorCategory.USER),
+        (ErrorCode.UPSTREAM_CANCELLED, ErrorCategory.UPSTREAM),
+        (ErrorCode.STALE_CURSOR, ErrorCategory.USER),
+    ],
+)
+def test_code_category_mapping(code: str, expected_category: ErrorCategory) -> None:
+    """Pin the intent of the attribution for the codes that drive dashboards."""
+    assert category_for_code(code) == expected_category
+
+
+def test_omnigent_error_category_defaults_from_code() -> None:
+    """An OmnigentError inherits its code's category when none is passed."""
+    assert OmnigentError("boom").category is ErrorCategory.SERVER  # default code
+    assert OmnigentError("nope", code=ErrorCode.NOT_FOUND).category is ErrorCategory.USER
+
+
+def test_omnigent_error_category_override() -> None:
+    """The override wins over the code's default category.
+
+    A NOT_FOUND raised while the server itself generated a bad id is a server
+    fault, not the user's stale reference.
+    """
+    err = OmnigentError(
+        "internally generated id not found",
+        code=ErrorCode.NOT_FOUND,
+        category=ErrorCategory.SERVER,
+    )
+    assert err.category is ErrorCategory.SERVER
+    # The code's default is still USER when not overridden.
+    assert category_for_code(ErrorCode.NOT_FOUND) is ErrorCategory.USER
+
+
+def test_category_for_unknown_code_is_unknown() -> None:
+    """A code outside the ErrorCode namespace attributes to UNKNOWN."""
+    assert category_for_code("not_a_real_code") is ErrorCategory.UNKNOWN
+
+
+def test_category_taxonomy_is_topology_aware() -> None:
+    """The owner set models deployment topology: host and runner are first-class,
+    and the ambiguous ``client`` bucket is gone."""
+    values = {c.value for c in ErrorCategory}
+    assert {"host", "runner"} <= values
+    assert "client" not in values
+    assert not hasattr(ErrorCategory, "CLIENT")
+
+
+def test_every_error_code_has_an_impact() -> None:
+    """Every named ErrorCode must declare a progress impact.
+
+    Adding a code without an ``_CODE_TO_IMPACT`` entry fails here rather than
+    silently defaulting; the value must be a real :class:`ErrorImpact`.
+    """
+    for code in _all_error_code_values():
+        assert code in _CODE_TO_IMPACT, f"{code!r} missing from _CODE_TO_IMPACT"
+        assert isinstance(_CODE_TO_IMPACT[code], ErrorImpact)
+        # UNKNOWN impact is only for arbitrary exceptions with no code.
+        assert _CODE_TO_IMPACT[code] is not ErrorImpact.UNKNOWN, (
+            f"{code!r} maps to UNKNOWN impact; a named code must declare a concrete one"
+        )
+
+
+@pytest.mark.parametrize(
+    "code,expected_impact",
+    [
+        # Blocking: the turn/task cannot proceed without intervention.
+        (ErrorCode.INTERNAL_ERROR, ErrorImpact.BLOCKING),
+        (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorImpact.BLOCKING),
+        (ErrorCode.WORKSPACE_MISSING, ErrorImpact.BLOCKING),
+        (ErrorCode.UNAUTHORIZED, ErrorImpact.BLOCKING),
+        # Transient: self-healing, no lost progress.
+        (ErrorCode.RUNNER_UNAVAILABLE, ErrorImpact.TRANSIENT),
+        (ErrorCode.WRONG_REPLICA, ErrorImpact.TRANSIENT),
+        (ErrorCode.UPSTREAM_CANCELLED, ErrorImpact.TRANSIENT),
+        # Benign: a rejected request that leaves the session healthy.
+        (ErrorCode.NOT_FOUND, ErrorImpact.BENIGN),
+        (ErrorCode.INVALID_INPUT, ErrorImpact.BENIGN),
+        (ErrorCode.FORBIDDEN, ErrorImpact.BENIGN),
+        (ErrorCode.STALE_CURSOR, ErrorImpact.BENIGN),
+    ],
+)
+def test_code_impact_mapping(code: str, expected_impact: ErrorImpact) -> None:
+    """Pin the intent: which codes actually block progress, which self-heal."""
+    assert impact_for_code(code) == expected_impact
+
+
+def test_omnigent_error_impact_and_blocking_flag() -> None:
+    """``impact`` defaults from the code; ``blocking`` is the simple boolean."""
+    internal = OmnigentError("boom")  # default code INTERNAL_ERROR
+    assert internal.impact is ErrorImpact.BLOCKING
+    assert internal.blocking is True
+
+    unavailable = OmnigentError("asleep", code=ErrorCode.RUNNER_UNAVAILABLE)
+    assert unavailable.impact is ErrorImpact.TRANSIENT
+    assert unavailable.blocking is False
+
+
+def test_omnigent_error_impact_override() -> None:
+    """A raise site that knows the real outcome can override the code default.
+
+    A normally-benign invalid_input that aborted the turn is blocking.
+    """
+    err = OmnigentError(
+        "aborted mid-turn",
+        code=ErrorCode.INVALID_INPUT,
+        impact=ErrorImpact.BLOCKING,
+    )
+    assert err.impact is ErrorImpact.BLOCKING
+    assert err.blocking is True
+
+
+def test_classify_exception_omnigent_error_passthrough() -> None:
+    """An OmnigentError classifies to its own axes."""
+    err = OmnigentError("gone", code=ErrorCode.HARNESS_NOT_CONFIGURED)
+    assert classify_exception(err) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
+
+
+def test_classify_exception_transport_is_transient_upstream() -> None:
+    """Stdlib transport failures read as a transient upstream blip.
+
+    ``ConnectionError`` / ``TimeoutError`` are caught directly; httpx / starlette
+    types are matched by name (see :data:`omnigent.errors._TRANSPORT_EXC_NAMES`)
+    without importing those packages, exercised in the debug-logging tests.
+    """
+    assert classify_exception(ConnectionError("reset")) == (
+        ErrorCategory.UPSTREAM,
+        ErrorImpact.TRANSIENT,
+    )
+    assert classify_exception(TimeoutError("slow")) == (
+        ErrorCategory.UPSTREAM,
+        ErrorImpact.TRANSIENT,
+    )
+
+
+def test_classify_exception_arbitrary_is_unknown() -> None:
+    """An unattributable exception is UNKNOWN on both axes, not a guessed owner."""
+    assert classify_exception(ValueError("nope")) == (
+        ErrorCategory.UNKNOWN,
+        ErrorImpact.UNKNOWN,
+    )
+
+
+def _make_rpc_error(status_name: str | None) -> Exception:
+    """Build a structural stand-in for a grpc ``RpcError``.
+
+    The class is literally named ``RpcError`` (as in both pypi grpcio and a
+    vendored copy — a different class identity) and exposes the ``code()``
+    accessor returning a status object with a ``name``, the shape
+    :func:`is_cancelled_rpc_error` matches on.
+
+    :param status_name: The status name ``code()`` reports, e.g. ``CANCELLED``.
+    :returns: The exception instance.
+    """
+
+    class _Status:
+        name = status_name
+
+    class RpcError(Exception):
+        def code(self) -> object:
+            return _Status()
+
+    return RpcError("RPC terminated")
+
+
+def test_is_cancelled_rpc_error_matches_by_shape_not_identity() -> None:
+    """A peer-cancelled RpcError matches regardless of which module defines it.
+
+    The deployed build vendors grpc, so an isinstance check against pypi
+    grpcio would never fire there; the match must be structural.
+    """
+    assert is_cancelled_rpc_error(_make_rpc_error("CANCELLED")) is True
+
+
+def test_is_cancelled_rpc_error_ignores_other_statuses() -> None:
+    """Only CANCELLED is the expected peer-teardown condition; the rest keep
+    their existing (unhandled) treatment."""
+    assert is_cancelled_rpc_error(_make_rpc_error("UNAVAILABLE")) is False
+    assert is_cancelled_rpc_error(_make_rpc_error(None)) is False
+
+
+def test_is_cancelled_rpc_error_requires_rpc_error_ancestry() -> None:
+    """A non-RpcError exception never matches, even with a cancelled code()."""
+
+    class NotAnRpcFailure(Exception):
+        def code(self) -> object:
+            class _Status:
+                name = "CANCELLED"
+
+            return _Status()
+
+    assert is_cancelled_rpc_error(NotAnRpcFailure("nope")) is False
+    assert is_cancelled_rpc_error(ValueError("nope")) is False
+
+
+def test_is_cancelled_rpc_error_tolerates_broken_status_readers() -> None:
+    """A code() that raises, or a non-callable code, reads as not-cancelled."""
+
+    class RpcError(Exception):
+        def code(self) -> object:
+            raise RuntimeError("status unavailable")
+
+    assert is_cancelled_rpc_error(RpcError("broken")) is False
+
+    class RpcErrorWithField(Exception):
+        pass
+
+    RpcErrorWithField.__name__ = "RpcError"
+    broken = RpcErrorWithField("no accessor")
+    broken.code = "CANCELLED"  # type: ignore[attr-defined]  # a field, not the accessor
+    assert is_cancelled_rpc_error(broken) is False
+
+
+def test_classify_exception_cancelled_rpc_is_transient_upstream() -> None:
+    """A peer-cancelled RPC buckets as a transient upstream blip, and its wire
+    code stays pinned (clients dispatch on the string)."""
+    assert ErrorCode.UPSTREAM_CANCELLED == "upstream_cancelled"
+    assert classify_exception(_make_rpc_error("CANCELLED")) == (
+        ErrorCategory.UPSTREAM,
+        ErrorImpact.TRANSIENT,
+    )
+    # A non-cancelled RpcError keeps the honest UNKNOWN bucket.
+    assert classify_exception(_make_rpc_error("UNAVAILABLE")) == (
+        ErrorCategory.UNKNOWN,
+        ErrorImpact.UNKNOWN,
+    )
+
+
+def test_every_error_code_has_a_phase() -> None:
+    """Every named ErrorCode declares a lifecycle phase (UNKNOWN allowed).
+
+    Unlike category/impact, UNKNOWN is a valid phase for a generic code
+    (internal_error) because the phase is context-driven, not code-driven.
+    """
+    for code in _all_error_code_values():
+        assert code in _CODE_TO_PHASE, f"{code!r} missing from _CODE_TO_PHASE"
+        assert isinstance(_CODE_TO_PHASE[code], ErrorPhase)
+
+
+@pytest.mark.parametrize(
+    "code,expected_phase,before_start",
+    [
+        (ErrorCode.INVALID_INPUT, ErrorPhase.REQUEST, True),
+        (ErrorCode.UNAUTHORIZED, ErrorPhase.REQUEST, True),
+        (ErrorCode.WRONG_REPLICA, ErrorPhase.ROUTING, True),
+        (ErrorCode.RUNNER_UNAVAILABLE, ErrorPhase.RUNNER_LAUNCH, True),
+        (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorPhase.HARNESS_SETUP, True),
+        (ErrorCode.WORKSPACE_MISSING, ErrorPhase.HARNESS_SETUP, True),
+        (ErrorCode.HARNESS_PROTOCOL_VIOLATION, ErrorPhase.TURN, False),
+        (ErrorCode.INTERNAL_ERROR, ErrorPhase.UNKNOWN, False),
+        (ErrorCode.UPSTREAM_CANCELLED, ErrorPhase.UNKNOWN, False),
+    ],
+)
+def test_code_phase_and_harness_boundary(
+    code: str, expected_phase: ErrorPhase, before_start: bool
+) -> None:
+    """Pin the phase per code and the before/after-harness-start split."""
+    assert phase_for_code(code) == expected_phase
+    assert is_before_harness_start(expected_phase) is before_start
+
+
+def test_omnigent_error_phase_default_and_override() -> None:
+    """`phase` follows the code by default; a raise-site override wins."""
+    assert (
+        OmnigentError("no harness", code=ErrorCode.HARNESS_NOT_CONFIGURED).phase
+        is ErrorPhase.HARNESS_SETUP
+    )
+    assert (
+        OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR, phase=ErrorPhase.TURN).phase
+        is ErrorPhase.TURN
+    )
+
+
+def test_harness_boundary_is_startup_not_before() -> None:
+    """The harness *start* itself (HARNESS_STARTUP) is not 'before start'."""
+    assert is_before_harness_start(ErrorPhase.HARNESS_SETUP) is True
+    assert is_before_harness_start(ErrorPhase.HARNESS_STARTUP) is False
+    assert is_before_harness_start(ErrorPhase.TURN) is False
+    assert is_before_harness_start(ErrorPhase.UNKNOWN) is False
+
+
+def test_stale_cursor_error_carries_cursor_and_maps_to_400() -> None:
+    """The error names the vanished cursor and rejects as a client 400.
+
+    The distinct code (not a bare empty page) is what lets a paging client
+    tell "restart the enumeration" apart from "fully enumerated".
+    """
+    err = StaleCursorError("conv_gone")
+    assert err.code == ErrorCode.STALE_CURSOR
+    assert err.http_status == 400
+    assert err.cursor_id == "conv_gone"
+    assert "conv_gone" in err.message
+
+
+def test_restart_on_stale_cursor_restarts_then_returns() -> None:
+    """One vanished cursor restarts the enumeration; the result is the
+    second (complete) walk's."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    def walk() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise StaleCursorError("conv_gone")
+        return "complete"
+
+    assert walk() == "complete"
+    assert calls == 2
+
+
+def test_restart_on_stale_cursor_reraises_when_persistent() -> None:
+    """Rows deleted faster than the walk can finish must surface, not loop."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    def walk() -> None:
+        nonlocal calls
+        calls += 1
+        raise StaleCursorError("conv_gone")
+
+    with pytest.raises(StaleCursorError):
+        walk()
+    assert calls == _STALE_CURSOR_ATTEMPTS
+
+
+def test_restart_on_stale_cursor_passes_other_errors_through() -> None:
+    """Only the stale-cursor signal restarts; anything else propagates."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    def walk() -> None:
+        nonlocal calls
+        calls += 1
+        raise ValueError("unrelated")
+
+    with pytest.raises(ValueError):
+        walk()
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_on_stale_cursor_restarts_an_async_walk() -> None:
+    """An ``async def`` walk is awaited inside the retry loop, not returned
+    as a coroutine the loop never sees fail."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    async def walk() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise StaleCursorError("conv_gone")
+        return "complete"
+
+    assert await walk() == "complete"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_on_stale_cursor_reraises_from_an_async_walk() -> None:
+    """A persistently dead cursor surfaces from an async walk too."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    async def walk() -> None:
+        nonlocal calls
+        calls += 1
+        raise StaleCursorError("conv_gone")
+
+    with pytest.raises(StaleCursorError):
+        await walk()
+    assert calls == _STALE_CURSOR_ATTEMPTS

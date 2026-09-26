@@ -36,10 +36,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 
@@ -499,7 +499,7 @@ def claude_managed_gateway(
 
     The single canonical parser for Claude Code's managed-settings credential,
     shared by ambient detection, the readiness gate, and the Smart-Routing
-    gateway check (:func:`omnigent.claude_native.managed_claude_gateway_signal`
+    gateway check (:func:`omnigent.harnesses.claude_native.main.managed_claude_gateway_signal`
     delegates here). A credential counts as delivered when the file carries a
     top-level ``apiKeyHelper`` (a token-printing command) or a truthy
     ``env.CLAUDE_CODE_USE_GATEWAY``.
@@ -536,6 +536,35 @@ def claude_managed_gateway(
         )
         return base_url or None, has_helper or use_gateway
     return None, False
+
+
+def claude_managed_model_picker(
+    paths: tuple[Path, ...] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Read a replacement model picker from Claude Code's managed settings."""
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        picker = payload.get("modelPicker")
+        if not isinstance(picker, dict) or picker.get("replaceBuiltInOptions") is not True:
+            return ()
+        options = picker.get("options")
+        if not isinstance(options, list):
+            return ()
+        return tuple(
+            (model.strip(), label.strip())
+            for option in options
+            if isinstance(option, dict)
+            and isinstance((model := option.get("model")), str)
+            and model.strip()
+            and isinstance((label := option.get("label", model)), str)
+            and label.strip()
+        )
+    return ()
 
 
 def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -> str | None:

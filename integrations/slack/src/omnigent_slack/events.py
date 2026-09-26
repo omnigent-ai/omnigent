@@ -4,9 +4,17 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 _logger = logging.getLogger(__name__)
+
+# How a session gets its host, in the server's own ``host_type`` vocabulary.
+# ``external``: the session runs on a host the caller registered with
+# ``omni host`` and keeps online. ``managed``: the server provisions a sandbox
+# from its ``sandbox:`` config, chooses the host and workspace itself, and binds
+# the session to it — so the bot must not send a host id or a workspace path,
+# and must not launch a runner.
+HostType = Literal["external", "managed"]
 
 
 class OmnigentError(RuntimeError):

@@ -205,7 +205,27 @@ def _build_capture_messages() -> Executor:
     return _CapturingExecutor()
 
 
+def _build_pr_tracking() -> Executor:
+    executor = MockExecutor()
+    executor._turns.append(
+        [
+            ToolCallRequest(
+                name="Bash", args={"command": "gh pr create"}, metadata={"call_id": "pr1"}
+            ),
+            ToolCallComplete(
+                name="Bash",
+                status=ToolCallStatus.SUCCESS,
+                result="https://github.com/example/sdk/pull/42",
+                metadata={"call_id": "pr1"},
+            ),
+            TurnComplete(response="Created"),
+        ]
+    )
+    return executor
+
+
 _SCRIPTS: dict[str, Callable[[], Executor]] = {
+    "pr_tracking": _build_pr_tracking,
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,
     "error": _build_error,

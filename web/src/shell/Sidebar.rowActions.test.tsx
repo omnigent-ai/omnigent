@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar conversation-row quick actions:
 //   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
 //      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
@@ -9,8 +13,8 @@
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
@@ -142,6 +146,12 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));
 vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("./ForkSessionDialog", () => ({
+  ForkSessionDialog: ({ open, sourceSessionId }: { open: boolean; sourceSessionId: string }) =>
+    open ? (
+      <div data-testid="fork-session-dialog" data-source-session-id={sourceSessionId} />
+    ) : null,
+}));
 // Force a multi-user (non-local) server so the "Shared with me" tab renders —
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
@@ -236,17 +246,19 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
     const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
     const tree = (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-            {activeId ? (
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-              </Routes>
-            ) : (
-              sidebar
-            )}
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+              {activeId ? (
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                </Routes>
+              ) : (
+                sidebar
+              )}
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     // No explicit info → CapabilitiesContext default ("loading"), matching
@@ -429,6 +441,17 @@ describe("quick pin/unpin hover button", () => {
     // Clicking again unpins: the Pinned section disappears.
     fireEvent.click(screen.getByTestId("quick-pin-conversation"));
     expect(screen.queryByText("Pinned")).toBeNull();
+  });
+
+  it.each([
+    ["quick-pin-conversation", "Pin"],
+    ["quick-archive-conversation", "Archive"],
+  ])("shows the %s action in a styled tooltip on hover", async (testId, label) => {
+    const user = userEvent.setup();
+    renderSidebar();
+
+    await user.hover(screen.getByTestId(testId));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
   });
 
   it("also offers Pin in the kebab menu (mobile affordance) and toggles the same pin state", () => {
@@ -792,8 +815,9 @@ describe("quick-archive owner gate", () => {
 describe("pinned row project flyout", () => {
   // Pinning lifts a session out of its project folder into the flat "Pinned"
   // section, so the folder no longer conveys which project it came from. The
-  // hover flyout restores that cue: title + folder icon + project name. It
-  // opens on focus/hover — fire focus on the row link and await the portal.
+  // hover flyout restores that cue: title + project icon (the project's chosen
+  // emoji, or a folder fallback) + project name. It opens on focus/hover — fire
+  // focus on the row link and await the portal.
 
   it("shows the project name in the flyout for a pinned, project-owned row", async () => {
     // Seed the pin so the row lifts into the always-expanded Pinned section
@@ -823,6 +847,46 @@ describe("pinned row project flyout", () => {
     expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
       "fix/sidebar-row-height",
     );
+  });
+
+  it("shows the project's real emoji icon in the flyout when the project has one", async () => {
+    // The flyout mirrors the folder/picker: a first-class project that carries a
+    // chosen emoji surfaces that glyph next to its name, not the generic folder.
+    // The icon is keyed off the row's first-class `project_id`, so seed one that
+    // resolves into the mocked projects list (id `p_<name>`).
+    mocks.projects = ["Moonshot"];
+    mocks.projectIcons = { Moonshot: "🚀" };
+    mocks.pinnedStore.set(["conv_1"]);
+    mockConversations([{ ...CONV, project_id: "p_Moonshot" }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    // The emoji renders via ProjectRowIcon (data-testid project-icon), replacing
+    // the folder svg the fallback would otherwise draw.
+    const icon = within(flyout).getByTestId("project-icon");
+    expect(icon).toHaveTextContent("🚀");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+    expect(within(flyout).queryByRole("img", { hidden: true })).toBeNull();
+  });
+
+  it("falls back to the folder icon in the flyout for a project with no emoji", async () => {
+    // A label-only project (no first-class id/icon) has no glyph to surface, so
+    // the flyout keeps the folder icon — proving the emoji path is opt-in.
+    mocks.pinnedStore.set(["conv_1"]);
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    // No emoji span; the project line leads with the folder svg fallback.
+    expect(within(flyout).queryByTestId("project-icon")).toBeNull();
+    const projectLine = within(flyout).getByText("Moonshot").closest("p")!;
+    expect(projectLine.querySelector("svg")).not.toBeNull();
   });
 
   it("renders no project flyout for a pinned row with no project", () => {
@@ -1092,6 +1156,29 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("opens the fork dialog for the selected session", () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
+  });
+
+  it.each(["quick-pin-conversation", "quick-archive-conversation", "conversation-actions"])(
+    "opens the session menu when right-clicking the %s button",
+    (testId) => {
+      renderSidebar();
+
+      expect(fireEvent.contextMenu(screen.getByTestId(testId))).toBe(false);
+
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    },
+  );
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
@@ -1297,11 +1384,13 @@ describe("peek mode row menu", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <Sidebar open={false} peek onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open={false} peek onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     return { onClose };

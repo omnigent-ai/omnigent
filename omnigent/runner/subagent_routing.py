@@ -315,6 +315,10 @@ class SubagentRouteRequest:
     :param harness: Requesting harness id, e.g. ``"claude-native"``.
     :param task_name: Subagent type / task name from the spawn payload,
         e.g. ``"code-reviewer"``.
+    :param task_description: The spawn's human task label (Claude's
+        ``Task`` ``description``, e.g. ``"Research auth flows"``) — what
+        distinguishes same-typed spawns in a fan-out. ``None`` when the
+        harness's spawn payload names none.
     :param prompt: Raw task text. ``None`` on codex, whose spawn message
         is encrypted in hook payloads.
     :param fork: ``True`` when the spawn is a fork of the parent session.
@@ -329,6 +333,7 @@ class SubagentRouteRequest:
 
     harness: str
     task_name: str = ""
+    task_description: str | None = None
     prompt: str | None = None
     fork: bool = False
     parent_model: str | None = None
@@ -346,12 +351,20 @@ class SubagentRouteRequest:
         if not isinstance(harness, str) or not harness.strip():
             raise ValueError("route-subagent body requires a non-empty 'harness' string")
         task_name = payload.get("task_name")
+        task_description = payload.get("task_description")
         prompt = payload.get("prompt")
         parent_model = payload.get("parent_model")
         requested_model = payload.get("requested_model")
         return cls(
             harness=harness.strip(),
             task_name=task_name[:_TASK_NAME_CAP] if isinstance(task_name, str) else "",
+            # Agent-authored like task_name, so bounded the same way before
+            # it is stored or rendered.
+            task_description=(
+                task_description.strip()[:_TASK_NAME_CAP].rstrip() or None
+                if isinstance(task_description, str)
+                else None
+            ),
             prompt=prompt if isinstance(prompt, str) and prompt else None,
             fork=bool(payload.get("fork")),
             parent_model=parent_model if isinstance(parent_model, str) and parent_model else None,
@@ -459,6 +472,7 @@ def decision_record(
         harness=decision.harness or req.harness,
         raw_model=decision.raw_model,
         agent=req.task_name or None,
+        task_description=req.task_description,
         scope=_SCOPE,
         attempted_override=attempted,
         router_source=decision.router_source,
@@ -531,7 +545,7 @@ def model_in_family(family: str | None, model: str) -> bool:
     """
     if family is None or family == "pi":
         return True
-    from omnigent.model_catalog import model_family_token
+    from omnigent.models.model_catalog import model_family_token
 
     token = model_family_token(model)
     return token == "claude" if family == "claude" else token == "openai"
@@ -618,7 +632,7 @@ def _with_unadvertised_arms(models: list[str], family: str | None) -> list[str]:
     """
     if not models or family != _UNADVERTISED_ARM_FAMILY:
         return models
-    from omnigent.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
+    from omnigent.models.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
 
     extra = [
         model
@@ -1198,6 +1212,7 @@ def make_server_relay_resolver(
         body = {
             "harness": req.harness,
             "task_name": req.task_name,
+            "task_description": req.task_description,
             "prompt": req.prompt,
             "fork": req.fork,
             "parent_model": req.parent_model,
@@ -1478,7 +1493,7 @@ def _prune_router_dirs(router: SubagentRouter) -> None:
     Only dirs under the subagent-router root: the native harnesses' bridge
     dirs are advertised in too and belong to the bridge, not to this router.
     """
-    from omnigent.claude_native_bridge import subagent_router_bridge_root
+    from omnigent.harnesses.claude_native.bridge import subagent_router_bridge_root
 
     root = subagent_router_bridge_root()
     for bridge_dir in (*router.advertised_dirs, router.bridge_dir):
@@ -1502,7 +1517,10 @@ def router_dir_for_session(session_id: str) -> Path:
     :returns: Created directory, mode ``0o700``.
     :raises RuntimeError: If an ancestor fails the ownership check.
     """
-    from omnigent.claude_native_bridge import ensure_secure_dir, subagent_router_bridge_root
+    from omnigent.harnesses.claude_native.bridge import (
+        ensure_secure_dir,
+        subagent_router_bridge_root,
+    )
 
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
     path = subagent_router_bridge_root() / digest

@@ -16,6 +16,8 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -34,11 +36,15 @@ from omnigent.server.auth import (
     local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_agent_owner as _require_agent_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
@@ -50,6 +56,7 @@ from omnigent.server.routes._sessions.common import (
     _TURN_ACTOR_LABEL,
     _logger,
     get_server_runner_router,
+    host_interactive_shells_for_request,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -87,6 +94,7 @@ def register_agent_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     agent_cache: AgentCache | None = None,
+    host_registry: HostRegistry | None = None,
 ) -> None:
     """Register the agent sub-resource routes on router."""
 
@@ -131,7 +139,23 @@ def register_agent_routes(
                 f"Agent not found: {conv.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
             )
-        return _to_agent_object(agent, agent_cache)
+        terminals_override = None
+        if (
+            conv.host_id is not None
+            and host_registry is not None
+            and native_coding_agent_for_agent_name(agent.name) is not None
+        ):
+            normalized = host_interactive_shells_for_request(
+                conv.host_id,
+                host_registry=host_registry,
+                runner_router=runner_router or get_server_runner_router(),
+            )
+            terminals_override = normalized or None
+        return _to_agent_object(
+            agent,
+            agent_cache,
+            terminals_override=terminals_override,
+        )
 
     @router.get(
         "/sessions/{session_id}/agent/contents",
@@ -159,11 +183,24 @@ def register_agent_routes(
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-        conv = access.conversation
+        managed_token = request.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        if managed_token:
+            # A sandbox host can read only bundles for sessions bound to it.
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            host_store = getattr(request.app.state, "host_store", None)
+            managed = None
+            if conv is not None and conv.host_id is not None and host_store is not None:
+                managed = await asyncio.to_thread(
+                    host_store.resolve_launch_token, conv.host_id, managed_token
+                )
+            if managed is None:
+                raise HTTPException(status_code=401, detail="unauthenticated host")
+        else:
+            user_id = _require_user(request, auth_provider)
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            )
+            conv = access.conversation
         if conv is None:
             conv = conversation_store.get_conversation(session_id)
             if conv is None:
@@ -197,6 +234,8 @@ def register_agent_routes(
             content=bundle_bytes,
             media_type="application/gzip",
             headers={
+                "Cache-Control": "no-store",
+                "X-Agent-Id": agent.id,
                 "X-Agent-Version": str(agent.version),
                 "X-Agent-Name": agent.name,
                 # Provenance for the runner's env-expansion decision:
@@ -266,6 +305,12 @@ def register_agent_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        # Owner-only: a session-scoped agent's bundle runs with runner
+        # authority, so a LEVEL_EDIT grant on the session (shared editors,
+        # reused-agent sessions) is not enough — only the creating user or an
+        # admin may replace it.
+        await asyncio.to_thread(_require_agent_owner, user_id, agent, permission_store)
+
         bundle_bytes = await bundle.read()
         # Run bundle validation (tar extraction + spec parse, both
         # blocking) off the event loop -- mirrors the POST
@@ -301,7 +346,7 @@ def register_agent_routes(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         artifact_store.put(new_loc, bundle_bytes)
-        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc)
+        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
         if updated is None:
             raise OmnigentError(
                 f"Agent not found: {agent.id!r}",

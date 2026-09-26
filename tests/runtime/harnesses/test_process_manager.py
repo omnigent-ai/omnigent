@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 import signal
@@ -37,16 +38,19 @@ from pathlib import Path
 import pytest
 
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
     NoLiveHarnessError,
     _default_tmp_parent,
+    _kill_orphan_runners,
     _model_env_key,
     _pid_alive,
     _pids_holding_socket,
     _SubprocessEntry,
+    sweep_orphaned_harness_processes,
 )
 
 _TEST_HARNESS_NAME = "test"
@@ -161,6 +165,24 @@ async def test_start_creates_instance_dir_with_sentinel(
         await manager.shutdown()
 
 
+async def test_start_can_delegate_orphan_sweep_to_host(short_tmp_parent: Path) -> None:
+    """Host-spawned runners can start without scanning machine-global state."""
+    stale_dir = short_tmp_parent / "ap-dead"
+    stale_dir.mkdir(mode=0o700)
+    (stale_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    await manager.start(sweep_orphans=False)
+    try:
+        assert stale_dir.exists()
+        assert manager.instance_dir.exists()
+    finally:
+        await manager.shutdown()
+
+    await sweep_orphaned_harness_processes(tmp_parent=short_tmp_parent)
+    assert not stale_dir.exists()
+
+
 async def test_start_is_idempotent(manager: HarnessProcessManager) -> None:
     """A second start() is a no-op; doesn't recreate / relaunch.
 
@@ -222,6 +244,35 @@ def test_default_tmp_parent_is_per_uid_on_posix(
     assert parent != Path("/tmp/omnigent")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Symlink path is POSIX-only.")
+def test_resolve_harness_tmp_parent_preserves_symlink_spelling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "private" / "tmp"
+    target.mkdir(parents=True)
+    short_root = tmp_path / "tmp"
+    short_root.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv(_TMP_PARENT_ENV_VAR, str(short_root))
+
+    resolved = resolve_harness_tmp_parent()
+
+    assert resolved == short_root
+    assert resolved != target.resolve()
+
+
+def test_resolve_harness_tmp_parent_makes_relative_path_absolute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(_TMP_PARENT_ENV_VAR, "nested/../harness-sockets")
+
+    resolved = resolve_harness_tmp_parent()
+
+    assert resolved == tmp_path / "harness-sockets"
+
+
 async def test_shutdown_without_start_is_noop(
     manager: HarnessProcessManager,
 ) -> None:
@@ -264,6 +315,35 @@ async def test_get_client_spawns_and_serves(
         # the contract; verify the round-trip works.
         cid_resp = await client.get("/conversation-id")
         assert cid_resp.json() == {"conversation_id": "conv_a"}
+    finally:
+        await manager.shutdown()
+
+
+async def test_get_client_emits_harness_started_event(
+    manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful spawn emits one ``harness_started`` debug event.
+
+    This is the observable "harness bound and ready" edge used to measure
+    startup latency; the row carries the spawn->ready time and, for the
+    first spawn on a cold runner, the manager-start-relative time.
+    """
+    await manager.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runtime.harnesses.process_manager"):
+            await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        started = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "harness_started"
+        ]
+        assert len(started) == 1
+        record = started[0]
+        assert record.session_id == "conv_a"
+        attrs = record.attributes
+        assert attrs["harness"] == _TEST_HARNESS_NAME
+        assert isinstance(attrs["pid"], int)
+        assert attrs["spawn_ms"] >= 0
+        assert attrs["since_manager_start_ms"] >= 0
     finally:
         await manager.shutdown()
 
@@ -390,8 +470,11 @@ async def test_close_entry_kills_process_when_aclose_raises(
         await manager.shutdown()
 
 
+@pytest.mark.parametrize("response_id", [None, "resp_crashed"])
 async def test_get_client_respawns_after_crash(
     manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+    response_id: str | None,
 ) -> None:
     """If the subprocess died, the next get_client respawns.
 
@@ -404,6 +487,8 @@ async def test_get_client_respawns_after_crash(
     try:
         client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         original_pid = (await client.get("/pid")).json()["pid"]
+        if response_id is not None:
+            manager.mark_in_flight("conv_a", response_id)
         os.kill(original_pid, signal.SIGKILL)
         # Wait for the OS to mark the process dead so the next
         # get_client's ``returncode`` check sees it.
@@ -418,6 +503,17 @@ async def test_get_client_respawns_after_crash(
         # crash detection is broken.
         assert new_pid != original_pid
         assert _pid_alive(new_pid)
+        exits = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "harness_exit_detected"
+        ]
+        assert len(exits) == 1
+        assert exits[0].session_id == "conv_a"
+        assert exits[0].attributes == {
+            "harness": _TEST_HARNESS_NAME,
+            "pid": original_pid,
+            "returncode": -signal.SIGKILL,
+            "tracked_response_id": response_id,
+        }
     finally:
         await manager.shutdown()
 
@@ -1007,6 +1103,130 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         await fresh.shutdown()
 
 
+@pytest.mark.posix_only
+async def test_orphan_sweep_survives_unreadable_tmp_parent(
+    short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Warn and continue startup when the configured parent cannot be listed."""
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    locked_parent = short_tmp_parent / "fp"
+    locked_parent.mkdir(mode=0o700)
+    (locked_parent / "ap-unreachable").mkdir(mode=0o700)
+    # Write+search without read: our own instance dir can be created,
+    # but the sweep cannot enumerate the configured shared parent.
+    locked_parent.chmod(0o333)
+    manager = HarnessProcessManager(tmp_parent=locked_parent)
+    try:
+        await manager.start()
+        assert any(
+            "cannot enumerate" in record.getMessage() and str(locked_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        locked_parent.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_survives_tmp_parent_stat_error(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tmp-parent stat race must not abort manager startup."""
+    real_exists = Path.exists
+    raised = False
+
+    def _racy_exists(self: Path) -> bool:
+        nonlocal raised
+        if self == short_tmp_parent and not raised:
+            raised = True
+            raise OSError("tmp parent changed during sweep")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _racy_exists)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert manager.instance_dir.exists()
+        assert any(
+            "cannot access" in record.getMessage() and str(short_tmp_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+@pytest.mark.posix_only
+async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
+    short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Skip a mode-0000 sibling, remove a readable dead orphan, and retain a live one."""
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    inaccessible = short_tmp_parent / "ap-inaccessible"
+    inaccessible.mkdir(mode=0o700)
+    (inaccessible / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    inaccessible.chmod(0o000)
+
+    dead = short_tmp_parent / "ap-deadsibling"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    live = short_tmp_parent / "ap-livesibling"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert inaccessible.exists(), "unreadable sibling must be skipped, not removed"
+        assert not dead.exists(), "readable dead orphan must still be swept"
+        assert live.exists(), "live sibling must remain untouched"
+        assert any(
+            "cannot inspect" in record.getMessage() and str(inaccessible) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        inaccessible.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_treats_vanishing_child_as_benign_race(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An injected is_dir race must not prevent cleanup of the next dead orphan."""
+    vanishing = short_tmp_parent / "ap-avanishing"
+    vanishing.mkdir(mode=0o700)
+    (vanishing / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    dead = short_tmp_parent / "ap-zzdead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    real_is_dir = Path.is_dir
+
+    def _racy_is_dir(self: Path, **kwargs: object) -> bool:
+        if self.name == "ap-avanishing":
+            raise FileNotFoundError(2, "vanished mid-sweep", str(self))
+        return real_is_dir(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "is_dir", _racy_is_dir)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert not dead.exists(), "sweep must continue past the racy child"
+    finally:
+        monkeypatch.undo()
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
 # ── Helper-level tests (small, fast) ───────────────────────────
 
 
@@ -1082,6 +1302,37 @@ async def test_get_client_env_override_propagates_to_subprocess(
         # Subprocess saw the override in its env.
         resp = await client.get("/env/HARNESS_TEST_CUSTOM")
         assert resp.json() == {"value": "marker_alpha"}
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize("desktop_granted", [False, True])
+async def test_spawned_harness_requires_desktop_session_grant(
+    manager: HarnessProcessManager, monkeypatch: pytest.MonkeyPatch, desktop_granted: bool
+) -> None:
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    for name, value in session_env.items():
+        monkeypatch.setenv(name, value)
+    auth_command = "printf %s test-provider-key"
+    await manager.start()
+    try:
+        client = await manager.get_client(
+            "conv_keyring",
+            _TEST_HARNESS_NAME,
+            env={
+                **(session_env if desktop_granted else {}),
+                "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": auth_command,
+            },
+        )
+        for name, value in session_env.items():
+            response = await client.get(f"/env/{name}")
+            assert response.json() == {"value": value if desktop_granted else None}
+            assert os.environ[name] == value
+        response = await client.get("/env/HARNESS_CODEX_GATEWAY_AUTH_COMMAND")
+        assert response.json() == {"value": auth_command}
     finally:
         await manager.shutdown()
 
@@ -1269,8 +1520,7 @@ async def test_orphan_sweep_escalates_to_sigkill(
     instance_dir.mkdir()
     (instance_dir / "conv-stale.sock").touch()
 
-    mgr = HarnessProcessManager(tmp_parent=short_tmp_parent)
-    await mgr._kill_orphan_runners(instance_dir)
+    await _kill_orphan_runners(instance_dir)
 
     assert calls == 2
     assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]

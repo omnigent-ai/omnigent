@@ -86,3 +86,19 @@ export const PublicReadOnly: Story = {
     }),
   ],
 };
+
+export const RestrictedHomeDirectory: Story = {
+  args: { workspace: "/home/alice" },
+  decorators: [
+    modalEnvironment({
+      mode: "restricted_read_only",
+      permissions: [{ user_id: "owner@example.com", conversation_id: sessionId, level: 4 }],
+      publicSharing: false,
+    }),
+  ],
+  play: async ({ canvasElement }) => {
+    const input = canvasElement.ownerDocument.querySelector<HTMLInputElement>("#perm-user");
+    if (!input) throw new Error("Permission user input not found");
+    await fireEvent.change(input, { target: { value: "viewer@example.com" } });
+  },
+};

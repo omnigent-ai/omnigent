@@ -10,6 +10,14 @@
 // unavailable stored host is never silently replaced with the automatic
 // default: the picker waits for it to reappear, or for the user to explicitly
 // choose another host.
+//
+// Also owns the sandbox-choice codec (sandboxHostChoice /
+// sandboxHostChoiceProvider), which widens the stored sentinel to name one
+// provider. It lives here because it extends that sentinel's grammar, and
+// because a Radix `Select` carries only a string value — so a picker rendered
+// as one list of targets must encode the provider into the value. The
+// NewChatDialog dropdown needs no encoding: it holds the provider in its own
+// React state.
 
 const STORAGE_KEY = "omnigent:last-host-choice";
 const SANDBOX_PROVIDER_KEY = "omnigent:last-sandbox-provider";
@@ -18,6 +26,39 @@ const SANDBOX_PROVIDER_KEY = "omnigent:last-sandbox-provider";
 // which has no host id of its own (the server provisions the host at create
 // time). A reserved sentinel so it can never collide with a real host id.
 export const SANDBOX_HOST_CHOICE = "__sandbox__";
+
+// Separator for the per-provider form of the sentinel, `__sandbox__:<provider>`
+// (see sandboxHostChoice). Kept next to the sentinel so both halves of the
+// grammar live in one place.
+const SANDBOX_PROVIDER_SEPARATOR = ":";
+
+/**
+ * Widen {@link SANDBOX_HOST_CHOICE} to name one sandbox provider.
+ *
+ * A picker rendered as a single list of targets needs a distinct value per
+ * provider row, which the bare sentinel can't give. A real host id can never
+ * collide with the result, since the sentinel prefix is reserved.
+ *
+ * @param provider Provider id, e.g. "modal"; `null` when the server names none.
+ * @returns The per-provider choice, e.g. `"__sandbox__:modal"`.
+ */
+export function sandboxHostChoice(provider: string | null): string {
+  return `${SANDBOX_HOST_CHOICE}${SANDBOX_PROVIDER_SEPARATOR}${provider ?? ""}`;
+}
+
+/**
+ * Read the provider back out of a {@link sandboxHostChoice} value.
+ *
+ * @param choice A picker value — either a per-provider sandbox choice or a
+ *   real host id.
+ * @returns The provider id; `null` for a sandbox choice naming none; and
+ *   `undefined` when `choice` is a host id rather than a sandbox choice.
+ */
+export function sandboxHostChoiceProvider(choice: string): string | null | undefined {
+  const prefix = `${SANDBOX_HOST_CHOICE}${SANDBOX_PROVIDER_SEPARATOR}`;
+  if (!choice.startsWith(prefix)) return undefined;
+  return choice.slice(prefix.length) || null;
+}
 
 /**
  * Read the user's last explicit host choice on the landing composer: a host

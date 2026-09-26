@@ -176,6 +176,106 @@ async def test_watchdog_resync_is_idempotent() -> None:
     # Exactly one Tier-1 reset: the cached executor was dropped and closed once.
     assert adapter._executor is None
     assert executor.close_calls == 1
+
+
+async def test_wedge_retry_waits_for_executor_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 10)
+    closing = asyncio.Event()
+    release = asyncio.Event()
+    orphan_result = None
+
+    class SlowCloseExecutor(_FakeExecutor):
+        async def close(self) -> None:
+            nonlocal orphan_result
+            closing.set()
+            await release.wait()
+            orphan_result = await self._tool_executor("count", {})
+            await super().close()
+
+    abandoned = SlowCloseExecutor(block_event=asyncio.Event())
+    fresh = _FakeExecutor(events=[TextChunk(text="done"), TurnComplete(response="done")])
+    creations = 0
+
+    def factory() -> Executor:
+        nonlocal creations
+        creations += 1
+        if creations == 1:
+            return abandoned
+        assert abandoned.close_calls == 1
+        assert abandoned.close_session_calls == 1
+        return fresh
+
+    adapter = ExecutorAdapter(executor_factory=factory)
+    ctx = _ctx("retry_after_close")
+    task = asyncio.create_task(adapter._guarded_run_turn(_request(), ctx))
+    try:
+        async with asyncio.timeout(5):
+            await closing.wait()
+            assert creations == 1
+            assert adapter._current_ctx is None
+            release.set()
+            await task
+        assert creations == 2
+        assert orphan_result is not None and orphan_result.get("error")
+    finally:
+        release.set()
+        await adapter.on_shutdown()
+
+
+@pytest.mark.parametrize(
+    "failure", ["close_error", "close_timeout", "cancel", "budget", "absolute"]
+)
+async def test_cleanup_cannot_enable_unsafe_retry(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from omnigent.runtime.harnesses import _executor_adapter, _scaffold
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(
+        _scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 0.4 if failure in {"budget", "absolute"} else 10
+    )
+    monkeypatch.setattr(
+        _executor_adapter,
+        "INTERRUPT_TIMEOUT_S",
+        0.5 if failure in {"budget", "absolute"} else 0.05,
+    )
+    ctx = _ctx("cleanup_failed")
+
+    class FailedCloseExecutor(_FakeExecutor):
+        async def close(self) -> None:
+            if failure == "close_error":
+                raise RuntimeError("close failed")
+            if failure == "close_timeout":
+                await asyncio.Event().wait()
+            if failure == "cancel":
+                ctx.cancelled.set()
+            if failure in {"budget", "absolute"}:
+                await asyncio.sleep(0.25 if failure == "budget" else 0.4)
+            await super().close()
+
+    executor = FailedCloseExecutor(block_event=asyncio.Event())
+    creations = 0
+
+    def factory() -> Executor:
+        nonlocal creations
+        creations += 1
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=factory)
+    try:
+        async with asyncio.timeout(5):
+            with pytest.raises(RuntimeError, match="idle watchdog"):
+                await adapter._guarded_run_turn(_request(), ctx)
+        assert creations == 1
+        events = []
+        while not ctx._event_queue.empty():
+            events.append(ctx._event_queue.get_nowait())
+        assert not any(getattr(event, "type", None) == "response.retry" for event in events)
+    finally:
+        await adapter.on_shutdown()
     assert executor.close_session_calls == 1
     assert adapter._orphan_callback_count == 0
     assert adapter._resyncing is False
@@ -569,3 +669,87 @@ async def test_safe_interrupt_reaps_even_when_interrupt_hangs(
     # … but the reap STILL ran: the abandoned executor was closed, not orphaned.
     assert executor.close_session_calls == 1
     assert executor.close_calls == 1
+
+
+class _RefusedInterruptExecutor(_FakeExecutor):
+    """Executor whose ``interrupt_session`` finds the harness socket gone.
+
+    Models the common abandoned-executor shape: the harness exited (which is
+    why the executor was abandoned), so connecting to its socket is refused.
+    """
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        self.interrupt_calls.append(session_key)
+        raise ConnectionRefusedError(111, "Connection refused")
+
+
+class _BrokenInterruptExecutor(_FakeExecutor):
+    """Executor whose ``interrupt_session`` fails for an unexpected reason."""
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        self.interrupt_calls.append(session_key)
+        raise RuntimeError("app-server rejected the interrupt")
+
+
+async def test_safe_interrupt_gone_harness_is_not_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refused interrupt socket is teardown evidence, not a session error.
+
+    The executor is abandoned *because* the harness exited, so a refused
+    connection only confirms that. Logging it at ERROR booked a mid-session
+    error against a session whose turn had already ended, while the reap that
+    follows did the real cleanup.
+    """
+    executor = _RefusedInterruptExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.WARNING, logger=_ADAPTER_LOGGER):
+        await adapter._safe_interrupt(executor, "sess_gone")
+
+    records = [rec for rec in caplog.records if rec.name == _ADAPTER_LOGGER]
+    assert [rec.levelno for rec in records] == [logging.WARNING]
+    assert "already gone (ConnectionRefusedError)" in records[0].getMessage()
+    # The reap still ran, so nothing is left orphaned by the softer severity.
+    assert executor.close_session_calls == 1
+    assert executor.close_calls == 1
+
+
+async def test_safe_interrupt_hang_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An interrupt slice that expires with nothing answering stays a warning."""
+    import omnigent.runtime.harnesses._executor_adapter as _adapter_mod
+
+    monkeypatch.setattr(_adapter_mod, "_INTERRUPT_SLICE_S", 0.05)
+    monkeypatch.setattr(_adapter_mod, "INTERRUPT_TIMEOUT_S", 0.2)
+
+    executor = _HangInterruptExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.WARNING, logger=_ADAPTER_LOGGER):
+        await adapter._safe_interrupt(executor, "sess_hang")
+
+    records = [rec for rec in caplog.records if rec.name == _ADAPTER_LOGGER]
+    assert [rec.levelno for rec in records] == [logging.WARNING]
+    assert "already gone (TimeoutError)" in records[0].getMessage()
+
+
+async def test_safe_interrupt_unexpected_failure_still_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An interrupt rejected for any other reason keeps its ERROR.
+
+    The softer severity is scoped to "the harness is gone"; a live harness that
+    refuses the interrupt is still a fault worth surfacing.
+    """
+    executor = _BrokenInterruptExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.WARNING, logger=_ADAPTER_LOGGER):
+        await adapter._safe_interrupt(executor, "sess_broken")
+
+    records = [rec for rec in caplog.records if rec.name == _ADAPTER_LOGGER]
+    assert [rec.levelno for rec in records] == [logging.ERROR]
+    assert "failed or timed out" in records[0].getMessage()

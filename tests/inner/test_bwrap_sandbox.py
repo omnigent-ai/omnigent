@@ -55,6 +55,15 @@ from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
 
 BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 
+# Skip anything that reaches real bwrap resolution/execution when bwrap is not
+# available (macOS, Windows, or a bwrap-less Linux box) — the backend hard-errors
+# off Linux by design. Defined here at module top so it can decorate tests
+# throughout the file, including the resolver tests below (issue #4279: it was
+# previously defined *after* those tests, so it never gated them).
+pytestmark_bwrap = pytest.mark.skipif(
+    not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
+)
+
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -248,6 +257,7 @@ def _repo_root() -> Path:
 # ---------------------------------------------------------------------------
 
 
+@pytestmark_bwrap
 def test_resolve_default_keeps_cwd_read_only() -> None:
     """
     ``write_paths`` omitted (the common case) leaves ``write_roots``
@@ -275,6 +285,7 @@ def test_resolve_default_keeps_cwd_read_only() -> None:
     assert policy.read_roots is None  # No spec-supplied read_paths.
 
 
+@pytestmark_bwrap
 def test_resolve_write_paths_dot_makes_cwd_writable() -> None:
     """
     Setting ``write_paths: ["."]`` flips cwd to writable. This is the
@@ -291,6 +302,7 @@ def test_resolve_write_paths_dot_makes_cwd_writable() -> None:
     assert policy.write_roots == [Path.cwd().resolve(strict=False)]
 
 
+@pytestmark_bwrap
 def test_resolve_default_cwd_allow_hidden_is_dot_venv() -> None:
     """
     ``cwd_allow_hidden=None`` in the spec resolves to the documented
@@ -312,6 +324,7 @@ def test_resolve_default_cwd_allow_hidden_is_dot_venv() -> None:
     )
 
 
+@pytestmark_bwrap
 def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     """
     An explicit ``cwd_allow_hidden`` in the spec replaces the default
@@ -573,6 +586,47 @@ def test_wrap_launcher_argv_nested_write_mount_follows_read_parent(
     assert read_index is not None
     assert write_index is not None
     assert read_index < write_index
+
+
+@pytest.mark.parametrize("exposure", ["cwd", "read-root", "root-alias", "implicit", "system"])
+def test_launcher_rejects_visible_credential_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exposure: str
+) -> None:
+    cwd = (tmp_path / "workspace").resolve()
+    cwd.mkdir()
+    private = (tmp_path / "private").resolve()
+    private.mkdir()
+    policy = _make_policy(cwd)
+    source = private / "token"
+    source.write_text("secret")
+    if exposure == "cwd":
+        source = cwd / "token"
+    elif exposure == "read-root":
+        policy.read_roots = [private]
+    elif exposure == "root-alias":
+        alias = tmp_path / "alias"
+        alias.symlink_to(private, target_is_directory=True)
+        policy.read_roots = [alias]
+    elif exposure == "implicit":
+        monkeypatch.setattr(
+            bwrap_sandbox,
+            "_ensure_executable_visible",
+            lambda argv, cwd: ["--ro-bind", str(private), "/runtime"],
+        )
+    else:
+        source = Path("/usr/lib/private-token")
+    policy.credential_source_paths = [source]
+    with pytest.raises(ValueError, match="sandbox-visible mounts"):
+        _make_backend().wrap_launcher_argv(["/bin/sh", "-c", "true"], policy, cwd)
+
+
+def test_launcher_accepts_private_credential_source(tmp_path: Path) -> None:
+    cwd = (tmp_path / "workspace").resolve()
+    cwd.mkdir()
+    policy = _make_policy(cwd)
+    policy.credential_source_paths = [(tmp_path / "private-token").resolve()]
+    argv = _make_backend().wrap_launcher_argv(["/bin/sh", "-c", "true"], policy, cwd)
+    assert argv[-3:] == ["/bin/sh", "-c", "true"]
 
 
 def test_wrap_launcher_argv_masks_denied_unix_socket_after_write_root(
@@ -888,6 +942,24 @@ def test_wrap_launcher_argv_target_none_no_extra_binds(
     assert without_target == with_none, (
         "Passing target=None must produce identical argv to omitting the parameter."
     )
+
+
+@pytest.mark.parametrize("target", ["/bin/bash", "/sbin/tool", "/workspace/tool"])
+def test_covered_executable_does_not_expose_parent_directories(target: str) -> None:
+    assert (
+        bwrap_sandbox._interpreter_chain_binds(
+            [target], [Path("/bin"), Path("/sbin"), Path("/workspace")]
+        )
+        == []
+    )
+
+
+def test_shallow_executable_never_exposes_the_host_root() -> None:
+    assert bwrap_sandbox._interpreter_chain_binds(["/opt/tool"], [Path("/usr")]) == [
+        "--ro-bind-try",
+        "/opt",
+        "/opt",
+    ]
 
 
 def test_wrap_launcher_argv_target_already_in_default_mounts(
@@ -1675,11 +1747,6 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Seccomp profile (real bwrap subprocess required)
 # ---------------------------------------------------------------------------
-
-
-pytestmark_bwrap = pytest.mark.skipif(
-    not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
-)
 
 
 @pytestmark_bwrap

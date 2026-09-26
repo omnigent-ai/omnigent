@@ -190,6 +190,7 @@ class _EngineEntry:
     available: AvailabilityProbe
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- static engine-name registry
 _ENGINE_REGISTRY: dict[str, _EngineEntry] = {}
 
 

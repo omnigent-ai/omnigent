@@ -155,6 +155,16 @@ class ZygoteManager:
         """The zygote process pid, or ``None`` if not started."""
         return self._proc.pid if self._proc is not None else None
 
+    @property
+    def unreaped_pid(self) -> int | None:
+        """Return the zygote pid only while its exit status is still pending.
+
+        Poll the local Popen without the control lock or a socket round-trip,
+        retaining any exit code for the manager's other lifecycle operations.
+        """
+        proc = self._proc
+        return proc.pid if proc is not None and proc.poll() is None else None
+
     def is_running(self) -> bool:
         """Whether the zygote process is started and has not exited."""
         return self._proc is not None and self._proc.poll() is None
@@ -236,6 +246,8 @@ class ZygoteManager:
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
+                # Avoid pinning the daemon's potentially transient cwd.
+                cwd="/",
             )
 
     def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> ZygoteRunnerProc:

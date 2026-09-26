@@ -26,6 +26,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
     supervise_host_command,
 )
+from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 _HOST_LAUNCH = "FOO=bar omnigent host --server https://srv"
 
@@ -225,15 +226,44 @@ def test_start_host_default_materialize_clones_repo() -> None:
         host_id="host_abc",
         host_name="managed-abc",
         server_url="https://srv",
-        repo_url="https://github.com/org/repo",
-        repo_branch="release-1.2",
-        repo_name="repo",
+        repos=[
+            RepoWorkspace(
+                url="https://github.com/org/repo", branch="release-1.2", repo_name="repo"
+            )
+        ],
     )
 
     assert workspace == "/root/workspace/repo"
     assert (
         "git clone --branch release-1.2 --single-branch -- "
         "https://github.com/org/repo /root/workspace/repo"
+    ) in launcher.commands
+
+
+def test_start_host_clones_multiple_repos_into_sibling_dirs() -> None:
+    """
+    Several repos → the exec-model default clones each into
+    ``<workspace>/<repo_name>`` and returns the parent workspace (the working
+    directory that holds them all), matching the entrypoint (k8s) rule.
+    """
+    launcher = _RecordingLauncher()
+
+    workspace = launcher.start_host(
+        "sb-1",
+        token="tok-123",
+        host_id="host_abc",
+        host_name="managed-abc",
+        server_url="https://srv",
+        repos=[
+            RepoWorkspace(url="https://github.com/org/api", branch=None, repo_name="api"),
+            RepoWorkspace(url="https://github.com/org/web", branch="dev", repo_name="web"),
+        ],
+    )
+
+    assert workspace == "/root/workspace"
+    assert "git clone -- https://github.com/org/api /root/workspace/api" in launcher.commands
+    assert (
+        "git clone --branch dev --single-branch -- https://github.com/org/web /root/workspace/web"
     ) in launcher.commands
 
 
@@ -272,9 +302,7 @@ def test_materialize_workspace_override_resolves_local_checkout_without_cloning(
         host_id="host_abc",
         host_name="managed-abc",
         server_url="https://srv",
-        repo_url="https://github.com/org/repo",
-        repo_branch="main",
-        repo_name="repo",
+        repos=[RepoWorkspace(url="https://github.com/org/repo", branch="main", repo_name="repo")],
     )
 
     assert workspace == "/checkouts/repo"

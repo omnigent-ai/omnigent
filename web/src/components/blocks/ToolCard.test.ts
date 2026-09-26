@@ -190,6 +190,48 @@ describe("ToolCard rendering", () => {
     expect(screen.queryByRole("link")).toBeNull();
     expect(screen.getByText("/etc/hosts")).toBeInTheDocument();
   });
+
+  it("soft-wraps panel content by default so long lines never clip", () => {
+    // WHY: a long single-line tool output used to keep `white-space: pre`
+    // and could only be read by scrolling the panel horizontally.
+    const { container } = renderCard({
+      name: "my_tool",
+      arguments: {},
+      output: "y".repeat(2000),
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+
+    // Both the Parameters and Output panels default to wrapping.
+    const pres = Array.from(container.querySelectorAll("pre"));
+    expect(pres.length).toBeGreaterThan(1);
+    for (const pre of pres) {
+      expect(pre.className).toContain("whitespace-pre-wrap");
+    }
+  });
+
+  it("word-wrap toggle restores the horizontal-scroll view per panel", () => {
+    // WHY: column-aligned output (tables, diffs) sometimes reads better
+    // unwrapped, so each panel's toggle must flip it back to `pre`.
+    const { container } = renderCard({
+      name: "my_tool",
+      arguments: {},
+      output: "the output",
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+
+    const toggles = screen.getAllByRole("button", { name: "Disable word wrap" });
+    expect(toggles.length).toBe(2); // Parameters + Output
+    fireEvent.click(toggles[0]);
+
+    // Only the toggled panel unwraps; the other keeps the default.
+    const wrapped = Array.from(container.querySelectorAll("pre")).filter((pre) =>
+      pre.className.includes("whitespace-pre-wrap"),
+    );
+    expect(wrapped.length).toBe(1);
+    expect(screen.getByRole("button", { name: "Enable word wrap" })).toBeInTheDocument();
+  });
 });
 
 describe("ToolGroupSummary", () => {

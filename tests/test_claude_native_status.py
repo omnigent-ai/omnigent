@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import claude_native_status
+from omnigent.harnesses.claude_native import status as claude_native_status
 
 
 def _run(
@@ -191,7 +191,7 @@ def test_status_wrapper_chain_swallows_subprocess_errors(
 
 def test_normalize_status_payload_extracts_record() -> None:
     """The normalizer extracts window/usage/cost/model; None without a window."""
-    from omnigent.claude_native_status import normalize_status_payload
+    from omnigent.harnesses.claude_native.status import normalize_status_payload
 
     record = normalize_status_payload(
         {
@@ -223,7 +223,7 @@ def test_sync_raw_status_context_normalizes_and_retries(tmp_path: Path) -> None:
     """
     import json as _json
 
-    from omnigent.claude_native_status import (
+    from omnigent.harnesses.claude_native.status import (
         CONTEXT_RAW_FILE,
         sync_raw_status_context,
     )

@@ -214,7 +214,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
   const handleNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node<AgentNodeData>) => {
       const params = new URLSearchParams(location.search);
-      for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
+      for (const key of ["file", "diff", "comment", "view", "message"]) params.delete(key);
       const search = params.toString();
       navigate({
         pathname: `/c/${node.data.sessionId}`,

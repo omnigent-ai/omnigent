@@ -134,6 +134,7 @@ describe("resolveServerInfo release features", () => {
     const parsed = await probe({});
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+    expect(isFeatureEnabled(parsed, "canvas")).toBe(false);
   });
 
   it("falls back to the legacy harness field from an older server", async () => {

@@ -72,6 +72,14 @@ describe("GoalControl", () => {
     expect(screen.getByTestId("goal-toggle")).toBeDisabled();
   });
 
+  it("collapses the visible Goal label in a narrow composer", () => {
+    renderControl();
+
+    const button = screen.getByRole("button", { name: "View goal" });
+    expect(button).toHaveClass("w-9", "@lg/composer-actions:w-auto");
+    expect(screen.getByText("Goal")).toHaveClass("hidden", "@lg/composer-actions:inline");
+  });
+
   it("starts a command-backed goal", () => {
     const onStartGoal = vi.fn();
     render(
@@ -92,9 +100,37 @@ describe("GoalControl", () => {
     expect(onStartGoal).toHaveBeenCalledWith("All tests pass");
   });
 
-  it("renders the status pill", () => {
-    render(<GoalStatusPill goal={{ ...GOAL, status: "blocked" }} />);
+  it("renders a working icon while the goal is in progress", () => {
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={{ ...GOAL, status: "active" }} />
+      </TooltipProvider>,
+    );
 
-    expect(screen.getByTestId("composer-goal-mode")).toHaveTextContent("Goal blocked");
+    const pill = screen.getByTestId("composer-goal-mode");
+    expect(pill).toHaveAttribute("data-state", "working");
+    expect(pill).toHaveAccessibleName(`Goal active: ${GOAL.objective}`);
+  });
+
+  it("renders a done icon once the goal completes", () => {
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={{ ...GOAL, status: "complete" }} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByTestId("composer-goal-mode")).toHaveAttribute("data-state", "done");
+  });
+
+  it("opens the goal dialog on click", () => {
+    const onOpen = vi.fn();
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={GOAL} onOpen={onOpen} />
+      </TooltipProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("composer-goal-mode"));
+    expect(onOpen).toHaveBeenCalledOnce();
   });
 });

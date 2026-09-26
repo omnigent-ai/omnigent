@@ -66,7 +66,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.reasoning_effort import COPILOT_EFFORTS, validate_effort
+from omnigent.util.reasoning_effort import COPILOT_EFFORTS, validate_effort
 
 from .datamodel import OSEnvSpec
 from .executor import (

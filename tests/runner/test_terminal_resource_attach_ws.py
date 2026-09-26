@@ -10,6 +10,7 @@ lookup while stubbing the control bridge itself.
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -695,3 +696,34 @@ async def test_direct_attach_listener_serves_probe_on_loopback() -> None:
                 pass
     finally:
         await listener.stop()
+
+
+@pytest.mark.asyncio
+async def test_direct_attach_listener_preserves_existing_log_handlers() -> None:
+    """Starting the nested listener must not reconfigure runner logging."""
+
+    class TrackingHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.was_closed = False
+
+        def emit(self, record: logging.LogRecord) -> None:
+            pass
+
+        def close(self) -> None:
+            self.was_closed = True
+            super().close()
+
+    handler = TrackingHandler()
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    listener = None
+    try:
+        listener = await start_direct_attach_listener(_make_direct_app([]))
+        assert listener is not None
+        assert not handler.was_closed
+    finally:
+        if listener is not None:
+            await listener.stop()
+        root_logger.removeHandler(handler)
+        handler.close()

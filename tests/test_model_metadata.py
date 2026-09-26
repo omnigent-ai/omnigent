@@ -2,7 +2,7 @@
 
 import pytest
 
-from omnigent.model_metadata import concrete_reported_model
+from omnigent.models.model_metadata import concrete_reported_model
 
 
 @pytest.mark.parametrize("value", [None, 42, "", " ", "<synthetic>", " <synthetic> "])

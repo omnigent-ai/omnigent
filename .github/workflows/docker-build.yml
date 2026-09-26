@@ -2,7 +2,9 @@
 # publishes (oss-publish-images.yml now builds on tags + nightly only): a broken
 # Dockerfile / lockfile / frontend build would otherwise not surface until the
 # nightly rebuild or a release. Builds the server image single-arch (linux/amd64)
-# with the GHA layer cache and runs a `omnigent --help` CLI smoke. It never pushes.
+# with the GHA layer cache and runs a `omnigent --help` CLI smoke. Changes to the
+# Cloudflare deployment or JavaScript lockfiles additionally run Wrangler's full
+# dry-run, including its derived container build. Nothing is pushed or deployed.
 #
 # Scope: the server target exercises the shared builder stage (Python deps +
 # web SPA build) that all five published variants inherit, so it catches the
@@ -25,6 +27,7 @@ on:
     paths:
       - 'deploy/docker/Dockerfile'
       - 'deploy/docker/entrypoint.py'
+      - 'deploy/cloudflare/**'
       - 'omnigent/**'
       - 'web/**'
       - 'sdks/**'
@@ -59,6 +62,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Detect Cloudflare container changes
+        id: cloudflare
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed=false
+          while IFS= read -r file; do
+            case "$file" in
+              deploy/cloudflare/*|pnpm-lock.yaml|pnpm-workspace.yaml|.github/workflows/docker-build.yml)
+                changed=true
+                break
+                ;;
+            esac
+          done < <(git diff --name-only "$BASE_SHA" HEAD)
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
@@ -80,3 +101,17 @@ jobs:
 
       - name: CLI smoke
         run: docker run --rm omnigent-server:pr-${{ github.event.pull_request.number || github.sha }} omnigent --help
+
+      - name: Set up pnpm
+        if: steps.cloudflare.outputs.changed == 'true'
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Install Cloudflare deployment dependencies
+        if: steps.cloudflare.outputs.changed == 'true'
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: pnpm install --frozen-lockfile --filter omnigent-cloudflare
+
+      - name: Cloudflare Worker and container dry-run
+        if: steps.cloudflare.outputs.changed == 'true'
+        run: pnpm --dir deploy/cloudflare exec wrangler deploy --dry-run

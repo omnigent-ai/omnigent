@@ -1,6 +1,46 @@
 import Foundation
 import WebKit
 
+/// Host-based authentication classification, independent of workspace mount discovery.
+enum ServerAuthentication: Equatable {
+  case databricksWorkspace
+  case databricksApp
+  case oidc
+
+  init(origin: String?) {
+    self.init(host: origin.flatMap { URL(string: $0)?.host })
+  }
+
+  init(host: String?) {
+    guard let host = host?.lowercased() else {
+      self = .oidc
+      return
+    }
+    if Self.workspaceDomains.contains(where: { Self.matches(host, domain: $0) }) {
+      self = .databricksWorkspace
+    } else if Self.matches(host, domain: Self.appsDomain) {
+      self = .databricksApp
+    } else {
+      self = .oidc
+    }
+  }
+
+  /// Databricks Apps retain inline SSO; workspace login is handled natively.
+  var usesInWebViewAuth: Bool {
+    switch self {
+    case .databricksApp: true
+    case .databricksWorkspace, .oidc: false
+    }
+  }
+
+  private static let workspaceDomains = ["databricks.com", "azuredatabricks.net"]
+  private static let appsDomain = "databricksapps.com"
+
+  private static func matches(_ host: String, domain: String) -> Bool {
+    host == domain || host.hasSuffix(".\(domain)")
+  }
+}
+
 extension URL {
   var omnigentOrigin: String? {
     guard let scheme, let host else { return nil }

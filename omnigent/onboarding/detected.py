@@ -22,7 +22,6 @@ Two surfaces:
 
 from __future__ import annotations
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
     build_cli_config_provider_entry,
@@ -42,6 +41,7 @@ from omnigent.onboarding.provider_config import (
     provider_families,
     set_default_provider,
 )
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 # The families auto-default resolution walks, in a stable order. ``gemini``
 # is included so a detected-only GEMINI_API_KEY (the antigravity-sdk harness's

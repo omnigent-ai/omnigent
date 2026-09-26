@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
-from omnigent import opencode_native_bridge as bridge
-from omnigent.opencode_native_bridge import (
+from omnigent.harnesses.opencode_native import bridge
+from omnigent.harnesses.opencode_native.bridge import (
     OpenCodeNativeBridgeState,
     auth_headers_for_secret,
     bridge_dir_for_bridge_id,
@@ -327,6 +328,62 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
     bridge_dir = prepare_bridge_dir("bridge_owner")
 
     assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prepare_bridge_dir_excludes_concurrent_orphan_prune(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement keeps its bridge and session data while preparation is active."""
+    root = tmp_path / "opencode-native"
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
+    bridge_dir = bridge_dir_for_bridge_id("same-session")
+    bridge_dir.mkdir(parents=True)
+    owner_marker = bridge_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    session_data = xdg_data_home_for_bridge_dir(bridge_dir) / "storage" / "session.json"
+    session_data.parent.mkdir(parents=True)
+    session_data.write_text("preserve me", encoding="utf-8")
+
+    marker_write_started = threading.Event()
+    release_marker_write = threading.Event()
+    real_write_owner_pid_marker = bridge.native_bridge_common.write_owner_pid_marker
+    errors: list[BaseException] = []
+    prepared_paths: list[Path] = []
+
+    def _pause_before_owner_write(path: Path) -> None:
+        marker_write_started.set()
+        if not release_marker_write.wait(timeout=5.0):
+            raise TimeoutError("test did not release owner-marker write")
+        real_write_owner_pid_marker(path)
+
+    def _prepare_replacement() -> None:
+        try:
+            prepared_paths.append(prepare_bridge_dir("same-session"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(
+        bridge.native_bridge_common,
+        "write_owner_pid_marker",
+        _pause_before_owner_write,
+    )
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    prepare_thread = threading.Thread(target=_prepare_replacement)
+    prepare_thread.start()
+    try:
+        assert marker_write_started.wait(timeout=5.0)
+        assert bridge.prune_orphaned_bridge_dirs() == 0
+    finally:
+        release_marker_write.set()
+        prepare_thread.join(timeout=5.0)
+
+    assert not prepare_thread.is_alive()
+    assert errors == []
+    assert prepared_paths == [bridge_dir]
+    assert bridge_dir.is_dir()
+    assert session_data.read_text(encoding="utf-8") == "preserve me"
+    assert owner_marker.read_text(encoding="utf-8").strip() == str(os.getpid())
 
 
 def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(

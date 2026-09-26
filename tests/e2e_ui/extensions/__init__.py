@@ -1,1 +1,0 @@
-"""Browser-extension UI journeys."""

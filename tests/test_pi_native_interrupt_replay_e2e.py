@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import pi_native_bridge
+from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
 pytestmark = pytest.mark.skipif(
     shutil.which("node") is None,

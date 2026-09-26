@@ -1,0 +1,70 @@
+services:
+  crdb-23-2-28:
+    image: cockroachdb/cockroach:v23.2.28
+    command: start-single-node --insecure --store=/cockroach/cockroach-data
+    ports:
+      - "26323:26257"
+      - "27323:8080"
+    volumes:
+      - crdb-23-2-28-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "--host=localhost:26257", "--execute=SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+
+  crdb-24-3-20:
+    image: cockroachdb/cockroach:v24.3.20
+    command: start-single-node --insecure --store=/cockroach/cockroach-data
+    ports:
+      - "26324:26257"
+      - "27324:8080"
+    volumes:
+      - crdb-24-3-20-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "--host=localhost:26257", "--execute=SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+
+  crdb-25-2-10:
+    image: cockroachdb/cockroach:v25.2.10
+    command: start-single-node --insecure --store=/cockroach/cockroach-data
+    ports:
+      - "26325:26257"
+      - "27325:8080"
+    volumes:
+      - crdb-25-2-10-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "--host=localhost:26257", "--execute=SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+
+  crdb-25-4-5:
+    image: cockroachdb/cockroach:v25.4.5
+    command: start-single-node --insecure --store=/cockroach/cockroach-data
+    ports:
+      - "26326:26257"
+      - "27326:8080"
+    volumes:
+      - crdb-25-4-5-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "--host=localhost:26257", "--execute=SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+
+volumes:
+  crdb-23-2-28-data:
+    name: omnigent-crdb-23-2-28-data
+  crdb-24-3-20-data:
+    name: omnigent-crdb-24-3-20-data
+  crdb-25-2-10-data:
+    name: omnigent-crdb-25-2-10-data
+  crdb-25-4-5-data:
+    name: omnigent-crdb-25-4-5-data

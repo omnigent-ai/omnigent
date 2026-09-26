@@ -20,7 +20,7 @@ from collections.abc import Iterator
 import click
 import httpx
 
-from omnigent.claude_native_bridge import url_component
+from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.process_logging import display_log_path, process_log_dir
 
 # Steady-state poll cadence while waiting for a daemon-spawned runner to

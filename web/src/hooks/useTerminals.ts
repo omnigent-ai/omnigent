@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { isTempConvId } from "@/lib/tempConversationId";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { showToast } from "@/components/ui/toast";
 
@@ -56,6 +57,7 @@ export const AGENT_TERMINAL_IDS: ReadonlySet<string> = new Set([
   "terminal_antigravity_main",
   "terminal_kimi_main",
   "terminal_hermes_main",
+  "terminal_devin_main",
 ]);
 
 /**
@@ -368,9 +370,13 @@ export function useDeleteTerminal(conversationId: string) {
  * the fetched list with whatever is already cached, deduped by id.
  */
 export function useTerminals(
-  conversationId: string | null,
+  rawConversationId: string | null,
   options?: UseTerminalsOptions,
 ): UseTerminalsResult {
+  // A `temp:*` id is a client-only routing token (navigate-first new-chat
+  // window) with no server session — normalize it to null so no fetch/poll
+  // hits `/v1/sessions/temp:*/resources/terminals`, by construction.
+  const conversationId = isTempConvId(rawConversationId) ? null : rawConversationId;
   const queryClient = useQueryClient();
   const reconcileWhilePending = options?.reconcileWhilePending ?? false;
   // The terminal list is SSE-primary: live `session.resource.{created,deleted}`

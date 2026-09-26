@@ -360,55 +360,6 @@ async def test_list_builtin_agents_empty_when_none_registered(
     assert body["has_more"] is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "AgentObject exposes no availability / unavailable_reason fields "
-        "yet. The Add Agent picker can't grey out an agent that "
-        "can't be launched in the current environment, nor explain why. "
-        "Flips to a failing XPASS when the catalog grows the metadata — "
-        "promote this to a real contract test then."
-    ),
-)
-async def test_catalog_entry_exposes_availability_and_reason(
-    agent_store: SqlAlchemyAgentStore,
-    artifact_store: LocalArtifactStore,
-    agents_client: httpx.AsyncClient,
-) -> None:
-    """
-    Each ``GET /v1/agents`` entry should report whether it is launchable
-    plus a reason when it is not.
-
-    Discoverability is only half the Add Agent contract: the picker also
-    needs to know which catalog entries it may actually launch for this
-    user/environment/session and why a disabled one is disabled. The two
-    field names below are the proposed wire contract — strict xfail so the
-    suite trips the moment the schema gains them and forces this test to
-    be turned into a positive assertion.
-    """
-    bundle = build_agent_bundle(
-        name="codex-reviewer",
-        executor={"type": "omnigent", "config": {"harness": "codex"}},
-    )
-    _register_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_id="77b35426aef3c1495c2912cecb232108",
-        name="codex-reviewer",
-        bundle=bundle,
-    )
-
-    resp = await agents_client.get("/v1/agents")
-
-    assert resp.status_code == 200, resp.text
-    entry = next(a for a in resp.json()["data"] if a["id"] == "77b35426aef3c1495c2912cecb232108")
-    # availability gates whether the picker can launch the entry;
-    # unavailable_reason explains a disabled one. Both absent from the
-    # AgentObject schema today, so these key lookups fail (the xfail).
-    assert "availability" in entry
-    assert "unavailable_reason" in entry
-
-
 async def test_catalog_description_falls_back_to_spec_when_row_unset(
     agent_store: SqlAlchemyAgentStore,
     artifact_store: LocalArtifactStore,

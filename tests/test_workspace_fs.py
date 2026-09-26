@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -274,6 +275,79 @@ def test_search_exclude_glob_prunes_results(tmp_path: Path) -> None:
     assert paths == {"keep.py"}
 
 
+def test_search_returns_matching_directories(tmp_path: Path) -> None:
+    """A query matching a directory name surfaces it as a directory entry.
+
+    Mirrors the runner's ``/search`` so a folder can be revealed from the
+    Explore tab whether the runner or the host answers.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("src")
+
+    by_path = {e["path"]: e for e in result["data"]}
+    assert by_path["src"]["type"] == "directory"
+    # A directory has no byte size.
+    assert by_path["src"]["bytes"] is None
+
+
+def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep dependency subtree must not starve a later-sorted real directory.
+
+    ``aaa/node_modules/<many>`` sorts before ``zzz/target``; without globally
+    deferring the noise subtree, a tight budget is exhausted inside
+    node_modules before the walk reaches the real match. Mirrors the runner.
+    """
+    noise = tmp_path / "aaa" / "node_modules"
+    noise.mkdir(parents=True)
+    for i in range(40):
+        (noise / f"dep{i}.js").write_text("x")
+    target = tmp_path / "zzz" / "target"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("y")
+
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 20)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target")
+
+    paths = {e["path"] for e in result["data"]}
+    assert "zzz/target" in paths, (
+        f"the real 'zzz/target' directory must be reached despite the earlier "
+        f"aaa/node_modules subtree, got {paths}"
+    )
+
+
+def test_search_does_not_follow_symlinked_deprioritized_dir(tmp_path: Path) -> None:
+    """A symlinked noise dir must not let the walk escape the workspace root.
+
+    Mirrors the runner: the deferred second pass walks each noise root directly,
+    and ``os.walk`` follows a top-level symlink, so a committed ``node_modules``
+    symlink pointing outside the workspace would disclose the target's contents.
+    Deferring only real directories preserves the ``followlinks=False`` boundary.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("leaked")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "node_modules").symlink_to(outside, target_is_directory=True)
+    reader = WorkspaceReader(ws)
+
+    result = reader.search("secret")
+
+    paths = {e["path"] for e in result["data"]}
+    assert not any("secret" in p for p in paths), (
+        f"search must not descend a symlinked node_modules and leak the target's "
+        f"contents, got {paths}"
+    )
+
+
 # ── changes / diff (git mode) ─────────────────────────────────────────
 
 
@@ -397,7 +471,7 @@ def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
 
     _git_branch_repo(tmp_path)
 
-    def fake_gh(argv, *, cwd):
+    def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
             return (0, '{"number": 3}', "")
         if tuple(argv[:1]) == ("api",):
@@ -434,7 +508,7 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
 
     _git_branch_repo(tmp_path)
 
-    def fake_gh(argv, *, cwd):
+    def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
             return (0, '{"number": 3}', "")
         if tuple(argv[:2]) == ("pr", "diff"):
@@ -448,3 +522,94 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
 
     assert "diff --git a/app.txt b/app.txt" in result["patch"]
     assert "+changed" in result["patch"]
+
+
+def test_search_finds_tracked_files_past_the_scan_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors the runner: tracked files come from git's index whatever the walk
+    budget, and untracked ones from the latest ``git status`` once one has run,
+    so a host-served search on a huge repo agrees with the runner's."""
+    _git_repo(tmp_path)
+    env = _git_env()
+    many = tmp_path / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (tmp_path / "zzz").mkdir()
+    (tmp_path / "zzz" / "target.jsonnet").write_text("y")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "more"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target")
+    assert [e["path"] for e in result["data"]] == ["zzz/target.jsonnet"], result
+    # Until a git status has run, untracked coverage is the walk's — which ran
+    # out of budget in aaa/.
+    assert result["truncated"] is True
+
+    reader.changes("conv")
+    result = reader.search("zzz")
+    assert [(e["path"], e["type"]) for e in result["data"]] == [
+        ("zzz", "directory"),
+        ("zzz/scratch.txt", "file"),
+        ("zzz/target.jsonnet", "file"),
+    ], result
+    # The walk still ran (only it can find ignored files) and still ran out of
+    # budget in aaa/, so the answer stays flagged as possibly incomplete.
+    assert result["truncated"] is True
+
+
+def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``.git`` sorts first and in a clone holds more entries than the whole
+    budget; the walk used to spend all of it there and miss every real file."""
+    _git_repo(tmp_path)
+    (tmp_path / "zz.txt").write_text("x")  # untracked: only the walk can find it
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("zz")
+
+    assert [e["path"] for e in result["data"]] == ["zz.txt"]
+    assert result["truncated"] is False
+
+
+def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Path) -> None:
+    """Ignored files are in neither git's index nor ``git status``, so only the
+    walk can find them — it must keep running once a status snapshot exists."""
+    _git_repo(tmp_path)
+    env = _git_env()
+    (tmp_path / ".gitignore").write_text("build/\n")
+    subprocess.run(
+        ["git", "add", ".gitignore"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "ignore"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "out.log").write_text("ignored")
+    reader = WorkspaceReader(tmp_path)
+
+    reader.changes("conv")
+    result = reader.search("out.log")
+
+    assert [e["path"] for e in result["data"]] == ["build/out.log"], result
+    assert result["truncated"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX filesystem root")
+def test_search_from_filesystem_root_keeps_paths_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reader rooted at ``/`` slices result paths off a root that already ends
+    in the separator; slicing one more character used to turn ``etc`` into ``tc``."""
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 60)
+    reader = WorkspaceReader(Path("/"))
+
+    result = reader.search("etc")
+
+    paths = [e["path"] for e in result["data"]]
+    assert "etc" in paths, paths
+    assert all((Path("/") / p).exists() for p in paths), paths

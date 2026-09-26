@@ -354,10 +354,10 @@ def test_native_cli_persists_raw_args_not_config_merged(
     import click
     from click.testing import CliRunner
 
-    import omnigent.claude_native as claude_native
     import omnigent.cli as _cli
     import omnigent.cli_native as cli_native
-    import omnigent.codex_native as codex_native
+    import omnigent.harnesses.claude_native.main as claude_native
+    import omnigent.harnesses.codex_native.main as codex_native
 
     cfg = {
         "harness": {

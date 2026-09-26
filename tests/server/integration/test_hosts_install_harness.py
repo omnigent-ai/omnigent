@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -37,6 +38,7 @@ from omnigent.host.frames import (
 )
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes import hosts as hosts_module
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -186,19 +188,11 @@ async def install_setup(
     conn = registry.get(_HOST_ID)
     assert conn is not None
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
-        """Drain outbound WS frames and reply to install_harness frames.
-
-        :returns: None when ``stop_drain`` is set or no events arrive
-            within the per-iteration timeout.
-        """
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        """Reply to install frames until fixture teardown cancels the drain."""
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -234,14 +228,36 @@ async def install_setup(
     try:
         yield app, registry, comm, replies, drain_task
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
+
+
+async def test_install_harness_survives_idle_mock_host(
+    install_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An idle mock host stays connected until fixture teardown."""
+    app, registry, comm, _replies, _drain = install_setup
+    await asyncio.sleep(0.75)
+    assert not comm.future.done()
+    assert registry.get(_HOST_ID) is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
+    assert response.status_code == 200, response.text
+    assert response.json()["configured_harnesses"]["claude"] is True
 
 
 async def test_install_harness_returns_refreshed_readiness(
@@ -357,6 +373,7 @@ async def test_install_harness_codex_reports_needs_auth_not_ready(
 
 async def test_install_coalesces_concurrent_same_family(
     install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Two overlapping installs of one family reach the host as a single frame.
@@ -374,8 +391,18 @@ async def test_install_coalesces_concurrent_same_family(
     assert conn is not None
 
     install_frames: list[str] = []
+    first_install_arrived = asyncio.Event()
+    second_install_arrived = asyncio.Event()
     release = asyncio.Event()
-    stop_drain = asyncio.Event()
+    original_install_key = hosts_module.ui_install_key
+
+    def observe_install_key(harness: str) -> str | None:
+        install_key = original_install_key(harness)
+        if harness == "codex-native":
+            second_install_arrived.set()
+        return install_key
+
+    monkeypatch.setattr(hosts_module, "ui_install_key", observe_install_key)
 
     async def _drain_holding_reply() -> None:
         """Record each install frame, then reply once ``release`` is set.
@@ -384,11 +411,8 @@ async def test_install_coalesces_concurrent_same_family(
         request lands while the first is still pending — exactly the
         window coalescing must cover.
         """
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -398,6 +422,7 @@ async def test_install_coalesces_concurrent_same_family(
             if not isinstance(frame, HostInstallHarnessFrame):
                 continue
             install_frames.append(frame.harness)
+            first_install_arrived.set()
             await release.wait()
             await comm.send_input(
                 {
@@ -412,32 +437,29 @@ async def test_install_coalesces_concurrent_same_family(
                 }
             )
 
-    drain_task = asyncio.create_task(_drain_holding_reply())
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            # Fire the first request and wait until its task is registered
-            # in-flight before firing the second, so the second provably hits
-            # the coalescing branch instead of racing task creation.
-            first = asyncio.create_task(
-                client.post(f"/v1/hosts/{_HOST_ID}/harnesses/codex/install")
-            )
-            while "openai" not in conn.inflight_installs:
-                await asyncio.sleep(0.01)
-            second = asyncio.create_task(
+        async with (
+            AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
+            asyncio.TaskGroup() as tasks,
+        ):
+            drain_task = tasks.create_task(_drain_holding_reply())
+            first = tasks.create_task(client.post(f"/v1/hosts/{_HOST_ID}/harnesses/codex/install"))
+            await asyncio.wait_for(first_install_arrived.wait(), timeout=5.0)
+            assert "openai" in conn.inflight_installs
+            second = tasks.create_task(
                 client.post(f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/install")
             )
-            # Let the second request reach the coalescing branch (it only has to
-            # clear an in-memory host lookup) before releasing the held reply.
-            await asyncio.sleep(0.1)
+            await asyncio.wait_for(second_install_arrived.wait(), timeout=5.0)
+            assert not first.done()
+            assert not second.done()
             release.set()
-            resp_first, resp_second = await asyncio.gather(first, second)
-    finally:
-        stop_drain.set()
-        release.set()
-        try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
+            resp_first, resp_second = await asyncio.wait_for(
+                asyncio.gather(first, second), timeout=5.0
+            )
             drain_task.cancel()
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=5.0)
 
     # Exactly one frame reached the host despite two concurrent requests.
     assert install_frames == ["codex"]

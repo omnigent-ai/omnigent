@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.cursor_native_bridge import (
+from omnigent.harnesses.cursor_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     FORK_HISTORY_CLOSE_TAG,
     FORK_HISTORY_OPEN_TAG,
@@ -42,6 +42,7 @@ from omnigent.inner.cursor_native_executor import (
     _latest_user_text,
 )
 from omnigent.inner.executor import ExecutorError
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 
 class TestContentExtraction:
@@ -67,7 +68,7 @@ class TestContentExtraction:
         )
         out = _content_to_text([{"type": "input_image", "image_url": png}], tmp_path)
         assert out.startswith("[Attached: ")
-        assert str(tmp_path) in out
+        assert str(attachment_cache_dir(tmp_path)) in out
 
     def test_empty_and_none(self, tmp_path: Path) -> None:
         assert _content_to_text(None, tmp_path) == ""
@@ -230,7 +231,7 @@ class TestBridge:
         so mirror the real ``<uid-scoped temp>/cursor-native/<digest>`` layout.
         """
         root = tmp_path / "omnigent-test" / "cursor-native"
-        monkeypatch.setattr("omnigent.cursor_native_bridge._BRIDGE_ROOT", root)
+        monkeypatch.setattr("omnigent.harnesses.cursor_native.bridge._BRIDGE_ROOT", root)
         return root / "sess"
 
     def test_bridge_dir_is_deterministic_and_session_scoped(self) -> None:
@@ -264,7 +265,7 @@ class TestBridge:
         assert server["args"] == [
             "-I",
             "-m",
-            "omnigent.claude_native_bridge",
+            "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
             "--bridge-dir",
             str(tmp_path),
@@ -279,7 +280,7 @@ class TestBridge:
     ) -> None:
         workspace = tmp_path / "workspace"
         monkeypatch.setattr(
-            "omnigent.cursor_native_bridge.approve_mcp_server_for_workspace",
+            "omnigent.harnesses.cursor_native.bridge.approve_mcp_server_for_workspace",
             lambda _workspace: pytest.fail("approval must happen after tool relay starts"),
         )
         path = write_mcp_config(workspace, bridge_dir, python_executable="python-test")
@@ -373,7 +374,7 @@ class TestBridge:
         calls: list[dict[str, object]] = []
 
         monkeypatch.setattr(
-            "omnigent.cursor_native.resolve_cursor_executable",
+            "omnigent.harnesses.cursor_native.main.resolve_cursor_executable",
             lambda: "/bin/cursor-agent-test",
         )
 
@@ -421,7 +422,7 @@ class TestRegistration:
         assert is_native_harness("native-cursor") is True
 
     def test_native_coding_agent_record(self) -> None:
-        from omnigent.native_coding_agents import native_coding_agent_for_harness
+        from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
         agent = native_coding_agent_for_harness("cursor-native")
         assert agent is not None

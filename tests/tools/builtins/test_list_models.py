@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from omnigent.spec.types import AgentSpec
+import pytest
+
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.list_models import SysListModelsTool
 
@@ -58,7 +61,7 @@ def test_invoke_returns_catalog(
         },
     }
     with patch(
-        "omnigent.model_catalog.catalog_for_spec",
+        "omnigent.models.model_catalog.catalog_for_spec",
         return_value=fake_catalog,
     ) as mock_catalog:
         tool = SysListModelsTool(spec=_make_spec())
@@ -68,3 +71,43 @@ def test_invoke_returns_catalog(
     parsed = json.loads(result)
     assert "self" in parsed
     assert parsed["self"]["models"][0]["id"] == "gpt-4o"
+
+
+def test_invoke_lists_acp_curated_models_without_gateway_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The real tool advertises only the ACP child's configured, dispatchable ids."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.delenv("ACP_TEST_CATALOG_API_KEY", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  gateway:\n"
+        "    kind: gateway\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.com/v1\n"
+        "      api_key: $ACP_TEST_CATALOG_API_KEY\n"
+        "      models:\n"
+        "        default: databricks-gpt-5-4\n"
+        "        alternate: vendor/custom-b\n"
+    )
+    child = AgentSpec(
+        spec_version=1,
+        name="acp_worker",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "acp:custom"},
+            auth=ProviderAuth(name="gateway"),
+        ),
+    )
+    parent = AgentSpec(spec_version=1, sub_agents=[child])
+
+    parsed = json.loads(SysListModelsTool(spec=parent).invoke("{}", _ctx()))
+
+    assert [model["id"] for model in parsed["acp_worker"]["models"]] == [
+        "databricks-gpt-5-4",
+        "vendor/custom-b",
+    ]
+    assert parsed["acp_worker"]["source"] == "static"
+    assert parsed["acp_worker"]["verified"] is False

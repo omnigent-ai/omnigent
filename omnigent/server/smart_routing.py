@@ -20,7 +20,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
-from omnigent.model_fallbacks import (
+from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.models.model_fallbacks import (
     SMART_ROUTING_CLAUDE_LADDER,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
     SMART_ROUTING_FAMILY_FALLBACKS,
@@ -30,7 +31,7 @@ from omnigent.model_fallbacks import (
     SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
 )
-from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
+from omnigent.models.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
     import httpx  # used in type annotations only; runtime import is lazy in fetch_runner_models
     from databricks.sdk.config import Config
 
-    from omnigent.reasoning_effort import ModelEffortCaps
+    from omnigent.util.reasoning_effort import ModelEffortCaps
 
 _logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ ROUTING_REQUEST_TIMEOUT_S = 9.0
 # Ordered cheapest → most powerful within each family. Live per-session catalogs
 # win wherever one is in reach (:func:`fetch_runner_models`); this table is the
 # fallback, so a stale entry pushes a router pick through the substitution path.
-# The ids themselves are owned records in :mod:`omnigent.model_fallbacks`.
+# The ids themselves are owned records in :mod:`omnigent.models.model_fallbacks`.
 
 MODEL_LISTS: dict[str, list[str]] = {
     "claude": list(SMART_ROUTING_CLAUDE_LADDER),
@@ -303,10 +304,14 @@ RUNNER_CATALOG_TTL_S = 300.0
 
 #: session id → (monotonic deadline, catalog). Process-local, like every other
 #: runner-derived overlay cache on the server.
-_runner_catalog_cache: dict[str, tuple[float, dict[str, list[_RunnerModel]]]] = {}
+_runner_catalog_cache: WorkspaceScopedCache[str, tuple[float, dict[str, list[_RunnerModel]]]] = (
+    WorkspaceScopedCache()
+)
 
 #: Single-flight per session, so a burst of turns costs one runner round trip.
-_runner_catalog_inflight: dict[str, asyncio.Task[dict[str, list[_RunnerModel]] | None]] = {}
+_runner_catalog_inflight: WorkspaceScopedCache[
+    str, asyncio.Task[dict[str, list[_RunnerModel]] | None]
+] = WorkspaceScopedCache()
 
 
 def invalidate_runner_catalog(session_id: str | None = None) -> None:
@@ -965,7 +970,7 @@ class RoutingSettings:
         endpoint. ``None`` uses :data:`_CURRENT_GENERATION_MODELS`.
     :param model_effort_caps: Per-model reasoning-effort ceilings this
         gateway imposes. ``None`` uses
-        :data:`~omnigent.reasoning_effort.DEFAULT_MODEL_EFFORT_CAPS`. The
+        :data:`~omnigent.util.reasoning_effort.DEFAULT_MODEL_EFFORT_CAPS`. The
         provider ladders themselves are not configurable — they are the wire
         APIs' own vocabularies, not a deployment fact.
     """
@@ -1043,7 +1048,7 @@ def parse_routing_tables(
     :returns: Keyword arguments for :class:`RoutingSettings`; every value is
         ``None`` when the block names none of these keys.
     """
-    from omnigent.reasoning_effort import ModelEffortCaps
+    from omnigent.util.reasoning_effort import ModelEffortCaps
 
     cfg = routing_cfg if isinstance(routing_cfg, dict) else {}
     caps: ModelEffortCaps | None = None
@@ -1143,7 +1148,7 @@ def _model_family(model: str) -> str:
     subagent candidate filtering never disagree about a family; the
     ``"openai"`` token there is this file's ``"gpt"`` family.
     """
-    from omnigent.model_catalog import model_family_token
+    from omnigent.models.model_catalog import model_family_token
 
     bare = _bare_id(model).lower()
     token = model_family_token(bare)

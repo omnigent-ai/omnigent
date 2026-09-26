@@ -285,6 +285,27 @@ export function markConversationUnread(conversationId: string, updatedAt: number
 }
 
 /**
+ * Marks a conversation read on explicit user action — the inverse of
+ * {@link markConversationUnread}, backing the row menu's and bulk bar's
+ * "Mark as read". Clears the explicit-unread override first (it would
+ * otherwise veto the baseline write), then anchors the baseline at or above
+ * the row's `updated_at` so the dot clears even when the server clock leads
+ * the client. Explicit intent, so unlike {@link markConversationSeen} it is
+ * exempt from the hydration gate.
+ */
+export function markConversationRead(conversationId: string, updatedAt: number): void {
+  const hadOverride = explicitlyUnread.delete(conversationId);
+  const baseline = Math.max(nowSeconds(), updatedAt);
+  const stored = lastSeenMap[conversationId];
+  const advanced = stored === undefined || stored < baseline;
+  if (advanced) lastSeenMap[conversationId] = baseline;
+  if (!hadOverride && !advanced) return;
+  persistToStorage();
+  notifySubscribers();
+  void syncReadState(conversationId);
+}
+
+/**
  * Subscribes the caller to read-state mirror writes and returns the current
  * write version, so a component re-renders (and recomputes
  * `isConversationUnseen`) the instant the user marks a row read/unread — not
@@ -299,6 +320,28 @@ export function useUnseenTick(): number {
     () => writeVersion,
     () => writeVersion,
   );
+}
+
+export function useConversationReadState(
+  conversationId: string,
+  updatedAt: number,
+  status: string | undefined,
+): { unseen: boolean; explicitlyUnread: boolean } {
+  const read = () =>
+    (isConversationUnseen(conversationId, updatedAt, status) ? 1 : 0) |
+    (isExplicitlyUnread(conversationId) ? 2 : 0);
+  const state = useSyncExternalStore(
+    (onChange) => {
+      subscribers.add(onChange);
+      return () => subscribers.delete(onChange);
+    },
+    read,
+    read,
+  );
+  return {
+    unseen: (state & 1) !== 0,
+    explicitlyUnread: (state & 2) !== 0,
+  };
 }
 
 /**
