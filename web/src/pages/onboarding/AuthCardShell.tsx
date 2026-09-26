@@ -1,8 +1,10 @@
-// Card shell for the v2 auth pages: the onboarding AnimatedOmnigentPanel with
-// no drag strip. Desktop shows the animated card; mobile (<md) drops the chrome
-// and animation and lets the content flow.
+// Card shell for the v2 auth pages: the onboarding AnimatedOmnigentPanel.
+// Desktop shows the animated card; mobile (<md) drops the chrome and animation
+// and lets the content flow. On the macOS Electron shell the strip keeps the
+// frameless window draggable (this shell is the page's only chrome).
 
 import type { CSSProperties, ReactNode } from "react";
+import { ElectronWindowDragStrip } from "@/components/ElectronWindowDragStrip";
 import { AnimatedOmnigentPanel } from "@/components/onboarding/AnimatedOmnigentPanel";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import omnigentLogo from "@/assets/omnigent-starfish-icon.png";
@@ -28,6 +30,7 @@ export function AuthCardShell({
     } as CSSProperties;
     return (
       <div className="flex min-h-screen flex-col items-center bg-background px-4" style={padding}>
+        <ElectronWindowDragStrip />
         <div className="flex w-full max-w-sm flex-1 flex-col justify-center gap-6">
           <img
             src={omnigentLogo}
@@ -52,6 +55,7 @@ export function AuthCardShell({
       className="flex min-h-screen justify-center overflow-y-auto bg-background p-6 [&>*]:my-auto"
       style={safeArea}
     >
+      <ElectronWindowDragStrip />
       <AnimatedOmnigentPanel
         panelHeight={Math.max(panelHeight, MIN_PANEL_HEIGHT)}
         autoHeight
