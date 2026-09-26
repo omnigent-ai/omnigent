@@ -238,6 +238,8 @@ export function McpRegistryPicker({
     null,
   );
   const authorization = useRef<AbortController | null>(null);
+  const [workspaceService, setWorkspaceService] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState("");
   useEffect(
     () => () => {
       authorization.current?.abort();
@@ -246,10 +248,14 @@ export function McpRegistryPicker({
     [onAuthorizingChange],
   );
 
-  async function enable(service: RegistryService) {
+  async function enable(service: RegistryService, workspaceUrl?: string) {
     setConnectionError(null);
     if (service.connected) {
       onToggle(service.id, true);
+      return;
+    }
+    if (service.auth === "databricks" && !workspaceUrl) {
+      setWorkspaceService(service.id);
       return;
     }
     const controller = new AbortController();
@@ -257,7 +263,8 @@ export function McpRegistryPicker({
     setAuthorizing(service.id);
     onAuthorizingChange?.(true);
     try {
-      await authorizeRegistryService(service, controller.signal);
+      await authorizeRegistryService(service, controller.signal, workspaceUrl);
+      setWorkspaceService(null);
       const updated = await refresh();
       if (!updated?.find((s) => s.id === service.id)?.connected) {
         throw new Error("Account is not connected. Please try again.");
@@ -346,6 +353,32 @@ export function McpRegistryPicker({
                 >
                   Reconnect
                 </Button>
+              )}
+              {workspaceService === service.id && (
+                <div className="mt-3 space-y-2">
+                  <Input
+                    aria-label="Databricks workspace URL"
+                    placeholder="https://your-workspace.cloud.databricks.com"
+                    value={workspace}
+                    onChange={(e) => setWorkspace(e.target.value)}
+                    disabled={busy || authorizing !== null}
+                  />
+                  <Button
+                    size="sm"
+                    disabled={busy || authorizing !== null || !workspace.trim()}
+                    onClick={() => void enable(service, workspace.trim())}
+                  >
+                    Connect workspace
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={authorizing !== null}
+                    onClick={() => setWorkspaceService(null)}
+                  >
+                    Cancel
+                  </Button>
+                </div>
               )}
               {connectionError?.id === service.id && (
                 <p role="alert" className="mt-2 text-sm text-destructive">

@@ -12,11 +12,13 @@ from omnigent.server.mcp_registry import McpRegistry, McpService
 class McpGatewayBackend(Protocol):
     """Execute approved operations; session authorization belongs to the adapter."""
 
-    async def list_tools(self, service: McpService, user_id: str) -> list[Tool]: ...
+    async def list_tools(self, service: McpService, user_id: str) -> list[Tool]:
+        """Discover tools using the authenticated caller's account."""
 
     async def call_tool(
         self, service: McpService, user_id: str, tool: str, arguments: dict[str, Any]
-    ) -> CallToolResult: ...
+    ) -> CallToolResult:
+        """Execute a policy-approved call using the authenticated caller's account."""
 
 
 class RegistryMcpBackend:

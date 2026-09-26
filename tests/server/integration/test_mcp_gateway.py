@@ -169,7 +169,7 @@ async def test_gateway_requires_context_selection_and_allowed_tool(client, backe
 
 
 @pytest.mark.parametrize("backend", ["custom"], indirect=True)
-async def test_gateway_uses_trusted_turn_actor(client, backend):
+async def test_gateway_does_not_use_historical_turn_actor(client, backend):
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
 
@@ -178,4 +178,4 @@ async def test_gateway_uses_trusted_turn_actor(client, backend):
     store.set_labels(session_id, {_TURN_ACTOR_LABEL: "actor@example.test"})
     called = await rpc(client, session_id)
     assert "result" in called.json(), called.text
-    assert backend.call_tool.await_args.args[1] == "actor@example.test"
+    assert backend.call_tool.await_args.args[1] == "local"

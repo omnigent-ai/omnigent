@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from playwright.async_api import async_playwright
@@ -100,11 +101,18 @@ def test_managed_mcp_selection_is_sent_with_launch(
     _run_in_fresh_loop(_drive_launch(*seeded_session, width, managed))
 
 
-async def _drive_launch(base_url: str, session_id: str, width: int, managed: bool) -> None:
+def test_databricks_connects_from_launch_picker(seeded_session: tuple[str, str]) -> None:
+    _run_in_fresh_loop(_drive_launch(*seeded_session, 1280, False, databricks=True))
+
+
+async def _drive_launch(
+    base_url: str, session_id: str, width: int, managed: bool, databricks: bool = False
+) -> None:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         page = await browser.new_page(viewport={"width": width, "height": 900})
         creates: list[dict] = []
+        connected = not databricks
         try:
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=creates
@@ -152,21 +160,49 @@ async def _drive_launch(base_url: str, session_id: str, width: int, managed: boo
                             {
                                 "id": "tracker",
                                 "title": "Demo work tracker",
-                                "auth": "oauth",
-                                "connected": True,
+                                "auth": "databricks" if databricks else "oauth",
+                                "connected": connected,
                                 "tools": ["read_ticket"],
-                                "connect_provider": "mcp-tracker",
+                                "connect_provider": "databricks" if databricks else "mcp-tracker",
                             }
                         ]
                     }
                 ),
             )
+
+            async def connect_workspace(route):
+                nonlocal connected
+                params = parse_qs(urlsplit(route.request.url).query)
+                assert params["workspace"] == ["https://workspace.example.test"]
+                connected = True
+                await route.fulfill(
+                    status=302,
+                    headers={"Location": base_url + "/settings/mcp?databricks=connected"},
+                )
+
+            if databricks:
+                await page.context.route(
+                    "**/v1/connections/databricks/connect?*", connect_workspace
+                )
             await page.goto(base_url)
             await page.get_by_test_id("new-chat-landing-input").fill("Read the demo ticket")
             await async_expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
             chip = page.get_by_test_id("new-chat-landing-mcp-registry-chip")
             await chip.click()
-            await page.get_by_role("checkbox", name="Demo work tracker").check()
+            checkbox = page.get_by_role("checkbox", name="Demo work tracker")
+            await checkbox.click()
+            if databricks:
+                await async_expect(checkbox).not_to_be_checked()
+                await page.get_by_label("Databricks workspace URL").fill(
+                    "https://workspace.example.test"
+                )
+                if directory := os.environ.get("E2E_SCREENSHOT_DIR"):
+                    await page.screenshot(
+                        path=Path(directory) / "mcp-databricks-workspace.png",
+                        animations="disabled",
+                    )
+                await page.get_by_role("button", name="Connect workspace").click()
+            await async_expect(checkbox).to_be_checked()
             if directory := os.environ.get("E2E_SCREENSHOT_DIR"):
                 await page.screenshot(
                     path=Path(directory)

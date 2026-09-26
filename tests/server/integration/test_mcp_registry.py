@@ -350,3 +350,42 @@ async def test_launch_selection_preserves_initial_metadata(client, launch_regist
         "harness_override",
     ):
         assert getattr(stored, field) == metadata[field]
+
+
+@pytest.mark.parametrize("launch_args", [None, ["--model", "test-model"]])
+async def test_registry_child_preserves_interactive_launch_args(
+    client, launch_registry, launch_args
+):
+    from omnigent.runtime import get_conversation_store
+
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(
+                    "codex-child", executor={"config": {"harness": "codex-native"}}
+                ),
+                "application/gzip",
+            )
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    source = uploaded.json()
+    persisted = []
+    for services in ([], ["tracker"]):
+        response = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": source["agent_id"],
+                "parent_session_id": source["session_id"],
+                "terminal_launch_args": launch_args,
+                "mcp_registry_services": services,
+            },
+        )
+        assert response.status_code == 201, response.text
+        persisted.append(
+            get_conversation_store().get_conversation(response.json()["id"]).terminal_launch_args
+        )
+    assert persisted == [launch_args, launch_args]

@@ -12,6 +12,7 @@ from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.mcp_registry import McpOAuthHooks, McpRegistry, McpUpstreamError
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.connections_base import ConnectionError, create_connection_router
+from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
 
 
 class ConnectMcpToken(BaseModel):
@@ -73,13 +74,16 @@ def create_mcp_registry_router(
             raise HTTPException(400, "This service does not accept a personal bearer token")
         if any(c.isspace() for c in body.token):
             raise HTTPException(400, "Bearer tokens must not contain whitespace")
-        await asyncio.to_thread(
-            registry.store.upsert,
-            user(request),
-            f"mcp:{entry.id}",
-            secret={"access_token": body.token},
-            metadata={},
-        )
+        try:
+            await asyncio.to_thread(
+                registry.store.upsert,
+                user(request),
+                f"mcp:{entry.id}",
+                secret={"access_token": body.token},
+                metadata={},
+            )
+        except SecretTooLargeError as exc:
+            raise HTTPException(400, str(exc)) from None
         return {"connected": True}
 
     @router.delete("/mcp-registry/services/{service_id}/connection")
