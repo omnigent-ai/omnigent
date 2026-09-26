@@ -8,6 +8,7 @@ from dev.opencode_v2_recon import (
     ASK_ALL_PERMISSIONS,
     build_arg_parser,
     build_recon_opencode_config,
+    credential_values_from_env,
     redact_secrets,
 )
 
@@ -63,6 +64,29 @@ def test_build_recon_opencode_config_shape(tmp_path: Path) -> None:
         "codemode": False,
     }
     assert config["plugins"] == [str(plugin_path)]
+
+
+def test_credential_values_from_env_matches_credential_like_names() -> None:
+    env = {
+        "ANTHROPIC_API_KEY": "sk-secret1",
+        "GITHUB_TOKEN": "ghp-secret2",
+        "MY_SECRET": "shh",
+        "OPENCODE_PASSWORD": "pw123",
+        "SOME_PASSWORD_THING": "pw456",
+        "PATH": "/usr/bin",
+        "EMPTY_TOKEN": "",
+    }
+    assert set(credential_values_from_env(env)) == {
+        "sk-secret1",
+        "ghp-secret2",
+        "shh",
+        "pw123",
+        "pw456",
+    }
+
+
+def test_credential_values_from_env_empty_for_no_matches() -> None:
+    assert credential_values_from_env({"PATH": "/usr/bin", "HOME": "/home/x"}) == []
 
 
 def test_main_help_exits_zero_and_documents_model_flag(capsys: object) -> None:

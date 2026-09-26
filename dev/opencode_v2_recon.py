@@ -21,8 +21,11 @@ provider; there is no mock path). Run:
 
     uv run python dev/opencode_v2_recon.py --model anthropic/claude-sonnet-4-5
 
-The generated server password and every temp path are redacted from the
-fixtures before they're written.
+The generated server password, every temp path, the user's home directory,
+and any provider credentials found in the environment are redacted from the
+fixtures before they're written. The server's stdout/stderr are logged to
+``server.stdout.log``/``server.stderr.log`` in the temp workdir (kept only
+with ``--keep-workdir``) for debugging.
 """
 
 from __future__ import annotations
@@ -38,6 +41,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +153,28 @@ def redact_secrets(text: str, secrets_to_redact: list[str]) -> str:
     return result
 
 
+_CREDENTIAL_ENV_NAME_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
+
+
+def credential_values_from_env(env: Mapping[str, str]) -> list[str]:
+    """
+    Collect env var values that look like provider credentials, for redaction.
+
+    Matches names ending in ``_API_KEY``, ``_TOKEN``, or ``_SECRET``, or
+    containing ``PASSWORD`` — the conventions real provider env vars follow
+    (``ANTHROPIC_API_KEY``, ``GITHUB_TOKEN``, ``OPENCODE_PASSWORD``, ...).
+
+    :param env: Environment mapping to scan, e.g. ``os.environ``.
+    :returns: Every non-empty matching value, so callers can add them to a
+        secret-redaction list.
+    """
+    return [
+        value
+        for name, value in env.items()
+        if value and (name.endswith(_CREDENTIAL_ENV_NAME_SUFFIXES) or "PASSWORD" in name)
+    ]
+
+
 def build_recon_opencode_config(
     *,
     instructions_path: Path,
@@ -255,10 +282,16 @@ async def _auto_answer_prompts(
                 request_id = event["data"]["id"]
                 reply = await client.post(
                     f"/api/session/{session_id}/permission/{request_id}/reply",
-                    json={"decision": "once", "message": "omnigent-recon"},
+                    json={"decision": "once"},
                 )
                 findings["permission_reply_status"] = str(reply.status_code)
-                answered_permission = True
+                if reply.status_code < 300:
+                    answered_permission = True
+                else:
+                    print(
+                        f"permission reply failed: {reply.status_code} {reply.text}",
+                        file=sys.stderr,
+                    )
             if event.get("type") == "form.created" and not answered_form:
                 form = event["data"]["form"]
                 answer = {
@@ -272,7 +305,30 @@ async def _auto_answer_prompts(
                     json={"answer": answer},
                 )
                 findings["form_reply_status"] = str(reply.status_code)
-                answered_form = True
+                if reply.status_code < 300:
+                    answered_form = True
+                else:
+                    print(
+                        f"form reply failed: {reply.status_code} {reply.text}",
+                        file=sys.stderr,
+                    )
+
+
+async def _wait_for_session_idle(
+    events: list[dict[str, Any]], session_id: str, timeout: float
+) -> bool:
+    """Poll captured events for a ``session.idle`` frame for *session_id*."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        for event in events:
+            if (
+                event.get("type") == "session.idle"
+                and event.get("data", {}).get("sessionID") == session_id
+            ):
+                return True
+        await asyncio.sleep(0.5)
+    return False
 
 
 def _fill_recon_findings(
@@ -342,6 +398,26 @@ def _write_fixtures(
     (out_dir / "recon-findings.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+_IDLE_TIMEOUT_SECONDS = 60.0
+_TURN_TIMEOUT_SECONDS = 600.0
+
+
+def _drain_pipe_to_file(pipe: Any, log_path: Path) -> None:
+    """
+    Continuously copy *pipe* to *log_path* until EOF.
+
+    Runs in a daemon thread once the ``{url}`` line has been read from
+    ``proc.stdout``, so a chatty server can't fill the OS pipe buffer and
+    deadlock the run once nothing else is reading from it.
+    """
+    try:
+        with log_path.open("wb") as fh:
+            for chunk in iter(lambda: pipe.read(4096), b""):
+                fh.write(chunk)
+    except (ValueError, OSError):
+        pass
+
+
 async def run_recon(args: argparse.Namespace) -> int:
     """Drive one live turn against a real opencode v2 server and write the fixtures."""
     opencode_path = args.opencode_path or shutil.which("opencode")
@@ -382,20 +458,17 @@ async def run_recon(args: argparse.Namespace) -> int:
             "OMNIGENT_RECON_PLUGIN_LOG": str(plugin_log),
         }
     )
-    secrets_to_redact = [password, str(workdir)]
+    secrets_to_redact = [password, str(workdir), str(Path.home())]
+    secrets_to_redact.extend(credential_values_from_env(env))
     findings: dict[str, str] = {}
     events: list[dict[str, Any]] = []
 
-    proc = subprocess.Popen(
-        [opencode_path, "serve", "--hostname", "127.0.0.1", "--port", "0", "--stdio"],
-        cwd=workspace,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        base_url = await _wait_for_url(proc)
+    stderr_log_path = workdir / "server.stderr.log"
+    stdout_log_path = workdir / "server.stdout.log"
+    stderr_fh = stderr_log_path.open("wb")
+
+    async def _drive_turn() -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Run the whole post-URL turn; returns ``None`` if the session never idles."""
         auth = base64.b64encode(f"opencode:{password}".encode()).decode()
         headers = {"Authorization": f"Basic {auth}"}
         async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=60.0) as client:
@@ -452,6 +525,19 @@ async def run_recon(args: argparse.Namespace) -> int:
             prompt_resp.raise_for_status()
 
             await _auto_answer_prompts(client, session_id, events, findings)
+
+            idle_reached = await _wait_for_session_idle(events, session_id, _IDLE_TIMEOUT_SECONDS)
+            if not idle_reached:
+                print(
+                    f"session {session_id} did not reach idle within "
+                    f"{_IDLE_TIMEOUT_SECONDS}s of the auto-answer window; aborting without "
+                    "writing fixtures",
+                    file=sys.stderr,
+                )
+                stop.set()
+                stream_task.cancel()
+                return None
+
             await asyncio.sleep(2.0)  # drain trailing events once the turn settles
 
             compact_resp = await client.post(f"/api/session/{session_id}/compact", json={})
@@ -476,7 +562,39 @@ async def run_recon(args: argparse.Namespace) -> int:
             if session_list.returncode == 0
             else f"no ({session_list.returncode}: {session_list.stderr})"
         )
+        return openapi, messages
 
+    proc = subprocess.Popen(
+        [opencode_path, "serve", "--hostname", "127.0.0.1", "--port", "0", "--stdio"],
+        cwd=workspace,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=stderr_fh,
+    )
+    try:
+        base_url = await _wait_for_url(proc)
+
+        assert proc.stdout is not None
+        drain_thread = threading.Thread(
+            target=_drain_pipe_to_file, args=(proc.stdout, stdout_log_path), daemon=True
+        )
+        drain_thread.start()
+
+        try:
+            result = await asyncio.wait_for(_drive_turn(), timeout=_TURN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            print(
+                f"recon turn did not complete within {_TURN_TIMEOUT_SECONDS}s; aborting without "
+                "writing fixtures",
+                file=sys.stderr,
+            )
+            return 1
+
+        if result is None:
+            return 1
+
+        openapi, messages = result
         _fill_recon_findings(events, messages, findings)
         _write_fixtures(args.out_dir, openapi, events, messages, findings, secrets_to_redact)
         print(f"wrote fixtures to {args.out_dir}")
@@ -487,6 +605,7 @@ async def run_recon(args: argparse.Namespace) -> int:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+        stderr_fh.close()
         if not args.keep_workdir:
             shutil.rmtree(workdir, ignore_errors=True)
     return 0
