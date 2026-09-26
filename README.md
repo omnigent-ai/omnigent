@@ -377,6 +377,10 @@ To suppress the automatic browser tab, use `omni host --no-open` or set
 --background` and `omni start`. Sign-in may still open a browser; use
 `--non-interactive` in scripts to fail if sign-in is required.
 
+A session can also start itself: the **Automations** page runs an agent on a
+recurring schedule. See the [automations guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/AUTOMATIONS.md)
+for the schedule format, the REST API, and the current limits.
+
 <details>
 <summary>Customize automatic session titles</summary>
 
