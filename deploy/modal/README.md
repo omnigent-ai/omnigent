@@ -430,6 +430,12 @@ URL ever embeds the token. Details by provider:
   `GIT_USERNAME=oauth2` to the secret.
 - **Other HTTPS remotes** — any server accepting basic auth works;
   set `GIT_USERNAME` if it requires a specific username.
+- **More than one host** — the helper resolves the token per host, so a
+  sandbox can authenticate several hosts at once. A `GIT_TOKEN_<HOST>` /
+  `GIT_USERNAME_<HOST>` pair (`<HOST>` is the host upper-cased with each
+  non-alphanumeric byte turned into `_`, e.g. `GIT_TOKEN_GIT_EXAMPLE_COM`
+  for `git.example.com`) overrides the shared `GIT_TOKEN` / `GIT_USERNAME`
+  for that host; hosts without their own pair fall back to the shared one.
 
 Use HTTPS repository URLs (`https://github.com/org/repo`) for private
 workspaces — SSH URLs (`git@github.com:…`) would need a key and
