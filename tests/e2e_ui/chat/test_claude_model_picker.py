@@ -942,9 +942,9 @@ def test_claude_native_permission_mode_switch_persists(
 ) -> None:
     """Picking a permission mode in the gear modal PATCHes the server.
 
-    Selecting "Auto" sends ``{"permission_mode": "auto"}`` to
-    ``PATCH /v1/sessions/{id}``, exercising the new in-chat permission-mode
-    control introduced by the claude-web-auto-mode feature.
+    Selecting "Plan" sends ``{"permission_mode": "plan"}`` to
+    ``PATCH /v1/sessions/{id}``, exercising the in-chat permission-mode
+    control.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -967,7 +967,7 @@ def test_claude_native_permission_mode_switch_persists(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-permission-option-auto").click()
+        page.get_by_test_id("composer-permission-option-plan").click()
 
-    assert patch_bodies[-1] == {"permission_mode": "auto"}
-    expect(perm).to_contain_text("Auto")
+    assert patch_bodies[-1] == {"permission_mode": "plan"}
+    expect(perm).to_contain_text("Plan")
