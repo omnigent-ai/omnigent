@@ -7,7 +7,7 @@ from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
-from omnigent.models.model_metadata import ModelMetadata
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata
 
 if TYPE_CHECKING:
     from omnigent.models.model_catalog import ModelEntry
@@ -103,16 +103,25 @@ def pi_model_is_reasoning(model_id: str) -> bool:
     return any(fragment in lower for fragment in PI_REASONING_MODEL_FRAGMENTS)
 
 
+def pi_model_entry_is_reasoning(model: ModelEntry) -> bool:
+    """Whether a catalog entry needs Pi's ``reasoning`` flag: catalog capability or id floor."""
+    return (
+        model.metadata.supports(ModelCapability.REASONING) is True
+        or pi_model_is_reasoning(model.id)
+        or any(fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS)
+    )
+
+
 def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
     """Translate normalized catalog metadata into Pi's ``models.json`` schema.
 
     Shared by every surface that renders a Pi ``models.json`` — the spawned
     harness in :mod:`omnigent.inner.pi_executor` and the interactive
     ``omnigent pi`` launch in :mod:`omnigent.harnesses.pi_native.credentials` — so both
-    advertise the same limits for the same model. Pi defaults an entry with no
-    ``contextWindow``/``maxTokens`` to 128000/16384, which silently truncates
-    the 1M-context gateway models, so limits are carried whenever the catalog
-    reports them.
+    advertise the same limits and reasoning flag for the same model. Pi
+    defaults an entry with no ``contextWindow``/``maxTokens`` to 128000/16384,
+    which silently truncates the 1M-context gateway models, so limits are
+    carried whenever the catalog reports them.
 
     :param model: A catalog entry, normally from
         :func:`~omnigent.models.model_catalog.fetch_databricks_model_service_entries`
@@ -125,9 +134,7 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["contextWindow"] = model.metadata.context_window
     if model.metadata.max_output_tokens is not None:
         entry["maxTokens"] = model.metadata.max_output_tokens
-    if pi_model_is_reasoning(model.id) or any(
-        fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
-    ):
+    if pi_model_entry_is_reasoning(model):
         entry["reasoning"] = True
     return entry
 
