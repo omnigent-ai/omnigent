@@ -527,6 +527,47 @@ class OpenCodeNativeForwarder:
             return
         await self._flush_pending_text(turn)
 
+    async def _on_reasoning_delta(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.reasoning.delta`` — transient reasoning chunk."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        message_id = _str_field(event.data, "assistantMessageID")
+        ordinal = _int_field(event.data, "ordinal")
+        delta = event.data.get("delta")
+        if message_id is None or ordinal is None or not isinstance(delta, str) or not delta:
+            return
+        key = (message_id, ordinal)
+        started = key not in turn.reasoning_started
+        turn.reasoning_started.add(key)
+        await self._begin_turn_if_needed(turn)
+        await self._post_event(
+            _EXTERNAL_OUTPUT_REASONING_DELTA,
+            {"delta": delta, "started": started},
+            conversation_id=turn.conversation_id,
+        )
+
+    async def _on_reasoning_ended(self, event: OpenCodeEvent) -> None:
+        """Handle ``session.reasoning.ended`` — post the whole block if no delta streamed."""
+        turn = await self._active_turn(event)
+        if turn is None:
+            return
+        message_id = _str_field(event.data, "assistantMessageID")
+        ordinal = _int_field(event.data, "ordinal")
+        text = event.data.get("text")
+        if message_id is None or ordinal is None or not isinstance(text, str) or not text:
+            return
+        key = (message_id, ordinal)
+        if key in turn.reasoning_started:
+            return
+        turn.reasoning_started.add(key)
+        await self._begin_turn_if_needed(turn)
+        await self._post_event(
+            _EXTERNAL_OUTPUT_REASONING_DELTA,
+            {"delta": text, "started": True},
+            conversation_id=turn.conversation_id,
+        )
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -560,4 +601,6 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.text.delta": OpenCodeNativeForwarder._on_text_delta,
     "session.text.ended": OpenCodeNativeForwarder._on_text_ended,
     "session.step.ended": OpenCodeNativeForwarder._on_step_ended,
+    "session.reasoning.delta": OpenCodeNativeForwarder._on_reasoning_delta,
+    "session.reasoning.ended": OpenCodeNativeForwarder._on_reasoning_ended,
 }

@@ -448,3 +448,66 @@ async def test_fixture_text_deltas_and_final_text_share_stream_id() -> None:
     item = next(i for i in _items(server.posts) if i["item_type"] == "message")
     assert item["message_id"] == stream_id
     assert item["item_data"]["content"][0]["text"] == ended["text"]
+
+
+# --- reasoning --------------------------------------------------------------
+
+
+async def test_reasoning_deltas_open_block_once() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    for chunk in ("Let me", " think"):
+        await fwd.handle_event(
+            _event("session.reasoning.delta", assistantMessageID="msg_1", ordinal=0, delta=chunk)
+        )
+    await fwd.handle_event(
+        _event(
+            "session.reasoning.ended", assistantMessageID="msg_1", ordinal=0, text="Let me think"
+        )
+    )
+    assert _datas(server.posts, "external_output_reasoning_delta") == [
+        {"delta": "Let me", "started": True},
+        {"delta": " think", "started": False},
+    ]
+
+
+async def test_reasoning_ended_without_deltas_posts_whole_block() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    await fwd.handle_event(
+        _event("session.reasoning.ended", assistantMessageID="msg_1", ordinal=0, text="Hmm.")
+    )
+    assert _datas(server.posts, "external_output_reasoning_delta") == [
+        {"delta": "Hmm.", "started": True}
+    ]
+
+
+async def test_second_reasoning_ordinal_opens_a_new_block() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    for ordinal in (0, 1):
+        await fwd.handle_event(
+            _event(
+                "session.reasoning.delta", assistantMessageID="msg_1", ordinal=ordinal, delta="x"
+            )
+        )
+    started = [d["started"] for d in _datas(server.posts, "external_output_reasoning_delta")]
+    assert started == [True, True]
+
+
+async def test_fixture_reasoning_streams_as_one_block() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, opencode_session_id=_FIX_SESSION)
+    ended = events_of_type("session.reasoning.ended")[0]["data"]
+    await fwd.handle_event(_fixture("session.step.started"))
+    for raw in events_of_type("session.reasoning.delta"):
+        if raw["data"]["assistantMessageID"] == ended["assistantMessageID"]:
+            await fwd.handle_event(_to_event(raw))
+    await fwd.handle_event(_fixture("session.reasoning.ended"))
+    deltas = _datas(server.posts, "external_output_reasoning_delta")
+    assert deltas[0]["started"] is True
+    assert all(d["started"] is False for d in deltas[1:])
+    assert "".join(d["delta"] for d in deltas) == ended["text"]
