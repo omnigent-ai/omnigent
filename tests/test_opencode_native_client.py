@@ -468,6 +468,19 @@ async def test_fork_non_object_body_raises() -> None:
     await client.aclose()
 
 
+async def test_fork_empty_session_raises_with_status() -> None:
+    """2.0.18 rejects forking a session with no messages yet."""
+    client = _client(
+        lambda _r: httpx.Response(
+            400, json={"_tag": "InvalidRequestError", "kind": "empty_session"}
+        )
+    )
+    with pytest.raises(OpenCodeClientError) as exc_info:
+        await client.fork("ses_1")
+    assert exc_info.value.status_code == 400
+    await client.aclose()
+
+
 async def test_prompt_posts_v2_body_and_unwraps() -> None:
     seen: dict[str, object] = {}
 

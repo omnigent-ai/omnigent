@@ -118,10 +118,14 @@ async def test_opencode_native_wire_contract_against_real_server() -> None:
             # The first SSE frame is server.connected; heartbeats are comments.
             event = await asyncio.wait_for(_first_event(server), timeout=10.0)
             assert event is not None and event.type == "server.connected"
+            assert isinstance(event.data, dict)
             assert await asyncio.wait_for(_saw_heartbeat(server), timeout=20.0)
 
             # A fresh session has no messages, and 2.0.18 refuses to fork one;
-            # forking a real turn needs model credentials this e2e doesn't have.
+            # forking a real turn needs model credentials this e2e doesn't have,
+            # so the 400/empty_session error is the contract asserted here
+            # (a unit test in test_opencode_native_client.py covers the same
+            # status-code propagation with a mocked transport).
             with pytest.raises(OpenCodeClientError) as fork_exc:
                 await client.fork(session.id)
             assert fork_exc.value.status_code == 400
@@ -130,8 +134,9 @@ async def test_opencode_native_wire_contract_against_real_server() -> None:
             with pytest.raises(OpenCodeClientError) as perm_exc:
                 await client.reply_permission(session.id, "per_missing", "reject")
             assert perm_exc.value.status_code in (400, 404)
-            with pytest.raises(OpenCodeClientError):
+            with pytest.raises(OpenCodeClientError) as form_exc:
                 await client.cancel_form(session.id, "frm_missing")
+            assert form_exc.value.status_code in (400, 404)
         finally:
             await client.aclose()
     finally:
