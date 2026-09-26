@@ -2068,7 +2068,7 @@ export function AppShell() {
           the traffic lights no matter what the sidebar does. Inside the sidebar
           they would be clipped and inert once it collapses (md:w-0 +
           overflow-hidden + inert), and while peeking the floating card's
-          inset-2 would drag them off the lights' centre line. The sidebar's own
+          offset would drag them off the lights' centre line. The sidebar's own
           copy is hidden on mac by CSS; this one is positioned by
           .electron-sidebar-header-actions in index.css. */}
             {/* Hidden on /settings: the settings nav replaces the session list
