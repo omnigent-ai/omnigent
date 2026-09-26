@@ -241,6 +241,33 @@ describe("HostBadge", () => {
     expect(onReconnect).toHaveBeenCalledTimes(1);
   });
 
+  it("shows the reconnect wording legibly, not only to screen readers", () => {
+    // The disabled composer's placeholder says "reconnect below to continue";
+    // this badge is what's below. Its call to action must be visible text —
+    // an sr-only span plus a hover title leaves a sighted user with nothing
+    // to find.
+    useSessionHostOnlineMock.mockReturnValue(false);
+    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    const badge = screen.getByTestId("host-badge");
+    const wording = Array.from(badge.querySelectorAll("span")).filter((s) =>
+      /click to reconnect/i.test(s.textContent ?? ""),
+    );
+    expect(wording.length).toBeGreaterThan(0);
+    expect(wording.some((s) => !s.classList.contains("sr-only"))).toBe(true);
+  });
+
+  it("keeps the status word sr-only while the host is reachable", () => {
+    // Only the dropped-host call to action earns visible space; a healthy
+    // badge stays name + dot, with the status for screen readers alone.
+    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    const badge = screen.getByTestId("host-badge");
+    const status = Array.from(badge.querySelectorAll("span")).find((s) =>
+      (s.textContent ?? "").includes("online"),
+    );
+    expect(status).toBeDefined();
+    expect(status?.classList.contains("sr-only")).toBe(true);
+  });
+
   it("never offers reconnect for an online host, even when onReconnect is set", () => {
     // onReconnect is wired for every host-bound session; a reachable host has
     // nothing to reconnect. The badge is still clickable — that click switches
