@@ -249,7 +249,7 @@ def _wait_for(predicate: Callable[[], object], timeout_s: float, what: str) -> o
 
 def _sanitized_env() -> dict[str, str]:
     """Ambient env with provider/runner/host leakage stripped, loopback proxy-exempt."""
-    env = dict(os.environ)
+    env = os.environ.copy()
     for key in list(env):
         if key.startswith(
             (
