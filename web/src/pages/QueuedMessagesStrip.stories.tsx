@@ -2,10 +2,15 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { QueuedMessage } from "@/store/chatStore";
 import { QueuedMessagesStrip } from "./QueuedMessagesStrip";
 
-const message = (queueId: string, text: string): QueuedMessage => ({
+const message = (
+  queueId: string,
+  text: string,
+  deliveryState?: QueuedMessage["deliveryState"],
+): QueuedMessage => ({
   queueId,
   text,
   conversationId: "conversation-story",
+  ...(deliveryState === undefined ? {} : { deliveryState }),
 });
 
 const meta = {
@@ -32,6 +37,15 @@ type Story = StoryObj<typeof meta>;
 export const WaitingForIdle: Story = {
   args: {
     messages: [message("queue-1", "Please add focused coverage for the new component state.")],
+  },
+};
+
+export const DeliveryUncertain: Story = {
+  args: {
+    messages: [
+      message("queue-1", "Check whether this message appeared before retrying.", "uncertain"),
+    ],
+    onSteer: () => undefined,
   },
 };
 

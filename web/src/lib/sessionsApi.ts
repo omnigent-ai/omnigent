@@ -1384,6 +1384,7 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 export async function postEvent(
   sessionId: string,
   event: SessionEventInput,
+  options?: { signal?: AbortSignal },
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
@@ -1392,6 +1393,7 @@ export async function postEvent(
       ...backgroundSessionTitlesRequestHeaders(),
     },
     body: JSON.stringify(event),
+    ...(options?.signal === undefined ? {} : { signal: options.signal }),
   });
   // Throw a typed ApiError (not the bare status line) so callers can branch
   // on `code` — e.g. surface a friendly "runner didn't come online" message

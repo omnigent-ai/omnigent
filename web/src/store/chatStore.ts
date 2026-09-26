@@ -161,9 +161,12 @@ export interface SendOptions {
    */
   onConversationCreated?: (conversationId: string) => void;
   /**
-   * Stable id to reuse for this send instead of generating a fresh one.
-   * Set by ChatPage when retrying a `failedSendDraft` so the server-side
-   * dedup recognises the retry and does not re-dispatch to the runner.
+   * Retained so a rejected queue send can reappear without becoming a draft.
+   */
+  queueEntry?: QueuedMessage;
+  /**
+   * Reuse this logical message's ID on retry. Native-terminal transcript
+   * deduplication uses it; SDK dispatch is not covered by that guarantee.
    */
   stableId?: string;
   /**
@@ -187,7 +190,7 @@ export interface SendOptions {
    * parent transcript/composer. The optimistic bubble is still rolled back and
    * status still settles.
    */
-  onError?: (message: string) => void;
+  onError?: (message: string, deliveryUncertain?: boolean) => void;
 }
 
 /**
@@ -531,19 +534,14 @@ export interface PendingUserMessage {
   posted?: boolean;
 }
 
-/**
- * A message the user submitted while the agent was busy. It is held
- * client-side — NOT yet POSTed — and shown in the docked queue strip above
- * the composer until the agent goes idle, when the head is flushed FIFO (one
- * per turn). This is the opposite of {@link PendingUserMessage}, which is
- * already POSTed and renders as an optimistic bubble in the transcript.
- *
- * In-memory only: a hard reload clears the queue, so `files` can be held
- * directly (no serialization concern).
- */
+/** In-memory draft awaiting a turn; uncertain delivery blocks automatic sends. */
 export interface QueuedMessage {
   /** Client-only id, e.g. `q_1`. */
   queueId: string;
+  /**
+   * The event POST may have been accepted; retry requires a user action.
+   */
+  deliveryState?: "uncertain";
   /** Fully-assembled message text (mentions/quotes already applied). */
   text: string;
   replyDraft?: StoredReplyDraft;
@@ -558,15 +556,29 @@ export interface QueuedMessage {
    */
   agentId?: string;
   /**
-   * Stable 32-char hex id for this logical message submit. Generated once at
-   * enqueue time and kept across retries so the server-side append is
-   * idempotent — a re-post of the same message after a network failure does
-   * not insert a duplicate conversation item. Optional for backward
-   * compatibility with serialized queue state that predates this field.
+   * Stable 32-char hex ID kept across retries for native-terminal transcript
+   * deduplication. SDK dispatch still needs uncertain-delivery protection.
    */
   stableId?: string;
   /** A failed send stays queued until the user explicitly retries or edits it. */
   requiresRetry?: boolean;
+}
+
+function atConversationQueueHead(
+  messages: QueuedMessage[],
+  message: QueuedMessage,
+): QueuedMessage[] {
+  const withoutMessage = messages.filter((candidate) => candidate.queueId !== message.queueId);
+  const firstConversationIndex = withoutMessage.findIndex(
+    (candidate) => candidate.conversationId === message.conversationId,
+  );
+  const insertionIndex =
+    firstConversationIndex === -1 ? withoutMessage.length : firstConversationIndex;
+  return [
+    ...withoutMessage.slice(0, insertionIndex),
+    message,
+    ...withoutMessage.slice(insertionIndex),
+  ];
 }
 
 /**
@@ -1528,15 +1540,91 @@ function enterSendChain(conversationId: string | null): {
 let flashTimer: ReturnType<typeof setTimeout> | null = null;
 const workspaceInvalidationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-// Background-flush throttle, kept OUT of store state so it can't re-trigger the
-// queue effect. A conversation currently mid-POST (inFlight) or in its
-// post-failure cooldown is skipped, so `flushBackgroundQueues` can't spin into
-// a tight retry loop against a persistently-failing idle conversation — a
-// failed POST leaves it idle in the cache, which would otherwise re-fire on
-// every re-queue. Cooldown paces retries to roughly the sidebar poll cadence.
+// In-flight and cooldown gates stay outside store state to avoid flush loops.
 const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
-const backgroundFlushInFlight = new Set<string>();
+const QUEUED_EVENT_POST_TIMEOUT_MS = 180_000;
+const queuedFlushInFlight = new Map<string, Set<string>>();
 const backgroundFlushCooldownUntil = new Map<string, number>();
+
+/** Whether a queue-owned send currently has the conversation's ordering slot. */
+export function hasQueuedSendInFlight(conversationId: string | null): boolean {
+  return conversationId !== null && queuedFlushInFlight.has(conversationId);
+}
+
+interface QueuedSendBarrierSnapshot {
+  queuedIds: Set<string>;
+  inFlightQueueIds: Set<string>;
+}
+
+function captureQueuedSendBarrier(
+  conversationId: string | null,
+  messages: QueuedMessage[],
+): QueuedSendBarrierSnapshot {
+  if (conversationId === null) return { queuedIds: new Set(), inFlightQueueIds: new Set() };
+  return {
+    queuedIds: new Set(
+      messages
+        .filter((message) => message.conversationId === conversationId)
+        .map((message) => message.queueId),
+    ),
+    inFlightQueueIds: new Set(queuedFlushInFlight.get(conversationId)),
+  };
+}
+
+function queuedSendBarrierStillPrecedes(
+  snapshot: QueuedSendBarrierSnapshot,
+  conversationId: string | null,
+  messages: QueuedMessage[],
+): boolean {
+  if (conversationId === null) return false;
+  const preceded = (queueId: string) =>
+    snapshot.queuedIds.has(queueId) || snapshot.inFlightQueueIds.has(queueId);
+  if ([...(queuedFlushInFlight.get(conversationId) ?? [])].some(preceded)) return true;
+  return messages.some(
+    (message) => message.conversationId === conversationId && preceded(message.queueId),
+  );
+}
+
+function releaseQueuedSend(conversationId: string, queueId: string): void {
+  const inFlight = queuedFlushInFlight.get(conversationId);
+  inFlight?.delete(queueId);
+  if (inFlight?.size === 0) queuedFlushInFlight.delete(conversationId);
+}
+
+/** Bound queue work; a timed-out event POST remains delivery-uncertain. */
+async function withQueuedWorkTimeout<T>(work: Promise<T>, onTimeout?: () => void): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      onTimeout?.();
+      reject(new Error("Queued message delivery timed out"));
+    }, QUEUED_EVENT_POST_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([work, timedOut]);
+  } finally {
+    if (timeout !== null) clearTimeout(timeout);
+  }
+}
+
+async function postQueuedMessage(
+  conversationId: string,
+  content: ContentBlock[],
+  stableId: string,
+): Promise<Awaited<ReturnType<typeof postEvent>>> {
+  const controller = new AbortController();
+  return await withQueuedWorkTimeout(
+    postEvent(
+      conversationId,
+      {
+        type: "message",
+        data: { role: "user", content, stable_id: stableId },
+      },
+      { signal: controller.signal },
+    ),
+    () => controller.abort(),
+  );
+}
 
 // Remembers each File's successful upload so a retry reuses the server-assigned
 // file_id instead of re-uploading the blob (which would orphan the prior one).
@@ -1642,7 +1730,7 @@ export function initChatStore(client: QueryClient): void {
     clearTimeout(timer);
   }
   workspaceInvalidationTimers.clear();
-  backgroundFlushInFlight.clear();
+  queuedFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
@@ -1863,6 +1951,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Reorder only within this conversation's messages, in their current
       // relative order, then drop `moved` before its target (or at the end).
       const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
+      // Preserve the position of an uncertain delivery and its successors.
+      if (own.some((message) => message.deliveryState === "uncertain")) return {};
       const without = own.filter((m) => m.queueId !== queueId);
       const at =
         beforeQueueId === null
@@ -1887,25 +1977,48 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
-    if (target === undefined || agentId === null) return;
+    if (
+      target === undefined ||
+      agentId === null ||
+      target.conversationId !== s.conversationId ||
+      queuedFlushInFlight.has(target.conversationId)
+    ) {
+      return;
+    }
+    const uncertainHead = s.queuedMessages.find(
+      (message) =>
+        message.conversationId === target.conversationId && message.deliveryState === "uncertain",
+    );
+    if (uncertainHead !== undefined && uncertainHead.queueId !== target.queueId) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files, queuedSendOptions(target));
+    queuedFlushInFlight.set(target.conversationId, new Set([target.queueId]));
+    void s
+      .send(target.text, agentId, target.files, queuedSendOptions(target))
+      .finally(() => releaseQueuedSend(target.conversationId, target.queueId));
   },
 
   steerAllQueuedMessages: (conversationId) => {
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
-    if (own.length === 0 || own.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
+    if (
+      own.length === 0 ||
+      queuedFlushInFlight.has(conversationId) ||
+      own.some((m) => (m.agentId ?? s.boundAgentId) === null)
+    )
+      return;
     const batchOrder = new Map(own.map((m, index) => [m.queueId, index]));
     // Remove BEFORE the POSTs so a concurrent flush can't also send one.
     setActive({
       queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
     });
+    queuedFlushInFlight.set(conversationId, new Set(own.map((m) => m.queueId)));
     for (const m of own) {
       const agentId = m.agentId ?? s.boundAgentId;
       if (agentId === null) continue;
-      void s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder));
+      void s
+        .send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder))
+        .finally(() => releaseQueuedSend(conversationId, m.queueId));
     }
   },
 
@@ -1920,12 +2033,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   maybeFlushQueuedHead: () => {
     const s = get();
+    const conversationId = s.conversationId;
     // Flush once the agent loop is free to take a turn. `waiting` is NOT busy:
     // the turn already ended and only background work (background shells /
     // sub-agents) outlives it, so the server accepts a new turn immediately —
     // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
     // an actively `running` turn gate the flush. No agent → nothing to send to.
-    if (s.conversationId === null || s.boundAgentId === null || s.sessionStatus === "running") {
+    if (
+      conversationId === null ||
+      s.boundAgentId === null ||
+      s.sessionStatus === "running" ||
+      queuedFlushInFlight.has(conversationId)
+    ) {
       return;
     }
     if (s.status === "streaming") {
@@ -1941,7 +2060,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // evidence, same conclusion: drop the link too. If that send ever does
       // settle, its `release` only clears an entry it still owns, so a fresh
       // chain started here is safe.
-      sendChains.delete(s.conversationId);
+      sendChains.delete(conversationId);
       // Clear the latch on THIS conversation's entry only, alongside its status.
       setActive({ status: "idle", sendLatchedAt: null });
     }
@@ -1949,11 +2068,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the global array head. The queue is one flat array across conversations,
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
-    const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry) return;
+    const head = s.queuedMessages.find((m) => m.conversationId === conversationId);
+    if (head === undefined || head.requiresRetry || head.deliveryState === "uncertain") return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
+    queuedFlushInFlight.set(conversationId, new Set([head.queueId]));
+    void s
+      .send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head))
+      .finally(() => releaseQueuedSend(conversationId, head.queueId));
   },
 
   flushBackgroundQueues: () => {
@@ -1990,17 +2112,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const now = Date.now();
     for (const conversationId of candidateIds) {
       if (statusById.get(conversationId) !== "idle") continue;
-      // Skip a conversation mid-POST or in its post-failure cooldown so a
-      // persistent failure can't spin this into a tight retry loop (the effect
-      // re-fires on every re-queue, and a failed POST leaves the row idle).
-      if (backgroundFlushInFlight.has(conversationId)) continue;
+      // An in-flight or failed head blocks this conversation's queue.
+      if (queuedFlushInFlight.has(conversationId)) continue;
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined || head.requiresRetry) continue;
+      if (head === undefined || head.requiresRetry || head.deliveryState === "uncertain") continue;
+      const stableId = head.stableId ?? randomUUID().replace(/-/g, "");
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
-      backgroundFlushInFlight.add(conversationId);
+      queuedFlushInFlight.set(conversationId, new Set([head.queueId]));
       setActive((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
@@ -2013,54 +2134,57 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // release in finally) serializes every POST to this conversation across
       // both paths through one ordering primitive.
       const { waitForPrior, releaseSend } = enterSendChain(conversationId);
-      // Upload any attachments, then post the message referencing their
-      // server-assigned file_ids — the same two-phase sequence send() runs
-      // (no combined endpoint exists: /resources/files stores the blob and
-      // returns an id, /events posts a message that points at that id). Both
-      // awaits sit under the one in-flight guard and the one catch, so a
-      // failure in either phase re-queues and backs off together.
-      //
-      // No optimistic bubble — we're not viewing this conversation; it
-      // re-hydrates from the snapshot on return. On failure re-queue at the
-      // head (preserving this conversation's FIFO order) and set a cooldown so
-      // the next trigger backs off instead of hammering a failing runner.
+      // An event POST may have been accepted even when its response is lost.
+      const restoreHead = (message: QueuedMessage) => {
+        setActive((st) => ({
+          queuedMessages: atConversationQueueHead(st.queuedMessages, {
+            ...message,
+            stableId,
+            requiresRetry: true,
+          }),
+        }));
+      };
       void (async () => {
-        await waitForPrior();
-        // Reuse prior successful uploads so cooldown-paced retries do not
-        // orphan blobs that already landed.
-        const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
-        const content: ContentBlock[] = [
-          ...fileBlocks,
-          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
-        ];
-        await postEvent(conversationId, {
-          type: "message",
-          data: { role: "user", content, stable_id: head.stableId },
-        });
-      })()
-        .catch(() => {
+        try {
+          await withQueuedWorkTimeout(waitForPrior());
+        } catch {
           backgroundFlushCooldownUntil.set(
             conversationId,
             Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
           );
-          setActive((st) => {
-            const idx = st.queuedMessages.findIndex((m) => m.conversationId === conversationId);
-            const at = idx === -1 ? st.queuedMessages.length : idx;
-            return {
-              queuedMessages: [
-                ...st.queuedMessages.slice(0, at),
-                head,
-                ...st.queuedMessages.slice(at),
-              ],
-            };
-          });
-        })
-        .finally(() => {
-          backgroundFlushInFlight.delete(conversationId);
-          // Hand the chain to the next POST (foreground or background) so it
-          // can start its own network work in submission order.
-          releaseSend();
-        });
+          restoreHead(head);
+          return;
+        }
+        let fileBlocks: ContentBlock[];
+        try {
+          // Reuse prior successful uploads so cooldown-paced retries do not
+          // orphan blobs that already landed.
+          fileBlocks = await withQueuedWorkTimeout(
+            uploadFileBlocks(conversationId, head.files ?? []),
+          );
+        } catch {
+          backgroundFlushCooldownUntil.set(
+            conversationId,
+            Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
+          );
+          restoreHead(head);
+          return;
+        }
+        const content: ContentBlock[] = [
+          ...fileBlocks,
+          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
+        ];
+        try {
+          await postQueuedMessage(conversationId, content, stableId);
+        } catch {
+          restoreHead({ ...head, deliveryState: "uncertain" });
+        }
+      })().finally(() => {
+        releaseQueuedSend(conversationId, head.queueId);
+        // Hand the chain to the next POST (foreground or background) so it
+        // can start its own network work in submission order.
+        releaseSend();
+      });
     }
   },
 
@@ -2209,6 +2333,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const queuedBarrierAtSubmit = captureQueuedSendBarrier(
+      submitConversationId,
+      get().queuedMessages,
+    );
 
     // Take our place in THIS conversation's send chain: wait for its prior
     // send's network work, then hand off to the next via `releaseSend` in the
@@ -2220,6 +2348,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    let eventPostStarted = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -2230,10 +2359,49 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     try {
       await waitForPrior();
       if (initialDraft && !initialSendPending()) return;
+      // A removed queue head may return uncertain; recheck after the chain wait.
+      if (
+        opts?.queueEntry === undefined &&
+        !opensSideChat &&
+        submitConversationId !== null &&
+        queuedSendBarrierStillPrecedes(
+          queuedBarrierAtSubmit,
+          submitConversationId,
+          get().queuedMessages,
+        )
+      ) {
+        queueSeq += 1;
+        const queueId = `q_${queueSeq}`;
+        setActive((state) => ({
+          queuedMessages: [
+            ...state.queuedMessages,
+            {
+              queueId,
+              text,
+              stableId,
+              conversationId: submitConversationId,
+              agentId,
+              ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+              ...(files && files.length > 0 ? { files } : {}),
+            },
+          ],
+        }));
+        setterFor(submitConversationId)((state) => ({
+          pendingUserMessages: state.pendingUserMessages.filter(
+            (pending) => pending.tempId !== tempId,
+          ),
+          ...(!alreadyStreaming ? { status: "idle" as const, sendLatchedAt: null } : {}),
+        }));
+        return;
+      }
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
+      const sessionBinding = ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
+      const sessionId =
+        opts?.queueEntry === undefined
+          ? await sessionBinding
+          : await withQueuedWorkTimeout(sessionBinding);
       postedSessionId = sessionId;
       if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
 
@@ -2242,7 +2410,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
       // a prior successful upload of the same File so a retry after a
       // post-phase failure doesn't re-upload — and orphan — blobs that landed.
-      const fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
+      const fileUpload = uploadFileBlocks(sessionId, files ?? []);
+      const fileBlocks =
+        opts?.queueEntry === undefined ? await fileUpload : await withQueuedWorkTimeout(fileUpload);
       const serverContent: ContentBlock[] = [
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
@@ -2277,14 +2447,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
-          stable_id: stableId,
-        },
-      });
+      eventPostStarted = true;
+      const postResult =
+        opts?.queueEntry === undefined
+          ? await postEvent(sessionId, {
+              type: "message",
+              data: { role: "user", content: serverContent, stable_id: stableId },
+            })
+          : await postQueuedMessage(sessionId, serverContent, stableId);
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -2333,6 +2503,51 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
+      const failTarget = postedSessionId ?? submitConversationId;
+      const failSet = failTarget === null ? setActive : setterFor(failTarget);
+      const failGet = (): ChatState =>
+        failTarget === null ? get() : (setterForState(failTarget) ?? get());
+      failSet((s) => ({
+        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+      }));
+
+      if (opts?.queueEntry !== undefined) {
+        if (opts.onError) {
+          opts.onError(message, eventPostStarted);
+        } else {
+          const queueEntry = {
+            ...opts.queueEntry,
+            stableId,
+            requiresRetry: true,
+            ...(eventPostStarted ? { deliveryState: "uncertain" as const } : {}),
+          };
+          setActive((s) => ({
+            queuedMessages: atConversationQueueHead(s.queuedMessages, queueEntry),
+          }));
+        }
+        if (!eventPostStarted) {
+          backgroundFlushCooldownUntil.set(
+            opts.queueEntry.conversationId,
+            Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
+          );
+        }
+
+        // Keep an ambiguous queue send visible without restoring a draft.
+        if (!alreadyStreaming) {
+          failSet((s) =>
+            s.sessionStatus === "running"
+              ? { sendLatchedAt: null }
+              : {
+                  status: "idle",
+                  sendLatchedAt: null,
+                  backgroundTaskCount: 0,
+                  backgroundTasks: [],
+                },
+          );
+        }
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
       // it, or the next sub-agent created under this parent would wrongly open
@@ -2370,22 +2585,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           },
         });
       }
-      // Settle the conversation this send targeted, wherever the user is now:
-      // its bubble must roll back and its status must not stay "streaming"
-      // forever. Target `postedSessionId ?? submitConversationId` (mirroring the
-      // draft restore above): a bind failure throws before `postedSessionId` is
-      // assigned, but the pin/submit id already names the session — so a failed
-      // navigate-first first turn settles the REAL new session, not whatever
-      // chat the user has since switched to. Null id (the landing composer's own
-      // failure) falls back to the active conversation.
-      const failTarget = postedSessionId ?? submitConversationId;
-      const failSet = failTarget === null ? setActive : setterFor(failTarget);
-      const failGet = (): ChatState =>
-        failTarget === null ? get() : (setterForState(failTarget) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
-      failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-      }));
       if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
@@ -2468,6 +2667,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const queuedBarrierAtSubmit = captureQueuedSendBarrier(
+      submitConversationId,
+      get().queuedMessages,
+    );
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -2476,6 +2679,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     try {
       await waitForPrior();
+      if (
+        submitConversationId !== null &&
+        queuedSendBarrierStillPrecedes(
+          queuedBarrierAtSubmit,
+          submitConversationId,
+          get().queuedMessages,
+        )
+      ) {
+        setterFor(submitConversationId)((state) => ({
+          pendingUserMessages: state.pendingUserMessages.filter(
+            (pending) => pending.tempId !== tempId,
+          ),
+          ...(!alreadyStreaming ? { status: "idle" as const, sendLatchedAt: null } : {}),
+        }));
+        return;
+      }
       // See `send`: rekey inside the call, before the new id is visible.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
@@ -2837,8 +3056,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
-    const { conversationId } = get();
+    const { conversationId, queuedMessages } = get();
     if (!conversationId) return;
+    if (
+      queuedFlushInFlight.has(conversationId) ||
+      queuedMessages.some((message) => message.conversationId === conversationId)
+    ) {
+      throw new Error(
+        "Wait for the earlier queued message to settle or resolve its delivery first.",
+      );
+    }
     await postEvent(conversationId, { type: "compact", data: {} });
   },
 
@@ -3150,9 +3377,10 @@ function queuedSendOptions(
   const stableId = message.stableId ?? randomUUID().replace(/-/g, "");
   return {
     replyDraft: message.replyDraft,
+    queueEntry: message,
     stableId,
     pinnedConversationId: message.conversationId,
-    onError: (error) => {
+    onError: (error, deliveryUncertain) => {
       setActive((s) => {
         if (s.queuedMessages.some((m) => m.queueId === message.queueId)) return {};
         // Keep failed sends in batch order, ahead of newly queued messages.
@@ -3166,7 +3394,12 @@ function queuedSendOptions(
         return {
           queuedMessages: [
             ...s.queuedMessages.slice(0, at),
-            { ...message, stableId, requiresRetry: true },
+            {
+              ...message,
+              stableId,
+              requiresRetry: true,
+              ...(deliveryUncertain ? { deliveryState: "uncertain" as const } : {}),
+            },
             ...s.queuedMessages.slice(at),
           ],
         };

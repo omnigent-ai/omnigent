@@ -18,6 +18,7 @@ _DIRECT_FOLLOWUP = "always-steer direct busy follow-up"
 _INITIAL_ORDERING = "always-steer initial ordering turn"
 _EARLIER_QUEUED = "always-steer earlier queued follow-up"
 _LATER_QUEUED = "always-steer later queued follow-up"
+_REENTRANT_SUBMIT = "one logical submit"
 
 
 def _wait_for(page: Page, predicate: Callable[[], bool], *, timeout_s: float = 30.0) -> None:
@@ -93,6 +94,12 @@ def _items_contain(base_url: str, session_id: str, *texts: str) -> bool:
     return all(text in payload for text in texts)
 
 
+def _session_is_idle(base_url: str, session_id: str) -> bool:
+    response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    response.raise_for_status()
+    return response.json()["status"] == "idle"
+
+
 def test_always_steer_persists_and_posts_a_busy_followup(
     page: Page,
     paused_mid_turn_session: tuple[str, str, str],
@@ -134,6 +141,40 @@ def test_always_steer_persists_and_posts_a_busy_followup(
     expect(page.get_by_text(_DIRECT_FOLLOWUP, exact=True)).to_be_visible(timeout=30_000)
     toggle = _open_general_settings(page, base_url, from_chat=True)
     expect(toggle).to_have_attribute("aria-checked", "true")
+
+
+def test_reentrant_form_submit_does_not_send_again_after_returning_from_settings(
+    page: Page,
+    paused_mid_turn_session: tuple[str, str, str],
+) -> None:
+    """One form action cannot leave a queued copy that sends on a later route."""
+    base_url, session_id, mock_url = paused_mid_turn_session
+    posts = _record_message_posts(page, session_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_label(_COMPOSER_LABEL)
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(_REENTRANT_SUBMIT)
+    form = composer.locator("xpath=ancestor::form")
+    form.evaluate(
+        """element => {
+            element.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+            element.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+        }"""
+    )
+
+    _wait_for_gate(page, mock_url)
+    _wait_for(page, lambda: posts == [_REENTRANT_SUBMIT])
+
+    _open_general_settings(page, base_url, from_chat=True)
+    _release_gate(mock_url)
+    _wait_for(page, lambda: _session_is_idle(base_url, session_id), timeout_s=60.0)
+    assert posts == [_REENTRANT_SUBMIT]
+
+    page.get_by_role("link", name="Back", exact=True).click()
+    expect(page).to_have_url(re.compile(rf"/c/{re.escape(session_id)}$"))
+    page.wait_for_timeout(2_000)
+    assert posts == [_REENTRANT_SUBMIT]
 
 
 def test_existing_queue_still_drains_in_order_after_enabling_always_steer(
