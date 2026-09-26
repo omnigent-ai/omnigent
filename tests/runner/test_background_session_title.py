@@ -1392,3 +1392,145 @@ async def test_background_title_timeout_releases_process(
     assert response.json()["error"] == "title_harness_timeout"
     [process_key] = process_manager.released
     assert uuid.UUID(process_key).hex == process_key
+
+
+def _opencode_title_events(*texts: str) -> bytes:
+    lines = [json.dumps({"type": "step_start", "part": {"type": "step-start"}})]
+    lines += [json.dumps({"type": "text", "part": {"type": "text", "text": t}}) for t in texts]
+    lines.append(json.dumps({"type": "step_finish", "part": {"type": "step-finish"}}))
+    return ("\n".join(lines) + "\n").encode()
+
+
+def _patch_opencode_title_launch(
+    monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any], process: Any
+) -> None:
+    async def create_subprocess_exec(command: str, *args: str, **kwargs: Any) -> Any:
+        captured.update(command=command, args=args, kwargs=kwargs)
+        return process
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.app_server.find_opencode_cli", lambda: "opencode"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.bridge.seed_opencode_auth",
+        lambda bridge_dir: captured.setdefault("seeded", bridge_dir),
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+
+def test_opencode_native_registers_a_background_title_generator() -> None:
+    from omnigent.harness_plugins import background_title_generators
+
+    spec = background_title_generators()["opencode-native"]
+    assert spec.generator == (
+        "omnigent.runner.background_titles.opencode_native:generate_background_title"
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_native_title_uses_isolated_tool_free_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from omnigent.runner.background_titles import opencode_native as opencode_native_titles
+
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return _opencode_title_events("Fix Safari ", "login redirect"), b""
+
+    _patch_opencode_title_launch(monkeypatch, captured, FakeProcess())
+
+    title = await opencode_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="the login redirect is broken on safari",
+            harness="opencode-native",
+            spawn_env={"OPENROUTER_API_KEY": "sk-test"},
+            process_manager=None,
+            cwd=tmp_path,
+            model_override="opencode/big-pickle",
+        )
+    )
+
+    assert title == "Fix Safari login redirect"
+    assert captured["command"] == "opencode"
+    args = list(captured["args"])
+    assert args[:4] == ["run", "--pure", "--format", "json"]
+    assert args[args.index("--model") + 1] == "opencode/big-pickle"
+    workdir = args[args.index("--dir") + 1]
+    assert workdir != str(tmp_path)
+    assert "<user_message>\nthe login redirect is broken on safari\n</user_message>" in args[-1]
+    env = captured["kwargs"]["env"]
+    # Per-run XDG dirs next to the seeded auth: never the user's global config.
+    assert env["XDG_CONFIG_HOME"].startswith(str(captured["seeded"]))
+    assert env["XDG_DATA_HOME"].startswith(str(captured["seeded"]))
+    assert env["OPENROUTER_API_KEY"] == "sk-test"
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"] == {
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny",
+    }
+
+
+@pytest.mark.asyncio
+async def test_opencode_native_title_prefers_title_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from omnigent.runner.background_titles import opencode_native as opencode_native_titles
+
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return _opencode_title_events("Plan quarterly deck"), b""
+
+    _patch_opencode_title_launch(monkeypatch, captured, FakeProcess())
+
+    await opencode_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="draft a deck for next quarter",
+            harness="opencode-native",
+            spawn_env={},
+            process_manager=None,
+            cwd=tmp_path,
+            model_override="openrouter/big-model",
+            title_model="openrouter/small-model",
+        )
+    )
+
+    args = list(captured["args"])
+    assert args[args.index("--model") + 1] == "openrouter/small-model"
+
+
+@pytest.mark.asyncio
+async def test_opencode_native_title_returns_none_when_the_run_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from omnigent.runner.background_titles import opencode_native as opencode_native_titles
+
+    class FakeProcess:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b'{"type":"error","error":{"name":"APIError"}}\n', b""
+
+    _patch_opencode_title_launch(monkeypatch, {}, FakeProcess())
+
+    title = await opencode_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="anything",
+            harness="opencode-native",
+            spawn_env={},
+            process_manager=None,
+            cwd=tmp_path,
+        )
+    )
+
+    assert title is None
