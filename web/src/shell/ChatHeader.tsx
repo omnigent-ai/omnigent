@@ -286,10 +286,13 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
  * canvas shows through, and chat content dissolves before it slides
  * under the controls (the conversation viewport's ``chat-scroll-fade``
  * mask, index.css; chat reserves clearance via ``pt-20``,
- * terminal-first via ``pt-14``). Left slot: open-sidebar + a conversation
- * breadcrumb (``[folder] / <title> [/ <sub-agent>]``, with the session-actions
- * kebab on desktop and a "Move to…" project picker on the folder tag). Right
- * slot: desktop action buttons (Agent info ·
+ * terminal-first via ``pt-14``). On desktop (md+) the bar is a three-column
+ * grid: the open-sidebar toggle on the left, the conversation breadcrumb
+ * (``[folder] / <title> [/ <sub-agent>]``, with the session-actions kebab and
+ * a "Move to…" project picker on the folder tag) centered on the chat pane —
+ * so widening the sidebar doesn't drag the title along with the pane's left
+ * edge — and the action cluster on the right. Mobile keeps the flex row with
+ * the breadcrumb leading. Right slot: desktop action buttons (Agent info ·
  * Share · right-panel toggle) and, on mobile, a **single** kebab holding both
  * the session actions (pin/share/rename/project/archive/delete) and the
  * workspace-rail entries that open Files · Agents · Shells as full-screen
@@ -540,7 +543,11 @@ export function ChatHeader({
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)] md:transition-[right] md:duration-300 md:ease-in-out",
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center gap-1 px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)] md:transition-[right] md:duration-300 md:ease-in-out",
+        // Desktop: a 1fr/auto/1fr grid centers the breadcrumb on the pane at any
+        // sidebar width; the fr side columns never shrink below their content, so
+        // the title truncates before colliding with the toggle or action cluster.
+        "md:grid md:grid-cols-[1fr_auto_1fr] md:gap-6",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -555,7 +562,7 @@ export function ChatHeader({
           in the title-bar strip). Inert outside the shell (index.css). */}
       <div
         className={cn(
-          "flex min-w-0 items-center gap-1 md:gap-6",
+          "flex shrink-0 items-center empty:hidden md:justify-self-start",
           !sidebarOpen && "traffic-light-clearance",
         )}
       >
@@ -601,14 +608,16 @@ export function ChatHeader({
             <TooltipContent side="bottom">Open sidebar</TooltipContent>
           </Tooltip>
         )}
-        {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
-            landing composer. A resolved title is enough; so is titleLinkTo —
-            a child must keep its climb-out while the parent title loads.
-            min-w-0 on this slot lets it truncate rather than push the
-            right-hand action cluster. On the macOS shell with the sidebar
-            collapsed, the slot's traffic-light-clearance pads it past the
-            window controls + title-bar cluster (index.css). */}
-        {conversationId && (conversationTitle || titleLinkTo) && (
+      </div>
+
+      {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
+          landing composer. A resolved title is enough; so is titleLinkTo —
+          a child must keep its climb-out while the parent title loads.
+          Desktop centers it in the grid's middle column; mobile keeps it
+          flowing after the toggle. min-w-0 lets it truncate rather than
+          push the right-hand action cluster. */}
+      {conversationId && (conversationTitle || titleLinkTo) && (
+        <div className="flex min-w-0 flex-1 items-center md:col-start-2 md:row-start-1 md:justify-self-center">
           <ConversationBreadcrumb
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
@@ -623,12 +632,13 @@ export function ChatHeader({
             actions={isMobile ? undefined : (conversationMenu ?? undefined)}
             className="pr-1"
           />
-        )}
-      </div>
+        </div>
+      )}
 
       <div
         className={cn(
-          "flex items-center gap-2 max-md:gap-0 max-md:empty:hidden",
+          "ml-auto flex shrink-0 items-center gap-2 max-md:gap-0 max-md:empty:hidden",
+          "md:col-start-3 md:row-start-1 md:ml-0 md:justify-self-end",
           MOBILE_GLASS_PILL,
         )}
       >
