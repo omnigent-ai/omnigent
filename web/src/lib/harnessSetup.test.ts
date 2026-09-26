@@ -8,6 +8,8 @@ import {
   harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
+  harnessWarningBadgeText,
+  isNativeOpenCodeHarness,
   resolveSetupSteps,
 } from "./harnessSetup";
 import type { SetupStepWire } from "@/lib/agentLabels";
@@ -335,7 +337,7 @@ describe("harnessAuthableOnHost", () => {
   });
 
   it("false for env-auth / own-login harnesses, flag off, offline, or loading", () => {
-    // OpenCode/Qwen (env-auth) and Cursor (own-login) are NOT UI-authable.
+    // OpenCode/Cursor (own CLI login) and Qwen (env-auth) are NOT UI-authable.
     expect(harnessAuthableOnHost(info(), "opencode-native", online)).toBe(false);
     expect(harnessAuthableOnHost(info(), "qwen", online)).toBe(false);
     expect(harnessAuthableOnHost(info(), "cursor-native", online)).toBe(false);
@@ -420,5 +422,48 @@ describe("resolveSetupSteps", () => {
   it("returns [] with no descriptor or no harness", () => {
     expect(resolveSetupSteps(undefined, "codex", hostWith({ codex: false }))).toEqual([]);
     expect(resolveSetupSteps(CODEX_STEPS, null, hostWith({ codex: false }))).toEqual([]);
+  });
+});
+
+// The server's opencode descriptor: install, then a run-on-host CLI login that
+// the host tracks through its "authed" readiness.
+const OPENCODE_STEPS: SetupStepWire[] = [
+  {
+    kind: "install",
+    title: "Install OpenCode",
+    detail: "We'll install OpenCode on the host for you.",
+    action: "install",
+    command: null,
+    status_key: "installed",
+  },
+  {
+    kind: "auth",
+    title: "Sign in to OpenCode",
+    detail: "OpenCode manages its own credentials — sign in on the host.",
+    action: "command",
+    command: "opencode auth login",
+    status_key: "authed",
+  },
+];
+
+describe("OpenCode setup", () => {
+  it("recognizes every OpenCode harness spelling", () => {
+    expect(isNativeOpenCodeHarness("opencode-native")).toBe(true);
+    expect(isNativeOpenCodeHarness("native-opencode")).toBe(true);
+    expect(isNativeOpenCodeHarness("opencode")).toBe(true);
+    expect(isNativeOpenCodeHarness("codex-native")).toBe(false);
+    expect(isNativeOpenCodeHarness("cursor-native")).toBe(false);
+  });
+
+  it("flags a 1.x OpenCode host as outdated with install + login still to do", () => {
+    const host = hostWith({ "opencode-native": "version-too-low" });
+    expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBe("version-too-low");
+    expect(harnessWarningBadgeText("version-too-low")).toBe("outdated");
+    const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "todo"],
+      ["auth", "todo"],
+    ]);
+    expect(steps[1].command).toBe("opencode auth login");
   });
 });
