@@ -946,6 +946,8 @@ class HostStore:
         The row lock serializes replacement with :meth:`delete_host`. A missing
         result means full teardown already removed the durable host, so the
         caller must clean up the unregistered sandbox instead of recreating it.
+        The row goes offline until the new generation's host connects: a dead
+        generation's ``online`` status would otherwise look fresh again.
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
@@ -981,6 +983,7 @@ class HostStore:
             existing.token_expires_at = token_expires_at
             existing.sandbox_provider = provider
             existing.sandbox_id = sandbox_id
+            existing.status = encode_host_status("offline")
             existing.updated_at = now
             return _row_to_host(existing)
 
