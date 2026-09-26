@@ -76,10 +76,9 @@ _GOOSE_NATIVE_OS_TOOLS = frozenset(
     }
 )
 
-# opencode-native permission ACTIONS (``permission.asked`` ``action``, used as the
-# policy tool name by the SSE forwarder). opencode 2.x names its shell tool
-# ``shell`` and collapses write/edit/patch into ``edit``; listed explicitly so
-# coverage does not depend on the overlapping pi / codex sets.
+# opencode 2.x ``permission.asked`` actions (``shell``; write/edit/patch
+# collapsed into ``edit``), used as the policy tool name by the SSE forwarder.
+# Listed explicitly so coverage does not depend on the pi / codex sets.
 _OPENCODE_NATIVE_OS_TOOLS = frozenset({"shell", "edit", "read", "grep", "glob"})
 
 # Codex in-process harness tool names surfaced as observational
