@@ -86,10 +86,11 @@ async def test_opencode_native_wire_contract_against_real_server() -> None:
             assert fetched is not None and fetched.id == session.id
             assert await client.get_session("ses_does_not_exist_xyz") is None
 
-            # message + permission listings are well-formed (empty for a fresh
-            # session that has run no turn).
+            # message listing is well-formed (empty for a fresh session that
+            # has run no turn). Pending permissions are exercised via
+            # ``permission.asked`` events, not a list call (Task 22 rewrites
+            # this file fully).
             assert await client.list_messages(session.id) == []
-            assert await client.list_permissions() == []
 
             # The SSE /event stream connects and frames at least the initial
             # ``server.connected`` event (proves _parse_sse against the real wire).

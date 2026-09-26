@@ -358,7 +358,7 @@ async def test_connect_provider_key() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
         seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"data": {"id": "crd_1"}})
+        return httpx.Response(204)
 
     client = _client(handler)
     assert await client.connect_provider_key("anthropic", "sk-test") is True
