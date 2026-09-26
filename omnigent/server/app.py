@@ -508,6 +508,29 @@ def _session_id_from_request(request: Request) -> str | None:
     return match.group(1) if match else None
 
 
+# Retry hint (seconds) sent with a 503 for transient upstream exhaustion:
+# such bursts clear as soon as in-flight upstream calls complete.
+_RESOURCE_EXHAUSTED_RETRY_AFTER_S = 1
+
+
+def _is_resource_exhausted_rpc_error(exc: Exception) -> bool:
+    """Whether ``exc`` is a gRPC-shaped ``RESOURCE_EXHAUSTED`` error.
+
+    Store backends may run a quota-limited gRPC call per read (e.g. an ACL
+    gate), and under a burst that quota answers ``RESOURCE_EXHAUSTED``. Such
+    errors carry a callable ``code()`` returning a status enum; matched by
+    shape so the server never imports grpc for a backend's transport detail.
+    """
+    code = getattr(exc, "code", None)
+    if not callable(code):
+        return False
+    try:
+        status = code()
+    except Exception:  # noqa: BLE001 — an unreadable status is simply not a match
+        return False
+    return getattr(status, "name", None) == "RESOURCE_EXHAUSTED"
+
+
 def _error_audit_extra(
     request: Request,
     *,
@@ -2411,8 +2434,47 @@ def create_app(
         :param request: The incoming request; its path supplies the session id
             threaded into the error log.
         :param exc: The unhandled exception.
-        :returns: A 500 JSON response with ``internal_error`` code.
+        :returns: A 500 JSON response with ``internal_error`` code, or a
+            retry-able 503 for a transient upstream exhaustion.
         """
+        if _is_resource_exhausted_rpc_error(exc):
+            # Transient upstream quota exhaustion, not a server fault: a
+            # retry-able condition, so 503 + Retry-After, never a bare 500.
+            mapped = OmnigentError(
+                "A backing service is at its concurrent request limit; retry shortly.",
+                code=ErrorCode.RESOURCE_EXHAUSTED,
+            )
+            # Stamp the per-request audit row (as _handle_omnigent_error does
+            # for every coded error) so these 503s stay queryable by owner/impact.
+            add_audit_attrs(
+                code=str(mapped.code),
+                http_status=str(mapped.http_status),
+                error_category=mapped.category.value,
+                error_impact=mapped.impact.value,
+                error_phase=mapped.phase.value,
+            )
+            _logger.warning(
+                "Upstream resource exhausted: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="resource_exhausted",
+                    code=str(mapped.code),
+                    http_status=str(mapped.http_status),
+                    error_category=mapped.category.value,
+                    error_impact=mapped.impact.value,
+                    error_phase=mapped.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            # Answered directly, not via _handle_omnigent_error: that handler
+            # books every 5xx on the ERROR stream and carries no Retry-After.
+            return JSONResponse(
+                status_code=mapped.http_status,
+                headers={"Retry-After": str(_RESOURCE_EXHAUSTED_RETRY_AFTER_S)},
+                content={"error": {"code": mapped.code, "message": mapped.message}},
+            )
         if is_cancelled_rpc_error(exc):
             # A peer-cancelled backing call (upstream teardown/restart) is an
             # expected, retryable condition, not a fault: attribute it as
