@@ -26,6 +26,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
     add_audit_attrs,
@@ -68,6 +69,10 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import (
+    FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
@@ -575,6 +580,47 @@ async def _resolve_agent_harness(
     return canonicalize_harness(loaded.spec.executor.harness_kind)
 
 
+def _drop_cross_host_fork_resume_directive(
+    conversation_store: ConversationStore,
+    conv: Conversation,
+    host_id: str,
+) -> None:
+    """Drop a native fork's local-transcript directive when binding to another host.
+
+    External forks are created unbound, so the target becomes known here.
+    Removing the directive enables rebuild-from-items. Keep it for same-host
+    binds or unknown source hosts, where the transcript may remain accessible.
+
+    :param conversation_store: Store holding session rows and labels.
+    :param conv: Fork being bound, with its launch-time labels.
+    :param host_id: Target host."""
+    if conv.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) is None:
+        return
+    source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
+    if source_id is None:
+        return
+    # A malformed source pointer can't locate the source's host; keep the
+    # directive rather than failing the launch (a Uuid16 bind would raise).
+    try:
+        uuid_to_bytes(source_id)
+    except InvalidUuidError:
+        return
+    source = conversation_store.get_conversation(source_id)
+    if source is None or source.host_id is None or source.host_id == host_id:
+        return
+    conversation_store.delete_label(conv.id, FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+    _logger.info(
+        "Dropped host-local fork-resume directive for session %s: fork bound "
+        "to host %s but source %s is on host %s; runner will rebuild history "
+        "from the copied items",
+        conv.id,
+        host_id,
+        source_id,
+        source.host_id,
+        extra={"session_id": conv.id},
+    )
+
+
 def create_hosts_router(
     host_registry: HostRegistry,
     host_store: HostStore,
@@ -984,6 +1030,16 @@ def create_hosts_router(
                 else:
                     await _settle_and_rollback()
                 raise
+
+        # The target host is only known now (an external fork is created
+        # unbound), so re-evaluate the fork's native-resume directive before
+        # the launch frame lets the runner read the session snapshot.
+        await asyncio.to_thread(
+            _drop_cross_host_fork_resume_directive,
+            conversation_store,
+            target.conv,
+            host_id,
+        )
 
         set_current_runner_id(runner_id)
         add_audit_attrs(runner_id=runner_id)
