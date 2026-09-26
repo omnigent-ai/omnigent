@@ -23,6 +23,7 @@ from omnigent.inner.open_responses_sdk import (
     _convert_messages_to_responses,
     _convert_tools_to_responses,
     _databricks_openai_base_url,
+    _is_databricks_gateway_base_url,
     _normalize_response_output_items,
 )
 
@@ -100,6 +101,34 @@ class TestConvertTools(unittest.TestCase):
         self.assertEqual(result[0]["type"], "function")
         self.assertEqual(result[0]["name"], "calc")
         self.assertFalse(result[0]["strict"])
+
+    def test_strict_omitted_for_databricks_gateway(self):
+        """include_strict=False omits the key entirely (gateway rejects it)."""
+        tools = [{"name": "calc", "description": "Calculate", "parameters": {}}]
+        result = _convert_tools_to_responses(tools, include_strict=False)
+        self.assertNotIn("strict", result[0])
+        # default still emits strict: False (non-gateway providers unchanged)
+        self.assertIn("strict", _convert_tools_to_responses(tools)[0])
+
+    def test_databricks_gateway_base_url_detection(self):
+        class _C:
+            base_url = "https://x.databricks.com/ai-gateway/openai/v1"
+
+        class _Legacy:
+            base_url = "https://x.databricks.com/serving-endpoints"
+
+        self.assertTrue(_is_databricks_gateway_base_url(_C()))
+        self.assertFalse(_is_databricks_gateway_base_url(_Legacy()))
+
+    def test_executor_omit_tool_strict_flag_tracks_gateway(self):
+        class _GatewayClient:
+            base_url = "https://x.databricks.com/ai-gateway/openai/v1"
+
+        class _PlainClient:
+            base_url = "https://api.openai.com/v1"
+
+        self.assertTrue(OpenResponsesExecutor(client=_GatewayClient())._omit_tool_strict)
+        self.assertFalse(OpenResponsesExecutor(client=_PlainClient())._omit_tool_strict)
 
     def test_invalid_tool_name_is_normalized_for_provider(self):
         tools = [{"name": "sys_runtime_execute", "description": "Run code"}]
