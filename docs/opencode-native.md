@@ -35,9 +35,6 @@ private database. Provider keys that exist only in the runner's environment
 integration API at launch. If none of these are present, the host shows the
 `opencode auth login` hint.
 
-To use a non-PATH binary, set `OMNIGENT_OPENCODE_PATH` or
-`harness.opencode-native.command` in the Omnigent config.
-
 ## Agent YAML
 
 ```yaml
