@@ -773,6 +773,60 @@ def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPa
     assert calls == [["npm", "install", "-g", "@openai/codex"]]
 
 
+def test_opencode_install_spec_pins_v2_cli() -> None:
+    """OpenCode installs the v2 ``@opencode/cli`` package, pinned to 2.0.x."""
+    spec = hi.harness_install_spec(hi.OPENCODE_KEY)
+    assert spec is not None
+    assert spec.binary == "opencode"
+    assert spec.package == "@opencode/cli@~2.0.18"
+
+
+def test_opencode_install_removes_v1_package_before_installing() -> None:
+    """v1 ``opencode-ai`` owns the global ``opencode`` bin and npm refuses to
+    overwrite another package's bin (EEXIST), so v1 is removed first."""
+    argv = hi.harness_install_command(hi.OPENCODE_KEY)
+    assert argv[:2] == ["bash", "-c"]
+    script = argv[2]
+    assert script.index("npm rm -g opencode-ai") < script.index(
+        "npm install -g @opencode/cli@~2.0.18"
+    )
+    assert hi.harness_install_display(hi.OPENCODE_KEY) == (
+        "npm rm -g opencode-ai; npm install -g @opencode/cli@~2.0.18"
+    )
+
+
+def test_install_harness_cli_runs_opencode_v1_removal_then_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one-click install runs the removal and the v2 install in one argv."""
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name == "bash":
+            return "/bin/bash"
+        if name == "opencode" and state["installed"]:
+            return "/usr/local/bin/opencode"
+        return None
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.install_harness_cli(hi.OPENCODE_KEY) is True
+    assert calls == [
+        [
+            "bash",
+            "-c",
+            "npm rm -g opencode-ai >/dev/null 2>&1 || true; npm install -g @opencode/cli@~2.0.18",
+        ]
+    ]
+
+
 def test_install_harness_cli_runs_hermes_installer_then_rechecks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

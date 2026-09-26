@@ -3486,13 +3486,13 @@ def _manage_opencode_harness() -> None:
     from omnigent.onboarding.harness_install import (
         OPENCODE_KEY,
         harness_cli_installed,
-        harness_install_command,
+        harness_install_display,
         install_harness_cli,
     )
     from omnigent.onboarding.interactive import console, select
 
     if not harness_cli_installed(OPENCODE_KEY):
-        cmd = " ".join(harness_install_command(OPENCODE_KEY))
+        cmd = harness_install_display(OPENCODE_KEY)
         choice = select(
             "OpenCode's CLI is missing or on an unsupported version. Install/upgrade it now?",
             [
@@ -3826,7 +3826,7 @@ def _run_configure_harnesses_interactive() -> None:
                     "OpenCode",
                     _cli_absence_label(OPENCODE_KEY),
                     "missing",
-                    _install_hint(" ".join(harness_install_command(OPENCODE_KEY))),
+                    _install_hint(harness_install_display(OPENCODE_KEY)),
                 ),
             )
         elif opencode.ready:

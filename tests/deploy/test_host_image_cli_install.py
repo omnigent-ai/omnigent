@@ -60,7 +60,7 @@ def test_extra_cli_rows_match_harness_install_table() -> None:
     The script resolves ``EXTRA_HARNESS_CLIS`` names to the same npm package
     and default pin the runtime installs via ``omnigent setup``, behind a
     "keep in sync" comment. A drift would bake a package or pin the runtime
-    then rejects (opencode's runtime gate bounds 1.18.x), so assert the two
+    then rejects (opencode's runtime gate bounds 2.x), so assert the two
     tables agree instead of trusting the comment.
     """
     from omnigent.onboarding import harness_install as hi
@@ -68,9 +68,11 @@ def test_extra_cli_rows_match_harness_install_table() -> None:
     script = (_ROOT / "deploy/docker/install-harness-cli.sh").read_text()
 
     opencode = hi._HARNESS_INSTALL[hi.OPENCODE_KEY]
-    assert opencode.package == "opencode-ai@~1.18.0"
+    assert opencode.package == "@opencode/cli@~2.0.18"
     pkg, _, pin = opencode.package.rpartition("@")
     assert f"{pkg}@${{version:-{pin}}}" in script
+    # v1 opencode-ai owns the same global `opencode` bin (npm EEXIST).
+    assert "npm rm -g opencode-ai" in script
 
     qwen = hi._HARNESS_INSTALL[hi.QWEN_KEY]
     assert qwen.package == "@qwen-code/qwen-code"
