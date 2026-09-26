@@ -25,7 +25,7 @@
 //    bubbles) keeps its trace expanded.
 
 import type { ReactNode } from "react";
-import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -229,6 +229,12 @@ type ToolRunFragment =
       index: number;
     };
 
+/** Keeps user-opened cards visible and open across streaming re-layouts. */
+interface ToolOpenState {
+  isOpen: (key: string) => boolean;
+  setOpen: (key: string, open: boolean) => void;
+}
+
 export function BlockRenderer({
   items,
   sessionStatus,
@@ -249,6 +255,18 @@ export function BlockRenderer({
     hasPendingElicitation,
     showsWorking,
   });
+
+  const userOpenedTools = useRef<Set<string>>(new Set());
+  const toolOpenState = useMemo<ToolOpenState>(
+    () => ({
+      isOpen: (key) => userOpenedTools.current.has(key),
+      setOpen: (key, open) => {
+        if (open) userOpenedTools.current.add(key);
+        else userOpenedTools.current.delete(key);
+      },
+    }),
+    [],
+  );
 
   // Fold a turn that did work AND either answered here or continues in a
   // later bubble: the trace collapses behind the "Worked for" row, exempt
@@ -328,12 +346,17 @@ export function BlockRenderer({
           animateCollapse={animateCollapse}
           defaultOpen={defaultExpanded}
         >
-          {renderSequence(process, { liveEdge: false })}
+          {renderSequence(process, { liveEdge: false, toolOpenState })}
         </TurnWorkedFold>
         {exempt.map(({ item, index }) =>
-          renderItem(item, index, false, false, false, false, onRetryError),
+          renderItem(item, index, false, false, false, false, onRetryError, toolOpenState),
         )}
-        {renderSequence(final, { liveEdge: false, indexBase: finalStart, onRetryError })}
+        {renderSequence(final, {
+          liveEdge: false,
+          indexBase: finalStart,
+          onRetryError,
+          toolOpenState,
+        })}
       </>
     );
   }
@@ -342,6 +365,7 @@ export function BlockRenderer({
     liveEdge: isTurnLive,
     suppressReasoningDuration: showsWorking,
     onRetryError,
+    toolOpenState,
   });
 }
 
@@ -354,7 +378,13 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, suppressReasoningDuration = false, indexBase = 0, onRetryError }: TurnSequenceOptions,
+  {
+    liveEdge,
+    suppressReasoningDuration = false,
+    indexBase = 0,
+    onRetryError,
+    toolOpenState,
+  }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -381,7 +411,7 @@ function renderSequence(
       // tail. Earlier runs, and any run followed by assistant
       // text/reasoning, fold entirely the same way they would when idle.
       const isStreamingRun = runStart === streamingRunStart;
-      const fragments = partitionToolRun(run, isStreamingRun);
+      const fragments = partitionToolRun(run, isStreamingRun, indexBase + runStart, toolOpenState);
 
       if (isStreamingRun && fragments[0]?.kind === "group") {
         const [group, ...tail] = fragments;
@@ -395,13 +425,15 @@ function renderSequence(
           <div key={`tool-group-with-tail:${indexBase + runStart}`} className="space-y-1">
             <ToolGroupSummary tools={group.tools} />
             {tail.map((fragment, idx) =>
-              renderToolRunFragment(fragment, indexBase + runStart, idx),
+              renderToolRunFragment(fragment, indexBase + runStart, idx, toolOpenState),
             )}
           </div>,
         );
       } else {
         for (let idx = 0; idx < fragments.length; idx += 1) {
-          rendered.push(renderToolRunFragment(fragments[idx]!, indexBase + runStart, idx));
+          rendered.push(
+            renderToolRunFragment(fragments[idx]!, indexBase + runStart, idx, toolOpenState),
+          );
         }
       }
       previousRenderedItemWasText = false;
@@ -419,6 +451,7 @@ function renderSequence(
         suppressReasoningDuration,
         followsText,
         onRetryError,
+        toolOpenState,
       ),
     );
     previousRenderedItemWasText = item.kind === "text";
@@ -432,6 +465,7 @@ interface TurnSequenceOptions {
   suppressReasoningDuration?: boolean;
   indexBase?: number;
   onRetryError?: BlockRendererProps["onRetryError"];
+  toolOpenState?: ToolOpenState;
 }
 
 interface TurnPartition {
@@ -683,11 +717,14 @@ function formatWorkedFor(seconds: number): string {
  * For the live-streaming run, the trailing `STREAMING_TAIL` tools
  * (regardless of state) stay outside the group so the user can watch
  * the most recent activity; any other run folds entirely. In-progress
- * spinners and persistent routing plan cards never fold, so a routing
- * judgement isn't swallowed mid-fan-out when later spawns push it past
- * the tail window.
+ * spinners, routing plans, and user-opened cards stay outside folds.
  */
-function partitionToolRun(run: RenderItem[], isStreamingRun: boolean): ToolRunFragment[] {
+function partitionToolRun(
+  run: RenderItem[],
+  isStreamingRun: boolean,
+  runStart = 0,
+  toolOpenState?: ToolOpenState,
+): ToolRunFragment[] {
   const tailStart = isStreamingRun ? Math.max(0, run.length - STREAMING_TAIL) : run.length;
   const fragments: ToolRunFragment[] = [];
   let group: RenderItem[] = [];
@@ -698,7 +735,12 @@ function partitionToolRun(run: RenderItem[], isStreamingRun: boolean): ToolRunFr
   };
   for (let index = 0; index < run.length; index += 1) {
     const item = run[index]!;
-    if (index >= tailStart || isInProgressTool(item) || isPersistentToolCard(item)) {
+    if (
+      index >= tailStart ||
+      isInProgressTool(item) ||
+      isPersistentToolCard(item) ||
+      isUserOpenedTool(item, runStart + index, toolOpenState)
+    ) {
       flushGroup();
       fragments.push({ kind: "standalone", tool: item, index });
     } else {
@@ -709,17 +751,36 @@ function partitionToolRun(run: RenderItem[], isStreamingRun: boolean): ToolRunFr
   return fragments;
 }
 
+/** Id-less native tools use positional keys, which may change after re-layout. */
+function isUserOpenedTool(
+  item: RenderItem,
+  index: number,
+  toolOpenState: ToolOpenState | undefined,
+): boolean {
+  return toolOpenState !== undefined && toolOpenState.isOpen(keyFor(item, index));
+}
+
 function renderToolRunFragment(
   fragment: ToolRunFragment,
   runStart: number,
   fragmentIndex: number,
+  toolOpenState?: ToolOpenState,
 ): ReactNode {
   if (fragment.kind === "group") {
     return (
       <ToolGroupSummary key={`tool-group:${runStart}:${fragmentIndex}`} tools={fragment.tools} />
     );
   }
-  return renderItem(fragment.tool, runStart + fragment.index, false, false);
+  return renderItem(
+    fragment.tool,
+    runStart + fragment.index,
+    false,
+    false,
+    false,
+    false,
+    undefined,
+    toolOpenState,
+  );
 }
 
 const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
@@ -768,6 +829,7 @@ function renderItem(
   suppressReasoningDuration = false,
   followsText = false,
   onRetryError?: BlockRendererProps["onRetryError"],
+  toolOpenState?: ToolOpenState,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -815,6 +877,8 @@ function renderItem(
           state={item.state}
           startedAt={item.startedAt}
           duration={item.duration}
+          defaultOpen={toolOpenState?.isOpen(key) ?? false}
+          onOpenChange={toolOpenState && ((open) => toolOpenState.setOpen(key, open))}
         />
       );
     case "native_tool":
@@ -829,6 +893,8 @@ function renderItem(
           arguments={item.data}
           output={null}
           state="output-available"
+          defaultOpen={toolOpenState?.isOpen(key) ?? false}
+          onOpenChange={toolOpenState && ((open) => toolOpenState.setOpen(key, open))}
         />
       );
     case "slash_command":
