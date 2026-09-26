@@ -138,16 +138,11 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "OpenCode",
     iconKind: "opencode",
     sortRank: 25,
-    // No capabilities → no permission picker. OpenCode has no claude-style
-    // permission-mode surface to mirror: its native modes are the `build`
-    // (allow-by-default) and `plan` primary agents, switched at runtime via Tab
-    // inside the TUI — and `opencode attach` (how the runner launches it) has
-    // no `--agent` flag to preset one anyway. The runner already forces
-    // `permission: "ask"` so tools route through the Omnigent policy engine, so
-    // a launch-time picker would mirror nothing. (Previously declared Codex's
-    // `approvalMode`, whose `--sandbox`/`--ask-for-approval` presets aren't
-    // understood by `opencode attach` and crashed the TUI on any non-default
-    // pick.)
+    // No capabilities → no permission picker. OpenCode's native modes are the
+    // `build` and `plan` primary agents, switched via Tab inside the TUI, and
+    // `opencode --server <url>` (how the runner launches it) has no `--agent`
+    // flag. The runner's config always asks on every tool (`permissions` rule
+    // `{action:"*", effect:"ask"}`), so a launch-time picker would mirror nothing.
   },
   {
     // Devin's native TUI (Cognition). Replaced the built-in ACP row, removed in
