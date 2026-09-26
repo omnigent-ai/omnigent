@@ -198,6 +198,13 @@ async def test_list_root_sessions_queries_newest_roots() -> None:
     await client.aclose()
 
 
+async def test_list_root_sessions_raises_on_error() -> None:
+    client = _client(lambda request: httpx.Response(401, json={"error": "unauthorized"}))
+    with pytest.raises(OpenCodeClientError):
+        await client.list_root_sessions()
+    await client.aclose()
+
+
 async def test_get_context_unwraps_list() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/session/ses_1/context"
