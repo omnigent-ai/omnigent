@@ -2892,6 +2892,103 @@ def test_format_codex_error_params_handles_missing_params() -> None:
     assert "no params" in _format_codex_error_params("not a dict")
 
 
+def test_unwrap_provider_error_json_extracts_responses_api_envelope() -> None:
+    """Unwrap a Responses-API envelope: the reason under ``error.message`` plus its code."""
+    from omnigent.inner.codex_executor import _unwrap_provider_error_json
+
+    envelope = (
+        '{"type": "error", "status": 400, "error": {"type": '
+        '"invalid_request_error", "message": "The \'gpt-6-astra\' model '
+        'is not supported when using Codex with a ChatGPT account."}}'
+    )
+    result = _unwrap_provider_error_json(envelope)
+    assert result == (
+        "The 'gpt-6-astra' model is not supported when using Codex with "
+        "a ChatGPT account. (error_code=invalid_request_error)"
+    )
+
+
+def test_unwrap_provider_error_json_leaves_plain_text_unchanged() -> None:
+    """Non-JSON and JSON-without-a-message inputs pass through untouched."""
+    from omnigent.inner.codex_executor import _unwrap_provider_error_json
+
+    assert _unwrap_provider_error_json("connection refused") == "connection refused"
+    # An envelope whose ``error`` carries no message has nothing to extract.
+    assert _unwrap_provider_error_json('{"error": {"type": "x"}}') == ('{"error": {"type": "x"}}')
+
+
+def test_format_codex_error_params_unwraps_top_level_provider_envelope() -> None:
+    """An error frame can carry the provider's stringified envelope as its top-level
+    ``message`` (not under ``params["error"]``); the formatter must unwrap that too."""
+    from omnigent.inner.codex_executor import _format_codex_error_params
+
+    params = {
+        "message": (
+            '{"type": "error", "status": 400, "error": {"type": '
+            '"invalid_request_error", "message": "The \'gpt-6-astra\' model '
+            'is not supported when using Codex with a ChatGPT account."}}'
+        ),
+        "willRetry": False,
+    }
+    result = _format_codex_error_params(params)
+    assert "model is not supported when using Codex with a ChatGPT account" in result
+    assert "error_code=invalid_request_error" in result
+    # The raw envelope must not leak through.
+    assert not result.lstrip().startswith("{")
+    assert '"invalid_request_error"' not in result
+
+
+async def test_run_turn_turn_failed_unwraps_provider_error_envelope() -> None:
+    """A ``turn/failed`` frame carrying the provider's JSON envelope surfaces the reason."""
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+    envelope = (
+        '{"type": "error", "status": 400, "error": {"type": '
+        '"invalid_request_error", "message": "The \'gpt-6-astra\' model '
+        'is not supported when using Codex with a ChatGPT account."}}'
+    )
+    # ``turnId`` must be set in ``params`` so the startup drain
+    # preserves the event for the main loop.
+    await session._events.put(
+        {
+            "method": "turn/failed",
+            "params": {
+                "turnId": "turn-1",
+                "turn": {"id": "turn-1"},
+                "message": envelope,
+            },
+        }
+    )
+
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+
+    error_events = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(error_events) == 1, f"expected exactly 1 ExecutorError, got: {events}"
+    surfaced = error_events[0].message
+    assert "model is not supported when using Codex with a ChatGPT account" in surfaced
+    assert not surfaced.lstrip().startswith("{")
+    assert '"invalid_request_error"' not in surfaced
+
+
 def test_extract_codex_last_turn_usage_splits_cached_out_of_input() -> None:
     """``tokenUsage.last`` maps onto TurnComplete.usage, splitting cached tokens.
 
