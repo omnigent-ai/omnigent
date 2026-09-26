@@ -32,19 +32,14 @@ class _FakeServerClient:
 
 
 class _FakeOpenCodeClient:
-    def __init__(self) -> None:
-        self.seeded: tuple[str, str, str | None, str | None] | None = None
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.seeded: tuple[str, str] | None = None
+        self._error = error
 
-    async def seed_context(
-        self,
-        session_id: str,
-        text: str,
-        *,
-        provider_id: str | None = None,
-        model_id: str | None = None,
-    ) -> bool:
-        self.seeded = (session_id, text, provider_id, model_id)
-        return True
+    async def seed_context(self, session_id: str, text: str) -> None:
+        if self._error is not None:
+            raise self._error
+        self.seeded = (session_id, text)
 
 
 # ── _render_opencode_transcript_text ────────────────────────────────────────
@@ -66,31 +61,29 @@ def test_render_transcript_skips_non_message_and_other_roles() -> None:
 # ── _rehydrate_opencode_session_from_transcript ─────────────────────────────
 
 
-async def test_rehydrate_seeds_transcript_with_model() -> None:
+async def test_rehydrate_seeds_transcript_without_model() -> None:
     oc = _FakeOpenCodeClient()
     ok = await app._rehydrate_opencode_session_from_transcript(
         opencode_client=oc,
         opencode_session_id="ses_1",
         omnigent_session_id="conv_1",
         server_client=_FakeServerClient(_ITEMS),
-        model_override="anthropic/claude-sonnet-4-5",
     )
     assert ok is True
     assert oc.seeded is not None
-    session_id, text, provider_id, model_id = oc.seeded
+    session_id, text = oc.seeded
     assert session_id == "ses_1"
+    assert text.startswith("[Resumed session")
     assert "User: hi" in text and "Assistant: yo" in text
-    assert (provider_id, model_id) == ("anthropic", "claude-sonnet-4-5")
 
 
 async def test_rehydrate_no_server_client_returns_false() -> None:
     oc = _FakeOpenCodeClient()
     ok = await app._rehydrate_opencode_session_from_transcript(
         opencode_client=oc,
-        opencode_session_id="s",
-        omnigent_session_id="c",
+        opencode_session_id="ses_1",
+        omnigent_session_id="conv_1",
         server_client=None,
-        model_override=None,
     )
     assert ok is False
     assert oc.seeded is None
@@ -100,10 +93,22 @@ async def test_rehydrate_empty_transcript_returns_false() -> None:
     oc = _FakeOpenCodeClient()
     ok = await app._rehydrate_opencode_session_from_transcript(
         opencode_client=oc,
-        opencode_session_id="s",
-        omnigent_session_id="c",
+        opencode_session_id="ses_1",
+        omnigent_session_id="conv_1",
         server_client=_FakeServerClient([]),
-        model_override=None,
     )
     assert ok is False
     assert oc.seeded is None
+
+
+async def test_rehydrate_seed_failure_returns_false() -> None:
+    from omnigent.harnesses.opencode_native.client import OpenCodeClientError
+
+    oc = _FakeOpenCodeClient(error=OpenCodeClientError("synthetic failed: 500"))
+    ok = await app._rehydrate_opencode_session_from_transcript(
+        opencode_client=oc,
+        opencode_session_id="ses_1",
+        omnigent_session_id="conv_1",
+        server_client=_FakeServerClient(_ITEMS),
+    )
+    assert ok is False

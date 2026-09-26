@@ -1723,7 +1723,6 @@ async def _auto_create_opencode_terminal(
                         opencode_session_id=opencode_session_id,
                         omnigent_session_id=session_id,
                         server_client=server_client,
-                        model_override=model_override,
                     )
                 # Persist the OpenCode session id so a later relaunch resumes
                 # it (best effort, like codex-native).
@@ -2130,17 +2129,18 @@ async def _rehydrate_opencode_session_from_transcript(
     opencode_session_id: str,
     omnigent_session_id: str,
     server_client: httpx.AsyncClient | None,
-    model_override: str | None,
 ) -> bool:
     """
-    Seed a fresh opencode session with prior context (text-prefix replay).
+    Seed a fresh OpenCode session with the Omnigent transcript as context.
 
-    opencode has no history-import API, so on a cross-host resume (where the
-    persisted opencode session is gone) inject the Omnigent transcript as a
-    single ``noReply`` context message — the agent resumes with its prior
-    context instead of silent amnesia. Best-effort: returns ``False`` when the
-    transcript can't be fetched or is empty.
+    Used when the persisted OpenCode session is gone (new host, wiped bridge
+    dir) or a forked clone could not fork natively. The transcript is recorded
+    through ``seed_context`` without starting a model turn. Best effort.
 
+    :param opencode_client: Client bound to the conversation's server.
+    :param opencode_session_id: The freshly created OpenCode session id.
+    :param omnigent_session_id: Omnigent conversation id whose items to replay.
+    :param server_client: Runner Omnigent server client, or ``None``.
     :returns: ``True`` when prior context was seeded.
     """
     if server_client is None:
@@ -2164,19 +2164,13 @@ async def _rehydrate_opencode_session_from_transcript(
     transcript = _render_opencode_transcript_text(items if isinstance(items, list) else [])
     if not transcript:
         return False
-    provider_id: str | None = None
-    model_id: str | None = None
-    if model_override and "/" in model_override:
-        provider_id, model_id = model_override.split("/", 1)
     text = (
         "[Resumed session — the prior opencode session was unavailable on this "
         "host, so the earlier conversation is included below for context. Treat "
         "it as history; do not re-run prior actions.]\n\n" + transcript
     )
     try:
-        await opencode_client.seed_context(
-            opencode_session_id, text, provider_id=provider_id, model_id=model_id
-        )
+        await opencode_client.seed_context(opencode_session_id, text)
     except Exception:  # noqa: BLE001 - rehydration is best effort.
         _logger.warning(
             "opencode resume: rehydration seed failed for %s", omnigent_session_id, exc_info=True
