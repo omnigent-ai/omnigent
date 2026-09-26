@@ -285,29 +285,23 @@ export const MobileMorePage: Story = {
   args: { harnessEntries: otherHarnesses },
   beforeEach: () => {
     const original = window.matchMedia.bind(window);
+    // Simulate a narrow touch device: phone width, coarse pointer, no hover.
+    const mobileTouchMatches: Record<string, boolean> = {
+      "(max-width: 767.98px)": true,
+      "(max-width: 767px)": true,
+      "(min-width: 768px)": false,
+      "(pointer: coarse)": true,
+      "(any-pointer: coarse)": true,
+      "(pointer: fine)": false,
+      "(any-pointer: fine)": false,
+      "(hover: hover)": false,
+      "(any-hover: hover)": false,
+      "(hover: none)": true,
+      "(any-hover: none)": true,
+    };
     window.matchMedia = (query: string) => {
-      // For mobile simulation: returns appropriate matches for media queries
-      let matches = false;
-
-      // Mobile viewport (narrow screens)
-      if (query === "(max-width: 767.98px)" || query === "(max-width: 767px)")
-        matches = true;
-      else if (query === "(min-width: 768px)")
-        matches = false; // not desktop
-      // Touch device queries
-      else if (query === "(pointer: coarse)" || query === "(any-pointer: coarse)")
-        matches = true;
-      else if (query === "(pointer: fine)" || query === "(any-pointer: fine)")
-        matches = false;
-      // Hover capability
-      else if (query === "(hover: hover)" || query === "(any-hover: hover)")
-        matches = false; // no hover on touch
-      else if (query === "(hover: none)" || query === "(any-hover: none)")
-        matches = true;
-      // For all other queries, use the original
-      else
-        return original(query);
-
+      const matches = mobileTouchMatches[query];
+      if (matches === undefined) return original(query);
       return {
         media: query,
         matches,
