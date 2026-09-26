@@ -6051,9 +6051,11 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
 
     - ``config.yaml``: ``llm.connection.*`` and
       ``executor.connection.*`` values, ``executor.auth``
-      ``api_key`` / ``base_url`` (when ``type: api_key``), and
-      ``tools.builtins[*]`` dict-entry values (except ``name``)
-    - ``tools/mcp/*.yaml``: ``headers.*`` and ``env.*`` values
+      ``api_key`` / ``base_url`` (when ``type: api_key``),
+      ``tools.builtins[*]`` dict-entry values (except ``name``), and
+      inline ``tools.<name>: {type: mcp}`` entries' ``url``,
+      ``headers.*`` and ``env.*`` values
+    - ``tools/mcp/*.yaml``: ``url``, ``headers.*`` and ``env.*`` values
 
     These mirror the server-side parser's ``${VAR}`` expansion
     sites. Resolving here, against the client's own environment,
@@ -6083,24 +6085,13 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
                 )
 
     # ── tools/mcp/*.yaml ─────────────────────────────
-    # ``headers`` (HTTP transport auth) and ``env`` (stdio transport
-    # process env) are both secret-bearing and both expanded by the
-    # server-side parser, so resolve both client-side.
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
             raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
-            changed = False
-            for field in ("headers", "env"):
-                value = raw.get(field)
-                if isinstance(value, dict):
-                    raw[field] = expand_env_vars(
-                        {str(k): str(v) for k, v in value.items()},
-                    )
-                    changed = True
-            if changed:
+            if _expand_mcp_server_env_vars(raw, expand_env_vars):
                 arcname = str(yaml_file.relative_to(source))
                 resolved[arcname] = yaml.dump(
                     raw,
@@ -6217,6 +6208,8 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
     - ``executor.auth`` — ``api_key`` / ``base_url`` when
       ``type == "api_key"``
     - ``tools.builtins[*]`` — dict-entry values except ``name``
+    - ``tools.<name>`` inline ``type: mcp`` entries — ``url``,
+      ``headers`` and ``env`` values
 
     :param raw: The parsed config.yaml dict (modified in-place).
     :param expand_fn: Callable that expands env var references
@@ -6261,6 +6254,9 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
             or changed
         )
 
+    if cfg.tools is not None:
+        changed = _expand_inline_mcp_env_vars(raw["tools"], expand_fn) or changed
+
     return changed
 
 
@@ -6296,6 +6292,43 @@ def _expand_builtin_env_vars(  # type: ignore[explicit-any]  # entries are parse
         if config_fields:
             expanded = expand_fn(config_fields)
             raw_builtins[i] = {"name": parsed.name, **expanded}
+            changed = True
+    return changed
+
+
+def _expand_inline_mcp_env_vars(  # type: ignore[explicit-any]  # entries are parsed YAML dicts
+    raw_tools: dict[str, Any],
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """Expand ``${VAR}`` in-place in the inline ``type: mcp`` entries of a ``tools:`` mapping."""
+    from omnigent.spec.parser import _TOOLS_CONFIG_KEYS
+
+    changed = False
+    for key, entry in raw_tools.items():
+        # Same selection as the parser: standard ToolsConfig keys are never MCP servers.
+        if key in _TOOLS_CONFIG_KEYS or not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")) != "mcp":
+            continue
+        changed = _expand_mcp_server_env_vars(entry, expand_fn) or changed
+    return changed
+
+
+def _expand_mcp_server_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML (heterogeneous values)
+    raw: dict[str, Any],
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """Expand ``${VAR}`` in-place in one MCP server mapping (sidecar YAML or inline entry)."""
+    # Mirrors the parser's expansion sites: url (HTTP endpoint), headers (HTTP), env (stdio).
+    changed = False
+    url = raw.get("url")
+    if url is not None:
+        raw["url"] = expand_fn({"url": str(url)})["url"]
+        changed = True
+    for field in ("headers", "env"):
+        value = raw.get(field)
+        if isinstance(value, dict):
+            raw[field] = expand_fn({str(k): str(v) for k, v in value.items()})
             changed = True
     return changed
 

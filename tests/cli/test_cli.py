@@ -2739,6 +2739,67 @@ def test_expand_config_expands_builtin_tool_config(
     assert entry["name"] == "web_search_pplx"
 
 
+def test_expand_config_expands_inline_mcp_url_headers_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inline ``type: mcp`` entries get ``url``/``headers`` (http) and ``env`` (stdio) expanded."""
+    monkeypatch.setenv("INLINE_MCP_URL", "http://127.0.0.1:3000/mcp")
+    monkeypatch.setenv("INLINE_MCP_TOKEN", "tok-inline-7")
+    monkeypatch.setenv("INLINE_STDIO_KEY", "stdio-key-9")
+    from omnigent.spec import expand_env_vars
+
+    raw: dict[str, Any] = {
+        "spec_version": 1,
+        "tools": {
+            "pipeshub": {
+                "type": "mcp",
+                "url": "${INLINE_MCP_URL}",
+                "headers": {"Authorization": "Bearer ${INLINE_MCP_TOKEN}"},
+            },
+            "local": {
+                "type": "mcp",
+                "command": "my-mcp",
+                "env": {"API_KEY": "${INLINE_STDIO_KEY}"},
+            },
+        },
+    }
+    changed = _expand_config_env_vars(raw, expand_env_vars)
+
+    assert changed is True
+    # If this is still "${INLINE_MCP_URL}", the runner would try to
+    # connect to the literal string instead of the real server.
+    assert raw["tools"]["pipeshub"]["url"] == "http://127.0.0.1:3000/mcp"
+    assert raw["tools"]["pipeshub"]["headers"] == {"Authorization": "Bearer tok-inline-7"}
+    assert raw["tools"]["pipeshub"]["type"] == "mcp"
+    assert raw["tools"]["local"]["env"] == {"API_KEY": "stdio-key-9"}
+    assert raw["tools"]["local"]["command"] == "my-mcp"
+
+
+def test_expand_config_inline_mcp_leaves_other_tools_entries_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Standard ``tools`` keys and non-MCP inline tools keep their literals, as in the parser."""
+    monkeypatch.setenv("NOT_FOR_US", "should-not-appear")
+    from omnigent.spec import expand_env_vars
+
+    raw: dict[str, Any] = {
+        "spec_version": 1,
+        "tools": {
+            "timeout": 30,
+            "builtins": ["web_search"],
+            # Standard ToolsConfig keys are never inline MCP servers,
+            # even when shaped like one.
+            "sandbox": {"type": "mcp", "url": "${NOT_FOR_US}"},
+            "notes": {"type": "function", "url": "${NOT_FOR_US}"},
+        },
+    }
+    changed = _expand_config_env_vars(raw, expand_env_vars)
+
+    assert changed is False
+    assert raw["tools"]["sandbox"] == {"type": "mcp", "url": "${NOT_FOR_US}"}
+    assert raw["tools"]["notes"] == {"type": "function", "url": "${NOT_FOR_US}"}
+
+
 def test_expand_config_expands_executor_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2963,6 +3024,78 @@ def test_resolve_bundle_expands_mcp_env(
     assert parsed["env"]["API_TOKEN"] == "stdio-tok-xyz"
 
 
+def test_resolve_bundle_expands_mcp_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An HTTP MCP sidecar's ``url`` is resolved, not only its ``headers``."""
+    monkeypatch.setenv("PIPESHUB_MCP_URL", "http://127.0.0.1:3000/mcp")
+    monkeypatch.setenv("PIPESHUB_MCP_TOKEN", "pipeshub-tok")
+    _write_mcp_config(
+        tmp_path,
+        "pipeshub",
+        {
+            "name": "pipeshub",
+            "transport": "http",
+            "url": "${PIPESHUB_MCP_URL}",
+            "headers": {"Authorization": "Bearer ${PIPESHUB_MCP_TOKEN}"},
+        },
+    )
+    _write_config(tmp_path, {"spec_version": 1})
+
+    resolved = _resolve_bundle_env_vars(tmp_path)
+
+    parsed = yaml.safe_load(resolved["tools/mcp/pipeshub.yaml"])
+    assert parsed["url"] == "http://127.0.0.1:3000/mcp"
+    assert parsed["headers"]["Authorization"] == "Bearer pipeshub-tok"
+    assert parsed["transport"] == "http"
+
+
+def test_resolve_bundle_expands_inline_mcp_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inline ``tools.<name>: {type: mcp}`` entry's ``url`` and ``headers`` are resolved."""
+    monkeypatch.setenv("PIPESHUB_MCP_URL", "http://127.0.0.1:3000/mcp")
+    monkeypatch.setenv("PIPESHUB_MCP_TOKEN", "pipeshub-tok")
+    _write_config(
+        tmp_path,
+        {
+            "spec_version": 1,
+            "tools": {
+                "pipeshub": {
+                    "type": "mcp",
+                    "url": "${PIPESHUB_MCP_URL}",
+                    "headers": {"Authorization": "Bearer ${PIPESHUB_MCP_TOKEN}"},
+                },
+            },
+        },
+    )
+
+    resolved = _resolve_bundle_env_vars(tmp_path)
+
+    parsed = yaml.safe_load(resolved["config.yaml"])
+    assert parsed["tools"]["pipeshub"]["url"] == "http://127.0.0.1:3000/mcp"
+    assert parsed["tools"]["pipeshub"]["headers"]["Authorization"] == "Bearer pipeshub-tok"
+
+
+def test_resolve_bundle_missing_mcp_url_var_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unset variable in an MCP ``url`` fails at bundling time, not at the runner."""
+    monkeypatch.delenv("UNSET_MCP_URL_12345", raising=False)
+    _write_mcp_config(
+        tmp_path,
+        "svc",
+        {"name": "svc", "transport": "http", "url": "${UNSET_MCP_URL_12345}"},
+    )
+    _write_config(tmp_path, {"spec_version": 1})
+
+    with pytest.raises(OmnigentError, match="UNSET_MCP_URL_12345"):
+        _resolve_bundle_env_vars(tmp_path)
+
+
 def test_resolve_bundle_no_env_vars_returns_empty(
     tmp_path: Path,
 ) -> None:
@@ -3132,6 +3265,35 @@ def test_bundle_resolves_mcp_header_env_vars(
     # Non-header fields survive bundling.
     assert parsed["name"] == "github"
     assert parsed["url"] == "http://localhost:9000/mcp"
+
+
+def test_bundle_resolves_mcp_url_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_bundle`` ships sidecar and inline MCP ``url`` values resolved in the tarball."""
+    monkeypatch.setenv("BUNDLE_MCP_URL", "http://127.0.0.1:3000/mcp")
+    _write_config(
+        tmp_path,
+        {
+            "spec_version": 1,
+            "name": "mcp-url-agent",
+            "tools": {"inline-svc": {"type": "mcp", "url": "${BUNDLE_MCP_URL}"}},
+        },
+    )
+    _write_mcp_config(
+        tmp_path,
+        "sidecar-svc",
+        {"name": "sidecar-svc", "transport": "http", "url": "${BUNDLE_MCP_URL}"},
+    )
+
+    bundle_bytes = _bundle(tmp_path)
+
+    sidecar = _extract_yaml_from_bundle(bundle_bytes, "tools/mcp/sidecar-svc.yaml")
+    assert sidecar["url"] == "http://127.0.0.1:3000/mcp"
+    config = _extract_yaml_from_bundle(bundle_bytes, "config.yaml")
+    assert config["tools"]["inline-svc"]["url"] == "http://127.0.0.1:3000/mcp"
+    assert config["name"] == "mcp-url-agent"
 
 
 def test_bundle_no_env_vars_preserves_files(
