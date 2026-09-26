@@ -2,9 +2,9 @@
 
 For the ``omnigent setup --no-internal-beta`` first-run experience, this module
 discovers credentials a user already has — vendor API keys in the
-environment, a logged-in ``claude`` / ``codex`` CLI, or a local Ollama
-server — so the setup flow can offer them as one-tap choices instead of
-asking the user to paste keys they already have.
+environment, a logged-in ``claude`` / ``codex`` / ``pi`` CLI, or a local
+Ollama server — so the setup flow can offer them as one-tap choices instead
+of asking the user to paste keys they already have.
 
 Detection is almost entirely pure standard library (``os``, ``socket``,
 ``pathlib``) and performs no network I/O beyond a single non-blocking
@@ -37,7 +37,12 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from omnigent.onboarding import codex_auth_readiness
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+from omnigent.onboarding.provider_config import (
+    ANTHROPIC_FAMILY,
+    GEMINI_FAMILY,
+    OPENAI_FAMILY,
+    PI_SURFACE,
+)
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
 from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
@@ -99,13 +104,14 @@ class DetectedProvider:
 
     :param name: The provider/source name, e.g. ``"anthropic"``,
         ``"openai"``, ``"openrouter"``, ``"gemini"``, ``"claude"``,
-        ``"codex"``, or ``"ollama"``.
+        ``"codex"``, ``"pi"``, or ``"ollama"``.
     :param kind: How the credential authenticates — ``"key"`` (an API key
         in the environment), ``"subscription"`` (a logged-in CLI), or
         ``"local"`` (a self-hosted endpoint).
-    :param family: The model family this credential serves
-        (``"anthropic"`` / ``"openai"`` / ``"gemini"``), or ``None`` when the
-        credential is detected but maps to no omnigent harness surface.
+    :param family: The harness surface this credential serves
+        (``"anthropic"`` / ``"openai"`` / ``"gemini"`` / ``"pi"``), or
+        ``None`` when the credential is detected but maps to no omnigent
+        harness surface.
     :param source: A human-readable descriptor of where the credential
         comes from, e.g. ``"$ANTHROPIC_API_KEY"``, ``"claude CLI login"``,
         or ``"http://localhost:11434"``.
@@ -233,6 +239,76 @@ def codex_cli_effective_auth_mode() -> str | None:
         no usable login.
     """
     return codex_auth_effective_mode(_codex_auth_path())
+
+
+def _pi_auth_path() -> Path:
+    """Return the path to the Pi CLI's stored login credentials.
+
+    Mirrors pi's own config-dir resolution: ``PI_CODING_AGENT_DIR`` relocates
+    the directory when set (the same variable omnigent's managed pi sessions
+    use), else ``~/.pi/agent`` under ``$HOME`` — so the check reads exactly
+    the file a bare ``pi`` in this shell would authenticate from.
+
+    :returns: Path to ``auth.json`` in pi's agent config dir.
+    """
+    env_dir = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
+    if env_dir:
+        return Path(os.path.expanduser(env_dir)) / "auth.json"
+    return Path(os.path.expanduser("~")) / ".pi" / "agent" / "auth.json"
+
+
+def pi_auth_has_credential(auth_path: Path) -> bool:
+    """Return whether a Pi ``auth.json`` carries a usable stored credential.
+
+    The mirror of :func:`codex_auth_has_credential` /
+    :func:`claude_auth_has_credential` for the pi CLI, whose ``/login`` stores
+    one type-tagged credential per provider id (pi-ai's ``Credential`` shape):
+
+    - ``{"type": "api_key", "key": "..."}`` — usable when ``key`` is a
+      non-empty string;
+    - ``{"type": "oauth", "access": ..., "refresh": ..., "expires": ms}`` —
+      usable when ``access`` is non-empty and is either renewable (a
+      non-empty ``refresh``) or not yet expired (``expires`` in the future),
+      matching the Claude helper's stale-but-refreshable rule.
+
+    Purely local (no network): its job is to reject the empty / logged-out /
+    malformed cases, not to prove a token will authenticate.
+
+    :param auth_path: Path to the Pi ``auth.json`` to inspect, e.g.
+        ``Path("~/.pi/agent/auth.json").expanduser()``.
+    :returns: ``True`` when at least one provider entry carries a usable
+        credential; ``False`` when the file is missing, unreadable, not a
+        JSON object, or carries no usable credential.
+    """
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    for credential in data.values():
+        if not isinstance(credential, dict):
+            continue
+        cred_type = credential.get("type")
+        if cred_type == "api_key":
+            key = credential.get("key")
+            if isinstance(key, str) and key.strip():
+                return True
+        elif cred_type == "oauth":
+            access = credential.get("access")
+            if not (isinstance(access, str) and access.strip()):
+                continue
+            refresh = credential.get("refresh")
+            if isinstance(refresh, str) and refresh.strip():
+                return True
+            expires = credential.get("expires")  # epoch milliseconds
+            if (
+                isinstance(expires, (int, float))
+                and not isinstance(expires, bool)
+                and expires > time.time() * 1000
+            ):
+                return True
+    return False
 
 
 def _codex_config_path() -> Path:
@@ -716,7 +792,9 @@ def detect_providers() -> list[DetectedProvider]:
        resolution (config.toml's default provider beats auth.json).
     4. A logged-in Codex CLI (``~/.codex/auth.json`` exists *and* carries a
        usable credential — see :func:`codex_auth_has_credential`).
-    5. A reachable local Ollama (``localhost:11434`` TCP-connectable).
+    5. A logged-in Pi CLI (``~/.pi/agent/auth.json`` carries a usable
+       credential — see :func:`pi_auth_has_credential`).
+    6. A reachable local Ollama (``localhost:11434`` TCP-connectable).
 
     No network I/O is performed except the single Ollama probe (see
     :func:`_ollama_reachable`). On macOS, a ``claude auth status`` subprocess
@@ -837,7 +915,23 @@ def _detect_providers_now() -> list[DetectedProvider]:
             )
         )
 
-    # 5. Local Ollama.
+    # 5. Pi CLI login. Pi stores one credential per provider in its own
+    #    ``~/.pi/agent/auth.json`` (its ``/login``), so a usable entry means a
+    #    bare ``pi`` runs without omnigent managing a provider — the "Pi
+    #    original auth" state the setup menu offers manually. Detecting it
+    #    lets adoption credit that login instead of reporting Pi as not
+    #    configured.
+    if pi_auth_has_credential(_pi_auth_path()):
+        detected.append(
+            DetectedProvider(
+                name="pi",
+                kind=SUBSCRIPTION_KIND,
+                family=PI_SURFACE,
+                source="pi CLI login",
+            )
+        )
+
+    # 6. Local Ollama.
     if _ollama_reachable():
         detected.append(
             DetectedProvider(
