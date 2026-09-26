@@ -35,10 +35,7 @@ from omnigent.harnesses.opencode_native.app_server import (
     client_for_state,
     find_opencode_cli,
 )
-from omnigent.harnesses.opencode_native.bridge import (
-    snapshot_opencode_database,
-    user_xdg_data_home,
-)
+from omnigent.harnesses.opencode_native.bridge import snapshot_opencode_database
 from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeClientError,
@@ -164,9 +161,9 @@ def _is_safe_opencode_import_session_id(session_id: str) -> bool:
 
 
 def _opencode_user_store_exists() -> bool:
-    """Whether the user has a local OpenCode database to import from."""
-    store = user_xdg_data_home() / "opencode"
-    return any(store.glob("opencode*.db"))
+    """Whether the OpenCode database the import would snapshot exists."""
+    db = opencode_db_path()
+    return db is not None and db.is_file()
 
 
 @contextlib.asynccontextmanager

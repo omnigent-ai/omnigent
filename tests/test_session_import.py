@@ -257,10 +257,24 @@ def test_list_recent_opencode_sessions_without_store_skips_server(
 
 
 def test_opencode_user_store_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     assert local_import._opencode_user_store_exists() is False
     (tmp_path / "opencode").mkdir()
     (tmp_path / "opencode" / "opencode.db").write_bytes(b"")
+    assert local_import._opencode_user_store_exists() is True
+
+
+def test_opencode_user_store_exists_honours_opencode_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Discovery checks the same DB the import snapshots, even outside the data dir."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    custom = tmp_path / "elsewhere" / "custom.db"
+    monkeypatch.setenv("OPENCODE_DB", str(custom))
+    assert local_import._opencode_user_store_exists() is False
+    custom.parent.mkdir()
+    custom.write_bytes(b"")
     assert local_import._opencode_user_store_exists() is True
 
 
