@@ -63,3 +63,21 @@ def test_build_recon_opencode_config_shape(tmp_path: Path) -> None:
         "codemode": False,
     }
     assert config["plugins"] == [str(plugin_path)]
+
+
+def test_main_help_exits_zero_and_documents_model_flag(capsys: object) -> None:
+    import pytest
+
+    with pytest.raises(SystemExit) as exc_info:
+        from dev.opencode_v2_recon import main
+
+        main(["--help"])
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()  # type: ignore[attr-defined]
+    assert "--model" in captured.out
+
+
+def test_run_recon_is_importable_and_callable() -> None:
+    from dev.opencode_v2_recon import run_recon
+
+    assert callable(run_recon)
