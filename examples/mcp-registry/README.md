@@ -6,7 +6,8 @@ refreshes upstream credentials. Runners receive a catalog reference and tool sch
 
 The **registry** is administrator-owned configuration: service IDs, destinations,
 authentication and allowed tools/users. The **gateway** executes requests through
-the existing session MCP endpoint and its authentication and tool policies.
+a per-service `/v1/mcp/{service}` endpoint. An Omnigent policy adapter validates
+session context and applies request/response policies around the execution backend.
 
 See the [architecture overview](../../designs/MCP_REGISTRY_GATEWAY.md) for component
 ownership and the OAuth, launch, tool-call, refresh and credential-broker diagrams.
@@ -27,7 +28,7 @@ flowchart LR
   subgraph server[Omnigent server]
     catalog[Registry YAML]
     api[Catalog and account API]
-    gateway[Session MCP endpoint / gateway]
+    gateway[General MCP endpoint / policy adapter]
     policies[Existing tool call and result policies]
     store[Existing per-user CredentialStore]
     cipher[Vault Transit or KMS]
@@ -45,7 +46,7 @@ flowchart LR
   settings --> api
   settings --> oauth
   picker --> api
-  proxy -->|Session identity and tools/call| gateway
+  proxy -->|tools/call plus authenticated session context| gateway
   gateway -->|HTTPS with upstream access token| mcp
   gateway -->|Refresh when expiring| oauth
 ```
@@ -82,7 +83,7 @@ The field is specific to the OSS registry. It does not reinterpret hosted
 connection names or labels, and does not change the store interface. Deployments
 without the registry continue through the existing creation path.
 
-Native harnesses discover selected MCP tools through the session gateway and
+Native harnesses discover selected MCP tools through the per-service gateway and
 advertise them alongside built-in tools in their existing relay. Calls still
 use the gateway's authorization and tool policies; upstream credentials stay
 on the server.
@@ -102,7 +103,7 @@ sequenceDiagram
   Server->>Sandbox: Launch with session identity
   UI->>Server: First message
   Server->>Sandbox: Dispatch first turn
-  Sandbox->>Server: Session MCP tools/call
+  Sandbox->>Server: POST /v1/mcp/service + X-Omnigent-Session-Id
   Server->>Server: Validate tool and policies, resolve/refresh credential
   Server->>MCP: Call with server-held access token
   MCP-->>Server: Result
@@ -295,12 +296,12 @@ rejected. The administrator's allowlist always applies.
 ```mermaid
 sequenceDiagram
   participant H as Harness on local / remote / sandbox host
-  participant G as Omnigent session MCP gateway
+  participant G as Omnigent general MCP gateway / policy adapter
   participant P as Existing policy layer
   participant C as Encrypted credential store
   participant O as External OAuth provider
   participant M as External MCP server
-  H->>G: tools/call tracker__read_ticket + session authentication
+  H->>G: POST /v1/mcp/tracker: read_ticket + authenticated session context
   G->>P: Existing tool-call policy / approval
   P-->>G: Allow
   G->>G: Resolve trusted actor and check service and tool allowlists
@@ -321,12 +322,40 @@ sequenceDiagram
 The registry and gateway are enabled only when `OMNIGENT_MCP_REGISTRY` is configured.
 The picker appears only when the server advertises the `mcp` connection capability.
 Existing HTTP/stdio configurations keep their existing routing and behavior.
+Registry calls now use `POST /v1/mcp/{service}` with the required
+`X-Omnigent-Session-Id` header. The server validates access to that session; the
+header alone grants no authority. Sessionless gateway calls are not supported.
+The existing session proxy remains available for runtime tools and older runners.
 
 An embedding application can retain its own catalog, OAuth UI, session-selection
 metadata and remote gateway. This prototype does not replace embed host capabilities,
 rewrite session labels or require a hosted provider to adopt the OSS credential store.
 The `registry` transport is specific to services selected from this server's catalog;
 existing hosted connections must not be reinterpreted as registry IDs.
+
+### Bring your own gateway
+
+For a standard Streamable HTTP gateway, use its URL as an approved registry entry
+with the credential it expects. Omnigent applies policies before forwarding the
+call and again before returning the result. The external gateway owns downstream
+routing and credentials; it does not need to understand Omnigent sessions.
+
+For a proprietary gateway, implement `McpGatewayBackend` and pass it to
+`create_app(mcp_gateway_backend=...)`. The same `McpPolicyAdapter` protects both
+backends. See the [API extension contract](../../designs/MCP_REGISTRY_API.md#execution-extension-point).
+This does not replace catalog/account UI or implement enterprise token exchange.
+
+To inspect the gateway directly, use an authenticated client to POST to
+`/v1/mcp/tracker` with `X-Omnigent-Session-Id: <your-selected-session>`. Send
+`{"jsonrpc":"2.0","id":1,"method":"tools/list"}` and then a `tools/call` for
+`read_ticket` with `{"ticket_id":"TEST-123"}`. Wire tool names have no service
+prefix; the runner adds `tracker__` when exposing them to the harness.
+
+For policy checks, attach a request policy that denies `tracker__read_ticket` and
+confirm no upstream call runs. Change it to ASK, approve in the existing approval
+UI, and inspect the returned tool result. A result policy can replace or suppress
+that output. Result-review ASK withholds it; interactive result review is not
+implemented. A separate ambient MCP configuration is outside this gateway path.
 
 ## Prototype boundaries and tests
 
@@ -348,6 +377,10 @@ existing hosted connections must not be reinterpreted as registry IDs.
 ```bash
 uv run --no-sync pytest tests/server/test_mcp_registry.py \
   tests/server/integration/test_mcp_registry.py tests/spec/test_mcp_registry.py \
+  tests/server/integration/test_mcp_gateway.py \
+  tests/server/integration/test_mcp_gateway_auth.py \
+  tests/server/integration/test_mcp_gateway_http.py \
+  tests/runner/test_registry_mcp_gateway.py \
   tests/e2e/test_mcp_registry.py
 uv run --no-sync pytest tests/e2e_ui/sessions/test_mcp_registry_connections.py
 pnpm --dir web exec vitest run src/components/McpRegistry.test.tsx
@@ -358,3 +391,6 @@ regression test intercepts catalog/account APIs. The manual walkthrough addition
 exercises real Vault encryption, UI OAuth redirects, the Docker host, and a harness.
 Browser launch tests cover local-host and sandbox selections on desktop and mobile;
 the local-host integration also discovers and calls tools through `ProxyMcpManager`.
+Gateway tests exercise both the default backend and an injected backend, including
+request denial, approval, argument transforms, result filtering, trusted actor
+selection, session permissions and transport failures without replay.

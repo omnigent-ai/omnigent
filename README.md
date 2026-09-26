@@ -581,7 +581,8 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 
 ## Write your own agent
 
-For centrally managed remote tools and reusable account connections, see the
+For centrally managed remote tools, reusable account connections, and a gateway
+with session policies around built-in or external backends, see the
 [MCP registry and gateway prototype](examples/mcp-registry/README.md).
 
 An agent is a short YAML file: your prompt, your tools — local Python

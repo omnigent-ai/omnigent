@@ -84,6 +84,7 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
+from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -1319,6 +1320,7 @@ def create_app(
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     mcp_registry: Any | None = None,
+    mcp_gateway_backend: McpGatewayBackend | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     default_public_sessions: str | Callable[[], str] | None = None,
@@ -1829,6 +1831,7 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
     if host_store is not None:
@@ -3104,6 +3107,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sessions"],
+    )
+    from omnigent.server.mcp_policy_adapter import McpPolicyAdapter
+    from omnigent.server.routes.mcp_gateway import create_mcp_gateway_router
+
+    app.include_router(
+        create_mcp_gateway_router(
+            McpPolicyAdapter(conversation_store, agent_store, auth_provider, permission_store)
+        ),
+        prefix="/v1",
+        tags=["mcp_gateway"],
     )
     app.include_router(
         create_imports_router(

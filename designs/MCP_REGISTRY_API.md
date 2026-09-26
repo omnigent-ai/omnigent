@@ -121,40 +121,73 @@ request model, so clients must not depend on rejection of unsupported fields.
 Per-session tool restrictions are authored in the agent bundle, not edited by
 this API. Existing running sessions need a runner reload to see changed tools.
 
-## Gateway requests
+## Gateway requests and policy context
 
-`POST /v1/sessions/{session}/mcp` accepts JSON-RPC with
-`Content-Type: application/json`. It requires session edit access and uses
-existing tool-call/approval/result policies. `ProxyMcpManager` is the runner
-client; native harnesses expose the schemas through their existing MCP relay.
+`POST /v1/mcp/{service_id}` is the per-service JSON-RPC endpoint. Use
+`Content-Type: application/json`, normal Omnigent authentication, and the required
+`X-Omnigent-Session-Id` header. This header supplies policy context, not authority:
+the adapter validates session edit access, an active session, the selected service,
+service entitlements and tool allowlists. It resolves the trusted turn actor from
+server state, falling back to the authenticated caller. Caller-supplied identity
+does not select whose upstream credential is used.
 
-This session-scoped route is hidden from OpenAPI. It supports the tool subset
-below; it is not a standalone gateway login/discovery service for arbitrary MCP
-clients.
+The URL and execution backend are independent of sessions. The **Omnigent policy
+adapter still requires a session**; calls without one return 422. This prototype
+does not expose a sessionless execution path with weaker policy enforcement.
+Delegated runner credentials can access `/v1/mcp`; this does not grant access to
+catalog/account-management endpoints.
 
 | Method | Parameters | Result |
 | --- | --- | --- |
-| `initialize` | `{}` | Protocol `2024-11-05`, tools capability and `omnigent-mcp-proxy` server info. |
-| `tools/list` | `{}` | `{"tools": [...]}` with upstream schemas and names `service__tool`. |
-| `tools/call` | `{"name": "tracker__read_ticket", "arguments": {"ticket_id": "TEST-123"}}` | `{"content": [{"type": "text", "text": "..."}], "isError": false}`. |
+| `initialize` | `{}` | Protocol `2024-11-05`, tools capability and service-specific server info. |
+| `notifications/initialized` | None | HTTP 202. |
+| `tools/list` | `{}` | `{"tools": [...]}`; upstream names, filtered by registry and session allowlists. |
+| `tools/call` | `{"name": "read_ticket", "arguments": {"ticket_id": "TEST-123"}}` | MCP text content and `isError`. |
 
-Example invocation and response:
+Example request, with authentication supplied by the existing client:
 
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tracker__read_ticket","arguments":{"ticket_id":"TEST-123"}}}
+```http
+POST /v1/mcp/tracker
+Content-Type: application/json
+X-Omnigent-Session-Id: <session-id>
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_ticket","arguments":{"ticket_id":"TEST-123"}}}
 ```
 
 ```json
 {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Ticket TEST-123: ready"}],"isError":false}}
 ```
 
-Registry and session tool allowlists both apply. Disconnected/unavailable services
-are omitted from discovery. An RPC failure normally returns HTTP 200 with
-`{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"..."}}`.
-Authentication and content-type failures remain HTTP errors. Tool-policy approval
-can return the existing approval-required result; use the runner client to handle
-that flow. Call failures are not automatically retried. See the architecture doc
-for credential-safe diagnostics and refresh behavior.
+`ProxyMcpManager` reads the selected registry references from the session's loaded
+agent spec, discovers each service, and exposes `service__tool` to the harness.
+It removes that namespace for the per-service wire request. Native Claude still
+adds its relay prefix: `mcp__omnigent__service__tool`. Separate native service names
+could use this same gateway; naming is independent of credential ownership.
+
+`McpPolicyAdapter` wraps the backend with the existing `TOOL_CALL` and `TOOL_RESULT`
+policy handler. Request policies can allow, deny, transform arguments or ask for
+approval. Approval uses the existing `requestState` / `inputResponses` round trip;
+the reviewed arguments and call identity stay on the server. Result policies can
+allow, transform or suppress output. A result-phase ASK withholds the output;
+interactive result review is not implemented. Adding it requires a server-held
+pending result and an approval continuation that releases or discards that result
+without executing the upstream tool again. Pending results need bounded retention,
+identity binding and cancellation cleanup; restart recovery would require shared
+protected storage. Result filtering cannot undo a side effect already performed upstream.
+
+The existing `/v1/sessions/{session}/mcp` route remains for built-in tools, custom
+HTTP/stdio declarations and older runners. Its registry compatibility path uses
+the same execution backend and policy handler. New runners use the general route
+for registry tools and request only non-registry tools from the legacy route.
+No downstream deployment must migrate its existing custom MCP route to opt out.
+
+Unknown/unselected/disallowed services produce HTTP 403/404, and authentication
+or missing context produces HTTP 401/422. Invalid RPC arguments return `-32602`.
+Policy denials and upstream failures normally return HTTP 200 with a JSON-RPC
+`error` (`-32000`). Disconnected services surface discovery failures to the runner.
+Tool calls are not retried after transport failures: completion may be unknown.
+Approval continuation happens before execution and is distinct from replaying a
+failed upstream call. See the architecture doc for credential-safe diagnostics.
 
 ## Bring your own registry or gateway
 
@@ -163,28 +196,31 @@ for credential-safe diagnostics and refresh behavior.
 | External Streamable HTTP MCP gateway | Configure its URL as an approved `McpService` with a supported auth mode and tool allowlist. | Agree which token the gateway accepts and which downstream services it owns. |
 | External registry | Operator exports approved entries to registry YAML, or embedding code constructs `McpRegistryConfig` at startup. | Automated import, ID mapping, synchronization and revocation are not built in. File changes require restart. |
 | Existing hosted catalog and gateway | Keep the deployment's existing UI, selection metadata and routing. OSS registry support is opt-in. | Validate downstream patch/build compatibility. Existing connection labels are not automatically OSS IDs. |
-| Proprietary gateway or delegated identity | Existing deployment identity/connection code can supply an adapter. | No generic execution-backend protocol or token-exchange adapter is shipped here. |
+| Proprietary gateway | Inject `McpGatewayBackend`; the Omnigent policy adapter stays in front. | Implement and test the partner-specific client and identity contract. |
+| Delegated enterprise identity | Existing provider resolvers remain available. | Audience-specific/on-behalf-of token exchange is not implemented. |
 
 ```mermaid
 flowchart LR
   H[Local / remote / sandbox harness]
   subgraph server[Omnigent server]
     R[Approved registry snapshot]
-    G[Session gateway and policies]
+    G[Omnigent MCP policy adapter]
     C[Credential for the external gateway]
     R --> G
-    G --> C
+    B --> C
   end
   ER[External registry] -.->|Operator export / custom import| R
   H -->|Session-authenticated MCP| G
-  G -->|Streamable HTTP and gateway credential| X[Enterprise MCP gateway]
+  G <-->|Approved calls and returned results| B[McpGatewayBackend]
+  B -->|Streamable HTTP and gateway credential| X[Enterprise MCP gateway]
   X --> M1[Upstream MCP A]
   X --> M2[Upstream MCP B]
 ```
 
-The gateway URL represents a normal approved upstream to Omnigent. That gateway
-owns its downstream routing and credentials. Omnigent still applies its session
-policies. A login token is not forwarded automatically, and `resource` configuration
+The external gateway URL represents a normal approved upstream to Omnigent. That gateway
+owns its downstream routing and credentials. Session context terminates at the
+Omnigent adapter; the external gateway does not have to understand Omnigent
+sessions. Omnigent still applies its session policies. A login token is not forwarded automatically, and `resource` configuration
 does not implement an on-behalf-of exchange.
 
 ### Existing Python integration points
@@ -192,18 +228,45 @@ does not implement an on-behalf-of exchange.
 | Interface / class | Role and status |
 | --- | --- |
 | [`McpService`, `OAuthConfig`, `McpRegistryConfig`](../omnigent/server/mcp_registry.py) | Validated configuration models, suitable for constructing an approved snapshot. |
-| [`McpRegistry(config, store)`](../omnigent/server/mcp_registry.py) | Concrete catalog, credential and upstream executor. `create_app(mcp_registry=...)` injects it. It is not a registry/gateway provider protocol. |
+| [`McpRegistry(config, store)`](../omnigent/server/mcp_registry.py) | Concrete approved catalog and credential resolver, injected with `create_app(mcp_registry=...)`. No live catalog provider protocol yet. |
+| [`McpGatewayBackend`, `RegistryMcpBackend`](../omnigent/server/mcp_gateway.py) | Importable execution protocol and default HTTP backend; inject with `create_app(mcp_gateway_backend=...)`. |
+| [`McpPolicyAdapter`](../omnigent/server/mcp_policy_adapter.py) | Resolves trusted session context and applies existing policies around either backend. |
 | [`ConnectionHooks`, `create_connection_router`](../omnigent/server/routes/connections_base.py) | Existing provider protocol and shared OAuth route factory. `McpOAuthHooks` implements the MCP flow. |
 | [`AuthProvider`](../omnigent/server/auth.py) | Existing identity abstraction; inject with `create_app(auth_provider=...)`. |
 | [`CredentialStore`](../omnigent/stores/credential_store/sqlalchemy_store.py) | Existing encrypted grant persistence. The resolver owns refresh/exchange, the store owns persistence. |
 
-If a partner needs a live external catalog or proprietary executor, the proposed
-next split is a **catalog provider** (`list_services`, `get_service` for a trusted
-user/workspace) and a **tool executor** (`list_tools`, `call_tool` for an approved
-service and trusted actor). These are discussion boundaries, not importable base
-classes yet. Keep session authorization and policy checks in the existing server
-layer, regardless of the chosen backend. Avoid freezing an SDK around the current
-combined implementation before learning the partner's requirements.
+### Execution extension point
+
+The following protocol is implemented, with MCP SDK result types:
+
+```python
+class McpGatewayBackend(Protocol):
+    async def list_tools(self, service: McpService, user_id: str) -> list[Tool]: ...
+
+    async def call_tool(
+        self, service: McpService, user_id: str, tool: str, arguments: dict[str, Any]
+    ) -> CallToolResult: ...
+```
+
+Supply an instance with `create_app(..., mcp_registry=catalog,
+mcp_gateway_backend=partner_backend)`. A backend receives a server-approved
+service, trusted user ID and policy-transformed arguments; it receives no
+`Conversation`, session headers or browser credential. Workspace context remains
+the existing request-scoped workspace. Backend code owns its upstream authentication
+and should raise credential-safe `ConnectionError` or `McpUpstreamError` failures;
+unexpected failures are sanitized by the adapter. Cancellation should propagate,
+and implementations must not silently replay non-idempotent calls.
+
+The default backend resolves credentials and refresh through `McpRegistry`.
+A standard external HTTP MCP gateway needs only registry configuration; a
+proprietary client can implement this protocol. The catalog and Settings connection
+flows remain registry-owned: backend injection alone does not replace account UI
+or add a live external registry. This is a prototype extension point for partner
+feedback, not a versioned stable SDK.
+
+For a future live registry, the proposed boundary remains a **catalog provider**
+(`list_services`, `get_service` for a trusted user/workspace). That interface is
+not implemented. Session authorization and policy checks stay in Omnigent.
 
 Useful feedback: who owns service IDs and entitlements, how revocations propagate,
 which issuer/audience/scopes the gateway accepts, whether calls need end-user

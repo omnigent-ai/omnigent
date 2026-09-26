@@ -16,7 +16,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -10050,6 +10050,7 @@ async def _handle_mcp_tools_call(
     *,
     actor: dict[str, str] | None = None,
     request: Request | None = None,
+    execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -10150,6 +10151,8 @@ async def _handle_mcp_tools_call(
             state = json.loads(request_state_str)  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001
             return _mcp_error_response(rpc_id, -32000, "Invalid requestState: not valid JSON")
+        if not isinstance(state, dict):
+            return _mcp_error_response(rpc_id, -32000, "Invalid requestState")
         if state.get("session_id") != session_id:
             # Reject cross-session replay.
             return _mcp_error_response(rpc_id, -32000, "requestState session mismatch")
@@ -10196,7 +10199,11 @@ async def _handle_mcp_tools_call(
             approval = input_responses.get(elicitation_id_from_state) or {}
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
-            _pending = _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
+            _pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
+            identity = (session_id, namespaced_name, (actor or {}).get("run_as"))
+            if _pending is not None and _pending.mcp_call_identity not in (None, identity):
+                return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
+            _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
             # Approval applies to the stored call and its reviewed transform.
             # Older pending entries use the re-evaluated transform.
             if _pending is not None and _pending.reviewed_arguments is not None:
@@ -10270,6 +10277,7 @@ async def _handle_mcp_tools_call(
                 from_mcp=True,
                 reviewed_arguments=arguments,
                 transformed_arguments=cast("dict[str, object] | None", call_result.data),
+                mcp_call_identity=(session_id, namespaced_name, (actor or {}).get("run_as")),
             )
             # The client carries identifiers; reviewed arguments stay on the server.
             request_state_payload: dict[str, Any] = {
@@ -10318,7 +10326,9 @@ async def _handle_mcp_tools_call(
             ),
             None,
         )
-    if registry_config is not None:
+    if execute_tool is not None:
+        exec_data = await execute_tool(arguments)
+    elif registry_config is not None:
         from omnigent.server.registry_gateway import execute_registry_tool
 
         exec_data = await execute_registry_tool(
@@ -10483,7 +10493,7 @@ async def _handle_mcp_tools_call(
         session_id, spec, conversation_store, conv, result_ctx
     )
 
-    if result_policy.set_labels:
+    if result_policy.set_labels and result_policy.action != PolicyAction.ASK:
         await asyncio.to_thread(engine.apply_label_writes, result_policy.set_labels)
 
     _logger.debug(
@@ -10495,7 +10505,11 @@ async def _handle_mcp_tools_call(
         extra={"session_id": session_id},
     )
 
-    if result_policy.action == PolicyAction.DENY:
+    if result_policy.action == PolicyAction.ASK and (
+        execute_tool is not None or registry_config is not None
+    ):
+        output = "[Result withheld: MCP gateway result-review approval is not supported]"
+    elif result_policy.action == PolicyAction.DENY:
         output = f"[Result suppressed by policy: {result_policy.reason or 'no reason given'}]"
     elif result_policy.data is not None:
         # Policy returned transformed output (e.g. PII-redacted content).

@@ -461,7 +461,7 @@ def register_agent_routes(
                 runner_router,
             )
             registry = getattr(request.app.state, "mcp_registry", None)
-            if registry is not None:
+            if registry is not None and not params.get("_omnigent_skip_registry"):
                 import json
 
                 from omnigent.server.registry_gateway import registry_tools

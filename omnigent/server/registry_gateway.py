@@ -9,6 +9,7 @@ from fastapi import Request
 
 from omnigent.entities import Conversation
 from omnigent.server.auth import RESERVED_USER_LOCAL, local_single_user_enabled
+from omnigent.server.mcp_gateway import gateway_backend
 from omnigent.server.mcp_registry import McpRegistry, McpUpstreamError
 from omnigent.server.routes.connections_base import ConnectionError
 from omnigent.spec.types import AgentSpec, MCPServerConfig
@@ -37,9 +38,14 @@ async def registry_tools(
         if config.transport != "registry":
             continue
         try:
-            definitions = await registry.execute(config.name, user, request.app.state)
+            service = registry.service(config.name, user)
+            definitions = await gateway_backend(registry, request.app.state).list_tools(
+                service, user
+            )
             for tool in definitions:
-                if config.tools is None or tool.name in config.tools:
+                if tool.name in service.tools and (
+                    config.tools is None or tool.name in config.tools
+                ):
                     tools.append(
                         {
                             **tool.model_dump(by_alias=True, exclude_none=True),
@@ -68,8 +74,12 @@ async def execute_registry_tool(
         tool = name[len(config.name) + 2 :]
         if config.tools is not None and tool not in config.tools:
             raise ConnectionError("Tool is not enabled for this session")
-        result = await registry.execute(
-            config.name, registry_user(actor), request.app.state, tool=tool, arguments=arguments
+        user = registry_user(actor)
+        service = registry.service(config.name, user)
+        if tool not in service.tools:
+            raise ConnectionError("Tool is not allowed by the MCP registry")
+        result = await gateway_backend(registry, request.app.state).call_tool(
+            service, user, tool, arguments
         )
         output = "\n".join(
             getattr(block, "text", None) or block.model_dump_json() for block in result.content

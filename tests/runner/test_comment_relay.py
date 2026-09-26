@@ -501,6 +501,7 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
             *,
             json: dict[str, Any],
             timeout: float = 60.0,
+            headers: dict[str, str] | None = None,
         ) -> httpx.Response:
             """Record the request and return a valid MCP tools/call response.
 
@@ -1099,7 +1100,7 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
     requests: list[str] = []
 
     class GatewayClient(_SwitchableServerClient):
-        """Return external tool schemas only through the session gateway."""
+        """Return per-service schemas for registry tools and session schemas otherwise."""
 
         async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
             """Simulate discovery success or a temporary gateway outage."""
@@ -1113,7 +1114,7 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
                     "result": {
                         "tools": [
                             {
-                                "name": "github__get_me",
+                                "name": "get_me" if transport == "registry" else "github__get_me",
                                 "description": "Read the connected profile",
                                 "inputSchema": {"type": "object", "properties": {}},
                             }
@@ -1150,7 +1151,11 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
                 names = _relay_tool_names(relay_file)
                 assert ("github__get_me" in names) is not unavailable
                 assert "list_comments" in names
-                assert requests == [f"/v1/sessions/{session_id}/mcp"]
+                assert requests == [
+                    "/v1/mcp/github"
+                    if transport == "registry"
+                    else f"/v1/sessions/{session_id}/mcp"
+                ]
 
                 await _launch_bridged(client, session_id)
                 assert len(requests) == 1
