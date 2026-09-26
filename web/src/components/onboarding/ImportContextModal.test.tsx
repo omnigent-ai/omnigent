@@ -30,64 +30,102 @@ function renderModal(
   );
 }
 
-function switchTab(harness: string) {
-  const tab = screen.getByRole("tab", { name: harness });
+function selectTab(tab: HTMLElement) {
   fireEvent.mouseDown(tab);
   fireEvent.focus(tab);
   fireEvent.click(tab);
 }
 
-function panel() {
-  return within(screen.getByRole("tabpanel"));
+function harnessTabs() {
+  return within(screen.getByRole("tablist", { name: "Harness" })).getAllByRole("tab");
 }
 
-function groupHeadings() {
-  return panel()
-    .queryAllByRole("heading", { level: 3 })
-    .map((h) => h.textContent);
+function switchHarness(name: string) {
+  selectTab(within(screen.getByRole("tablist", { name: "Harness" })).getByRole("tab", { name }));
+}
+
+/** Asset-type tab labels ("MCPs 4", …) in the active harness. */
+function assetTabNames() {
+  const list = screen.queryByRole("tablist", { name: "Asset type" });
+  return list
+    ? within(list)
+        .getAllByRole("tab")
+        .map((t) => t.textContent)
+    : [];
+}
+
+function switchAsset(label: string) {
+  const list = screen.getByRole("tablist", { name: "Asset type" });
+  selectTab(within(list).getByRole("tab", { name: new RegExp(`^${label}`) }));
+}
+
+function checkbox(name: string) {
+  return screen.getByRole("checkbox", { name });
 }
 
 describe("ImportContextModal – harness tabs", () => {
   it("lists one tab per detected harness and opens the first", () => {
     renderModal();
 
-    const tabs = screen.getAllByRole("tab");
+    const tabs = harnessTabs();
+    expect(tabs.map((t) => t.getAttribute("aria-selected"))).toEqual(["true", "false", "false"]);
     expect(screen.getByRole("tab", { name: "Claude Code" })).toBe(tabs[0]);
     expect(screen.getByRole("tab", { name: "Codex" })).toBe(tabs[1]);
     expect(screen.getByRole("tab", { name: "Cursor" })).toBe(tabs[2]);
-    expect(tabs[0]).toHaveAttribute("data-state", "active");
     expect(screen.getByText("Your imports are ready")).toBeTruthy();
   });
 
-  it("shows the Claude Code credential and only Claude assets, grouped", () => {
+  it("shows the credential line and asset-type tabs with counts", () => {
     renderModal();
 
-    expect(panel().getByText("Databricks AI Gateway")).toBeTruthy();
-    expect(panel().getAllByText("Imported")).toHaveLength(1);
-    expect(groupHeadings()).toEqual(["MCPs 4", "Skills 10", "Plugins 2"]);
+    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
+    expect(screen.getAllByText("Imported")).toHaveLength(1);
+    expect(assetTabNames()).toEqual(["MCPs 4", "Skills 10", "Plugins 2"]);
 
-    expect(panel().getByRole("checkbox", { name: "databricks-v2" })).toBeTruthy();
-    expect(panel().getByRole("checkbox", { name: "$create-kafka-topic" })).toBeTruthy();
-    expect(panel().getByRole("checkbox", { name: "frontend-toolkit" })).toBeTruthy();
-    expect(panel().queryByRole("checkbox", { name: "confluence" })).toBeNull();
+    // MCPs is selected first and lists only Claude's servers.
+    expect(checkbox("databricks-v2")).toHaveAttribute("data-state", "checked");
+    expect(screen.getByText("18 tools")).toBeTruthy();
+    expect(screen.getByText("1 tool")).toBeTruthy();
+    expect(screen.queryByRole("checkbox", { name: "confluence" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "$create-system" })).toBeNull();
 
-    for (const cb of panel().getAllByRole("checkbox")) {
-      expect(cb).toHaveAttribute("data-state", "checked");
-    }
-    expect(panel().getByText("18 tools")).toBeTruthy();
-    expect(panel().getByText("1 tool")).toBeTruthy();
-    expect(panel().getByText("12 skills")).toBeTruthy();
+    switchAsset("Plugins");
+    expect(checkbox("frontend-toolkit")).toHaveAttribute("data-state", "checked");
+    expect(screen.getByText("12 skills")).toBeTruthy();
   });
 
-  it("switches to Codex and hides the empty Plugins group", () => {
+  it("switches to Codex and omits the empty Plugins type", () => {
     renderModal();
-    switchTab("Codex");
+    switchHarness("Codex");
 
-    expect(panel().getByText("Databricks (dbc-a5d4177a-49dc)")).toBeTruthy();
-    expect(groupHeadings()).toEqual(["MCPs 2", "Skills 3"]);
-    expect(panel().getByRole("checkbox", { name: "github" })).toBeTruthy();
-    expect(panel().getByRole("checkbox", { name: "$ship" })).toBeTruthy();
-    expect(panel().queryByRole("checkbox", { name: "databricks-v2" })).toBeNull();
+    expect(screen.getByText("Databricks (dbc-a5d4177a-49dc)")).toBeTruthy();
+    expect(assetTabNames()).toEqual(["MCPs 2", "Skills 3"]);
+    expect(checkbox("github")).toBeTruthy();
+    expect(screen.queryByRole("checkbox", { name: "databricks-v2" })).toBeNull();
+  });
+});
+
+describe("ImportContextModal – select all", () => {
+  it("reflects partial selection and toggles the whole list", () => {
+    renderModal();
+    switchAsset("Skills");
+
+    const all = checkbox("Select all");
+    expect(all).toHaveAttribute("data-state", "checked");
+    expect(screen.getByText("10 of 10 selected")).toBeTruthy();
+
+    fireEvent.click(checkbox("$create-kafka-topic"));
+    expect(all).toHaveAttribute("data-state", "indeterminate");
+    expect(screen.getByText("9 of 10 selected")).toBeTruthy();
+
+    // Clicking an indeterminate select-all selects everything again.
+    fireEvent.click(all);
+    expect(all).toHaveAttribute("data-state", "checked");
+    expect(checkbox("$create-kafka-topic")).toHaveAttribute("data-state", "checked");
+
+    fireEvent.click(all);
+    expect(all).toHaveAttribute("data-state", "unchecked");
+    expect(screen.getByText("0 of 10 selected")).toBeTruthy();
   });
 });
 
@@ -97,18 +135,18 @@ describe("ImportContextModal – confirm with partial selection", () => {
     const onOpenChange = vi.fn();
     renderModal(MOCK_IMPORT_CONTEXT, { onConfirm, onOpenChange });
 
-    fireEvent.click(panel().getByRole("checkbox", { name: "$create-kafka-topic" }));
-    fireEvent.click(panel().getByRole("checkbox", { name: "dev-productivity" }));
+    switchAsset("Skills");
+    fireEvent.click(checkbox("$create-kafka-topic"));
+    switchAsset("Plugins");
+    fireEvent.click(checkbox("dev-productivity"));
 
-    switchTab("Cursor");
-    fireEvent.click(panel().getByRole("checkbox", { name: "confluence" }));
+    switchHarness("Cursor");
+    fireEvent.click(checkbox("confluence"));
 
-    // Returning to a tab shows the earlier choice.
-    switchTab("Claude Code");
-    expect(panel().getByRole("checkbox", { name: "dev-productivity" })).toHaveAttribute(
-      "data-state",
-      "unchecked",
-    );
+    // Returning to a harness and type shows the earlier choice.
+    switchHarness("Claude Code");
+    switchAsset("Plugins");
+    expect(checkbox("dev-productivity")).toHaveAttribute("data-state", "unchecked");
 
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
 
@@ -127,10 +165,10 @@ describe("ImportContextModal – empty states", () => {
   it("shows the empty state for a harness with a credential but no assets", () => {
     renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [], skills: [], plugins: [] });
 
-    expect(screen.getAllByRole("tab")).toHaveLength(3);
-    expect(panel().getByText("Databricks AI Gateway")).toBeTruthy();
-    expect(panel().getByText("No MCPs, skills, or plugins detected")).toBeTruthy();
-    expect(groupHeadings()).toEqual([]);
+    expect(harnessTabs()).toHaveLength(3);
+    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
+    expect(screen.getByText("No MCPs, skills, or plugins detected")).toBeTruthy();
+    expect(assetTabNames()).toEqual([]);
   });
 
   it("shows a single message and no tabs when nothing was detected", () => {
@@ -148,12 +186,9 @@ describe("ImportContextModal – selection reset on reopen", () => {
   it("resets all checkboxes to checked after close then reopen", () => {
     const { rerender } = renderModal();
 
-    switchTab("Cursor");
-    fireEvent.click(panel().getByRole("checkbox", { name: "confluence" }));
-    expect(panel().getByRole("checkbox", { name: "confluence" })).toHaveAttribute(
-      "data-state",
-      "unchecked",
-    );
+    switchHarness("Cursor");
+    fireEvent.click(checkbox("confluence"));
+    expect(checkbox("confluence")).toHaveAttribute("data-state", "unchecked");
 
     // Close the modal (Radix unmounts ImportContextBody, discarding state).
     rerender(
@@ -173,11 +208,8 @@ describe("ImportContextModal – selection reset on reopen", () => {
       />,
     );
 
-    switchTab("Cursor");
-    expect(panel().getByRole("checkbox", { name: "confluence" })).toHaveAttribute(
-      "data-state",
-      "checked",
-    );
+    switchHarness("Cursor");
+    expect(checkbox("confluence")).toHaveAttribute("data-state", "checked");
   });
 });
 
@@ -208,14 +240,8 @@ describe("ImportContextModal – checkbox identity", () => {
 
     fireEvent.click(screen.getByText("plugin:foo"));
 
-    expect(screen.getByRole("checkbox", { name: "plugin-foo" })).toHaveAttribute(
-      "data-state",
-      "checked",
-    );
-    expect(screen.getByRole("checkbox", { name: "plugin:foo" })).toHaveAttribute(
-      "data-state",
-      "unchecked",
-    );
+    expect(checkbox("plugin-foo")).toHaveAttribute("data-state", "checked");
+    expect(checkbox("plugin:foo")).toHaveAttribute("data-state", "unchecked");
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
     expect(onConfirm).toHaveBeenCalledWith({
       mcps: ["cursor:plugin-foo"],
