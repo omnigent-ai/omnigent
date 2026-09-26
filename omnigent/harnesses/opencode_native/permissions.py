@@ -102,6 +102,52 @@ def parse_permission_request(data: _JsonMapping) -> OpenCodePermissionRequest | 
     )
 
 
+_PATH_ACTIONS = frozenset({"read", "edit", "external_directory"})
+_PATTERN_ACTIONS = frozenset({"glob", "grep"})
+# Actions whose single resource is the operand, keyed by the argument name policies read.
+_SINGLE_RESOURCE_ARGUMENT = {
+    "webfetch": "url",
+    "websearch": "query",
+    "skill": "skill",
+    "subagent": "agent",
+}
+
+
+def policy_arguments(request: OpenCodePermissionRequest) -> _JsonObject:
+    """
+    Build policy ``data.arguments`` for a v2 permission request.
+
+    :param request: The parsed permission request.
+    :returns: Action-specific arguments, e.g. ``{"command": "ls"}`` for ``shell``.
+    """
+    action = request.action or ""
+    resources = request.resources
+    first = resources[0] if resources else None
+    if action == "shell":
+        return {"command": "\n".join(resources)} if resources else {}
+    if action in _PATH_ACTIONS:
+        if first is None:
+            return {}
+        arguments: _JsonObject = {"path": first}
+        if len(resources) > 1:
+            arguments["paths"] = list(resources)
+        return arguments
+    if action in _PATTERN_ACTIONS:
+        if first is None:
+            return {}
+        arguments = {"pattern": first}
+        search_path = request.metadata.get("path")
+        if isinstance(search_path, str) and search_path:
+            arguments["path"] = search_path
+        return arguments
+    key = _SINGLE_RESOURCE_ARGUMENT.get(action)
+    if key is not None:
+        return {key: first} if first is not None else {}
+    if resources and resources != ["*"]:
+        return {"resources": list(resources)}
+    return {}
+
+
 def normalize_for_policy(
     request: OpenCodePermissionRequest,
     *,
@@ -112,57 +158,34 @@ def normalize_for_policy(
     Build an Omnigent policy-evaluation input from a permission request.
 
     The shape mirrors what the codex-native policy hook posts to
-    ``/v1/sessions/{id}/policies/evaluate`` — an action name plus the
-    concrete command / path / url being acted on, so configured policies
-    can reason about the operation.
+    ``/v1/sessions/{id}/policies/evaluate`` — an action name plus
+    ``arguments`` built per-action from the v2 ``resources`` list, so
+    configured policies can reason about the operation.
 
     :param request: The normalized OpenCode permission request.
     :param omnigent_session_id: Owning Omnigent conversation id.
     :param workspace: Session working directory, when known.
     :returns: A flat dict suitable for policy evaluation.
     """
-    command, path, url = _extract_resource_fields(request)
+    arguments = policy_arguments(request)
+    command = arguments.get("command")
+    path = arguments.get("path")
+    url = arguments.get("url")
     return {
         "harness": OPENCODE_NATIVE_HARNESS,
         "action": request.action,
-        "command": command,
-        "path": path,
-        "url": url,
+        "arguments": arguments,
+        "resources": list(request.resources),
+        "command": command if isinstance(command, str) else None,
+        "path": path if isinstance(path, str) else None,
+        "url": url if isinstance(url, str) else None,
         "working_directory": workspace,
         "opencode_session_id": request.session_id,
         "omnigent_session_id": omnigent_session_id,
         "request_id": request.request_id,
+        "tool_call_id": request.tool_call_id,
         "metadata": request.metadata,
     }
-
-
-def _extract_resource_fields(
-    request: OpenCodePermissionRequest,
-) -> tuple[str | None, str | None, str | None]:
-    """
-    Pull command / path / url out of a permission request's resources.
-
-    :param request: The normalized permission request.
-    :returns: ``(command, path, url)``; each ``None`` when not present.
-    """
-    command: str | None = None
-    path: str | None = None
-    url: str | None = None
-    candidates: list[_JsonMapping] = [request.metadata]
-    for resource in request.resources:
-        if isinstance(resource, Mapping):
-            candidates.append(resource)
-    for source in candidates:
-        if command is None:
-            value = source.get("command")
-            command = value if isinstance(value, str) and value else command
-        if path is None:
-            value = source.get("path") or source.get("filePath") or source.get("file")
-            path = value if isinstance(value, str) and value else path
-        if url is None:
-            value = source.get("url")
-            url = value if isinstance(value, str) and value else url
-    return command, path, url
 
 
 def map_verdict_to_decision(verdict: _JsonMapping | None) -> PolicyDecision:

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-# normalize_for_policy's v2 resource-shape test is rewritten in Task 48.
-from omnigent.harnesses.opencode_native.permissions import (  # noqa: F401
+import pytest
+
+from omnigent.harnesses.opencode_native.permissions import (
     OPENCODE_NATIVE_HARNESS,
     decision_to_reply,
     map_verdict_to_decision,
@@ -104,3 +105,63 @@ def test_reply_body() -> None:
         "reply": "reject",
         "message": "blocked by policy",
     }
+
+
+@pytest.mark.parametrize(
+    ("action", "resources", "metadata", "expected"),
+    [
+        ("shell", ["git status", "rm -rf x"], {}, {"command": "git status\nrm -rf x"}),
+        ("read", ["src/a.py"], {}, {"path": "src/a.py"}),
+        (
+            "edit",
+            ["a.py", "b.py"],
+            {"filepath": "a.py, b.py"},
+            {"path": "a.py", "paths": ["a.py", "b.py"]},
+        ),
+        ("external_directory", ["/etc/*"], {}, {"path": "/etc/*"}),
+        ("grep", ["secret"], {"path": "src"}, {"pattern": "secret", "path": "src"}),
+        ("glob", ["**/*.py"], {"path": None}, {"pattern": "**/*.py"}),
+        ("webfetch", ["https://x.test"], {"url": "https://x.test"}, {"url": "https://x.test"}),
+        ("websearch", ["opencode v2"], {}, {"query": "opencode v2"}),
+        ("skill", ["deploy"], {}, {"skill": "deploy"}),
+        ("subagent", ["explore"], {}, {"agent": "explore"}),
+        ("omnigent_sys_session_list", ["*"], {}, {}),
+        ("opencode_read_mcp_resource", ["srv:file://x"], {}, {"resources": ["srv:file://x"]}),
+    ],
+)
+def test_normalize_for_policy_builds_action_arguments(
+    action: str, resources: list[str], metadata: dict[str, object], expected: dict[str, object]
+) -> None:
+    req = parse_permission_request(
+        {
+            "id": "per_1",
+            "sessionID": "ses_1",
+            "action": action,
+            "resources": resources,
+            "metadata": metadata,
+            "source": {"type": "tool", "messageID": "msg_1", "id": "call_9"},
+        }
+    )
+    assert req is not None
+    normalized = normalize_for_policy(req, omnigent_session_id="conv_1", workspace="/repo")
+    assert normalized["arguments"] == expected
+    assert normalized["action"] == action
+    assert normalized["resources"] == resources
+    assert normalized["tool_call_id"] == "call_9"
+    assert normalized["harness"] == OPENCODE_NATIVE_HARNESS
+    assert normalized["working_directory"] == "/repo"
+    assert normalized["omnigent_session_id"] == "conv_1"
+    assert normalized["opencode_session_id"] == "ses_1"
+
+
+def test_normalize_for_policy_keeps_flat_command_path_url() -> None:
+    """The flat keys stay for callers that predate ``arguments``."""
+    shell = parse_permission_request({"id": "p", "action": "shell", "resources": ["ls"]})
+    read = parse_permission_request({"id": "p", "action": "read", "resources": ["a.py"]})
+    fetch = parse_permission_request({"id": "p", "action": "webfetch", "resources": ["https://u"]})
+    assert shell and read and fetch
+    assert normalize_for_policy(shell, omnigent_session_id="c", workspace=None)["command"] == "ls"
+    assert normalize_for_policy(read, omnigent_session_id="c", workspace=None)["path"] == "a.py"
+    assert (
+        normalize_for_policy(fetch, omnigent_session_id="c", workspace=None)["url"] == "https://u"
+    )
