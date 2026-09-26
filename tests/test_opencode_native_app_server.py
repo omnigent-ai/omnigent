@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -293,6 +294,54 @@ async def test_start_launches_stdio_server_with_stdin_pipe(
     assert started["env"]["OPENCODE_DB"] == str(tmp_path / "opencode.db")
     assert server.process is not None
     assert server.process.pid == 4242
+
+
+async def test_start_captures_stderr_in_bridge_dir_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Boot failures need a log: stderr goes to a fresh 0600 file in the bridge dir."""
+    server = _server(monkeypatch, tmp_path)
+    log_path = tmp_path / appsrv.OPENCODE_SERVE_LOG_NAME
+    log_path.write_text("previous launch\n", encoding="utf-8")
+    started: dict[str, Any] = {}
+
+    def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
+        started.update(kwargs)
+        kwargs["stderr"].write(b"booting\n")
+        return _FakeProc()
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    await server.start()
+    assert started["stdout"] == subprocess.DEVNULL
+    assert Path(started["stderr"].name) == log_path
+    assert log_path.stat().st_mode & 0o777 == 0o600
+    await server.close()
+    assert started["stderr"].closed
+    assert log_path.read_bytes() == b"booting\n"
+
+
+async def test_start_closes_stderr_log_when_readiness_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = _server(monkeypatch, tmp_path)
+    started: dict[str, Any] = {}
+
+    def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
+        started.update(kwargs)
+        return _FakeProc()
+
+    async def failing_wait(self: OpenCodeNativeServer) -> None:
+        raise RuntimeError("opencode serve did not become ready")
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", failing_wait)
+    with pytest.raises(RuntimeError):
+        await server.start()
+    assert started["stderr"].closed
 
 
 async def test_start_closes_process_when_readiness_is_cancelled(

@@ -36,6 +36,7 @@ import socket
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import BinaryIO
 
 import httpx
 from packaging.version import InvalidVersion, Version
@@ -99,6 +100,8 @@ _ENV_OPENCODE_DENYLIST = frozenset(
 )
 # How long a ``--stdio`` server gets to exit after its stdin closes.
 _STDIN_CLOSE_GRACE_S = 3.0
+# ``opencode serve`` stderr, kept in the bridge dir so boot failures can be diagnosed.
+OPENCODE_SERVE_LOG_NAME = "opencode-serve.log"
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 
@@ -382,6 +385,8 @@ class OpenCodeNativeServer:
         self.port: int | None = port
         self.process: subprocess.Popen[bytes] | None = None
         self.version: str | None = None
+        self.log_path = bridge_dir / OPENCODE_SERVE_LOG_NAME
+        self._log_file: BinaryIO | None = None
 
     @property
     def base_url(self) -> str:
@@ -450,21 +455,42 @@ class OpenCodeNativeServer:
             self.workspace,
             self.xdg_data_home,
         )
-        self.process = subprocess.Popen(
-            argv,
-            cwd=str(self.workspace),
-            env=self.env,
-            # ``--stdio`` serves until stdin closes; keep the pipe open.
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        self._log_file = self._open_log()
+        try:
+            self.process = subprocess.Popen(
+                argv,
+                cwd=str(self.workspace),
+                env=self.env,
+                # ``--stdio`` serves until stdin closes; keep the pipe open.
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._log_file,
+            )
+        except BaseException:
+            self._close_log()
+            raise
         try:
             await self._wait_until_ready()
         except BaseException:
             # No caller owns the child until startup succeeds.
             await self.close()
             raise
+
+    def _open_log(self) -> BinaryIO:
+        """Open the stderr log ``0600``, truncated so it holds only this launch."""
+
+        def _private_opener(path: str, flags: int) -> int:
+            fd = os.open(path, flags, 0o600)
+            os.fchmod(fd, 0o600)
+            return fd
+
+        return open(self.log_path, "wb", opener=_private_opener)
+
+    def _close_log(self) -> None:
+        log_file, self._log_file = self._log_file, None
+        if log_file is not None:
+            with contextlib.suppress(OSError):
+                log_file.close()
 
     async def _wait_until_ready(self, *, attempts: int = 60, delay: float = 0.5) -> None:
         """
@@ -488,6 +514,7 @@ class OpenCodeNativeServer:
                 if self.process is not None and self.process.poll() is not None:
                     raise RuntimeError(
                         f"opencode serve exited early with code {self.process.returncode}"
+                        f" (see {self.log_path})"
                     )
                 try:
                     response = await client.get("/api/info")
@@ -501,7 +528,9 @@ class OpenCodeNativeServer:
                         raise RuntimeError("opencode serve rejected the per-session password")
                     last_error = f"HTTP {response.status_code}"
                 await asyncio.sleep(delay)
-        raise RuntimeError(f"opencode serve did not become ready: {last_error}")
+        raise RuntimeError(
+            f"opencode serve did not become ready: {last_error} (see {self.log_path})"
+        )
 
     def _record_info(self, response: httpx.Response) -> None:
         """
@@ -538,6 +567,7 @@ class OpenCodeNativeServer:
         """Stop the server: close stdin (graceful ``--stdio`` exit), then escalate."""
         process = self.process
         if process is None:
+            self._close_log()
             return
         if process.stdin is not None:
             with contextlib.suppress(OSError):
@@ -553,6 +583,7 @@ class OpenCodeNativeServer:
                     process.kill()
                     await asyncio.to_thread(process.wait)
         self.process = None
+        self._close_log()
 
 
 def client_for_state(

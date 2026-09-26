@@ -122,4 +122,4 @@ replays the history as a text preamble instead.
 - *Needs auth / auth-shaped turn error*: run `opencode auth login` on the host.
 - Diagnostics: see [harness-diagnostics.md](harness-diagnostics.md). The
   per-conversation bridge directory holds `opencode.json`, the policy plugin, and
-  server logs.
+  `opencode-serve.log` (the server's stderr from the latest launch).
