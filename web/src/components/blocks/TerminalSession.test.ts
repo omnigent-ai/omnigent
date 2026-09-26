@@ -15,6 +15,7 @@ import {
   applyTerminalCopy,
   decodeTerminalClipboardBase64,
   hadRecentTerminalInput,
+  isComposingPrintableKey,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
@@ -366,6 +367,34 @@ describe("terminalKeyEventPayload", () => {
     expect(
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
+  });
+});
+
+describe("isComposingPrintableKey", () => {
+  const mk = (init: KeyboardEventInit) => new KeyboardEvent("keydown", init);
+
+  it("matches a printable single-character key (the Shift+letter trigger)", () => {
+    expect(isComposingPrintableKey(mk({ key: "K", shiftKey: true }))).toBe(true);
+    expect(isComposingPrintableKey(mk({ key: "a" }))).toBe(true);
+  });
+
+  it("ignores the IME-processing keyCode 229 (a romaji keystroke keeps composing)", () => {
+    // keyCode can't be set through the constructor init dict, so stub it.
+    expect(isComposingPrintableKey({ key: "k", keyCode: 229 } as unknown as KeyboardEvent)).toBe(
+      false,
+    );
+  });
+
+  it("ignores modifier and named keys via the single-character check", () => {
+    expect(isComposingPrintableKey(mk({ key: "Shift" }))).toBe(false);
+    expect(isComposingPrintableKey(mk({ key: "Enter" }))).toBe(false);
+    expect(isComposingPrintableKey(mk({ key: "ArrowLeft" }))).toBe(false);
+  });
+
+  it("ignores Ctrl/Alt/Meta chords (commands, not text entry)", () => {
+    expect(isComposingPrintableKey(mk({ key: "c", ctrlKey: true }))).toBe(false);
+    expect(isComposingPrintableKey(mk({ key: "a", metaKey: true }))).toBe(false);
+    expect(isComposingPrintableKey(mk({ key: "b", altKey: true }))).toBe(false);
   });
 });
 
@@ -1207,6 +1236,43 @@ describe("TerminalSession", () => {
     const { container, session } = makeSession();
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
+    session.dispose();
+  });
+
+  it("intercepts a mid-composition Shift+letter, delivering it once (#7895)", () => {
+    // WHY: real Chromium (verified via CDP) shows that a printable keydown
+    // during composition makes xterm flush a partial from a stale start and
+    // re-send the whole buffer on compositionend, duplicating the committed
+    // prefix. The guard returns false to suppress xterm's finalize and — since
+    // preventDefault also stops the char reaching the PTY — sends the character
+    // itself, exactly once. Without the guard, xterm's finalize path runs and
+    // this key is not delivered as a clean standalone byte.
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const ta = term.textarea as HTMLTextAreaElement;
+
+    ta.dispatchEvent(new CompositionEvent("compositionstart", { data: "" }));
+    const ev = new KeyboardEvent("keydown", {
+      key: "K",
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    const prevent = vi.spyOn(ev, "preventDefault");
+    ta.dispatchEvent(ev);
+
+    const dec = new TextDecoder();
+    const composed = socket.sent
+      .filter((m): m is Uint8Array => typeof m !== "string")
+      .map((m) => dec.decode(m))
+      .join("");
+    expect(composed).toBe("K");
+    expect(prevent).toHaveBeenCalled();
+
+    // After compositionend the guard disarms: a later Shift+letter is no longer
+    // intercepted (it becomes ordinary input handled by xterm).
+    ta.dispatchEvent(new CompositionEvent("compositionend", { data: "" }));
     session.dispose();
   });
 });

@@ -293,6 +293,35 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
   return null;
 }
 
+/**
+ * Whether *event* is a printable key that, arriving mid-composition, would
+ * corrupt xterm's IME handling (#7895).
+ *
+ * xterm's ``CompositionHelper.keydown`` runs ``_finalizeComposition(false)``
+ * for any non-IME, non-modifier keydown while composing — flushing a partial
+ * from ``textarea.value.substring(start)`` and clearing ``_isComposing``
+ * without resetting the textarea or advancing ``start``. Because
+ * ``compositionstart`` does not re-fire for the continued kana, the trailing
+ * ``compositionend`` then re-sends ``substring(start)`` = the whole buffer,
+ * duplicating the already-committed prefix and leaking the shifted ASCII. The
+ * trigger is specifically a printable key with a real keyCode (e.g. Shift+letter);
+ * a romaji keystroke carrying the IME-processing code 229 does not finalize.
+ *
+ * Control chords (Ctrl/Alt/Meta) are excluded — they are commands, not text
+ * entry — and modifier keys and named keys fall out via the single-character
+ * check. Verified against real Chromium via CDP (see the Issue #7895 repro).
+ */
+export function isComposingPrintableKey(event: KeyboardEvent): boolean {
+  return (
+    event.keyCode !== 229 &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    typeof event.key === "string" &&
+    event.key.length === 1
+  );
+}
+
 // Reused across keystrokes — allocating a fresh TextEncoder per keypress
 // is needless churn on the input hot path.
 const INPUT_ENCODER = new TextEncoder();
@@ -678,6 +707,12 @@ export class TerminalSession {
   private touchLastY = 0;
   /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
   private touchPartialLines = 0;
+  /**
+   * True between a textarea ``compositionstart`` and its ``compositionend``.
+   * Gates the {@link isComposingPrintableKey} interception (#7895) so it only
+   * ever fires during a live IME composition.
+   */
+  private imeComposing = false;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -832,6 +867,27 @@ export class TerminalSession {
       { signal },
     );
 
+    // Track IME composition so the key-level guard below only fires while a
+    // composition is live. xterm exposes no composition-state event of its
+    // own, so listen on its textarea directly (created by term.open above).
+    const imeTextarea = this.term.textarea;
+    if (imeTextarea) {
+      imeTextarea.addEventListener(
+        "compositionstart",
+        () => {
+          this.imeComposing = true;
+        },
+        { signal },
+      );
+      imeTextarea.addEventListener(
+        "compositionend",
+        () => {
+          this.imeComposing = false;
+        },
+        { signal },
+      );
+    }
+
     this.dataDispose = this.term.onData((d) => {
       onInput?.();
       // Stamp before the readyState guard so clipboard trust still reflects
@@ -842,6 +898,21 @@ export class TerminalSession {
     });
 
     this.term.attachCustomKeyEventHandler((e) => {
+      // #7895: a printable keydown mid-composition (e.g. Shift+letter) makes
+      // xterm flush a partial from a stale start and then re-send the whole
+      // buffer on compositionend, duplicating the committed prefix and leaking
+      // the ASCII. Intercept it: return false so xterm runs no premature
+      // finalize, and — since preventDefault also stops the char reaching the
+      // PTY — deliver that character once ourselves, in keystroke order.
+      if (e.type === "keydown" && this.imeComposing && isComposingPrintableKey(e)) {
+        e.preventDefault();
+        onInput?.();
+        this.lastUserInputAt = performance.now();
+        if (this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(INPUT_ENCODER.encode(e.key));
+        }
+        return false;
+      }
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
       // xterm invokes this handler for keydown, keypress, and keyup.
