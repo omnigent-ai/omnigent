@@ -8844,6 +8844,9 @@ async def _delete_native_bridge_dirs(
     from omnigent.harnesses.hermes_native.bridge import (
         bridge_dir_for_session_id as hermes_bridge_dir,
     )
+    from omnigent.harnesses.hermes_native.bridge import (
+        hermes_home_for_bridge_dir,
+    )
     from omnigent.harnesses.kimi_native.bridge import (
         bridge_dir_for_session_id as kimi_bridge_dir,
     )
@@ -8881,6 +8884,7 @@ async def _delete_native_bridge_dirs(
         cursor_bridge_dir(session_id),
         goose_bridge_dir(session_id),
         hermes_bridge_dir(session_id),
+        hermes_home_for_bridge_dir(hermes_bridge_dir(session_id)),
         kimi_bridge_dir(session_id),
         kiro_bridge_dir(session_id),
         opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
