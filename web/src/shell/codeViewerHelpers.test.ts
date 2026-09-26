@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   HTML_PREVIEW_SANDBOX,
+  MAX_RICH_MARKDOWN_CHARS,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   getModelFormat,
   isBinaryPath,
   isImageFile,
+  isMarkdownTooLargeForRichView,
   isModelFile,
   isNotebookPath,
   isPdfFile,
@@ -114,6 +116,24 @@ describe("isBinaryPath", () => {
 
   it("treats extension-less paths as non-binary", () => {
     expect(isBinaryPath("Dockerfile")).toBe(false);
+  });
+});
+
+describe("isMarkdownTooLargeForRichView", () => {
+  // The markdown block lexer overflows the call stack on multi-MiB buffers,
+  // so oversized markdown must bypass the rich editor/preview.
+  it("flags markdown above the cap", () => {
+    expect(isMarkdownTooLargeForRichView("markdown", MAX_RICH_MARKDOWN_CHARS + 1)).toBe(true);
+  });
+
+  it("keeps markdown at or below the cap on the rich surfaces", () => {
+    expect(isMarkdownTooLargeForRichView("markdown", MAX_RICH_MARKDOWN_CHARS)).toBe(false);
+    expect(isMarkdownTooLargeForRichView("markdown", 0)).toBe(false);
+  });
+
+  it("never flags non-markdown content, regardless of size", () => {
+    expect(isMarkdownTooLargeForRichView("json", MAX_RICH_MARKDOWN_CHARS * 10)).toBe(false);
+    expect(isMarkdownTooLargeForRichView("text", MAX_RICH_MARKDOWN_CHARS * 10)).toBe(false);
   });
 });
 
