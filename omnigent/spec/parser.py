@@ -19,6 +19,9 @@ from pydantic import (
     model_validator,
 )
 
+from omnigent._yaml_compat import SafeLoaderBase, narrow_bools_to_yaml_1_2
+from omnigent._yaml_compat import load as _yaml_load
+from omnigent._yaml_compat import safe_load as _yaml_safe_load
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
     DEFAULT_BASIC_USERNAME,
@@ -71,62 +74,18 @@ _CONTEXT_FILE_PRIORITY: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", ".cursorrul
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
 
 
-class _ConfigYamlLoader(yaml.SafeLoader):
-    """
-    SafeLoader variant that does NOT treat ``on``/``off``/
-    ``yes``/``no`` as booleans.
+class _ConfigYamlLoader(SafeLoaderBase):
+    """Keep on/off/yes/no as strings so policy selectors retain their names.
 
-    Default PyYAML resolves these per the YAML 1.1 spec — a
-    trap for our spec because the policy system uses
-    ``on:`` as the selector field (see POLICIES.md §3.3
-    implementation notes). Without this override, an author
-    writing ``on: [request]`` would get a dict keyed by ``True``
-    instead of ``"on"``. We scope the override to a dedicated
-    loader class so the rest of the YAML 1.1 type inference
-    stays intact.
-
-    YAML 1.2 drops these bool aliases entirely; this override
-    makes our loader YAML-1.2-aligned for the narrow set of
-    aliases that matter here.
-    """
+    The dedicated resolver preserves other YAML 1.1 inference and works with
+    both libyaml and pure-Python bases."""
 
 
-# Replace the YAML 1.1 bool resolver pattern with a YAML 1.2
-# pattern that accepts only ``true`` / ``false`` (and their
-# title/upper-case variants). Strip the old bool resolvers
-# first, then add back the narrowed one.
-_BOOL_TAG = "tag:yaml.org,2002:bool"
-_YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+narrow_bools_to_yaml_1_2(_ConfigYamlLoader)
 
 # ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
     {"context_files", "system_prompt_mode"}
-)
-
-# Copy the resolver dict onto the subclass before mutating — it's inherited
-# from SafeLoader by reference, so in-place edits below would strip
-# SafeLoader's bool resolver process-wide.
-_ConfigYamlLoader.yaml_implicit_resolvers = {
-    key: value[:] for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
-}
-for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
-    _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
-        (tag, regexp)
-        for tag, regexp in _ConfigYamlLoader.yaml_implicit_resolvers[_ch]
-        if tag != _BOOL_TAG
-    ]
-# Re-register a narrowed bool resolver keyed on ``t`` / ``T`` /
-# ``f`` / ``F`` only (the YAML 1.1 aliases keyed on o/O/y/Y/n/N
-# are now gone, so those characters parse as plain strings).
-# mypy flags BaseResolver.add_implicit_resolver as untyped
-# (PyYAML lacks type stubs on this classmethod); the call
-# is the only way to register an implicit resolver, so the
-# ignore is narrowly scoped to this YAML-1.2 compatibility
-# override.
-_ConfigYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
-    _BOOL_TAG,
-    _YAML_1_2_BOOL_RE,
-    list("tTfF"),
 )
 
 
@@ -216,7 +175,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     if not config_path.exists():
         raise AgentImageConfigMissingError(root)
 
-    raw = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_ConfigYamlLoader)
+    raw = _yaml_load(config_path.read_text(encoding="utf-8"), _ConfigYamlLoader)
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"config.yaml must be a YAML mapping, got {type(raw).__name__}",
@@ -2592,6 +2551,9 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         )
     frontmatter_str, content = match.groups()
     try:
+        # Pure-Python loader on purpose: frontmatter is a few hundred bytes,
+        # so libyaml buys nothing measurable, and its errors drop the source
+        # line and caret that make a malformed SKILL.md easy to fix.
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
         # Retry with colon-bearing prose quoted before giving up, and report
@@ -2872,7 +2834,7 @@ def _discover_mcp_servers(
         return []
     servers: list[MCPServerConfig] = []
     for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-        raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
+        raw = _yaml_safe_load(yaml_file.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise OmnigentError(
                 f"MCP config must be a YAML mapping: {yaml_file}",
