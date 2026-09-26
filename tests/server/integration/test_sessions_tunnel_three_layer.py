@@ -847,10 +847,15 @@ async def test_on_runner_connect_restarts_relay_via_router(
     from omnigent.server.routes import sessions as sessions_routes
     from omnigent.server.routes.sessions import _runner_relay_tasks
 
-    # Zero the reconnect grace: this test needs the deregistered relay to
-    # die promptly so the reconnect hook's restart path is what revives it.
+    # Zero the reconnect grace and the mid-turn resume window: this test
+    # needs the deregistered relay to die promptly so the reconnect hook's
+    # restart path is what revives it.
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
         0.0,
     )
     ap_client = tunnel_three_layer_stack.ap_client
@@ -1489,17 +1494,17 @@ def _stub_connect_hook_for_pumpless_ws(ap_app: FastAPI, monkeypatch: pytest.Monk
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
-async def test_runner_disconnect_grace_defers_failed_marking(
+async def test_runner_disconnect_defers_failed_marking_until_resume_window(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A tunnel drop marks sessions failed only after the reconnect grace.
+    """A tunnel drop marks sessions failed only after the turn-resume window.
 
     Drives a real WS disconnect for a dedicated runner whose session is
     seeded mid-turn (``running`` — offline reconciliation only fails
     interrupted turns) and asserts (a) the session is NOT failed inside
-    the grace, (b) it IS failed once the grace expires with the runner
-    still gone, and (c) a reconnect inside the grace suppresses the
+    the window, (b) it IS failed once the window expires with the runner
+    still gone, and (c) a reconnect inside the window suppresses the
     marking entirely.
     """
     from omnigent.runtime import get_conversation_store
@@ -1508,8 +1513,10 @@ async def test_runner_disconnect_grace_defers_failed_marking(
     ap_client = tunnel_three_layer_stack.ap_client
     ap_app = tunnel_three_layer_stack.ap_app
 
-    grace = 0.4
-    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    resume_window = 0.4
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.RUNNER_TURN_RESUME_WINDOW_S", resume_window
+    )
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
 
     create_resp = await ap_client.post(
@@ -1540,24 +1547,24 @@ async def test_runner_disconnect_grace_defers_failed_marking(
     reconnect_communicator: ApplicationCommunicator | None = None
     try:
         # (a) Drop the tunnel. The disconnect hook has completed by the
-        # time the ASGI app exits, so the grace timer is armed — but the
-        # failed flip must not have happened yet.
+        # time the ASGI app exits, so the reconnect timer is armed — but
+        # the failed flip must not have happened yet.
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         await communicator.wait(timeout=budget(2.0))
         assert runner_id in cleared_runners
         assert sessions_module._session_status_cache.get(session_id) != "failed", (
-            "session failed immediately on disconnect — the grace window "
+            "session failed immediately on disconnect — the resume window "
             "is not deferring the failed-marking"
         )
 
-        # (b) Past the grace with the runner still gone, the marking lands.
+        # (b) Past the window with the runner still gone, the marking lands.
         async def _marked_failed() -> None:
             while sessions_module._session_status_cache.get(session_id) != "failed":
                 await asyncio.sleep(0.02)
 
-        await asyncio.wait_for(_marked_failed(), timeout=grace * 10)
+        await asyncio.wait_for(_marked_failed(), timeout=resume_window * 10)
 
-        # (c) Drop again, but reconnect inside the grace: no failed flip.
+        # (c) Drop again, but reconnect inside the window: no failed flip.
         communicator2 = await _connect_runner_tunnel(ap_app, runner_id)
         await _send_hello_and_wait(
             communicator2, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
@@ -1569,9 +1576,9 @@ async def test_runner_disconnect_grace_defers_failed_marking(
         await _send_hello_and_wait(
             reconnect_communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
         )
-        await asyncio.sleep(grace * 2)
+        await asyncio.sleep(resume_window * 2)
         assert sessions_module._session_status_cache.get(session_id) != "failed", (
-            "reconnect inside the grace did not suppress the failed-marking"
+            "reconnect inside the resume window did not suppress the failed-marking"
         )
     finally:
         if reconnect_communicator is not None:
@@ -1607,8 +1614,10 @@ async def test_server_initiated_close_never_fails_the_turn(
     ap_client = tunnel_three_layer_stack.ap_client
     ap_app = tunnel_three_layer_stack.ap_app
 
-    grace = 0.4
-    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    resume_window = 0.4
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.RUNNER_TURN_RESUME_WINDOW_S", resume_window
+    )
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
 
     create_resp = await ap_client.post(
@@ -1643,8 +1652,8 @@ async def test_server_initiated_close_never_fails_the_turn(
         assert runner_id not in cleared_runners
         assert runner_id in touched_runners
 
-        # Well past the grace: the timer has fired and must have skipped the marking.
-        await asyncio.sleep(grace * 3)
+        # Well past the window: the timer has fired and must have skipped the marking.
+        await asyncio.sleep(resume_window * 3)
         assert sessions_module._session_status_cache.get(session_id) == "running"
         conv = store.get_conversation(session_id)
         assert conv is not None
@@ -1684,9 +1693,9 @@ async def test_on_runner_disconnect_spares_idle_sessions_and_labels_interrupted_
     ap_app = tunnel_three_layer_stack.ap_app
     runner_id = "runner-offline-reconcile-test"
 
-    # Shrink the reconnect grace so the deferred reconciliation lands
+    # Shrink the turn-resume window so the deferred reconciliation lands
     # within the test's wait window.
-    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", 0.05)
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_TURN_RESUME_WINDOW_S", 0.05)
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(

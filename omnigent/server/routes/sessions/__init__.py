@@ -605,6 +605,7 @@ from omnigent.server.routes._sessions.helpers import (
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
+    RUNNER_TURN_RESUME_WINDOW_S as RUNNER_TURN_RESUME_WINDOW_S,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
     _context_labels_from_turn_usage as _context_labels_from_turn_usage,

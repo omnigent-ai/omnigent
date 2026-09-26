@@ -569,14 +569,19 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
 
     Regression test for #1114: before the fix the relay swallowed the
     ``ConnectionError`` and exited silently, leaving the client's SSE
-    stream truncated with no error event. The reconnect grace is zeroed
-    so the drop is terminal on the first attempt.
+    stream truncated with no error event. The reconnect grace and the
+    mid-turn resume window are zeroed so the drop is terminal on the
+    first attempt.
     """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -621,6 +626,270 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
         assert record.exc_info is not None
     finally:
         gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+class _ScriptedThenOpenStreamResponse:
+    """Async stream that emits scripted SSE frames, then stays open.
+
+    Models a healthy reconnected tunnel: the relay drains the frames and
+    keeps the subscription alive (the test tears the relay task down).
+
+    :param frames: Ready-to-send ``data: ...`` frames yielded in order
+        after the ready heartbeat.
+    """
+
+    def __init__(self, frames: list[str]) -> None:
+        self._frames = frames
+        self._stay_open = asyncio.Event()
+
+    def raise_for_status(self) -> None:
+        pass
+
+    async def __aenter__(self) -> _ScriptedThenOpenStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        yield 'data: {"type": "session.heartbeat"}\n\n'
+        for frame in self._frames:
+            yield frame
+        await self._stay_open.wait()
+
+
+class _RecycledTunnelRunnerClient:
+    """Fake runner client modelling a tunnel recycle with a slow reconnect.
+
+    The first stream drops with ``ConnectionError`` (the live tunnel is
+    severed mid-turn). While the recycled endpoint is still down, every
+    reconnect attempt raises ``ConnectionError`` — what the tunnel
+    transport surfaces for an offline runner — and is counted. Once
+    *back_online* is set, the next attempt streams *frames* and stays
+    open, like the transport reaching the runner's re-registered tunnel.
+
+    :param frames: Frames served once the endpoint is back.
+    :param back_online: Event flipping the endpoint from down to up.
+    """
+
+    def __init__(self, frames: list[str], back_online: asyncio.Event) -> None:
+        self._frames = frames
+        self._back_online = back_online
+        self._severed = False
+        self.rejected_attempts = 0
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _TunnelCloseStreamResponse | _ScriptedThenOpenStreamResponse:
+        del method, path, timeout
+        if not self._severed:
+            self._severed = True
+            sever_now = asyncio.Event()
+            sever_now.set()
+            return _TunnelCloseStreamResponse(sever_now)
+        if not self._back_online.is_set():
+            self.rejected_attempts += 1
+            raise ConnectionError("runner is offline")
+        return _ScriptedThenOpenStreamResponse(self._frames)
+
+
+@pytest.mark.asyncio
+async def test_relay_holds_mid_turn_session_across_slow_tunnel_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A mid-turn tunnel outage longer than the grace is held, not failed.
+
+    A server-side tunnel recycle severs the stream while a turn is in
+    flight, and the recycled endpoint can take longer than
+    ``RUNNER_DISCONNECT_GRACE_S`` to accept the runner's reconnect (a pod
+    reschedule / cold start). The runner never died: it keeps the turn
+    running and queues its stream events, so the turn resumes where it
+    left off once the tunnel is back. Failing at the grace published a
+    spurious hard "Runner disconnected unexpectedly." to the user's live
+    stream anyway. The relay must hold the turn — publish nothing, persist
+    nothing — while retrying inside ``RUNNER_TURN_RESUME_WINDOW_S``, then
+    resume relaying the turn's events on the same relay task.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    # Zeroing the grace makes the very first reconnect attempt already
+    # past it — the exact spot that used to publish the failure. The
+    # resume window stays wide; the retry interval is small so the hold
+    # spins fast enough to observe.
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
+        30.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        0.05,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    back_online = asyncio.Event()
+    # A "waiting" edge is a distinctive mid-turn frame the relay republishes
+    # verbatim through _publish_status, proving the resumed stream reached
+    # the user's session stream.
+    frames = ['data: {"type": "session.status", "status": "waiting"}\n\n']
+    fake_runner = _RecycledTunnelRunnerClient(frames, back_online)
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_recycled_tunnel",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        # The endpoint stays down well past the (zeroed) grace. The relay
+        # must keep retrying instead of ending with a published failure.
+        async def _retried_past_grace() -> None:
+            while fake_runner.rejected_attempts < 3:
+                assert not handle.task.done(), (
+                    "relay task ended during the outage — it gave up on the "
+                    "in-flight turn instead of holding it across the reconnect"
+                )
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_retried_past_grace(), timeout=_TASK_TIMEOUT_S)
+
+        # Nothing was published or persisted during the hold: the user's
+        # stream never saw a disconnect failure and the session still
+        # reads mid-turn.
+        assert sessions_module._session_status_cache.get(session_id) == "running"
+        assert store.labels.get(session_id) is None
+
+        # The endpoint comes back; the same relay task resumes the stream
+        # and the turn's next event reaches the session stream.
+        back_online.set()
+        while True:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
+            assert not (
+                event.get("type") == "session.status" and event.get("status") == "failed"
+            ), f"disconnect failure surfaced on the user's stream: {event!r}"
+            if event.get("type") == "session.status" and event.get("status") == "waiting":
+                break
+
+        assert not handle.task.done(), "relay task ended after the resumed stream"
+        assert store.labels.get(session_id) is None
+    finally:
+        back_online.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_hold_ends_quietly_when_the_session_settles_mid_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A settled session ends the mid-turn hold without a second failure.
+
+    The hold re-checks the session's state on every retry, so another path
+    settling the session during the outage — a crash report failing it, a
+    Stop idling it — must end the hold early and publish nothing: the
+    settled state already tells the user what happened, and a disconnect
+    failure on top would overwrite it.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
+        30.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        0.05,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    # Never set: the endpoint stays down for the relay's whole lifetime.
+    back_online = asyncio.Event()
+    fake_runner = _RecycledTunnelRunnerClient([], back_online)
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "1f2e3d4c5b6a798887a6b5c4d3e2f1a0"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_recycled_tunnel",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        relay_task = handle.task
+        collector = await start_session_stream_collector(session_id)
+
+        # The hold is live: reconnect attempts are being rejected.
+        async def _holding() -> None:
+            while fake_runner.rejected_attempts < 3:
+                assert not relay_task.done(), "relay task ended before the hold was observed"
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_holding(), timeout=_TASK_TIMEOUT_S)
+
+        # A crash report settles the session during the hold (the crash path
+        # publishes its own failure and flips the relay-fed cache).
+        sessions_module._session_status_cache[session_id] = "failed"
+
+        # The next retry's state re-check ends the hold; the relay exits
+        # without publishing a disconnect failure over the settled state.
+        await asyncio.wait_for(relay_task, timeout=_TASK_TIMEOUT_S)
+
+        assert store.labels.get(session_id) is None, (
+            "the ended hold stamped disconnect labels over the settled session"
+        )
+        while not collector.queue.empty():
+            event = collector.queue.get_nowait()
+            assert not (
+                event.get("type") == "session.status" and event.get("status") == "failed"
+            ), f"the ended hold published a second failure: {event!r}"
+    finally:
+        back_online.set()
         if collector is not None:
             await collector.stop()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -727,6 +996,10 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
+        0.0,
+    )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     fake_runner = _TunnelCloseRunnerClient(gate)
@@ -797,6 +1070,10 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
 
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1017,6 +1294,10 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
+        0.0,
+    )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     # Terminal stop event clears the fence, then a new turn's running edge
@@ -1188,6 +1469,10 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
+        0.0,
+    )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     # No status frames: the relay never caches an edge, exactly as after a
@@ -1245,6 +1530,10 @@ async def test_relay_reports_the_drop_when_the_live_status_read_fails(
 
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
