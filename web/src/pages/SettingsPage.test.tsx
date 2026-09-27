@@ -42,6 +42,7 @@ const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
   isEmbedded: false,
+  resolvedTheme: undefined as string | undefined,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
   bulkArchiveMutate: vi.fn(),
@@ -79,7 +80,7 @@ vi.mock("next-themes", () => ({
   useTheme: () => ({
     theme: mocks.theme,
     systemTheme: "light",
-    resolvedTheme: mocks.theme === "dark" ? "dark" : "light",
+    resolvedTheme: mocks.resolvedTheme ?? (mocks.theme === "dark" ? "dark" : "light"),
     setTheme: mocks.setTheme,
   }),
 }));
@@ -289,6 +290,7 @@ beforeEach(() => {
   mocks.conversationQuery.mockReset();
   mocks.theme = "system";
   mocks.isEmbedded = false;
+  mocks.resolvedTheme = undefined;
   mocks.accountsEnabled = true;
   mocks.adminViewSupported = true;
   mocks.bootFallback = false;
@@ -857,6 +859,66 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement).value).toBe(
       "off",
     );
+  });
+
+  it("describes the extra keys row by the keys it adds, without truncating", () => {
+    renderPage("/settings/appearance");
+    const description = screen.getByText(
+      "Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.",
+    );
+    expect(description).not.toHaveClass("truncate");
+  });
+
+  it("switches the extra keys preview between Always, Never and Auto", () => {
+    renderPage("/settings/appearance");
+    const preview = screen.getByTestId("terminal-extra-keys-preview");
+    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
+
+    fireEvent.change(select, { target: { value: "on" } });
+    expect(within(preview).queryByTestId("extra-keys-preview-auto")).toBeNull();
+    expect(within(preview).getAllByTestId("extra-keys-preview-pills")).toHaveLength(1);
+
+    fireEvent.change(select, { target: { value: "off" } });
+    expect(within(preview).queryByTestId("extra-keys-preview-auto")).toBeNull();
+    expect(within(preview).queryByTestId("extra-keys-preview-pills")).toBeNull();
+
+    fireEvent.change(select, { target: { value: "auto" } });
+    expect(within(preview).getByTestId("extra-keys-preview-auto")).toBeInTheDocument();
+  });
+
+  it("composites Always and Never on System's diagonal for the Auto preview", () => {
+    renderPage("/settings/appearance");
+    const auto = within(screen.getByTestId("terminal-extra-keys-preview")).getByTestId(
+      "extra-keys-preview-auto",
+    );
+    const [always, never] = Array.from(auto.children) as HTMLElement[];
+    expect(auto.children).toHaveLength(2);
+    // Both layers share one grid cell so the frames line up.
+    for (const layer of [always!, never!]) {
+      expect(layer).toHaveClass("col-start-1", "row-start-1");
+    }
+    expect(always!.style.clipPath).toBe("");
+    expect(within(always!).getByTestId("extra-keys-preview-pills")).toBeInTheDocument();
+    expect(never!.style.clipPath).toBe("polygon(62% 0, 100% 0, 100% 100%, 38% 100%)");
+    expect(within(never!).queryByTestId("extra-keys-preview-pills")).toBeNull();
+  });
+
+  it("draws both Auto halves of the extra keys preview in the current light or dark palette", () => {
+    const frameColors = () =>
+      Array.from(
+        screen
+          .getByTestId("extra-keys-preview-auto")
+          .querySelectorAll<HTMLElement>(".h-16.p-1\\.5"),
+        (frame) => frame.style.backgroundColor,
+      );
+
+    renderPage("/settings/appearance");
+    expect(frameColors()).toEqual(["rgb(233, 235, 238)", "rgb(233, 235, 238)"]);
+    cleanup();
+
+    mocks.resolvedTheme = "dark";
+    renderPage("/settings/appearance");
+    expect(frameColors()).toEqual(["rgb(14, 16, 19)", "rgb(14, 16, 19)"]);
   });
 
   it("defaults transcripts to Chat and persists a Terminal default", () => {
