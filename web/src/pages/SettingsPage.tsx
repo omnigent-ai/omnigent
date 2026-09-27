@@ -81,7 +81,14 @@ import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
-import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/AppearancePreviews";
+import {
+  DARK_MODE_PREVIEW,
+  ExtraKeysPreview,
+  LIGHT_MODE_PREVIEW,
+  ModePreview,
+  PaletteChip,
+  PaletteSwatchPreview,
+} from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -574,8 +581,12 @@ function TerminalThemeControl() {
   );
 }
 
-/** Extra-keys row (Esc / Tab / Ctrl / arrows) under the terminal on touch devices. */
+/**
+ * Extra-keys row under the terminal on touch devices, as a Color-theme-style
+ * header card: a thumbnail of the current mode beside its select.
+ */
 function TerminalExtraKeysControl() {
+  const isDark = useResolvedThemeMode() === "dark";
   const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
   const labelId = useId();
   const choose = useCallback((next: TerminalExtraKeysMode) => {
@@ -583,35 +594,52 @@ function TerminalExtraKeysControl() {
     writeTerminalExtraKeysMode(next);
   }, []);
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Extra keys row"
-      helper="Show Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal for on-screen keyboards."
-    >
-      <Select
-        value={mode}
-        onValueChange={(next) => {
-          if (isTerminalExtraKeysMode(next)) choose(next);
-        }}
-        componentId="settings.appearance.terminal_extra_keys"
-        valueHasNoPii
-      >
-        <SelectTrigger
-          aria-labelledby={labelId}
-          data-testid="terminal-extra-keys-select"
-          className="w-full sm:w-56"
+    <div className="overflow-hidden rounded-xl border bg-card/55">
+      <div className="flex flex-col gap-3 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-center gap-3">
+          <div
+            data-testid="terminal-extra-keys-preview"
+            className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm"
+          >
+            <ExtraKeysPreview
+              mode={mode}
+              swatch={isDark ? DARK_MODE_PREVIEW : LIGHT_MODE_PREVIEW}
+            />
+          </div>
+          <div className="min-w-0">
+            <div id={labelId} className="text-ui font-medium">
+              Extra keys row
+            </div>
+            <div className="text-sm text-muted-foreground">
+              Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.
+            </div>
+          </div>
+        </div>
+        <Select
+          value={mode}
+          onValueChange={(next) => {
+            if (isTerminalExtraKeysMode(next)) choose(next);
+          }}
+          componentId="settings.appearance.terminal_extra_keys"
+          valueHasNoPii
         >
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {terminalExtraKeysModes.map((value) => (
-            <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
-              {terminalExtraKeysLabels[value]}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    </ThemeSubsection>
+          <SelectTrigger
+            aria-labelledby={labelId}
+            data-testid="terminal-extra-keys-select"
+            className="w-full shrink-0 sm:w-48"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {terminalExtraKeysModes.map((value) => (
+              <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
+                {terminalExtraKeysLabels[value]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
   );
 }
 
