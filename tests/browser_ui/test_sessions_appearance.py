@@ -120,6 +120,11 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
             },
         )
         browser_contract.json(f"/v1/sessions/{session_id}/child_sessions", empty_list)
+        # Expanding the Workspace rail mounts AgentInfo, which reads session
+        # policies, the handler registry, and the owner. Declare all three so
+        # the panel's fetches stay inside the contract when they land.
+        browser_contract.json(f"/v1/sessions/{session_id}/policies", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/owner", {"owner": None})
         browser_contract.json(f"/v1/sessions/{session_id}/resources/terminals", empty_list)
         browser_contract.response(f"/v1/sessions/{session_id}/read-state", method="PUT")
         for resource in ("environments/default", "github"):
@@ -129,6 +134,7 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
                 status=404,
             )
         browser_contract.sse(f"/v1/sessions/{session_id}/stream")
+    browser_contract.json("/v1/policy-registry", empty_list)
     browser_contract.json(
         re.compile(r"/health(?:\?.*)?$"),
         {
