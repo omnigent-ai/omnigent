@@ -1,8 +1,25 @@
-"""Reconcile native Codex session and model-probe processes after owner-lock release.
+"""E2E: crash-safe reaping of native Codex ``app-server`` children.
 
-Use the real npm Codex shebang launcher to verify that registry tags survive
-exec and identify the process tree. Releasing the owner lock simulates host
-death; the test does not crash a live host or make model calls."""
+The Host records every ``codex app-server`` it spawns in a crash-safe registry so
+that, when a Host dies without tearing its children down, the next Host reaps the
+orphans it left behind (``reconcile_codex_native_process_registry``). Two gaps in
+that guarantee are covered here against the real ``codex`` CLI:
+
+* The *model-probe* app-server started for model discovery
+  (``_start_codex_model_discovery_process``) must be registered as well, or a
+  Host that dies mid-probe strands a ``node ... codex app-server`` tree that no
+  later reconcile can see.
+* A stock npm/Homebrew ``codex`` is a ``#!/usr/bin/env node`` shim, so the kernel
+  rewrites ``argv[0]`` and a reap tag carried there never reaches the process
+  command line. The tag must travel as a real argument so reconciliation can
+  still prove a PID is ours.
+
+Releasing the owner lock stands in for the Host dying; no live Host is crashed
+and no model calls are made. Run with::
+
+    OMNIGENT_E2E_CODEX_NATIVE=1 \\
+        .venv/bin/python -m pytest tests/e2e/test_codex_app_server_crash_reap_e2e.py -v
+"""
 
 from __future__ import annotations
 
@@ -23,53 +40,42 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexNativeAppServer,
     _allocate_loopback_port,
     _start_codex_model_discovery_process,
+    _stop_codex_model_discovery_process,
     _wait_for_discovery_listener,
 )
 from omnigent.harnesses.codex_native.process_registry import (
+    CodexNativeProcessEntry,
     codex_native_process_registry_path,
     codex_native_session_tag_cmdline_arg,
     reconcile_codex_native_process_registry,
 )
+from omnigent.inner.codex_executor import _clean_codex_env
 
-# The crash-safe registry relies on flock + /proc-or-ps + os.killpg semantics,
-# which are POSIX-only; the shebang-wrapper argv[0] rewrite is likewise a POSIX
-# exec detail. The reported OSes are macOS and Linux.
+# flock, /proc-or-ps and killpg semantics and the shebang argv[0] rewrite are
+# POSIX-only; the reported platforms are macOS and Linux.
 pytestmark = pytest.mark.skipif(
-    os.name != "posix",
-    reason="codex crash reaping relies on POSIX flock/killpg + shebang exec semantics",
+    os.name != "posix"
+    or os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1"
+    or shutil.which("codex") is None,
+    reason="codex crash-reap e2e needs POSIX, `codex` on PATH and OMNIGENT_E2E_CODEX_NATIVE=1",
 )
 
 
 def _codex_cli() -> str:
-    """Locate the ``codex`` CLI or skip.
-
-    :returns: Absolute path to the ``codex`` launcher on PATH.
-    """
     codex = shutil.which("codex")
-    if not codex:
-        pytest.skip("native Codex crash-reap test requires the 'codex' CLI on PATH")
+    assert codex is not None
     return codex
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return whether *pid* is still alive.
-
-    :param pid: Process id to probe.
-    :returns: ``True`` while the process exists.
-    """
-    return registry._pid_alive(pid)
+def _registry_entry(pid: int) -> CodexNativeProcessEntry | None:
+    for entry in registry._read_registry(codex_native_process_registry_path()):
+        if entry.pid == pid:
+            return entry
+    return None
 
 
 def _proc_state(pid: int) -> str:
-    """Return the single-letter scheduler state of *pid*, or ``""`` if gone.
-
-    ``Z`` marks a zombie: the process has exited and only awaits a parent
-    ``wait()``. A crash orphan is reparented to init, which reaps zombies
-    immediately, so a zombie here means "already reaped" for our purposes.
-
-    :param pid: Process id to inspect.
-    :returns: State char (``R``/``S``/``Z``/...), or ``""`` when the pid is gone.
-    """
+    """Return the scheduler state letter of *pid* (``Z`` = zombie), or ``""`` if gone."""
     if not Path("/proc").is_dir():
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True, timeout=5
@@ -84,15 +90,7 @@ def _proc_state(pid: int) -> str:
 
 
 def _tagged_pids(tag: str) -> set[int]:
-    """Return every PID whose command line still carries *tag*.
-
-    Identifies exactly the ``node`` shim and its Rust ``codex app-server`` child
-    spawned by one launch, so the reap check is scoped to our own processes and
-    never trips over unrelated codex instances.
-
-    :param tag: The crash-reap session tag.
-    :returns: Set of live pids carrying the tag marker.
-    """
+    """Return every PID whose command line carries *tag*: the node shim and its Rust child."""
     marker = codex_native_session_tag_cmdline_arg(tag)
     found: set[int] = set()
     proc_root = Path("/proc")
@@ -118,22 +116,16 @@ def _tagged_pids(tag: str) -> set[int]:
     return found
 
 
-def _reap_zombie_children() -> None:
-    """Reap any exited direct children, the way init reaps a crash orphan.
-
-    :returns: None.
-    """
-    with contextlib.suppress(ChildProcessError):
-        while True:
-            reaped_pid, _ = os.waitpid(-1, os.WNOHANG)
-            if reaped_pid == 0:
-                return
+async def _wait_for_exit(process: asyncio.subprocess.Process, timeout: float = 10.0) -> bool:
+    try:
+        await asyncio.wait_for(process.wait(), timeout)
+    except TimeoutError:
+        return False
+    return True
 
 
 async def _wait_group_terminated(tag: str, timeout: float = 8.0) -> set[int]:
-    """Wait for tagged processes to exit, allowing child watchers to reap zombies.
-
-    Returns any tagged non-zombie PIDs still alive at the deadline."""
+    """Return the tagged PIDs still running (neither exited nor zombie) at the deadline."""
     deadline = time.monotonic() + timeout
     while True:
         still_live = {pid for pid in _tagged_pids(tag) if _proc_state(pid) not in ("", "Z")}
@@ -143,53 +135,37 @@ async def _wait_group_terminated(tag: str, timeout: float = 8.0) -> set[int]:
 
 
 def _kill_group(pid: int) -> None:
-    """Best-effort SIGKILL of *pid*'s whole process group (test cleanup).
-
-    :param pid: Any pid in the group to reap.
-    :returns: None.
-    """
     with contextlib.suppress(OSError, ProcessLookupError):
         os.killpg(os.getpgid(pid), signal.SIGKILL)
 
 
 @pytest.fixture()
 def _hermetic_state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect the codex-native state root (registry + owner locks) to tmp.
-
-    ``OMNIGENT_CODEX_NATIVE_STATE_DIR`` is honoured by
-    ``_codex_native_state_root``, which backs both
-    ``codex_native_process_registry_path`` and the owner-lock directory, so the
-    product's register/reconcile calls and this test share one throwaway root.
-
-    :returns: The temporary state root path.
-    """
+    """Point the registry and owner-lock directory at a throwaway state root."""
     root = tmp_path / "codex-native-state"
     root.mkdir(mode=0o700)
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(root))
     return root
 
 
-async def test_model_probe_app_server_registered_for_crash_reaping(
+async def test_model_probe_app_server_reaped_after_host_crash(
     _hermetic_state_root: Path,
 ) -> None:
-    """Facet 1: the model-probe app-server must be crash-reapable.
+    """A model-probe app-server stranded by a dead Host is reaped by the next reconcile.
 
-    Drives the real ``_start_codex_model_discovery_process`` (the probe spawn)
-    and asserts the spawned ``codex app-server`` is registered in the crash-safe
-    process registry, so a reconcile after a Host death can find and reap it.
-    Before the fix the probe is never registered, so the registry has no entry
-    for it and this assertion fails.
+    Drives the real probe spawn, drops the owner lock the way a Host crash does,
+    then runs the reconcile a fresh Host performs at boot. Unfixed, the probe is
+    never registered, so reconciliation cannot see it and the orphan survives.
     """
-    codex = _codex_cli()
     codex_home = _hermetic_state_root / "probe-home"
     codex_home.mkdir(mode=0o700)
     port = _allocate_loopback_port()
-    listen_url = f"ws://127.0.0.1:{port}"
-    env = {**os.environ, "CODEX_HOME": str(codex_home)}
+    env = _clean_codex_env()
+    env["CODEX_HOME"] = str(codex_home)
 
     discovery = await _start_codex_model_discovery_process(
-        codex_path=codex,
-        listen_url=listen_url,
+        codex_path=_codex_cli(),
+        listen_url=f"ws://127.0.0.1:{port}",
         env=env,
         cwd=codex_home,
     )
@@ -198,24 +174,26 @@ async def test_model_probe_app_server_registered_for_crash_reaping(
         await _wait_for_discovery_listener(discovery, port)
         assert discovery.process.returncode is None
 
-        registry_path = codex_native_process_registry_path()
-        raw = registry_path.read_text(encoding="utf-8") if registry_path.exists() else ""
-        assert f'"pid":{pid}' in raw or f'"pid": {pid}' in raw, (
-            "model-probe codex app-server was not registered in the crash-safe "
-            f"registry (pid={pid}); a Host that dies mid-probe would orphan it "
-            f"forever. Registry contents: {raw!r}"
+        # The owner flock dies with a crashed Host. Here it is held by this very
+        # process, so drop the lock file; reconcile treats a missing file as released.
+        entry = _registry_entry(pid)
+        if entry is not None and entry.owner_lock_path:
+            Path(entry.owner_lock_path).unlink(missing_ok=True)
+        reconcile_codex_native_process_registry()
+
+        assert await _wait_for_exit(discovery.process), (
+            f"model-probe codex app-server (pid {pid}) survived reconciliation after "
+            f"its Host died; crash-safe registry entry at spawn: {entry!r}"
         )
+        assert _registry_entry(pid) is None
     finally:
-        _kill_group(pid)
-        discovery.stderr_tail.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await discovery.stderr_tail
+        await _stop_codex_model_discovery_process(discovery)
 
 
 async def test_session_app_server_reaped_after_host_crash(
     _hermetic_state_root: Path,
 ) -> None:
-    """Verify the real launcher preserves its tag, then release ownership and reap its tree."""
+    """A session app-server keeps its reap tag through the node shim and is reaped."""
     codex = _codex_cli()
     root = _hermetic_state_root
     codex_home = root / "session-home"
@@ -243,52 +221,39 @@ async def test_session_app_server_reaped_after_host_crash(
 
     reaped = False
     try:
-        # The launcher registered a crash-safe entry for the running app-server.
-        registry_path = codex_native_process_registry_path()
-        raw = registry_path.read_text(encoding="utf-8")
-        assert f'"pid":{pid}' in raw or f'"pid": {pid}' in raw, (
-            f"session codex app-server (pid={pid}) was not registered. Registry: {raw!r}"
+        entry = _registry_entry(pid)
+        assert entry is not None, f"session codex app-server (pid {pid}) was not registered"
+        assert entry.process_start_identity is not None, (
+            "session app-server was registered without a process birth identity"
         )
 
-        # The reap tag must be findable on the REAL running process. Through the
-        # npm codex shebang wrapper the kernel rewrites argv[0], so an argv[0]
-        # tag is lost here.
+        # Through the npm shim the kernel rewrites argv[0], so a tag carried there
+        # is lost; the tag must be visible on the real running process.
         running_cmdline = registry._process_cmdline(pid)
         assert registry._process_cmdline_has_tag(pid, tag), (
-            "reap tag is not present in the running codex app-server command "
-            "line, so reconcile can never prove the PID is ours and will drop "
-            f"the entry without reaping it. tag={tag!r}; "
-            f"running cmdline={running_cmdline!r}"
+            "reap tag is missing from the running codex app-server command line, so "
+            f"reconcile cannot prove the PID is ours. tag={tag!r}; cmdline={running_cmdline!r}"
         )
+        assert _tagged_pids(tag), "expected the tagged codex app-server tree to be running"
 
-        # The launch really is running: the node shim and its Rust app-server
-        # child both carry the tag. This is what a reconcile must reap.
-        live_before = _tagged_pids(tag)
-        assert live_before, "expected the tagged codex app-server tree to be running"
-
-        # Simulate the Host dying without graceful teardown: the OS releases the
-        # launcher's owner flock. A crashing parent does NOT kill its children,
-        # so the whole codex app-server tree keeps running as an orphan — this
-        # is exactly the state a fresh Host must reap.
+        # The Host dies without teardown: the OS releases its owner flock while the
+        # app-server tree keeps running as an orphan for the next Host to reap.
         assert server.process_owner_lock is not None
         server.process_owner_lock.close()
         server.process_owner_lock = None
 
-        # A fresh Host reconciles the registry at boot.
         reconcile_codex_native_process_registry()
 
-        # Init reaps the orphan's zombies; model that and confirm no live
-        # (non-zombie) codex app-server from this launch survives.
         survivors = await _wait_group_terminated(tag)
         assert not survivors, (
-            "orphaned codex app-server tree survived reconcile after the owning "
-            "Host died — it should have been reaped by process group. Still "
-            "alive (pid -> cmdline): " + repr({p: registry._process_cmdline(p) for p in survivors})
+            "orphaned codex app-server tree survived reconcile after its Host died; "
+            "still alive (pid -> cmdline): "
+            + repr({p: registry._process_cmdline(p) for p in survivors})
         )
+        assert _registry_entry(pid) is None
         reaped = True
     finally:
         if not reaped:
             _kill_group(pid)
-        _reap_zombie_children()
         with contextlib.suppress(Exception):
             await server.close()
