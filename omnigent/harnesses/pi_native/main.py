@@ -189,6 +189,12 @@ def pi_supports_approve(executable: str) -> bool:
     return ver >= (0, 79, 0)
 
 
+def pi_supports_agent_settled(executable: str) -> bool:
+    """Return whether this Pi version emits the RPC ``agent_settled`` event."""
+    ver = pi_version(executable)
+    return ver is not None and ver >= (0, 80, 4)
+
+
 def build_pi_launch(
     pi_args: Sequence[str],
     *,
