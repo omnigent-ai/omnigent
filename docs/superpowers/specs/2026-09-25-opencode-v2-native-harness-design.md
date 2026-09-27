@@ -80,12 +80,14 @@ the docs at `https://opencode.ai/v2/docs/build/{sdk,client,plugins}`, and npm.
 - TUI leg: tmux runs `opencode --server <url> --session <ses_id> <workspace>`
   with the password in the environment. `build_tui_attach_command` and the
   `attach` argv are removed.
-- One `opencode serve` per Omnigent conversation, as today. The synthesized
-  config (model, gateway, MCP, plugins) and the policy plugin's
-  `OMNIGENT_SESSION_ID` env are per process, and the per-session data dir keeps
-  credentials and history isolated. A shared server (v2 `--service`, session
-  metadata lookup in the plugin, per-session `permissions`) is a possible
-  follow-up, not part of this work.
+- One `opencode serve` per Omnigent conversation, as today. OpenCode 2.x scopes
+  plugins, MCP servers, instructions (`AGENTS.md`) and the process environment
+  to the server, and Omnigent binds the policy plugin (`OMNIGENT_SESSION_ID`),
+  the tool relay and the agent's instructions per conversation; the per-session
+  data dir also keeps the fork snapshot and cleanup simple. A shared server
+  (session-to-conversation lookup in the plugin, a union of every agent's MCP
+  servers and prompts, per-session `permissions`) is a possible follow-up, not
+  part of this work.
 
 ### 2. HTTP client and prompt injection
 

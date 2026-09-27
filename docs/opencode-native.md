@@ -93,9 +93,13 @@ flattened to text. A message sent during a running turn is delivered as a
 
 Each conversation gets its own `opencode serve --stdio` process, its own
 password (`OPENCODE_PASSWORD`) and its own data directory under
-`~/.omnigent/opencode-native/`. Model, gateway, MCP servers, the policy plugin
-and the policy plugin's session binding are all per process, and credentials and
-history stay isolated. Resume reattaches to the same data directory on the same
+`~/.omnigent/opencode-native/`. OpenCode 2.x scopes plugins, MCP servers,
+instructions (`AGENTS.md`) and the process environment to the server, and
+Omnigent binds the policy plugin, the tool relay and the agent's instructions per
+conversation; a shared server would need a session-to-conversation registry
+inside the plugin and a union of every agent's MCP servers and prompts. One
+process per conversation also keeps the fork snapshot and cleanup simple.
+Resume reattaches to the same data directory on the same
 host. A resume on a different host, or of a lost session, starts a new OpenCode
 session seeded with the Omnigent transcript. A same-agent fork into the same
 workspace clones the source OpenCode session natively from a snapshot of the
@@ -109,8 +113,8 @@ replays the history as a text preamble instead.
   when the server launches. A session that outlives that token's expiry fails
   open on the request/tool-result phases until it is relaunched. Tool-call
   approvals are unaffected, because they go through `permission.asked`.
-- **No shared server.** OpenCode's background `--service` server, pairing, and
-  one-server-for-many-sessions are not used.
+- **No shared server.** Each conversation runs its own `opencode serve`; one
+  process never serves several conversations.
 - **No Direct mode.** `opencode acp` is not wired as an ACP harness.
 - **Session import** starts a short-lived `opencode serve` on a snapshot copy
   of your OpenCode 2.x database (never the live store) and reads sessions over
