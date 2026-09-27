@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from omnigent.harnesses.opencode_native.permissions import evaluate_elicitation_id
 from omnigent.runner.app import _build_opencode_policy_evaluator
 
 
@@ -133,6 +134,28 @@ async def test_evaluator_names_v2_shell_action() -> None:
     )
     await evaluate({"action": "shell", "arguments": {"command": "ls"}, "metadata": {}})
     assert client.calls[0][1]["event"]["data"] == {"name": "shell", "arguments": {"command": "ls"}}
+
+
+async def test_evaluator_stamps_elicitation_id_derived_from_request_id() -> None:
+    """The parked card is addressable by the id the forwarder posts on a TUI answer."""
+    client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    await evaluate({"action": "shell", "arguments": {"command": "ls"}, "request_id": "per_1"})
+    body = client.calls[0][1]
+    assert body["_omnigent_elicitation_id"] == evaluate_elicitation_id("per_1")
+    assert body["_omnigent_elicitation_id"].startswith("elicit_evaluate_")
+    assert len(body["_omnigent_elicitation_id"]) == len("elicit_evaluate_") + 32
+
+    client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    await evaluate({"action": "shell", "arguments": {"command": "ls"}})
+    assert "_omnigent_elicitation_id" not in client.calls[0][1]
 
 
 def test_evaluator_docstring_describes_v2_permission_flow() -> None:

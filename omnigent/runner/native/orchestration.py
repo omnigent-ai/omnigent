@@ -2015,7 +2015,10 @@ def _build_opencode_policy_evaluator(
     :returns: An async evaluator returning a verdict mapping, or a deny
         verdict on failure.
     """
-    from omnigent.harnesses.opencode_native.permissions import OPENCODE_NATIVE_HARNESS
+    from omnigent.harnesses.opencode_native.permissions import (
+        OPENCODE_NATIVE_HARNESS,
+        evaluate_elicitation_id,
+    )
 
     session_component = urllib.parse.quote(conversation_id, safe="")
     url = f"/v1/sessions/{session_component}/policies/evaluate"
@@ -2033,7 +2036,7 @@ def _build_opencode_policy_evaluator(
         metadata = normalized.get("metadata")
         if isinstance(metadata, Mapping) and metadata:
             arguments.setdefault("metadata", dict(metadata))
-        body = {
+        body: dict[str, object] = {
             "event": {
                 "type": "PHASE_TOOL_CALL",
                 "target": "",
@@ -2044,6 +2047,10 @@ def _build_opencode_policy_evaluator(
                 "context": {"harness": OPENCODE_NATIVE_HARNESS},
             },
         }
+        request_id = normalized.get("request_id")
+        if isinstance(request_id, str) and request_id:
+            # Lets the forwarder withdraw the parked card when the TUI answers first.
+            body["_omnigent_elicitation_id"] = evaluate_elicitation_id(request_id)
         try:
             resp = await server_client.post(
                 url, json=body, timeout=_OPENCODE_POLICY_EVALUATE_TIMEOUT_S
@@ -2103,19 +2110,24 @@ def _opencode_model_ref(model: str | None) -> dict[str, str] | None:
     Parse ``provider/model[#variant]`` into an OpenCode ``Model.Ref``.
 
     Splits on the first ``/`` (gateway ids such as ``omnigent/omnigent/x``
-    keep the rest as the model id) and on the first ``#`` after it.
+    keep the rest as the model id) and on the last ``#`` after it, the same
+    way the transport's ``split_model_id`` does for ``POST .../model``.
 
     :param model: Qualified model string, e.g. ``"openai/gpt-5#high"``.
     :returns: ``{"providerID", "id"[, "variant"]}``, or ``None`` when unparsable.
     """
+    from omnigent.harnesses.opencode_native.http_transport import split_model_id
+
     if not isinstance(model, str) or not model.strip():
         return None
-    provider_id, slash, rest = model.strip().partition("/")
-    model_id, hash_sign, variant = rest.partition("#")
-    if not slash or not provider_id or not model_id or "#" in provider_id:
+    split = split_model_id(model.strip())
+    if split is None:
+        return None
+    provider_id, model_id, variant = split
+    if not model_id or "#" in provider_id:
         return None
     ref = {"providerID": provider_id, "id": model_id}
-    if hash_sign and variant:
+    if variant:
         ref["variant"] = variant
     return ref
 

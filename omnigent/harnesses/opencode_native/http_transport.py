@@ -43,7 +43,13 @@ _JsonMapping: TypeAlias = Mapping[str, object]
 # annotation for ``OpenCodeHttpTransport(client_factory=...)``; export it so the
 # alias reads as intended public API (its only other use is a PEP 563 stringified
 # annotation, which static analysis can't see as a load).
-__all__ = ["ClientFactory", "OpenCodeHttpTransport", "PromptPayload", "build_prompt_payload"]
+__all__ = [
+    "ClientFactory",
+    "OpenCodeHttpTransport",
+    "PromptPayload",
+    "build_prompt_payload",
+    "split_model_id",
+]
 
 
 class PromptPayload(TypedDict):
@@ -107,7 +113,7 @@ def _attachment_to_file(attachment: Mapping[str, object]) -> dict[str, str] | No
     return entry
 
 
-def _split_model_id(model: str) -> tuple[str, str, str | None] | None:
+def split_model_id(model: str) -> tuple[str, str, str | None] | None:
     """
     Split a qualified model ref into provider, model id, and optional variant.
 
@@ -244,7 +250,7 @@ class OpenCodeHttpTransport:
         :param model: Qualified ``provider/model`` id, e.g. ``"opencode/big-pickle"``.
         :raises OpenCodeClientError: When OpenCode rejects the switch.
         """
-        split = _split_model_id(model)
+        split = split_model_id(model)
         if split is None:
             _logger.warning("opencode-native: ignoring unqualified model id %r", model)
             return

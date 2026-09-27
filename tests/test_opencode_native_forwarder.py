@@ -14,6 +14,7 @@ import pytest
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
 from omnigent.harnesses.opencode_native.client import OpenCodeClientError, OpenCodeEvent
+from omnigent.harnesses.opencode_native.permissions import evaluate_elicitation_id
 from tests.opencode_v2_fixtures import events_of_type, load_events, load_messages
 
 _SESSION = "ses_1"
@@ -693,6 +694,28 @@ async def test_text_before_tool_call_lands_first() -> None:
     assert [i["item_type"] for i in _items(server.posts)] == ["message", "function_call"]
 
 
+async def test_streamed_text_lands_before_tool_call_when_ended_arrives_later() -> None:
+    """The captured flush order is deltas, tool.called, then text.ended (fixture seq 14 < 17)."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
+    for chunk in ("Running", " ls."):
+        await fwd.handle_event(
+            _event("session.text.delta", assistantMessageID="msg_1", ordinal=0, delta=chunk)
+        )
+    await fwd.handle_event(
+        _event("session.tool.called", assistantMessageID="msg_1", id="c1", input={}, executed=True)
+    )
+    await fwd.handle_event(
+        _event("session.text.ended", assistantMessageID="msg_1", ordinal=0, text="Running ls.")
+    )
+    await fwd.handle_event(_step_ended("msg_1"))
+    items = _items(server.posts)
+    assert [i["item_type"] for i in items] == ["message", "function_call"]
+    assert items[0]["item_data"]["content"][0]["text"] == "Running ls."
+    assert items[0]["message_id"] == "opencode:msg_1:text:0"
+
+
 # --- tool progress ----------------------------------------------------------
 
 
@@ -1327,7 +1350,9 @@ async def test_tui_permission_reply_cancels_parked_evaluation_and_clears_card() 
     await fwd.handle_event(_event("permission.replied", requestID="per_t", reply="once"))
     assert task.cancelled()
     assert opencode.permission_replies == []
-    assert _datas(server.posts, "external_elicitation_resolved") == [{"elicitation_id": "per_t"}]
+    assert _datas(server.posts, "external_elicitation_resolved") == [
+        {"elicitation_id": evaluate_elicitation_id("per_t")}
+    ]
 
 
 async def test_fixture_permission_replied_without_pending_task_clears_card() -> None:
@@ -1336,7 +1361,7 @@ async def test_fixture_permission_replied_without_pending_task_clears_card() -> 
     replied = _fixture("permission.replied")
     await fwd.handle_event(replied)
     assert _datas(server.posts, "external_elicitation_resolved") == [
-        {"elicitation_id": replied.data["requestID"]}
+        {"elicitation_id": evaluate_elicitation_id(replied.data["requestID"])}
     ]
 
 

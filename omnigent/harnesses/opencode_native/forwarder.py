@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ from omnigent.harnesses.opencode_native.permissions import (
     OpenCodePermissionRequest,
     PolicyDecision,
     decision_to_reply,
+    evaluate_elicitation_id,
     map_verdict_to_decision,
     normalize_for_policy,
     parse_permission_request,
@@ -347,6 +349,8 @@ def _parse_number(raw: str, *, integer: bool) -> int | float | None:
     try:
         number = float(raw.strip())
     except ValueError:
+        return None
+    if not math.isfinite(number):
         return None
     if integer:
         return int(number) if number.is_integer() else None
@@ -993,8 +997,7 @@ class OpenCodeNativeForwarder:
         raw_input = event.data.get("input")
         arguments = dict(raw_input) if isinstance(raw_input, Mapping) else {}
         await self._begin_turn_if_needed(turn)
-        # Text the model wrote before the call lands above it in the chat.
-        await self._flush_pending_text(turn)
+        await self._settle_text_before_tool(turn)
         await self._post_tool_call(
             turn,
             call_id,
@@ -1002,6 +1005,16 @@ class OpenCodeNativeForwarder:
             arguments,
             message_id=_str_field(event.data, "assistantMessageID"),
         )
+
+    async def _settle_text_before_tool(self, turn: _SessionTurn) -> None:
+        """Persist text the model wrote before a tool call so it lands above the call.
+
+        ``session.text.ended`` arrives after ``session.tool.called`` in the same
+        step flush, so the streamed deltas are the text at this point; the
+        later ``ended`` is deduped by the same key.
+        """
+        await self._flush_pending_text(turn)
+        await self._persist_partial_text(turn)
 
     async def _on_tool_success(self, event: OpenCodeEvent) -> None:
         """Handle ``session.tool.success`` — mirror the result as ``function_call_output``."""
@@ -1033,6 +1046,7 @@ class OpenCodeNativeForwarder:
             return
         message_id = _str_field(event.data, "assistantMessageID")
         if self.state.mark(self._key("tool-call", call_id)):
+            await self._settle_text_before_tool(turn)
             await self._post_tool_call(
                 turn, call_id, turn.tool_names.get(call_id, "tool"), {}, message_id=message_id
             )
@@ -1504,7 +1518,11 @@ class OpenCodeNativeForwarder:
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        await self._post_event(_EXTERNAL_ELICITATION_RESOLVED, {"elicitation_id": request_id})
+        # The card is parked under the evaluate id, not OpenCode's request id.
+        await self._post_event(
+            _EXTERNAL_ELICITATION_RESOLVED,
+            {"elicitation_id": evaluate_elicitation_id(request_id)},
+        )
 
     async def _on_form_created(self, event: OpenCodeEvent) -> None:
         """Handle ``form.created`` — park a web question card in the background."""

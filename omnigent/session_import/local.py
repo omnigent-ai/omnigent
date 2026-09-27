@@ -1535,11 +1535,7 @@ def load_opencode_session(session_id: str) -> LocalSessionImport:
         raise SessionImportNotFoundError(
             f"OpenCode session {session_id!r} has no importable history"
         )
-    location = session.raw.get("location")
-    workspace_value = session.directory or (
-        location.get("directory") if isinstance(location, dict) else None
-    )
-    workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    workspace = session.directory.strip() if session.directory else None
     native_title = session.title.strip() if session.title and session.title.strip() else None
     return LocalSessionImport(
         source="opencode",

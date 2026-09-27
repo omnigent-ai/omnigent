@@ -9,6 +9,7 @@ reply; an unmapped verdict yields no auto-reply (fail closed).
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
@@ -16,6 +17,22 @@ from typing import Literal, TypeAlias
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 OPENCODE_NATIVE_HARNESS = "opencode-native"
+
+
+def evaluate_elicitation_id(request_id: str) -> str:
+    """
+    Derive the ``_omnigent_elicitation_id`` a permission request evaluates under.
+
+    The evaluator stamps it on ``POST /policies/evaluate`` so the parked
+    approval card is addressable, and the forwarder posts the same id in
+    ``external_elicitation_resolved`` when the TUI answers first.
+
+    :param request_id: OpenCode permission request id, e.g. ``"per_abc"``.
+    :returns: ``"elicit_evaluate_<32 hex>"``, stable for *request_id*.
+    """
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:32]
+    return f"elicit_evaluate_{digest}"
+
 
 # Reply tokens the forwarder sends; ``always`` is never used (see decision_to_reply).
 OpenCodeReply = Literal["once", "reject"]
