@@ -624,10 +624,7 @@ function TerminalThemeControl() {
   );
 }
 
-/**
- * Extra-keys row under the terminal on touch devices, as a Color-theme-style
- * header card: a thumbnail of the current mode beside its select.
- */
+/** Extra-keys row under the terminal on touch devices: a mode thumbnail beside its select. */
 function TerminalExtraKeysControl() {
   const isDark = useResolvedThemeMode() === "dark";
   const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
