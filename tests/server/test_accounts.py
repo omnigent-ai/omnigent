@@ -2143,7 +2143,10 @@ def test_browser_login_never_issues_refresh_token(accounts_app: TestClient) -> N
         json={"username": "admin", "password": "admin-pw-12345"},
     )
     assert resp.status_code == 200, resp.text
-    assert "refresh_token" not in resp.json()
+    body = resp.json()
+    assert "refresh_token" not in body
+    # No grant issued → no refresh expiry either.
+    assert "refresh_expires_at" not in body
 
 
 def test_cli_login_with_issue_refresh_issues_grant(accounts_app: TestClient) -> None:
@@ -2163,6 +2166,10 @@ def test_cli_login_with_issue_refresh_issues_grant(accounts_app: TestClient) -> 
     assert "refresh_token" in body
     refresh_token = body["refresh_token"]
     assert isinstance(refresh_token, str) and len(refresh_token) > 10
+    # The absolute refresh expiry travels with the grant so the client
+    # persists a true expiry rather than re-deriving it.
+    login_expiry = body["refresh_expires_at"]
+    assert isinstance(login_expiry, int) and login_expiry > 0
 
     # The refresh token must be immediately usable at /oauth/token.
     refresh_resp = accounts_app.post(
@@ -2174,3 +2181,5 @@ def test_cli_login_with_issue_refresh_issues_grant(accounts_app: TestClient) -> 
     assert "access_token" in refresh_body
     # Login grants don't rotate — same token is returned.
     assert refresh_body["refresh_token"] == refresh_token
+    # Refresh reports the same absolute expiry (anchored at approved_at).
+    assert refresh_body["refresh_expires_at"] == login_expiry
