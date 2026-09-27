@@ -912,7 +912,7 @@ def _build_mcp_tools(
                     raw = await tool_executor(tool_name, args)
                     result: ToolResult = raw if isinstance(raw, dict) else {"result": raw}
                     response: McpResponse = {
-                        "content": [{"type": "text", "text": json.dumps(result)}],
+                        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
                     }
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")

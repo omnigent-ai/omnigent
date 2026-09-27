@@ -183,7 +183,7 @@ class _OSEnvBackedTool(Tool):
         except Exception as exc:
             _logger.exception("%s failed", self.name())
             return json.dumps({"error": str(exc)})
-        return json.dumps(result)
+        return json.dumps(result, ensure_ascii=False)
 
     async def _invoke_async(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """

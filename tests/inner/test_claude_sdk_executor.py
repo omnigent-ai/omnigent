@@ -1458,6 +1458,24 @@ class TestBuildMcpTools(unittest.TestCase):
         self.assertEqual(parsed["result"], 42)
         self.assertNotIn("isError", result)
 
+    def test_handler_keeps_non_ascii_text_unescaped(self):
+        # The handler's text is what the model reads. \uXXXX escapes make every
+        # non-ASCII character six characters long and several times the tokens,
+        # which pushes ordinary non-English tool output past the harness's size
+        # limit for tool results.
+        from omnigent.inner.claude_sdk_executor import _build_mcp_tools
+
+        async def mock_executor(name, args):
+            return {"stdout": "Спикер 1: привет"}
+
+        schemas = [{"name": "sh", "description": "Shell", "parameters": {"type": "object", "properties": {}}}]
+        tools = _build_mcp_tools(schemas, mock_executor)
+        result = _run(tools[0].handler({}))
+        text = result["content"][0]["text"]
+        self.assertIn("Спикер 1: привет", text)
+        self.assertNotIn("\\u", text)
+        self.assertEqual(json.loads(text)["stdout"], "Спикер 1: привет")
+
     def test_handler_marks_blocked_result_as_error(self):
         from omnigent.inner.claude_sdk_executor import _build_mcp_tools
 
