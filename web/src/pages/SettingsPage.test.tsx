@@ -6,6 +6,7 @@
 import { Fragment, type ReactNode } from "react";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -563,13 +564,161 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
-  it("shows matching arrows and the archive-left/delete-right surface defaults", () => {
+  it("puts Swipe actions in a Touch & mobile section above Export", () => {
     renderPage("/settings/appearance");
 
-    expect(screen.getByText(/Swipe left/).textContent).toBe("Swipe left ←");
-    expect(screen.getByText(/Swipe right/).textContent).toBe("Swipe right →");
-    expect(screen.getByTestId("swipe-action-left")).toHaveValue("delete");
-    expect(screen.getByTestId("swipe-action-right")).toHaveValue("archive");
+    const touch = screen.getByRole("heading", { level: 2, name: "Touch & mobile" });
+    const codeWeight = screen.getByText("Heavier code font");
+    const swipe = screen.getByText("Swipe actions");
+    const exportButton = screen.getByTestId("export-settings-button");
+    const follows = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(follows(codeWeight, touch)).toBe(true);
+    expect(follows(touch, swipe)).toBe(true);
+    expect(follows(swipe, exportButton)).toBe(true);
+    // Swipe actions moved out of the workspace settings.
+    expect(follows(screen.getByTestId("hide-unconfigured-harnesses-toggle"), touch)).toBe(true);
+  });
+
+  it("shows Swipe right then Swipe left cards with the archive-right/delete-left defaults", () => {
+    renderPage("/settings/appearance");
+
+    const group = screen.getByRole("group", { name: "Swipe actions" });
+    const right = within(group).getByTestId("swipe-action-right");
+    const left = within(group).getByTestId("swipe-action-left");
+    expect(right.compareDocumentPosition(left) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(right).toHaveAccessibleName("Swipe right: Archive");
+    expect(left).toHaveAccessibleName("Swipe left: Delete");
+    for (const card of [right, left]) {
+      expect(card).toHaveAttribute("aria-haspopup", "menu");
+      expect(card).toHaveAttribute("aria-expanded", "false");
+      // Not a radio card: no arrows, no selected border or check while closed.
+      expect(card).not.toHaveAttribute("role", "radio");
+      expect(card.textContent).not.toMatch(/[←→]/);
+      expect(card).toHaveClass("border-border");
+      expect(card).not.toHaveClass("border-primary");
+    }
+    expect(right).toHaveTextContent("Swipe right");
+    expect(right).toHaveTextContent("Archive");
+    expect(left).toHaveTextContent("Delete");
+  });
+
+  it("opens a swipe card's panel, marks the current action, and persists a pick", async () => {
+    // The open menu makes the page behind it pointer-events: none; outside clicks still dismiss.
+    const user = userEvent.setup({ pointerEventsCheck: 0 });
+    renderPage("/settings/appearance");
+    const right = screen.getByTestId("swipe-action-right");
+
+    await user.click(right);
+    const menu = screen.getByRole("menu", { name: "Swipe right: Archive" });
+    expect(right).toHaveAttribute("aria-expanded", "true");
+    expect(right).toHaveClass("border-primary");
+    const items = within(menu).getAllByRole("menuitemradio");
+    expect(items.map((item) => item.textContent)).toEqual(["Archive", "Delete", "None"]);
+    expect(within(menu).getByRole("menuitemradio", { name: "Archive" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(within(menu).getByRole("menuitemradio", { name: "Delete" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+
+    await user.click(within(menu).getByRole("menuitemradio", { name: "None" }));
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(right).toHaveAccessibleName("Swipe right: None");
+    expect(right).not.toHaveClass("border-primary");
+    expect(JSON.parse(localStorage.getItem("omnigent:swipe-actions") ?? "null")).toEqual({
+      left: "delete",
+      right: "none",
+    });
+
+    // Clicking outside closes the panel without changing the setting.
+    await user.click(right);
+    expect(screen.getByRole("menu", { name: "Swipe right: None" })).toBeInTheDocument();
+    await user.click(screen.getByText("Touch & mobile"));
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(right).toHaveAccessibleName("Swipe right: None");
+  });
+
+  it("drives the swipe panel from the keyboard and returns focus to the card", async () => {
+    const user = userEvent.setup();
+    renderPage("/settings/appearance");
+    const left = screen.getByTestId("swipe-action-left");
+
+    left.focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("menu", { name: "Swipe left: Delete" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(left).toHaveFocus();
+    expect(localStorage.getItem("omnigent:swipe-actions")).toBeNull();
+
+    await user.keyboard(" ");
+    const menu = screen.getByRole("menu", { name: "Swipe left: Delete" });
+    await waitFor(() =>
+      expect(within(menu).getByRole("menuitemradio", { name: "Archive" })).toHaveFocus(),
+    );
+    await user.keyboard("{ArrowDown}{ArrowDown}");
+    expect(within(menu).getByRole("menuitemradio", { name: "None" })).toHaveFocus();
+    await user.keyboard("{ArrowUp}{Enter}");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(left).toHaveAccessibleName("Swipe left: Delete");
+    await user.keyboard("{Enter}");
+    await user.keyboard("{Enter}");
+    expect(left).toHaveAccessibleName("Swipe left: Archive");
+    expect(left).toHaveFocus();
+    expect(JSON.parse(localStorage.getItem("omnigent:swipe-actions") ?? "null")).toEqual({
+      left: "archive",
+      right: "archive",
+    });
+  });
+
+  it("colours Delete red and Archive blue on the card and checked item; None stays neutral", async () => {
+    localStorage.setItem(
+      "omnigent:swipe-actions",
+      JSON.stringify({ left: "none", right: "delete" }),
+    );
+    const user = userEvent.setup();
+    renderPage("/settings/appearance");
+    const right = screen.getByTestId("swipe-action-right");
+    const icon = (card: HTMLElement) => card.querySelector("svg") as SVGElement;
+    const label = (direction: string) => screen.getByTestId(`swipe-action-${direction}-label`);
+
+    expect(icon(right)).toHaveClass("text-destructive");
+    expect(label("right")).toHaveClass("text-destructive");
+    // Dark hover sits on bg-muted, where the tone misses AA: text falls back.
+    expect(label("right")).toHaveClass("dark:group-hover:text-foreground");
+    expect(right).toHaveClass("group");
+    expect(right.querySelector(".lucide-chevron-down")).toHaveClass("text-muted-foreground");
+
+    const left = screen.getByTestId("swipe-action-left");
+    expect(icon(left)).toHaveClass("text-muted-foreground");
+    expect(icon(left)).not.toHaveClass("text-destructive");
+    expect(label("left")).toHaveClass("text-muted-foreground");
+    expect(label("left")).not.toHaveClass("dark:group-hover:text-foreground");
+
+    await user.click(right);
+    let menu = screen.getByRole("menu", { name: "Swipe right: Delete" });
+    const deleteItem = within(menu).getByRole("menuitemradio", { name: "Delete" });
+    expect(deleteItem).toHaveClass("text-destructive", "dark:focus:text-foreground");
+    expect(within(menu).getByRole("menuitemradio", { name: "Archive" })).not.toHaveClass(
+      "text-accent-foreground",
+    );
+    await user.click(within(menu).getByRole("menuitemradio", { name: "Archive" }));
+
+    expect(icon(right)).toHaveClass("text-accent-foreground");
+    expect(label("right")).toHaveClass("text-accent-foreground");
+    expect(label("right")).not.toHaveClass("text-destructive");
+    await user.click(right);
+    menu = screen.getByRole("menu", { name: "Swipe right: Archive" });
+    expect(within(menu).getByRole("menuitemradio", { name: "Archive" })).toHaveClass(
+      "text-accent-foreground",
+      "dark:focus:text-foreground",
+    );
+    expect(within(menu).getByRole("menuitemradio", { name: "Delete" })).not.toHaveClass(
+      "text-destructive",
+    );
   });
 
   it("offers explicit modes and links the automatic browser mode to Databricks settings", () => {
@@ -1148,6 +1297,12 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
     localStorage.setItem("omnigent:hidden-picker-agents", '["polly"]');
+    localStorage.setItem(
+      "omnigent:swipe-actions",
+      JSON.stringify({ left: "archive", right: "none" }),
+    );
+    fireEvent(window, new StorageEvent("storage", { key: "omnigent:swipe-actions" }));
+    expect(screen.getByTestId("swipe-action-right")).toHaveAccessibleName("Swipe right: None");
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -1216,6 +1371,9 @@ describe("SettingsPage", () => {
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
+    expect(screen.getByTestId("swipe-action-right")).toHaveAccessibleName("Swipe right: Archive");
+    expect(screen.getByTestId("swipe-action-left")).toHaveAccessibleName("Swipe left: Delete");
+    expect(localStorage.getItem("omnigent:swipe-actions")).toBeNull();
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {
