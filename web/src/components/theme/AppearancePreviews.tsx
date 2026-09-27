@@ -88,14 +88,20 @@ export function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
   );
 }
 
+/** A session row's status dot and title bar. */
+function PreviewRowMarks({ swatch, opacity }: { swatch: PaletteSwatch; opacity: number }) {
+  return (
+    <>
+      <div className="size-1.5 rounded-full" style={{ backgroundColor: swatch.accent }} />
+      <div className="h-1 w-3/5 rounded-full" style={{ backgroundColor: swatch.text, opacity }} />
+    </>
+  );
+}
+
 function PreviewSidebarRow({ swatch }: { swatch: PaletteSwatch }) {
   return (
     <div className="flex h-2.5 shrink-0 items-center gap-1 px-1">
-      <div className="size-1.5 rounded-full" style={{ backgroundColor: swatch.accent }} />
-      <div
-        className="h-1 w-3/5 rounded-full"
-        style={{ backgroundColor: swatch.text, opacity: 0.25 }}
-      />
+      <PreviewRowMarks swatch={swatch} opacity={0.25} />
     </div>
   );
 }
@@ -138,11 +144,7 @@ function PreviewSwipedRow({
           transform: `translateX(${offset})`,
         }}
       >
-        <div className="size-1.5 rounded-full" style={{ backgroundColor: swatch.accent }} />
-        <div
-          className="h-1 w-3/5 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.35 }}
-        />
+        <PreviewRowMarks swatch={swatch} opacity={0.35} />
       </div>
     </div>
   );
