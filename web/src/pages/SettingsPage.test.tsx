@@ -866,7 +866,18 @@ describe("SettingsPage", () => {
     const description = screen.getByText(
       "Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.",
     );
-    expect(description).not.toHaveClass("truncate");
+    const card = description.closest<HTMLElement>(".rounded-xl");
+    expect(card).not.toBeNull();
+    // Nothing from the text up to the card may clip it to one line or a line count.
+    for (let el: HTMLElement | null = description; el && el !== card!.parentElement;) {
+      const utilities = Array.from(el.classList, (token) => token.split(":").pop()!);
+      expect(
+        utilities.filter(
+          (u) => u === "truncate" || u === "whitespace-nowrap" || u.startsWith("line-clamp-"),
+        ),
+      ).toEqual([]);
+      el = el.parentElement;
+    }
   });
 
   it("switches the extra keys preview between Always, Never and Auto", () => {
@@ -874,13 +885,25 @@ describe("SettingsPage", () => {
     const preview = screen.getByTestId("terminal-extra-keys-preview");
     const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
 
+    // A scene is a frame of terminal lines, optional key pills, then a 20-key keyboard.
+    const scene = () => {
+      const parts = Array.from(preview.firstElementChild!.children);
+      return {
+        terminalLines: parts[0]!.children.length,
+        pills: parts.length === 3,
+        keyboardKeys: parts[parts.length - 1]!.children.length,
+      };
+    };
+
     fireEvent.change(select, { target: { value: "on" } });
     expect(within(preview).queryByTestId("extra-keys-preview-auto")).toBeNull();
     expect(within(preview).getAllByTestId("extra-keys-preview-pills")).toHaveLength(1);
+    expect(scene()).toEqual({ terminalLines: 2, pills: true, keyboardKeys: 20 });
 
     fireEvent.change(select, { target: { value: "off" } });
     expect(within(preview).queryByTestId("extra-keys-preview-auto")).toBeNull();
     expect(within(preview).queryByTestId("extra-keys-preview-pills")).toBeNull();
+    expect(scene()).toEqual({ terminalLines: 3, pills: false, keyboardKeys: 20 });
 
     fireEvent.change(select, { target: { value: "auto" } });
     expect(within(preview).getByTestId("extra-keys-preview-auto")).toBeInTheDocument();
@@ -892,6 +915,7 @@ describe("SettingsPage", () => {
       "extra-keys-preview-auto",
     );
     const [always, never] = Array.from(auto.children) as HTMLElement[];
+    expect(auto).toHaveClass("grid");
     expect(auto.children).toHaveLength(2);
     // Both layers share one grid cell so the frames line up.
     for (const layer of [always!, never!]) {
@@ -903,7 +927,7 @@ describe("SettingsPage", () => {
     expect(within(never!).queryByTestId("extra-keys-preview-pills")).toBeNull();
   });
 
-  it("draws both Auto halves of the extra keys preview in the current light or dark palette", () => {
+  it("draws the extra keys preview in the current light or dark palette", () => {
     const frameColors = () =>
       Array.from(
         screen
@@ -919,6 +943,15 @@ describe("SettingsPage", () => {
     mocks.resolvedTheme = "dark";
     renderPage("/settings/appearance");
     expect(frameColors()).toEqual(["rgb(14, 16, 19)", "rgb(14, 16, 19)"]);
+
+    // Always and Never on their own use the dark palette too (DARK_MODE_PREVIEW.bg).
+    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
+    const frame = () =>
+      screen.getByTestId("terminal-extra-keys-preview").firstElementChild as HTMLElement;
+    for (const mode of ["on", "off"]) {
+      fireEvent.change(select, { target: { value: mode } });
+      expect(frame().style.backgroundColor).toBe("rgb(14, 16, 19)");
+    }
   });
 
   it("defaults transcripts to Chat and persists a Terminal default", () => {
