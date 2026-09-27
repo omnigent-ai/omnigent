@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 import type { TerminalExtraKeysMode } from "@/lib/terminalExtraKeysPreferences";
 import type { PaletteSwatch } from "@/lib/themePalette";
 import type { ThemeMode } from "./themeMode";
@@ -86,80 +85,56 @@ export function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
   );
 }
 
-function ExtraKeysFrame({ swatch, children }: { swatch: PaletteSwatch; children: ReactNode }) {
+function ExtraKeysScene({ swatch, keysRow }: { swatch: PaletteSwatch; keysRow: boolean }) {
   return (
     <div
       aria-hidden
       className="flex h-16 w-full flex-col gap-1 overflow-hidden rounded-lg p-1.5"
       style={{ backgroundColor: swatch.bg, border: `1px solid ${swatch.border}` }}
     >
-      {children}
-    </div>
-  );
-}
-
-function ExtraKeysTerminal({ swatch, lines }: { swatch: PaletteSwatch; lines: 2 | 3 }) {
-  return (
-    <div
-      className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-hidden rounded-md p-1"
-      style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
-    >
       <div
-        className="h-1 w-3/5 shrink-0 rounded-full"
-        style={{ backgroundColor: swatch.text, opacity: 0.5 }}
-      />
-      <div
-        className="h-1 w-2/5 shrink-0 rounded-full"
-        style={{ backgroundColor: swatch.text, opacity: 0.3 }}
-      />
-      {lines === 3 && (
+        className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-hidden rounded-md p-1"
+        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
+      >
         <div
-          className="h-1 w-1/2 shrink-0 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.3 }}
-        />
-      )}
-    </div>
-  );
-}
-
-function ExtraKeysPills({ swatch }: { swatch: PaletteSwatch }) {
-  return (
-    <div data-testid="extra-keys-preview-pills" className="flex shrink-0 gap-0.5">
-      {Array.from({ length: 7 }, (_, index) => (
-        <div
-          key={index}
-          className="h-1.5 flex-1 rounded-sm"
+          className="h-1 w-3/5 shrink-0 rounded-full"
           style={{ backgroundColor: swatch.text, opacity: 0.5 }}
         />
-      ))}
-    </div>
-  );
-}
-
-function ExtraKeysKeyboard({ swatch }: { swatch: PaletteSwatch }) {
-  return (
-    <div
-      className="grid shrink-0 grid-cols-10 gap-0.5 rounded-md p-0.5"
-      style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
-    >
-      {Array.from({ length: 20 }, (_, index) => (
         <div
-          key={index}
-          className="h-1 rounded-sm"
-          style={{ backgroundColor: swatch.text, opacity: 0.2 }}
+          className="h-1 w-2/5 shrink-0 rounded-full"
+          style={{ backgroundColor: swatch.text, opacity: 0.3 }}
         />
-      ))}
+        {!keysRow && (
+          <div
+            className="h-1 w-1/2 shrink-0 rounded-full"
+            style={{ backgroundColor: swatch.text, opacity: 0.3 }}
+          />
+        )}
+      </div>
+      {keysRow && (
+        <div data-testid="extra-keys-preview-pills" className="flex shrink-0 gap-0.5">
+          {Array.from({ length: 7 }, (_, index) => (
+            <div
+              key={index}
+              className="h-1.5 flex-1 rounded-sm"
+              style={{ backgroundColor: swatch.text, opacity: 0.5 }}
+            />
+          ))}
+        </div>
+      )}
+      <div
+        className="grid shrink-0 grid-cols-10 gap-0.5 rounded-md p-0.5"
+        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
+      >
+        {Array.from({ length: 20 }, (_, index) => (
+          <div
+            key={index}
+            className="h-1 rounded-sm"
+            style={{ backgroundColor: swatch.text, opacity: 0.2 }}
+          />
+        ))}
+      </div>
     </div>
-  );
-}
-
-function ExtraKeysScene({ swatch, keysRow }: { swatch: PaletteSwatch; keysRow: boolean }) {
-  return (
-    <ExtraKeysFrame swatch={swatch}>
-      <ExtraKeysTerminal swatch={swatch} lines={keysRow ? 2 : 3} />
-      {keysRow && <ExtraKeysPills swatch={swatch} />}
-      <ExtraKeysKeyboard swatch={swatch} />
-    </ExtraKeysFrame>
   );
 }
 
