@@ -2841,7 +2841,7 @@ async def test_elicitation_resolved_externally_finalizes_without_posting(tmp_pat
     await _wait_for_card(slack)
     # No Slack click — resolve elsewhere; the fixture then emits the push.
     omnigent.resolve_externally.set()
-    await _wait_for_turn_end(slack)
+    await _wait_for_turn_end(slack, service)
     await service.shutdown()
 
     # We posted NO verdict (answered elsewhere), the card shows the neutral
@@ -3358,7 +3358,7 @@ async def test_post_elicitation_answer_recovered_when_stream_silent(tmp_path: Pa
     await service.handle_elicitation_action(
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
     )
-    await _wait_for_turn_end(slack)
+    await _wait_for_turn_end(slack, service)
     await service.shutdown()
 
     # The final answer was recovered and delivered exactly once; the turn task
@@ -3426,13 +3426,25 @@ class EventScriptClient(FakeOmnigentClient):
         yield {"type": "session.status", "status": "idle"}
 
 
-async def _wait_for_turn_end(slack: FakeSlackClient) -> None:
+async def _wait_for_turn_end(slack: FakeSlackClient, service: Any = None) -> None:
     """Wait until the turn finished: its final stream segment is stopped.
 
     An interruption seal splits the answer, so "any stream stopped" is not a
     completion signal. The turn ends only once its last-opened segment stops
     with no further append pending, which is stable once the loop settles.
+
+    Stream state alone cannot tell "finished" from "parked awaiting a verdict"
+    — a turn waiting on an elicitation also has all its segments stopped. When
+    the service is supplied, the definitive signal is the turn task itself
+    retiring from ``_turn_tasks``; the stream check stays as the fallback for
+    callers with no service handle.
     """
+    if service is not None:
+        for _ in range(500):
+            if not service._turn_tasks:  # type: ignore[attr-defined]
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError("Timed out waiting for the turn task to retire")
     for _ in range(100):
         if slack.streams and all(s.stopped for s in slack.streams):
             # Give the loop a beat to open a follow-on segment if more is coming.
@@ -3454,7 +3466,7 @@ async def _run_scripted_turn(tmp_path: Path, events: list[dict[str, Any]]) -> "F
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_turn_end(slack)
+    await _wait_for_turn_end(slack, service)
     await service.shutdown()
     return slack
 
@@ -3505,7 +3517,7 @@ async def test_answer_then_trailing_notice_is_not_duplicated(tmp_path: Path) -> 
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_turn_end(slack)
+    await _wait_for_turn_end(slack, service)
     await service.shutdown()
 
     # The answer appears exactly once across all stream segments — not duplicated

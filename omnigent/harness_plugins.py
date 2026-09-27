@@ -611,6 +611,21 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
+    # omp runs its own RPC wrap (``omp --mode rpc``) with the same integration
+    # mode, resume, and delivery semantics as pi (same gateway models, same
+    # thinking ladder, same per-turn composition).
+    "omp": _C(
+        _IM.CLI_SUBPROCESS,
+        _EL.NONE,
+        _RS.COLD_ONLY,
+        _EF.PI,
+        _MF.MULTI,
+        _AU.OMNIGENT_CREDENTIAL,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
+    ),
     "openai-agents": _C(
         _IM.SDK_IN_PROCESS,
         _EL.NONE,
@@ -746,6 +761,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
 
+# ``omp`` runs its own RPC wrap (``omnigent.inner.omp_harness``) rather than
+# the generic ACP wrap, so its profile is declared alongside ``pi``'s above
+# with the same integration mode, resume, and delivery semantics.
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
@@ -772,6 +790,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "open-responses",
             "openai-agents",
             "opencode-native",
+            "omp",
             "pi",
             "pi-native",
             "qwen",
@@ -786,6 +805,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
         "devin-native": "omnigent.inner.devin_native_harness",
+        # ``omp`` runs its own RPC wrap (``omp --mode rpc``), not the generic
+        # ACP wrap.
+        "omp": "omnigent.inner.omp_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
@@ -827,6 +849,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
+        "oh-my-pi": "omp",
         "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
         "native-devin": "devin-native",
@@ -905,6 +928,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
+        "omp": "HARNESS_OMP_MODEL",
         "pi": "HARNESS_PI_MODEL",
         "qwen": "HARNESS_QWEN_MODEL",
     },
@@ -934,6 +958,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
+        "omp": "Oh My Pi",
         "pi": "Pi",
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },

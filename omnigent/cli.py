@@ -7197,7 +7197,7 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
-    "'cursor', 'kimi', "
+    "'cursor', 'kimi', 'omp' (alias 'oh-my-pi'), "
     "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
@@ -7269,7 +7269,7 @@ _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnige
 # acp:<slug> launcher: without os_env the runner 404s the session's
 # environment resource and the web UI unmounts the Files panel.
 _OS_ENV_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "codex", "pi", "qwen", "goose", "kimi", "acp"}
+    {"claude-sdk", "codex", "omp", "pi", "qwen", "goose", "kimi", "acp"}
 )
 
 
