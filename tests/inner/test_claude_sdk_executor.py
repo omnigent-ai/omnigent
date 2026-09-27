@@ -1468,7 +1468,13 @@ class TestBuildMcpTools(unittest.TestCase):
         async def mock_executor(name, args):
             return {"stdout": "Спикер 1: привет"}
 
-        schemas = [{"name": "sh", "description": "Shell", "parameters": {"type": "object", "properties": {}}}]
+        schemas = [
+            {
+                "name": "sh",
+                "description": "Shell",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
         tools = _build_mcp_tools(schemas, mock_executor)
         result = _run(tools[0].handler({}))
         text = result["content"][0]["text"]
