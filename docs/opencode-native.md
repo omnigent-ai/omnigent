@@ -26,6 +26,9 @@ the harness as *outdated* until it is upgraded.
 `omni setup` → OpenCode does the same install and shows the login step. The web
 UI's setup dialog shows the same checklist for a remote host.
 
+Omnigent never removes packages; if `opencode-ai` is still installed, setup
+stops with a message asking you to remove it first.
+
 Omnigent stores no OpenCode credential. At launch, the runner writes a
 per-conversation `auth.json` merged from your legacy `auth.json` and your
 OpenCode 2.x credential store (`~/.local/share/opencode/opencode.db`; the store

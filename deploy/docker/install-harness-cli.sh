@@ -245,8 +245,11 @@ for spec in "$@"; do
     case "$name" in
         opencode)
             # v1 opencode-ai owns the same global `opencode` bin; npm refuses
-            # to overwrite another package's bin (EEXIST).
-            npm rm -g opencode-ai >/dev/null 2>&1 || true
+            # to overwrite another package's bin (EEXIST). This script does
+            # not remove packages, so fail loudly instead of uninstalling it.
+            if npm ls -g opencode-ai --depth=0 >/dev/null 2>&1; then
+                die "OpenCode 1.x (opencode-ai) is installed and owns the global 'opencode' binary. Remove it first: npm rm -g opencode-ai"
+            fi
             install_npm "@opencode/cli@${version:-~2.0.18}" opencode
             ;;
         qwen)     install_npm "@qwen-code/qwen-code${version:+@$version}" qwen ;;

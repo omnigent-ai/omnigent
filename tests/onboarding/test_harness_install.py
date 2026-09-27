@@ -14,6 +14,11 @@ import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
+# Captured before the autouse fixture below monkeypatches ``subprocess.run``
+# (on the shared module object), so tests that need a real subprocess call
+# can bypass that stub.
+_REAL_SUBPROCESS_RUN = subprocess.run
+
 
 @pytest.fixture(autouse=True)
 def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -781,24 +786,23 @@ def test_opencode_install_spec_pins_v2_cli() -> None:
     assert spec.package == "@opencode/cli@~2.0.18"
 
 
-def test_opencode_install_removes_v1_package_before_installing() -> None:
-    """v1 ``opencode-ai`` owns the global ``opencode`` bin and npm refuses to
-    overwrite another package's bin (EEXIST), so v1 is removed first."""
+def test_opencode_install_never_removes_v1_package() -> None:
+    """Omnigent doesn't remove packages: it checks for v1 ``opencode-ai``
+    and stops with a message instead of uninstalling it."""
     argv = hi.harness_install_command(hi.OPENCODE_KEY)
     assert argv[:2] == ["bash", "-c"]
     script = argv[2]
-    assert script.index("npm rm -g opencode-ai") < script.index(
+    assert "npm rm -g opencode-ai >" not in script
+    assert script.index("npm ls -g opencode-ai") < script.index(
         "npm install -g @opencode/cli@~2.0.18"
     )
-    assert hi.harness_install_display(hi.OPENCODE_KEY) == (
-        "npm rm -g opencode-ai; npm install -g @opencode/cli@~2.0.18"
-    )
+    assert hi.harness_install_display(hi.OPENCODE_KEY) == ("npm install -g @opencode/cli@~2.0.18")
 
 
-def test_install_harness_cli_runs_opencode_v1_removal_then_install(
+def test_install_harness_cli_runs_opencode_guard_and_install(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The one-click install runs the removal and the v2 install in one argv."""
+    """The one-click install runs the v1 guard and the v2 install in one argv."""
     calls: list[list[str]] = []
     state = {"installed": False}
 
@@ -818,13 +822,55 @@ def test_install_harness_cli_runs_opencode_v1_removal_then_install(
     monkeypatch.setattr(hi.subprocess, "run", _run)
 
     assert hi.install_harness_cli(hi.OPENCODE_KEY) is True
-    assert calls == [
-        [
-            "bash",
-            "-c",
-            "npm rm -g opencode-ai >/dev/null 2>&1 || true; npm install -g @opencode/cli@~2.0.18",
-        ]
-    ]
+    assert calls == [["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT]]
+
+
+def test_opencode_install_script_blocks_when_v1_present(tmp_path: Path) -> None:
+    """Run the real install script through bash with a fake npm that reports
+    ``opencode-ai`` installed: it must exit 1, print the message on stderr,
+    and never invoke ``npm rm`` or ``npm install``."""
+    npm_log = tmp_path / "npm-calls.log"
+    fake_npm = tmp_path / "npm"
+    fake_npm.write_text(
+        f'#!/bin/bash\necho "$*" >> "{npm_log}"\nif [ "$1" = "ls" ]; then exit 0; fi\nexit 0\n'
+    )
+    fake_npm.chmod(0o755)
+
+    result = _REAL_SUBPROCESS_RUN(
+        ["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT],
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "opencode-ai" in result.stderr
+    assert "Omnigent does not remove packages" in result.stderr
+    calls = npm_log.read_text().splitlines() if npm_log.exists() else []
+    assert not any(call.startswith("rm") for call in calls)
+    assert not any(call.startswith("install") for call in calls)
+
+
+def test_opencode_install_script_installs_when_v1_absent(tmp_path: Path) -> None:
+    """When ``npm ls -g opencode-ai`` fails (not installed), the script
+    proceeds straight to ``npm install -g @opencode/cli@~2.0.18``."""
+    npm_log = tmp_path / "npm-calls.log"
+    fake_npm = tmp_path / "npm"
+    fake_npm.write_text(
+        f'#!/bin/bash\necho "$*" >> "{npm_log}"\nif [ "$1" = "ls" ]; then exit 1; fi\nexit 0\n'
+    )
+    fake_npm.chmod(0o755)
+
+    result = _REAL_SUBPROCESS_RUN(
+        ["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT],
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    calls = npm_log.read_text().splitlines()
+    assert any(call.startswith("install -g @opencode/cli@~2.0.18") for call in calls)
 
 
 def test_install_harness_cli_runs_hermes_installer_then_rechecks(

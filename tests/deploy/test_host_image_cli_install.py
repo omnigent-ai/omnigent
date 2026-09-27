@@ -71,8 +71,10 @@ def test_extra_cli_rows_match_harness_install_table() -> None:
     assert opencode.package == "@opencode/cli@~2.0.18"
     pkg, _, pin = opencode.package.rpartition("@")
     assert f"{pkg}@${{version:-{pin}}}" in script
-    # v1 opencode-ai owns the same global `opencode` bin (npm EEXIST).
-    assert "npm rm -g opencode-ai" in script
+    # v1 opencode-ai owns the same global `opencode` bin (npm EEXIST); this
+    # script doesn't remove it, it checks and fails loudly instead.
+    assert "npm rm -g opencode-ai >" not in script
+    assert "npm ls -g opencode-ai" in script
 
     qwen = hi._HARNESS_INSTALL[hi.QWEN_KEY]
     assert qwen.package == "@qwen-code/qwen-code"

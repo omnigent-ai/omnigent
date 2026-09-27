@@ -135,10 +135,16 @@ _ANTIGRAVITY_MIN_VERSION = "1.1.13"
 OPENCODE_KEY = "opencode"
 _OPENCODE_PACKAGE = "@opencode/cli@~2.0.18"
 # v1 ``opencode-ai`` links the same global ``opencode`` bin and npm refuses to
-# overwrite another package's bin (EEXIST), so the v1 package is removed first.
-_OPENCODE_INSTALL_HINT = f"npm rm -g opencode-ai; npm install -g {_OPENCODE_PACKAGE}"
+# overwrite another package's bin (EEXIST). Omnigent doesn't remove packages it
+# didn't install, so setup stops with a message instead of uninstalling it.
+_OPENCODE_INSTALL_HINT = f"npm install -g {_OPENCODE_PACKAGE}"
 _OPENCODE_INSTALL_SCRIPT = (
-    f"npm rm -g opencode-ai >/dev/null 2>&1 || true; npm install -g {_OPENCODE_PACKAGE}"
+    "if npm ls -g opencode-ai --depth=0 >/dev/null 2>&1; then "
+    'echo "OpenCode 1.x (opencode-ai) is installed and owns the global '
+    "'opencode' binary. Omnigent does not remove packages; run "
+    "'npm rm -g opencode-ai' yourself, then rerun setup.\" >&2; "
+    "exit 1; "
+    f"fi; npm install -g {_OPENCODE_PACKAGE}"
 )
 
 # Goose authenticates against its own config (``goose configure`` → keyring /
