@@ -1836,6 +1836,7 @@ async def _run_auto_create_cursor_terminal(
     monkeypatch: pytest.MonkeyPatch,
     agent_spec: AgentSpec | None,
     terminal_launch_args: list[str] | None,
+    model_override: str | None = None,
 ) -> dict[str, Any]:
     """Drive ``_auto_create_cursor_terminal`` and return what it wired up.
 
@@ -1914,7 +1915,11 @@ async def _run_auto_create_cursor_terminal(
                 metadata={"terminal_name": "cursor", "session_key": "main", "running": True},
             )
 
-    snapshot = {"workspace": str(workspace), "terminal_launch_args": terminal_launch_args}
+    snapshot = {
+        "workspace": str(workspace),
+        "terminal_launch_args": terminal_launch_args,
+        "model_override": model_override,
+    }
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
         transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
@@ -1978,6 +1983,26 @@ async def test_auto_create_cursor_terminal_inherits_agent_os_env(
 
     assert captured["parent_os_env"] is agent_os_env
     assert captured["spec"].os_env.sandbox is agent_os_env.sandbox
+
+
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_launches_with_create_time_model_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model picked before the first message reaches the first cursor-agent process."""
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(
+            spec_version=1, name="cursor", executor=ExecutorSpec(model="sonnet-4-thinking")
+        ),
+        terminal_launch_args=None,
+        model_override="claude-opus-5-5",
+    )
+    spec = captured["spec"]
+    assert spec.args.count("--model") == 1
+    assert spec.args[spec.args.index("--model") + 1] == "claude-opus-5-5"
 
 
 @pytest.mark.parametrize(

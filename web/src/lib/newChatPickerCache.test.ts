@@ -112,6 +112,42 @@ describe("newChatPickerCache", () => {
     expect(readNewChatPickerOptionsCache(key)).toEqual(migrated);
   });
 
+  it("caches a host's Cursor catalog alongside the other harnesses", () => {
+    const withCursor = {
+      ...options,
+      models: {
+        ...options.models,
+        cursor: [
+          {
+            id: "grok-4.7",
+            displayName: "Grok 4.7",
+            isDefault: false,
+            source: { kind: "subscription", label: "Subscription", name: "cursor-agent" },
+          },
+        ],
+      },
+    };
+    writeNewChatPickerOptionsCache(key, withCursor);
+    expect(readNewChatPickerOptionsCache(key)).toEqual(withCursor);
+  });
+
+  it("reads caches written before Cursor had a launch catalog", () => {
+    writeNewChatPickerOptionsCache(key, options);
+    const record = JSON.parse(localStorage.getItem(`${key}:options`)!);
+    expect(record.preview.models).not.toHaveProperty("cursor");
+
+    expect(readNewChatPickerOptionsCache(key)?.models.cursor).toBeUndefined();
+  });
+
+  it("treats a legacy empty Cursor catalog as unknown", () => {
+    writeNewChatPickerOptionsCache(key, { ...options, models: { ...options.models, cursor: [] } });
+    const record = JSON.parse(localStorage.getItem(`${key}:options`)!);
+    delete record.preview.catalogVersion;
+    localStorage.setItem(`${key}:options`, JSON.stringify(record));
+
+    expect(readNewChatPickerOptionsCache(key)?.models.cursor).toBeUndefined();
+  });
+
   it("isolates and expires cached menu choices just like their labels", () => {
     writeNewChatPickerOptionsCache(key, options);
     expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey("another-project"))).toBeNull();
