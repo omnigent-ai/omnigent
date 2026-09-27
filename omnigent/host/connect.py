@@ -3240,6 +3240,52 @@ class HostProcess:
         routable = list(config.routable_models) if config is not None else []
         return ModelOptionsResult(models=rows, routable_models=routable)
 
+    async def _cursor_model_options_result(
+        self,
+        request_id: str,
+        with_source: Callable[[list[dict[str, object]]], list[dict[str, object]]],
+    ) -> HostModelOptionsResultFrame:
+        """
+        Preview the Cursor picker by running ``cursor-agent models`` on this host.
+
+        Uses the same discovery and base-id normalization as the in-session
+        picker, so a pre-launch pick is a value the runner can pass to
+        ``--model`` and the session gear can show once the runner is up.
+
+        :param request_id: The server's model-options request id.
+        :param with_source: Adds the host's model-configuration source.
+        :returns: The catalog, or a failed frame explaining why none exists.
+        """
+        from omnigent.harnesses.cursor_native.main import list_cursor_cli_model_options
+
+        def failed(error: str) -> HostModelOptionsResultFrame:
+            return HostModelOptionsResultFrame(request_id=request_id, status="failed", error=error)
+
+        try:
+            options = await asyncio.to_thread(list_cursor_cli_model_options)
+        except click.ClickException as exc:
+            # A missing optional CLI is an expected picker result, not a host fault.
+            return failed(str(exc))
+        except subprocess.TimeoutExpired:
+            _logger.warning("Cursor model catalog timed out", exc_info=True)
+            return failed("cursor-agent models timed out on this host")
+        except subprocess.CalledProcessError as exc:
+            _logger.warning("Cursor model catalog unavailable", exc_info=True)
+            return failed(
+                f"cursor-agent models exited with status {exc.returncode}; "
+                "if Cursor is signed out on this host, run 'cursor-agent login'"
+            )
+        except Exception:  # noqa: BLE001 — no catalog, never a crash
+            _logger.warning("Cursor model catalog unavailable", exc_info=True)
+            return failed("failed to resolve Cursor model options")
+        models: list[dict[str, object]] = [dict(option) for option in options]
+        return HostModelOptionsResultFrame(
+            request_id=request_id,
+            status="ok",
+            models=with_source(models),
+            routable_models=[option["id"] for option in options],
+        )
+
     async def _handle_model_options(
         self,
         frame: HostModelOptionsFrame,
@@ -3323,6 +3369,9 @@ class HostProcess:
                 status="ok",
                 models=with_source(devin_models),
             )
+
+        if harness == "cursor-native":
+            return await self._cursor_model_options_result(frame.request_id, with_source)
 
         if is_claude_sdk_harness_name(harness):
             # SDK-mode Claude is a pass-through client with no model catalog
