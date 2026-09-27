@@ -22,8 +22,10 @@ with ``modelProvider: "gemini"`` in its settings.
        "token": {"access_token": "ya29.…", "refresh_token": "1//0g…",
                  "token_type": "Bearer", "expiry": "…"}}
 
-- Newer agy versions use the OS keyring (macOS Keychain, Linux Secret
-  Service/dbus, or Windows Credential Manager) and may write no token file.
+- Google documents OS keyring storage (macOS Keychain, Linux Secret
+  Service/dbus, or Windows Credential Manager) at
+  https://antigravity.google/docs/cli/install/. Keyring-only storage was
+  observed with agy 1.2.8 on Linux.
 
 Detection accepts the API key first, then legacy token files, then asks the CLI
 via :func:`omnigent.onboarding.harness_install.harness_cli_logged_in`. Its
@@ -153,7 +155,9 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
     # Modern agy can keep OAuth solely in the OS keyring on any platform.
     # Ask its status command rather than inferring login from settings files.
     try:
-        return harness_install.harness_cli_logged_in(GEMINI_FAMILY)
+        return harness_install.harness_cli_logged_in(
+            GEMINI_FAMILY, timeout=harness_install.READINESS_CLI_PROBE_TIMEOUT_S
+        )
     except (OSError, ValueError, subprocess.SubprocessError):
         # Readiness must never raise: a probe that cannot run is "no credential".
         return False
