@@ -114,6 +114,58 @@ async def test_settlement_keeps_continuation_on_first_turn(
     assert rpc._line_queue.empty()
 
 
+async def test_live_stdout_timeout_during_compaction_after_error_keeps_turn_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.inner.pi_executor._find_pi_cli", lambda: "/unused/pi")
+    monkeypatch.setattr("omnigent.inner.pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S", 0.01)
+    executor = PiExecutor()
+    executor._settled_supported = True
+    rpc = _PiRpcSession()
+    rpc._line_queue = asyncio.Queue()
+    rpc._read_task = asyncio.create_task(asyncio.sleep(30))
+    for event in [
+        {"type": "message_end", "message": _error("context overflow")},
+        {"type": "agent_end", "messages": [_error("context overflow")]},
+        {"type": "compaction_start"},
+    ]:
+        rpc._line_queue.put_nowait(json.dumps(event))
+
+    async def feed_after_timeout() -> None:
+        await asyncio.sleep(0.03)
+        for event in [
+            {"type": "compaction_end"},
+            {"type": "agent_start"},
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "Recovered"},
+            },
+            {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}},
+            {"type": "agent_end", "messages": []},
+            {"type": "agent_settled"},
+        ]:
+            rpc._line_queue.put_nowait(json.dumps(event))
+
+    feeder = asyncio.create_task(feed_after_timeout())
+    monkeypatch.setattr(rpc, "send_command", AsyncMock())
+    monkeypatch.setattr(rpc, "close", AsyncMock(wraps=rpc.close))
+    executor._session_states["__default__"] = _PiSessionState(rpc=rpc)
+    monkeypatch.setattr(executor, "_ensure_rpc", AsyncMock(return_value=rpc))
+    try:
+        result = [
+            event
+            async for event in executor.run_turn([{"role": "user", "content": "first"}], [], "")
+        ]
+    finally:
+        feeder.cancel()
+        rpc._read_task.cancel()
+        await asyncio.gather(feeder, rpc._read_task, return_exceptions=True)
+    assert [event.response for event in result if isinstance(event, TurnComplete)] == ["Recovered"]
+    assert not any(isinstance(event, ExecutorError) for event in result)
+    assert rpc._line_queue.empty()
+    rpc.close.assert_not_awaited()
+
+
 async def test_failed_settled_turn_does_not_poison_second_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

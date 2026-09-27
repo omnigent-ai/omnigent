@@ -2537,7 +2537,7 @@ class PiExecutor(Executor):
                 else _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
             )
             if line is None:
-                if pending_error is None and not rpc.stdout_at_eof():
+                if (self._settled_supported or pending_error is None) and not rpc.stdout_at_eof():
                     # Idle timeout, not process death: pi's stdout reader is
                     # still running — e.g. a long tool call silent past the
                     # idle budget. Keep waiting; a dead pi process delivers
