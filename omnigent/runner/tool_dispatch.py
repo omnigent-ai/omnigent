@@ -7113,7 +7113,7 @@ async def _execute_os_env_tool(
         if os_env is not None and owns_environment:
             os_env.close()
 
-    return json.dumps(result)
+    return json.dumps(result, ensure_ascii=False)
 
 
 # ── REST-backed tools (Phase 1) ──────────────────────────
