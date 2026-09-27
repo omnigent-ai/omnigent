@@ -43,6 +43,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostModelOptionsResultFrame,
+    HostProviderOpResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -790,6 +791,19 @@ async def _receive_loop(
             skills_future = conn.pending_skills.pop(frame.request_id, None)
             if skills_future is not None and not skills_future.done():
                 skills_future.set_result(frame)
+
+        if isinstance(frame, HostProviderOpResultFrame):
+            op_future = conn.pending_provider_ops.pop(frame.request_id, None)
+            if op_future is not None and not op_future.done():
+                op_future.set_result(
+                    {
+                        "status": frame.status,
+                        "payload": frame.payload,
+                        "error_status": frame.error_status,
+                        "error_code": frame.error_code,
+                        "error": frame.error,
+                    }
+                )
             continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
