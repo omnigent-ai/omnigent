@@ -8,9 +8,14 @@ host daemon -> create a host-bound session -> the runner auto-creates the
 resource -> send a user message -> poll session items until the assistant echoes a marker.
 
 Opt-in and run manually before merging opencode-native changes (needs
-``@opencode/cli`` 2.0.x on PATH and LLM credentials)::
+``@opencode/cli`` 2.0.x on PATH). OpenCode's free models need no credentials::
 
     npm install -g @opencode/cli@~2.0.18
+    OMNIGENT_E2E_OPENCODE_NATIVE=1 OMNIGENT_E2E_OPENCODE_MODEL=opencode/big-pickle \
+    HOME=/tmp/omni-isolated uv run pytest tests/e2e/test_host_opencode_native_e2e.py -v
+
+With gateway credentials instead::
+
     OMNIGENT_E2E_OPENCODE_NATIVE=1 \
     HOME=/tmp/omni-isolated DATABRICKS_CONFIG_FILE=$REAL_HOME/.databrickscfg \
     uv run pytest tests/e2e/test_host_opencode_native_e2e.py \
@@ -128,9 +133,12 @@ def test_opencode_native_multiturn_item_order(
                 "agent_id": agent_id,
                 "host_id": host_id,
                 "workspace": str(workspace),
-                # gateway-valid model via opencode's openai provider (the daemon
-                # has OPENAI_BASE_URL/OPENAI_API_KEY pointed at the gateway).
-                "model_override": "openai/databricks-claude-sonnet-4-6",
+                # Default: a gateway-valid model via opencode's openai provider
+                # (the daemon has OPENAI_BASE_URL/OPENAI_API_KEY pointed at the
+                # gateway). Override with a free model such as opencode/big-pickle.
+                "model_override": os.environ.get(
+                    "OMNIGENT_E2E_OPENCODE_MODEL", "openai/databricks-claude-sonnet-4-6"
+                ),
             },
             timeout=60.0,
         )
