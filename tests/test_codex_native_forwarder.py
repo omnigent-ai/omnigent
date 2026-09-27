@@ -1072,17 +1072,18 @@ async def test_child_usage_model_less_resume_is_not_retried() -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_usage_recovery_error_does_not_mark_session_failed() -> None:
-    """Usage-only model recovery stays retryable without failing the child."""
+async def test_child_usage_recovery_error_does_not_mark_failed_or_retry() -> None:
+    """A refused usage-only recovery neither fails the child nor retries the resume.
+
+    Backfill only mirrors history: a resume error outside the not-ready class is
+    logged and marked done for this connection, and the child's usage stays
+    buffered rather than being posted under the parent model.
+    """
     client = _RecordingClient()
     codex_client = MagicMock()
-    codex_client.request = AsyncMock(
-        side_effect=[
-            RuntimeError("temporary resume failure"),
-            _resume_response("thread_child", "child-model"),
-        ]
-    )
+    codex_client.request = AsyncMock(side_effect=RuntimeError("temporary resume failure"))
     state = _child_state(codex_client)
+    _record_child_usage(client, state, "thread_child", "conv_child")
 
     for _ in range(2):
         await fwd._recover_child_usage_model(
@@ -1092,8 +1093,10 @@ async def test_child_usage_recovery_error_does_not_mark_session_failed() -> None
             forwarder_state=state,
         )
 
-    assert codex_client.request.await_count == 2
-    assert state.model_for_child_thread("thread_child") == "child-model"
+    assert codex_client.request.await_count == 1
+    assert state.model_for_child_thread("thread_child") is None
+    assert not state.needs_child_thread_backfill("thread_child")
+    assert _usage_posts(client) == []
     assert not any(
         body["type"] == "external_session_status" and body["data"]["status"] == "failed"
         for _url, body in client.posts
