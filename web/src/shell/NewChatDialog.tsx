@@ -4610,20 +4610,15 @@ export function NewChatLandingScreen() {
       ),
     [availableSkills, skillPrefix],
   );
-  // Selecting a skill fills "/name " and leaves the caret ready for the
-  // argument — skills never auto-execute from the menu.
+  // Insert the selected skill at the caret while preserving surrounding text.
   function applySlashSelection(cmd: string) {
-    const completion = slashCompletion.complete(cmd);
-    setMessage(completion.text);
-    textareaRef.current?.focus();
-    requestAnimationFrame(() => {
-      textareaRef.current?.setSelectionRange(completion.caret, completion.caret);
-      if (textareaRef.current) slashCompletion.onSelectionChange(textareaRef.current);
-    });
+    setMessage(slashCompletion.complete(cmd).text);
   }
   const slashCompletion = useSlashCompletion({
     text: message,
     commands: skillCommands,
+    skills: skillCommands,
+    textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
     mobile: isMobileViewport,
@@ -6375,6 +6370,7 @@ export function NewChatLandingScreen() {
                         activeIndex={slashCompletion.index}
                         onSelect={applySlashSelection}
                         commands={slashCompletion.commands}
+                        builtinNames={slashCompletion.builtinNames}
                         skillsStatus={skillsStatus}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}

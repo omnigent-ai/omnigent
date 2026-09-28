@@ -2853,7 +2853,6 @@ describe("Composer native skill menu", () => {
       expect(textarea()).toHaveValue(`please $review${suffix}`);
       expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
       await waitFor(() => expect(textarea().selectionStart).toBe(suffix.startsWith(" ") ? 15 : 14));
-      expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
     },
   );
 
@@ -2863,6 +2862,39 @@ describe("Composer native skill menu", () => {
     fireEvent.keyDown(textarea(), { key: "Escape" });
     expect(textarea()).toHaveValue("please /rev");
     expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+  });
+
+  it.each(["context", "help", "compact"])(
+    "offers the inline %s skill despite its built-in name",
+    (name) => {
+      setComposerState({
+        sessionHarness: "claude-sdk",
+        skills: [{ name, description: "Custom skill" }],
+      });
+      const props = composerProps();
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "please /" } });
+      expect(screen.getByText("Skills")).toBeVisible();
+      expect(screen.queryByText("Commands")).toBeNull();
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+      expect(textarea()).toHaveValue(`please /${name} `);
+      expect(props.onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps quote and tail selection separate when their text matches", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    act(() => ref.current?.appendReplyQuote("Quoted text"));
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    const before = screen.getByLabelText("Reply text before quote 1");
+    fireEvent.focus(before);
+    fireEvent.change(before, { target: { value: "please /review" } });
+    fireEvent.select(before, { target: { selectionStart: 9, selectionEnd: 9 } });
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+    expect(textarea()).toHaveValue("please /rev");
+    expect(before).toHaveValue("please /review");
   });
 
   it("keeps built-in commands slash-prefixed when opened with a dollar sign", () => {

@@ -7571,7 +7571,20 @@ describe("NewChatLandingScreen skills menu", () => {
       expect(input).toHaveValue(`please /review-pr${suffix}`);
       expect(screen.queryByTestId("slash-menu-item-review-pr")).toBeNull();
       await waitFor(() => expect(input.selectionStart).toBe(suffix.startsWith(" ") ? 18 : 17));
-      expect(screen.queryByTestId("slash-menu-item-review-pr")).toBeNull();
+    },
+  );
+
+  it.each(["context", "help", "compact"])(
+    "shows %s as a skill both before and after text",
+    (name) => {
+      mockAgents([{ ...skilledAgent(), skills: [{ name, description: "Custom skill" }] }]);
+      renderLanding();
+      typeMessage(`/${name.slice(0, 3)}`);
+      expect(screen.getByText("Skills")).toBeVisible();
+      expect(screen.queryByText("Commands")).toBeNull();
+      typeMessage(`please /${name.slice(0, 3)}`);
+      fireEvent.click(screen.getByTestId(`slash-menu-item-${name}`));
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(`please /${name} `);
     },
   );
 

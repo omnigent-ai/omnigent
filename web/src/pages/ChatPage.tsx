@@ -3105,22 +3105,12 @@ function ComposerImpl(
     }
   };
 
-  /**
-   * Called when the user selects a suggestion from the menu (keyboard or
-   * click). Commands that need an argument (``SLASH_COMMANDS_WITH_ARGS``)
-   * fill in the text with a trailing space so the user can type the arg.
-   * All other commands execute immediately.
-   */
+  // Skills insert at the caret; standalone no-argument built-ins execute immediately.
   const applyMenuSelection = (cmd: string) => {
     if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
       const completion = slashCompletion.complete(cmd);
       setValue(completion.text);
-      requestAnimationFrame(() => {
-        textareaRef.current?.setSelectionRange(completion.caret, completion.caret);
-        if (textareaRef.current) slashCompletion.onSelectionChange(textareaRef.current);
-      });
       dirtyRef.current = true;
-      textareaRef.current?.focus();
     } else {
       // Execute immediately — no argument needed.
       setValue("");
@@ -3129,10 +3119,18 @@ function ComposerImpl(
     }
   };
 
+  const skillCommands = useMemo(
+    () =>
+      Object.fromEntries(skills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description])),
+    [skills, skillPrefix],
+  );
+
   // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
     commands: slashCommands,
+    skills: skillCommands,
+    textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
     mobile: isMobile,
@@ -3749,6 +3747,7 @@ function ComposerImpl(
                   activeIndex={slashCompletion.index}
                   onSelect={applyMenuSelection}
                   commands={slashCompletion.commands}
+                  builtinNames={slashCompletion.builtinNames}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
                 />

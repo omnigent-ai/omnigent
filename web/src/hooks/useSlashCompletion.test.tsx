@@ -23,6 +23,7 @@ function setup(overrides: Partial<Options> = {}) {
   const props: Options = {
     text: "/",
     commands: COMMANDS,
+    skills: { "/review-pr": "Review", "/cross-review": "Cross review" },
     prefix: "/",
     status: null,
     mobile: false,
@@ -102,14 +103,17 @@ describe("useSlashCompletion open condition", () => {
     expect(clearText).not.toHaveBeenCalled();
   });
 
-  it.each(["/", "$"])("opens on the surface prefix even with an empty inventory", (prefix) => {
-    // Discovery is still in flight: the menu opens on the prefix so the
-    // loading state can render, before any command exists.
-    const { view } = setup({ text: `${prefix}rev`, commands: {}, prefix, status: "loading" });
-    expect(view.result.current.open).toBe(true);
-    expect(view.result.current.matches).toEqual([]);
-    expect(view.result.current.pendingCompletion).toBe(true);
-  });
+  it.each(["/", "$"] as const)(
+    "opens on the surface prefix even with an empty inventory",
+    (prefix) => {
+      // Discovery is still in flight: the menu opens on the prefix so the
+      // loading state can render, before any command exists.
+      const { view } = setup({ text: `${prefix}rev`, commands: {}, prefix, status: "loading" });
+      expect(view.result.current.open).toBe(true);
+      expect(view.result.current.matches).toEqual([]);
+      expect(view.result.current.pendingCompletion).toBe(true);
+    },
+  );
 
   it("opens on both / and a $ surface prefix", () => {
     // A codex-native surface prefixes skills with "$"; both "$" and "/"
@@ -424,6 +428,43 @@ describe("inline skill completion", () => {
     expect(view.result.current.matches).toEqual(["/review-pr", "/cross-review"]);
   });
 
+  it("preserves skills that share built-in names and ranks them as skills", () => {
+    const skills = { "/review": "Review", "/context": "A context skill", "/help": "A help skill" };
+    const { view } = setup({
+      text: "please /",
+      commands: { "/compact": "Compact", ...skills },
+      skills,
+    });
+    expect(view.result.current.matches).toEqual(["/review", "/context", "/help"]);
+    expect([...view.result.current.builtinNames]).toEqual(["/compact"]);
+  });
+
+  it("keeps Escape dismissal while moving within the same unchanged token", () => {
+    const text = "please /review";
+    const { view } = setup({ text });
+    act(() => view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE));
+    const element = document.createElement("textarea");
+    element.value = text;
+    for (const position of [13, 11, 14]) {
+      element.setSelectionRange(position, position);
+      act(() => view.result.current.onSelectionChange(element));
+      expect(view.result.current.open).toBe(false);
+    }
+  });
+
+  it("does not restore a completion caret after the draft has been replaced", () => {
+    const element = document.createElement("textarea");
+    element.value = "please /rev";
+    const { view, props } = setup({ text: element.value, textareaRef: { current: element } });
+    act(() => {
+      view.result.current.complete("/review-pr");
+    });
+    element.value = "different prompt";
+    element.setSelectionRange(2, 2);
+    view.rerender({ ...props, text: element.value });
+    expect(element.selectionStart).toBe(2);
+  });
+
   it("shows only skills after text", () => {
     const { view } = setup({ text: "please /" });
     expect(view.result.current.matches).toEqual(["/review-pr", "/cross-review"]);
@@ -457,7 +498,12 @@ describe("inline skill completion", () => {
   });
 
   it.each(["please /rev", "please $rev"])("uses the native skill prefix in %j", (text) => {
-    const { view } = setup({ text, prefix: "$", commands: { $review: "Review" } });
+    const { view } = setup({
+      text,
+      prefix: "$",
+      commands: { $review: "Review" },
+      skills: { $review: "Review" },
+    });
     expect(view.result.current.matches).toEqual(["$review"]);
     act(() => {
       expect(view.result.current.complete("$review").text).toBe("please $review ");
@@ -519,7 +565,12 @@ describe("inline skill completion", () => {
   });
 
   it("allows sending after dismissing an inline loading menu", () => {
-    const { view, clearText } = setup({ text: "please /rev", commands: {}, status: "loading" });
+    const { view, clearText } = setup({
+      text: "please /rev",
+      commands: {},
+      skills: {},
+      status: "loading",
+    });
     expect(view.result.current.pendingCompletion).toBe(true);
     act(() => view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE));
     expect(view.result.current.pendingCompletion).toBe(false);
