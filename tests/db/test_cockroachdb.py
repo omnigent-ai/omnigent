@@ -98,7 +98,16 @@ def test_cockroachdb_migration_replays_a_restarted_transaction(db_uri: str) -> N
 
     def restart_compression(conn, cursor, statement, parameters, context, executemany):
         nonlocal attempts
-        if "ADD COLUMN _inference_snapshot_blob" in statement:
+        # Inject on the DML copy loop, NOT on the step's DDL. CRDB commits
+        # schema changes eagerly, so a forced restart during ``ADD COLUMN``
+        # would leave the temporary column behind and the replay would then
+        # trip over a half-migrated table. A DML statement rolls back with
+        # its transaction, which is what a real 40001 on contended data
+        # looks like — the original CI failure was a COMMIT conflict here.
+        copying = (
+            "FROM omnigent_conversation_metadata" in statement and "workspace_id" in statement
+        )
+        if copying:
             attempts += 1
             if attempts == 1:
                 # Observed results prevent transparent server retries of a fresh
