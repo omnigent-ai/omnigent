@@ -2174,6 +2174,7 @@ export function AppShell() {
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
+                    permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}
                     projectName={headerProjectName}
@@ -2450,7 +2451,11 @@ export function AppShell() {
                     Tools and policies configured for the active agent.
                   </DialogDescription>
                 </DialogHeader>
-                <AgentInfoContent agent={boundAgent} sessionId={conversationId} />
+                <AgentInfoContent
+                  agent={boundAgent}
+                  sessionId={conversationId}
+                  permissionLevel={permissionLevel}
+                />
               </DialogContent>
             </Dialog>
           )}

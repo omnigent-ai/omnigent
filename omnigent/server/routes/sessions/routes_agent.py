@@ -31,6 +31,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
     local_single_user_enabled,
@@ -264,6 +265,7 @@ def register_agent_routes(
         the existing agent, stores the bundle under a
         content-addressed key, updates the agent row, and warm-swaps
         the cache. Idempotent when the bundle content is unchanged.
+        Requires session-owner permission because a bundle can replace MCP servers.
 
         :param request: The incoming FastAPI request.
         :param session_id: Session identifier, e.g.
@@ -275,7 +277,7 @@ def register_agent_routes(
         """
         user_id = _require_user(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
         )
         conv = access.conversation
         if conv is None:

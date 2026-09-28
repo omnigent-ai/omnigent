@@ -27,8 +27,10 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from tests.e2e_ui.conftest import fetch_with_retry
 
 _COMPOSER = "Send a message…"
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
@@ -316,6 +318,80 @@ def test_agent_info_mcp_server_add_and_remove(
 
     dialog.get_by_role("button", name="Delete ui-search").click()
     _wait_for(lambda: not _agent_mcp_names(base_url, session_id))
+
+
+@pytest.mark.parametrize("viewport_width", [1280, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize(
+    "permission_level", [4, 1, 2, 3], ids=["owner", "reader", "editor", "manager"]
+)
+def test_agent_info_mcp_controls_require_owner(
+    page: Page,
+    seeded_session: tuple[str, str],
+    viewport_width: int,
+    permission_level: int,
+) -> None:
+    """Real SPA and MCP metadata, with only snapshot access mocked.
+
+    The agent creator retains editable metadata after losing session ownership.
+    Exercise AppShell's desktop/mobile permission wiring for that case; backend
+    role enforcement is covered separately by the authorization integration tests.
+    """
+    base_url, session_id = seeded_session
+    for config in (
+        {"name": "ui-http", "transport": "http", "url": "https://example.com/mcp"},
+        {"name": "ui-stdio", "transport": "stdio", "command": sys.executable},
+    ):
+        response = httpx.post(
+            f"{base_url}/v1/sessions/{session_id}/agent/mcp-servers",
+            json=config,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+    agent = httpx.get(f"{base_url}/v1/sessions/{session_id}/agent", timeout=10.0)
+    agent.raise_for_status()
+    assert agent.json()["mcp_servers_editable"] is True
+
+    def snapshot_with_access(route: Route) -> None:
+        response = fetch_with_retry(route)
+        snapshot = response.json()
+        snapshot["permission_level"] = permission_level
+        route.fulfill(response=response, json=snapshot)
+
+    snapshot_url = re.compile(rf"{re.escape(base_url)}/v1/sessions/{session_id}(?:\?.*)?$")
+    page.route(snapshot_url, snapshot_with_access)
+    page.set_viewport_size({"width": viewport_width, "height": 844})
+    with page.expect_response(snapshot_url):
+        page.goto(f"{base_url}/c/{session_id}")
+    if viewport_width < 768:
+        menu_name = "Conversation actions" if permission_level == 4 else "Session actions"
+        page.get_by_role("button", name=menu_name, exact=True).click()
+        page.get_by_role("menuitem", name="Agent info", exact=True).click()
+        panel = page.get_by_role("dialog").filter(
+            has=page.get_by_role("heading", name="Agent", exact=True)
+        )
+    else:
+        _open_popover(page)
+        panel = page.locator(_AGENT_INFO_PANEL)
+
+    for name in ("ui-http", "ui-stdio"):
+        expect(panel.get_by_text(name, exact=True)).to_be_visible()
+    manage = panel.get_by_role("button", name="Manage MCP servers")
+    if permission_level != 4:
+        expect(manage).to_have_count(0)
+        for name in ("ui-http", "ui-stdio"):
+            expect(panel.get_by_role("button", name=name, exact=True)).to_have_count(0)
+        return
+
+    expect(manage).to_be_visible()
+    expect(panel.get_by_role("button", name="ui-http", exact=True)).to_be_visible()
+    manage.click()
+    dialog = page.get_by_role("dialog").filter(
+        has=page.get_by_role("heading", name="Manage MCP Servers", exact=True)
+    )
+    expect(dialog.get_by_label("Name", exact=True)).to_be_visible()
+    for name in ("ui-http", "ui-stdio"):
+        expect(dialog.get_by_role("button", name=f"Edit {name}")).to_be_visible()
+        expect(dialog.get_by_role("button", name=f"Delete {name}")).to_be_visible()
 
 
 def test_agent_info_mcp_dirty_warning_after_edit(
