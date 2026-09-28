@@ -143,6 +143,11 @@ export function SetupTerminalStep({
           : runningLabel;
   const phaseLabel = inProgress ? `${baseLabel}${".".repeat(dots)}` : baseLabel;
   const pendingHint = phase === "installing" ? "Installing the CLI…" : "Starting the local server…";
+  // Coarse progress: each step is a real detected milestone — warmup → install
+  // output starts → server starting → done. Holds within a step (streaming log +
+  // pulse show liveness) rather than fake an unmeasurable fraction.
+  const progress =
+    phase === "ready" || phase === "failed" ? 100 : phase === "running" ? 70 : streamed ? 35 : 10;
 
   return (
     <div className="flex h-full flex-col px-2 pb-1 pt-4">
@@ -151,8 +156,8 @@ export function SetupTerminalStep({
         <div
           className={`h-full rounded-full transition-all duration-300 ease-linear ${
             phase === "failed" ? "bg-destructive/60" : "bg-foreground/25"
-          } ${phase === "installing" || phase === "running" ? "animate-pulse" : ""}`}
-          style={{ width: phase === "ready" || phase === "failed" ? "100%" : "60%" }}
+          } ${inProgress ? "animate-pulse" : ""}`}
+          style={{ width: `${progress}%` }}
         />
       </div>
 
