@@ -819,7 +819,7 @@ describe("SettingsPage", () => {
     });
   });
 
-  // Dracula's accent tone is pink, so a palette-following colour would not be blue there.
+  // A non-default palette still gets the fixed Tailwind classes, not a palette token.
   it.each(["omni", "dracula"])(
     "colours Delete red and Archive blue in the %s palette; None stays neutral",
     async (palette) => {
