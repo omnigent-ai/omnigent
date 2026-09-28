@@ -10,7 +10,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import { type ReactElement, type ReactNode, useSyncExternalStore } from "react";
+import { useSyncExternalStore, type ReactElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   act,
@@ -195,46 +195,6 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   resolveIdentity: () => Promise.resolve(mocks.viewerId),
 }));
 
-// Settings uses a Radix Select portal that jsdom cannot drive. Render a native
-// select so these tests can exercise the real swipe preference control.
-vi.mock("@/components/ui/select", async () => {
-  const { Children, isValidElement } = await import("react");
-  const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
-  // The trigger carries the data-testid the tests query for; lift it onto the
-  // native <select> and keep the trigger itself out of the option list.
-  const isTrigger = (child: ReactNode): child is ReactElement<{ "data-testid"?: string }> =>
-    isValidElement(child) && child.type === SelectTrigger;
-  const Select = ({
-    value,
-    onValueChange,
-    children,
-  }: {
-    value: string;
-    onValueChange: (value: string) => void;
-    children: ReactNode;
-  }) => {
-    const kids = Children.toArray(children);
-    return (
-      <select
-        data-testid={kids.find(isTrigger)?.props["data-testid"]}
-        value={value}
-        onChange={(event) => onValueChange(event.target.value)}
-      >
-        {kids.filter((child) => !isTrigger(child))}
-      </select>
-    );
-  };
-  return {
-    Select,
-    SelectTrigger,
-    SelectValue: () => null,
-    SelectContent: ({ children }: { children: ReactNode }) => children,
-    SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
-      <option value={value}>{typeof children === "string" ? children : value}</option>
-    ),
-  };
-});
-
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
 import { HeaderTitle } from "./HeaderTitle";
@@ -372,10 +332,16 @@ function renderSidebar(
   });
 }
 
-// Pick an action for one direction through the real Appearance settings control
-// (the Radix Select is mocked to a native <select> above), then unmount so the
-// sidebar can render against the preference the page just wrote.
-function chooseSwipeActionInSettings(direction: SwipeDirection, action: SwipeAction) {
+const SWIPE_ACTION_NAMES: Record<SwipeAction, string> = {
+  archive: "Archive",
+  delete: "Delete",
+  none: "None",
+};
+
+// Pick an action for one direction through the real Appearance settings card and
+// its menu, then unmount so the sidebar renders against the preference just written.
+async function chooseSwipeActionInSettings(direction: SwipeDirection, action: SwipeAction) {
+  const user = userEvent.setup();
   render(
     <TooltipProvider>
       <MemoryRouter initialEntries={["/settings/appearance"]}>
@@ -383,7 +349,11 @@ function chooseSwipeActionInSettings(direction: SwipeDirection, action: SwipeAct
       </MemoryRouter>
     </TooltipProvider>,
   );
-  fireEvent.change(screen.getByTestId(`swipe-action-${direction}`), { target: { value: action } });
+  await user.click(screen.getByTestId(`swipe-action-${direction}`));
+  await user.click(screen.getByRole("menuitemradio", { name: SWIPE_ACTION_NAMES[action] }));
+  expect(screen.getByTestId(`swipe-action-${direction}`)).toHaveAccessibleName(
+    `Swipe ${direction}: ${SWIPE_ACTION_NAMES[action]}`,
+  );
   cleanup();
 }
 
@@ -2018,29 +1988,31 @@ describe("touch swipe actions", () => {
     expect(reveal.querySelector(icons.hides)).toBeNull();
   }
 
-  it("maps the Settings swipe-left selection to the row's left-swipe action", () => {
-    chooseSwipeActionInSettings("left", "delete");
-    expect(readSwipeActions()).toEqual({ left: "delete", right: "archive" });
+  it("maps the Settings swipe-left selection to the row's left-swipe action", async () => {
+    // Archive is not the left default, so this only passes if Settings wrote it.
+    await chooseSwipeActionInSettings("left", "archive");
+    expect(readSwipeActions()).toEqual({ left: "archive", right: "archive" });
 
     renderSidebar();
     swipeRow(-90);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("maps the Settings swipe-right selection to the row's right-swipe action", async () => {
+    // Delete is not the right default, so this only passes if Settings wrote it.
+    await chooseSwipeActionInSettings("right", "delete");
+    expect(readSwipeActions()).toEqual({ left: "delete", right: "delete" });
+
+    renderSidebar();
+    swipeRow(90);
 
     expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(mocks.del.mutate).toHaveBeenCalledTimes(1);
-  });
-
-  it("maps the Settings swipe-right selection to the row's right-swipe action", () => {
-    chooseSwipeActionInSettings("right", "archive");
-    expect(readSwipeActions()).toEqual({ left: "delete", right: "archive" });
-
-    renderSidebar();
-    swipeRow(90);
-
-    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-    expect(mocks.del.mutate).not.toHaveBeenCalled();
-    expect(screen.queryByText("Delete conversation?")).toBeNull();
   });
 
   it("reveals the same action that fires in both configured directions", () => {
