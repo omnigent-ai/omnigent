@@ -2273,6 +2273,8 @@ async def _resolve_pi_resume_session(
     """
     if server_client is None:
         return launch_config.external_session_id
+    if launch_config.external_session_id is None and not launch_config.fork_carry_history:
+        return None
 
     from omnigent.harnesses.pi_native.resume import (
         ensure_local_pi_resume_session,
@@ -2286,7 +2288,7 @@ async def _resolve_pi_resume_session(
     try:
         from omnigent.harnesses.pi_native.credentials import resolve_pi_native_provider
 
-        provider = resolve_pi_native_provider()
+        provider = await asyncio.to_thread(resolve_pi_native_provider)
         if provider is not None and getattr(provider, "model", None):
             model = provider.model
     except Exception:  # noqa: BLE001 — informational only; never block launch
@@ -2435,7 +2437,7 @@ async def _auto_create_pi_terminal(
     pi_extension = pi_extension_path(bridge_dir)
     session_dir = pi_session_dir(bridge_dir)
     auth_factory = _make_auth_token_factory()
-    auth_token = auth_factory() if auth_factory is not None else None
+    auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
     # Route the extension's out-of-process POSTs (/events, /mcp,
     # /policies/evaluate) through the shared header builder so they carry the
     # workspace / deployment routing selectors, not just a bare bearer. A bare
@@ -2502,7 +2504,7 @@ async def _auto_create_pi_terminal(
         extension_path=pi_extension,
         session_dir=session_dir,
         external_session_id=resume_session_id,
-        approve=pi_supports_approve(pi_command),
+        approve=await asyncio.to_thread(pi_supports_approve, pi_command),
     )
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
@@ -2537,10 +2539,14 @@ async def _auto_create_pi_terminal(
         # from the provider configured through ``omni setup``.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+        # Provider discovery does network I/O; keep the runner's stream and
+        # tunnel heartbeats responsive while Pi starts.
         if pi_binding is not None and pi_spec is not None:
-            provider = resolve_pi_native_provider(model=spec_model, auth=pi_spec.executor.auth)
+            provider = await asyncio.to_thread(
+                resolve_pi_native_provider, model=spec_model, auth=pi_spec.executor.auth
+            )
         else:
-            provider = resolve_pi_native_provider(model=spec_model)
+            provider = await asyncio.to_thread(resolve_pi_native_provider, model=spec_model)
         if provider is not None:
             launch = pi_native_provider_launch(
                 bridge_dir / "pi-agent",

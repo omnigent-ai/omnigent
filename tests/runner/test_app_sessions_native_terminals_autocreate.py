@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -167,11 +168,16 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     # The lifecycle of the launch — not the binary or credentials — is under
     # test, so neither a real Pi install nor a configured provider is needed.
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
-    # Accept the ``model`` kwarg the runner now threads through (the spec model
-    # → models.json path); None still skips provider injection here.
-    monkeypatch.setattr(
-        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
-    )
+    loop = asyncio.get_running_loop()
+    provider_waits: list[bool] = []
+
+    def _slow_provider(**_kwargs: Any) -> None:
+        # Credential discovery must let the runner service its stream heartbeat.
+        serviced = threading.Event()
+        loop.call_soon_threadsafe(serviced.set)
+        provider_waits.append(serviced.wait(timeout=2))
+
+    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", _slow_provider)
 
     # Skip the GET /v1/sessions round-trip: hand the flow a ready launch
     # config pointing at the tmp workspace.
@@ -230,6 +236,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
     assert captured["spec"].command == "pi"
     assert captured["spec"].env_unset == expected_env_unset
+    assert provider_waits == [True], "Fresh Pi startup must resolve once without blocking"
     config = json.loads(
         Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text()
     )
