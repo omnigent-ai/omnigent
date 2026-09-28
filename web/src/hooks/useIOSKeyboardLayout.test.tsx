@@ -95,6 +95,22 @@ describe("iOS keyboard layout", () => {
     expect(shellHeight()).toBe("834px");
   });
 
+  it("reserves short native docked insets for both the shell and fixed overlays", () => {
+    const { result } = renderHook(useKeyboardLayout);
+    changeKeyboard(779, 779);
+    expect(shellHeight()).toBe("779px");
+    expect(result.current).toBe(55);
+    changeKeyboard(834, 834);
+    expect(result.current).toBe(0);
+  });
+
+  it("keeps filtering small visual viewport changes on older shells", () => {
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    const { result } = renderHook(useKeyboardLayout);
+    changeKeyboard(779, 834);
+    expect(result.current).toBe(0);
+  });
+
   it("accepts fractional native dimensions without expanding the document", () => {
     nativeViewport = { width: 1210.33, height: 834.33 };
     viewport.height = 685;

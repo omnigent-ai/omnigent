@@ -112,6 +112,7 @@ def test_ios_ipad_uses_docked_keyboard_geometry(
     assert before is not None
 
     page.evaluate("setKeyboardGeometry(149, 0)")
+    page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
     expect(shell).to_have_css("height", f"{viewport['height']}px")
     after = composer.bounding_box()
     assert after is not None

@@ -107,7 +107,7 @@ struct OmnigentWebView: UIViewRepresentable {
     coordinator.detach()
   }
 
-  private static func nativeBridgeScript(managesWorkspace: Bool) -> String {
+  static func nativeBridgeScript(managesWorkspace: Bool) -> String {
     """
     (() => {
       if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
@@ -377,6 +377,9 @@ struct OmnigentWebView: UIViewRepresentable {
             method: "openServerSetup",
           });
         },
+      });
+      window.webkit.messageHandlers.omnigentNative.postMessage({
+        method: "requestKeyboardViewport",
       });
     })();
     """
@@ -803,13 +806,18 @@ struct OmnigentWebView: UIViewRepresentable {
       _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
     ) {
       guard isTrustedBridgeMessage(message) else { return }
-      // Any trusted message proves the page is alive and driving the bridge, so
-      // stand down the liveness watchdog — the page owns the switcher from here.
-      parent.model.cancelServerSwitcherWatchdog()
       guard let body = message.body as? [String: Any],
         let method = body["method"] as? String
       else { return }
-
+      // Document-start geometry must not wait for slow subresources or count
+      // as proof that the web app has mounted for the switcher watchdog.
+      if method == "requestKeyboardViewport" {
+        (webView as? AccessoryFreeWebView)?.emitKeyboardViewport(force: true)
+        return
+      }
+      // Any trusted message proves the page is alive and driving the bridge, so
+      // stand down the liveness watchdog — the page owns the switcher from here.
+      parent.model.cancelServerSwitcherWatchdog()
       switch method {
       case "setDocumentScrollEnabled":
         guard let enabled = body["enabled"] as? Bool else { return }
@@ -887,7 +895,6 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
       guard isCurrent(webView) else { return }
-      webView.scrollView.isScrollEnabled = true
       guard webStore == nil || workspaceSession != nil else { return }
       if let url = webView.url, !acceptWorkspaceNavigation(url, in: webView) { return }
       if let url = webView.url,
@@ -912,7 +919,10 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-      guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
+      guard isCurrent(webView) else { return }
+      // Failed or cancelled provisional loads leave the old document's lock intact.
+      webView.scrollView.isScrollEnabled = true
+      guard webStore == nil || workspaceSession != nil else { return }
       if let url = webView.url, !acceptWorkspaceNavigation(url, in: webView) { return }
       if let session = workspaceSession, let url = webView.url,
         session.navigationURL(for: url) != nil
@@ -1260,7 +1270,7 @@ struct OmnigentWebView: UIViewRepresentable {
   }
 }
 
-private final class AccessoryFreeWebView: WKWebView {
+final class AccessoryFreeWebView: WKWebView {
   var onWindowAvailable: ((UIWindow) -> Void)?
   private let keyboardViewport = KeyboardViewportProbe()
   private var lastKeyboardViewportSize: CGSize?
@@ -1286,6 +1296,10 @@ private final class AccessoryFreeWebView: WKWebView {
       probeBottom,
     ])
     keyboardViewport.onLayout = { [weak self] in self?.emitKeyboardViewport() }
+    for name in [Notification.Name.GCKeyboardDidConnect, .GCKeyboardDidDisconnect] {
+      NotificationCenter.default.addObserver(
+        self, selector: #selector(hardwareKeyboardChanged), name: name, object: nil)
+    }
   }
 
   required init?(coder: NSCoder) {
@@ -1295,6 +1309,10 @@ private final class AccessoryFreeWebView: WKWebView {
   override func layoutSubviews() {
     super.layoutSubviews()
     emitKeyboardViewport()
+  }
+
+  @objc private func hardwareKeyboardChanged() {
+    emitKeyboardViewport(force: true)
   }
 
   func emitKeyboardViewport(force: Bool = false) {

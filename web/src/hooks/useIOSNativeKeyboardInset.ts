@@ -23,8 +23,7 @@ export function useIOSNativeKeyboardInset(enabled = true): number {
         return;
       }
 
-      const nextInset = getIOSNativeKeyboardInset();
-      setInset(nextInset > KEYBOARD_INSET_THRESHOLD_PX ? nextInset : 0);
+      setInset(getIOSNativeKeyboardInset());
     };
 
     const unsubscribe = onNativeKeyboardViewportChanged(sync);
@@ -57,6 +56,8 @@ function getIOSNativeKeyboardInset(): number {
   // Fixed overlays sit outside the resized app shell. Reserve only the docked
   // keyboard's footprint, using WebKit's viewport on older native shells.
   const layoutBottom = window.innerHeight;
-  const visibleBottom = getIOSKeyboardViewportHeight() ?? viewport.offsetTop + viewport.height;
-  return Math.max(0, Math.round(layoutBottom - visibleBottom));
+  const nativeHeight = getIOSKeyboardViewportHeight();
+  const visibleBottom = nativeHeight ?? viewport.offsetTop + viewport.height;
+  const inset = Math.max(0, Math.round(layoutBottom - visibleBottom));
+  return nativeHeight !== null || inset > KEYBOARD_INSET_THRESHOLD_PX ? inset : 0;
 }
