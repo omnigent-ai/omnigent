@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.e2e_ui.sharding import SHARD_PLAN
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--ui-timing-output", type=Path, help="Write per-phase JSONL timing records.")
@@ -40,6 +42,7 @@ class TimingRecorder:
                 "version": 1,
                 "splits": config.getoption("--splits", default=None),
                 "group": config.getoption("--group", default=None),
+                "sharding": config.stash.get(SHARD_PLAN, None),
                 "nodeids": [item.nodeid for item in session.items],
                 "run_id": os.environ.get("GITHUB_RUN_ID"),
                 "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
