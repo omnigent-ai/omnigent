@@ -7470,6 +7470,7 @@ async def test_handle_import_local_all_streams_a_frame_per_session(
             type="message",
             response_id="r1",
             data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+            created_at=None,
         )
         return SimpleNamespace(
             external_session_id=session_id,
@@ -7524,6 +7525,7 @@ async def test_handle_import_local_exact_id_does_not_list_sessions(
             type="message",
             response_id="r1",
             data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+            created_at=None,
         )
         return SimpleNamespace(
             external_session_id=session_id,
@@ -7564,6 +7566,61 @@ async def test_handle_import_local_exact_id_does_not_list_sessions(
     assert len(done_frames) == 1 and done_frames[0].status == "ok"
 
 
+async def test_handle_import_local_carries_record_times_through_host_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host.frames import HostImportLocalDoneFrame, HostImportLocalSessionFrame
+
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    claude_home = tmp_path / "claude"
+    transcript = claude_home / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "user",
+            "uuid": "user-1",
+            "timestamp": "2026-06-15T09:00:00Z",
+            "cwd": "/repo",
+            "message": {"role": "user", "content": "inspect TODO.md"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "assistant-1",
+            "parentUuid": "user-1",
+            "timestamp": "2026-06-15T09:05:00Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+        },
+        {
+            "type": "user",
+            "uuid": "user-2",
+            "parentUuid": "assistant-1",
+            "message": {"role": "user", "content": "thanks"},
+        },
+    ]
+    transcript.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await _make_host_process()._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalByIdFrame(request_id="req_timed", source="claude", session_id=session_id),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    sessions = [frame for frame in frames if isinstance(frame, HostImportLocalSessionFrame)]
+    done = [frame for frame in frames if isinstance(frame, HostImportLocalDoneFrame)]
+    assert len(sessions) == 1
+    items = sessions[0].session.items
+    assert [item.get("created_at") for item in items] == [1781514000, 1781514300, None]
+    assert "created_at" not in items[-1]
+    assert len(done) == 1 and done[0].status == "ok" and done[0].failed == 0
+
+
 async def test_handle_import_local_reports_unreadable_sessions_as_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7586,6 +7643,7 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
             type="message",
             response_id="r1",
             data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+            created_at=None,
         )
         return SimpleNamespace(
             external_session_id=session_id,
@@ -7659,6 +7717,7 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
             type="message",
             response_id="r1",
             data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+            created_at=None,
         )
         return SimpleNamespace(
             external_session_id=session_id,
@@ -7728,6 +7787,7 @@ async def test_handle_import_local_send_failure_skips_only_that_session(
             type="message",
             response_id="r1",
             data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+            created_at=None,
         )
         return SimpleNamespace(
             external_session_id=session_id,
@@ -7784,6 +7844,7 @@ async def test_handle_import_local_send_connection_closed_aborts_batch(
             type="message",
             response_id="r1",
             data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+            created_at=None,
         )
         return SimpleNamespace(
             external_session_id=session_id,
