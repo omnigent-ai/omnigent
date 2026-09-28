@@ -361,6 +361,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     pinned_label_key,
@@ -6777,10 +6778,10 @@ async def _dispatch_session_event_to_runner_impl(
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
 
-# Deployed runners back off to a 10s cap with ±50% jitter, so the
-# worst-case reconnect is ~15s plus handshake. 20s covers that cluster
-# and resolves transient drops silently; a runner still gone afterwards fails.
-RUNNER_DISCONNECT_GRACE_S: float = 20.0
+# Sized to the runner liveness lease so the relay give-up, the disconnect
+# timer, and the liveness-driven sidebar agree on when a dropped runner is
+# gone; a crash is reported separately by the daemon and never waits this out.
+RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but

@@ -3291,13 +3291,22 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(runner_id: str) -> None:
-        """Reconcile a dropped runner's sessions once the grace expires.
+        """Reconcile a dropped runner's sessions once the liveness lease expires.
 
-        A runner that re-registered inside the grace makes this a no-op
-        via the live-tunnel re-check (the same newest-wins rule the
-        immediate path used); one still gone hands its bound sessions to
+        Waits for the runner to re-register on this replica, event-driven,
+        for the whole liveness lease (:data:`RUNNER_DISCONNECT_GRACE_S`,
+        sized to :data:`RUNNER_LIVENESS_TTL_S`). A reconnect resolves the
+        wait at once and makes this a no-op, so a Wi-Fi roam, VPN stall,
+        ingress recycle, or sleep/resume that comes back within the lease
+        never flaps its sessions to failed. A runner still absent when the
+        lease expires hands its bound sessions to
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
+
+        This is the transport-drop path only. A runner that actually
+        crashed is reported by its daemon on the host tunnel and handled by
+        :func:`_on_runner_exited`, which fails fast and cancels this timer,
+        so waiting out the lease here costs nothing on real death.
 
         A server that is itself shutting down skips the marking too: it
         closed the tunnel, and the runner cannot re-register with a
@@ -3312,16 +3321,21 @@ def create_app(
         )
         from omnigent.server.schemas import ErrorDetail
 
-        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        # Event-driven: `register` resolves the wait the instant the runner
+        # reconnects here. A non-positive grace collapses to an immediate
+        # registry check, matching the sleep(0) behavior tests pin.
+        reconnected = await tunnel_registry.wait_for_runner(
+            runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
+        )
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
                 runner_id,
             )
             return
-        if tunnel_registry.get(runner_id) is not None:
+        if reconnected is not None:
             _logger.info(
-                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
+                "Runner %s reconnected within the liveness lease; skipping offline-marking",
                 runner_id,
             )
             return
