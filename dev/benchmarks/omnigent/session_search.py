@@ -24,12 +24,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
 import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
+from typing import TypeVar
 
 # Allow ``uv run <path>`` (no package context) to import omnigent + siblings.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -37,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
+from dev.benchmarks.omnigent.measure import RunResult
 from dev.benchmarks.omnigent.seed import seed
 from omnigent.stores.conversation_store import sqlalchemy_store as store_mod
 
@@ -49,6 +51,7 @@ _PAGE_SIZE = 30
 # a term only the last item of each session carries, and no match at all.
 _DEFAULT_TERMS = ("runner", "item 127)", "no-such-term")
 
+_T = TypeVar("_T")
 
 # Prefixes each seeded item text with md5 hex (poorly compressible, so TOAST
 # can't shrink it away). Items already at the target size are left alone.
@@ -62,19 +65,15 @@ _PAD_SQL = text(
 
 
 def _timed_ms(fn: Callable[[], object], runs: int, warmup: int) -> dict[str, float]:
-    """Return median and p95 wall time (ms) of ``fn`` over *runs* calls."""
+    """Return p50 and p95 wall time (ms) of ``fn`` over *runs* calls."""
     for _ in range(warmup):
         fn()
-    samples = []
+    result = RunResult()
     for _ in range(runs):
         start = time.monotonic()
         fn()
-        samples.append((time.monotonic() - start) * 1000)
-    samples.sort()
-    return {
-        "median_ms": round(statistics.median(samples), 3),
-        "p95_ms": round(samples[min(len(samples) - 1, int(len(samples) * 0.95))], 3),
-    }
+        result.latencies_ms.append((time.monotonic() - start) * 1000)
+    return {"p50_ms": round(result.percentile(50), 3), "p95_ms": round(result.percentile(95), 3)}
 
 
 @contextmanager
@@ -98,33 +97,14 @@ def _search(
     return [(c.id, c.search_snippet) for c in page.data]
 
 
-def _is_statement_timeout(exc: OperationalError) -> bool:
-    """Whether *exc* is the store's ``SET LOCAL statement_timeout`` firing."""
-    return getattr(exc.orig, "sqlstate", None) == "57014"  # query_canceled
-
-
-def _search_within_deadline(
-    store: store_mod.SqlAlchemyConversationStore, term: str
-) -> list[tuple[str, str | None]] | None:
-    """Like :func:`_search`, but ``None`` when the statement timeout fires."""
+def _within_deadline(fn: Callable[[], _T]) -> _T | None:
+    """Return ``fn()``, or ``None`` when the store's search statement timeout fires."""
     try:
-        return _search(store, term)
+        return fn()
     except OperationalError as exc:
-        if not _is_statement_timeout(exc):
+        if getattr(exc.orig, "sqlstate", None) != "57014":  # query_canceled
             raise
         return None
-
-
-def _call_ms(
-    store: store_mod.SqlAlchemyConversationStore, term: str, runs: int
-) -> dict[str, float] | str:
-    """Time the whole search call, or ``"statement_timeout"`` if any run hits it."""
-    try:
-        return _timed_ms(lambda: _search(store, term), runs, warmup=1)
-    except OperationalError as exc:
-        if not _is_statement_timeout(exc):
-            raise
-        return "statement_timeout"
 
 
 def _bench_term(
@@ -135,7 +115,8 @@ def _bench_term(
     call_runs: int,
 ) -> dict[str, object]:
     """Measure one term; raise ``AssertionError`` if the two forms disagree."""
-    after_page = _search_within_deadline(store, term)
+    search = partial(_search, store, term)
+    after_page = _within_deadline(search)
     ids = [conv_id for conv_id, _ in after_page or []]
     if not ids:
         # No hits (or timed out): probe the most recent page instead.
@@ -162,10 +143,12 @@ def _bench_term(
     assert before_snippets == after_snippets, f"snippet mismatch for {term!r}"
     result["snippets"] = len(after_snippets)
 
-    result["list_conversations_after"] = _call_ms(store, term, call_runs)
+    after_call = _within_deadline(lambda: _timed_ms(search, call_runs, warmup=1))
     with _before_fix():
-        before_page = _search_within_deadline(store, term)
-        result["list_conversations_before"] = _call_ms(store, term, call_runs)
+        before_page = _within_deadline(search)
+        before_call = _within_deadline(lambda: _timed_ms(search, call_runs, warmup=1))
+    result["list_conversations_after"] = after_call or "statement_timeout"
+    result["list_conversations_before"] = before_call or "statement_timeout"
     if after_page is not None and before_page is not None:
         assert before_page == after_page, f"page mismatch for {term!r}"
     return result
@@ -251,9 +234,10 @@ def main(argv: list[str] | None = None) -> int:
         "page_size": _PAGE_SIZE,
         "results": results,
     }
-    print(json.dumps(report, indent=2))
+    rendered = json.dumps(report, indent=2)
+    print(rendered)
     if args.output is not None:
-        args.output.write_text(json.dumps(report, indent=2) + "\n")
+        args.output.write_text(rendered + "\n")
     return 0
 
 
