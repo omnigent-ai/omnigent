@@ -208,9 +208,9 @@ running cost/tokens, last seen model.
   the user's v2 SQLite DB, in the legacy shape, so v2's one-time import
   populates the per-session store. Provider env keys are already detected by
   v2 from the process environment; `connect_provider_key` remains as a
-  fallback. Readiness (`opencode_auth.py`) counts both `auth.json` and v2 DB
-  credentials, and reads `needs-auth` with the `opencode auth login` hint when
-  neither has any.
+  fallback. Readiness does not require a credential: an installed OpenCode 2.x
+  is ready, because its built-in `opencode` provider serves free models
+  without sign-in. Setup lists `opencode auth login` as an optional step.
 
 ### 5. Session commands, import, docs, testing, rollout
 

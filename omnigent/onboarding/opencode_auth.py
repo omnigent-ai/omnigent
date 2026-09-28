@@ -152,14 +152,22 @@ def _env_providers(environ: dict[str, str] | None = None) -> tuple[str, ...]:
     return tuple(seen)
 
 
+# OpenCode's built-in provider; its free models (e.g. ``opencode/big-pickle``)
+# run without any sign-in.
+OPENCODE_FREE_PROVIDER_ID = "opencode"
+
+
 def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[str]:
     """Return OpenCode provider ids reachable from stored auth + env keys.
+
+    Always includes :data:`OPENCODE_FREE_PROVIDER_ID`, whose free models need
+    no credential.
 
     Ids match OpenCode's own (the ``provider/model`` prefix), so callers can
     filter a model list down to what the user can actually authenticate.
     """
     env = os.environ if environ is None else environ
-    ids = set(_stored_providers())
+    ids = set(_stored_providers()) | {OPENCODE_FREE_PROVIDER_ID}
     for provider_id, _label, var in _ENV_PROVIDER_VARS:
         if env.get(var, "").strip():
             ids.add(provider_id)
@@ -186,8 +194,8 @@ class OpenCodeAuthSummary:
 
     @property
     def ready(self) -> bool:
-        """Launchable when the CLI is installed AND a provider is configured."""
-        return self.installed and self.has_provider
+        """Launchable once the CLI is installed; free models need no provider."""
+        return self.installed
 
     def describe(self) -> str:
         """A short human summary of configured providers, e.g.
@@ -200,7 +208,7 @@ class OpenCodeAuthSummary:
             )
         if self.env_providers:
             parts.append(f"env: {', '.join(self.env_providers)}")
-        return " · ".join(parts) if parts else "no provider configured yet"
+        return " · ".join(parts) if parts else "free models only (no provider signed in)"
 
 
 def opencode_auth_summary() -> OpenCodeAuthSummary:

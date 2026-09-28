@@ -558,11 +558,14 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
     ),
     OPENCODE_KEY: SetupStep(
         kind="auth",
-        title="Sign in to OpenCode",
-        detail="OpenCode manages its own credentials — sign in on the host.",
+        # Optional: OpenCode's free models run without a login, so the step is
+        # informational (``status_key=None``) and never blocks readiness.
+        title="Sign in to a provider (optional)",
+        detail="OpenCode's free models work without signing in. Sign in on the host "
+        "to use your own providers.",
         action="command",
         command="opencode auth login",
-        status_key="authed",
+        status_key=None,
     ),
     PI_KEY: SetupStep(
         kind="auth",

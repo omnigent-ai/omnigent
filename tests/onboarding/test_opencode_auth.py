@@ -62,13 +62,16 @@ def test_env_providers_detects_present_keys(monkeypatch: pytest.MonkeyPatch) -> 
     assert "OpenAI" in labels and "Anthropic" in labels
 
 
-def test_summary_ready_requires_installed_and_a_provider(
+def test_summary_ready_without_a_provider_for_free_models(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """OpenCode's built-in free models need no sign-in, so an install alone is ready."""
     monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
-    # No provider yet → not ready.
-    assert oc.opencode_auth_summary().ready is False
-    # An env key flips it ready.
+    summary = oc.opencode_auth_summary()
+    assert summary.ready is True
+    assert summary.has_provider is False
+    assert summary.describe() == "free models only (no provider signed in)"
+    # An env key adds a provider on top.
     monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
     summary = oc.opencode_auth_summary()
     assert summary.ready is True
@@ -102,6 +105,15 @@ def test_reachable_provider_ids_merges_stored_and_env(
     assert "anthropic" in ids  # from auth.json
     assert "openai" in ids  # from env key
     assert "groq" not in ids
+
+
+def test_reachable_provider_ids_always_include_free_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ``opencode`` provider serves free models without any credential."""
+    for _provider_id, _label, var in oc._ENV_PROVIDER_VARS:
+        monkeypatch.delenv(var, raising=False)
+    assert oc.reachable_provider_ids() == frozenset({"opencode"})
 
 
 def _write_db(rows: list[tuple[str | None, dict[str, object], int | None, int]]) -> Path:
@@ -179,16 +191,16 @@ def test_opencode_db_path_honors_opencode_db(
     assert oc.opencode_db_path() is None
 
 
-def test_summary_not_ready_with_empty_v2_db(
+def test_summary_ready_on_free_models_with_empty_v2_db(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An installed CLI whose credential table is empty reads needs-auth, not ready."""
+    """An empty credential table has no provider but still runs the free models."""
     monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
     _write_db([])
     summary = oc.opencode_auth_summary()
     assert summary.stored_providers == ()
     assert summary.has_provider is False
-    assert summary.ready is False
+    assert summary.ready is True
 
 
 def test_summary_ready_with_only_v2_credentials(

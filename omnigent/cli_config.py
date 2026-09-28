@@ -3356,7 +3356,7 @@ def _launch_opencode_auth_login() -> str | None:
     summary = opencode_auth_summary()
     if summary.has_provider:
         return f"✓ providers: {summary.describe()}"
-    return "No provider detected yet"
+    return "No provider signed in; OpenCode's free models still work"
 
 
 def _run_opencode_auth_list() -> None:
@@ -3455,6 +3455,7 @@ def _print_opencode_auth_help() -> None:
 
     console.print(
         "  OpenCode resolves a model from the provider its agent uses:\n"
+        "    • Free models (e.g. opencode/big-pickle) need no sign-in.\n"
         "    • [bold]opencode auth login[/bold] — sign in to a provider (OpenAI, Anthropic, …);\n"
         "      stored in ~/.local/share/opencode/auth.json.\n"
         "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are auto-detected.\n"
@@ -3536,7 +3537,7 @@ def _manage_opencode_harness() -> None:
         header = (
             f"OpenCode — providers: {summary.describe()}"
             if summary.has_provider
-            else "OpenCode — no provider configured yet"
+            else f"OpenCode — {summary.describe()}"
         )
         model_label = (
             f"Set default model (current: {default_model})"
@@ -3816,10 +3817,10 @@ def _run_configure_harnesses_interactive() -> None:
                 ),
             )
 
-        # OpenCode — its own provider auth (login or env keys); the status is
-        # what it can reach (e.g. "1 stored").
+        # OpenCode — ready once installed (its free models need no sign-in);
+        # the status is what it can reach (e.g. "1 stored").
         opencode = opencode_auth_summary()
-        if not opencode.installed:
+        if not opencode.ready:
             rows.append(
                 (
                     _OPENCODE,
@@ -3829,18 +3830,8 @@ def _run_configure_harnesses_interactive() -> None:
                     _install_hint(harness_install_display(OPENCODE_KEY)),
                 ),
             )
-        elif opencode.ready:
-            rows.append((_OPENCODE, "OpenCode", opencode.describe(), "ready", ""))
         else:
-            rows.append(
-                (
-                    _OPENCODE,
-                    "OpenCode",
-                    "Not configured",
-                    "warn",
-                    "Open to sign in (opencode auth login).",
-                ),
-            )
+            rows.append((_OPENCODE, "OpenCode", opencode.describe(), "ready", ""))
 
         # Hermes — curl-installed; its provider/model live in
         # ``~/.hermes/config.yaml`` (written by `hermes model`). Read that so a

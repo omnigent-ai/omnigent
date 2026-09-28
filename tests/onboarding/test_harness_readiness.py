@@ -248,7 +248,13 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
     )
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
-    # opencode: no stored/env provider.
+    result = configured_harness_map()
+    assert result["claude-native"] == "needs-auth"
+
+
+def test_opencode_ready_without_provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An installed OpenCode is launchable with no credential: its free models need none."""
+    _all_clis_installed(monkeypatch)
     import omnigent.onboarding.opencode_auth as oc
 
     monkeypatch.setattr(
@@ -256,9 +262,7 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
         "opencode_auth_summary",
         lambda: oc.OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
     )
-    result = configured_harness_map()
-    assert result["claude-native"] == "needs-auth"
-    assert result["opencode-native"] == "needs-auth"
+    assert configured_harness_map()["opencode-native"] is True
 
 
 def test_claude_ready_via_configured_provider_without_cli_login(

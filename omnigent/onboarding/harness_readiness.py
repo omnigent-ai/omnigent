@@ -917,9 +917,8 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
     if binary_state is not True:
         return binary_state
     if install_key == OPENCODE_KEY:
-        from omnigent.onboarding.opencode_auth import opencode_auth_summary
-
-        return True if opencode_auth_summary().has_provider else "needs-auth"
+        # OpenCode's built-in free models run without any provider sign-in.
+        return True
     # claude: ready when EITHER an omnigent-managed provider serves the family
     # (an API key / gateway the user set, incl. from the UI) OR the harness's
     # own subscription login is present (`claude auth status`, a subprocess —

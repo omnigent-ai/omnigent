@@ -20,11 +20,15 @@ the harness as *outdated* until it is upgraded.
 
     npm rm -g opencode-ai            # only if OpenCode 1.x is installed
     npm i -g @opencode/cli@~2.0.18
-    opencode auth login
+    opencode auth login              # optional; free models need no sign-in
     omnigent opencode
 
-`omni setup` → OpenCode does the same install and shows the login step. The web
-UI's setup dialog shows the same checklist for a remote host.
+No sign-in is required. An installed OpenCode is ready to use with its built-in
+free models, such as `opencode/big-pickle`. Sign in to a provider only to use
+your own models.
+
+`omni setup` → OpenCode does the same install and offers the optional login.
+The web UI's setup dialog shows the same checklist for a remote host.
 
 Omnigent never removes packages; if `opencode-ai` is still installed, setup
 stops with a message asking you to remove it first.
@@ -35,8 +39,8 @@ OpenCode 2.x credential store (`~/.local/share/opencode/opencode.db`; the store
 wins on conflicts), and OpenCode imports it once into the conversation's
 private database. Provider keys that exist only in the runner's environment
 (for example `ANTHROPIC_API_KEY`) are then connected through OpenCode's
-integration API at launch. If none of these are present, the host shows the
-`opencode auth login` hint.
+integration API at launch. With none of these, OpenCode runs on its free
+models.
 
 ## Agent YAML
 
@@ -126,7 +130,8 @@ replays the history as a text preamble instead.
 ## Troubleshooting
 
 - *Harness is outdated*: install `@opencode/cli@~2.0.18` as shown above.
-- *Needs auth / auth-shaped turn error*: run `opencode auth login` on the host.
+- *Auth-shaped turn error*: the model's provider needs a sign-in. Run
+  `opencode auth login` on the host, or pick a free `opencode/…` model.
 - Diagnostics: see [harness-diagnostics.md](harness-diagnostics.md). The
   per-conversation bridge directory holds `opencode.json`, the policy plugin, and
   `opencode-serve.log` (the server's stderr from the latest launch).

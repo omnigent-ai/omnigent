@@ -425,8 +425,8 @@ describe("resolveSetupSteps", () => {
   });
 });
 
-// The server's opencode descriptor: install, then a run-on-host CLI login that
-// the host tracks through its "authed" readiness.
+// The server's opencode descriptor: install, then an optional run-on-host CLI
+// login. Free models need no login, so that step is informational (no status key).
 const OPENCODE_STEPS: SetupStepWire[] = [
   {
     kind: "install",
@@ -438,11 +438,12 @@ const OPENCODE_STEPS: SetupStepWire[] = [
   },
   {
     kind: "auth",
-    title: "Sign in to OpenCode",
-    detail: "OpenCode manages its own credentials — sign in on the host.",
+    title: "Sign in to a provider (optional)",
+    detail:
+      "OpenCode's free models work without signing in. Sign in on the host to use your own providers.",
     action: "command",
     command: "opencode auth login",
-    status_key: "authed",
+    status_key: null,
   },
 ];
 
@@ -455,15 +456,18 @@ describe("OpenCode setup", () => {
     expect(isNativeOpenCodeHarness("cursor-native")).toBe(false);
   });
 
-  it("flags a 1.x OpenCode host as outdated with install + login still to do", () => {
+  it("flags a 1.x OpenCode host as outdated with only the install to do", () => {
     const host = hostWith({ "opencode-native": "version-too-low" });
     expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBe("version-too-low");
     expect(harnessWarningBadgeText("version-too-low")).toBe("outdated");
     const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
-    expect(steps.map((s) => [s.kind, s.status])).toEqual([
-      ["install", "todo"],
-      ["auth", "todo"],
-    ]);
-    expect(steps[1].command).toBe("opencode auth login");
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "todo"]]);
+  });
+
+  it("treats an installed OpenCode with no provider login as ready", () => {
+    const host = hostWith({ "opencode-native": true });
+    expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBeNull();
+    const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "done"]]);
   });
 });
