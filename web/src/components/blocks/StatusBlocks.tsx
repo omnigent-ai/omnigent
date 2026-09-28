@@ -88,6 +88,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   databricks_sign_in_completed: "The Databricks sign-in completed and the agent is ready.",
   codex_thread_not_started: "Codex stopped before it could start, so this turn never ran.",
   native_turn_error: "The agent ran into an error during this turn.",
+  native_prompt_not_recorded: "Message not delivered. Try sending it again.",
   rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
   budget_exhausted:
     "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",

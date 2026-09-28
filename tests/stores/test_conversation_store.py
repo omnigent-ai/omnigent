@@ -7645,6 +7645,31 @@ def test_append_with_stable_id_is_idempotent(
     assert [i.id for i in page.data if i.id == stable] == [stable]
 
 
+def test_get_item_returns_the_persisted_item_or_none(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``get_item`` is the point lookup the native mirror path uses to spot a retry."""
+    conv = conversation_store.create_conversation()
+    stable = "cd" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_y",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    assert conversation_store.get_item(conv.id, stable) is None
+
+    [persisted] = conversation_store.append(conv.id, [item])
+
+    found = conversation_store.get_item(conv.id, stable)
+    assert found is not None
+    assert found.id == persisted.id
+    assert isinstance(found.data, MessageData)
+    assert found.data.content == [{"type": "input_text", "text": "hi"}]
+    other = conversation_store.create_conversation()
+    assert conversation_store.get_item(other.id, stable) is None
+
+
 def test_append_without_stable_id_still_duplicates(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -111,6 +111,30 @@ class _FakePipe:
         return b""
 
 
+class _ScriptedStdoutPipe(_FakePipe):
+    """Stdout that emits scripted frames, then stays open like a live server.
+
+    The prompt stdout-EOF recovery turns an immediate EOF into
+    ``HarnessTransportClosedError``, and ``start()`` resets ``_events``,
+    so tests that drive the real ``start()`` must deliver events through
+    the reader and keep stdout open until ``close()`` cancels the reader
+    task.
+    """
+
+    def __init__(self, lines: list[bytes]) -> None:
+        super().__init__()
+        self._lines = list(lines)
+
+    async def read(self, n: int) -> bytes:
+        if self._lines:
+            return self._lines.pop(0)
+        await asyncio.Event().wait()
+        return b""
+
+    async def readline(self) -> bytes:
+        return await self.read(-1)
+
+
 class _OverflowingPipe:
     def __init__(self):
         self.read_calls = 0
@@ -377,6 +401,29 @@ class TestCodexExecutor(unittest.TestCase):
         prompt = _prompt_for_turn(messages, is_new_thread=False)
         self.assertEqual(prompt, "Summarize our conversation.")
 
+    def test_build_initial_prompt_keeps_user_attachments_as_native_blocks(self):
+        # A fresh thread replaying multimodal history must keep image bytes as
+        # native input_image blocks, not flatten the data URI into prompt text.
+        uri = "data:image/png;base64,QUJD"
+        messages = [
+            {"role": "user", "content": [{"type": "input_image", "image_url": uri}]},
+            {"role": "assistant", "content": "Saw it."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Compare."},
+                    {"type": "input_image", "image_url": uri},
+                ],
+            },
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        images = [item for item in wire if item["type"] == "image"]
+        self.assertEqual(images, [{"type": "image", "url": uri}, {"type": "image", "url": uri}])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn(uri, text)
+
     def test_goal_objective_requires_a_standalone_command(self):
         self.assertEqual(
             _goal_objective_from_content("  /goal Finish the implementation  "),
@@ -520,7 +567,7 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_app_server_run_turn_keeps_native_shell_by_default(self):
-        async def _t():
+        async def _t(supports_direct_tools: bool):
             session = _CodexAppServerSession(
                 codex_path="/bin/echo",
                 cwd="/tmp/workspace",
@@ -528,6 +575,7 @@ class TestCodexExecutor(unittest.TestCase):
                 tool_executor=None,
             )
             session.start = AsyncMock()
+            session._supports_direct_tool_namespaces = supports_direct_tools
             session._proc = _FakeProcess()
             session._request = AsyncMock(
                 side_effect=[
@@ -580,10 +628,21 @@ class TestCodexExecutor(unittest.TestCase):
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
-            self.assertNotIn("shell_tool", params["config"]["features"])
+            self.assertNotIn("features.shell_tool", params["config"])
+            if supports_direct_tools:
+                self.assertEqual(
+                    params["config"]["features.code_mode.direct_only_tool_namespaces"],
+                    ["functions"],
+                )
+            else:
+                self.assertNotIn(
+                    "features.code_mode.direct_only_tool_namespaces", params["config"]
+                )
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
 
-        _run(_t())
+        for supports_direct_tools in (False, True):
+            with self.subTest(supports_direct_tools=supports_direct_tools):
+                _run(_t(supports_direct_tools))
 
     def test_app_server_run_turn_starts_goal_before_objective_turn(self):
         async def _t():
@@ -1081,7 +1140,7 @@ class TestCodexExecutor(unittest.TestCase):
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
-            self.assertEqual(params["config"]["features"]["shell_tool"], False)
+            self.assertEqual(params["config"]["features.shell_tool"], False)
 
         _run(_t())
 
@@ -3759,6 +3818,79 @@ def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
 
     assert (target / "auth.json").is_symlink()
     assert not (target / "config.toml").exists()
+
+
+@pytest.mark.parametrize(
+    "user_agent,direct_tools",
+    [
+        ("omnigent/0.141.0 (macOS 15.6.1)", False),
+        ("omnigent/0.142.0", True),
+        ("codex_cli_rs/0.154.0", True),
+        ("custom-client/0.154.0-alpha.1 (client/0.1)", True),
+        ("unknown (client/0.154.0)", False),
+        (None, False),
+    ],
+)
+def test_app_server_negotiates_direct_tools_from_server_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    user_agent: str | None,
+    direct_tools: bool,
+) -> None:
+    """Only compatible servers receive the direct dynamic-tool setting."""
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: tmp_path / "empty-config",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle", lambda *_: None
+    )
+
+    async def _t() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/fixture/codex", cwd=str(tmp_path), env={}, tool_executor=None
+        )
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"userAgent": user_agent}},
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        fake_process = _FakeProcess()
+        fake_process.stdout = _ScriptedStdoutPipe(
+            [
+                json.dumps(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turnId": "turn-1", "turn": {"id": "turn-1"}},
+                    }
+                ).encode()
+                + b"\n"
+            ]
+        )
+        with patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=AsyncMock(return_value=fake_process),
+        ):
+            try:
+                async for _event in session.run_turn(
+                    messages=[{"role": "user", "content": "Read the screenshot"}],
+                    tools=[{"name": "snapshot", "description": "Screenshot", "parameters": {}}],
+                    system_prompt="",
+                    model="fixture-model",
+                    cwd=str(tmp_path),
+                    sandbox="workspace-write",
+                ):
+                    pass
+                config = session._request.await_args_list[1].args[1]["config"]
+                assert config["features.unified_exec"] is False
+                key = "features.code_mode.direct_only_tool_namespaces"
+                assert config.get(key) == (["functions"] if direct_tools else None)
+            finally:
+                await session.close()
+
+    _run(_t())
 
 
 def test_app_server_start_uses_real_home_for_private_inherited_codex_home(

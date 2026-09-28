@@ -40,6 +40,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     ResourceEventData,
+    SlashCommandData,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -194,6 +195,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _model_options_cache,
     _model_options_inflight,
     _model_options_stale,
+    _native_mirror_locks,
     _native_popup_forward_tasks,
     _pending_policy_ask_writes,
     _PendingPolicyAskWrites,
@@ -361,6 +363,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     pinned_label_key,
@@ -2537,7 +2540,138 @@ async def _persist_external_devin_subagent_start(
     )
 
 
+def _native_mirror_lock(session_id: str) -> asyncio.Lock:
+    """
+    Return the lock serializing native transcript mirrors for one conversation.
+
+    The persist site probes the store for an already-persisted mirror, drains
+    the pending-input queue, and appends — three steps that must not interleave
+    with a retry of the same mirror, or the retry can pass the probe, match a
+    newer identical queued message, and write undelivered pairs for entries
+    that are still on their way. Get-or-create is race-free because there is no
+    ``await`` between the lookup and the insert (single event loop).
+
+    :param session_id: Conversation id whose mirrors are serialized.
+    :returns: A process-wide :class:`asyncio.Lock` shared by every concurrent
+        mirror for ``session_id``.
+    """
+    lock = _native_mirror_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _native_mirror_locks[session_id] = lock
+    return lock
+
+
+def _drains_pending_inputs(item: NewConversationItem) -> bool:
+    """
+    Whether a mirrored item settles a queued web message.
+
+    True for a web-composer user message echoed back by the transcript and for
+    a slash command (typed in the web composer as plain text, mirrored as a
+    ``slash_command`` item). Assistant and tool items never touch the queue.
+
+    :param item: The parsed external item.
+    :returns: ``True`` when persisting *item* drains a pending-input entry.
+    """
+    if item.type == "slash_command":
+        return isinstance(item.data, SlashCommandData)
+    return (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and not item.data.is_meta
+        and not _is_native_interrupt_record(item.data)
+    )
+
+
 async def _persist_external_conversation_item(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    enabled: bool = True,
+) -> str:
+    """
+    Persist and broadcast a conversation item produced outside AP.
+
+    Serialized per conversation (see :func:`_native_mirror_lock`) so a retried
+    mirror observes the first attempt's commit before it touches the
+    pending-input queue, and shielded from the caller's cancellation: a
+    request dropped mid-append must still settle the queue entries it holds
+    and publish its receipts, or they would stay held until the TTL and the
+    live tab would never be acknowledged. See
+    :func:`_persist_external_conversation_item_unlocked` for the parameters
+    and behaviour.
+
+    :returns: Store-assigned conversation item id.
+    """
+    task = asyncio.ensure_future(
+        _persist_external_conversation_item_serialized(
+            session_id,
+            conv,
+            body,
+            conversation_store,
+            created_by=created_by,
+            background_title_coordinator=background_title_coordinator,
+            enabled=enabled,
+        )
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The detached persist finishes on its own; keep its failure visible.
+        task.add_done_callback(lambda done: _log_detached_mirror_persist(session_id, done))
+        raise
+
+
+def _log_detached_mirror_persist(session_id: str, task: asyncio.Task[str]) -> None:
+    """
+    Log a native mirror persist that failed after its request was cancelled.
+
+    :param session_id: Conversation the mirror belonged to.
+    :param task: The finished shielded persist task.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        _logger.warning(
+            "native mirror persist for session=%s failed after its request was cancelled: %r",
+            session_id,
+            exc,
+            extra={"session_id": session_id},
+        )
+
+
+async def _persist_external_conversation_item_serialized(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    enabled: bool = True,
+) -> str:
+    """
+    Run :func:`_persist_external_conversation_item_unlocked` under the mirror lock.
+
+    :returns: Store-assigned conversation item id.
+    """
+    async with _native_mirror_lock(session_id):
+        return await _persist_external_conversation_item_unlocked(
+            session_id,
+            conv,
+            body,
+            conversation_store,
+            created_by=created_by,
+            background_title_coordinator=background_title_coordinator,
+            enabled=enabled,
+        )
+
+
+async def _persist_external_conversation_item_unlocked(
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -2567,17 +2701,34 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _new_external_conversation_item(session_id, body)
+    if item.stable_id is not None and _drains_pending_inputs(item):
+        # A forwarder retry of a mirror already persisted under its source-derived
+        # id: nothing to drain, persist or publish. Draining again could match a
+        # NEWER identical queued message and mark everything queued in between
+        # as undelivered. Items that never touch the queue skip the lookup; their
+        # retries are absorbed by the idempotent append below.
+        existing = await asyncio.to_thread(conversation_store.get_item, session_id, item.stable_id)
+        if existing is not None:
+            return existing.id
     # A native user message round-tripping back from the transcript:
-    # drain its optimistic pending-input entry (FIFO) and fold the
-    # entry's file blocks (image / file) into the item BEFORE persisting.
-    # The transcript is text-only, so without this the image is dropped
-    # from durable history and disappears on every reload / navigation.
+    # drain its optimistic pending-input entry and fold the entry's file
+    # blocks (image / file) into the item BEFORE persisting. The transcript
+    # is text-only, so without this the image is dropped from durable
+    # history and disappears on every reload / navigation.
     # The vendor CLI's own interrupt record is exempt: it is synthesized by
     # Claude (not a queued web message) and has no pending entry, so
     # draining for it would hand the queued message's uploads to the marker.
     cleared_pending_id: str | None = None
     drained: pending_inputs.DrainedInput | None = None
-    skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
+    # Every drain below holds its entries in place (``hold=True``): they keep
+    # their slot until the append settles, so a failed append restores the
+    # queue exactly and a refill meanwhile cannot evict them. Older entries a
+    # text match jumped over: a user message with a retry-safe identity
+    # surfaces them as undelivered; a source-less mirror or a slash command
+    # only holds them and puts them back afterwards.
+    skipped_pending: list[pending_inputs.DrainedInput] = []
+    uncertain_pending: list[pending_inputs.DrainedInput] = []
+    held_older: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2585,13 +2736,31 @@ async def _persist_external_conversation_item(
         and not item.data.is_meta
         and not _is_native_interrupt_record(item.data)
     ):
-        if _is_kiro_native_session(conv):
-            text = _message_text(item.data.content) or ""
-            matched = pending_inputs.resolve_matching_text(session_id, text)
-            drained = matched.matched
-            skipped_kiro_pending = matched.skipped
+        # Match the mirror to its entry by text: a pasted message the TUI never
+        # recorded leaves a stale head entry, and draining by position would
+        # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
+        # Skipped older entries are persisted as undelivered. A miss falls back
+        # to the oldest entry, except for Kiro, whose prompt text is exact.
+        text = _message_text(item.data.content) or ""
+        matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
+        drained = matched.matched
+        if item.stable_id is not None or _is_kiro_native_session(conv):
+            skipped_pending = matched.skipped
+            # Jumped-over entries that a positional drain may already have
+            # settled: drained without an undelivered record.
+            uncertain_pending = matched.uncertain
         else:
-            drained = pending_inputs.resolve_oldest(session_id)
+            # A mirror without a source id cannot be told from a retry of an
+            # already-persisted one, and a retry matching a newer identical
+            # message would brand everything queued in between undelivered.
+            # Leave the older entries queued for a later mirror instead.
+            held_older = [*matched.skipped, *matched.uncertain]
+        if drained is None and not _is_kiro_native_session(conv):
+            drained = pending_inputs.resolve_oldest(session_id, hold=True)
+            if drained is not None:
+                # The mirror's true owner may be any entry still queued, so none
+                # of them can be declared undelivered later.
+                pending_inputs.mark_uncertain(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -2612,35 +2781,63 @@ async def _persist_external_conversation_item(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
-    # Build the batch: skipped Kiro entries first (their positions must
-    # precede the matched item to match broadcast order), then the anchor.
-    # Each skipped entry gets a pair of items (user message + error) with
-    # stable IDs derived from pending_id, so the whole batch is idempotent
-    # under the append lock — no separate has_item probe needed. When the
-    # anchor is already persisted (a forwarder retry), append returns every
-    # item as deduplicated and the queue entries are restored below.
-    skipped_new_items = _build_skipped_kiro_items(session_id, skipped_kiro_pending)
-    batch = [*skipped_new_items, item]
-    pending_background_title = prepare_background_session_title(
-        coordinator=background_title_coordinator,
-        conversation=conv,
-        event=SessionEventInput(type=item.type, data=item.data.model_dump()),
-        enabled=enabled and (drained is None or drained.background_titles_enabled),
-    )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    elif item.type == "slash_command" and isinstance(item.data, SlashCommandData):
+        # A command typed in the web composer was queued as plain text but comes
+        # back as a slash_command item. Drain its own entry so it is not later
+        # mistaken for a lost message; older entries stay in place.
+        command_line = f"/{item.data.name} {item.data.arguments}".strip()
+        matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        drained = matched.matched
+        if drained is not None:
+            cleared_pending_id = drained.pending_id
+        held_older = matched.skipped
+    # Build the batch: skipped entries first (their positions must precede
+    # the matched item to match broadcast order), then the anchor. Each
+    # skipped entry gets a pair of items (user message + error) with stable
+    # IDs derived from pending_id, so the whole batch is idempotent under the
+    # append lock. A drain reports at most ``pending_inputs.
+    # _MAX_ENTRIES_PER_CONVERSATION`` skipped entries, so one append writes at
+    # most ``2 * cap + 1`` rows whatever state a rolled-back drain left the
+    # queue in. A concurrent retry that slipped past the probe above comes
+    # back deduplicated and its queue entries are unheld.
+    try:
+        skipped_new_items = _build_skipped_native_items(session_id, conv, skipped_pending)
+        batch = [*skipped_new_items, item]
+        pending_background_title = prepare_background_session_title(
+            coordinator=background_title_coordinator,
+            conversation=conv,
+            event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+            enabled=enabled and (drained is None or drained.background_titles_enabled),
+        )
+        persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    except Exception:
+        # Nothing was committed: unhold every drained entry so the forwarder's
+        # retry drains the same entries and surfaces the same undelivered
+        # messages.
+        _restore_drained_inputs(
+            session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
+        )
+        raise
     persisted = persisted_items[-1]
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user
-        # message — restore in original queue order (skipped entries preceded
-        # the match; restore prepends, so reverse).
-        for entry in reversed([*skipped_kiro_pending, drained]):
-            if entry is not None:
-                pending_inputs.restore(session_id, entry)
+        # message.
+        _restore_drained_inputs(
+            session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
+        )
         return persisted.id
-    # Not a duplicate: publish side effects for each skipped Kiro pair.
-    # Items are [user0, error0, user1, error1, ...]; 2 per skipped entry.
-    for i, skipped in enumerate(skipped_kiro_pending):
+    # Landed: the drained entries are settled (uncertain ones leave without a
+    # record — their mirror may already have been attributed by position);
+    # older messages a slash command jumped over are still on their way and
+    # go back into play.
+    _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
+    _restore_drained_inputs(session_id, held_older, None)
+    # Not a duplicate: publish side effects for each skipped pair. Items are
+    # [user0, error0, user1, error1, ...]; 2 per skipped entry. The consumed
+    # event names each skipped entry so clients settle those bubbles in order
+    # before the matched message's own receipt arrives.
+    for i, skipped in enumerate(skipped_pending):
         persisted_user = persisted_items[i * 2]
         persisted_error = persisted_items[i * 2 + 1]
         if not persisted_user.deduplicated:
@@ -2810,19 +3007,83 @@ async def _settle_undelivered_native_input(
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
 
 
-def _build_skipped_kiro_items(
+def _restore_drained_inputs(
     session_id: str,
+    skipped: list[pending_inputs.DrainedInput],
+    drained: pending_inputs.DrainedInput | None,
+) -> None:
+    """
+    Put a mirror's drained pending entries back into play, in queue order.
+
+    Compensation for a drain whose persist did not land (a deduplicated retry,
+    or an append that raised), and the way a slash command hands back the
+    older entries it only held. Held entries are unheld in place; one the TTL
+    evicted meanwhile is re-inserted at the front, newest-first, so the
+    original order survives either way.
+
+    :param session_id: Conversation the entries belong to.
+    :param skipped: Older entries skipped by the text match, oldest first.
+    :param drained: The matched (or FIFO-drained) entry, or ``None``.
+    """
+    for entry in reversed([*skipped, drained]):
+        if entry is not None:
+            pending_inputs.restore(session_id, entry)
+
+
+def _release_drained_inputs(
+    session_id: str, entries: list[pending_inputs.DrainedInput | None]
+) -> None:
+    """
+    Drop a mirror's drained pending entries once their persist landed.
+
+    :param session_id: Conversation the entries belong to.
+    :param entries: The matched entry and any skipped ones; ``None`` is skipped.
+    """
+    for entry in entries:
+        if entry is not None:
+            pending_inputs.release(session_id, entry)
+
+
+def _build_skipped_native_items(
+    session_id: str,
+    conv: Conversation,
     skipped_entries: list[pending_inputs.DrainedInput],
 ) -> list[NewConversationItem]:
     """
-    Build ``NewConversationItem`` pairs for Kiro web inputs not in the transcript.
+    Build ``NewConversationItem`` pairs for web inputs the native TUI never recorded.
 
-    Each skipped entry produces ``[user_message, error_item]``. Stable IDs
-    derived from ``pending_id`` make each pair idempotent under the batch
-    append so no pre-flight has_item probe is needed — if the anchor item
-    is already persisted (a forwarder retry), these items are too, and
-    append returns the whole batch deduplicated.
+    Each skipped entry produces ``[user_message, error_item]``: the message the
+    person sent, followed by an error saying the harness never recorded it, so
+    the transcript keeps the lost message instead of silently dropping it.
+    Stable IDs derived from ``pending_id`` make each pair idempotent under the
+    batch append so no pre-flight has_item probe is needed — if the anchor item
+    is already persisted (a forwarder retry), these items are too, and append
+    returns the whole batch deduplicated.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row, used to name the harness in the error.
+    :param skipped_entries: Older queue entries skipped by a text-matched drain.
+    :returns: The item pairs in queue order, empty when nothing was skipped.
     """
+    if not skipped_entries:
+        return []
+    if _is_kiro_native_session(conv):
+        harness_key = "kiro"
+        code = "kiro_native_prompt_not_recorded"
+        message = (
+            "Kiro did not accept this web message into its structured session "
+            "transcript. The native terminal may have shown the underlying error."
+        )
+    else:
+        native_agent = _native_coding_agent_for_session(conv)
+        display_name = native_agent.display_name if native_agent is not None else "The agent"
+        harness_key = "native"
+        code = "native_prompt_not_recorded"
+        message = (
+            f"{display_name} never recorded this message in its transcript before "
+            "accepting a later one, so it was not delivered. The native terminal may "
+            "have shown the underlying error."
+        )
     items: list[NewConversationItem] = []
     for skipped in skipped_entries:
         turn_id = generate_task_id()
@@ -2834,7 +3095,7 @@ def _build_skipped_kiro_items(
                 created_by=skipped.created_by,
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
-                    f"omnigent-skipped-kiro-user:{session_id}:{skipped.pending_id}",
+                    f"omnigent-skipped-{harness_key}-user:{session_id}:{skipped.pending_id}",
                 ).hex,
             )
         )
@@ -2842,17 +3103,10 @@ def _build_skipped_kiro_items(
             NewConversationItem(
                 type="error",
                 response_id=turn_id,
-                data=ErrorData(
-                    source="execution",
-                    code="kiro_native_prompt_not_recorded",
-                    message=(
-                        "Kiro did not accept this web message into its structured session "
-                        "transcript. The native terminal may have shown the underlying error."
-                    ),
-                ),
+                data=ErrorData(source="execution", code=code, message=message),
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
-                    f"omnigent-skipped-kiro-error:{session_id}:{skipped.pending_id}",
+                    f"omnigent-skipped-{harness_key}-error:{session_id}:{skipped.pending_id}",
                 ).hex,
             )
         )
@@ -6777,10 +7031,10 @@ async def _dispatch_session_event_to_runner_impl(
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
 
-# Deployed runners back off to a 10s cap with ±50% jitter, so the
-# worst-case reconnect is ~15s plus handshake. 20s covers that cluster
-# and resolves transient drops silently; a runner still gone afterwards fails.
-RUNNER_DISCONNECT_GRACE_S: float = 20.0
+# Sized to the runner liveness lease so the relay give-up, the disconnect
+# timer, and the liveness-driven sidebar agree on when a dropped runner is
+# gone; a crash is reported separately by the daemon and never waits this out.
+RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but

@@ -600,6 +600,21 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
+        """
+        Fetch one persisted item by id, or ``None`` when absent.
+
+        A bounded point lookup on the item's key, never a scan. Lets the native
+        mirror path recognise a forwarder retry of an item it has already
+        persisted before it touches the pending-input queue.
+
+        :param conversation_id: The conversation to look in, e.g. ``"conv_abc123"``.
+        :param item_id: The item id, e.g. a source-derived ``stable_id``.
+        :returns: The item, or ``None``.
+        """
+        ...
+
+    @abstractmethod
     def list_items(
         self,
         conversation_id: str,

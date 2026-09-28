@@ -1265,7 +1265,7 @@ def _extract_role_keyed_messages(
     """Extract role-keyed message items from an Omnigent input list.
 
     Tool-call items (function_call, function_call_output, etc.) are skipped — the inner SDK
-    reconstructs them from its own Layer 1 state. Returns empty list for non-history inputs.
+    reconstructs its own tool state. Returns an empty list for non-history inputs.
     """
     messages: list[Message] = []
     for item in input_value:

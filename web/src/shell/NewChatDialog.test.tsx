@@ -7438,6 +7438,30 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByText("Loading skills…")).not.toBeInTheDocument();
   });
 
+  it("submits inline slash text while skills are still loading", async () => {
+    mockSkills({ skillsStatus: "loading" });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderLanding();
+    typeMessage("fix the /api route");
+    const input = screen.getByTestId("new-chat-landing-input");
+    await userEvent.click(input);
+    fireEvent.select(input, { target: { selectionStart: 12, selectionEnd: 12 } });
+    expect(screen.getByText("Loading skills…")).toBeInTheDocument();
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    expect(submit).toBeEnabled();
+    fireEvent.blur(input);
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    expect(setPendingInitialPromptMock.mock.calls[0]![1]).toMatchObject({
+      text: "fix the /api route",
+      skill: null,
+    });
+  });
+
   it("keeps Create disabled with the loading reason when the composer blurs mid-discovery", async () => {
     // A lone partial token typed while skills are still loading keeps
     // Create blocked even after the textarea loses focus — the pending
@@ -7541,6 +7565,52 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByText("Review a pull request")).toBeTruthy();
     expect(screen.getByText("Cross-vendor review")).toBeTruthy();
   });
+
+  it.each(["click", "Tab"])(
+    "completes an inline skill via %s and keeps surrounding text",
+    async (method) => {
+      mockAgents([skilledAgent()]);
+      renderLanding();
+      typeMessage("please /rev this change");
+      const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+      await userEvent.click(input);
+      fireEvent.select(input, { target: { selectionStart: 11, selectionEnd: 11 } });
+      if (method === "click") fireEvent.click(screen.getByTestId("slash-menu-item-review-pr"));
+      else fireEvent.keyDown(input, { key: method });
+      expect(input).toHaveValue("please /review-pr this change");
+      await waitFor(() => expect(input.selectionStart).toBe(18));
+    },
+  );
+
+  it.each([" then /rev", "\nkeep this", "\tkeep this"])(
+    "keeps completion at the caret before %j",
+    async (suffix) => {
+      mockAgents([skilledAgent()]);
+      renderLanding();
+      typeMessage(`please /rev${suffix}`);
+      const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+      await userEvent.click(input);
+      fireEvent.select(input, { target: { selectionStart: 11, selectionEnd: 11 } });
+      fireEvent.keyDown(input, { key: "Tab" });
+      expect(input).toHaveValue(`please /review-pr${suffix}`);
+      expect(screen.queryByTestId("slash-menu-item-review-pr")).toBeNull();
+      await waitFor(() => expect(input.selectionStart).toBe(suffix.startsWith(" ") ? 18 : 17));
+    },
+  );
+
+  it.each(["context", "help", "compact"])(
+    "shows %s as a skill both before and after text",
+    (name) => {
+      mockAgents([{ ...skilledAgent(), skills: [{ name, description: "Custom skill" }] }]);
+      renderLanding();
+      typeMessage(`/${name.slice(0, 3)}`);
+      expect(screen.getByText("Skills")).toBeVisible();
+      expect(screen.queryByText("Commands")).toBeNull();
+      typeMessage(`please /${name.slice(0, 3)}`);
+      fireEvent.click(screen.getByTestId(`slash-menu-item-${name}`));
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(`please /${name} `);
+    },
+  );
 
   it("filters by the typed query (substring) and fills the draft on click", () => {
     mockAgents([skilledAgent()]);

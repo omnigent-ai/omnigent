@@ -4610,15 +4610,15 @@ export function NewChatLandingScreen() {
       ),
     [availableSkills, skillPrefix],
   );
-  // Selecting a skill fills "/name " and leaves the caret ready for the
-  // argument — skills never auto-execute from the menu.
+  // Insert the selected skill at the caret while preserving surrounding text.
   function applySlashSelection(cmd: string) {
-    setMessage(cmd + " ");
-    textareaRef.current?.focus();
+    setMessage(slashCompletion.complete(cmd).text);
   }
   const slashCompletion = useSlashCompletion({
     text: message,
     commands: skillCommands,
+    skills: skillCommands,
+    textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
     mobile: isMobileViewport,
@@ -6304,7 +6304,9 @@ export function NewChatLandingScreen() {
               input={{
                 ref: textareaRef,
                 value: message,
+                onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
+                  slashCompletion.onSelectionChange(e.target);
                   setMessage(e.target.value);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
@@ -6367,7 +6369,8 @@ export function NewChatLandingScreen() {
                         query={slashCompletion.query}
                         activeIndex={slashCompletion.index}
                         onSelect={applySlashSelection}
-                        commands={skillCommands}
+                        commands={slashCompletion.commands}
+                        builtinNames={slashCompletion.builtinNames}
                         skillsStatus={skillsStatus}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}

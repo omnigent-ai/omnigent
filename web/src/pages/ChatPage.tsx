@@ -3105,18 +3105,12 @@ function ComposerImpl(
     }
   };
 
-  /**
-   * Called when the user selects a suggestion from the menu (keyboard or
-   * click). Commands that need an argument (``SLASH_COMMANDS_WITH_ARGS``)
-   * fill in the text with a trailing space so the user can type the arg.
-   * All other commands execute immediately.
-   */
+  // Skills insert at the caret; standalone no-argument built-ins execute immediately.
   const applyMenuSelection = (cmd: string) => {
-    if (slashCommandsWithArgs.has(cmd)) {
-      // Fill in "cmd " and let the user type the argument.
-      setValue(cmd + " ");
+    if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
+      const completion = slashCompletion.complete(cmd);
+      setValue(completion.text);
       dirtyRef.current = true;
-      textareaRef.current?.focus();
     } else {
       // Execute immediately — no argument needed.
       setValue("");
@@ -3125,13 +3119,18 @@ function ComposerImpl(
     }
   };
 
-  // Slash-completion menu mechanics (shared useSlashCompletion): the menu
-  // opens while the focused draft is a lone command token with no
-  // attachments, and owns Escape, arrows, and Tab/Enter completion while
-  // open. What a selection does (fill vs execute) stays in the adapter.
+  const skillCommands = useMemo(
+    () =>
+      Object.fromEntries(skills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description])),
+    [skills, skillPrefix],
+  );
+
+  // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
     commands: slashCommands,
+    skills: skillCommands,
+    textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
     mobile: isMobile,
@@ -3525,6 +3524,7 @@ function ComposerImpl(
   };
 
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
+    slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
@@ -3654,6 +3654,7 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           onChange: (e) => handleTextChange(null, e),
+          onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
           onFocus: (e) => {
             setInputFocused(true);
             handleTextFocus(null, e.currentTarget);
@@ -3745,7 +3746,8 @@ function ComposerImpl(
                   query={slashCompletion.query}
                   activeIndex={slashCompletion.index}
                   onSelect={applyMenuSelection}
-                  commands={slashCommands}
+                  commands={slashCompletion.commands}
+                  builtinNames={slashCompletion.builtinNames}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
                 />
