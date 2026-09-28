@@ -1259,6 +1259,122 @@ async def test_external_session_superseded_drains_pending_inputs(
         pending_inputs.reset_for_tests()
 
 
+# ── POST /v1/sessions/{id}/events external_session_rotated ────────
+
+
+def _runner_authority(db_uri: str, session_id: str) -> dict[str, str]:
+    """Bind *session_id* to a token-derived runner and return the tunnel header.
+
+    The ``external_session_rotated`` event is gated on runner-tunnel authority,
+    so tests that exercise the authorized path must both bind the conversation's
+    runner id to ``token_bound_runner_id(token)`` and present that token in the
+    ``X-Omnigent-Runner-Tunnel-Token`` header — the same pairing a live
+    cursor-native forwarder carries.
+    """
+    import secrets
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    token = secrets.token_urlsafe(16)
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(
+        session_id, token_bound_runner_id(token)
+    )
+    return {RUNNER_TUNNEL_TOKEN_HEADER: token}
+
+
+async def test_external_session_rotated_re_points_resume_target(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``external_session_rotated`` overwrites ``external_session_id``.
+
+    The cursor-native forwarder posts this when the TUI's in-pane ``/clear``
+    starts a new vendor chat, so a later cold resume targets the chat the pane
+    is actually on. The plain PATCH keeps its write-once contract — only this
+    explicit wrapper-reported rotation, carrying the session's runner-tunnel
+    authority, may re-point the value.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    runner_headers = _runner_authority(db_uri, session["id"])
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "chat-before-clear"},
+    )
+    assert patch.status_code == 200
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_rotated",
+            "data": {"external_session_id": "chat-after-clear"},
+        },
+        headers=runner_headers,
+    )
+    assert resp.status_code in (200, 202), resp.text
+
+    fetched = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert fetched["external_session_id"] == "chat-after-clear"
+
+    # The write-once PATCH guard is untouched: a divergent plain PATCH is
+    # still rejected loudly.
+    conflicting = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "chat-something-else"},
+    )
+    assert conflicting.status_code == 400
+
+
+async def test_external_session_rotated_requires_runner_authority(
+    client: httpx.AsyncClient,
+) -> None:
+    """A generic ``LEVEL_EDIT`` caller cannot overwrite an established
+    ``external_session_id``.
+
+    The rotation event is the one sanctioned bypass of the write-once guard, so
+    it is reserved for the session's runner bridge. A caller without runner-tunnel
+    authority is rejected and the established value is preserved.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "chat-before-clear"},
+    )
+    assert patch.status_code == 200
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_rotated",
+            "data": {"external_session_id": "hijacked-chat"},
+        },
+    )
+    assert resp.status_code == 403, resp.text
+
+    fetched = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert fetched["external_session_id"] == "chat-before-clear"
+
+
+async def test_external_session_rotated_requires_external_session_id(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A rotation event without a new external session id is rejected."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    runner_headers = _runner_authority(db_uri, session["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_rotated", "data": {}},
+        headers=runner_headers,
+    )
+    assert resp.status_code == 400
+
+
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
