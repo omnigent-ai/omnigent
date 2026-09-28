@@ -38,6 +38,7 @@ import {
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
+import { useSwipeActions } from "@/lib/swipeActionPreferences";
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -251,6 +252,12 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
     permission_level: null,
     ...partial,
   };
+}
+
+/** Another swipe-actions subscriber, standing in for the sidebar rows that stay mounted. */
+function SwipeActionsProbe() {
+  const { left, right } = useSwipeActions();
+  return <span data-testid="swipe-actions-probe">{`${left}/${right}`}</span>;
 }
 
 /** Exposes the router location so navigation assertions read the real URL. */
@@ -812,51 +819,129 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("colours Delete red and Archive blue on the card and checked item; None stays neutral", async () => {
-    localStorage.setItem(
-      "omnigent:swipe-actions",
-      JSON.stringify({ left: "none", right: "delete" }),
-    );
+  // Dracula's accent tone is pink, so a palette-following colour would not be blue there.
+  it.each(["omni", "dracula"])(
+    "colours Delete red and Archive blue in the %s palette; None stays neutral",
+    async (palette) => {
+      localStorage.setItem("omnigent:ui-theme-palette", JSON.stringify(palette));
+      localStorage.setItem(
+        "omnigent:swipe-actions",
+        JSON.stringify({ left: "none", right: "delete" }),
+      );
+      const user = userEvent.setup();
+      renderPage("/settings/appearance");
+      expect(screen.getByTestId("color-theme-select")).toHaveValue(palette);
+      const right = screen.getByTestId("swipe-action-right");
+      const left = screen.getByTestId("swipe-action-left");
+      const icon = (card: HTMLElement) => card.querySelector("svg") as SVGElement;
+      const label = (direction: string) => screen.getByTestId(`swipe-action-${direction}-label`);
+      const RED = ["text-red-800", "dark:text-red-200"];
+      const BLUE = ["text-blue-700", "dark:text-blue-300"];
+
+      // Fixed tones on the card's icon and name; the chevron and card stay neutral.
+      expect(icon(right)).toHaveClass(...RED);
+      expect(label("right")).toHaveClass(...RED);
+      expect(label("right")).not.toHaveClass("text-destructive");
+      expect(label("right").className).not.toMatch(/hover:text-/);
+      expect(right.querySelector(".lucide-chevron-down")).toHaveClass("text-muted-foreground");
+      expect(right.className).not.toMatch(/text-(red|blue)-/);
+
+      expect(icon(left)).toHaveClass("text-muted-foreground");
+      expect(icon(left).getAttribute("class")).not.toMatch(/text-(red|blue)-/);
+      expect(label("left")).toHaveClass("text-muted-foreground");
+      expect(label("left").className).not.toMatch(/text-(red|blue)-/);
+
+      // The checked item keeps its tone while highlighted, and its check mark follows the text.
+      await user.click(right);
+      let menu = screen.getByRole("menu", { name: "Swipe right: Delete" });
+      const deleteItem = within(menu).getByRole("menuitemradio", { name: "Delete" });
+      expect(deleteItem).toHaveClass(...RED, "focus:text-red-800", "dark:focus:text-red-200");
+      expect(deleteItem).toHaveClass("[&_svg]:text-current");
+      expect(deleteItem.className).not.toMatch(/focus:text-foreground/);
+      const archiveItem = within(menu).getByRole("menuitemradio", { name: "Archive" });
+      expect(archiveItem.className).not.toMatch(/text-(red|blue)-/);
+      await user.click(archiveItem);
+
+      expect(icon(right)).toHaveClass(...BLUE);
+      expect(label("right")).toHaveClass(...BLUE);
+      expect(label("right")).not.toHaveClass("text-accent-foreground");
+      expect(label("right").className).not.toMatch(/text-red-/);
+      await user.click(right);
+      menu = screen.getByRole("menu", { name: "Swipe right: Archive" });
+      expect(within(menu).getByRole("menuitemradio", { name: "Archive" })).toHaveClass(
+        ...BLUE,
+        "focus:text-blue-700",
+        "dark:focus:text-blue-300",
+      );
+      expect(within(menu).getByRole("menuitemradio", { name: "Delete" }).className).not.toMatch(
+        /text-(red|blue)-/,
+      );
+    },
+  );
+
+  it("shows each action's own icon on its swipe card", async () => {
     const user = userEvent.setup();
     renderPage("/settings/appearance");
     const right = screen.getByTestId("swipe-action-right");
-    const icon = (card: HTMLElement) => card.querySelector("svg") as SVGElement;
-    const label = (direction: string) => screen.getByTestId(`swipe-action-${direction}-label`);
+    const iconClass = (card: HTMLElement) => card.querySelector("svg")?.getAttribute("class");
 
-    expect(icon(right)).toHaveClass("text-destructive");
-    expect(label("right")).toHaveClass("text-destructive");
-    // Dark hover sits on bg-muted, where the tone misses AA: text falls back.
-    expect(label("right")).toHaveClass("dark:group-hover:text-foreground");
-    expect(right).toHaveClass("group");
-    expect(right.querySelector(".lucide-chevron-down")).toHaveClass("text-muted-foreground");
+    expect(iconClass(right)).toMatch(/lucide-archive\b/);
+    expect(iconClass(screen.getByTestId("swipe-action-left"))).toMatch(/lucide-trash-2\b/);
+    const pick = async (name: string) => {
+      await user.click(right);
+      await user.click(screen.getByRole("menuitemradio", { name }));
+      return iconClass(right);
+    };
+    expect(await pick("Delete")).toMatch(/lucide-trash-2\b/);
+    expect(await pick("None")).toMatch(/lucide-minus\b/);
+    expect(await pick("Archive")).toMatch(/lucide-archive\b/);
+  });
 
-    const left = screen.getByTestId("swipe-action-left");
-    expect(icon(left)).toHaveClass("text-muted-foreground");
-    expect(icon(left)).not.toHaveClass("text-destructive");
-    expect(label("left")).toHaveClass("text-muted-foreground");
-    expect(label("left")).not.toHaveClass("dark:group-hover:text-foreground");
+  it("previews each option as the sidebar row swiped in that card's direction", async () => {
+    const user = userEvent.setup();
+    renderPage("/settings/appearance");
+    const expected = {
+      right: { side: "left-0", offset: "translateX(40%)" },
+      left: { side: "right-0", offset: "translateX(-40%)" },
+    } as const;
 
-    await user.click(right);
-    let menu = screen.getByRole("menu", { name: "Swipe right: Delete" });
-    const deleteItem = within(menu).getByRole("menuitemradio", { name: "Delete" });
-    expect(deleteItem).toHaveClass("text-destructive", "dark:focus:text-foreground");
-    expect(within(menu).getByRole("menuitemradio", { name: "Archive" })).not.toHaveClass(
-      "text-accent-foreground",
-    );
-    await user.click(within(menu).getByRole("menuitemradio", { name: "Archive" }));
+    const expectPreviews = async (direction: "right" | "left") => {
+      await user.click(screen.getByTestId(`swipe-action-${direction}`));
+      const menu = screen.getByRole("menu");
+      const preview = (name: string) => {
+        const item = within(menu).getByRole("menuitemradio", { name });
+        return {
+          tile: within(item).queryByTestId("swipe-preview-tile"),
+          row: within(item).getByTestId("swipe-preview-row"),
+        };
+      };
 
-    expect(icon(right)).toHaveClass("text-accent-foreground");
-    expect(label("right")).toHaveClass("text-accent-foreground");
-    expect(label("right")).not.toHaveClass("text-destructive");
-    await user.click(right);
-    menu = screen.getByRole("menu", { name: "Swipe right: Archive" });
-    expect(within(menu).getByRole("menuitemradio", { name: "Archive" })).toHaveClass(
-      "text-accent-foreground",
-      "dark:focus:text-foreground",
-    );
-    expect(within(menu).getByRole("menuitemradio", { name: "Delete" })).not.toHaveClass(
-      "text-destructive",
-    );
+      // Archive and Delete slide the row the way the finger moves and reveal the real sidebar tile.
+      const archive = preview("Archive");
+      expect(archive.tile).toHaveClass(
+        expected[direction].side,
+        "bg-accent",
+        "text-accent-foreground",
+      );
+      expect(archive.tile?.querySelector(".lucide-archive")).not.toBeNull();
+      expect(archive.row.style.transform).toBe(expected[direction].offset);
+
+      const del = preview("Delete");
+      expect(del.tile).toHaveClass(
+        expected[direction].side,
+        "bg-destructive/20",
+        "text-destructive",
+      );
+      expect(del.tile?.querySelector(".lucide-trash-2")).not.toBeNull();
+      expect(del.row.style.transform).toBe(expected[direction].offset);
+
+      const none = preview("None");
+      expect(none.tile).toBeNull();
+      expect(none.row.style.transform).toBe("translateX(0%)");
+      await user.keyboard("{Escape}");
+    };
+    await expectPreviews("right");
+    await expectPreviews("left");
   });
 
   it("offers explicit modes and links the automatic browser mode to Databricks settings", () => {
@@ -1409,6 +1494,7 @@ describe("SettingsPage", () => {
   it("resets every appearance preference back to product defaults", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
+    render(<SwipeActionsProbe />);
 
     // Tweak a representative set of appearance preferences.
     mocks.theme = "dark";
@@ -1451,6 +1537,7 @@ describe("SettingsPage", () => {
     );
     fireEvent(window, new StorageEvent("storage", { key: "omnigent:swipe-actions" }));
     expect(screen.getByTestId("swipe-action-right")).toHaveAccessibleName("Swipe right: None");
+    expect(screen.getByTestId("swipe-actions-probe")).toHaveTextContent("archive/none");
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -1535,6 +1622,8 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("swipe-action-right")).toHaveAccessibleName("Swipe right: Archive");
     expect(screen.getByTestId("swipe-action-left")).toHaveAccessibleName("Swipe left: Delete");
     expect(localStorage.getItem("omnigent:swipe-actions")).toBeNull();
+    // Rows mounted outside Settings (the sidebar) pick up the defaults too.
+    expect(screen.getByTestId("swipe-actions-probe")).toHaveTextContent("delete/archive");
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {

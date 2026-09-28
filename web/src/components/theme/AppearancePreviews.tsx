@@ -121,6 +121,7 @@ function PreviewSwipedRow({
     <div className="relative h-5 shrink-0 overflow-hidden rounded-md">
       {action !== "none" && (
         <div
+          data-testid="swipe-preview-tile"
           className={cn(
             "absolute inset-y-0 flex w-2/5 items-center justify-center rounded-md",
             direction === "right" ? "left-0" : "right-0",
@@ -137,6 +138,7 @@ function PreviewSwipedRow({
         </div>
       )}
       <div
+        data-testid="swipe-preview-row"
         className="absolute inset-0 flex items-center gap-1 rounded-md px-1"
         style={{
           backgroundColor: swatch.bg,
