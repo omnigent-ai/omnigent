@@ -97,6 +97,8 @@ interface NativeShellApi {
    * fallback so a newer SPA can still ask an older shell to hide the switcher.
    */
   setSidebarOpen?: (open: boolean) => void;
+  /** Control root-document scrolling; nested web scrollers remain independent. */
+  setDocumentScrollEnabled?: (enabled: boolean) => void;
   /**
    * Current server origin + managed/recent choices, or null on a foreign page.
    * Optional: shells older than the sidebar server picker lack it — the SPA
@@ -725,6 +727,17 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
   }
 }
 
+/** Prevent native focus scrolling while the app shell owns keyboard layout. */
+export function setIOSDocumentScrollEnabled(enabled: boolean): void {
+  const native = nativeApi();
+  if (native?.kind !== "ios") return;
+  try {
+    native.setDocumentScrollEnabled?.(enabled);
+  } catch (err) {
+    console.warn("[nativeBridge] native setDocumentScrollEnabled failed:", err);
+  }
+}
+
 /** UIKit's visible height, or null for older shells and pending orientation updates. */
 export function getIOSKeyboardViewportHeight(): number | null {
   if (!isIOSShell()) return null;
@@ -735,12 +748,15 @@ export function getIOSKeyboardViewportHeight(): number | null {
       !Number.isFinite(viewport.width) ||
       !Number.isFinite(viewport.height) ||
       Math.abs(viewport.width - window.innerWidth) > 1 ||
-      viewport.height <= 0 ||
-      viewport.height > window.innerHeight + 1
+      viewport.height <= 0
     ) {
       return null;
     }
-    return Math.min(viewport.height, window.innerHeight);
+    // WebKit can temporarily shrink innerHeight during a keyboard transition.
+    // Only reconcile subpixel rounding; UIKit owns the usable app height.
+    return Math.abs(viewport.height - window.innerHeight) <= 1
+      ? Math.min(viewport.height, window.innerHeight)
+      : viewport.height;
   } catch {
     return null;
   }

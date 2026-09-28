@@ -4,6 +4,7 @@ import {
   getIOSKeyboardViewportHeight,
   isIOSShell,
   onNativeKeyboardViewportChanged,
+  setIOSDocumentScrollEnabled,
 } from "@/lib/nativeBridge";
 
 /** Keep content above the docked keyboard without shrinking for floating iPad controls. */
@@ -15,6 +16,10 @@ export function useIOSViewportLock(): void {
 
     const root = document.documentElement;
     let frame = 0;
+
+    // WebKit otherwise animates the root to reveal the caret before our scroll
+    // correction runs. The shell scrolls its inner panes instead of the document.
+    setIOSDocumentScrollEnabled(false);
 
     // WebKit may still pan the document when an input focuses. Keep the header
     // fixed while the inner panes scroll within the keyboard-aware shell.
@@ -46,6 +51,7 @@ export function useIOSViewportLock(): void {
     window.addEventListener("resize", schedule);
 
     return () => {
+      setIOSDocumentScrollEnabled(true);
       unsubscribe();
       if (frame) window.cancelAnimationFrame(frame);
       viewport.removeEventListener("resize", schedule);

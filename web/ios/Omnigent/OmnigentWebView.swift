@@ -1,3 +1,4 @@
+import GameController
 import SwiftUI
 import UIKit
 import WebKit
@@ -339,6 +340,11 @@ struct OmnigentWebView: UIViewRepresentable {
           if (lastInsets) { try { callback(lastInsets); } catch {} }
           return () => insetCallbacks.delete(callback);
         },
+        setDocumentScrollEnabled(enabled) {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "setDocumentScrollEnabled", enabled: !!enabled,
+          });
+        },
         getKeyboardViewport() { return keyboardViewport; },
         onKeyboardViewportChanged(callback) {
           if (typeof callback !== "function") return () => {};
@@ -378,7 +384,7 @@ struct OmnigentWebView: UIViewRepresentable {
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
-    UIGestureRecognizerDelegate
+    UIGestureRecognizerDelegate, UIScrollViewDelegate
   {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
@@ -434,6 +440,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func attach(_ webView: WKWebView) {
+      webView.scrollView.delegate = self
       self.webView = webView
       if webStore != nil {
         activationObserver = NotificationCenter.default.addObserver(
@@ -470,6 +477,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
+      webView?.scrollView.delegate = nil
       navigationID = UUID()
       activationTask?.cancel()
       activationTask = nil
@@ -782,6 +790,15 @@ struct OmnigentWebView: UIViewRepresentable {
       }
     }
 
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+      guard scrollView === webView?.scrollView, !scrollView.isScrollEnabled,
+        scrollView.contentOffset != .zero
+      else { return }
+      // Focus scrolling can ignore isScrollEnabled. Clamp before the native
+      // frame is displayed instead of correcting the pan later in JavaScript.
+      scrollView.setContentOffset(.zero, animated: false)
+    }
+
     func userContentController(
       _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
     ) {
@@ -794,6 +811,9 @@ struct OmnigentWebView: UIViewRepresentable {
       else { return }
 
       switch method {
+      case "setDocumentScrollEnabled":
+        guard let enabled = body["enabled"] as? Bool else { return }
+        webView?.scrollView.isScrollEnabled = enabled
       case "signOut":
         requestSignOut()
       case "setColorScheme":
@@ -866,7 +886,9 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-      guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
+      guard isCurrent(webView) else { return }
+      webView.scrollView.isScrollEnabled = true
+      guard webStore == nil || workspaceSession != nil else { return }
       if let url = webView.url, !acceptWorkspaceNavigation(url, in: webView) { return }
       if let url = webView.url,
         ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
@@ -1278,7 +1300,10 @@ private final class AccessoryFreeWebView: WKWebView {
   func emitKeyboardViewport(force: Bool = false) {
     let size = CGSize(
       width: bounds.width,
-      height: keyboardViewportHeight(in: bounds, keyboardFrame: keyboardLayoutGuide.layoutFrame))
+      height: keyboardViewportHeight(
+        in: bounds, keyboardFrame: keyboardLayoutGuide.layoutFrame,
+        hasIPadHardwareKeyboard: traitCollection.userInterfaceIdiom == .pad
+          && GCKeyboard.coalesced != nil))
     guard size.width > 0, size.height > 0, force || size != lastKeyboardViewportSize else { return }
     lastKeyboardViewportSize = size
     evaluateJavaScript(
@@ -1298,7 +1323,14 @@ private final class AccessoryFreeWebView: WKWebView {
   }
 }
 
-func keyboardViewportHeight(in bounds: CGRect, keyboardFrame: CGRect) -> CGFloat {
+func keyboardViewportHeight(
+  in bounds: CGRect, keyboardFrame: CGRect, hasIPadHardwareKeyboard: Bool = false
+) -> CGFloat {
+  // iPadOS initially reports the hardware toolbar as a short full-width frame
+  // before publishing its floating bounds. Ignore that accessory-only area.
+  if hasIPadHardwareKeyboard && keyboardFrame.height <= 80 {
+    return bounds.height
+  }
   // Only a keyboard spanning the bottom edge reduces the app's usable height.
   // Floating keyboards and hardware-keyboard controls overlay the app instead.
   let docked =

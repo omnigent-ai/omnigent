@@ -7,6 +7,7 @@ const HEIGHT_VAR = "--omnigent-viewport-height";
 let viewport: EventTarget & { height: number; offsetTop: number };
 let nativeViewport: { width: number; height: number } | null;
 let nativeListeners: Set<() => void>;
+let setDocumentScrollEnabled: ReturnType<typeof vi.fn>;
 
 function useKeyboardLayout() {
   useIOSViewportLock();
@@ -36,8 +37,10 @@ beforeEach(() => {
   vi.stubGlobal("visualViewport", viewport);
   nativeViewport = { width: 1210, height: 834 };
   nativeListeners = new Set();
+  setDocumentScrollEnabled = vi.fn();
   vi.stubGlobal("omnigentNative", {
     kind: "ios",
+    setDocumentScrollEnabled,
     getKeyboardViewport: () => nativeViewport,
     onKeyboardViewportChanged: (callback: () => void) => {
       nativeListeners.add(callback);
@@ -53,6 +56,16 @@ afterEach(() => {
 });
 
 describe("iOS keyboard layout", () => {
+  it("disables native root scrolling only while the shell controls keyboard layout", () => {
+    const { unmount } = renderHook(useKeyboardLayout);
+    expect(setDocumentScrollEnabled).toHaveBeenCalledExactlyOnceWith(false);
+    changeKeyboard(765.5, 834);
+    expect(shellHeight()).toBe("834px");
+    expect(setDocumentScrollEnabled).toHaveBeenCalledTimes(1);
+    unmount();
+    expect(setDocumentScrollEnabled).toHaveBeenLastCalledWith(true);
+  });
+
   it("keeps the shell and overlays full-height for floating hardware-keyboard controls", () => {
     const { result } = renderHook(useKeyboardLayout);
     changeKeyboard(685, 834);
@@ -69,6 +82,17 @@ describe("iOS keyboard layout", () => {
     changeKeyboard(464, 834);
     expect(shellHeight()).toBe("834px");
     expect(result.current).toBe(0);
+  });
+
+  it("keeps native height when WebKit briefly shrinks innerHeight for the toolbar", () => {
+    const { result } = renderHook(useKeyboardLayout);
+    vi.stubGlobal("innerHeight", 766);
+    changeKeyboard(766, 834);
+    expect(shellHeight()).toBe("834px");
+    expect(result.current).toBe(0);
+    vi.stubGlobal("innerHeight", 834);
+    changeKeyboard(765.5, 834);
+    expect(shellHeight()).toBe("834px");
   });
 
   it("accepts fractional native dimensions without expanding the document", () => {
@@ -107,7 +131,7 @@ describe("iOS keyboard layout", () => {
     null,
     { width: 1210, height: NaN },
     { width: 1210, height: -1 },
-    { width: 1210, height: 900 },
+    { width: NaN, height: 834 },
   ])("falls back until native geometry is valid: %j", (value) => {
     nativeViewport = value;
     viewport.height = 464;
