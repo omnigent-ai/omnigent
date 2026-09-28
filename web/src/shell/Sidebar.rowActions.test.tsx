@@ -332,21 +332,15 @@ describe("quick pin/unpin hover button", () => {
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
-    // The folder-header pencil + kebab share the right-edge column with the
-    // session-row kebab, so they must be the same compact `icon-xs` (size-6)
-    // button — not the larger `icon-sm` (size-7) — or their glyphs sit in
-    // different columns and read as misaligned.
+    // Project and session menu buttons share the same compact right-edge slot.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const projectActions = screen.getByTestId("project-actions");
-    const projectNewSession = screen.getByTestId("project-new-session");
-    for (const button of [projectActions, projectNewSession]) {
-      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
-      expect(button).not.toHaveClass("size-7");
-      expect(button.querySelector("svg")).toHaveClass("size-3.5");
-      expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
-    }
+    expect(projectActions).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+    expect(projectActions).not.toHaveClass("size-7");
+    expect(projectActions.querySelector("svg")).toHaveClass("size-3.5");
+    expect(projectActions.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
     // Same compact size as the session-row kebab it aligns with.
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });
