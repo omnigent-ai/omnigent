@@ -99,6 +99,10 @@ async def _drive(base_url: str, browser_name: str) -> None:
                 await expect(breadcrumbs).to_have_text(label)
                 await expect(path_input).to_have_value(path)
 
+            await breadcrumbs.get_by_role("button", name="projects", exact=True).click()
+            await expect(breadcrumbs).to_have_text("alice/projects")
+            await expect(path_input).to_have_value(f"{_HOME}/projects")
+
             await page.get_by_test_id("workspace-picker-home").click()
             await expect(breadcrumbs).to_have_text("alice")
             await expect(path_input).to_have_value(_HOME)

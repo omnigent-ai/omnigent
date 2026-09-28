@@ -699,6 +699,26 @@ describe("WorkspacePicker breadcrumbs", () => {
     expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue(path);
   });
 
+  it("navigates through intermediate breadcrumbs and selects their canonical paths", () => {
+    const onNavigate = vi.fn();
+    const onSelect = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/var/log"
+        onNavigate={onNavigate}
+        onSelect={onSelect}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "var" }));
+    expect(onNavigate).toHaveBeenLastCalledWith("/var");
+    expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toBe("/var");
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/var");
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(onSelect).toHaveBeenLastCalledWith("/var");
+  });
+
   it("keeps the root breadcrumb navigable and selects canonical paths", () => {
     const onNavigate = vi.fn();
     const onSelect = vi.fn();
