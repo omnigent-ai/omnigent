@@ -687,7 +687,9 @@ class SlackOmnigentService:
             await self._mark_turn_inflight(turn.key, True)
 
             try:
-                errored = await self._stream_turn(turn, omnigent, session_id, reply)
+                errored = await self._stream_turn(
+                    turn, omnigent, session_id, reply, text=text, attachments=attachments
+                )
             except _TurnAborted:
                 # A known mid-stream error already delivered its message and stopped
                 # the reply; nothing left to finalize.

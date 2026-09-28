@@ -3,8 +3,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import omnigent_slack.service as service_module
 import pytest
+import respx
 from omnigent_slack.approvals import Verdict, parse_action_value
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
@@ -147,6 +149,9 @@ class FakeStream:
 
 class FakeSlackClient:
     def __init__(self) -> None:
+        # The bot token the CDN attachment fetch authorizes with (the real
+        # Bolt AsyncClient carries it; the fake mirrors it for relay tests).
+        self.token: str | None = "xoxb-test"
         # Live (not-yet-deleted) posts. The immediate "Working on it…" ack is
         # posted then deleted, so it lands here transiently and is removed by
         # chat_delete — leaving posts to reflect only durable replies.
@@ -236,6 +241,11 @@ class FakeSlackClient:
 class FakeOmnigentClient:
     def __init__(self, final_text: str = "hello final") -> None:
         self.created: list[tuple[str, str]] = []
+        # Inbound-attachment relay recording: (session, filename, content_type,
+        # data) per upload, and per-turn (text, attachments) with attachments
+        # forwarded through run_turn.
+        self.uploads: list[tuple[str, str, str | None, bytes]] = []
+        self.turn_attachments: list[list[dict[str, Any]] | None] = []
         # host_type each create_session / run_turn was asked for, so a test can
         # prove a managed session never reaches the runner-launch path.
         self.created_host_types: list[str] = []
@@ -298,6 +308,17 @@ class FakeOmnigentClient:
     async def delete_session(self, session_id: str) -> None:
         self.deleted.append(session_id)
 
+    async def upload_session_file(
+        self,
+        session_id: str,
+        *,
+        filename: str,
+        content_type: str | None,
+        data: bytes,
+    ) -> dict[str, Any]:
+        self.uploads.append((session_id, filename, content_type, data))
+        return {"id": "file_1", "filename": filename}
+
     async def run_turn(
         self,
         session_id: str,
@@ -306,8 +327,10 @@ class FakeOmnigentClient:
         workspace: str | None = None,
         host_id: str | None = None,
         host_type: str = "external",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
+        self.turn_attachments.append(attachments)
         self.turn_host_types.append(host_type)
         yield {"type": "response.output_text.delta", "delta": "hel"}
         yield {"type": "response.output_text.delta", "delta": "lo"}
@@ -400,6 +423,8 @@ class FakeSetup:
             }
         )
         return True
+
+
 async def _store(tmp_path: Path) -> SQLiteStore:
     store = SQLiteStore(tmp_path / "store.sqlite3")
     await store.initialize()
@@ -3574,8 +3599,6 @@ async def _wait_for_turns(omnigent: FakeOmnigentClient, count: int = 1) -> None:
 
 
 @respx.mock
-
-
 async def test_dm_with_file_uploads_and_references_attachment(tmp_path: Path) -> None:
     # A DM carrying a file (and no text): the file is downloaded from Slack's
     # CDN with the bot token, uploaded to the session, and referenced as an
@@ -3623,8 +3646,6 @@ async def test_dm_with_file_uploads_and_references_attachment(tmp_path: Path) ->
 
 
 @respx.mock
-
-
 async def test_dm_attachment_failure_becomes_visible_note(tmp_path: Path) -> None:
     # One relayable file plus one with no download URL: the turn still runs,
     # and the failed name is surfaced in the submitted text instead of being

@@ -7,11 +7,12 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
+mlflow-skinny = "2026-09-05T00:00:00Z"
 cwsandbox = "2026-06-12T00:00:00Z"
 google-antigravity = "2026-06-12T00:00:00Z"
-cryptography = "2026-06-26T00:00:00Z"
+mlflow = "2026-09-05T00:00:00Z"
 nimble-python = "2026-07-29T00:00:00Z"
-pydantic-settings = "2026-06-26T00:00:00Z"
+mlflow-tracing = "2026-09-05T00:00:00Z"
 
 [[package]]
 name = "aiohappyeyeballs"
@@ -555,7 +556,7 @@ wheels = [
 
 [[package]]
 name = "omnigent-slack"
-version = "0.12.0.dev0"
+version = "0.16.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

@@ -1683,7 +1683,7 @@ async def test_run_turn_does_not_retry_a_refused_first_connection() -> None:
     assert submit.call_count == 0
 
 
-
+@respx.mock
 async def test_client_upload_session_file_posts_multipart() -> None:
     upload = respx.post("http://omnigent.test/v1/sessions/conv_1/resources/files").mock(
         return_value=httpx.Response(201, json={"id": "file_1", "filename": "shot.png"})
@@ -1707,8 +1707,6 @@ async def test_client_upload_session_file_posts_multipart() -> None:
 
 
 @respx.mock
-
-
 async def test_client_submit_message_appends_attachment_blocks() -> None:
     submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(200, json={})
