@@ -558,6 +558,54 @@ def _build_alembic_config(db_uri: str) -> Config:
     return config
 
 
+_MIGRATION_QUERY_NAME = "omnigent.database.run_migrations"
+_MIGRATION_MAX_RETRIES = 5
+
+
+def _replay_crdb_restart_retries(
+    dialect_name: str,
+    operation: Callable[[], None],
+    *,
+    operation_name: str,
+    max_retries: int = _MIGRATION_MAX_RETRIES,
+    sleep: Callable[[float], None] = time.sleep,
+    random_value: Callable[[], float] = random.random,
+) -> None:
+    """Replay a migration CockroachDB asked the client to restart.
+
+    Only CockroachDB's 40001 is replayed; every other failure means the
+    migration itself is wrong and must surface on its first error. Backoff
+    matches :func:`run_write_transaction` so both paths shed contention the
+    same way.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            operation()
+            return
+        except DBAPIError as exc:
+            if not (is_cockroachdb(dialect_name) and _is_serialization_failure(exc)):
+                raise
+            if attempt == max_retries:
+                record_transaction_retry(operation_name, "exhausted")
+                _logger.error(
+                    "Database migration retries exhausted",
+                    extra={"db_operation": operation_name, "retry_count": attempt},
+                )
+                raise
+            delay = min(0.025 * (2**attempt), 0.1) * random_value()
+            record_transaction_retry(operation_name, "scheduled")
+            _logger.warning(
+                "Retrying database migration after a concurrency conflict",
+                extra={
+                    "db_operation": operation_name,
+                    "retry_count": attempt + 1,
+                    "retry_delay_seconds": delay,
+                },
+            )
+            sleep(delay)
+    raise AssertionError("migration retry loop exited unexpectedly")
+
+
 def _run_migrations(engine: Engine, db_uri: str) -> None:
     """
     Bring the database schema up to head.
@@ -590,15 +638,16 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     _verify_db_revision_is_supported(db_uri, current, head)
 
     _logger.info("Running database migrations...")
-    config = _build_alembic_config(db_uri)
-    # Pass a shared connection so Alembic operates within the same engine.
-    # Most dialects let Alembic own transaction demarcation. CRDB needs an
-    # externally started SERIALIZABLE transaction for schema changes; on
-    # versions that provide it, autocommit_before_ddl is also enabled.
-    with query_name_scope("omnigent.database.run_migrations"):
-        crdb_version = (
-            _crdb_server_version(engine) if is_cockroachdb(engine.dialect.name) else None
-        )
+
+    def upgrade_once() -> None:
+        # Pass a shared connection so Alembic operates within the same engine.
+        # Most dialects let Alembic own transaction demarcation. CRDB needs an
+        # externally started SERIALIZABLE transaction for schema changes; on
+        # versions that provide it, autocommit_before_ddl is also enabled.
+        # A new config and connection per attempt: the failed transaction is dead
+        # server-side, and neither its session nor Alembic's revision state can
+        # be carried over.
+        config = _build_alembic_config(db_uri)
         with engine.connect() as connection:
             if crdb_version is not None:
                 _prepare_crdb_schema_transaction(connection, crdb_version)
@@ -616,6 +665,24 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
                 # it into the chain, create_all still creates missing tables.
                 for base in (OmnigentBase, ConversationBase):
                     base.metadata.create_all(bind=engine, checkfirst=True)
+
+    with query_name_scope(_MIGRATION_QUERY_NAME):
+        crdb_version = (
+            _crdb_server_version(engine) if is_cockroachdb(engine.dialect.name) else None
+        )
+        # Schema changes must run SERIALIZABLE (CRDB rejects DDL under READ
+        # COMMITTED), which is exactly the isolation CockroachDB refuses to
+        # retry for us: a migration that loses a conflict is reported as
+        # SQLSTATE 40001 and the client is expected to replay it. Replay the
+        # whole upgrade rather than a single step — Alembic writes each step's
+        # alembic_version bookmark before running it, so a rollback taken inside
+        # a step would discard that bookmark and leave the next
+        # ``UPDATE ... WHERE version_num = <bookmark>`` matching no rows.
+        _replay_crdb_restart_retries(
+            engine.dialect.name,
+            upgrade_once,
+            operation_name=f"{_MIGRATION_QUERY_NAME}.upgrade",
+        )
 
 
 def run_migrations_with_retry(
