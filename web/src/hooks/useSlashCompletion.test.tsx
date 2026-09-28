@@ -564,15 +564,20 @@ describe("inline skill completion", () => {
     expect(view.result.current.open).toBe(true);
   });
 
-  it("allows sending after dismissing an inline loading menu", () => {
+  it("keeps inline loading suggestions from blocking explicit submission", () => {
     const { view, clearText } = setup({
       text: "please /rev",
       commands: {},
       skills: {},
       status: "loading",
     });
-    expect(view.result.current.pendingCompletion).toBe(true);
+    expect(view.result.current.open).toBe(true);
+    expect(view.result.current.pendingCompletion).toBe(false);
+    expect(view.result.current.handleKey(keyEvent("Tab"), NO_PREFERENCE)).toBe(true);
+    expect(view.result.current.handleKey(keyEvent("Enter"), NO_PREFERENCE)).toBe(true);
+    expect(view.result.current.handleKey(keyEvent("Enter"), PREFER_SEND)).toBe(false);
     act(() => view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE));
+    expect(view.result.current.open).toBe(false);
     expect(view.result.current.pendingCompletion).toBe(false);
     expect(clearText).not.toHaveBeenCalled();
   });

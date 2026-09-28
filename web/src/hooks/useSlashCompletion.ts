@@ -71,7 +71,7 @@ export interface UseSlashCompletionResult {
   /** Highlighted row index, -1 when nothing is highlighted. */
   index: number;
   /**
-   * The caret follows a command token, discovery is in flight, and
+   * The draft is a lone command token, discovery is in flight, and
    * there is nothing to complete yet. Not gated on the menu being open —
    * submit blocking keys off it even while the composer is blurred.
    */
@@ -139,7 +139,7 @@ export function useSlashCompletion({
   const query = open ? baseQuery : "";
   const matches = open ? baseMatches : [];
   const pendingCompletion =
-    baseOpen && !isDismissed && status === "loading" && baseMatches.length === 0;
+    baseOpen && !inline && !isDismissed && status === "loading" && baseMatches.length === 0;
 
   const [index, setIndex] = useState(-1);
   // New queries select the first match; asynchronous arrivals retain the

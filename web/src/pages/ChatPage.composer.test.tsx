@@ -2882,14 +2882,19 @@ describe("Composer native skill menu", () => {
     },
   );
 
-  it("keeps quote and tail selection separate when their text matches", () => {
+  it("keeps quote and tail selection separate when their text matches", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     render(<Composer {...composerProps()} ref={ref} />);
     fireEvent.change(textarea(), { target: { value: "please /rev" } });
     act(() => ref.current?.appendReplyQuote("Quoted text"));
     fireEvent.change(textarea(), { target: { value: "please /rev" } });
     const before = screen.getByLabelText("Reply text before quote 1");
-    fireEvent.focus(before);
+    await userEvent.click(before);
+    fireEvent.select(before, { target: { selectionStart: 9, selectionEnd: 9 } });
+    fireEvent.keyDown(before, { key: "Tab" });
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+    expect(textarea()).toHaveValue("please /rev");
+    expect(before).toHaveValue("please /rev");
     fireEvent.change(before, { target: { value: "please /review" } });
     fireEvent.select(before, { target: { selectionStart: 9, selectionEnd: 9 } });
     expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
