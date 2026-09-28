@@ -2817,6 +2817,54 @@ describe("Composer native skill menu", () => {
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("$review focus on tests", undefined);
   });
 
+  it.each(["click", "Tab", "Enter"])(
+    "inserts an inline skill using %s without sending",
+    (method) => {
+      const props = composerProps({ isNativeWrapper: true });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "please /" } });
+      expect(screen.queryByTestId("slash-menu-item-help")).toBeNull();
+      expect(screen.getByTestId("slash-menu-item-review")).toHaveTextContent("$review");
+      if (method === "click") fireEvent.click(screen.getByTestId("slash-menu-item-review"));
+      else fireEvent.keyDown(textarea(), { key: method });
+      expect(textarea()).toHaveValue("please $review ");
+      expect(props.onSend).not.toHaveBeenCalled();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith("please $review", undefined);
+    },
+  );
+
+  it("completes at the caret and preserves the suffix", async () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev this change" } });
+    fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("please $review this change");
+    await waitFor(() => expect(textarea().selectionStart).toBe(15));
+  });
+
+  it.each([" then /rev", "\nkeep this", "\tkeep this"])(
+    "keeps completion at the caret before %j",
+    async (suffix) => {
+      render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+      fireEvent.change(textarea(), { target: { value: `please /rev${suffix}` } });
+      fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+      expect(textarea()).toHaveValue(`please $review${suffix}`);
+      expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+      await waitFor(() => expect(textarea().selectionStart).toBe(suffix.startsWith(" ") ? 15 : 14));
+      expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+    },
+  );
+
+  it("dismisses the inline menu without deleting the prompt", () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(textarea()).toHaveValue("please /rev");
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+  });
+
   it("keeps built-in commands slash-prefixed when opened with a dollar sign", () => {
     const props = composerProps({ isNativeWrapper: true });
     render(<Composer {...props} />);

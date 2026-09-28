@@ -3112,9 +3112,13 @@ function ComposerImpl(
    * All other commands execute immediately.
    */
   const applyMenuSelection = (cmd: string) => {
-    if (slashCommandsWithArgs.has(cmd)) {
-      // Fill in "cmd " and let the user type the argument.
-      setValue(cmd + " ");
+    if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
+      const completion = slashCompletion.complete(cmd);
+      setValue(completion.text);
+      requestAnimationFrame(() => {
+        textareaRef.current?.setSelectionRange(completion.caret, completion.caret);
+        if (textareaRef.current) slashCompletion.onSelectionChange(textareaRef.current);
+      });
       dirtyRef.current = true;
       textareaRef.current?.focus();
     } else {
@@ -3125,10 +3129,7 @@ function ComposerImpl(
     }
   };
 
-  // Slash-completion menu mechanics (shared useSlashCompletion): the menu
-  // opens while the focused draft is a lone command token with no
-  // attachments, and owns Escape, arrows, and Tab/Enter completion while
-  // open. What a selection does (fill vs execute) stays in the adapter.
+  // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
     commands: slashCommands,
@@ -3525,6 +3526,7 @@ function ComposerImpl(
   };
 
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
+    slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
@@ -3654,6 +3656,7 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           onChange: (e) => handleTextChange(null, e),
+          onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
           onFocus: (e) => {
             setInputFocused(true);
             handleTextFocus(null, e.currentTarget);
@@ -3745,7 +3748,7 @@ function ComposerImpl(
                   query={slashCompletion.query}
                   activeIndex={slashCompletion.index}
                   onSelect={applyMenuSelection}
-                  commands={slashCommands}
+                  commands={slashCompletion.commands}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
                 />

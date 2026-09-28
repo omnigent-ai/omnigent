@@ -415,3 +415,123 @@ describe("useSlashCompletion key fallthrough", () => {
     expect(view.result.current.handleKey(keyEvent("Backspace"), NO_PREFERENCE)).toBe(false);
   });
 });
+
+describe("inline skill completion", () => {
+  it.each(["please /rev", "please\n/rev", "please\t/rev"])("finds skills in %j", (text) => {
+    const { view } = setup({ text });
+    expect(view.result.current.open).toBe(true);
+    expect(view.result.current.query).toBe("rev");
+    expect(view.result.current.matches).toEqual(["/review-pr", "/cross-review"]);
+  });
+
+  it("shows only skills after text", () => {
+    const { view } = setup({ text: "please /" });
+    expect(view.result.current.matches).toEqual(["/review-pr", "/cross-review"]);
+    expect(view.result.current.commands).not.toHaveProperty("/compact");
+  });
+
+  it.each(["see https://example.com/rev", "see /tmp/rev", "see abc/rev", "please /rev\n"])(
+    "ignores paths, URLs, and finished tokens in %j",
+    (text) => {
+      expect(setup({ text }).view.result.current.open).toBe(false);
+    },
+  );
+
+  it("replaces the whole token at the caret while preserving surrounding text", () => {
+    const text = "please /rev old suffix";
+    const { view } = setup({ text });
+    const element = document.createElement("textarea");
+    element.value = text;
+    element.setSelectionRange(9, 9);
+    act(() => view.result.current.onSelectionChange(element));
+    expect(view.result.current.query).toBe("r");
+    act(() => {
+      expect(view.result.current.complete("/review-pr")).toEqual({
+        text: "please /review-pr old suffix",
+        caret: 18,
+      });
+    });
+    element.setSelectionRange(7, 11);
+    act(() => view.result.current.onSelectionChange(element));
+    expect(view.result.current.open).toBe(false);
+  });
+
+  it.each(["please /rev", "please $rev"])("uses the native skill prefix in %j", (text) => {
+    const { view } = setup({ text, prefix: "$", commands: { $review: "Review" } });
+    expect(view.result.current.matches).toEqual(["$review"]);
+    act(() => {
+      expect(view.result.current.complete("$review").text).toBe("please $review ");
+    });
+  });
+
+  it.each(["\n", "\t"])("keeps the caret before an existing %j separator", (separator) => {
+    const text = `please /rev${separator}keep this`;
+    const { view, props } = setup({ text });
+    const element = document.createElement("textarea");
+    element.value = text;
+    element.setSelectionRange(11, 11);
+    act(() => view.result.current.onSelectionChange(element));
+    let completion!: ReturnType<typeof view.result.current.complete>;
+    act(() => {
+      completion = view.result.current.complete("/review-pr");
+    });
+    expect(completion).toEqual({ text: `please /review-pr${separator}keep this`, caret: 17 });
+    view.rerender({ ...props, text: completion.text });
+    expect(view.result.current.open).toBe(false);
+  });
+
+  it("keeps the completed caret when a later token also matches skills", () => {
+    const text = "please /rev then /cross";
+    const { view, props } = setup({ text });
+    const element = document.createElement("textarea");
+    element.value = text;
+    element.setSelectionRange(11, 11);
+    act(() => view.result.current.onSelectionChange(element));
+    let completion!: ReturnType<typeof view.result.current.complete>;
+    act(() => {
+      completion = view.result.current.complete("/review-pr");
+    });
+    view.rerender({ ...props, text: completion.text });
+    expect(view.result.current.open).toBe(false);
+    expect(view.result.current.handleKey(keyEvent("Tab"), NO_PREFERENCE)).toBe(false);
+  });
+
+  it.each(["/review.md", "/review/file", "/review-pr.tsx"])(
+    "does not complete inside the path %s",
+    (path) => {
+      const text = `please ${path}`;
+      const { view } = setup({ text });
+      const element = document.createElement("textarea");
+      element.value = text;
+      element.setSelectionRange(11, 11);
+      act(() => view.result.current.onSelectionChange(element));
+      expect(view.result.current.open).toBe(false);
+    },
+  );
+
+  it("reopens a previously dismissed query after editing away and back", () => {
+    const { view, props } = setup({ text: "please /rev" });
+    act(() => view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE));
+    view.rerender({ ...props, text: "please /re" });
+    expect(view.result.current.open).toBe(true);
+    view.rerender({ ...props, text: "please /rev" });
+    expect(view.result.current.open).toBe(true);
+  });
+
+  it("allows sending after dismissing an inline loading menu", () => {
+    const { view, clearText } = setup({ text: "please /rev", commands: {}, status: "loading" });
+    expect(view.result.current.pendingCompletion).toBe(true);
+    act(() => view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE));
+    expect(view.result.current.pendingCompletion).toBe(false);
+    expect(clearText).not.toHaveBeenCalled();
+  });
+
+  it("dismisses inline suggestions without clearing text and reopens after editing", () => {
+    const { view, props, clearText } = setup({ text: "please /rev" });
+    act(() => view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE));
+    expect(clearText).not.toHaveBeenCalled();
+    expect(view.result.current.open).toBe(false);
+    view.rerender({ ...props, text: "please /revi" });
+    expect(view.result.current.open).toBe(true);
+  });
+});
