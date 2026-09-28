@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from omnigent.onboarding.harness_install import ZCODE_KEY, harness_cli_installed
+from omnigent.onboarding.harness_install import ZCODE_KEY
 
 
 def zcode_data_base_dir() -> Path:
@@ -27,6 +27,16 @@ def zcode_data_base_dir() -> Path:
 def zcode_credentials_path() -> Path:
     """Path of the encrypted credential file. The file is not opened."""
     return zcode_data_base_dir() / ".zcode" / "v2" / "credentials.json"
+
+
+def zcode_cli_installed() -> bool:
+    """Whether ``harness.zcode.command`` (default ``zcode``) resolves to a binary."""
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.harness_startup_config import resolve_harness_command
+    from omnigent.onboarding.provider_config import load_config
+
+    command = resolve_harness_command(ZCODE_KEY, default=ZCODE_KEY, cfg=load_config())
+    return resolve_cli_binary(command) is not None
 
 
 def zcode_login_configured() -> bool:
@@ -62,6 +72,6 @@ class ZCodeAuthSummary:
 def zcode_auth_summary() -> ZCodeAuthSummary:
     """Report install and credential presence without reading the credential file."""
     return ZCodeAuthSummary(
-        installed=harness_cli_installed(ZCODE_KEY),
+        installed=zcode_cli_installed(),
         signed_in=zcode_login_configured(),
     )

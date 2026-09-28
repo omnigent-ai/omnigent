@@ -645,6 +645,7 @@ def test_zcode_readiness_honors_configured_command(
     monkeypatch.setattr(zcode_auth, "zcode_login_configured", lambda: True)
 
     assert harness_is_configured("zcode") is True
+    assert zcode_auth.zcode_auth_summary().ready is True
 
 
 def test_configured_harness_map_probes_codex_readiness_once(

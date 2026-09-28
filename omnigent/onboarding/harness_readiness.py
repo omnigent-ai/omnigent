@@ -886,18 +886,10 @@ def _zcode_availability() -> HarnessAvailability:
     historical bare ``False``. A CLI without ``credentials.json`` is also not
     launchable.
     """
-    from omnigent._platform import resolve_cli_binary
-    from omnigent.harness_startup_config import resolve_harness_command
-    from omnigent.onboarding.provider_config import load_config
+    from omnigent.onboarding.zcode_auth import zcode_cli_installed, zcode_login_configured
 
-    command = resolve_harness_command(
-        ZCODE_KEY,
-        default=ZCODE_KEY,
-        cfg=load_config(),
-    )
-    if resolve_cli_binary(command) is None:
+    if not zcode_cli_installed():
         return False
-    from omnigent.onboarding.zcode_auth import zcode_login_configured
 
     return zcode_login_configured()
 
