@@ -667,6 +667,63 @@ describe("WorkspacePicker listing filter", () => {
   });
 });
 
+describe("WorkspacePicker breadcrumbs", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockImplementation((_hostId, path) =>
+      result({
+        data: {
+          entries: path === "" ? [dir("projects", "/Users/corey/projects")] : [],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it.each([
+    ["/", "/"],
+    ["/Users", "/Users"],
+    ["/var/log", "/var/log"],
+    ["/Users/corey", "corey"],
+    ["/Users/corey/projects/app", "corey/projects/app"],
+  ])("renders %s without duplicating the root separator", (path, expected) => {
+    render(<WorkspacePicker hostId="host_1" initialPath={path} />);
+
+    expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toBe(expected);
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue(path);
+  });
+
+  it("keeps the root breadcrumb navigable and selects canonical paths", () => {
+    const onNavigate = vi.fn();
+    const onSelect = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users"
+        onNavigate={onNavigate}
+        onSelect={onSelect}
+      />,
+    );
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/Users");
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(onSelect).toHaveBeenLastCalledWith("/Users");
+
+    fireEvent.click(screen.getByTestId("workspace-picker-home"));
+    expect(onNavigate).toHaveBeenLastCalledWith("/");
+    expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toBe("/");
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/");
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(onSelect).toHaveBeenLastCalledWith("/");
+  });
+});
+
 describe("WorkspacePicker modal actions", () => {
   beforeEach(() => {
     useHostFilesystemMock.mockReset();
