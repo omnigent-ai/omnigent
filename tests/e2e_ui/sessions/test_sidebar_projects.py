@@ -268,6 +268,42 @@ def test_project_header_action_is_clickable_on_touch_tablet(
         context.close()
 
 
+def test_project_menu_is_keyboard_accessible_on_desktop(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Tab reveals the desktop menu and Enter opens a project-scoped session."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size({"width": 1280, "height": 800})
+    project = f"Keyboard project {uuid.uuid4().hex[:6]}"
+    page.goto(f"{base_url}/c/{session_id}")
+    _move_to_new_project(page, _row(page, session_id), project)
+    page.reload()
+    page.mouse.move(1279, 0)
+    assert page.evaluate("matchMedia('(hover: hover) and (pointer: fine)').matches")
+
+    header = page.get_by_role("button", name=project, exact=True)
+    kebab = page.get_by_role("button", name=f"Project actions for {project}")
+    actions = kebab.locator("xpath=..")
+    expect(actions).to_have_css("opacity", "0")
+    header.hover()
+    expect(actions).to_have_css("opacity", "1")
+    page.mouse.move(1279, 0)
+    expect(actions).to_have_css("opacity", "0")
+
+    # Start at the folder, then use the browser's real Tab order to reach ⋯.
+    header.focus()
+    page.keyboard.press("Tab")
+    expect(kebab).to_be_focused()
+    expect(actions).to_have_css("opacity", "1")
+    expect(page.get_by_test_id("project-new-session")).to_have_count(0)
+    page.keyboard.press("Enter")
+    new_session = page.get_by_test_id("project-new-session-menu")
+    expect(new_session).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(page).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
+
+
 @pytest.mark.parametrize(
     "viewport,has_touch",
     [
