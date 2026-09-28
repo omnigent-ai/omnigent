@@ -46,8 +46,9 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Any, Literal
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -201,6 +202,30 @@ _HARNESS_FAMILY: dict[str, str] = {
     "native-antigravity": GEMINI_FAMILY,
     "agy-native": GEMINI_FAMILY,
     "native-agy": GEMINI_FAMILY,
+    # OpenCode routes generic-provider traffic over the OpenAI-compatible
+    # wire (the opencode-native bridge synthesizes an
+    # ``@ai-sdk/openai-compatible`` provider per spawn), and its CLI takes
+    # a per-spawn ``-m provider/model`` override — same shape as antigravity
+    # above, so it consumes the ``openai`` family for resolution.
+    "opencode": OPENAI_FAMILY,
+    "opencode-native": OPENAI_FAMILY,
+    "native-opencode": OPENAI_FAMILY,
+    # Hermes Agent accepts per-spawn ``--provider`` / ``--model`` /
+    # ``--reasoning`` flags and its default profile points at an
+    # OpenAI-compatible endpoint (``api_mode: chat_completions``), so it
+    # consumes the ``openai`` family for resolution.
+    "hermes": OPENAI_FAMILY,
+    "hermes-native": OPENAI_FAMILY,
+    "native-hermes": OPENAI_FAMILY,
+    # prime-agent accepts per-spawn ``--provider`` / ``--model`` /
+    # ``--thinking`` flags (plus ACP mode) and its default provider is an
+    # OpenAI-compatible router, so it consumes the ``openai`` family.
+    "prime-agent": OPENAI_FAMILY,
+    "prime-agent-native": OPENAI_FAMILY,
+    "native-prime-agent": OPENAI_FAMILY,
+    # NB: ``feynman`` is intentionally absent. It is a Pi-based shell, so
+    # like ``pi`` it consumes both families and resolution falls back to
+    # whichever family the active provider configures.
 }
 
 # Executor-type spellings that ``AgentSpec.harness_kind`` returns for SDK
@@ -580,6 +605,26 @@ def resolve_secret(ref: str) -> str:
     expanded = expand_envvars_with_omnigent_prefix(ref)
     check_unresolved_env_vars(ref, expanded)
     return expanded
+
+
+def credential_for_block(block: Mapping[str, Any]) -> str | None:
+    """Resolve the key material a family block configures, for outbound use.
+
+    Shared by the runtime turn path and the host config control-plane probe
+    so both honor identical ``api_key_ref`` / inline ``api_key`` semantics.
+
+    :param block: One family block (the ``openai:`` / ``anthropic:`` /
+        ``gemini:`` mapping of a provider entry).
+    :returns: The resolved credential, or ``None`` when the block carries
+        no key material (an ``auth_command`` or keyless local endpoint).
+    """
+    ref = block.get("api_key_ref")
+    if isinstance(ref, str):
+        return resolve_secret(ref)
+    inline = block.get("api_key")
+    if isinstance(inline, str):
+        return resolve_secret(inline)
+    return None
 
 
 def _config_path() -> str:
