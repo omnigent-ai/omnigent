@@ -1,19 +1,8 @@
-"""task_v3 routing over catalogs keyed by native harness ids.
+"""Harness-name round trips through the production client and a loopback router.
 
-The Databricks AI Gateway ``task_v3`` router validates
-``route_options[].harness`` against its canonical harness names (``codex`` /
-``claude``) and rejects a request offering anything else with a 400, so a
-client that sends Omnigent harness ids (``codex-native`` / ``claude-native``)
-never routes. :class:`~omnigent.server.smart_routing.ExternalRoutingClient`
-must translate the ids into that vocabulary.
-
-The real :meth:`~omnigent.server.smart_routing.ExternalRoutingClient.route`
-call is driven over a real socket against an in-process ``routes:select``
-service that mirrors the documented ``task_v3`` harness validation and the
-``task_v1`` passthrough (harness echoed, never read). The live Databricks AI
-Gateway is a Databricks-network service this CI cannot reach, so that service
-stands in for it; the harness ids Omnigent puts on the wire are real product
-output.
+The stand-in requires canonical harness names for task_v3 and echoes task_v1
+tags unchanged. These tests cover HTTP serialization and local selection
+resolution; they do not start a harness or call the live Databricks gateway.
 """
 
 from __future__ import annotations
@@ -36,7 +25,6 @@ _TASK_V3_REJECT_MESSAGE = (
 )
 
 _PROMPT = "rename a variable in one file"
-_CODEX_CATALOG = {"codex-native": ["system.ai.glm-5-3", "system.ai.kimi-k3"]}
 
 
 def _handler_class(recorded: list[dict[str, Any]]) -> type[BaseHTTPRequestHandler]:
@@ -59,6 +47,11 @@ def _handler_class(recorded: list[dict[str, Any]]) -> type[BaseHTTPRequestHandle
             body = json.loads(self.rfile.read(length).decode())
             recorded.append(body)
             options = body.get("route_options") or []
+            if not options:
+                self._reply(
+                    400, {"error_code": "BAD_REQUEST", "message": "route_options is empty"}
+                )
+                return
             router_name = (body.get("route_selector") or {}).get("router_name")
             harnesses = {str(o.get("harness") or "") for o in options}
             # task_v3 validates the harness tag; task_v1 (and older) treat it as
@@ -104,51 +97,96 @@ def task_v3_router() -> Iterator[tuple[str, list[dict[str, Any]]]]:
         thread.join(timeout=5)
 
 
-async def test_task_v3_routes_a_native_harness_catalog(
+@pytest.mark.parametrize("router_name", ["task_v3", "task_v1"])
+@pytest.mark.parametrize(
+    ("harness", "model", "wire_harness"),
+    [
+        ("codex-native", "glm-5-3", "codex"),
+        ("codex", "kimi-k3", "codex"),
+        ("claude-native", "claude-sonnet-5", "claude"),
+        ("claude-sdk", "claude-opus-4-8", "claude"),
+        ("claude_sdk", "claude-sonnet-5", "claude"),
+        ("openai-agents", "gpt-5-4", "codex"),
+        ("openai-agents-sdk", "gpt-5-4", "codex"),
+        ("agents_sdk", "gpt-5-4", "codex"),
+    ],
+)
+async def test_routes_back_to_the_offered_harness(
     task_v3_router: tuple[str, list[dict[str, Any]]],
+    router_name: str,
+    harness: str,
+    model: str,
+    wire_harness: str,
 ) -> None:
-    """A codex-native catalog goes out as harness ``codex`` and routes."""
+    """Canonical wire tags resolve back to native, SDK, and aliased harness ids."""
     from omnigent.server.smart_routing import ExternalRoutingClient
 
     base_url, recorded = task_v3_router
-    client = ExternalRoutingClient(base_url=base_url, router_name="task_v3")
+    client = ExternalRoutingClient(base_url=base_url, router_name=router_name)
+    catalog_model = f"system.ai.{model}"
 
-    result = await client.route(_PROMPT, _CODEX_CATALOG)
-
-    sent_harnesses = {o["harness"] for o in recorded[-1]["route_options"]}
-    assert sent_harnesses == {"codex"}, (
-        f"route_options carried {sent_harnesses}; task_v3 only accepts {set(_TASK_V3_HARNESSES)}"
-    )
-    assert result is not None, f"task_v3 route() returned None: {client.last_error}"
-    assert result.raw_model in {"glm-5-3", "kimi-k3"}
-
-
-async def test_task_v3_accepts_canonical_harness(
-    task_v3_router: tuple[str, list[dict[str, Any]]],
-) -> None:
-    """A catalog already keyed by the canonical name routes unchanged."""
-    from omnigent.server.smart_routing import ExternalRoutingClient
-
-    base_url, _ = task_v3_router
-    client = ExternalRoutingClient(base_url=base_url, router_name="task_v3")
-
-    result = await client.route(_PROMPT, {"codex": ["system.ai.glm-5-3", "system.ai.kimi-k3"]})
+    result = await client.route(_PROMPT, {harness: [catalog_model]})
 
     assert result is not None, client.last_error
-    assert result.model == "system.ai.glm-5-3"
+    sent_harnesses = {o["harness"] for o in recorded[-1]["route_options"]}
+    assert sent_harnesses == {wire_harness}
+    assert (result.harness, result.model, result.raw_model) == (harness, catalog_model, model)
 
 
-async def test_task_v1_routes_the_same_native_catalog(
+@pytest.mark.parametrize("router_name", ["task_v3", "task_v1"])
+@pytest.mark.parametrize("first_harness", ["claude-native", "codex-native"])
+async def test_mixed_native_catalog_resolves_both_families(
     task_v3_router: tuple[str, list[dict[str, Any]]],
+    router_name: str,
+    first_harness: str,
 ) -> None:
-    """task_v1 never reads the tag, so the canonical name routes there too."""
+    """Both canonical tags may occur in one request without leaking into the result."""
     from omnigent.server.smart_routing import ExternalRoutingClient
 
     base_url, recorded = task_v3_router
-    client = ExternalRoutingClient(base_url=base_url, router_name="task_v1")
+    client = ExternalRoutingClient(base_url=base_url, router_name=router_name)
+    models = {"claude-native": "claude-sonnet-5", "codex-native": "kimi-k3"}
+    # The stand-in picks the first option; exercise a selection from each family.
+    harnesses = [first_harness, *(h for h in models if h != first_harness)]
+    catalog = {h: [f"system.ai.{models[h]}"] for h in harnesses}
 
-    result = await client.route(_PROMPT, _CODEX_CATALOG)
+    result = await client.route(_PROMPT, catalog)
 
-    sent_harnesses = {o["harness"] for o in recorded[-1]["route_options"]}
-    assert sent_harnesses == {"codex"}
     assert result is not None, client.last_error
+    wire_options = {o["model"]: o["harness"] for o in recorded[-1]["route_options"]}
+    assert wire_options["claude-sonnet-5"] == "claude"
+    assert wire_options["kimi-k3"] == "codex"
+    assert result.harness == first_harness
+    assert result.model == catalog[first_harness][0]
+    assert result.raw_model == models[first_harness]
+
+
+@pytest.mark.parametrize("router_name", ["task_v3", "task_v1"])
+@pytest.mark.parametrize("first_model", ["claude-sonnet-5", "gpt-5-4", "glm-5-3", "kimi-k3"])
+async def test_pi_mixed_catalog_keeps_pi_after_canonicalization(
+    task_v3_router: tuple[str, list[dict[str, Any]]],
+    router_name: str,
+    first_model: str,
+) -> None:
+    """Pi's wire tag follows each model's family while its local harness stays pi."""
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    base_url, recorded = task_v3_router
+    client = ExternalRoutingClient(base_url=base_url, router_name=router_name)
+    expected_tags = {
+        "claude-sonnet-5": "claude",
+        "gpt-5-4": "codex",
+        "glm-5-3": "codex",
+        "kimi-k3": "codex",
+    }
+    models = [first_model, *(m for m in expected_tags if m != first_model)]
+    catalog = {"pi": [f"system.ai.{m}" for m in models]}
+
+    result = await client.route(_PROMPT, catalog)
+
+    assert result is not None, client.last_error
+    wire_options = {o["model"]: o["harness"] for o in recorded[-1]["route_options"]}
+    assert {model: wire_options[model] for model in expected_tags} == expected_tags
+    assert result.harness == "pi"
+    assert result.model == f"system.ai.{first_model}"
+    assert result.raw_model == first_model

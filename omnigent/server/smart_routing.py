@@ -1112,10 +1112,7 @@ class ResolvedRoute:
 # outright — only used when no single-vendor harness fits.
 _MULTI_MODEL_FAMILY = "pi"
 
-# The router's own harness vocabulary, keyed by harness family. task_v3
-# validates ``route_options[].harness`` against these canonical names and 400s
-# a request offering anything else; earlier routers echo the tag unread, so the
-# canonical name is safe to send to every router.
+# Canonical harness names required by routers such as task_v3.
 _ROUTER_HARNESS_BY_FAMILY: dict[str, str] = {"claude": "claude", "gpt": "codex"}
 
 # (harness, model) pairs the harness's own gateway 400s on: under pi, Claude
@@ -1433,13 +1430,9 @@ class TaskV1RouteOptionSource:
     ) -> ResolvedRoute | None:
         """Translate *pick* into a servable (harness, model) pair.
 
-        :param pick: The router's selection as received; its ``harness`` is
-            ignored because the echo is router vocabulary (``codex`` /
-            ``claude``), not a servable Omnigent harness id — the harness
-            derives from the picked arm's family instead. An id that already
-            carries a catalog prefix is mapped
-            back to router vocabulary first, so re-resolving an id this seam
-            already resolved is a no-op rather than a miss.
+        :param pick: The router's selection. Its harness tag is ignored; the
+            local harness is derived from the model and catalog. Prefixed model
+            ids are normalized first so resolving an id twice is a no-op.
         :param harnesses: Harnesses the decision may land on.
         :param catalog: Harness → servable model ids.
         :returns: A :class:`ResolvedRoute`, or ``None`` when the pick was
@@ -1525,12 +1518,9 @@ class TaskV1RouteOptionSource:
         return "both"
 
     def _router_harness(self, harness: str | None, model: str) -> str | None:
-        """Translate an Omnigent harness id into the router's harness vocabulary.
+        """Map a harness to its canonical router name, using the model's family for pi.
 
-        task_v3 validates ``route_options[].harness`` against the canonical
-        family names (``codex`` / ``claude``) and rejects the whole request on
-        an Omnigent id like ``codex-native``. A multi-model harness is tagged
-        by the model's own family; a harness with no known family keeps its id.
+        Unknown families keep the original harness tag.
         """
         family = _HARNESS_FAMILY.get(harness or "")
         if family == _MULTI_MODEL_FAMILY:
@@ -1543,12 +1533,7 @@ class TaskV1RouteOptionSource:
         harnesses: Sequence[str],
         catalog: dict[str, list[str]],
     ) -> str | None:
-        """Pick the catalog harness that plausibly owns an injected arm.
-
-        A family match is enough — :meth:`_router_harness` canonicalizes the
-        tag before it reaches the wire — falling back to the first harness on
-        offer.
-        """
+        """Pick a harness by model family, falling back to the first one offered."""
         order = list(catalog) or list(harnesses)
         family = _model_family(arm)
         match = next((h for h in order if _HARNESS_FAMILY.get(h) == family), None)
