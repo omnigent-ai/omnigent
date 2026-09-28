@@ -34,6 +34,8 @@ afterEach(() => {
 
 it("surfaces the Browser tab only after the view accepts the link", async () => {
   expect(maybeOpenLinkInApp(CONV, URL_)).toBe(true);
+  // Model-authored links get the agent navigation policy (no internal hosts).
+  expect(openOrNavigate).toHaveBeenCalledWith(CONV, URL_, undefined, { agent: true });
   expect(surfaced).toEqual([]);
   await vi.waitFor(() => expect(surfaced).toEqual([CONV]));
   expect(window.open).not.toHaveBeenCalled();

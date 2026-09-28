@@ -55,7 +55,7 @@ function clickLink(href = LINK, init: MouseEventInit = {}): MouseEvent {
 
 it("routes an opted-in plain click into the conversation's browser view", () => {
   expect(clickLink().defaultPrevented).toBe(true);
-  expect(openOrNavigate).toHaveBeenCalledWith("conv-1", LINK);
+  expect(openOrNavigate).toHaveBeenCalledWith("conv-1", LINK, undefined, { agent: true });
 });
 
 it.each([

@@ -9,6 +9,8 @@ import { supportsBrowser } from "./nativeBridge";
 type OpenOrNavigate = (
   conversationId: string,
   url: string,
+  bounds: undefined,
+  opts: { agent: boolean },
 ) => Promise<{ ok: boolean; error?: string }>;
 
 const listeners = new Set<(conversationId: string) => void>();
@@ -25,7 +27,11 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
   ).omnigentDesktop;
   let error: string | undefined;
   try {
-    const result = await bridge.browserOpenOrNavigate(conversationId, url);
+    // Chat links are model-authored and the agent can read the view, so they get
+    // the agent's navigation policy (no loopback/private hosts, even via redirect).
+    const result = await bridge.browserOpenOrNavigate(conversationId, url, undefined, {
+      agent: true,
+    });
     if (result?.ok) {
       for (const listener of listeners) listener(conversationId);
       return;
