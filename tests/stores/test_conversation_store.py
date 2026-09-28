@@ -2368,15 +2368,6 @@ def test_list_conversations_search_snippet_uses_earliest_match(
     assert "second mention" not in snippet
 
 
-def _user_message(text: str) -> NewConversationItem:
-    """Build a user message item whose ``search_text`` is *text*."""
-    return NewConversationItem(
-        type="message",
-        response_id="resp_snippet",
-        data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
-    )
-
-
 @pytest.mark.parametrize(
     ("dialect", "uses_probe"),
     [("postgresql", True), ("cockroachdb", False), ("sqlite", False), ("mysql", False)],
