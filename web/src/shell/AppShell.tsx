@@ -884,30 +884,6 @@ export function AppShell() {
     resyncBrowserSuppression();
   }, []);
 
-  // Auto-surface the Browser tab on a `navigate` action — agent-issued
-  // (browser_navigate) or a chat link the user routed in-app — so the load
-  // never lands in a hidden pane. Browser-capable shells only; no-op
-  // elsewhere (neither source fires without the bridge).
-  useEffect(() => {
-    if (!supportsBrowser()) return;
-    const surfaceBrowserTab = (sourceConversationId: string) => {
-      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
-      if (sourceConversationId === conversationId) {
-        setRightRailTab("browser");
-        setRightPanelOpen(true);
-      }
-    };
-    const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
-    const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
-      if (evt.action !== "navigate" || !sourceConversationId) return;
-      surfaceBrowserTab(sourceConversationId);
-    });
-    return () => {
-      unsubscribeLink();
-      unsubscribeAction();
-    };
-  }, [conversationId]);
-
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
   // shell, not BrowserPane. On submit: build the `[Design Mode — …]` message,
@@ -1626,6 +1602,30 @@ export function AppShell() {
     },
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
+
+  // Auto-surface the Browser tab on a `navigate` action — agent-issued
+  // (browser_navigate) or a chat link the user routed in-app — so the load
+  // never lands in a hidden pane, even behind an open file or shell tab.
+  // Browser-capable shells only (neither source fires without the bridge).
+  useEffect(() => {
+    if (!supportsBrowser()) return;
+    const surfaceBrowserTab = (sourceConversationId: string) => {
+      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
+      if (sourceConversationId === conversationId) {
+        handleRightRailTabChange("browser");
+        setRightPanelOpen(true);
+      }
+    };
+    const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
+    const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
+      if (evt.action !== "navigate" || !sourceConversationId) return;
+      surfaceBrowserTab(sourceConversationId);
+    });
+    return () => {
+      unsubscribeLink();
+      unsubscribeAction();
+    };
+  }, [conversationId, handleRightRailTabChange]);
 
   // A side chat the user just opened must be visible: reveal the Workspace rail
   // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
