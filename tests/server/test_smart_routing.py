@@ -21,6 +21,7 @@ from omnigent.server.smart_routing import (
     _AUTO_ROUTING_HARNESSES,
     LLMRoutingClient,
     RoutingResult,
+    TaskV1RouteOptionSource,
     _build_rubric,
     fetch_runner_models,
     harness_bars_model,
@@ -2099,8 +2100,6 @@ def test_route_option_source_offers_only_the_catalog_for_another_router() -> Non
 
 def test_build_route_options_sends_canonical_harness_names() -> None:
     """Native/SDK harness ids go out as the router's codex/claude vocabulary."""
-    from omnigent.server.smart_routing import TaskV1RouteOptionSource
-
     source = TaskV1RouteOptionSource(router_name="task_v3")
     options = source.build_route_options(
         ["codex-native", "claude-native", "claude-sdk"],
@@ -2119,8 +2118,6 @@ def test_build_route_options_sends_canonical_harness_names() -> None:
 
 def test_injected_menu_arms_carry_canonical_harness_names() -> None:
     """Arms the task_v1 menu injects are tagged codex/claude, not native ids."""
-    from omnigent.server.smart_routing import TaskV1RouteOptionSource
-
     source = TaskV1RouteOptionSource()
     options = source.build_route_options(["codex-native"], {"codex-native": ["system.ai.glm-5-3"]})
     assert len(options) > 1, "the codex scenario menu should inject arms"
@@ -2129,8 +2126,6 @@ def test_injected_menu_arms_carry_canonical_harness_names() -> None:
 
 def test_pi_options_are_tagged_by_the_models_own_family() -> None:
     """The multi-model pi harness tags each option by its model's family."""
-    from omnigent.server.smart_routing import TaskV1RouteOptionSource
-
     source = TaskV1RouteOptionSource(router_name="task_v3")
     options = source.build_route_options(
         ["pi"], {"pi": ["databricks-claude-sonnet-5", "databricks-gpt-5-5"]}
@@ -2143,8 +2138,6 @@ def test_pi_options_are_tagged_by_the_models_own_family() -> None:
 
 def test_a_harness_with_no_known_family_keeps_its_tag() -> None:
     """A tag outside the family table passes through for routers that ignore it."""
-    from omnigent.server.smart_routing import TaskV1RouteOptionSource
-
     source = TaskV1RouteOptionSource(router_name="task_v3")
     options = source.build_route_options(["self"], {"self": ["acme-model"]})
     assert [o.harness for o in options] == ["self"]

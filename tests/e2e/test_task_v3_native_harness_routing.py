@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 
+from omnigent.server.smart_routing import ExternalRoutingClient
+
 # The two canonical harness names the gateway's task_v3 router accepts.
 # Anything else is rejected.
 _TASK_V3_HARNESSES = frozenset({"codex", "claude"})
@@ -119,8 +121,6 @@ async def test_routes_back_to_the_offered_harness(
     wire_harness: str,
 ) -> None:
     """Canonical wire tags resolve back to native, SDK, and aliased harness ids."""
-    from omnigent.server.smart_routing import ExternalRoutingClient
-
     base_url, recorded = task_v3_router
     client = ExternalRoutingClient(base_url=base_url, router_name=router_name)
     catalog_model = f"system.ai.{model}"
@@ -141,8 +141,6 @@ async def test_mixed_native_catalog_resolves_both_families(
     first_harness: str,
 ) -> None:
     """Both canonical tags may occur in one request without leaking into the result."""
-    from omnigent.server.smart_routing import ExternalRoutingClient
-
     base_url, recorded = task_v3_router
     client = ExternalRoutingClient(base_url=base_url, router_name=router_name)
     models = {"claude-native": "claude-sonnet-5", "codex-native": "kimi-k3"}
@@ -169,8 +167,6 @@ async def test_pi_mixed_catalog_keeps_pi_after_canonicalization(
     first_model: str,
 ) -> None:
     """Pi's wire tag follows each model's family while its local harness stays pi."""
-    from omnigent.server.smart_routing import ExternalRoutingClient
-
     base_url, recorded = task_v3_router
     client = ExternalRoutingClient(base_url=base_url, router_name=router_name)
     expected_tags = {
