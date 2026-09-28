@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import signal
 import socket
 import socketserver
@@ -66,7 +67,14 @@ from tests.e2e.conftest import (
 # the turn alive, so this proves the lease-based fix rather than a bigger grace.
 _BLACKOUT_S = 45.0
 _ANSWER = "RUNNER_RECONNECT_GRACE_E2E_COMPLETED"
-_FAILURE_SIGNATURE = "origin=runner_disconnected_mid_turn code=runner_disconnected"
+# Both server paths that fail a turn on a runner drop log through the same
+# "session turn failed" line: the relay give-up stamps
+# origin=runner_disconnected_mid_turn and the per-runner disconnect timer stamps
+# origin=runner_offline_sweep. Reject either, so a regression in one path cannot
+# hide behind the other.
+_FAILURE_SIGNATURE = re.compile(
+    r"session turn failed for \S+ \(origin=\S+ code=runner_disconnected"
+)
 _HEALTH_TIMEOUT_S = 90.0
 
 pytestmark = [pytest.mark.timeout(300, method="signal")]
@@ -153,7 +161,9 @@ class _TunnelIngressProxy:
             while chunk := source.recv(65536):
                 destination.sendall(chunk)
         except OSError:
-            pass
+            # Expected when begin_blackout() or teardown cuts a socket mid-pipe;
+            # the finally block closes both ends either way.
+            return
         finally:
             self._close_socket(source)
             self._close_socket(destination)
@@ -276,7 +286,7 @@ class _ReconnectStack:
             stderr=subprocess.STDOUT,
         )
         _poll_until(
-            lambda: self._server_healthy(),
+            self._server_healthy,
             timeout=_HEALTH_TIMEOUT_S,
             what="the real Omnigent server to become healthy",
         )
@@ -434,7 +444,7 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
     )
 
     server_log = stack.server_log.read_text()
-    assert _FAILURE_SIGNATURE not in server_log, (
+    assert _FAILURE_SIGNATURE.search(server_log) is None, (
         f"The server failed session {session_id} during a {_BLACKOUT_S:.0f}s transient "
         "runner-tunnel outage even though the same runner reconnected and the original "
         "turn completed. This reproduces the production false-fatal path.\n"
