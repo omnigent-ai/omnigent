@@ -251,6 +251,9 @@ class OpenCodeNativeBridgeState:
     :param status: Coarse status, ``"idle"`` or ``"busy"``.
     :param model_override: Persisted model override, e.g.
         ``"anthropic/claude-opus-4"``, or ``None``.
+    :param variant_override: Persisted model-variant override pinned
+        alongside :attr:`model_override` (sent as the top-level
+        ``variant`` prompt key), or ``None``.
     :param workspace: Workspace cwd the session runs in.
     :param last_event_id: Last SSE event id seen, for resume/debug.
     """
@@ -264,6 +267,7 @@ class OpenCodeNativeBridgeState:
     active_message_id: str | None = None
     status: str = "idle"
     model_override: str | None = None
+    variant_override: str | None = None
     workspace: str | None = None
     last_event_id: str | None = None
 
@@ -590,6 +594,7 @@ def write_bridge_state(bridge_dir: Path, state: OpenCodeNativeBridgeState) -> No
                     "active_message_id": state.active_message_id,
                     "status": state.status,
                     "model_override": state.model_override,
+                    "variant_override": state.variant_override,
                     "workspace": state.workspace,
                     "last_event_id": state.last_event_id,
                 },
@@ -666,6 +671,7 @@ def read_bridge_state(bridge_dir: Path) -> OpenCodeNativeBridgeState | None:
         active_message_id=_opt_str("active_message_id"),
         status=status if isinstance(status, str) and status else "idle",
         model_override=_opt_str("model_override"),
+        variant_override=_opt_str("variant_override"),
         workspace=_opt_str("workspace"),
         last_event_id=_opt_str("last_event_id"),
     )
@@ -729,8 +735,8 @@ def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
     value clears the override (fall back to opencode's own default).
 
     :param bridge_dir: Native OpenCode bridge directory.
-    :param model_override: New qualified model id (``provider/model``), or
-        ``None`` / blank to clear.
+    :param model_override: New qualified model id (``provider/model``,
+        optionally with a ``#variant`` suffix), or ``None`` / blank to clear.
     :returns: ``True`` when the state existed and was updated, ``False`` when
         no bridge state is present (server not launched yet).
     """
@@ -740,5 +746,28 @@ def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
     import dataclasses
 
     normalized = model_override.strip() if isinstance(model_override, str) else None
-    write_bridge_state(bridge_dir, dataclasses.replace(state, model_override=normalized or None))
+    # A variant pin belongs to the model it was pinned with, so replacing the
+    # model replaces (or clears) the variant with it.
+    variant: str | None = None
+    if normalized:
+        normalized, variant = split_model_variant(normalized)
+    write_bridge_state(
+        bridge_dir,
+        dataclasses.replace(state, model_override=normalized or None, variant_override=variant),
+    )
     return True
+
+
+def split_model_variant(model: str) -> tuple[str, str | None]:
+    """
+    Split a ``model#variant`` id into its base model id and variant.
+
+    :param model: A model id, e.g.
+        ``"opencode-go/muse-spark-1.3-contributor#xhigh"``.
+    :returns: ``(base_model, variant)``; ``variant`` is ``None`` when the id
+        carries no ``#`` suffix.
+    """
+    base, sep, variant = model.partition("#")
+    if not sep:
+        return model, None
+    return base, variant or None
