@@ -6416,6 +6416,24 @@ async def execute_tool(
         refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
         if refusal is not None:
             return json.dumps({"error": refusal})
+    from omnigent.sandbox.copy_on_write import has_copy_on_write
+
+    disposable = has_copy_on_write(getattr(agent_spec, "os_env", None)) or bool(
+        resource_registry is not None
+        and conversation_id is not None
+        and resource_registry.uses_copy_on_write(conversation_id)
+    )
+    if disposable and (
+        tool_name in _SKILL_TOOLS
+        or tool_name in {UploadFileTool.name(), "sys_agent_download", "sys_agent_list"}
+        or (tool_name == "sys_session_create" and args.get("config_path"))
+    ):
+        return json.dumps(
+            {
+                "error": f"{tool_name} does not yet support copy_on_write environments; "
+                "use sys_os_* tools and an inherited terminal for filesystem operations"
+            }
+        )
     try:
         if mcp_manager is not None:
             # All MCP tool calls are routed through the AP server's
@@ -6429,6 +6447,7 @@ async def execute_tool(
             output = await _execute_os_env_tool(
                 tool_name,
                 args,
+                resource_registry=resource_registry,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 runner_workspace=runner_workspace,
@@ -6990,6 +7009,7 @@ async def _execute_os_env_tool(
     conversation_id: str | None = None,
     runner_workspace: Path | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
 ) -> str:
     """
     Execute sys_os_* through a runner-local OSEnvironment.
@@ -7013,10 +7033,25 @@ async def _execute_os_env_tool(
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
 
     os_env = None
+    owns_environment = True
     try:
-        os_env = create_os_environment(
-            _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+        effective_spec = _effective_runner_os_env_spec(
+            agent_spec, conversation_id, runner_workspace
         )
+        needs_shared_environment = effective_spec.sandbox is not None and any(
+            p.copy_on_write for p in effective_spec.sandbox.write_path_specs
+        )
+        if needs_shared_environment:
+            if resource_registry is None or conversation_id is None:
+                raise ValueError("copy_on_write tools require a session resource registry")
+            from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+
+            os_env = resource_registry.resolve_environment(
+                conversation_id, DEFAULT_ENVIRONMENT_ID, agent_spec
+            )
+            owns_environment = False
+        else:
+            os_env = create_os_environment(effective_spec)
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 
@@ -7075,7 +7110,7 @@ async def _execute_os_env_tool(
         )
         return json.dumps({"error": str(exc)})
     finally:
-        if os_env is not None:
+        if os_env is not None and owns_environment:
             os_env.close()
 
     return json.dumps(result)

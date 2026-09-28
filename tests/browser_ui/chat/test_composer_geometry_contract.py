@@ -6,7 +6,7 @@ import re
 from itertools import pairwise
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.browser_ui.chat._geometry_helpers import (
     DESKTOP,
@@ -43,6 +43,13 @@ from tests.browser_ui.chat.session_contract import (
     message_item,
     model_option,
 )
+
+
+def _settle_menu(menu: Locator) -> None:
+    """Wait for a menu's open animation (and its rows') to finish before measuring."""
+    menu.evaluate(
+        "el => Promise.all(el.getAnimations({subtree: true}).map(a => a.finished.catch(() => {})))"
+    )
 
 
 def _surface(page: Page, chat: ChatSessionContract, name: str, viewport: dict[str, int]) -> None:
@@ -279,6 +286,9 @@ def test_wrapped_attachment_rows_keep_the_grid(
     if not workspace.is_visible():
         page.get_by_role("button", name="Expand right panel").click()
         expect(workspace).to_be_visible()
+    workspace.evaluate(
+        "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
+    )
     names = [
         "quarterly-planning-notes.txt",
         "customer-feedback-export.csv",
@@ -453,30 +463,45 @@ def test_picker_rows_follow_the_row_grid(
     if surface == "landing":
         page.get_by_test_id("new-chat-landing-agent-select").click()
         rows = page.locator(".composer-agent-menu .composer-agent-row")
-    else:
-        page.get_by_test_id("composer-config-gear").click()
-        rows = page.locator(".composer-agent-menu [role=menuitem]")
-    expect(rows.first).to_be_visible()
-    rows.locator("xpath=ancestor::*[contains(@class, 'composer-agent-menu')][1]").first.evaluate(
-        "el => Promise.all(el.getAnimations({subtree: true}).map(a => a.finished.catch(() => {})))"
-    )
-    values = [box(rows.nth(index)) for index in range(min(rows.count(), 3))]
-    assert len(values) >= 2
-    assert_row_grid(values)
-    if surface == "landing":
+        expect(rows.first).to_be_visible()
+        _settle_menu(page.locator(".composer-agent-menu").first)
+        values = [box(rows.nth(index)) for index in range(min(rows.count(), 3))]
+        assert len(values) >= 2
+        assert_row_grid(values)
         icons = [box(rows.nth(index).locator("img, svg").first) for index in range(2)]
         labels = [box(rows.nth(index).locator("span.truncate").first) for index in range(2)]
         summaries = [
             box(rows.nth(index).locator("[data-testid*='agent-summary-']")) for index in range(2)
         ]
         assert icons[0]["x"] == pytest.approx(icons[1]["x"], abs=TOLERANCE)
+        assert labels[0]["x"] == pytest.approx(labels[1]["x"], abs=TOLERANCE)
+        assert summaries[0]["x"] + summaries[0]["width"] == pytest.approx(
+            summaries[1]["x"] + summaries[1]["width"], abs=TOLERANCE
+        )
     else:
-        labels = [box(rows.nth(index).locator("span.flex-1").first) for index in range(2)]
-        summaries = [box(rows.nth(index).locator("span.text-right").first) for index in range(2)]
-    assert labels[0]["x"] == pytest.approx(labels[1]["x"], abs=TOLERANCE)
-    assert summaries[0]["x"] + summaries[0]["width"] == pytest.approx(
-        summaries[1]["x"] + summaries[1]["width"], abs=TOLERANCE
-    )
+        # The session picker has one config row; its submenu holds the model and
+        # effort rows, which share one grid across the section break.
+        page.get_by_test_id("composer-config-gear").click()
+        page.get_by_test_id("composer-agent-edit").click()
+        submenu = page.get_by_test_id("composer-agent-config-menu")
+        expect(submenu).to_be_visible()
+        # The phone layout swaps the submenu in as a page of the menu itself, so
+        # settle the menu root as well as the desktop sub-content portal.
+        _settle_menu(page.locator(".composer-agent-menu").first)
+        _settle_menu(submenu)
+        model_rows = submenu.get_by_test_id("composer-agent-models").get_by_role(
+            "menuitemcheckbox"
+        )
+        effort_rows = submenu.get_by_test_id("composer-agent-efforts").get_by_role(
+            "menuitemcheckbox"
+        )
+        model_boxes = [box(model_rows.nth(index)) for index in range(model_rows.count())]
+        effort_boxes = [box(effort_rows.nth(index)) for index in range(effort_rows.count())]
+        assert len(model_boxes) >= 2 and len(effort_boxes) >= 2
+        assert_row_grid(model_boxes)
+        assert_row_grid(effort_boxes)
+        for key in ("x", "width", "height"):
+            assert effort_boxes[0][key] == pytest.approx(model_boxes[0][key], abs=TOLERANCE)
     if surface == "landing":
         menu = page.locator(".composer-agent-menu").first
         smart_routing = page.get_by_test_id("new-chat-landing-harness-smart-routing")

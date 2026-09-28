@@ -531,8 +531,16 @@
   padding: 1px;
 }
 
-/* Compact icon-only buttons use the full 16px glyph inside that box. */
-.button-standard-icons[data-size="icon-xs"] svg:not([data-icon-size]) {
+/* Small and standard icon buttons use the full 16px glyph. */
+.button-standard-icons:is([data-size="icon-xs"], [data-size="icon-sm"], [data-size="icon"])
+  svg:not([data-icon-size]) {
+  padding: 0;
+}
+
+/* Large icon buttons step up to a 24px glyph. */
+.button-standard-icons[data-size="icon-lg"] svg:not([data-icon-size]) {
+  width: 24px;
+  height: 24px;
   padding: 0;
 }
 

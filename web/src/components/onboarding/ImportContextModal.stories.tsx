@@ -18,16 +18,17 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-/** Full import context: credentials, MCPs, and skills all populated. */
+/** Every harness tab populated with its credential, MCPs, skills, and plugins. */
 export const Default: Story = {};
 
-/** Only credentials were detected; MCP and skill lists are empty. */
+/** Only credentials were detected; each harness tab shows the empty state. */
 export const EmptyImports: Story = {
   args: {
     context: {
       credentials: MOCK_IMPORT_CONTEXT.credentials,
       mcps: [],
       skills: [],
+      plugins: [],
     } satisfies ImportContext,
   },
 };

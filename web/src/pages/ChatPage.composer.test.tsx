@@ -209,8 +209,8 @@ async function openSessionModels() {
 
 async function openSessionEfforts() {
   if (!screen.queryByTestId("composer-agent-menu")) openSessionConfig();
-  fireEvent.click(screen.getByTestId("composer-agent-effort-select"));
-  await screen.findByTestId("composer-agent-effort-menu");
+  fireEvent.click(screen.getByTestId("composer-agent-edit"));
+  await screen.findByTestId("composer-agent-efforts");
 }
 
 function openSessionConfig() {
@@ -1722,7 +1722,7 @@ describe("Composer model/effort label", () => {
 
   const label = () => screen.getByTestId("composer-agent-config-value");
 
-  it("opens directly to Model and Effort rows under the session harness heading", () => {
+  it("opens directly to one config row whose submenu holds Models and Effort", () => {
     useChatStore.setState({
       llmModel: "system.ai.claude-opus-4-6",
       sessionHarness: "claude-native",
@@ -1742,17 +1742,16 @@ describe("Composer model/effort label", () => {
     expect(label()).toHaveTextContent("Opus");
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
     const menu = within(screen.getByTestId("composer-agent-menu"));
-    expect(menu.getByText("Claude Code")).toBeVisible();
     expect(menu.queryByText("Harnesses")).toBeNull();
     expect(menu.queryByText("Edit")).toBeNull();
-    expect(menu.getAllByRole("menuitem")).toHaveLength(2);
-    const row = menu.getByRole("menuitem", { name: "Model: Opus" });
+    expect(menu.getAllByRole("menuitem")).toHaveLength(1);
+    const row = menu.getByRole("menuitem", { name: "Claude Code: Opus" });
     expect(within(row).getByText("Opus")).toHaveClass("text-right");
-    expect(menu.getByRole("menuitem", { name: "Effort: xHigh" })).toBeVisible();
     expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
     fireEvent.keyDown(row, { key: "ArrowRight" });
     expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus");
-    expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
+    expect(screen.getByTestId("composer-agent-efforts")).toBeVisible();
+    expect(screen.getByTestId("composer-agent-effort-high")).toBeVisible();
   });
 
   it("shows the model in the foreground and effort muted", () => {
@@ -2816,6 +2815,91 @@ describe("Composer native skill menu", () => {
     expect(overlay.querySelector(".text-brand-accent")?.textContent).toBe("$review");
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("$review focus on tests", undefined);
+  });
+
+  it.each(["click", "Tab", "Enter"])(
+    "inserts an inline skill using %s without sending",
+    (method) => {
+      const props = composerProps({ isNativeWrapper: true });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "please /" } });
+      expect(screen.queryByTestId("slash-menu-item-help")).toBeNull();
+      expect(screen.getByTestId("slash-menu-item-review")).toHaveTextContent("$review");
+      if (method === "click") fireEvent.click(screen.getByTestId("slash-menu-item-review"));
+      else fireEvent.keyDown(textarea(), { key: method });
+      expect(textarea()).toHaveValue("please $review ");
+      expect(props.onSend).not.toHaveBeenCalled();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith("please $review", undefined);
+    },
+  );
+
+  it("completes at the caret and preserves the suffix", async () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev this change" } });
+    fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("please $review this change");
+    await waitFor(() => expect(textarea().selectionStart).toBe(15));
+  });
+
+  it.each([" then /rev", "\nkeep this", "\tkeep this"])(
+    "keeps completion at the caret before %j",
+    async (suffix) => {
+      render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+      fireEvent.change(textarea(), { target: { value: `please /rev${suffix}` } });
+      fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+      expect(textarea()).toHaveValue(`please $review${suffix}`);
+      expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+      await waitFor(() => expect(textarea().selectionStart).toBe(suffix.startsWith(" ") ? 15 : 14));
+    },
+  );
+
+  it("dismisses the inline menu without deleting the prompt", () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(textarea()).toHaveValue("please /rev");
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+  });
+
+  it.each(["context", "help", "compact"])(
+    "offers the inline %s skill despite its built-in name",
+    (name) => {
+      setComposerState({
+        sessionHarness: "claude-sdk",
+        skills: [{ name, description: "Custom skill" }],
+      });
+      const props = composerProps();
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "please /" } });
+      expect(screen.getByText("Skills")).toBeVisible();
+      expect(screen.queryByText("Commands")).toBeNull();
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+      expect(textarea()).toHaveValue(`please /${name} `);
+      expect(props.onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps quote and tail selection separate when their text matches", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    act(() => ref.current?.appendReplyQuote("Quoted text"));
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    const before = screen.getByLabelText("Reply text before quote 1");
+    await userEvent.click(before);
+    fireEvent.select(before, { target: { selectionStart: 9, selectionEnd: 9 } });
+    fireEvent.keyDown(before, { key: "Tab" });
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+    expect(textarea()).toHaveValue("please /rev");
+    expect(before).toHaveValue("please /rev");
+    fireEvent.change(before, { target: { value: "please /review" } });
+    fireEvent.select(before, { target: { selectionStart: 9, selectionEnd: 9 } });
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+    expect(textarea()).toHaveValue("please /rev");
+    expect(before).toHaveValue("please /review");
   });
 
   it("keeps built-in commands slash-prefixed when opened with a dollar sign", () => {
@@ -4707,10 +4791,14 @@ describe("Composer config gear", () => {
         />,
       );
       openSessionConfig();
-      if (showModels) await openSessionModels();
+      const rootMenu = within(screen.getByTestId("composer-agent-menu"));
+      expect(rootMenu.queryByRole("separator")).toBeNull();
+      await openSessionModels();
       expect(screen.queryByRole("menuitem", { name: "Smart Routing" })).toBeNull();
-      expect(screen.queryByRole("separator")).toBeNull();
-      expect(screen.getByTestId("composer-agent-effort-select")).toBeVisible();
+      const configMenu = within(screen.getByTestId("composer-agent-config-menu"));
+      // Only the Models | Effort divider remains.
+      expect(configMenu.queryAllByRole("separator")).toHaveLength(showModels ? 1 : 0);
+      expect(configMenu.getByTestId("composer-agent-efforts")).toBeVisible();
     },
   );
 
@@ -4736,11 +4824,15 @@ describe("Composer config gear", () => {
       expect(menu.getByRole("menuitem", { name: "Smart Routing" })).not.toHaveAttribute(
         "data-disabled",
       );
-      expect(menu.getAllByRole("separator")).toHaveLength(1);
+      // Smart Routing | Models, then Models | Effort.
+      expect(menu.getAllByRole("separator")).toHaveLength(2);
       expect(useChatStore.getState().costControlModeOverride).toBe(costControlModeOverride);
       if (costControlModeOverride === "on") {
-        expect(screen.getByTestId("composer-agent-effort-select")).toHaveAttribute("data-disabled");
-        expect(screen.getByTestId("composer-agent-effort-select")).toHaveTextContent("Automatic");
+        for (const choice of menu.getAllByRole("menuitemcheckbox")) {
+          if (choice.getAttribute("data-effort-level")) {
+            expect(choice).toHaveAttribute("data-disabled");
+          }
+        }
       }
     },
   );
@@ -4755,11 +4847,11 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-advanced-settings")).toBeNull();
     expect(screen.queryByText("Advanced settings…")).toBeNull();
     const menu = screen.getByTestId("composer-agent-menu");
-    expect(menu.lastElementChild).toBe(screen.getByTestId("composer-agent-effort-select"));
+    expect(menu.lastElementChild).toBe(screen.getByTestId("composer-agent-edit"));
     expect(within(menu).queryByRole("separator")).toBeNull();
   });
 
-  it("switches between Model and Effort flyouts on hover and returns to typing on outside click", async () => {
+  it("opens the combined Model and Effort flyout on hover and returns to typing on outside click", async () => {
     const user = userEvent.setup();
     renderWithTooltips(
       <Composer {...composerProps({ showModels: true, modelPickerKind: "claude" })} />,
@@ -4767,15 +4859,13 @@ describe("Composer config gear", () => {
     await user.click(screen.getByTestId("composer-config-gear"));
     await user.hover(screen.getByTestId("composer-agent-edit"));
     expect(await screen.findByTestId("composer-agent-models")).toBeVisible();
-    await user.hover(screen.getByTestId("composer-agent-effort-select"));
-    expect(await screen.findByTestId("composer-agent-efforts")).toBeVisible();
-    expect(screen.queryByTestId("composer-agent-models")).toBeNull();
+    expect(screen.getByTestId("composer-agent-efforts")).toBeVisible();
     await user.click(textarea());
     expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
     expect(textarea()).toHaveFocus();
   });
 
-  it("opens mobile model and effort settings in place with Back navigation", async () => {
+  it("opens mobile model and effort settings on one page with Back navigation", async () => {
     const originalMatchMedia = window.matchMedia;
     window.matchMedia = ((query: string) => ({
       ...originalMatchMedia(query),
@@ -4796,17 +4886,12 @@ describe("Composer config gear", () => {
       fireEvent.click(screen.getByTestId("composer-agent-edit"));
       const menu = await screen.findByTestId("composer-agent-menu");
       expect(within(menu).getByTestId("composer-agent-models")).toBeVisible();
-      expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
-      expect(screen.getAllByRole("menu")).toHaveLength(1);
-      fireEvent.click(screen.getByTestId("composer-agent-config-back"));
-      expect(screen.queryByTestId("composer-agent-models")).toBeNull();
-      fireEvent.click(screen.getByTestId("composer-agent-effort-select"));
       expect(within(menu).getByTestId("composer-agent-efforts")).toBeVisible();
       expect(screen.getAllByRole("menu")).toHaveLength(1);
       fireEvent.click(screen.getByTestId("composer-agent-config-back"));
+      expect(screen.queryByTestId("composer-agent-models")).toBeNull();
       expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
       expect(screen.getByTestId("composer-agent-edit")).toBeVisible();
-      expect(screen.getByTestId("composer-agent-effort-select")).toBeVisible();
     } finally {
       window.matchMedia = originalMatchMedia;
     }
@@ -4830,9 +4915,8 @@ describe("Composer config gear", () => {
       />,
     );
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
-    fireEvent.keyDown(screen.getByTestId("composer-agent-effort-select"), { key: "ArrowRight" });
-    expect(screen.queryByTestId("composer-agent-models")).toBeNull();
-    expect(screen.queryByRole("separator")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("composer-agent-edit"), { key: "ArrowRight" });
+    expect(await screen.findByTestId("composer-agent-models")).toBeVisible();
     expect(await screen.findByTestId("composer-agent-effort-xhigh")).toHaveAttribute(
       "aria-checked",
       "true",
@@ -5187,10 +5271,11 @@ describe("Composer config gear", () => {
     fireEvent.click(
       document.querySelector('[data-testid="composer-agent-model-sonnet"]') as Element,
     );
-    const effortRow = screen.getByTestId("composer-agent-effort-select");
-    expect(effortRow).toHaveAttribute("data-disabled");
-    fireEvent.click(effortRow);
-    expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
+    const configRow = screen.getByTestId("composer-agent-edit");
+    expect(configRow).toHaveAttribute("data-disabled");
+    for (const choice of screen.queryAllByRole("menuitemcheckbox")) {
+      if (choice.getAttribute("data-effort-level")) expect(choice).toHaveAttribute("data-disabled");
+    }
     expect(setModel).toHaveBeenCalledTimes(1);
     expect(setEffort).not.toHaveBeenCalled();
 
@@ -5201,9 +5286,7 @@ describe("Composer config gear", () => {
     expect(setEffort).not.toHaveBeenCalled();
     resolveModel();
     await waitFor(() =>
-      expect(screen.getByTestId("composer-agent-effort-select")).not.toHaveAttribute(
-        "data-disabled",
-      ),
+      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
     );
     await openSessionEfforts();
     fireEvent.click(screen.getByTestId("composer-agent-effort-low"));

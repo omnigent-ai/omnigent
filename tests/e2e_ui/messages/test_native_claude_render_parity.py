@@ -25,9 +25,12 @@ pane genuinely is in that state when the message is injected.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import re
+import signal
 import subprocess
 import time
 import uuid
@@ -37,7 +40,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.conftest import _server_state, reset_mock_llm, set_fallback_mock_llm
 
 # Reuse the custom-agent suite's helpers — both surfaces render from the same
 # canonical transcript, so parity / dedup / ordering are asserted identically.
@@ -269,6 +272,31 @@ _OCCUPYING_SURFACES: tuple[tuple[str, Callable[[Page], None], str], ...] = (
 # then races.
 
 
+def _tmux_advert(base_url: str, session_id: str) -> dict[str, str] | None:
+    """Return the session terminal's tmux advert (socket + pane target).
+
+    The runner writes ``tmux.json`` into the claude-native bridge directory
+    once the terminal launches; it is the handle both the bridge and these
+    tests use to reach the live TUI.
+
+    :param base_url: Spawned server base URL.
+    :param session_id: The session/conversation id.
+    :returns: The parsed advert, or ``None`` before the terminal is up.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        BRIDGE_ID_LABEL_KEY,
+        bridge_dir_for_bridge_id,
+    )
+
+    session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+    labels = session.get("labels") or {}
+    bridge_id = labels.get(BRIDGE_ID_LABEL_KEY) or session_id
+    advert = bridge_dir_for_bridge_id(bridge_id) / _TMUX_ADVERT_FILE
+    if not advert.exists():
+        return None
+    return json.loads(advert.read_text(encoding="utf-8"))
+
+
 def _pane_text(base_url: str, session_id: str) -> str:
     """Capture the session terminal's tmux pane — the TUI's own screen.
 
@@ -281,18 +309,9 @@ def _pane_text(base_url: str, session_id: str) -> str:
     :returns: The pane's visible text, or ``""`` before the terminal has
         been advertised (or if the capture fails).
     """
-    from omnigent.harnesses.claude_native.bridge import (
-        BRIDGE_ID_LABEL_KEY,
-        bridge_dir_for_bridge_id,
-    )
-
-    session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
-    labels = session.get("labels") or {}
-    bridge_id = labels.get(BRIDGE_ID_LABEL_KEY) or session_id
-    advert = bridge_dir_for_bridge_id(bridge_id) / _TMUX_ADVERT_FILE
-    if not advert.exists():
+    info = _tmux_advert(base_url, session_id)
+    if info is None:
         return ""
-    info = json.loads(advert.read_text(encoding="utf-8"))
     proc = subprocess.run(
         ["tmux", "-S", info["socket_path"], "capture-pane", "-t", info["tmux_target"], "-p"],
         check=False,
@@ -537,3 +556,332 @@ def test_native_claude_composer_delivers_into_an_occupied_tui(
     _assert_no_duplicate_render(page, user_markers, assistant_tokens)
     _assert_transcript_parity(base_url, session_id, user_markers, assistant_tokens)
     _log.info("every occupied surface released the composer; all turns landed once")
+
+
+# --- Journey 3: a message the TUI never recorded must not duplicate the next one. ---
+
+# The server records a web message as a queued input before the runner pastes
+# it and only drops that record once the transcript mirrors the message back.
+_QUEUED_INPUT_TIMEOUT_S = 30.0
+# Tunnel teardown after SIGKILL is asynchronous (see chat/test_stale_stream.py).
+_RUNNER_OFFLINE_TIMEOUT_S = 20.0
+# A respawned runner boots a fresh Claude Code (``--resume``) before the next
+# message can be pasted, so that turn gets a cold-boot budget.
+_RESUMED_TURN_TIMEOUT_MS = 180_000
+# Headline the SPA gives an undelivered web message (StatusBlocks.tsx).
+_UNDELIVERED_HEADLINE = "was not delivered"
+
+
+def _pane_process_ids(advert: dict[str, str]) -> list[int]:
+    """Return the pane's root process and its descendants (Claude Code and children).
+
+    :param advert: The session terminal's tmux advert (see :func:`_tmux_advert`).
+    :returns: Process ids, roots first.
+    """
+    listed = subprocess.run(
+        [
+            "tmux",
+            "-S",
+            advert["socket_path"],
+            "list-panes",
+            "-t",
+            advert["tmux_target"],
+            "-F",
+            "#{pane_pid}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    pending = [int(pid) for pid in listed.stdout.split() if pid.isdigit()]
+    pids: list[int] = []
+    while pending:
+        pid = pending.pop(0)
+        pids.append(pid)
+        children = subprocess.run(
+            ["pgrep", "-P", str(pid)], check=False, capture_output=True, text=True, timeout=10
+        )
+        pending.extend(int(child) for child in children.stdout.split() if child.isdigit())
+    return pids
+
+
+def _signal_each(pids: list[int], sig: signal.Signals) -> None:
+    """Send *sig* to every pid, ignoring ones that already exited.
+
+    :param pids: Target process ids.
+    :param sig: Signal to deliver, e.g. ``signal.SIGSTOP``.
+    """
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, sig)
+
+
+def _queued_input_texts(base_url: str, session_id: str) -> list[str]:
+    """Return the text of every web message the server still holds as queued.
+
+    :param base_url: Spawned server base URL.
+    :param session_id: The session/conversation id.
+    :returns: One entry per ``pending_inputs`` record, in queue order.
+    """
+    session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+    texts: list[str] = []
+    for entry in session.get("pending_inputs") or []:
+        texts.append(
+            " ".join(
+                block["text"]
+                for block in entry.get("content") or []
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            )
+        )
+    return texts
+
+
+def _wait_for_queued_input(page: Page, base_url: str, session_id: str, marker: str) -> None:
+    """Block until the server holds a queued web message carrying *marker*.
+
+    :param page: The Playwright page (used for its polling sleep).
+    :param base_url: Spawned server base URL.
+    :param session_id: The session/conversation id.
+    :param marker: Unique text of the message that must be queued.
+    :raises AssertionError: If the server never records it.
+    """
+    deadline = time.monotonic() + _QUEUED_INPUT_TIMEOUT_S
+    queued: list[str] = []
+    while time.monotonic() < deadline:
+        queued = _queued_input_texts(base_url, session_id)
+        if any(marker in text for text in queued):
+            return
+        page.wait_for_timeout(500)
+    raise AssertionError(
+        f"the server never held {marker!r} as a queued input within "
+        f"{_QUEUED_INPUT_TIMEOUT_S}s; queued: {queued!r}"
+    )
+
+
+def _wait_for_runner_offline(page: Page, base_url: str, session_id: str) -> None:
+    """Block until the health endpoint reports the session's runner offline.
+
+    :param page: The Playwright page (used for its polling sleep).
+    :param base_url: Spawned server base URL.
+    :param session_id: The session/conversation id.
+    :raises AssertionError: If the runner is still reported online at the deadline.
+    """
+    deadline = time.monotonic() + _RUNNER_OFFLINE_TIMEOUT_S
+    health: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        health = httpx.get(
+            f"{base_url}/health", params={"session_id": session_id}, timeout=5
+        ).json()
+        session = health.get("session")
+        if isinstance(session, dict) and session.get("runner_online") is False:
+            return
+        page.wait_for_timeout(500)
+    raise AssertionError(f"runner still reported online after the kill: {health}")
+
+
+def _send_turn_and_settle(
+    page: Page,
+    mock_llm_server_url: str,
+    *,
+    base_url: str,
+    session_id: str,
+    index: int,
+    user_marker: str,
+    assistant_token: str,
+    expected_assistant_bubbles: int,
+    turn_timeout_ms: int = _MOCK_TURN_TIMEOUT_MS,
+) -> None:
+    """Send one composer turn and wait until Claude has answered it.
+
+    Settles on the assistant bubble count rather than the echoed token, so the
+    journey holds whether the turn is served by the mock or by a real model.
+
+    :param page: The Playwright page, on the session's chat surface.
+    :param mock_llm_server_url: Mock LLM server base URL.
+    :param base_url: Spawned server base URL.
+    :param session_id: The session/conversation id.
+    :param index: 1-based turn number, for the prompt text.
+    :param user_marker: Unique token embedded in the user message.
+    :param assistant_token: Unique token the agent is asked to echo back.
+    :param expected_assistant_bubbles: Assistant bubbles once this turn is answered.
+    :param turn_timeout_ms: Budget for the answer to render.
+    """
+    set_fallback_mock_llm(mock_llm_server_url, "default", assistant_token)
+    set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, assistant_token)
+    _send(page, _turn_prompt(index, user_marker, assistant_token))
+    expect(page.locator(_ASSISTANT)).to_have_count(
+        expected_assistant_bubbles, timeout=turn_timeout_ms
+    )
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=turn_timeout_ms)
+    _wait_for_transcript_message(page, base_url, session_id, user_marker, role="user")
+
+
+def _assert_user_bubbles_are_their_committed_items(
+    page: Page, base_url: str, session_id: str, markers: list[str]
+) -> None:
+    """Assert each marker renders as exactly one bubble carrying its own item id.
+
+    A user bubble's ``data-message-id`` is the committed transcript item it
+    was promoted into (an optimistic bubble still awaiting its receipt carries
+    a client temp id instead). A receipt that names the wrong queued message
+    leaves a bubble promoted under another message's id and the real message
+    stranded as optimistic — the state behind the duplicate the person sees
+    once history is merged back in.
+
+    :param page: The Playwright page, on the settled chat surface.
+    :param base_url: Spawned server base URL.
+    :param session_id: The session/conversation id.
+    :param markers: Unique per-message markers, oldest first.
+    """
+    committed = {
+        str(item.get("id")): _item_text(item)
+        for item in _ordered_message_items(base_url, session_id)
+        if item.get("role") == "user"
+    }
+    bubbles: list[list[str]] = page.locator(_USER).evaluate_all(
+        "els => els.map(e => [e.getAttribute('data-message-id') ?? '', e.innerText])"
+    )
+    for marker in markers:
+        matching = [(item_id, text) for item_id, text in bubbles if marker in text]
+        assert len(matching) == 1, f"{marker!r} rendered {len(matching)}x: {bubbles!r}"
+        item_id, _text = matching[0]
+        assert marker in committed.get(item_id, ""), (
+            f"the bubble for {marker!r} carries item id {item_id!r}, which is "
+            f"{committed.get(item_id, 'not a committed user message')!r}; "
+            f"committed user items: {committed!r}"
+        )
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(600)
+def test_native_claude_lost_message_does_not_duplicate_the_next_one(
+    page: Page,
+    native_claude_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
+    _recover_shared_runner: Callable[[], None],
+) -> None:
+    """A message Claude Code never recorded must not double-render the next one.
+
+    The shape of a host reconnect: the runner accepts a web message into a TUI
+    that then never records it (here the TUI is frozen, so the paste is never
+    read), the runner and its terminal go away, a fresh runner resumes the
+    session, and the person keeps chatting in the SAME tab. The server still
+    holds the lost message as a queued input. When the next message is mirrored
+    back, that stale record must not be the one the server drains: the receipt
+    would name the wrong message, the tab would keep the new message's
+    optimistic bubble beside its committed copy, and the lost message would
+    vanish without a trace — while a fresh tab showed everything once.
+    """
+    base_url, session_id = native_claude_mock_session
+    _log.info("lost-message journey: base_url=%s session_id=%s", base_url, session_id)
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _ensure_chat_view(page)
+    reset_mock_llm(mock_llm_server_url)
+
+    nonce = uuid.uuid4().hex[:8]
+    first_marker, first_token = f"usr-1-{nonce}", f"ast-1-{nonce}"
+    lost_marker, lost_token = f"usr-2-{nonce}", f"ast-2-{nonce}"
+    next_marker, next_token = f"usr-3-{nonce}", f"ast-3-{nonce}"
+
+    # Turn 1 on a healthy TUI: proves delivery and gives Claude Code a
+    # transcript for the resume below.
+    _send_turn_and_settle(
+        page,
+        mock_llm_server_url,
+        base_url=base_url,
+        session_id=session_id,
+        index=1,
+        user_marker=first_marker,
+        assistant_token=first_token,
+        expected_assistant_bubbles=1,
+    )
+    _log.info("turn 1 settled")
+
+    # Freeze Claude Code. The bridge still pastes and submits (blind, once its
+    # draft-visibility budget lapses), so the runner accepts the message and
+    # the server keeps its queued record — but the TUI never reads the paste.
+    advert = _tmux_advert(base_url, session_id)
+    assert advert is not None, "the Claude terminal advertised no tmux pane"
+    pane_pids = _pane_process_ids(advert)
+    assert pane_pids, "the Claude terminal pane owns no process"
+    _signal_each(pane_pids, signal.SIGSTOP)
+    _log.info("froze the Claude Code pane (pids=%s); sending the message it will lose", pane_pids)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and response.url.endswith(f"/v1/sessions/{session_id}/events")
+        ),
+        timeout=60_000,
+    ) as posted:
+        _send(page, _turn_prompt(2, lost_marker, lost_token))
+    assert posted.value.ok, f"the frozen-TUI message was refused: {posted.value.status}"
+    expect(page.locator(_USER, has_text=lost_marker)).to_have_count(1)
+    _wait_for_queued_input(page, base_url, session_id, lost_marker)
+    _log.info("server holds the lost message as a queued input")
+
+    # The host goes away: Claude Code, its tmux server, and the runner all die.
+    _signal_each(pane_pids, signal.SIGKILL)
+    subprocess.run(
+        ["tmux", "-S", advert["socket_path"], "kill-server"],
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+    os.kill(int(str(_server_state["runner_pid"])), signal.SIGKILL)
+    _wait_for_runner_offline(page, base_url, session_id)
+    _log.info("runner and terminal are gone; bringing a fresh runner back")
+
+    # The host comes back: a fresh runner registers under the same id and
+    # resumes the session's Claude Code when the next message arrives.
+    _recover_shared_runner()
+    _send_turn_and_settle(
+        page,
+        mock_llm_server_url,
+        base_url=base_url,
+        session_id=session_id,
+        index=3,
+        user_marker=next_marker,
+        assistant_token=next_token,
+        expected_assistant_bubbles=2,
+        turn_timeout_ms=_RESUMED_TURN_TIMEOUT_MS,
+    )
+    _log.info("turn 3 settled after the reconnect")
+    # The reported symptom: the tab that lived through the reconnect must show
+    # the new message once, not committed copy + stranded optimistic bubble.
+    expect(page.locator(_USER, has_text=next_marker)).to_have_count(1)
+    expect(page.locator(_USER)).to_have_count(3)
+    # And every bubble must be the message it says it is: the receipt for the
+    # new message must not have promoted the lost message's bubble under the
+    # new item id while the new message's own bubble stays optimistic.
+    markers = [first_marker, lost_marker, next_marker]
+    _assert_user_bubbles_are_their_committed_items(page, base_url, session_id, markers)
+    # The lost message is flagged as undelivered instead of silently vanishing.
+    expect(
+        page.get_by_test_id("error-headline").filter(has_text=_UNDELIVERED_HEADLINE)
+    ).to_have_count(1)
+
+    # The canonical transcript agrees: each message once, in send order.
+    user_texts = [
+        _item_text(item)
+        for item in _ordered_message_items(base_url, session_id)
+        if item.get("role") == "user"
+    ]
+    assert [marker for text in user_texts for marker in markers if marker in text] == markers, (
+        f"transcript user messages out of order or duplicated: {user_texts!r}"
+    )
+
+    # A fresh tab renders the same three messages — what the person saw when
+    # they opened the conversation a second time.
+    fresh = page.context.new_page()
+    try:
+        fresh.goto(f"{base_url}/c/{session_id}")
+        expect(fresh.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=30_000)
+        _select_view_mode(fresh, "Chat")
+        expect(fresh.locator(_USER, has_text=next_marker)).to_have_count(1, timeout=30_000)
+        expect(fresh.locator(_USER)).to_have_count(3, timeout=30_000)
+    finally:
+        fresh.close()
+    _log.info("lost message surfaced once as undelivered; next message rendered once")

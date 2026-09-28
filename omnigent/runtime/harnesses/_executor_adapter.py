@@ -112,6 +112,37 @@ def _is_host_tool(tool_name: str) -> bool:
     return _strip_mcp_tool_prefix(tool_name).startswith(_HOST_TOOL_PREFIX)
 
 
+class InnerExecutorError(RuntimeError):
+    """
+    An executor-reported failure that names its own semantic error code.
+
+    Raised by :class:`ExecutorAdapter` when an :class:`ExecutorError` event
+    carries a ``code``, so the terminal ``response.failed`` reports that code,
+    headline and next step instead of the exception class name.
+
+    :param message: Human-readable failure text shown to the user.
+    :param code: Semantic failure code, e.g. ``"databricks_sign_in_pending"``.
+    :param title: Short headline for the error card, or ``None``.
+    :param remediation: Concrete next step for the user, or ``None``.
+    :param undelivered: ``True`` when the harness never received the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        title: str | None = None,
+        remediation: str | None = None,
+        undelivered: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.title = title
+        self.remediation = remediation
+        self.undelivered = undelivered
+
+
 class ExecutorAdapter(HarnessApp):
     """
     :class:`HarnessApp` subclass that drives any inner :class:`Executor`.
@@ -335,6 +366,17 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
+                        if event.code:
+                            # The executor named the failure: keep its code, headline
+                            # and next step so the card reads as that failure rather
+                            # than as a bare exception class.
+                            raise InnerExecutorError(
+                                detail,
+                                code=event.code,
+                                title=event.title,
+                                remediation=event.remediation,
+                                undelivered=event.undelivered,
+                            )
                         raise RuntimeError(f"inner executor error: {detail}")
         except ElicitationDeclinedError:
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
@@ -939,8 +981,25 @@ class ExecutorAdapter(HarnessApp):
         Unknown types fall back to base class (``type(exception).__name__``).
         """
         from omnigent.errors import OmnigentError
+        from omnigent.inner.model_auth import ProviderAuthRequired
         from omnigent.server.schemas import ErrorDetail
 
+        if isinstance(exception, ProviderAuthRequired):
+            return ErrorDetail(
+                code=exception.code,
+                message=str(exception),
+                title=exception.title,
+                cause=exception.cause,
+                remediation=exception.remediation,
+            )
+        if isinstance(exception, InnerExecutorError):
+            return ErrorDetail(
+                code=exception.code,
+                message=str(exception),
+                title=exception.title,
+                remediation=exception.remediation,
+                undelivered=True if exception.undelivered else None,
+            )
         if isinstance(exception, OmnigentError):
             return ErrorDetail(code=exception.code, message=str(exception))
 
