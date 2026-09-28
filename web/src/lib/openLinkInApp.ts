@@ -54,6 +54,8 @@ function notifyListeners(conversationId: string): void {
  * and tell the user why it left the app.
  */
 function fallBackToExternalBrowser(url: string, reason: string | undefined): void {
+  // Runs after the click's user gesture has expired; safe only because the
+  // desktop shell's window-open handler sends it to the OS browser anyway.
   window.open(url, "_blank", "noopener,noreferrer");
   showToast(
     `Couldn't open this link in the in-app browser (${reason?.trim() || "unknown error"}). ` +
