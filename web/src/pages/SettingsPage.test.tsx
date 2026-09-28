@@ -583,7 +583,7 @@ describe("SettingsPage", () => {
     expect(follows(codeWeight, touch)).toBe(true);
     expect(follows(touch, swipe)).toBe(true);
     expect(follows(swipe, exportButton)).toBe(true);
-    // Swipe actions moved out of the workspace settings.
+    // The Touch & mobile section comes after the workspace settings, not inside them.
     expect(follows(screen.getByTestId("hide-unconfigured-harnesses-toggle"), touch)).toBe(true);
   });
 
