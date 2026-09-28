@@ -858,6 +858,129 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_fresh_session_replays_tool_history(self):
+        """A fresh SDK session (a forked session, or a restart) must replay
+        recorded ``tool_call`` / ``tool_result`` history into the model input.
+
+        There is no Layer-1 SDK state to reconstruct the tool items from, so
+        a fact that lives only in a tool output must travel with the replayed
+        history — otherwise the model cannot answer follow-ups about it and
+        re-invokes the tool.
+        """
+
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="Ada")
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                _ = [
+                    e
+                    async for e in executor.run_turn(
+                        [
+                            {
+                                "role": "user",
+                                "content": "greet the new hire",
+                                "session_id": "s1",
+                            },
+                            {
+                                "role": "tool_call",
+                                "content": {"tool": "greet", "args": {"name": "Ada"}},
+                                "session_id": "s1",
+                            },
+                            {
+                                "role": "tool_result",
+                                "content": "Hello, Ada!",
+                                "session_id": "s1",
+                            },
+                            {"role": "assistant", "content": "Done.", "session_id": "s1"},
+                            {
+                                "role": "user",
+                                "content": "Who did you greet?",
+                                "session_id": "s1",
+                            },
+                        ],
+                        [],
+                        "",
+                    )
+                ]
+
+            replayed = _FakeRunner.last_calls[0]["input"]
+            self.assertIsInstance(replayed, list)
+            item_types = [item.get("type") for item in replayed]
+            self.assertIn("function_call", item_types)
+            self.assertIn("function_call_output", item_types)
+            output_item = next(
+                item for item in replayed if item.get("type") == "function_call_output"
+            )
+            self.assertIn("Hello, Ada!", output_item["output"])
+            # History replays in order: the follow-up question stays last.
+            self.assertEqual(replayed[-1]["content"], "Who did you greet?")
+
+        _run(_t())
+
+    def test_started_session_delta_excludes_tool_history(self):
+        """A continued turn must not re-send replayed tool history.
+
+        The live SDK session already holds its own tool items (Layer-1
+        state); the ``tool_call`` / ``tool_result`` messages in the persisted
+        conversation are for fresh-session replay only. If they leaked into
+        the delta, the history cursor (which counts only conversational
+        messages) would misalign and the turn would replay stale items —
+        duplicated tool context and a duplicated assistant reply — instead of
+        just the new user message.
+        """
+
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="one")
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                _ = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "first", "session_id": "s1"}],
+                        [],
+                        "",
+                    )
+                ]
+                # The first turn ran a tool; the server persisted the tool
+                # items, so the next turn's input carries them as history.
+                _FakeRunner.next_result = _FakeResult(events=[], final_output="two")
+                _ = [
+                    e
+                    async for e in executor.run_turn(
+                        [
+                            {"role": "user", "content": "first", "session_id": "s1"},
+                            {
+                                "role": "tool_call",
+                                "content": {"tool": "greet", "args": {"name": "Ada"}},
+                                "session_id": "s1",
+                            },
+                            {
+                                "role": "tool_result",
+                                "content": "Hello, Ada!",
+                                "session_id": "s1",
+                            },
+                            {"role": "assistant", "content": "one", "session_id": "s1"},
+                            {"role": "user", "content": "second", "session_id": "s1"},
+                        ],
+                        [],
+                        "",
+                    )
+                ]
+
+            # Only the new user message reaches the runner — not the tool
+            # items or the assistant reply the live session already holds.
+            self.assertEqual(_FakeRunner.last_calls[1]["input"], "second")
+
+        _run(_t())
+
     def test_started_session_preserves_structured_user_content(self):
         """Regression: fast path must not json.dumps a structured content list.
 
