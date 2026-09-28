@@ -29,9 +29,12 @@ def _retry_events(message: str) -> list[dict]:
     ]
 
 
-async def _run(monkeypatch: pytest.MonkeyPatch, events: list[dict]) -> tuple[list, _PiRpcSession]:
+async def _run(
+    monkeypatch: pytest.MonkeyPatch, events: list[dict], *, settled: bool = False
+) -> tuple[list, _PiRpcSession]:
     monkeypatch.setattr("omnigent.inner.pi_executor._find_pi_cli", lambda: "/unused/pi")
     executor = PiExecutor()
+    executor._settled_supported = settled
     rpc = _PiRpcSession()
     rpc._line_queue = asyncio.Queue()
     for event in events:
@@ -261,6 +264,72 @@ async def test_partial_failed_message_stops_before_regenerated_output(
     ]
     assert not any(isinstance(event, TurnComplete) for event in result)
     rpc.close.assert_awaited_once()
+
+
+async def test_truncated_output_stops_before_overflow_compaction_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = [
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "Truncated"},
+        },
+        {"type": "message_end", "message": {"role": "assistant", "stopReason": "length"}},
+        {"type": "agent_end", "messages": [], "willRetry": False},
+        {"type": "compaction_start", "reason": "overflow"},
+        {"type": "compaction_end", "reason": "overflow", "willRetry": True},
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "Replacement"},
+        },
+    ]
+    result, rpc = await _run(monkeypatch, events, settled=True)
+    assert [event.text for event in result if isinstance(event, TextChunk)] == ["Truncated"]
+    assert [event.message for event in result if isinstance(event, ExecutorError)] == [
+        "Pi continued after partial output."
+    ]
+    assert not any(isinstance(event, TurnComplete) for event in result)
+    rpc.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("stop", "expected_error"), [("error", "provider failed"), ("length", None)]
+)
+async def test_threshold_compaction_after_partial_output_keeps_process(
+    monkeypatch: pytest.MonkeyPatch, stop: str, expected_error: str | None
+) -> None:
+    final = {"role": "assistant", "stopReason": stop, "errorMessage": "provider failed"}
+    if stop == "length":
+        del final["errorMessage"]
+    first = [
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "Partial"},
+        },
+        {"type": "message_end", "message": final},
+        {"type": "agent_end", "messages": [final], "willRetry": False},
+        {"type": "compaction_start", "reason": "threshold"},
+        {"type": "compaction_end", "reason": "threshold", "willRetry": False},
+        {"type": "agent_settled"},
+    ]
+    second = [
+        {"type": "agent_end", "messages": [{"role": "assistant", "content": "Next"}]},
+        {"type": "agent_settled"},
+    ]
+    closed = AsyncMock()
+    monkeypatch.setattr(PiExecutor, "close_session", closed)
+    result, second_result, rpc = await _run_two_settled_turns(monkeypatch, first, second)
+    assert [event.message for event in result if isinstance(event, ExecutorError)] == (
+        [expected_error] if expected_error else []
+    )
+    assert [event.response for event in result if isinstance(event, TurnComplete)] == (
+        [] if expected_error else ["Partial"]
+    )
+    assert [event.response for event in second_result if isinstance(event, TurnComplete)] == [
+        "Next"
+    ]
+    assert rpc._line_queue.empty()
+    closed.assert_not_awaited()
 
 
 async def test_eof_with_partial_text_before_settlement_is_error(

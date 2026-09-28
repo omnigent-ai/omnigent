@@ -1586,6 +1586,25 @@ def _resolve_pi_skill_args(
     return []
 
 
+def _last_assistant_error(
+    messages: list[dict],
+    *,
+    stop_reasons: frozenset[str] = frozenset({"error"}),
+    fallback: str | None = None,
+) -> str | None:
+    """Return the error text of the last assistant message if it stopped in *stop_reasons*.
+
+    Falls back to *fallback*, then the stop reason, when ``errorMessage`` is absent.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            stop = msg.get("stopReason")
+            if stop in stop_reasons:
+                return str(msg.get("errorMessage") or fallback or stop)
+            return None
+    return None
+
+
 def _extract_pi_turn_usage(
     message: object,
     fallback_model: str | None,
@@ -2588,7 +2607,12 @@ class PiExecutor(Executor):
                     return
                 continue
 
-            if event_type in ("auto_retry_start", "compaction_start") and message_had_output:
+            # Threshold compaction never re-runs the interrupted message; retries
+            # and overflow compaction do.
+            retries_message = event_type == "auto_retry_start" or (
+                event_type == "compaction_start" and event.get("reason") != "threshold"
+            )
+            if retries_message and message_had_output:
                 # The failed message already reached an append-only consumer.
                 with contextlib.suppress(Exception):
                     await self.close_session(session_key)
@@ -2736,16 +2760,11 @@ class PiExecutor(Executor):
                             message=pending_error or "Pi retry after partial output."
                         )
                         return
-                    retry_error = pending_error
-                    if retry_error is None:
-                        for msg in reversed(last_end_messages):
-                            if isinstance(msg, dict) and msg.get("role") == "assistant":
-                                if msg.get("stopReason") == "error":
-                                    retry_error = str(
-                                        msg.get("errorMessage") or "Pi retry failed."
-                                    )
-                                break
-                    retry_error = retry_error or "Pi retry failed."
+                    retry_error = (
+                        pending_error
+                        or _last_assistant_error(last_end_messages)
+                        or "Pi retry failed."
+                    )
                     pending_error = None
                     continue
                 if (
@@ -2753,12 +2772,10 @@ class PiExecutor(Executor):
                     and retry_error is not None
                     and not self._settled_supported
                 ):
-                    pending_error = retry_error
-                    for msg in reversed(event.get("messages", [])):
-                        if isinstance(msg, dict) and msg.get("role") == "assistant":
-                            if msg.get("stopReason") == "error":
-                                pending_error = str(msg.get("errorMessage") or retry_error)
-                            break
+                    pending_error = (
+                        _last_assistant_error(last_end_messages, fallback=retry_error)
+                        or retry_error
+                    )
                 if self._settled_supported:
                     continue
                 if pending_error is not None:
@@ -2768,21 +2785,13 @@ class PiExecutor(Executor):
                 if not saw_agent_end:
                     continue
                 end_messages = last_end_messages
-                if pending_error is None:
-                    for msg in reversed(end_messages):
-                        if isinstance(msg, dict) and msg.get("role") == "assistant":
-                            if msg.get("stopReason") in ("error", "aborted"):
-                                pending_error = str(
-                                    msg.get("errorMessage") or msg.get("stopReason")
-                                )
-                            break
-                if pending_error is None and retry_error is not None:
-                    pending_error = retry_error
-                    for msg in reversed(end_messages):
-                        if isinstance(msg, dict) and msg.get("role") == "assistant":
-                            if msg.get("stopReason") == "error":
-                                pending_error = str(msg.get("errorMessage") or retry_error)
-                            break
+                pending_error = (
+                    pending_error
+                    or _last_assistant_error(
+                        end_messages, stop_reasons=frozenset({"error", "aborted"})
+                    )
+                    or retry_error
+                )
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
@@ -2834,8 +2843,9 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                    # A truncated ("length") message may be re-run after overflow compaction.
                     if (
-                        stop not in {"error", "aborted"}
+                        stop not in {"error", "aborted", "length"}
                         and msg.get("role", "assistant") == "assistant"
                     ):
                         message_had_output = False
