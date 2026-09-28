@@ -569,7 +569,7 @@ _RUNNER_OFFLINE_TIMEOUT_S = 20.0
 # message can be pasted, so that turn gets a cold-boot budget.
 _RESUMED_TURN_TIMEOUT_MS = 180_000
 # Headline the SPA gives an undelivered web message (StatusBlocks.tsx).
-_UNDELIVERED_HEADLINE = "was not delivered"
+_UNDELIVERED_HEADLINE = "Message not delivered. Try sending it again."
 
 
 def _pane_process_ids(advert: dict[str, str]) -> list[int]:

@@ -473,7 +473,7 @@ describe("ErrorBanner", () => {
       />,
     );
     expect(screen.getByTestId("error-headline")).toHaveTextContent(
-      "The agent never received this message, so it was not delivered.",
+      "Message not delivered. Try sending it again.",
     );
   });
 
