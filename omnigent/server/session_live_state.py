@@ -192,6 +192,11 @@ def persist_live_status(session_id: str, status: str) -> None:
     submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
 
 
+def forget_live_status(session_id: str) -> None:
+    """Drop this process's dedupe state for a session handed to another replica."""
+    _last_status.pop(session_id, None)
+
+
 def persist_scheduled_run_completion(
     conversation_id: str,
     run_status: str,

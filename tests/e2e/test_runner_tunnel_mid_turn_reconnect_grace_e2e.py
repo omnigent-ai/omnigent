@@ -435,6 +435,15 @@ def _session_snapshot(client: httpx.Client, session_id: str) -> dict:
     return response.json()
 
 
+def _session_list_entry(client: httpx.Client, session_id: str) -> dict:
+    response = client.get(
+        "/v1/sessions",
+        params={"visibility": "all", "limit": 100},
+    )
+    response.raise_for_status()
+    return next(entry for entry in response.json()["data"] if entry["id"] == session_id)
+
+
 def _session_blob(client: httpx.Client, session_id: str) -> str:
     return json.dumps(_session_snapshot(client, session_id).get("items", []))
 
@@ -621,6 +630,19 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
             f"Failure lines: {failed_edges}\n"
             f"Replica A log tail:\n{server_a_log[-4000:]}"
         )
+
+        snapshot_a = _session_snapshot(stack.client, session_id)
+        assert snapshot_a.get("status") != "running", (
+            f"Replica A still reports the completed session as running; "
+            f"snapshot={json.dumps(snapshot_a)[:2000]}"
+        )
+        assert snapshot_a.get("active_response_id") is None
+        list_entry_a = _session_list_entry(stack.client, session_id)
+        assert list_entry_a.get("status") == snapshot_a.get("status"), (
+            f"Replica A's list and snapshot disagree after handoff; "
+            f"list_entry={json.dumps(list_entry_a)[:2000]}"
+        )
+
         snapshot = _session_snapshot(replica_b.client, session_id)
         assert snapshot.get("status") != "failed", (
             f"Session {session_id} reads failed after completing on replica B; "

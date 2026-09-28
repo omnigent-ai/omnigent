@@ -99,6 +99,13 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
     ]
 
 
+def test_forget_live_status_drops_dedupe_state() -> None:
+    """A replica handing off a session must not keep its stale dedupe state."""
+    session_live_state._last_status["conv_1"] = "running"
+    session_live_state.forget_live_status("conv_1")
+    assert "conv_1" not in session_live_state._last_status
+
+
 def test_pending_count_hook_persists_publish_and_resolve(
     recording_store: _RecordingStore,
 ) -> None:

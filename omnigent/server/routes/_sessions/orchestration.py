@@ -7063,56 +7063,40 @@ class _RelayTransportLost(Exception):
         self.intentional = intentional
 
 
-async def _runner_live_on_another_replica(
-    conversation_store: ConversationStore,
-    session_ids: Sequence[str],
+def _relinquish_session_live_state(session_id: str) -> None:
+    """Drop local live state for a session now owned by another replica."""
+    _session_status_cache.pop(session_id, None)
+    _session_active_response_cache.pop(session_id, None)
+    session_live_state.forget_live_status(session_id)
+
+
+def _runner_stamp_is_live_elsewhere(
+    *,
+    stamp: int | None,
+    reference_stamp: int | None,
+) -> bool:
+    """Return whether *stamp* is fresh evidence written by another replica."""
+    return (
+        stamp is not None
+        and runner_seen_is_fresh(stamp)
+        and (reference_stamp is None or stamp > reference_stamp)
+    )
+
+
+def _runner_live_on_another_replica_from_conversations(
+    conversations: Sequence[Conversation],
     runner_id: str,
     reference_stamp: int | None,
 ) -> bool:
-    """
-    Report whether another replica has taken over *runner_id* since *reference_stamp*.
-
-    A replica can be slow to notice its own tunnel dropped (the ping loop
-    only declares one dead after a silent stretch), and by then the
-    runner has often already re-tunnelled to a different replica, which
-    stamps ``runner_last_seen`` through its own connect/ping-loop writes.
-    Reads :meth:`ConversationStore.get_session_connectivity` for
-    *session_ids* and looks for a row still bound to *runner_id* whose
-    stamp is fresh and strictly newer than *reference_stamp* — a stamp
-    this replica wrote itself is never newer than its own reference, so
-    this only fires for a write from elsewhere.
-
-    :param conversation_store: Store used to read connectivity.
-    :param session_ids: Sessions to check — e.g. every session bound to
-        the runner, or a single relay session.
-    :param runner_id: Runner id the matching row must be bound to.
-    :param reference_stamp: This replica's own last stamp for
-        *runner_id* (:func:`session_live_state.last_liveness_stamp`), or
-        ``None`` if it never touched the runner.
-    :returns: ``True`` when the runner is confirmed live elsewhere;
-        ``False`` when not, or the connectivity read failed — failing
-        closed so the caller marks/fails exactly as it does today.
-    """
-    if not session_ids:
-        return False
-    try:
-        connectivity = await asyncio.to_thread(
-            conversation_store.get_session_connectivity, list(session_ids)
+    """Check already-loaded runner-bound rows for a fresher replica's stamp."""
+    return any(
+        conv.runner_id == runner_id
+        and _runner_stamp_is_live_elsewhere(
+            stamp=conv.runner_last_seen,
+            reference_stamp=reference_stamp,
         )
-    except Exception:  # noqa: BLE001 — never let a read failure block the disconnect handler
-        _logger.warning(
-            "Runner %s liveness cross-check failed; treating as offline",
-            runner_id,
-            exc_info=True,
-        )
-        return False
-    for row in connectivity.values():
-        stamp = row.runner_last_seen
-        if row.runner_id != runner_id or stamp is None or not runner_seen_is_fresh(stamp):
-            continue
-        if reference_stamp is None or stamp > reference_stamp:
-            return True
-    return False
+        for conv in conversations
+    )
 
 
 async def _runner_drop_interrupted_turn(
@@ -7169,37 +7153,32 @@ async def _relay_runner_live_elsewhere(
     ``_runner_relay_tasks`` registration; a caller that drives
     :func:`_relay_runner_stream` directly (tests, or a code path
     bypassing :func:`_ensure_runner_relay`) has no such entry, so fall
-    back to the connectivity row's binding.
+    back to the session row's binding. One row read serves both the
+    binding and the liveness stamp, keeping this path bounded.
 
     :param session_id: Session/conversation identifier.
-    :param conversation_store: Store used to resolve the binding and,
-        via :func:`_runner_live_on_another_replica`, read connectivity.
+    :param conversation_store: Store used to read the session row.
     :returns: ``True`` when the bound runner is confirmed live on
-        another replica; ``False`` when unbound, unresolvable, or not.
+        another replica; ``False`` when unbound, unreadable, or not.
     """
+    try:
+        row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
+        _logger.warning(
+            "Relay: session-row lookup failed for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return False
+    if row is None:
+        return False
     handle = _runner_relay_tasks.get(session_id)
-    runner_id = handle.runner_id if handle is not None else None
-    if runner_id is None:
-        try:
-            connectivity = await asyncio.to_thread(
-                conversation_store.get_session_connectivity, [session_id]
-            )
-        except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
-            _logger.warning(
-                "Relay: runner-binding lookup failed for session=%s",
-                session_id,
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
-            return False
-        row = connectivity.get(session_id)
-        runner_id = row.runner_id if row is not None else None
+    runner_id = handle.runner_id if handle is not None else row.runner_id
     if runner_id is None:
         return False
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return await _runner_live_on_another_replica(
-        conversation_store, [session_id], runner_id, reference_stamp
-    )
+    return _runner_live_on_another_replica_from_conversations([row], runner_id, reference_stamp)
 
 
 async def _relay_runner_stream(
@@ -7335,6 +7314,7 @@ async def _relay_runner_stream(
             elif decision == "live_elsewhere":
                 # The runner re-tunnelled to another replica before this one
                 # noticed the drop; that replica now owns the turn.
+                _relinquish_session_live_state(session_id)
                 _logger.info(
                     "Relay: runner live on another replica for session=%s; no failure to report",
                     session_id,

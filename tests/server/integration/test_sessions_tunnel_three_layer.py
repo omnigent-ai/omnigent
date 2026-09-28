@@ -1586,9 +1586,11 @@ async def test_runner_disconnect_grace_defers_failed_marking(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("foreign_write", [True, False])
 async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
+    foreign_write: bool,
 ) -> None:
     """A dropped runner that re-tunnelled to another replica is not failed.
 
@@ -1597,7 +1599,6 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     last stamp, another replica wrote it — the runner is live there, so the
     grace timer must leave the mid-turn session alone.
     """
-    import time
 
     from omnigent.runtime import get_conversation_store
     from omnigent.server import session_live_state
@@ -1626,27 +1627,39 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     runner_id = "runner-live-elsewhere"
     store = get_conversation_store()
     store.replace_runner_id(session_id, runner_id)
-    # Pin this replica's own last stamp a minute in the past, so the row
-    # stamp written below can only have come from another replica.
-    now = int(time.time())
-    monkeypatch.setattr(session_live_state, "last_liveness_stamp", lambda _runner_id: now - 60)
+    # No pinning: the real recorder tracks this replica's own last stamp, so
+    # only a strictly newer row stamp reads as another replica's write. A
+    # reference pinned in the past would let the hello's own stamp qualify
+    # and prove nothing.
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
     sessions_module._session_status_cache[session_id] = "running"
+    sessions_module._session_active_response_cache[session_id] = "response-live-elsewhere"
     try:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         await communicator.wait(timeout=budget(2.0))
         # Let this replica's own disconnect-time liveness write land first,
         # then stamp the row the way the replica now holding the tunnel does.
         await asyncio.sleep(0.1)
-        store.touch_runner_liveness([runner_id], now)
+        if foreign_write:
+            own = session_live_state.last_liveness_stamp(runner_id)
+            assert own is not None, "the hello did not record this replica's own stamp"
+            store.touch_runner_liveness([runner_id], own + 1)
         await asyncio.sleep(grace * 3)
-        assert sessions_module._session_status_cache.get(session_id) != "failed", (
-            "a runner live on another replica was failed by this replica's grace timer"
-        )
+        cached = sessions_module._session_status_cache.get(session_id)
+        if foreign_write:
+            assert cached is None, (
+                f"a runner live on another replica left stale local state {cached!r}"
+            )
+            assert sessions_module._session_active_response_cache.get(session_id) is None
+        else:
+            # Control: with no foreign stamp the same setup must fail the turn,
+            # proving the foreign write, not the setup, spares the session.
+            assert cached == "failed", f"expected the grace timer to fail the turn, got {cached!r}"
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
 
 
 @pytest.mark.asyncio

@@ -3316,7 +3316,7 @@ def create_app(
         it on reconnect (:mod:`omnigent.server.shutdown_state`).
 
         A runner confirmed live on another replica (via
-        :func:`_runner_live_on_another_replica`) skips it too: that
+        :func:`_runner_live_on_another_replica_from_conversations`) skips it too: that
         replica's tunnel is authoritative now, and this one's registry
         only ever knew about its own connections.
 
@@ -3329,7 +3329,8 @@ def create_app(
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
-            _runner_live_on_another_replica,
+            _relinquish_session_live_state,
+            _runner_live_on_another_replica_from_conversations,
         )
         from omnigent.server.schemas import ErrorDetail
 
@@ -3361,9 +3362,11 @@ def create_app(
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
-        if await _runner_live_on_another_replica(
-            conversation_store, [conv.id for conv in affected], runner_id, reference_stamp
+        if _runner_live_on_another_replica_from_conversations(
+            affected, runner_id, reference_stamp
         ):
+            for conv in affected:
+                _relinquish_session_live_state(conv.id)
             _logger.info(
                 "Runner %s is live on another replica; skipping offline-marking",
                 runner_id,

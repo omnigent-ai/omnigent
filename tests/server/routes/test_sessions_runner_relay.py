@@ -646,7 +646,8 @@ class _RecordingLabelStore:
     ``_publish_runner_recovered_status`` to gate the clear on the
     persisted disconnect code, so both are implemented here.
 
-    :param connectivity: Canned rows for ``get_session_connectivity``,
+    :param connectivity: Canned ``SessionConnectivity`` rows whose
+        ``runner_id`` / ``runner_last_seen`` surface on ``get_conversation``,
         e.g. to simulate a runner already live on another replica.
     """
 
@@ -666,20 +667,19 @@ class _RecordingLabelStore:
     def get_conversation(self, conversation_id: str) -> Any:
         """Return a conversation-shaped object exposing the read fields.
 
-        ``.labels`` is read by the recovery guard and ``.live_status`` by
-        the mid-turn check when the in-memory status cache is cold, so a
-        lightweight namespace over both is enough.
+        ``.labels`` is read by the recovery guard, ``.live_status`` by the
+        mid-turn check when the in-memory status cache is cold, and
+        ``.runner_id`` / ``.runner_last_seen`` by the cross-replica liveness
+        check (from the canned connectivity row, else ``None``: no other
+        replica has stamped this session).
         """
+        row = self._connectivity.get(conversation_id)
         return SimpleNamespace(
             labels=dict(self.labels.get(conversation_id, {})),
             live_status=self.live_status,
+            runner_id=row.runner_id if row is not None else None,
+            runner_last_seen=row.runner_last_seen if row is not None else None,
         )
-
-    def get_session_connectivity(self, conversation_ids: list[str]) -> dict[str, Any]:
-        """Return this test's canned rows for the cross-replica liveness check."""
-        return {
-            cid: self._connectivity[cid] for cid in conversation_ids if cid in self._connectivity
-        }
 
 
 @pytest.mark.asyncio
@@ -1615,6 +1615,7 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     # A turn is in flight, so a plain disconnect (without the cross-replica
     # check) would otherwise fail it.
     sessions_module._session_status_cache[session_id] = "running"
+    sessions_module._session_active_response_cache[session_id] = "response-live-elsewhere"
 
     try:
         handle = await sessions_module._ensure_runner_relay_ready(
@@ -1628,7 +1629,8 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         assert session_id not in store.labels, "drop persisted failure labels"
-        assert sessions_module._session_status_cache.get(session_id) == "running"
+        assert sessions_module._session_status_cache.get(session_id) is None
+        assert sessions_module._session_active_response_cache.get(session_id) is None
     finally:
         gate.set()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -1638,7 +1640,29 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
+    """The grace path can detect a newer replica from already-loaded rows."""
+    import time
+    from types import SimpleNamespace
+
+    from omnigent.server.routes.sessions import (
+        _runner_live_on_another_replica_from_conversations,
+    )
+
+    now = int(time.time())
+    conversations = [SimpleNamespace(runner_id="runner_a", runner_last_seen=now)]
+
+    assert _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now - 1)
+    assert not _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now)
+    assert not _runner_live_on_another_replica_from_conversations(
+        [SimpleNamespace(runner_id="runner_a", runner_last_seen=now - 91)],
+        "runner_a",
+        now - 100,
+    )
 
 
 @pytest.mark.asyncio
