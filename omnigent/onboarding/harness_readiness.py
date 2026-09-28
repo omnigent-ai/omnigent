@@ -57,6 +57,7 @@ from omnigent.onboarding.harness_install import (
     PI_KEY,
     QWEN_KEY,
     READINESS_CLI_PROBE_TIMEOUT_S,
+    ZCODE_KEY,
     harness_cli_installed,
     harness_install_spec,
     required_cli_for_harness,
@@ -263,6 +264,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(GOOSE_KEY)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
         return _installer_only_availability(HERMES_KEY)
+    if canonical == ZCODE_KEY:
+        return _zcode_availability()
     if canonical in _DEVIN_NATIVE_HARNESSES:
         return _installer_only_availability(DEVIN_KEY)
     if canonical == CURSOR_KEY:
@@ -875,6 +878,30 @@ def _sdk_harness_availability(canonical: str) -> HarnessAvailability:
     return HARNESS_NEEDS_AUTH
 
 
+def _zcode_availability() -> HarnessAvailability:
+    """Binary plus a non-empty credential file.
+
+    ZCode has no credential-status command, so this accepts its shared OAuth /
+    Coding Plan API-key store without reading it. A missing CLI is the
+    historical bare ``False``. A CLI without ``credentials.json`` is also not
+    launchable.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.harness_startup_config import resolve_harness_command
+    from omnigent.onboarding.provider_config import load_config
+
+    command = resolve_harness_command(
+        ZCODE_KEY,
+        default=ZCODE_KEY,
+        cfg=load_config(),
+    )
+    if resolve_cli_binary(command) is None:
+        return False
+    from omnigent.onboarding.zcode_auth import zcode_login_configured
+
+    return zcode_login_configured()
+
+
 def _installer_only_availability(install_key: str) -> HarnessAvailability:
     """Return availability for a binary-gated harness without login commands.
 
@@ -1058,6 +1085,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(KIMI_SURFACE)
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
+    spellings.add(ZCODE_KEY)
     spellings.add(COPILOT_KEY)
     canonical_by_cache_key: dict[tuple[str, ...], str] = {}
     cache_key_by_spelling: dict[str, tuple[str, ...]] = {}

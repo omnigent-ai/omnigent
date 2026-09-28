@@ -35,6 +35,7 @@ _HARNESSES = [
     "kimi",
     "pi",
     "qwen",
+    "zcode",
 ]
 
 

@@ -2560,6 +2560,52 @@ def _manage_hermes_harness() -> None:
                 status = "✗ hermes binary not found"
 
 
+def _manage_zcode_harness() -> None:
+    """Level-2 drill-in for ZCode.
+
+    ZCode owns its credential file. This does not launch the browser login,
+    which needs a person at the machine. It prints the command instead.
+
+    :returns: None.
+    """
+    from omnigent.onboarding.harness_install import harness_install_spec
+    from omnigent.onboarding.interactive import console, select
+    from omnigent.onboarding.zcode_auth import zcode_auth_summary
+
+    summary = zcode_auth_summary()
+    spec = harness_install_spec("zcode")
+    hint = (
+        spec.install_hint if spec and spec.install_hint else "Install ZCode so `zcode` is on PATH"
+    )
+    if not summary.installed:
+        console.print(f"  ZCode isn't installed.\n    [bold]{hint}[/bold]")
+        return
+    status = (
+        "Credentials found"
+        if summary.signed_in
+        else "No credentials found. Run `zcode login` or configure a Coding Plan API key."
+    )
+    while True:
+        idx = select(
+            "ZCode",
+            ["Show sign-in command", "← Back"],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx <= 0:
+            if idx < 0:
+                return
+            console.print(
+                "  Sign in with [bold]zcode login[/bold] (browser).\n"
+                "  An API key is the TUI slash "
+                "[bold]/login zai-coding-plan-api-key <key>[/bold].\n"
+                "  Omnigent never reads or decrypts ZCode's credential store."
+            )
+            status = "Command printed"
+            continue
+        return
+
+
 def _manage_kiro_harness() -> None:
     """Run the level-2 loop for Kiro: ensure the CLI is installed and signed in.
 
@@ -3673,6 +3719,9 @@ def _run_configure_harnesses_interactive() -> None:
     # Sentinel marking the Hermes row — like Goose it owns its own auth via
     # ``hermes model`` and is installed via a curl installer.
     _HERMES = "\x00hermes"
+    # Sentinel for ZCode. Auth is the vendor CLI's credential file, not an
+    # Omnigent provider.
+    _ZCODE = "\x00zcode"
     # Sentinel marking the Kiro row — like Goose/Hermes it owns its own auth (via
     # ``kiro-cli login``) and is installed via Kiro's curl installer, so it
     # dispatches to its own drill-in rather than a provider family.
@@ -4181,6 +4230,40 @@ def _run_configure_harnesses_interactive() -> None:
                 "Add an ACP agent (gemini, qwen, goose, …).",
             )
         )
+
+        # Append new harnesses after established actions so existing numeric
+        # setup choices keep their meaning.
+        from omnigent.onboarding.zcode_auth import zcode_auth_summary
+
+        zcode = zcode_auth_summary()
+        if not zcode.installed:
+            zcode_spec = harness_install_spec("zcode")
+            zcode_hint = (
+                zcode_spec.install_hint
+                if zcode_spec and zcode_spec.install_hint
+                else "Install ZCode so `zcode` is on PATH"
+            )
+            rows.append(
+                (
+                    _ZCODE,
+                    "ZCode",
+                    _cli_absence_label("zcode"),
+                    "missing",
+                    _install_hint(zcode_hint),
+                ),
+            )
+        elif zcode.ready:
+            rows.append((_ZCODE, "ZCode", zcode.describe(), "ready", ""))
+        else:
+            rows.append(
+                (
+                    _ZCODE,
+                    "ZCode",
+                    "No credentials found",
+                    "warn",
+                    "Open to configure browser OAuth or a Coding Plan API key.",
+                ),
+            )
         return rows
 
     while True:
@@ -4250,6 +4333,8 @@ def _run_configure_harnesses_interactive() -> None:
             _show_acp_cli_harness(selected_target[len(_ACP_CLI_PREFIX) :])
         elif selected_target == _HERMES:
             _manage_hermes_harness()
+        elif selected_target == _ZCODE:
+            _manage_zcode_harness()
         elif selected_target == _DEVIN:
             _manage_devin_harness()
         elif selected_target == _KIRO:

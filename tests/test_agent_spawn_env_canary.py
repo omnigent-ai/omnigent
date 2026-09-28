@@ -48,6 +48,7 @@ HARNESS_PREFIXES = {
     "kimi": ("KIMI_", "MOONSHOT_"),
     "acp": (),
     "hermes": ("HERMES_",),
+    "zcode": ("ZCODE_",),
 }
 
 
@@ -124,6 +125,12 @@ def _hermes_spawn_env():
     return _bare(HermesExecutor, _hermes_home=None)._build_spawn_env()
 
 
+def _zcode_spawn_env():
+    from omnigent.inner.zcode_executor import ZCodeExecutor
+
+    return _bare(ZCodeExecutor)._build_spawn_env()
+
+
 def _pi_spawn_env():
     from omnigent.inner.pi_executor import _clean_pi_env
 
@@ -144,6 +151,7 @@ SPAWN_ENV_BUILDERS = {
     "kimi": _kimi_spawn_env,
     "pi": _pi_spawn_env,
     "qwen": _qwen_spawn_env,
+    "zcode": _zcode_spawn_env,
 }
 
 
