@@ -447,6 +447,24 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   },
   /** Organization-provided server URLs from macOS Managed Preferences. */
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
+  /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
+   *  legacy" because the env var pins the selector on. */
+  getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),
+  /** Live color-scheme override for the wizard (System/Light/Dark). Not
+   *  persisted — resets to the OS default on relaunch.
+   *  @param {"light"|"dark"|"system"} scheme */
+  setColorScheme: (scheme) => ipcRenderer.send("omnigent:setup-set-color-scheme", scheme),
+  /** Current color scheme: `{source, effective}` — the persisted-for-the-session
+   *  source (system/light/dark) and the resolved appearance. Seeds the wizard's
+   *  radio + `.dark` class on load (themeSource may hold a value set earlier). */
+  getColorScheme: () => ipcRenderer.invoke("omnigent:setup-get-color-scheme"),
+  /** Subscribe to the wizard's effective theme ("dark"/"light") so the renderer
+   *  can sync its `.dark` class; fires on set and on OS changes. */
+  onColorScheme: (callback) => {
+    const listener = (_event, theme) => callback(theme);
+    ipcRenderer.on("omnigent:setup-theme", listener);
+    return () => ipcRenderer.removeListener("omnigent:setup-theme", listener);
+  },
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
   /** Drop one recent server from the saved list; resolves the remaining ones. */

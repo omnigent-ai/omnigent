@@ -6,6 +6,7 @@
 import { type ComponentType, type ReactNode, useEffect, useState } from "react";
 import {
   ArrowLeft,
+  ArrowRight,
   ChevronDown,
   Cloudy,
   Copy,
@@ -29,7 +30,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import type { ConnectResult, ServerCheckResult } from "@/pages/onboarding/ServerSelectorV2";
-import { installActionLabel, OnboardingHeading } from "@/pages/onboarding/primitives";
+import {
+  InstallActionIcon,
+  installActionLabel,
+  OnboardingHeading,
+} from "@/pages/onboarding/primitives";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_LOCAL = "http://localhost:6767";
@@ -389,6 +394,7 @@ export function ServerSelectStep({
             </div>
             <Button type="button" disabled={typedUrl.trim().length === 0} onClick={addServer}>
               Join
+              <ArrowRight className="size-4" aria-hidden />
             </Button>
           </div>
         </div>
@@ -451,6 +457,7 @@ export function ServerSelectStep({
               Back
             </Button>
             <Button disabled={selected === null} onClick={join} size="lg">
+              <InstallActionIcon installed={installed} />
               {installActionLabel(installed)}
             </Button>
           </>

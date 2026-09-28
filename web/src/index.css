@@ -928,8 +928,8 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 
 /* The iOS WKWebView runs full-screen under the keyboard at every responsive
- * width. Lock the shell to the visual viewport published by
- * useIOSViewportLock so flow content, including the composer, stays visible. */
+ * width. useIOSViewportLock publishes the area above the docked keyboard so
+ * flow content stays visible without shrinking for floating iPad controls. */
 [data-ios-native].app-shell {
   height: 100lvh;
   height: var(--omnigent-viewport-height, 100lvh);

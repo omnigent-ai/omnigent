@@ -1017,7 +1017,8 @@ class TestToolServer(unittest.TestCase):
             server = _ToolServer()
             await server.start()
 
-            async def executor(name, args):
+            async def executor(name, args, *, call_id=None):
+                self.assertEqual(call_id, "call-1")
                 return {
                     "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
                     "tags": {1, 2, 3},
@@ -1364,6 +1365,7 @@ class TestPiRpcSession(unittest.TestCase):
             payload = "x" * (70 * 1024)
             event = {
                 "type": "tool_execution_end",
+                "toolCallId": "pi_add",
                 "toolName": "large_result",
                 "isError": False,
                 "result": {"content": payload},
@@ -2028,11 +2030,17 @@ class TestRunTurn(unittest.TestCase):
             lines = [
                 json.dumps({"type": "response", "success": True}),
                 json.dumps(
-                    {"type": "tool_execution_start", "toolName": "add", "args": {"a": 1, "b": 2}}
+                    {
+                        "type": "tool_execution_start",
+                        "toolCallId": "pi_add",
+                        "toolName": "add",
+                        "args": {"a": 1, "b": 2},
+                    }
                 ),
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "add",
                         "isError": False,
                         "result": {"sum": 3},
@@ -2325,6 +2333,7 @@ class TestRunTurn(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "fail_tool",
                         "isError": True,
                         "result": "Something broke",
@@ -2485,6 +2494,7 @@ class TestRunTurn(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "sys_os_shell",
                         "isError": False,
                         "result": {"content": [{"type": "text", "text": "ok"}]},
@@ -2569,6 +2579,192 @@ def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> P
 
     executor._ensure_rpc = fake_ensure_rpc
     return executor
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+async def test_pi_native_tool_results_survive_adapter_and_persistence(is_error: bool) -> None:
+    """Native results pair by Pi ID, including overlapping calls of the same tool."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+
+    starts = [
+        {
+            "type": "tool_execution_start",
+            "toolCallId": cid,
+            "toolName": "read",
+            "args": {"path": cid},
+        }
+        for cid in ("read_a", "read_b")
+    ]
+    ends = [
+        {
+            "type": "tool_execution_end",
+            "toolCallId": cid,
+            "toolName": "read",
+            "isError": is_error,
+            "result": {"content": [{"type": "text", "text": f"result_{cid}"}]},
+        }
+        for cid in ("read_b", "read_a")
+    ]
+    executor = _executor_with_scripted_rpc(
+        [json.dumps(e) for e in [*starts, *ends, {"type": "agent_end", "messages": []}]]
+    )
+    adapter = ExecutorAdapter(lambda: executor, harness_label="Pi")
+    queue = asyncio.Queue()
+    ctx = TurnContext("turn_pi", queue, asyncio.Event())
+    persisted = []
+    live = []
+    async for event in executor.run_turn([{"role": "user", "content": "read files"}], [], ""):
+        adapter._translate_event(event, ctx)
+        while not queue.empty():
+            wire = queue.get_nowait().model_dump()
+            live.append(wire["item"])
+            item = _extract_persistent_item_from_sse(wire, response_id=ctx.response_id)
+            if item is not None:
+                persisted.append(item)
+
+    assert [item["status"] for item in live[:2]] == ["in_progress", "in_progress"]
+    assert [(item.type, item.data.call_id) for item in persisted] == [
+        ("function_call", "read_b"),
+        ("function_call_output", "read_b"),
+        ("function_call", "read_a"),
+        ("function_call_output", "read_a"),
+    ]
+    assert all(item.response_id == "turn_pi" for item in persisted)
+    for item in persisted:
+        if item.type == "function_call_output":
+            assert f"result_{item.data.call_id}" in item.data.output
+    assert not adapter._pending_mcp_call_ids
+    assert not adapter._observed_tool_calls
+
+
+@pytest.mark.parametrize("callback_first", [False, True])
+async def test_pi_bridge_correlates_out_of_order_tcp_and_stdout(callback_first: bool) -> None:
+    """TCP callbacks keep their own IDs even before stdout or in reverse call order."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+
+    starts = [
+        {
+            "type": "tool_execution_start",
+            "toolCallId": cid,
+            "toolName": "sys_os_shell",
+            "args": {"command": cid},
+        }
+        for cid in ("shell_a", "shell_b")
+    ]
+    ends = [
+        {
+            "type": "tool_execution_end",
+            "toolCallId": cid,
+            "toolName": "sys_os_shell",
+            "result": {"result": cid},
+        }
+        for cid in ("shell_b", "shell_a")
+    ]
+    executor = _executor_with_scripted_rpc(
+        [json.dumps(e) for e in [*starts, *ends, {"type": "agent_end", "messages": []}]]
+    )
+    adapter = ExecutorAdapter(lambda: executor, harness_label="Pi")
+    queue = asyncio.Queue()
+    ctx = TurnContext("turn_pi", queue, asyncio.Event())
+    adapter._current_ctx = ctx
+    adapter._current_agent = "Pi"
+    server = _ToolServer()
+    server._tool_executor = adapter._stable_tool_executor
+    await server.start()
+    stream = executor.run_turn(
+        [{"role": "user", "content": "run commands"}], [{"name": "sys_os_shell"}], ""
+    )
+    wire_events = []
+
+    async def call_tool(cid: str) -> dict:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        try:
+            writer.write(
+                (
+                    json.dumps(
+                        {
+                            "id": f"tcp_{cid}",
+                            "token": server.token,
+                            "call_id": cid,
+                            "tool": "sys_os_shell",
+                            "args": {"command": cid},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            return json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def dispatch(cid: str) -> None:
+        task = asyncio.create_task(call_tool(cid))
+        try:
+            while True:
+                wire = (await asyncio.wait_for(queue.get(), timeout=5)).model_dump()
+                wire_events.append(wire)
+                item = wire["item"]
+                if item.get("status") == "action_required":
+                    assert item["call_id"] == cid
+                    assert json.loads(item["arguments"]) == {"command": cid}
+                    break
+            assert ctx._complete_tool(cid, json.dumps({"result": cid}))
+            response = await asyncio.wait_for(task, timeout=5)
+            assert response == {"id": f"tcp_{cid}", "result": {"result": cid}}
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        if not callback_first:
+            for _ in starts:
+                adapter._translate_event(await anext(stream), ctx)
+        for cid in ("shell_b", "shell_a"):
+            await dispatch(cid)
+        async for event in stream:
+            adapter._translate_event(event, ctx)
+        while not queue.empty():
+            wire_events.append(queue.get_nowait().model_dump())
+    finally:
+        await stream.aclose()
+        await server.stop()
+
+    persisted = [
+        item
+        for wire in wire_events
+        if (item := _extract_persistent_item_from_sse(wire, response_id=ctx.response_id))
+        is not None
+    ]
+    assert [(item.type, item.data.call_id) for item in persisted] == [
+        ("function_call", "shell_b"),
+        ("function_call_output", "shell_b"),
+        ("function_call", "shell_a"),
+        ("function_call_output", "shell_a"),
+    ]
+    assert not adapter._pending_mcp_call_ids
+    assert not adapter._observed_tool_calls
+    if callback_first:
+        assert not any(wire["item"].get("status") == "in_progress" for wire in wire_events)
+
+
+@pytest.mark.parametrize("call_id", [None, "", 123])
+async def test_pi_ignores_tool_events_without_correlation_id(call_id) -> None:
+    """Malformed tool events must not create cards whose results can never pair."""
+    executor = _executor_with_scripted_rpc(
+        [
+            json.dumps({"type": kind, "toolCallId": call_id, "toolName": "read"})
+            for kind in ("tool_execution_start", "tool_execution_end")
+        ]
+        + [json.dumps({"type": "agent_end", "messages": []})]
+    )
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "read"}], [], "")]
+    assert not any(isinstance(e, (ToolCallRequest, ToolCallComplete)) for e in events)
 
 
 def test_pi_thinking_deltas_stream_as_reasoning_chunks() -> None:
@@ -2934,6 +3130,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": {"blocked": True, "reason": "Policy blocked it"},
@@ -2956,6 +3153,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": {"content": [{"type": "text", "text": blocked_json}]},
@@ -2977,6 +3175,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": json.dumps({"blocked": True, "reason": "Denied"}),
@@ -2999,6 +3198,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": False,  # top-level is False!
                         "result": {
@@ -3023,6 +3223,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "fail",
                         "isError": True,
                         "result": "Connection refused",

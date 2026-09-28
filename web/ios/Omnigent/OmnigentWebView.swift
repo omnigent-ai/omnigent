@@ -1,3 +1,4 @@
+import GameController
 import SwiftUI
 import UIKit
 import WebKit
@@ -106,7 +107,7 @@ struct OmnigentWebView: UIViewRepresentable {
     coordinator.detach()
   }
 
-  private static func nativeBridgeScript(managesWorkspace: Bool) -> String {
+  static func nativeBridgeScript(managesWorkspace: Bool) -> String {
     """
     (() => {
       if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
@@ -225,6 +226,15 @@ struct OmnigentWebView: UIViewRepresentable {
         serverPickerWaiters.clear();
       });
       const insetCallbacks = new Set();
+      const keyboardViewportCallbacks = new Set();
+      let keyboardViewport = null;
+      defineEmit("__omnigentNativeEmitKeyboardViewport", (width, height) => {
+        if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+        keyboardViewport = { width, height };
+        for (const callback of keyboardViewportCallbacks) {
+          try { callback(); } catch {}
+        }
+      });
       // Cache the last footprint so a subscriber that registers AFTER native
       // first emitted (the React app mounts later than document-start) still
       // gets the current value immediately on subscribe.
@@ -330,6 +340,17 @@ struct OmnigentWebView: UIViewRepresentable {
           if (lastInsets) { try { callback(lastInsets); } catch {} }
           return () => insetCallbacks.delete(callback);
         },
+        setDocumentScrollEnabled(enabled) {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "setDocumentScrollEnabled", enabled: !!enabled,
+          });
+        },
+        getKeyboardViewport() { return keyboardViewport; },
+        onKeyboardViewportChanged(callback) {
+          if (typeof callback !== "function") return () => {};
+          keyboardViewportCallbacks.add(callback);
+          return () => keyboardViewportCallbacks.delete(callback);
+        },
         getServerPicker() {
           // Always fetch fresh rather than caching: the picker re-reads on
           // every menu open so a runtime MDM profile change appears without a
@@ -357,13 +378,16 @@ struct OmnigentWebView: UIViewRepresentable {
           });
         },
       });
+      window.webkit.messageHandlers.omnigentNative.postMessage({
+        method: "requestKeyboardViewport",
+      });
     })();
     """
   }
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
-    UIGestureRecognizerDelegate
+    UIGestureRecognizerDelegate, UIScrollViewDelegate
   {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
@@ -419,6 +443,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func attach(_ webView: WKWebView) {
+      webView.scrollView.delegate = self
       self.webView = webView
       if webStore != nil {
         activationObserver = NotificationCenter.default.addObserver(
@@ -455,6 +480,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
+      webView?.scrollView.delegate = nil
       navigationID = UUID()
       activationTask?.cancel()
       activationTask = nil
@@ -767,18 +793,35 @@ struct OmnigentWebView: UIViewRepresentable {
       }
     }
 
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+      guard scrollView === webView?.scrollView, !scrollView.isScrollEnabled,
+        scrollView.contentOffset != .zero
+      else { return }
+      // Focus scrolling can ignore isScrollEnabled. Clamp before the native
+      // frame is displayed instead of correcting the pan later in JavaScript.
+      scrollView.setContentOffset(.zero, animated: false)
+    }
+
     func userContentController(
       _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
     ) {
       guard isTrustedBridgeMessage(message) else { return }
-      // Any trusted message proves the page is alive and driving the bridge, so
-      // stand down the liveness watchdog — the page owns the switcher from here.
-      parent.model.cancelServerSwitcherWatchdog()
       guard let body = message.body as? [String: Any],
         let method = body["method"] as? String
       else { return }
-
+      // Document-start geometry must not wait for slow subresources or count
+      // as proof that the web app has mounted for the switcher watchdog.
+      if method == "requestKeyboardViewport" {
+        (webView as? AccessoryFreeWebView)?.emitKeyboardViewport(force: true)
+        return
+      }
+      // Any trusted message proves the page is alive and driving the bridge, so
+      // stand down the liveness watchdog — the page owns the switcher from here.
+      parent.model.cancelServerSwitcherWatchdog()
       switch method {
+      case "setDocumentScrollEnabled":
+        guard let enabled = body["enabled"] as? Bool else { return }
+        webView?.scrollView.isScrollEnabled = enabled
       case "signOut":
         requestSignOut()
       case "setColorScheme":
@@ -851,7 +894,8 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-      guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
+      guard isCurrent(webView) else { return }
+      guard webStore == nil || workspaceSession != nil else { return }
       if let url = webView.url, !acceptWorkspaceNavigation(url, in: webView) { return }
       if let url = webView.url,
         ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
@@ -875,7 +919,10 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-      guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
+      guard isCurrent(webView) else { return }
+      // Failed or cancelled provisional loads leave the old document's lock intact.
+      webView.scrollView.isScrollEnabled = true
+      guard webStore == nil || workspaceSession != nil else { return }
       if let url = webView.url, !acceptWorkspaceNavigation(url, in: webView) { return }
       if let session = workspaceSession, let url = webView.url,
         session.navigationURL(for: url) != nil
@@ -912,6 +959,7 @@ struct OmnigentWebView: UIViewRepresentable {
       // SPA's client-side routing keeps the same document, so the injected
       // stylesheet persists across in-app navigation.
       if pinnedOrigin != nil, webView.url?.omnigentOrigin == pinnedOrigin {
+        (webView as? AccessoryFreeWebView)?.emitKeyboardViewport(force: true)
         webView.evaluateJavaScript(WorkspaceChromeScript.source)
         parent.loadSucceeded()
       }
@@ -1222,8 +1270,63 @@ struct OmnigentWebView: UIViewRepresentable {
   }
 }
 
-private final class AccessoryFreeWebView: WKWebView {
+final class AccessoryFreeWebView: WKWebView {
   var onWindowAvailable: ((UIWindow) -> Void)?
+  private let keyboardViewport = KeyboardViewportProbe()
+  private var lastKeyboardViewportSize: CGSize?
+
+  override init(frame: CGRect, configuration: WKWebViewConfiguration) {
+    super.init(frame: frame, configuration: configuration)
+    // Without following undocked keyboards, UIKit reports the floating iPad
+    // toolbar as a full-width docked area.
+    keyboardLayoutGuide.usesBottomSafeArea = false
+    keyboardLayoutGuide.followsUndockedKeyboard = true
+    keyboardViewport.isUserInteractionEnabled = false
+    keyboardViewport.accessibilityElementsHidden = true
+    keyboardViewport.translatesAutoresizingMaskIntoConstraints = false
+    insertSubview(keyboardViewport, at: 0)
+    let probeBottom = keyboardViewport.bottomAnchor.constraint(
+      equalTo: keyboardLayoutGuide.topAnchor)
+    probeBottom.priority = .defaultHigh
+    NSLayoutConstraint.activate([
+      keyboardViewport.topAnchor.constraint(equalTo: topAnchor),
+      keyboardViewport.leadingAnchor.constraint(equalTo: keyboardLayoutGuide.leadingAnchor),
+      keyboardViewport.trailingAnchor.constraint(equalTo: keyboardLayoutGuide.trailingAnchor),
+      keyboardViewport.heightAnchor.constraint(greaterThanOrEqualToConstant: 0),
+      probeBottom,
+    ])
+    keyboardViewport.onLayout = { [weak self] in self?.emitKeyboardViewport() }
+    for name in [Notification.Name.GCKeyboardDidConnect, .GCKeyboardDidDisconnect] {
+      NotificationCenter.default.addObserver(
+        self, selector: #selector(hardwareKeyboardChanged), name: name, object: nil)
+    }
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    emitKeyboardViewport()
+  }
+
+  @objc private func hardwareKeyboardChanged() {
+    emitKeyboardViewport(force: true)
+  }
+
+  func emitKeyboardViewport(force: Bool = false) {
+    let size = CGSize(
+      width: bounds.width,
+      height: keyboardViewportHeight(
+        in: bounds, keyboardFrame: keyboardLayoutGuide.layoutFrame,
+        hasIPadHardwareKeyboard: traitCollection.userInterfaceIdiom == .pad
+          && GCKeyboard.coalesced != nil))
+    guard size.width > 0, size.height > 0, force || size != lastKeyboardViewportSize else { return }
+    lastKeyboardViewportSize = size
+    evaluateJavaScript(
+      "window.__omnigentNativeEmitKeyboardViewport?.(\(size.width), \(size.height));")
+  }
 
   override func didMoveToWindow() {
     super.didMoveToWindow()
@@ -1235,6 +1338,32 @@ private final class AccessoryFreeWebView: WKWebView {
 
   override var inputAccessoryView: UIView? {
     nil
+  }
+}
+
+func keyboardViewportHeight(
+  in bounds: CGRect, keyboardFrame: CGRect, hasIPadHardwareKeyboard: Bool = false
+) -> CGFloat {
+  // iPadOS initially reports the hardware toolbar as a short full-width frame
+  // before publishing its floating bounds. Ignore that accessory-only area.
+  if hasIPadHardwareKeyboard && keyboardFrame.height <= 80 {
+    return bounds.height
+  }
+  // Only a keyboard spanning the bottom edge reduces the app's usable height.
+  // Floating keyboards and hardware-keyboard controls overlay the app instead.
+  let docked =
+    keyboardFrame.minX <= bounds.minX + 1
+    && keyboardFrame.maxX >= bounds.maxX - 1
+    && keyboardFrame.maxY >= bounds.maxY - 1
+  return docked ? max(0, min(bounds.height, keyboardFrame.minY - bounds.minY)) : bounds.height
+}
+
+private final class KeyboardViewportProbe: UIView {
+  var onLayout: (() -> Void)?
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    onLayout?()
   }
 }
 

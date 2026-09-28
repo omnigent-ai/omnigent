@@ -39,6 +39,7 @@ function loadNavigationHarness({
   registerFallbacks = true,
   databricksMode = "embedded",
   ensureSession = async (_ses, origin) => origin,
+  normalizeServer = (url) => url,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
 } = {}) {
@@ -211,7 +212,7 @@ function loadNavigationHarness({
     },
     "./url": {
       ...urlHelpers,
-      normalizeUrl: (url) => url,
+      normalizeUrl: normalizeServer,
       expandDatabricksWorkspaceUrl: expandWorkspace,
       fetchServerManifest: async (url) => {
         calls.manifests.push(url);
@@ -356,6 +357,34 @@ function loadNavigationHarness({
 
 describe("Databricks auth mode wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
+
+  it("connects a pasted HTTP workspace URL using HTTPS auth and the Omnigent mount", async (t) => {
+    const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ headers: new Headers({ server: "databricks" }) });
+    t.after(() => {
+      globalThis.fetch = originalFetch;
+    });
+    const h = loadNavigationHarness({
+      serverUrl: target,
+      databricksMode: "browser",
+      normalizeServer: urlHelpers.normalizeUrl,
+      expandWorkspace: urlHelpers.expandDatabricksWorkspaceUrl,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.ipc.get("omnigent:set-server-url")(
+      { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+      "http://workspace.cloud.databricks.com/omnigent?o=123",
+    );
+    assert.deepEqual(h.calls.loadURL, [[target]]);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][1], "https://workspace.cloud.databricks.com");
+    assert.equal(h.api.windows.get(h.win).origin, "https://workspace.cloud.databricks.com");
+    const saved = JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    assert.equal(saved.server_url, target);
+    assert.deepEqual(saved.recent_servers, [target]);
+  });
   const tick = () =>
     new Promise((resolve) => {
       setTimeout(resolve, 5);
@@ -406,6 +435,21 @@ describe("Databricks auth mode wiring", () => {
     await h.api.loadServerUrl(h.win, workspace, "/c/deep-linked");
     assert.equal(h.calls.auth[1][2].interactive, false);
     assert.deepEqual(h.calls.loadURL[1], [`${workspace}/c/deep-linked`]);
+  });
+
+  it("upgrades a saved HTTP workspace before restoring authentication", async (t) => {
+    const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({
+      savedServerUrl: target.replace("https:", "http:"),
+      serverUrl: target,
+      databricksMode: "browser",
+    });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    await tick();
+    assert.deepEqual(h.calls.loadURL, [[target]]);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][1], "https://workspace.cloud.databricks.com");
   });
 
   it("never opens browser OAuth for the explicit embedded rollback or non-workspace servers", async (t) => {

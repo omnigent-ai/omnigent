@@ -54,6 +54,7 @@ export function LandingStep({
               onClick={() => onJoinManaged(managedServers[0])}
               className="flex-1 py-5 rounded-tr-none rounded-br-none border-none"
             >
+              <Users className="size-4" />
               <span>
                 Join your team (
                 <span className="opacity-80 font-normal">{shortName(managedServers[0])}</span>)
@@ -82,6 +83,7 @@ export function LandingStep({
             </DropdownMenu>
           </div>
           <Button variant="outline" onClick={onGetStarted} className="py-5">
+            <Laptop className="size-4" />
             Get started locally
           </Button>
         </>
