@@ -68,6 +68,7 @@ let changedPaths: string[] = [];
 const FILE_VIEWER = {
   openFile,
   openGithubTab: () => {},
+  openGitlabTab: () => {},
   isChangedPath: (p: string) => changedPaths.includes(p),
   conversationId: undefined as string | undefined,
   workspaceRoot: WORKSPACE as string | null,

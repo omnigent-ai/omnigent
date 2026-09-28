@@ -15,6 +15,7 @@ from tests.budgets import budget
 
 A = "https://github.com/example/one/pull/42"
 B = "https://github.com/example/two/pull/42"
+GITLAB_MR = "https://gitlab.example/group/subgroup/project/-/merge_requests/42"
 
 _MCP_CREATE_SUMMARY = (
     "=== PULL REQUEST CREATED ===\n\n"
@@ -81,6 +82,31 @@ def test_reference_normalizes_identity() -> None:
     )
 
 
+def test_gitlab_reference_normalizes_nested_namespace() -> None:
+    reference = PullRequestRef.from_url(
+        "https://GITLAB.example/group/subgroup/project/-/merge_requests/42"
+    )
+    assert reference.provider == "gitlab"
+    assert reference.host == "gitlab.example"
+    assert reference.repository == "group/subgroup/project"
+    assert reference.number == 42
+    assert reference.url == "https://gitlab.example/group/subgroup/project/-/merge_requests/42"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://gitlab.example/group/project/merge_requests/42",
+        "https://gitlab.example/group/project/-/merge_requests/0",
+        "https://gitlab.example/group/../project/-/merge_requests/42",
+        "https://gitlab.example/group/-/merge_requests/42",
+    ],
+)
+def test_invalid_gitlab_reference(url: str) -> None:
+    with pytest.raises(ValueError):
+        PullRequestRef.from_url(url)
+
+
 @pytest.mark.parametrize(
     "host",
     [
@@ -117,6 +143,16 @@ def test_reference_accepts_dns_hostname(host: str) -> None:
 @pytest.mark.parametrize(
     "name,args,result,urls",
     [
+        (
+            "Bash",
+            {"command": "glab mr create --title test"},
+            {"stdout": GITLAB_MR + "\n"},
+            [GITLAB_MR],
+        ),
+        ("Bash", {"command": "glab mr edit 42"}, {"stdout": GITLAB_MR + "\n"}, [GITLAB_MR]),
+        ("Bash", {"command": "glab mr create"}, {"stdout": GITLAB_MR, "exit_code": 1}, []),
+        ("Bash", {"command": "glab mr list"}, GITLAB_MR, []),
+        ("Bash", {"command": "glab mr note 42 --message test"}, GITLAB_MR, []),
         ("Bash", {"command": "gh pr create --title test"}, {"stdout": A + "\n"}, [A]),
         ("shell", {"command": "env FOO=bar /usr/bin/gh pr create"}, A, [A]),
         ("exec_command", {"cmd": "bash -lc 'cd /repo && gh pr create'"}, {"output": A}, [A]),

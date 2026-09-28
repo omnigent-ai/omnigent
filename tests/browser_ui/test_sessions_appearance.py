@@ -116,6 +116,8 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
             },
         )
         browser_contract.json(f"/v1/sessions/{session_id}/child_sessions", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/policies", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/owner", {"owner": None})
         browser_contract.json(f"/v1/sessions/{session_id}/resources/terminals", empty_list)
         browser_contract.response(f"/v1/sessions/{session_id}/read-state", method="PUT")
         for resource in ("environments/default", "github"):
@@ -124,7 +126,16 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
                 {"error": {"message": "No browser-contract environment"}},
                 status=404,
             )
+        browser_contract.json(
+            f"/v1/sessions/{session_id}/resources/gitlab",
+            {
+                "object": "session.gitlab.info",
+                "available": False,
+                "reason": "not_a_git_repo",
+            },
+        )
         browser_contract.sse(f"/v1/sessions/{session_id}/stream")
+    browser_contract.json("/v1/policy-registry", empty_list)
     browser_contract.json(
         re.compile(r"/health(?:\?.*)?$"),
         {

@@ -4568,6 +4568,27 @@ def server(
 
             github_store = GithubConnectionStore(db_uri, cipher)
 
+    # GitLab OAuth uses the same encrypted connection store and is deployment-host
+    # scoped, so GitLab.com and self-managed instances share one server wiring path.
+    from omnigent.server.gitlab_app import GitLabAppConfig
+
+    gitlab_config = GitLabAppConfig.from_env()
+    gitlab_store = None
+    if gitlab_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        gitlab_cipher = build_secret_cipher()
+        if gitlab_cipher is None:
+            logging.getLogger(__name__).error(
+                "GitLab OAuth is configured but disabled: configure a credential cipher "
+                "(OMNIGENT_CREDENTIAL_KMS_KEY_ID or OMNIGENT_CREDENTIAL_VAULT_KEY) "
+                "to enable it."
+            )
+        else:
+            from omnigent.connections.gitlab import GitlabConnectionStore
+
+            gitlab_store = GitlabConnectionStore(db_uri, gitlab_cipher)
+
     # Databricks Connect (per-user OAuth U2M). Shares the credential store's
     # cipher; inert unless OMNIGENT_DATABRICKS_CLIENT_ID/_SECRET are set.
     from omnigent.server.databricks_app import DatabricksConfig
@@ -4657,6 +4678,8 @@ def server(
         sandbox_config=sandbox_config,
         github_config=github_config,
         github_store=github_store,
+        gitlab_config=gitlab_config,
+        gitlab_store=gitlab_store,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,

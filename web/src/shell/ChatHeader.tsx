@@ -16,6 +16,7 @@ import {
   UserPlusIcon,
 } from "lucide-react";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { GitlabIcon } from "@/components/icons/GitlabIcon";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -94,6 +95,12 @@ interface MobileSessionMenuProps {
   githubPanelOpen: boolean;
   /** Open the mobile GitHub drawer. */
   onOpenGithub: () => void;
+  /** Whether the configured GitLab provider is available for this session. */
+  showGitlabTab: boolean;
+  /** True while the mobile GitLab drawer is open. */
+  gitlabPanelOpen: boolean;
+  /** Open the mobile GitLab drawer. */
+  onOpenGitlab: () => void;
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -365,12 +372,12 @@ export function ChatHeader({
     }, 400);
   }, [isMobile, onOpenSidebar, cancelPeek]);
   useEffect(() => cancelPeek, [cancelPeek]);
-  // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
-  // opening the matching rail tab as a full-screen drawer. Mobile only: they
-  // ride in the header's single kebab rather than a second trigger of their
-  // own. Suppressed while a push panel already owns the right side — except in
-  // a terminal-first session, where `panelOpen` means the terminal renders
-  // inline in main and no drawer is mounted.
+  // Workspace-rail entries (Files · Changes · GitHub · GitLab · Agents ·
+  // Shells · Logs), each opening the matching rail tab as a full-screen drawer.
+  // Mobile only: they ride in the header's single kebab rather than a second
+  // trigger of their own. Suppressed while a push panel already owns the right
+  // side — except in a terminal-first session, where `panelOpen` means the
+  // terminal renders inline in main and no drawer is mounted.
   const workspaceItems =
     conversationId &&
     !pending &&
@@ -381,6 +388,7 @@ export function ChatHeader({
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
     !mobileMenu.githubPanelOpen &&
+    !mobileMenu.gitlabPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
       <>
         {showFilesPanel && (
@@ -413,6 +421,15 @@ export function ChatHeader({
           >
             <GithubMono size={16} className="shrink-0" />
             GitHub
+          </DropdownMenuItem>
+        )}
+        {mobileMenu.showGitlabTab && (
+          <DropdownMenuItem
+            onSelect={mobileMenu.onOpenGitlab}
+            className="gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <GitlabIcon className="size-4 shrink-0" />
+            GitLab
           </DropdownMenuItem>
         )}
         {/* Agents — always present (the panel lists at least

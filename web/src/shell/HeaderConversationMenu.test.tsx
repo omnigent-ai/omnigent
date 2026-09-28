@@ -66,9 +66,14 @@ vi.mock("@/hooks/useFileContent", async (importOriginal) => {
   return { ...actual, triggerBrowserDownload: mocks.triggerDownload };
 });
 
-vi.mock("sonner", () => ({
-  toast: { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() },
-}));
+vi.mock("sonner", () => {
+  const toast = Object.assign(vi.fn(), {
+    error: mocks.toastError,
+    custom: vi.fn(),
+    dismiss: vi.fn(),
+  });
+  return { toast };
+});
 
 const CONVERSATION: Conversation = {
   id: "conv-1",

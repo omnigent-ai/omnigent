@@ -7833,6 +7833,30 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
     assert seen == {"root": "/ws/omnigent", "account": "octocat", "remote": "origin"}
 
 
+async def test_dispatch_fs_write_op_routes_gitlab_mr_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The write dispatcher forwards GitLab MR associations to the registry helper."""
+    from omnigent.runner import gitlab_resource
+
+    seen: dict[str, object] = {}
+
+    def fake_update(session_id: str, *, url: str, action: str = "attach"):
+        seen.update({"session_id": session_id, "url": url, "action": action})
+        return {"object": "session.gitlab.mr_association", "ok": True}
+
+    monkeypatch.setattr(gitlab_resource, "update_session_mr", fake_update)
+    url = "https://gitlab.example/group/project/-/merge_requests/42"
+    out = HostProcess._dispatch_fs_write_op(
+        "/ws/omnigent",
+        "gitlab_mrs_update",
+        {"session_id": "session", "url": url, "action": "attach"},
+    )
+
+    assert out == {"object": "session.gitlab.mr_association", "ok": True}
+    assert seen == {"session_id": "session", "url": url, "action": "attach"}
+
+
 async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
     """An unknown write op fails loud rather than silently no-op'ing."""
     with pytest.raises(ValueError, match="unknown fs write op"):

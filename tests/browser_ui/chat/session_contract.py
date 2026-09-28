@@ -520,6 +520,14 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             status=404,
         )
     contract.json(
+        f"{session_api}/resources/gitlab",
+        {
+            "object": "session.gitlab.info",
+            "available": False,
+            "reason": "not_a_git_repo",
+        },
+    )
+    contract.json(
         "/health",
         lambda _request: handle._health(),
     )

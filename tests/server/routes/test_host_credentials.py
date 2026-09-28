@@ -8,8 +8,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omnigent.connections.github import GithubConnectionStore
+from omnigent.connections.gitlab import GitlabConnectionStore
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.server.github_app import GitHubTokenSet
+from omnigent.server.gitlab_app import GitLabTokenSet
 from omnigent.server.routes.host_credentials import create_host_credentials_router
 
 
@@ -60,12 +62,14 @@ class _BoomStore:
         raise RuntimeError("db down")
 
 
-def _app(host_store: _FakeHostStore, *, github_store) -> TestClient:
+def _app(host_store: _FakeHostStore, *, github_store, gitlab_store=None) -> TestClient:
     app = FastAPI()
     # The generic route reads app.state.<provider>_{store,client}, populated by
     # the connection-provider wiring in create_app.
     app.state.github_store = github_store
     app.state.github_client = None
+    app.state.gitlab_store = gitlab_store
+    app.state.gitlab_client = None
     app.include_router(create_host_credentials_router(host_store), prefix="/v1")  # type: ignore[arg-type]
     return TestClient(app)
 
@@ -115,15 +119,40 @@ def test_connected_false_when_owner_has_no_github(db_uri: str) -> None:
     assert resp.json() == {"connected": False}
 
 
+def test_gitlab_credentials_are_vended_when_provider_is_registered(db_uri: str) -> None:
+    hs = _FakeHostStore("host1", "launch-tok", "alice@example.com")
+    github_store = GithubConnectionStore(db_uri, SecretBox("enc-secret"))
+    gitlab_store = GitlabConnectionStore(db_uri, SecretBox("enc-secret"))
+    gitlab_store.upsert(
+        "alice@example.com",
+        gitlab_login="alice",
+        gitlab_user_id=42,
+        gitlab_host="https://gitlab.example",
+        tokens=GitLabTokenSet("glpat_live", "refresh", None, "api"),
+    )
+    tc = _app(hs, github_store=github_store, gitlab_store=gitlab_store)
+    response = tc.get("/v1/hosts/host1/credentials/gitlab", headers=_HDR)
+    assert response.status_code == 200
+    assert response.json() == {
+        "connected": True,
+        "owner": "alice@example.com",
+        "username": "oauth2",
+        "token": "glpat_live",
+        "login": "alice",
+        "host": "https://gitlab.example",
+    }
+
+
 def test_unknown_provider_is_404_but_only_after_auth(db_uri: str) -> None:
     hs = _FakeHostStore("host1", "launch-tok", "alice@example.com")
     store = GithubConnectionStore(db_uri, SecretBox("enc-secret"))
     tc = _app(hs, github_store=store)
-    # Authenticated, but no resolver/store registered for 'gitlab'.
-    assert tc.get("/v1/hosts/host1/credentials/gitlab", headers=_HDR).status_code == 404
+    # Authenticated unknown providers are 404. The GitLab provider is covered
+    # separately above when its configured store is registered.
+    assert tc.get("/v1/hosts/host1/credentials/unknown", headers=_HDR).status_code == 404
     # Unauthenticated stays 401 even for an unknown provider — auth is checked
     # first, so the endpoint reveals nothing about which providers exist.
-    assert tc.get("/v1/hosts/host1/credentials/gitlab").status_code == 401
+    assert tc.get("/v1/hosts/host1/credentials/unknown").status_code == 401
 
 
 def test_resolver_fault_degrades_to_connected_false() -> None:

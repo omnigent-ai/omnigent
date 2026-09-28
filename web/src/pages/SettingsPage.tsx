@@ -31,8 +31,8 @@
 
 import {
   type ComponentType,
-  lazy,
   type CSSProperties,
+  lazy,
   type ReactNode,
   Suspense,
   useCallback,
@@ -43,17 +43,19 @@ import {
   useState,
 } from "react";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { GitlabIcon } from "@/components/icons/GitlabIcon";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
-  ArchiveRestoreIcon,
   AlertTriangleIcon,
+  ArchiveRestoreIcon,
   BotIcon,
+  ClockIcon,
   DownloadIcon,
   FileDiffIcon,
   FilesIcon,
   KeyRoundIcon,
-  Loader2Icon,
   LaptopMinimalIcon,
+  Loader2Icon,
   LogOutIcon,
   MessagesSquareIcon,
   MinusIcon,
@@ -62,15 +64,14 @@ import {
   PanelRightCloseIcon,
   PanelRightIcon,
   PlusIcon,
-  SunIcon,
   SquareCheckIcon,
   SquareIcon,
+  SunIcon,
   TerminalIcon,
   Trash2Icon,
   UploadIcon,
   UserCogIcon,
   XIcon,
-  ClockIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -113,10 +114,16 @@ import {
 } from "@/lib/githubIntegration";
 import {
   beginDatabricksConnect,
+  type DatabricksConnectionStatus,
   disconnectDatabricks,
   fetchDatabricksStatus,
-  type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
+import {
+  beginGitlabConnect,
+  disconnectGitlab,
+  fetchGitlabStatus,
+  type GitlabConnectionStatus,
+} from "@/lib/gitlabIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
@@ -170,8 +177,8 @@ import {
 import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
-  writeTerminalThemeMode,
   type TerminalThemeMode,
+  writeTerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
   canRememberTerminalClipboardPreference,
@@ -183,20 +190,20 @@ import {
 import {
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
-  writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
+  writeWorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
 import {
   readTranscriptViewDefault,
   TRANSCRIPT_VIEW_DEFAULT,
-  writeTranscriptViewDefault,
   type TranscriptViewDefault,
+  writeTranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
 import {
   DEFAULT_WORKSPACE_TAB,
+  type DefaultWorkspaceTab,
   readDefaultWorkspaceTab,
   writeDefaultWorkspaceTab,
-  type DefaultWorkspaceTab,
 } from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
@@ -227,10 +234,10 @@ import {
 import {
   applyCustomTheme,
   createCustomThemeFromPalette,
+  type CustomTheme,
   customThemeSwatches,
   DEFAULT_CUSTOM_THEME,
   readCustomTheme,
-  type CustomTheme,
   writeCustomTheme,
 } from "@/lib/customTheme";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -246,9 +253,9 @@ import {
   getCliStatus,
   isElectronShell,
   resetCliPath,
+  updateBridge,
   type UpdateConfig,
   type UpdateMode,
-  updateBridge,
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import {
@@ -395,6 +402,7 @@ const workspaceTabCards: {
   { value: "files", label: "Files", icon: FilesIcon },
   { value: "changes", label: "Changes", icon: FileDiffIcon },
   { value: "github", label: "GitHub", icon: GithubMono },
+  { value: "gitlab", label: "GitLab", icon: GitlabIcon },
   { value: "subagents", label: "Agents", icon: BotIcon },
 ];
 
@@ -1103,13 +1111,14 @@ function GithubMark({ className }: { className?: string }) {
 }
 
 /**
-/**
+ /**
  * Which panel connects/disconnects each provider. The server's
  * ``enabled_connections`` list says WHICH panels to show; this map says HOW to
  * render each. Adding a provider is one entry here plus one string server-side.
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
   github: GithubIntegrationControl,
+  gitlab: GitlabIntegrationControl,
   databricks: DatabricksIntegrationControl,
 };
 
@@ -1256,6 +1265,101 @@ function GithubIntegrationControl() {
           .
         </p>
       )}
+    </div>
+  );
+}
+
+/** Connect / disconnect the account for the deployment-configured GitLab instance. */
+function GitlabIntegrationControl() {
+  const [status, setStatus] = useState<GitlabConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<"connected" | "error" | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchGitlabStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("gitlab");
+    if (outcome === "connected" || outcome === "error") {
+      setNotice(outcome);
+      params.delete("gitlab");
+      const query = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+    }
+  }, [refresh]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectGitlab();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+  if (status === "loading") return <p className="text-sm text-muted-foreground">Checking…</p>;
+  if (status === null)
+    return <p className="text-sm text-muted-foreground">GitLab status is unavailable.</p>;
+
+  return (
+    <div className="flex flex-col gap-4">
+      {notice === "connected" && (
+        <div
+          role="status"
+          className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-sm"
+        >
+          GitLab account connected.
+        </div>
+      )}
+      {notice === "error" && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          Couldn't connect your GitLab account. Please try again.
+        </div>
+      )}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">GitLab</span>
+          <span className="text-sm text-muted-foreground">
+            {status.connected && status.login
+              ? `Connected as ${status.login}${status.host ? ` on ${status.host}` : ""}. New sandboxes authenticate glab and git as you.`
+              : `Connect your GitLab account${status.host ? ` on ${status.host}` : ""} so new sandboxes authenticate glab and git as you.`}
+          </span>
+        </div>
+        {status.connected ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-9"
+            disabled={busy}
+            data-testid="gitlab-disconnect"
+            onClick={() => void onDisconnect()}
+          >
+            Disconnect
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            className="h-9"
+            disabled={busy || !status.enabled}
+            data-testid="gitlab-connect"
+            onClick={() => beginGitlabConnect(returnTo)}
+          >
+            Connect GitLab
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
