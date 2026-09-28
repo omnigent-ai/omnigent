@@ -7556,12 +7556,25 @@ async def _relay_runner_stream_once(
                                 status == "idle"
                                 and _session_status_cache.get(session_id) == "failed"
                             ):
-                                await _publish_runner_recovered_status(
-                                    session_id,
-                                    conversation_store,
-                                    require_disconnect_code=True,
-                                )
-                                continue
+                                try:
+                                    await _publish_runner_recovered_status(
+                                        session_id,
+                                        conversation_store,
+                                        require_disconnect_code=True,
+                                    )
+                                except Exception:  # noqa: BLE001 — a read error must not kill the relay
+                                    # Fail soft: the session keeps its existing
+                                    # failed status (the sticky rule below drops
+                                    # this idle) and the relay keeps streaming.
+                                    _logger.warning(
+                                        "Relay: disconnect-recovery check failed for session=%s; "
+                                        "keeping failed status",
+                                        session_id,
+                                        exc_info=True,
+                                        extra={"session_id": session_id},
+                                    )
+                                else:
+                                    continue
                             _publish_status(
                                 session_id,
                                 status,

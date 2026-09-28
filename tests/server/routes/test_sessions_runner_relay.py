@@ -1273,6 +1273,85 @@ async def test_relay_backs_off_when_a_registered_runner_rejects_the_stream(
 
 
 @pytest.mark.asyncio
+async def test_relay_survives_a_failed_recovery_read_and_keeps_delivering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A database error while clearing a disconnect failure must not kill the relay.
+
+    The completion-idle recovery reads the conversation row to confirm the
+    failure is a ``runner_disconnected``. The relay supervisor only handles
+    transport loss, so an unguarded read error would end the relay task and
+    silently drop every later runner event for the session. The recovery must
+    fail soft: keep the existing ``failed`` status and keep streaming.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    # Completion idle (triggers the recovery read), then a new turn's running edge.
+    frames = [
+        'data: {"type": "session.status", "status": "idle"}\n\n',
+        'data: {"type": "session.status", "status": "running"}\n\n',
+    ]
+    fake_runner = _ScriptedThenDropRunnerClient(frames, gate)
+    store = _RecordingLabelStore(live_status="idle")
+    session_id = "f1e2d3c4b5a6978877665544332211aa"
+    store.set_labels(
+        session_id,
+        {
+            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_disconnected",
+            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "prior disconnect",
+        },
+    )
+    sessions_module._session_status_cache[session_id] = "failed"
+    monkeypatch.setattr(
+        store,
+        "get_conversation",
+        lambda conversation_id: (_ for _ in ()).throw(RuntimeError("db blip")),
+    )
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_recovery_read_fails",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        statuses = []
+        while not collector.queue.empty():
+            statuses.append(await collector.queue.get())
+        running = [e for e in statuses if e.get("status") == "running"]
+        assert running, (
+            "the running edge after the failed recovery read never reached the stream: "
+            f"the relay died on the read error; saw {statuses}"
+        )
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
