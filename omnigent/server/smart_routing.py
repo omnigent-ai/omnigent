@@ -1521,6 +1521,9 @@ class TaskV1RouteOptionSource:
         """Map a harness to its canonical router name, using the model's family for pi.
 
         Unknown families keep the original harness tag.
+
+        Examples: ``("codex-native", "glm-5-3") -> "codex"``;
+        ``("pi", "claude-sonnet-5") -> "claude"``.
         """
         family = _HARNESS_FAMILY.get(harness or "")
         if family == _MULTI_MODEL_FAMILY:
