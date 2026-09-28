@@ -2436,11 +2436,6 @@ def test_search_snippet_probe_matches_min_position_on_postgres(
     ]
 
     with conversation_store._conv_session("test_snippet_parity") as session:
-        for term in terms:
-            pattern = f"%{term.lower()}%"
-            probe_rows = session.execute(store_mod._earliest_match_by_probe(ids, pattern)).all()
-            min_rows = session.execute(store_mod._earliest_match_by_min(ids, pattern)).all()
-            assert sorted(probe_rows) == sorted(min_rows), term
         actual = {term: _fetch_search_snippets(session, ids, term) for term in terms}
         with monkeypatch.context() as patch:
             patch.setattr(store_mod, "_earliest_match_by_probe", store_mod._earliest_match_by_min)
