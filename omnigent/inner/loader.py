@@ -449,6 +449,21 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
         )
 
     if tool_type == "mcp":
+        if data.get("transport") == "registry" and any(
+            key in data
+            for key in (
+                "url",
+                "command",
+                "args",
+                "env",
+                "headers",
+                "auth",
+                "profile",
+                "databricks_server",
+                "tool_name",
+            )
+        ):
+            raise ValueError("registry MCP tools cannot override server connection settings")
         # ``profile`` can be declared directly (``profile: myprof``)
         # or inside an ``auth:`` block (``auth: {type: databricks,
         # profile: myprof}``). The ``auth:`` block is the preferred
@@ -459,6 +474,7 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
             if str(raw_auth.get("type", "")) == "databricks":
                 mcp_profile = raw_auth.get("profile")
         return MCPTool(
+            registry=data.get("transport") == "registry",
             name=name,
             description=data.get("description"),
             url=data.get("url"),

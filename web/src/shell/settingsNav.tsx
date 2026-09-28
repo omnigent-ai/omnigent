@@ -15,6 +15,7 @@ import {
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
+  PlugIcon,
   SettingsIcon,
   Share2Icon,
   ShieldCheckIcon,
@@ -37,6 +38,7 @@ export type SettingsSectionId =
   | "general"
   | "git"
   | "integrations"
+  | "mcp"
   | "shortcuts"
   | "import"
   | "account"
@@ -60,6 +62,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "general",
   "git",
   "integrations",
+  "mcp",
   "shortcuts",
   "import",
   "account",
@@ -102,6 +105,7 @@ export function settingsNavGroups(
   isSingleUser = false,
   integrationsEnabled = false,
   customizeEnabled = false,
+  mcpEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
@@ -119,14 +123,16 @@ export function settingsNavGroups(
       to: `/settings/customize/${CUSTOMIZE_SUBSECTIONS[0]}`,
     });
   }
-  // Sandbox Integrations appears once any connection provider is wired
-  // (enabled_connections non-empty). Slots right after Git.
+  // Provider credentials and MCP accounts have separate settings pages.
   if (integrationsEnabled) {
     general.splice(2, 0, {
       id: "integrations",
       label: "Sandbox Integrations",
       icon: BlocksIcon,
     });
+  }
+  if (mcpEnabled) {
+    general.splice(2, 0, { id: "mcp", label: "MCP", icon: PlugIcon });
   }
   if (hasAuthSession) {
     // Account leads the group when present — it's the most-visited section
@@ -250,7 +256,9 @@ export function SettingsSidebarBody({
   // `/v1/me` (mode-agnostic) so the group appears for admins under OIDC too,
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
-  const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
+  const integrationsEnabled =
+    info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
+  const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
   const customizeEnabled = isFeatureEnabled(info, "customize");
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
@@ -260,6 +268,7 @@ export function SettingsSidebarBody({
     isSingleUserMode(info),
     integrationsEnabled,
     customizeEnabled,
+    mcpEnabled,
   );
 
   return (

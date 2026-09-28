@@ -742,6 +742,7 @@ class _PendingPolicyAskWrites:
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
     :param reviewed_arguments: Original MCP arguments shown for approval.
     :param transformed_arguments: Policy transform stored with that approval.
+    :param mcp_call_identity: Session, tool, policy actor and credential user.
     """
 
     state_updates: list[StateUpdate] | None
@@ -749,6 +750,7 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
+    mcp_call_identity: tuple[str, str, str | None, str | None] | None = None
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be
