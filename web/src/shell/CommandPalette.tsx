@@ -375,10 +375,7 @@ export function CommandPalette({
   const loadError =
     (sessionsOnly || query === debouncedQuery) &&
     (searching ? searchGroups.some((group) => group.isError) : isError || isFetchNextPageError);
-  const searchTimedOut =
-    !sessionsOnly &&
-    Boolean(debouncedQuery) &&
-    searchGroups.some((group) => isAbortTimeout(group.error));
+  const searchTimedOut = searchGroups.some((group) => isAbortTimeout(group.error));
   const loadMoreError = searching
     ? searchGroups.some((group) => group.isFetchNextPageError)
     : isFetchNextPageError;
