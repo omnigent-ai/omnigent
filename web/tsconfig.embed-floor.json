@@ -1,0 +1,21 @@
+// Type-checks src against the react-router version the EMBED externalizes to the
+// host (6.4.1), not the 7.x the standalone app ships. vite.embed.config.ts leaves
+// react-router(-dom) as bare externals resolved by the host monolith, so routing
+// that compiles here on 7.x but uses APIs absent in the host's 6.4.1 breaks every
+// embedder at runtime — the class fixed in databricks-eng/universe#2682435. The
+// react-router(-dom)-floor aliases pin 6.4.1 for this check only; the app keeps 7.x.
+// Bump these + the host in lockstep, never one alone.
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.embed-floor.tsbuildinfo",
+    "paths": {
+      "@/*": ["./src/*"],
+      "react-router": ["./node_modules/react-router-floor"],
+      "react-router/*": ["./node_modules/react-router-floor/*"],
+      "react-router-dom": ["./node_modules/react-router-dom-floor"],
+      "react-router-dom/*": ["./node_modules/react-router-dom-floor/*"]
+    }
+  },
+  "include": ["src"]
+}

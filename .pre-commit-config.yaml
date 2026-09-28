@@ -92,6 +92,16 @@ repos:
         files: ^(web/.*\.[cm]?[jt]sx?|web/tsconfig(?:\.[^.]+)?\.json|web/package\.json|pnpm-(?:lock|workspace)\.yaml)$
         pass_filenames: false
 
+      # Type-check src against the react-router version the embed externalizes to
+      # the host (6.4.1), not the 7.x the app ships. Catches routing that compiles
+      # on 7.x but breaks embedders on 6.4.1. See web/tsconfig.embed-floor.json.
+      - id: web-tsc-embed-floor
+        name: web TypeScript embed host-floor type check
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/tsc && cd web && node_modules/.bin/tsc -p tsconfig.embed-floor.json'
+        files: ^(web/.*\.[cm]?[jt]sx?|web/tsconfig(?:\.[^.]+)?\.json|web/package\.json|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
       - id: vscode-tsc
         name: VS Code extension TypeScript type check
         language: system
