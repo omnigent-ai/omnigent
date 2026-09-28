@@ -262,6 +262,67 @@ async def test_agent_creator_still_needs_session_ownership(
     assert await _download_bundle(client, session_id) == initial
 
 
+@pytest.mark.parametrize(
+    "level",
+    [LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE],
+    ids=["reader", "editor", "manager"],
+)
+async def test_child_agent_metadata_requires_effective_session_owner(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    permission_store: SqlAlchemyPermissionStore,
+    level: int,
+) -> None:
+    """A creator with inherited non-owner access sees read-only child MCP metadata."""
+    session_id, headers = await _create_session(
+        client,
+        db_uri,
+        _bundle(_mcp_config("http")),
+        LEVEL_OWNER,
+    )
+    parent = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert parent is not None and parent.agent_id is not None
+    child = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=parent.agent_id,
+        kind="sub_agent",
+        parent_conversation_id=session_id,
+        sub_agent_name="child",
+    )
+    permission_store.grant(_OWNER["X-Forwarded-Email"], session_id, level)
+
+    response = await client.get(f"/v1/sessions/{child.id}/agent", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert [server["name"] for server in response.json()["mcp_servers"]] == ["service"]
+    assert response.json()["mcp_servers_editable"] is False
+
+
+async def test_child_agent_metadata_allows_effective_session_owner(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The parent owner and agent creator retain MCP controls on a child."""
+    session_id, headers = await _create_session(
+        client,
+        db_uri,
+        _bundle(_mcp_config("http")),
+        LEVEL_OWNER,
+    )
+    parent = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert parent is not None and parent.agent_id is not None
+    child = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=parent.agent_id,
+        kind="sub_agent",
+        parent_conversation_id=session_id,
+        sub_agent_name="child",
+    )
+
+    response = await client.get(f"/v1/sessions/{child.id}/agent", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["mcp_servers_editable"] is True
+
+
 @pytest.mark.parametrize("level", _LEVELS)
 @pytest.mark.parametrize("transport", ["http", "stdio"])
 @pytest.mark.parametrize("nested", [False, True], ids=["root", "subagent"])

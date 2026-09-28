@@ -39,6 +39,9 @@ from omnigent.server.auth import (
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import (
+    can_mutate_session_agent as _can_mutate_session_agent,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -140,6 +143,15 @@ def register_agent_routes(
                 f"Agent not found: {conv.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
             )
+        mcp_servers_editable = await asyncio.to_thread(
+            _can_mutate_session_agent,
+            user_id,
+            session_id,
+            agent,
+            permission_store,
+            conversation_store,
+            conversation=conv,
+        )
         terminals_override = None
         if (
             conv.host_id is not None
@@ -156,6 +168,7 @@ def register_agent_routes(
             agent,
             agent_cache,
             terminals_override=terminals_override,
+            mcp_servers_editable=mcp_servers_editable,
         )
 
     @router.get(
@@ -340,7 +353,7 @@ def register_agent_routes(
 
         # Idempotency: same bundle content = no-op
         if new_loc == agent.bundle_location:
-            return _to_agent_object(agent, agent_cache)
+            return _to_agent_object(agent, agent_cache, mcp_servers_editable=True)
 
         if artifact_store is None:
             raise OmnigentError(
@@ -363,7 +376,7 @@ def register_agent_routes(
                 agent.id, new_loc, bundle_bytes, expand_env=agent.session_id is None
             )
 
-        return _to_agent_object(updated, agent_cache)
+        return _to_agent_object(updated, agent_cache, mcp_servers_editable=True)
 
     # ── POST /sessions/{session_id}/mcp ──────────────────────────────────
     # MCP Streamable HTTP proxy endpoint. Only registered when a
